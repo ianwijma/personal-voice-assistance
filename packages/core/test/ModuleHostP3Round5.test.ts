@@ -7,15 +7,14 @@ import { TestClock } from "effect/testing"
 import { exampleAdminSnapshot } from "../../protocol/src/examples.ts"
 import { makeTool } from "../src/Module.ts"
 import { defineModule, type ModuleDefinition } from "../src/ModuleDefinition.ts"
+import { ADMIN_MODULES_SHARE_BYTES, adminModules, withinModuleFrame } from "../src/ModuleFrames.ts"
 import {
-  ADMIN_FORMS_SHARE_BYTES,
   MAX_LISTED_TOOL_DESCRIPTION,
   MAX_LISTED_TOOLS,
   type ModuleDemand,
   makeModuleHost,
   MODULE_FORM_MAX_BYTES,
-  readOnlyPersistence,
-  withinAdminShare
+  readOnlyPersistence
 } from "../src/ModuleHost.ts"
 import { resolveSettings, Setting } from "../src/Settings.ts"
 
@@ -26,13 +25,19 @@ const roundTrip = (info: ModuleInfo) => {
   assert.strictEqual(decoded._tag, "Ok", decoded._tag === "Invalid" ? decoded.reason : "")
   return text
 }
-/** An admin snapshot of these modules, as the hub assembles it (`withinAdminShare`), encoded and decoded. */
+/**
+ * An admin snapshot of these modules as the hub assembles it (`adminModules` over `withinModuleFrame`), and the
+ * `module.changed` frames that follow it, each encoded and decoded; `page` is what a page has after all of them.
+ */
 const snapshotRoundTrip = (modules: ReadonlyArray<ModuleInfo>) => {
-  const snapshot: AdminSnapshot = { ...exampleAdminSnapshot, modules: [...withinAdminShare(modules)] }
+  const { modules: sent, follow } = adminModules(modules.map(withinModuleFrame))
+  const snapshot: AdminSnapshot = { ...exampleAdminSnapshot, modules: sent }
   const text = encodeServerMessage({ type: "admin.snapshot", snapshot })
   const decoded = decodeServerMessage(text)
   assert.strictEqual(decoded._tag, "Ok", decoded._tag === "Invalid" ? decoded.reason : "")
-  return snapshot
+  const page = new Map(sent.map((m) => [m.id, m]))
+  for (const m of follow) page.set(m.id, (JSON.parse(roundTrip(m)) as { module: ModuleInfo }).module)
+  return { ...snapshot, follow, page }
 }
 const enabledAll = (catalog: ReadonlyArray<ModuleDefinition<any>>, settings: Record<string, Record<string, unknown>> = {}) =>
   readOnlyPersistence({ modules: Object.fromEntries(catalog.map((d) => [d.id, { enabled: true, ...(settings[d.id] !== undefined ? { settings: settings[d.id] } : {}) }])), secrets: {} })
@@ -144,7 +149,7 @@ describe("the complete form has a limit (5A-2)", () => {
       assert.deepStrictEqual(saves, [])
     }))
 
-  it.effect("forty modules each just under the limit: the snapshot decodes, and the withheld forms are the largest", () =>
+  it.effect("forty modules each just under the limit: the snapshot decodes, the modules it has no room for are light entries whose complete projections follow, and no form is withheld", () =>
     Effect.gen(function*() {
       const catalog = Array.from({ length: 40 }, (_, m) =>
         defineModule({
@@ -157,7 +162,6 @@ describe("the complete form has a limit (5A-2)", () => {
           },
           start: () => Effect.succeed({})
         }))
-      // Sizes in a shuffled order, each just under 48 KiB, so "the largest" is not the catalogue's order.
       const saved = Object.fromEntries(catalog.map((d, m) => [d.id, { a: items(60, 390, "a"), b: items(60, 390 - ((m * 7) % 20), "b") }]))
       const host = yield* makeModuleHost({ catalog, persistence: enabledAll(catalog, saved), env: {} })
       yield* host.startEnabled
@@ -168,15 +172,18 @@ describe("the complete form has a limit (5A-2)", () => {
         assert.isAbove(jsonBytes(info.settings), MODULE_FORM_MAX_BYTES - 4 * 1024, "just under the limit")
         roundTrip(info)
       }
-      const sent = snapshotRoundTrip(infos).modules
-      const withheld = sent.filter((m) => m.settings.fields.length === 0).map((m) => m.id)
-      assert.isAbove(withheld.length, 0)
-      const bySize = [...infos].sort((x, y) => jsonBytes(y.settings) - jsonBytes(x.settings)).map((m) => m.id)
-      assert.deepStrictEqual([...withheld].sort(), bySize.slice(0, withheld.length).sort(), "the largest are withheld")
-      for (const m of sent.filter((x) => withheld.includes(x.id))) {
-        assert.match(m.settings.errors[0]!.message, /settings are not shown: all modules' settings together .* the largest field is "[AB]"\)\. Reduce it in the settings file\.$/)
+      const sent = snapshotRoundTrip(infos)
+      const light = sent.modules.filter((m) => m.details === "follow")
+      assert.isAbove(light.length, 0)
+      // A light entry: identity, switch and state only; its complete projection follows, in catalogue order.
+      for (const m of light) {
+        assert.deepStrictEqual([m.settings.fields, m.settings.values, m.tools], [[], {}, []])
+        assert.strictEqual(m.state, "running")
       }
-      assert.isAtMost(jsonBytes(sent.map((m) => [m.settings, m.tools])), ADMIN_FORMS_SHARE_BYTES)
+      assert.deepStrictEqual(sent.follow.map((m) => m.id), light.map((m) => m.id))
+      assert.isAtMost(jsonBytes(sent.modules), ADMIN_MODULES_SHARE_BYTES)
+      // Nothing is withheld: after the frames that follow, the page has every module's complete form.
+      for (const info of infos) assert.deepStrictEqual(sent.page.get(info.id), info)
     }))
 })
 

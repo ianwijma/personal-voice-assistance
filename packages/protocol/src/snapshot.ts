@@ -140,7 +140,14 @@ export const ModuleInfo = Schema.Struct({
    * Protocol 10: the HTTP routes its shared part declares (docs/UI-AND-MODULES.md §1.11), while it runs. Absent =
    * none. The recent calls and the tokens are read through the admin API (`GET /api/module-routes`).
    */
-  routes: Schema.optionalKey(Schema.Array(ModuleRouteInfo).check(Schema.isMaxLength(MAX_ROUTES_PER_MODULE)))
+  routes: Schema.optionalKey(Schema.Array(ModuleRouteInfo).check(Schema.isMaxLength(MAX_ROUTES_PER_MODULE))),
+  /**
+   * Protocol 10: `"follow"` on a module of `admin.snapshot` whose complete entry did not fit the snapshot's share of
+   * its frame: this entry carries only its identity, switch, state and short error (an empty form, no tools), and the
+   * complete entry follows at once, in its own `module.changed` of the same send. A page shows the module as loading
+   * until then, never makes a form of it, and keeps a complete entry it already has. Absent = complete.
+   */
+  details: Schema.optionalKey(Schema.Literal("follow"))
 })
 export type ModuleInfo = typeof ModuleInfo.Type
 

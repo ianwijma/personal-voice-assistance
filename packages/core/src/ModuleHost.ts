@@ -67,6 +67,7 @@ import {
 import type { FieldActionHandler, FieldActionResult } from "./ModuleContributions.ts"
 import { type FieldActionOwner, makeFieldActionOwner } from "./FieldActionOwner.ts"
 import { type ModuleRoute, type PublishedRoute, RouteTokenError, routeInfo, routeProblem, type RouteTokens, type RouteTokenStore } from "./ModuleRoutes.ts"
+import { clipText as clip, jsonBytes, largestField, wholeCodePoints } from "./ModuleFrames.ts"
 import { makePageBoundary } from "./PageBoundary.ts"
 import { makeModuleSlots, MAX_PRESS_SLOTS, slotIssues } from "./ModuleSlots.ts"
 import { type ModuleDefinition, type ModuleInstance, ModuleStartError } from "./ModuleDefinition.ts"
@@ -213,21 +214,17 @@ export const FIELD_ACTION_TIMEOUT_MS = 8_000
 export const MODULE_FORM_BUDGET_BYTES = 8 * 1024
 
 /**
- * What one module's complete settings form may take as it is sent (UTF-8 bytes of the form as JSON: its fields, the
- * effective values, errors and warnings, with what the running instance adds), together with the module's listed
- * tools. A save that would make it larger is refused, naming the largest field; settings already larger (a
- * hand-edited file) are not valid: the module gets no form on the page, only an error naming the largest field, and
- * does not start. What the instance adds, and then the listed tools, are trimmed to what the form leaves. One
- * `module.changed` therefore always fits a frame.
+ * What one module's complete settings form may take as it is sent (UTF-8 bytes of the form as JSON, envelope
+ * included: its fields with the generated Test button, the effective values, the errors and warnings after the page
+ * boundary, the room its run-time notes need, and what the running instance adds), together with the module's listed
+ * tools. One function builds that form (`sentForm` in the host) and the load check, the save check and `info()` all
+ * measure its output. A save that would make it larger is refused, naming the largest field; settings already larger
+ * (a hand-edited file) are not valid: the module gets no form on the page, only an error naming the largest field,
+ * and does not start. When only the messages make it larger (a secret the boundary replaced inside an error), the
+ * messages are cut shorter, never the values. What the instance adds, and then the listed tools, get what is left.
+ * One module's whole projection is bounded once more by `MODULE_FRAME_MAX_BYTES` (`ModuleFrames.ts`).
  */
 export const MODULE_FORM_MAX_BYTES = 48 * 1024
-
-/**
- * The share of one `admin.snapshot` frame (1 MiB, `MAX_TEXT_FRAME_BYTES`) that all modules' forms and listed tools
- * take together (`withinAdminShare`): it leaves 576 KiB for the Health issues (256 KiB), the templates (128 KiB) and
- * everything else. Over it, forms are withheld largest first, each with a note, until the modules fit.
- */
-export const ADMIN_FORMS_SHARE_BYTES = 448 * 1024
 
 /** At most this many of a module's tools are listed on the admin page (`ModuleInfo.toolsLeft` counts the rest). */
 export const MAX_LISTED_TOOLS = 100
@@ -583,12 +580,6 @@ export const unavailableLine = (name: string, reason: string): string => `${name
 export const outsideTurns = <A, E, R>(effect: Effect.Effect<A, E, R>): Effect.Effect<A, E, R> =>
   effect.pipe(Effect.provideService(CurrentTurn, undefined), Effect.provideService(CurrentJob, undefined), Effect.provideService(CurrentPrincipal, undefined))
 
-/** `n`, moved back so that `text.slice(0, n)` does not end in half a character (a lone high surrogate). */
-const wholeCodePoints = (text: string, n: number): number => {
-  const c = n > 0 && n < text.length ? text.charCodeAt(n - 1) : 0
-  return c >= 0xd800 && c <= 0xdbff ? n - 1 : n
-}
-const clip = (text: string, max: number) => (text.length <= max ? text : `${text.slice(0, wholeCodePoints(text, max - 1))}…`)
 
 /** An unavailable reason made safe for the wire's `ModuleUnavailable` (reason ≤ 500, the fix's label ≤ 200, value ≤ 1000). */
 const wireUnavailable = (u: ModuleUnavailable): ModuleUnavailable => {
@@ -820,10 +811,54 @@ export const makeModuleHost = Effect.fnUntraced(function*(options: ModuleHostOpt
   }
   /** Per resolved form, the messages of the field code that threw while it was resolved (`resolveRaw`). */
   const faults = new WeakMap<SettingsForm, ReadonlySet<string>>()
+  /** An agent or decision provider without a `test` field of its own gets the generated Test button. */
+  const generatesTest = (entry: Entry) => (entry.def.kind === "agent" || entry.def.kind === "decider") && !Object.hasOwn(entry.def.settings, "test")
+
   /**
-   * The module's settings from these sources. Settings whose complete form is larger than `MODULE_FORM_MAX_BYTES`
-   * are not valid, like any settings a field refuses: no form, one error naming the largest field (its values are
-   * kept as they are; nothing is cut).
+   * The form as it is sent, before what the running instance adds (`decorateForm`): the one measure of
+   * `MODULE_FORM_MAX_BYTES`, used by the load check (`resolveFrom`), the save check (`configureEntry`) and `info()`.
+   * Its messages (errors, warnings) pass the page boundary first, the generated Test button is in it, and it is
+   * measured as the UTF-8 JSON of the whole form (its envelope included), with the room each combo or info field's
+   * run-time note needs (`NOTE_RESERVE_BYTES`). Over the limit, its messages are cut shorter, step by step
+   * (`MESSAGE_CAPS`); the editable values never are. `over` says it does not fit even with the shortest messages:
+   * then its values are too large (the largest field is named).
+   */
+  const sentForm = (entry: Entry, form: SettingsForm): {
+    readonly form: SettingsForm
+    readonly bytes: number
+    readonly over?: { readonly bytes: number; readonly key: string | null; readonly label: string }
+  } => {
+    const fields = generatesTest(entry) ? [...form.fields, GENERATED_TEST_FIELD] : form.fields
+    const reserve = notesReserve(fields)
+    // Through the boundary in full, then cut: a secret is matched before anything shortens it.
+    const through = (list: ReadonlyArray<FieldError>) => list.map((e) => ({ ...e, message: boundary.text(entry.def.id, e.message, 2000) }))
+    const errors = through(form.errors)
+    const warnings = form.warnings === undefined ? undefined : through(form.warnings)
+    let first: { readonly form: SettingsForm; readonly bytes: number } | undefined
+    for (const cap of MESSAGE_CAPS) {
+      const cut = (list: ReadonlyArray<FieldError>) => list.map((e) => ({ ...e, message: clip(e.message, cap) }))
+      const candidate: SettingsForm = { ...form, fields, errors: cut(errors), ...(warnings !== undefined ? { warnings: cut(warnings) } : {}) }
+      const bytes = jsonBytes(candidate) + reserve
+      if (bytes <= MODULE_FORM_MAX_BYTES) return { form: candidate, bytes }
+      first ??= { form: candidate, bytes }
+    }
+    return { ...first!, over: { bytes: first!.bytes, ...largestField(form) } }
+  }
+  /** The form sent for settings too large for the admin page: one error naming the largest field. */
+  const tooLargeForm = (entry: Entry, over: { readonly bytes: number; readonly label: string }): SettingsForm => ({
+    fields: [],
+    values: {},
+    secrets: {},
+    errors: [{
+      key: null,
+      message: `${entry.def.name}'s settings are too large for the admin page (${kib(over.bytes)} KiB; at most ${kib(MODULE_FORM_MAX_BYTES)} KiB). The largest is "${over.label}": reduce it in the settings file.`
+    }]
+  })
+
+  /**
+   * The module's settings from these sources. Settings whose form as it is sent (`sentForm`) is larger than
+   * `MODULE_FORM_MAX_BYTES` even with its messages cut short are not valid, like any settings a field refuses: no
+   * form, one error naming the largest field (its values are kept as they are; nothing is cut).
    */
   const resolveFrom = (
     entry: Entry,
@@ -832,10 +867,8 @@ export const makeModuleHost = Effect.fnUntraced(function*(options: ModuleHostOpt
     defaults: Readonly<Record<string, unknown>> | undefined
   ): ResolvedSettings<any> => {
     const resolved = resolveRaw(entry, src, own, defaults)
-    const over = formOverLimit(resolved.form)
-    if (over === undefined) return resolved
-    const message = `${entry.def.name}'s settings are too large for the admin page (${kib(over.bytes)} KiB; at most ${kib(MODULE_FORM_MAX_BYTES)} KiB). The largest is "${over.label}": reduce it in the settings file.`
-    return { value: undefined, form: { fields: [], values: {}, secrets: {}, errors: [{ key: null, message }] } }
+    const { over } = sentForm(entry, resolved.form)
+    return over === undefined ? resolved : { value: undefined, form: tooLargeForm(entry, over) }
   }
   /** The settings as saved now (what the form shows). */
   const resolve = (entry: Entry) => resolveFrom(entry, entry.want, undefined, entry.want.defaults)
@@ -1209,6 +1242,11 @@ export const makeModuleHost = Effect.fnUntraced(function*(options: ModuleHostOpt
    * decision provider. Never part of an instance's settings key.
    */
   const decorateForm = (entry: Entry, form: SettingsForm): SettingsForm => {
+    // The form as it is sent (`sentForm`: messages through the boundary and cut to fit, the generated Test): measured
+    // here as on load and save, never skipped.
+    const sent = sentForm(entry, form)
+    if (sent.over !== undefined) return tooLargeForm(entry, sent.over)
+    const checked = sent.form
     const instance = mainOf(entry)?.instance
     // Called on the instance (a method may use `this`); a throwing one gives nothing.
     const read = <T>(f: () => T): T | undefined => {
@@ -1222,18 +1260,13 @@ export const makeModuleHost = Effect.fnUntraced(function*(options: ModuleHostOpt
     const options = instance?.settingOptions === undefined ? undefined : read(() => instance.settingOptions!())
     const own = <T>(dict: Readonly<Record<string, T>> | undefined, key: string): T | undefined =>
       typeof dict === "object" && dict !== null && Object.hasOwn(dict, key) ? dict[key] : undefined
-    const generated = generatesTest(entry)
-    // Messages may come from a field's own check (module code): through the boundary, like everything it writes.
-    const errors = form.errors.map((e) => ({ ...e, message: boundary.text(entry.def.id, e.message, 2000) }))
-    const warnings = form.warnings?.map((e) => ({ ...e, message: boundary.text(entry.def.id, e.message, 2000) }))
-    const checked = { ...form, errors, ...(warnings !== undefined ? { warnings } : {}) }
-    if (infos === undefined && options === undefined && !generated && !form.fields.some((f) => f.type === "combo")) return checked
-    const values: Record<string, SettingValue> = { ...form.values }
-    const base = generated ? [...form.fields, GENERATED_TEST_FIELD] : form.fields
+    if (infos === undefined && options === undefined && !checked.fields.some((f) => f.type === "combo")) return checked
+    const values: Record<string, SettingValue> = { ...checked.values }
+    const base = checked.fields
     // What the instance adds fits in what the described form leaves of the module's budget (`MODULE_FORM_BUDGET_BYTES`)
-    // and in what the complete form (its fields with their notes' room, its values, errors and warnings) leaves of
-    // `MODULE_FORM_MAX_BYTES`; the listed tools get what is left after that.
-    let room = Math.min(MODULE_FORM_BUDGET_BYTES - formBytes(base), MODULE_FORM_MAX_BYTES - formBytes(base) - jsonBytes({ ...checked, fields: [] }))
+    // and in what the form as it is sent (with its notes' room) leaves of `MODULE_FORM_MAX_BYTES`; the listed tools
+    // get what is left after that.
+    let room = Math.min(MODULE_FORM_BUDGET_BYTES - formBytes(base), MODULE_FORM_MAX_BYTES - sent.bytes)
     const fields = base.map((field): SettingField => {
       const info = own(infos, field.key)
       // Through the boundary: an info value never carries one of the module's secrets to the page.
@@ -1266,11 +1299,10 @@ export const makeModuleHost = Effect.fnUntraced(function*(options: ModuleHostOpt
       const shownNote = more > 0 && field.optionsNote !== undefined ? `${field.optionsNote} (and ${more} more)` : field.optionsNote ?? note
       return { ...field, options: all, ...(shownNote !== undefined ? { optionsNote: clip(shownNote, MAX_FIELD_LABEL) } : {}) }
     })
-    return { ...checked, fields, values }
+    const decorated = { ...checked, fields, values }
+    // Measured once more as it goes: what the instance added stays within the limit, or is not sent.
+    return jsonBytes(decorated) <= MODULE_FORM_MAX_BYTES ? decorated : checked
   }
-
-  /** An agent or decision provider without a `test` field of its own gets the generated Test button. */
-  const generatesTest = (entry: Entry) => (entry.def.kind === "agent" || entry.def.kind === "decider") && !Object.hasOwn(entry.def.settings, "test")
 
   /** The module's own issues (source `module:<id>`): requirements, unavailable, a failed start, what hung. */
   const moduleIssues = (entry: Entry, demandedNow: ReadonlySet<Entry>): ReadonlyArray<Issue> => {
@@ -1736,6 +1768,8 @@ export const makeModuleHost = Effect.fnUntraced(function*(options: ModuleHostOpt
   let closing = false
   /** P3: shutdown has begun: no field action is admitted from now on. */
   let pressesClosed = false
+  /** The host's own presses have ended at shutdown (or the bounded wait for them is over). */
+  const hostPressesEnded = Deferred.makeUnsafe<void>()
   const closingSignal = Deferred.makeUnsafe<void>()
 
   /**
@@ -2122,8 +2156,12 @@ export const makeModuleHost = Effect.fnUntraced(function*(options: ModuleHostOpt
     announceAll()
   })
 
-  /** Closing the host: close what `revokeAll` withdrew (and anything published since), consumers first, without grace. */
+  /**
+   * Closing the host: close what `revokeAll` withdrew (and anything published since), consumers first, without grace;
+   * first the host's own presses have ended (or their bounded wait is over), so none outlives what it may use.
+   */
   const shutdownWalk = Effect.gen(function*() {
+    yield* Deferred.await(hostPressesEnded)
     for (const run of revoked.splice(0)) yield* contained(run.entry, "", closeRun(run, 0))
     for (const entry of [...ordered].reverse()) {
       if (entry.run !== undefined) yield* contained(entry, "", stopModule(entry, 0))
@@ -2216,13 +2254,18 @@ export const makeModuleHost = Effect.fnUntraced(function*(options: ModuleHostOpt
   // `closeTimeoutMs` in all. Registered after the forks, so it runs before they are interrupted.
   yield* Effect.addFinalizer(() =>
     Effect.gen(function*() {
-      // P3: the host's own presses stop first (refused from now on; each in flight has ended), before anything closes.
+      // P3: in one synchronous step, nothing is admitted any more (presses, calls, routes), the host's own presses
+      // are asked to stop, every run is withdrawn with its presses and calls signalled, and the worker is woken. Only
+      // then is the definition presses' cleanup awaited (bounded); the worker's shutdown walk waits for it before it
+      // releases any module's resources.
       pressesClosed = true
-      yield* Effect.timeoutOption(hostPresses.stop, closeTimeoutMs)
       closing = true
+      hostPresses.signal()
       revokeAll()
       Deferred.doneUnsafe(closingSignal, Effect.void)
       Deferred.doneUnsafe(wake, Effect.void)
+      yield* Effect.timeoutOption(hostPresses.stop, closeTimeoutMs)
+      Deferred.doneUnsafe(hostPressesEnded, Effect.void)
       const deadline = (yield* Clock.currentTimeMillis) + closeTimeoutMs
       const finished = yield* Effect.timeoutOption(Fiber.await(worker), closeTimeoutMs)
       if (Option.isNone(finished)) {
@@ -2353,7 +2396,7 @@ export const makeModuleHost = Effect.fnUntraced(function*(options: ModuleHostOpt
       )
       if (!patched.ok) return Effect.succeed(failure("invalid_settings", "Some settings are not valid", { moduleId: id, fieldErrors: patched.errors }))
       // Settings the admin page could not show again are not saved (`MODULE_FORM_MAX_BYTES`).
-      const over = formOverLimit(resolveRaw(entry, { stored: patched.stored, secrets: patched.secrets }, undefined, base.defaults).form)
+      const { over } = sentForm(entry, resolveRaw(entry, { stored: patched.stored, secrets: patched.secrets }, undefined, base.defaults).form)
       if (over !== undefined) {
         const message = `Too large to save: these settings would take ${kib(over.bytes)} KiB on the admin page, more than the ${kib(MODULE_FORM_MAX_BYTES)} KiB a module's settings may take. The largest is "${over.label}"; make it smaller.`
         return Effect.succeed(failure("invalid_settings", "Some settings are not valid", { moduleId: id, fieldErrors: [{ key: over.key, message }] }))
@@ -2517,15 +2560,28 @@ export const makeModuleHost = Effect.fnUntraced(function*(options: ModuleHostOpt
           issues.set(source, [])
           return Effect.void
         }
-        // The check holds what it is given until its issues are published.
+        // The check holds what it is given until both its fiber has really ended (its observer: a check left at its
+        // time limit may still be cleaning up with those secrets) and its issues have passed the boundary and been
+        // published (the first of the two releases nothing). The answer never waits for the cleanup.
         const holder = {}
+        let holds = 1
+        const releaseHold = () => {
+          if (--holds === 0) boundary.release(holder)
+        }
         const settings = given(entry, [holder], resolve(entry).value)
         const own = (title: string, detail: string): ReadonlyArray<Issue> => [{ id: `${entry.def.id}.health`, module: entry.def.id, severity: "warning", title, detail }]
         // In a fiber of its own, awaited as its Exit: one that throws, fails or interrupts itself is that module's
         // issue, never the whole check's; one that does not finish in time is left (interrupted, not waited for).
         return Effect.gen(function*() {
-          const fiber = yield* Effect.forkChild(Effect.suspend(() => health({ settings, running: entry.run !== undefined })))
-          const exit = yield* Effect.timeoutOption(Fiber.await(fiber), healthTimeoutMs)
+          // Forked (in the host's scope, so no caller waits for its cleanup) and observed in one uninterruptible step,
+          // so a check interrupted while it is admitted is still held until its fiber ends; the fiber itself is
+          // interruptible, and asked to stop when its caller is interrupted or its time is up (never waited for).
+          const fiber = yield* Effect.uninterruptible(Effect.map(Effect.forkIn(Effect.suspend(() => health({ settings, running: entry.run !== undefined })), hostScope), (f) => {
+            holds++
+            f.addObserver(releaseHold)
+            return f
+          }))
+          const exit = yield* Effect.timeoutOption(Fiber.await(fiber), healthTimeoutMs).pipe(Effect.onInterrupt(() => Effect.sync(() => fiber.interruptUnsafe())))
           if (Option.isNone(exit)) {
             fiber.interruptUnsafe()
             return own(`${entry.def.name}'s health check did not finish`, `It took longer than ${Math.round(healthTimeoutMs / 1000)} s.`)
@@ -2541,7 +2597,7 @@ export const makeModuleHost = Effect.fnUntraced(function*(options: ModuleHostOpt
               issues.set(source, normaliseIssues(entry.def.id, Array.isArray(list) ? list : [], (value, max) => boundary.text(entry.def.id, value, max)))
             )
           ),
-          Effect.ensuring(Effect.sync(() => boundary.release(holder)))
+          Effect.ensuring(Effect.sync(releaseHold))
         )
       }),
     { concurrency: "unbounded", discard: true }
@@ -3015,76 +3071,19 @@ function normaliseIssues(
 // ---------------------------------------------------------------------------
 // The form's budget (`MODULE_FORM_BUDGET_BYTES`)
 
-const utf8 = new TextEncoder()
-const jsonBytes = (value: unknown): number => utf8.encode(JSON.stringify(value)).length
 /** Room kept per field for what the host adds at run time beside the instance's values: a combo's note, a cut marker. */
 const NOTE_RESERVE_BYTES = 256
-/** The described fields' size, with the room their run-time notes need. */
-const formBytes = (fields: ReadonlyArray<SettingField>): number =>
-  jsonBytes(fields) + fields.filter((f) => f.type === "combo" || f.type === "info").length * NOTE_RESERVE_BYTES
+/** The room the run-time notes of these fields need (a combo's "and N more", an info value's cut marker). */
+const notesReserve = (fields: ReadonlyArray<SettingField>): number => fields.filter((f) => f.type === "combo" || f.type === "info").length * NOTE_RESERVE_BYTES
+/** The described fields' size (the complete array as JSON, brackets and commas included), with their notes' room. */
+const formBytes = (fields: ReadonlyArray<SettingField>): number => jsonBytes(fields) + notesReserve(fields)
+/**
+ * The lengths a sent form's messages are cut to, in turn, until the form fits `MODULE_FORM_MAX_BYTES` (`sentForm`):
+ * first as the page gets them (2,000 characters), at last 100.
+ */
+const MESSAGE_CAPS = [2000, 1000, 500, 200, 100] as const
 
 const kib = (bytes: number) => Math.ceil(bytes / 1024)
-
-/** The field of a form whose value (or, without values, whose description) takes the most, as `{ key, label }`. */
-const largestField = (form: SettingsForm): { readonly key: string | null; readonly label: string } => {
-  let best: { key: string; bytes: number } | undefined
-  for (const [key, value] of Object.entries(form.values)) {
-    const bytes = jsonBytes(value)
-    if (best === undefined || bytes > best.bytes) best = { key, bytes }
-  }
-  for (const field of form.fields) {
-    const bytes = jsonBytes(field)
-    if (best === undefined || bytes > best.bytes) best = { key: field.key, bytes }
-  }
-  if (best === undefined) return { key: null, label: "its messages" }
-  const key = best.key
-  const label = form.fields.find((f) => f.key === key)?.label ?? key
-  return { key, label: clip(label.replace(/\s+/g, " "), 100) }
-}
-
-/**
- * Whether a resolved form is larger than `MODULE_FORM_MAX_BYTES` as it is sent (its messages measured at the length
- * the page gets them, 2000 characters), and then its size and largest field.
- */
-const formOverLimit = (form: SettingsForm): { readonly bytes: number; readonly key: string | null; readonly label: string } | undefined => {
-  const short = (list: ReadonlyArray<FieldError> | undefined) => list?.map((e) => ({ ...e, message: clip(e.message, 2000) }))
-  const warnings = short(form.warnings)
-  const bytes = jsonBytes({ ...form, errors: short(form.errors), ...(warnings !== undefined ? { warnings } : {}) })
-  return bytes <= MODULE_FORM_MAX_BYTES ? undefined : { bytes, ...largestField(form) }
-}
-
-/**
- * The modules as one `admin.snapshot` sends them: their forms and listed tools together within
- * `ADMIN_FORMS_SHARE_BYTES`. Over it, forms are withheld largest first (the module keeps running; its page says why
- * and names its largest field), and if that is not enough, tool lists largest first (`toolsLeft` counts them).
- */
-export const withinAdminShare = (modules: ReadonlyArray<ModuleInfo>): ReadonlyArray<ModuleInfo> => {
-  const formSize = modules.map((m) => jsonBytes(m.settings))
-  const toolSize = modules.map((m) => jsonBytes(m.tools))
-  let total = formSize.reduce((a, b) => a + b, 0) + toolSize.reduce((a, b) => a + b, 0)
-  if (total <= ADMIN_FORMS_SHARE_BYTES) return modules
-  const out = [...modules]
-  for (const i of out.map((_, i) => i).sort((a, b) => formSize[b]! - formSize[a]! || a - b)) {
-    if (total <= ADMIN_FORMS_SHARE_BYTES) break
-    const m = out[i]!
-    const largest = largestField(m.settings).label
-    const message = clip(
-      `${m.name}'s settings are not shown: all modules' settings together are more than the admin page can take, and these are among the largest (${kib(formSize[i]!)} KiB; the largest field is "${largest}"). Reduce it in the settings file.`,
-      2000
-    )
-    const settings: SettingsForm = { fields: [], values: {}, secrets: {}, errors: [{ key: null, message }] }
-    total += jsonBytes(settings) - formSize[i]!
-    out[i] = { ...m, settings }
-  }
-  for (const i of out.map((_, i) => i).sort((a, b) => toolSize[b]! - toolSize[a]! || a - b)) {
-    if (total <= ADMIN_FORMS_SHARE_BYTES) break
-    const m = out[i]!
-    if (m.tools.length === 0) continue
-    total -= toolSize[i]! - 2
-    out[i] = { ...m, tools: [], toolsLeft: (m.toolsLeft ?? 0) + m.tools.length }
-  }
-  return out
-}
 
 /** `text` cut to `room` bytes as JSON, saying how much was left out. */
 const withinBytes = (text: string, room: number): string => {
@@ -3125,14 +3124,16 @@ const formProblem = (def: ModuleDefinition<any>, generatedTest = false): string 
     return `Its settings form could not be described: ${describe(error)}`
   }
   const all = generatedTest ? [...fields, GENERATED_TEST_FIELD] : fields
-  let used = 0
+  // The complete encoded array (its brackets and commas), with the same note reserves as the run-time measure; added
+  // up field by field so that the error names the field from which on it is too large.
+  const encodedFields: Array<SettingField> = []
   for (const field of all) {
     const encoded = encodeField(field)
     if (Result.isFailure(encoded)) {
       return `Its settings field "${field.key}" cannot be sent to the admin page: ${clip(encoded.failure.message.replace(/\s+/g, " "), 300)}. Fix the module.`
     }
-    used += formBytes([encoded.success as SettingField]) - 2
-    if (used > MODULE_FORM_BUDGET_BYTES) {
+    encodedFields.push(encoded.success as SettingField)
+    if (formBytes(encodedFields) > MODULE_FORM_BUDGET_BYTES) {
       return `Its settings form is larger than the ${MODULE_FORM_BUDGET_BYTES} bytes a module's form may take, from the field "${field.key}" on. Fix the module.`
     }
   }
@@ -3144,7 +3145,8 @@ const formProblem = (def: ModuleDefinition<any>, generatedTest = false): string 
 
 const TEST_TIMEOUT_MS = 30_000
 
-const quote = (s: string) => (s.length > 120 ? `${s.slice(0, 117)}...` : s)
+/** At most 120 characters, cut at a whole character. */
+const quote = (s: string) => (s.length > 120 ? `${s.slice(0, wholeCodePoints(s, 117))}...` : s)
 
 /** Options within the wire's bounds (`MAX_COMBO_OPTIONS`, `MAX_OPTIONS_JSON`): the last go first, the first `keep` stay. */
 const withinOptionBounds = (options: ReadonlyArray<ChoiceOption>, keep: number): Array<ChoiceOption> => {
