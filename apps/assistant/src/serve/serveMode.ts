@@ -131,7 +131,9 @@ import { makeVoiceSessions, type VoiceSessions } from "./VoiceSessions.ts"
 import { makeRoutingService, ROUTING_KEYS } from "./routing.ts"
 import { openServeHousehold } from "./household.ts"
 import { makeHouseholdPush } from "./HouseholdPush.ts"
-import { Devices, hostEvent, makeIssueRegistry, oneLine, People, Privacy, withContextProvider } from "@pva/core"
+import { DeviceControl, Devices, hostEvent, makeIssueRegistry, oneLine, People, phraseLanguageOf, Privacy, SessionControl, withContextProvider } from "@pva/core"
+import { ringingWithoutWake } from "@pva/protocol"
+import { makeReplyVolumes, makeServePhrases } from "./phraseCommands.ts"
 import { openServeScheduler } from "./scheduler.ts"
 import { boundaryChanged, makeDeviceFacts, membersRemoved } from "./deviceFacts.ts"
 import { effectiveMembersOf, makeMembersGate, makePeopleService, MEMBERS_ENV_REFUSED, MEMBERS_KEY, MEMBERS_SECTION_ID } from "./people.ts"
@@ -441,10 +443,30 @@ export const startServe = (options: ServeOptions): Effect.Effect<ServeHandle, Ht
       language: () => notifyLanguageOf(sections.value("HOME_LANGUAGE")),
       log: logInfo
     })
+    // P7: each device's reply volume (`DeviceControl`, `output.volume` to its voice connections; memory only).
+    const replyVolumes = makeReplyVolumes((deviceId, message) => {
+      for (const c of hub?.voiceConnections() ?? []) if (c.deviceId === deviceId) c.send(message)
+    })
     // Capabilities run for the assistants that switch them on (`moduleDemand`, below; read from startEnabled on).
     const host = yield* makeModuleHost({
       // P5: the core's own services for modules (`host.service`).
-      coreServices: [People.of(people), Privacy.of(deviceFacts.privacy), Devices.of(deviceFacts.devices)],
+      // P7: session and device control (docs/PHRASES.md), late-bound to the voice sessions and the hub.
+      coreServices: [
+        People.of(people),
+        Privacy.of(deviceFacts.privacy),
+        Devices.of(deviceFacts.devices),
+        SessionControl.of({
+          stopReply: (deviceId) => Effect.suspend(() => sessionsRef?.get(deviceId)?.control.stopReply ?? Effect.succeed(false)),
+          cancelPending: (deviceId) => Effect.suspend(() => sessionsRef?.get(deviceId)?.control.cancelPending ?? Effect.succeed(false)),
+          repeatLast: (deviceId) => Effect.suspend(() => sessionsRef?.get(deviceId)?.control.repeatLast ?? Effect.succeed(false)),
+          newConversation: (deviceId) =>
+            Effect.suspend(() => {
+              const session = sessionsRef?.get(deviceId)
+              return session === undefined ? Effect.succeed(undefined) : Effect.map(session.conversation.newConversation(), (info) => info.id)
+            })
+        }),
+        DeviceControl.of(replyVolumes.service)
+      ],
       routeTokens,
       issues,
       scheduler,
@@ -647,6 +669,21 @@ export const startServe = (options: ServeOptions): Effect.Effect<ServeHandle, Ht
         modules
       }
     }
+
+    // P7: phrase commands (docs/PHRASES.md): each assistant's set from the registry its turns get, cached per snapshot;
+    // the Health page names what a set leaves out (made again whenever the modules change, and at every check).
+    const servePhrases = makeServePhrases({
+      host,
+      assistants: assistantsNow,
+      registryOf: (snapshot, assistant) => modulesFor(snapshot, assistant).registry,
+      language: () => phraseLanguageOf(sections.value("HOME_LANGUAGE")),
+      notify,
+      ringingAllowed: (deviceId) => ringingWithoutWake(deviceSettingsOf(deviceId).place),
+      room: (deviceId) => deviceFacts.originOf(deviceId).room,
+      volume: replyVolumes.service,
+      log: (line) => runFork(Effect.logInfo(line))
+    })
+    host.subscribe(() => servePhrases.refreshIssues())
 
     /** The household's ambient facts in every turn's context (`HOME_AMBIENT_FACTS`, read at each turn). */
     const ambientFacts = household.ambient({
@@ -1422,6 +1459,8 @@ export const startServe = (options: ServeOptions): Effect.Effect<ServeHandle, Ht
             run(household.store.endConversation(conversationId).pipe(Effect.asVoid, Effect.catch((e) => Effect.logWarning(`Conversation data not deleted: ${e.message}`)))),
           ...(reserved !== undefined ? { reservedConversations: reserved } : {}),
           ...(options.stallMs !== undefined ? { stallMs: options.stallMs } : {}),
+          // P7: phrase commands, the host's essential controls and the ringing window.
+          phrases: servePhrases.forDevice(device?.id),
           heard: {
             dir: recordings,
             enabled: () => sections.value("RECORD_HEARD_AUDIO") === true,
@@ -1473,7 +1512,11 @@ export const startServe = (options: ServeOptions): Effect.Effect<ServeHandle, Ht
       catalog,
       fork: run,
       // The household's cheap checks (backup age, directories, the log's size); its quick check is `pnpm start doctor`'s.
-      ...(household.sqlite !== undefined ? { checks: { "household-checks": householdBackupIssues(household.sqlite) } } : {})
+      checks: {
+        // P7: what each assistant's phrase set leaves out (duplicates, modules past the bound).
+        phrases: Effect.sync(() => servePhrases.issues()),
+        ...(household.sqlite !== undefined ? { "household-checks": householdBackupIssues(household.sqlite) } : {})
+      }
     })
     const push = makeHouseholdPush({
       feed: household.feed,
@@ -1493,6 +1536,8 @@ export const startServe = (options: ServeOptions): Effect.Effect<ServeHandle, Ht
     hub = makeSessionHub({
       household: push.hooks,
       notify,
+      // P7: a voice page of a device whose reply volume is not the default is told it after its welcome.
+      replyVolume: replyVolumes.levelOf,
       onDeviceChange: deviceFacts.changed,
       speakerAllowed: deviceFacts.speakerAllowed,
       admin,

@@ -693,6 +693,8 @@ const server: ServerHandlers = {
     const rest = s.notifications.filter((n) => n.id !== m.notification.id)
     return { ...s, notifications: [...rest, card].sort((a, b) => a.sentAt - b.sentAt).slice(-MAX_CARDS) }
   },
+  // P7: the reply volume reaches the audio graph (`connection.ts`); nothing on the page shows it.
+  "output.volume": (s) => s,
   "notification.resolved": (s, m) => (s.notifications.some((n) => n.id === m.id) ? { ...s, notifications: s.notifications.filter((n) => n.id !== m.id) } : s)
 }
 

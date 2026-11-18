@@ -55,7 +55,9 @@
  * Control endpoints (for tests): GET /mock/log (client messages and microphone stats), POST /mock/reset,
  * POST /mock/turn (run the scripted voice turn now), POST /mock/send {"messages": [ServerMessage…]} (broadcast),
  * POST /mock/notify {"title", "ring"?, "deviceId"?, "actions"?, "handlerDown"?} (P9: a notification card, delivered as the
- * server does, again after each hello while open), POST /mock/notify/resolve {"id"},
+ * server does, again after each hello while open), POST /mock/notify/resolve {"id"}, POST /mock/volume {"deviceId",
+ * "direction" | "to"} (P7: the device's reply volume as a spoken "louder"/"quieter" changes it, `output.volume` to its
+ * voice pages now and after each welcome while it is not the default),
  * POST /mock/drop (terminate every socket), POST /mock/offline {"ms": 3000} (drop and refuse connections for a while),
  * POST /mock/admin/end {"reason": "idle" | "expired"} (end every admin session), POST /mock/wake {"phrase", "armed"}
  * (the owner said the wake phrase), POST /mock/heard {"text", "matched"?, "accepted"?, "source"?} (a tester line; `accepted: null` or `source: null` leaves that field out), POST /mock/state
@@ -155,7 +157,7 @@ import { encodeWav, MOCK_PROVIDERS } from "./voices.ts"
 import { createModelPickersMock } from "./modelPickers.ts"
 import { createModuleRoutesMock, DEMO_DEFINITION_ACTIONS, demoHomeAction, demoHomeModule, TokenRefusal } from "./demoHome.ts"
 import { createScheduledJobsMock, MockSchedulerError } from "./scheduledJobs.ts"
-import { boundaryKey, checkDietList, checkMembersValue, cleanDeviceName, type Condition, decideDelivery, deviceOutputsFrom, type FieldError, speakerAllowedFrom } from "@pva/protocol"
+import { boundaryKey, checkDietList, checkMembersValue, cleanDeviceName, type Condition, decideDelivery, deviceOutputsFrom, type FieldError, REPLY_VOLUME, replyVolumeLevel, speakerAllowedFrom, stepReplyVolume } from "@pva/protocol"
 
 const PORT = Number(process.env.MOCK_PORT ?? 8787)
 const HOST = process.env.MOCK_HOST ?? "127.0.0.1"
@@ -1438,6 +1440,7 @@ const mockHeld = new Map<string, Set<string>>()
 /** Ids are never reused (a counter, not the map's size). */
 let mockNotifySeq = 0
 const resetState = () => {
+  mockVolumes.clear()
   mockNotifications.clear()
   mockHeld.clear()
   for (const t of scriptTimers) clearTimeout(t)
@@ -1517,6 +1520,26 @@ const reconcileMock = (c: Conn) => {
   }
 }
 const notificationsAfterWelcome = reconcileMock
+
+// ---- P7: the reply volume, as the real server keeps it (docs/PHRASES.md "Louder and quieter")
+
+/** Per device, only while not the default (the server keeps it in memory, as here). */
+const mockVolumes = new Map<string, number>()
+/** After a voice page's welcome: its device's level when it is not the default (the page went back to the default). */
+const volumeAfterWelcome = (c: Conn) => {
+  if (c.frontend !== "voice" || c.deviceId === undefined) return
+  const level = mockVolumes.get(c.deviceId)
+  if (level !== undefined) sendTo(c, { type: "output.volume", volume: level })
+}
+/** One "louder" / "quieter" or a level for a device, with the server's own step (`stepReplyVolume`), sent to its voice pages when it changed. */
+const changeMockVolume = (deviceId: string, change: "louder" | "quieter" | { readonly to: number }) => {
+  const before = mockVolumes.get(deviceId) ?? REPLY_VOLUME.default
+  const next = typeof change === "string" ? stepReplyVolume(before, change) : { level: replyVolumeLevel(change.to), atLimit: false }
+  if (next.level === REPLY_VOLUME.default) mockVolumes.delete(deviceId)
+  else mockVolumes.set(deviceId, next.level)
+  if (next.level !== before) for (const c of notifyConns(deviceId)) sendTo(c, { type: "output.volume", volume: next.level })
+  return next
+}
 const resolveMockNotification = (id: string, outcome: string) => {
   const n = mockNotifications.get(id)
   if (n === undefined) return false
@@ -2804,6 +2827,7 @@ wss.on("connection", (ws: WebSocket) => {
         }
       })
       if (isAdminConn(c)) sendAdminSnapshot(c)
+      volumeAfterWelcome(c)
       notificationsAfterWelcome(c)
       if (c.deviceId !== undefined) devicesChanged()
       if (resumed) {
@@ -3364,6 +3388,16 @@ const http = createServer((req, res) => {
         const v = targetSession(payload.deviceId)
         for (const x of v !== undefined ? [v] : [...voiceSessions.values()]) setState(x, state)
         return json(res, 200, { ok: true })
+      }
+      case "/mock/volume": {
+        // P7: {"deviceId", "direction": "louder" | "quieter"} or {"deviceId", "to": 0..1}: the device's reply volume,
+        // as the server changes it for a spoken "louder" or "quieter" (the mock has no recogniser), sent to its voice pages.
+        if (typeof payload.deviceId !== "string") return json(res, 400, { error: "deviceId is required" })
+        const change = payload.direction === "louder" || payload.direction === "quieter"
+          ? payload.direction
+          : typeof payload.to === "number" ? { to: payload.to } : undefined
+        if (change === undefined) return json(res, 400, { error: "direction (louder, quieter) or to (0..1) is required" })
+        return json(res, 200, changeMockVolume(payload.deviceId, change))
       }
       case "/mock/notify": {
         // P9: a notification delivered as the server would: {"id"?, "title", "text"?, "ring"?, "silent"?, "deviceId"?

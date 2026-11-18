@@ -209,6 +209,11 @@ export interface HubOptions {
    * Stop reaches the announcement being spoken (`stopSpeech`). Absent: none of it.
    */
   readonly notify?: Pick<NotifyEngine, "reconcile" | "press" | "stopSpeech">
+  /**
+   * P7: a device's reply volume when it is not the default (`DeviceControl`), sent as `output.volume` to each of its
+   * voice connections right after its `welcome`. Absent, or `undefined` for the device: nothing is sent.
+   */
+  readonly replyVolume?: (deviceId: string) => number | undefined
   /** P5: a device's connections, declaration or live state changed (the device facts rebuild their list). */
   readonly onDeviceChange?: () => void
   /**
@@ -961,6 +966,11 @@ export const makeSessionHub = (options: HubOptions): SessionHub => {
       snapshot: first
     })
     if (client.adminToken !== undefined) sendAdminSnapshot(client)
+    // P7: the device's reply volume when it is not the default (the page set its gain back to the default at welcome).
+    if (client.role === "voice" && client.device !== undefined) {
+      const volume = options.replyVolume?.(client.device.id)
+      if (volume !== undefined) send(client, { type: "output.volume", volume })
+    }
     const firstOfDevice = client.device !== undefined && ![...clients].some((c) => c !== client && c.helloed && !c.closed && c.device?.id === client.device!.id)
     client.helloed = true
     if (client.device !== undefined) deviceChanged()

@@ -19,6 +19,18 @@ import {
   type SttEvent,
   type Trace,
   type ConnectionRef,
+  type CommandSet,
+  decideUtterance,
+  type KeptReply,
+  makeTurnContext,
+  matchWakePhrase,
+  type PhraseLanguage,
+  type PhraseOutcome,
+  type PhrasePorts,
+  phraseText,
+  type RingingCard,
+  runTaken,
+  type Taken,
   type TurnOrigin,
   type TurnPerson,
   type TurnSetup,
@@ -190,7 +202,29 @@ export interface VoiceSessionOptions {
   }
   readonly stallMs?: number
   readonly log: (line: string) => void
+  /**
+   * P7: phrase commands, the host's essential controls and the ringing window (docs/PHRASES.md). Absent: no utterance is
+   * ever taken (every final goes through the gates as before).
+   */
+  readonly phrases?: SessionPhrases
 }
+
+/** What a voice session needs for phrase commands (serve mode supplies it; every member is read when it is used). */
+export interface SessionPhrases {
+  /** The household's language now. */
+  readonly language: () => PhraseLanguage
+  /** The commands of `assistant` now (`undefined`: the host's controls alone). Called at a final, on the turn path: cached. */
+  readonly commandsFor: (assistant: string | undefined) => CommandSet
+  /** What rings on the device now, or `undefined` when the window cannot open (no device, its "while ringing" is off). */
+  readonly ringing: () => ReadonlyArray<RingingCard> | undefined
+  /** The runner's ports that are not the session's own. */
+  readonly ports: Pick<PhrasePorts, "notify" | "volume" | "playback" | "room" | "gateway" | "isPublished" | "pageText">
+  /** Every outcome (the log). Must not throw. */
+  readonly onOutcome?: (outcome: PhraseOutcome) => void
+}
+
+/** The longest reply text a session keeps for "repeat" and for speaking an interrupted reply again (characters). */
+export const MAX_KEPT_REPLY_CHARS = 2_000
 
 /** What typed text came to: `dropped` when nobody answers it on this device (its target is off, or there is none). */
 export type TextOutcome = SendOutcome | "dropped"
@@ -261,6 +295,17 @@ export interface VoiceSession {
   readonly holder: () => string | null
   /** A `device.pick` was accepted: the open windows close, so the picked assistant answers the next sentence (§5.3). */
   readonly pickAccepted: () => void
+  /**
+   * P7: the session's part of `SessionControl` (docs/PHRASES.md): stop the reply or announcement, cancel what is
+   * pending, speak the last reply again. The host's spoken controls do exactly these.
+   */
+  readonly control: {
+    readonly stopReply: Effect.Effect<boolean>
+    readonly cancelPending: Effect.Effect<boolean>
+    readonly repeatLast: Effect.Effect<boolean>
+    /** The last spoken reply kept (tests, diagnostics). */
+    readonly lastReply: () => KeptReply | undefined
+  }
   /**
    * P9: announcements on this device (docs/NOTIFICATIONS.md "Speech"). `speak` makes the answering assistant's voice
    * ready first (`TurnSetup.tts` and its `ttsReady`: the reply's synthesis), then waits until nothing is spoken or heard
@@ -392,6 +437,8 @@ export const silentUnless = (output: AudioOutput["Service"], allowed: () => bool
 
 export const makeVoiceSession = (options: VoiceSessionOptions): Effect.Effect<VoiceSession, never, Scope.Scope> =>
   Effect.gen(function*() {
+    /** P7: a taken utterance's run lives here (interrupted when the session ends). */
+    const sessionScope = yield* Effect.scope
     const now = () => performance.now()
     let lastActive = now()
     const touch = () => {
@@ -498,9 +545,28 @@ export const makeVoiceSession = (options: VoiceSessionOptions): Effect.Effect<Vo
       }
       options.send(message)
     }
+    /** P7: turns that were committed (a speculative turn never promoted is no reply anyone heard), until they end. */
+    const committedTurns = new Set<number>()
+    /** P7: the device's last spoken reply, as far as it was prepared (`MAX_KEPT_REPLY_CHARS`), for "repeat" and "louder". */
+    let lastReply: (KeptReply & { readonly turnId: number; readonly interrupted: boolean }) | undefined
+    const keepReply = (assistant: string, turnId: number, texts: ReadonlyArray<string | undefined>, interrupted: boolean) => {
+      let text = ""
+      for (const clause of texts) {
+        const c = clause?.trim() ?? ""
+        if (c === "") continue
+        const next = text === "" ? c : `${text} ${c}`
+        if (next.length > MAX_KEPT_REPLY_CHARS) {
+          if (text === "") text = c.slice(0, MAX_KEPT_REPLY_CHARS)
+          break
+        }
+        text = next
+      }
+      if (text !== "") lastReply = { assistant, text, turnId, interrupted }
+    }
     const publisher = makePublisher({
       broadcast: send,
       onCommitted: (turnId) => {
+        committedTurns.add(turnId)
         // The handed-over words have their turn now: the turn in flight names the holder.
         handedTo = undefined
         inFlight = turnId
@@ -522,6 +588,8 @@ export const makeVoiceSession = (options: VoiceSessionOptions): Effect.Effect<Vo
         if (event._tag === "started") {
           tracker.playbackStarted(event.turnId)
           gate.playbackStarted(now())
+          // P7: the device spoke while this utterance was heard: the ringing window does not take it (its own line).
+          if (heardUtterance !== undefined) heardUtterance.audible = true
           if (assistant !== undefined) route.replyStarted(assistant, now())
           if (unsuppress !== undefined) clearTimeout(unsuppress)
           if (options.deviceSettings().interruptMode === "manual") web.setSuppressed(true)
@@ -559,10 +627,14 @@ export const makeVoiceSession = (options: VoiceSessionOptions): Effect.Effect<Vo
           // Committed turns reach the tracker through the publisher's onCommitted, right after turn.start.
           if (event.speculative) tracker.turnStarted(event.turnId, true)
           return
-        case "TurnEnded":
+        case "TurnEnded": {
+          const entry = clauses.get(event.turnId)
+          if (entry !== undefined && committedTurns.has(event.turnId)) keepReply(assistant, event.turnId, entry.texts, event.outcome === "interrupted")
+          committedTurns.delete(event.turnId)
           clauses.delete(event.turnId)
           if (inFlight === event.turnId) inFlight = undefined
           return tracker.turnEnded(event.turnId)
+        }
         case "ClauseQueued": {
           const entry = clauses.get(event.turnId) ?? { texts: [], given: 0 }
           entry.texts[event.index] = event.text
@@ -806,20 +878,68 @@ export const makeVoiceSession = (options: VoiceSessionOptions): Effect.Effect<Vo
       options.send({ type: "transcript", text })
     }
     /**
+     * P7: the utterance being heard (from its `SpeechStarted` to its final), as the one decision needs it: whether the
+     * device was audible at any moment of it (a reply or an announcement playing, or its echo tail: the ringing window
+     * then does not take it, since its own spoken line may be what was heard), whether a reply was being prepared or
+     * spoken as it began (what "stop" stops), and the reply that was playing then (said again after "louder").
+     */
+    let heardUtterance: { audible: boolean; readonly active: boolean; readonly replyTurn: number | undefined } | undefined
+    /** A reply is being prepared or spoken here now, or an announcement plays. */
+    const replyActiveNow = () => {
+      const state = tracker.current().state
+      return inFlight !== undefined || lease.holder() !== undefined || state === "thinking" || state === "speaking"
+    }
+    const watchUtterance = (event: SttEvent, t: number) => {
+      if (event._tag === "SpeechStarted" && heardUtterance === undefined) {
+        const holder = lease.holder()
+        heardUtterance = {
+          audible: gate.audible(t),
+          active: replyActiveNow(),
+          replyTurn: holder !== undefined && holder !== ANNOUNCE_HOLDER ? web.playingTurn() : undefined
+        }
+      } else if (heardUtterance !== undefined && gate.audible(t)) heardUtterance.audible = true
+    }
+
+    /**
      * Only what passed both gates is shown (transcript), moves the state or reaches a conversation: an utterance the
      * route gate drops reaches no page, no history, no agent and no recording (`heard.discard`); its text goes only
-     * to admin pages with the phrase tester on (`wake.heard`).
+     * to admin pages with the phrase tester on (`wake.heard`). P7: an utterance's final goes through the one decision
+     * (`decideUtterance`, docs/PHRASES.md), which runs the gates on it once; a taken utterance's final reaches them, or
+     * the dispatcher, with no words, and what took it runs after it is dispatched.
      */
     const onStt = (event: SttEvent): Effect.Effect<void> =>
       Effect.suspend(() => {
         const t = now()
         if (event._tag !== "EndOfTurn") heard.event(event)
-        const echo = gate.filter(event, t)
-        const results: Array<RouteResult> = []
+        if (options.phrases !== undefined) watchUtterance(event, t)
+        let echoes: ReadonlyArray<SttEvent> = []
+        let echoDropped = false
+        const gates = (e: SttEvent): ReadonlyArray<RouteResult> => {
+          const echo = gate.filter(e, t)
+          echoDropped = echo.dropped
+          echoes = echo.events
+          return echoes.map((x) => route.filter(x, t))
+        }
+        let results: ReadonlyArray<RouteResult>
+        let taken: { readonly taken: Taken; readonly utterance: NonNullable<typeof heardUtterance> } | undefined
+        const phrases = options.phrases
+        if (event._tag === "EndOfTurn" && phrases !== undefined) {
+          const utterance = heardUtterance ?? { audible: gate.audible(t), active: false, replyTurn: undefined }
+          heardUtterance = undefined
+          const decision = decideUtterance({
+            final: event,
+            language: phrases.language(),
+            ringing: utterance.audible || gate.audible(t) ? undefined : phrases.ringing(),
+            wakeAtStart: (text) => matchWakePhrase(text, route.config().phrases.map((p) => p.phrase), route.config().match) !== undefined,
+            gates,
+            commandsFor: phrases.commandsFor
+          })
+          results = decision.results
+          if (decision.taken !== undefined) taken = { taken: decision.taken, utterance }
+        } else results = gates(event)
         let dropped = false
-        for (const e of echo.events) {
-          const r = route.filter(e, t)
-          results.push(r)
+        results.forEach((r, i) => {
+          const e = echoes[i]!
           // The utterance's assistant (a phrase in it may change it), before the state that names it is sent.
           const routed = r.target
           const routedTo = routed === undefined || routed.by === "decide" || routed.by === "dropped" ? undefined : routed.assistant
@@ -856,15 +976,80 @@ export const makeVoiceSession = (options: VoiceSessionOptions): Effect.Effect<Vo
               }
             }
           }
-        }
+        })
         if (event._tag === "EndOfTurn") {
-          if (dropped) heard.discard()
+          if (dropped && taken === undefined) heard.discard()
           else heard.event(event)
         }
-        if (echo.dropped) transcript("")
+        if (echoDropped) transcript("")
         // A phrase inside the utterance may have changed who has the turn while the state stayed `hearing`.
         holderCheck()
-        return Effect.forEach(results, dispatcher.dispatch, { discard: true })
+        const dispatched = Effect.forEach(results, dispatcher.dispatch, { discard: true })
+        return taken === undefined ? dispatched : Effect.andThen(dispatched, runPhrase(taken.taken, taken.utterance))
+      })
+
+    /** P7: one taken utterance runs at a time on the device; another taken meanwhile is answered "One moment…". */
+    let phraseRunning = false
+    const sayLine = (assistant: string | undefined, text: string): Effect.Effect<void> =>
+      Effect.suspend(() => {
+        const a = assistant ?? answering()
+        if (a === undefined || text.trim().length === 0) return Effect.void
+        return Effect.asVoid(dispatcher.send(a, { _tag: "Say", text }))
+      })
+    const phraseTurn = (assistant: string) => {
+      const place = options.place?.()
+      const connection = options.audioConnection?.()
+      return makeTurnContext({ turnId: counter.next++, conversationId: conversations.conversation(assistant).id, source: "phrase" }, {
+        assistantId: assistant,
+        ...(options.deviceId !== undefined ? { deviceId: options.deviceId } : {}),
+        deviceName: options.name(),
+        ...(connection !== undefined ? { connection } : {}),
+        ...(place?.room !== undefined ? { room: place.room } : {}),
+        ...(place?.person !== undefined ? { person: place.person } : {})
+      })
+    }
+    /** Run what took an utterance, in the session's scope (the recogniser loop does not wait for it). */
+    const runPhrase = (taken: Taken, utterance: { readonly active: boolean; readonly replyTurn: number | undefined }): Effect.Effect<void> =>
+      Effect.suspend(() => {
+        const phrases = options.phrases!
+        const report = (outcome: PhraseOutcome) => {
+          try {
+            phrases.onOutcome?.(outcome)
+          } catch {
+            // A throwing observer must not break the session.
+          }
+        }
+        if (phraseRunning) {
+          const said = phraseText(phrases.language(), "busy")
+          report({ taken, did: "busy", said })
+          return sayLine(undefined, said)
+        }
+        phraseRunning = true
+        const ports: PhrasePorts = {
+          ...phrases.ports,
+          deviceId: options.deviceId,
+          language: phrases.language,
+          session: {
+            replyActive: () => utterance.active || replyActiveNow(),
+            stopReply: control.stopReply,
+            cancelPending: control.cancelPending,
+            lastReply: () => lastReply,
+            interruptedReply: () =>
+              utterance.replyTurn !== undefined && lastReply?.turnId === utterance.replyTurn && lastReply.interrupted ? lastReply : undefined,
+            answering,
+            say: sayLine
+          },
+          turn: phraseTurn
+        }
+        return Effect.asVoid(Effect.forkIn(
+          runTaken(taken, ports).pipe(
+            Effect.tap((outcome) => Effect.sync(() => report(outcome))),
+            Effect.ensuring(Effect.sync(() => {
+              phraseRunning = false
+            }))
+          ),
+          sessionScope
+        ))
       })
 
     // ---- Which recogniser the device hears with (docs/ASSISTANTS.md §3.5)
@@ -887,6 +1072,7 @@ export const makeVoiceSession = (options: VoiceSessionOptions): Effect.Effect<Vo
 
     /** An utterance closed outside `onStt` (a recogniser switch, a new build): it holds the turn no longer. */
     const utteranceDropped = () => {
+      heardUtterance = undefined
       heardFor = undefined
       heardStopped = false
       handedTo = undefined
@@ -1038,6 +1224,29 @@ export const makeVoiceSession = (options: VoiceSessionOptions): Effect.Effect<Vo
         })
       })
 
+    /** P7: the session's part of `SessionControl` (and what the spoken controls do). */
+    const control: VoiceSession["control"] = {
+      stopReply: Effect.suspend(() => {
+        const was = replyActiveNow()
+        conversations.stop()
+        const notify = options.phrases?.ports.notify()
+        const speech = options.deviceId === undefined || notify === undefined ? Effect.succeed(false) : notify.stopSpeech(options.deviceId)
+        return Effect.map(speech, (stopped) => was || stopped)
+      }),
+      cancelPending: Effect.sync(() => {
+        const was = replyActiveNow() || route.window(now()) !== undefined
+        conversations.stop()
+        route.release()
+        wakeChanged()
+        return was
+      }),
+      repeatLast: Effect.suspend(() => {
+        const last = lastReply
+        return last === undefined ? Effect.succeed(false) : Effect.as(sayLine(last.assistant, last.text), true)
+      }),
+      lastReply: () => lastReply
+    }
+
     const conversations: SessionConversations = {
       sendText: (text, speak, named, connection) =>
         Effect.suspend(() => {
@@ -1116,6 +1325,7 @@ export const makeVoiceSession = (options: VoiceSessionOptions): Effect.Effect<Vo
 
     return {
       announce,
+      control,
       key: options.key,
       deviceId: options.deviceId,
       name: options.name,

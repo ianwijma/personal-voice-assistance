@@ -8,6 +8,7 @@ import {
   encodeClientMessage,
   FrameKind,
   PROTOCOL_VERSION,
+  REPLY_VOLUME,
   type ServerMessage,
   type ServerMessageOf,
   writeFrameHeader
@@ -37,6 +38,11 @@ export interface AudioPort {
   readonly socketLost: () => void
   /** The page's audio graph is running (so a reconnect may resume ownership). */
   readonly running: () => boolean
+  /**
+   * P7: the reply output's gain (`output.volume`; 0..1). Set back to the default at every `welcome`, so a server that
+   * restarted (and forgot the device's level) and the page never disagree. Optional: an audio port without it keeps 1.
+   */
+  readonly replyVolume?: (volume: number) => void
 }
 
 export interface ConnectionHooks {
@@ -223,6 +229,8 @@ export const makeConnection = (options: ConnectionOptions): Connection => {
         if (m.protocol !== PROTOCOL_VERSION) return // the server closes with 4400
         welcomed = true
         outstandingPing = undefined
+        // P7: the server sends the device's reply volume after the welcome when it is not the default.
+        audio.replyVolume?.(REPLY_VOLUME.default)
         store.dispatch(m)
         Deferred.doneUnsafe(welcomedSignal, Effect.void)
         const resumed = m.snapshot.role === "owner" && audio.running()
@@ -249,6 +257,10 @@ export const makeConnection = (options: ConnectionOptions): Connection => {
         break
       case "reply.stop":
         if (owner) audio.replyStop(m.turnId)
+        break
+      case "output.volume":
+        // Every tab of the device keeps it (the one that owns the audio plays; another may take over).
+        audio.replyVolume?.(m.volume)
         break
     }
     store.dispatch(m)
