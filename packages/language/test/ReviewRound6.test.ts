@@ -1,6 +1,6 @@
 // Review round 6 of the language package: the reviewer's inputs.
 import { describe, expect, it } from "@effect/vitest"
-import { parseRecurrence, parseRRule } from "../src/index.ts"
+import { normalizeTimeZone, parseDtstart, parseRecurrence, parseRRule, readSeries } from "../src/index.ts"
 
 describe("round 6 findings", () => {
   it("1: a spoken recurrence looks from today's civil date on (README: 'on or after today's civil date'); yesterday's date pushed into today is not considered", () => {
@@ -23,5 +23,30 @@ describe("round 6 findings", () => {
     }
     const lower = parseRRule("freq=daily;interval=2")
     expect(lower.kind).toBe("ok")
+  })
+})
+
+describe("round 7 findings", () => {
+  it("1: rule text outside printable ASCII is refused before trimming", () => {
+    for (const ch of [" ", " ", "﻿"]) {
+      for (const text of [`FREQ=DAILY${ch}`, `${ch}FREQ=DAILY`, `RRULE:FREQ=DAILY${ch}`, `${ch}RRULE:FREQ=DAILY`]) {
+        expect(parseRRule(text).kind, JSON.stringify(text)).not.toBe("ok")
+      }
+    }
+    for (const text of ["FREQ=DAILY", "freq=daily", "RRULE:FREQ=DAILY", "rrule:freq=daily;interval=2", " FREQ=DAILY "]) {
+      expect(parseRRule(text).kind, text).toBe("ok")
+    }
+  })
+
+  it("1: DTSTART and time zone text are not trimmed of Unicode whitespace", () => {
+    const line = "DTSTART;TZID=Europe/Amsterdam:20261120T090000"
+    expect(parseDtstart(line)).toBeDefined()
+    for (const ch of [" ", " ", "﻿"]) {
+      expect(parseDtstart(line + ch), JSON.stringify(ch)).toBeUndefined()
+      expect(parseDtstart(ch + line), JSON.stringify(ch)).toBeUndefined()
+      expect(normalizeTimeZone(`Europe/Amsterdam${ch}`), JSON.stringify(ch)).toBeUndefined()
+      expect(readSeries({ rrule: "FREQ=DAILY", dtstart: line, timeZone: `${ch}Europe/Amsterdam` }).kind).not.toBe("ok")
+    }
+    expect(readSeries({ rrule: "FREQ=DAILY", dtstart: line, timeZone: "Europe/Amsterdam" }).kind).toBe("ok")
   })
 })

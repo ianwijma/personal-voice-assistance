@@ -18,7 +18,7 @@ const ianaName = /^[A-Za-z][A-Za-z0-9_+\-]*(?:\/[A-Za-z0-9_+\-]+)*$/
 export const normalizeTimeZone = (timeZone: string): string | undefined => {
   if (typeof timeZone !== "string" || timeZone.length > 64) return undefined
   if (canonical.has(timeZone)) return canonical.get(timeZone)
-  const trimmed = timeZone.trim()
+  const trimmed = timeZone.replace(/^ +| +$/g, "")
   let found: string | undefined
   if (trimmed !== "" && ianaName.test(trimmed)) {
     try {

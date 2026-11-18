@@ -177,6 +177,10 @@ const shapeProblem = (rule: RecurrenceRule): RRuleRead | undefined => {
   return undefined
 }
 
+const printableAscii = /^[\x20-\x7e]*$/
+/** Trims ASCII spaces only: `trim()` would also remove U+00A0, U+2028, U+FEFF and the like, which RFC 5545 text never contains. */
+const trimSpaces = (text: string): string => text.replace(/^ +| +$/g, "")
+
 /** Upper-case ASCII letters only: Unicode look-alikes (dotless i, long s) must not fold into rule tokens. */
 const asciiUpper = (text: string): string => text.replace(/[a-z]/g, (c) => c.toUpperCase())
 
@@ -189,7 +193,8 @@ const asciiUpper = (text: string): string => text.replace(/[a-z]/g, (c) => c.toU
 export const parseRRule: (text: string) => RRuleRead = guarded((text: string): RRuleRead => {
   if (typeof text !== "string") return invalidRule("Not text")
   if (text.length > maxRuleText) return unsupported(`An RRULE longer than ${maxRuleText} characters is not read`)
-  const body = text.trim().replace(/^RRULE:/i, "")
+  if (!printableAscii.test(text)) return invalidRule("Not printable ASCII")
+  const body = trimSpaces(text).replace(/^RRULE:/i, "")
   if (body === "") return invalidRule("Empty")
   const seen = new Set<string>()
   let freq: string | undefined
@@ -304,7 +309,8 @@ const dtstartPattern = /^DTSTART;TZID=([^:;"]+):(\d{4})(\d{2})(\d{2})T(\d{2})(\d
  */
 export const parseDtstart: (text: string) => Dtstart | undefined = guarded((text: string): Dtstart | undefined => {
   if (typeof text !== "string" || text.length > maxRuleText) return undefined
-  const m = dtstartPattern.exec(text.trim())
+  if (!printableAscii.test(text)) return undefined
+  const m = dtstartPattern.exec(trimSpaces(text))
   if (m === null) return undefined
   const timeZone = normalizeTimeZone(m[1]!)
   const start = { year: Number(m[2]), month: Number(m[3]), day: Number(m[4]), hour: Number(m[5]), minute: Number(m[6]), second: Number(m[7]) }
@@ -441,7 +447,7 @@ export const readSeries: (spec: RecurrenceSpec) => SeriesRead = guarded((spec: R
   if (rule.kind !== "ok") return rule
   const dt = parseDtstart(spec.dtstart)
   if (dt === undefined) {
-    const line = typeof spec.dtstart === "string" ? spec.dtstart.trim() : ""
+    const line = typeof spec.dtstart === "string" ? trimSpaces(spec.dtstart) : ""
     return /^DTSTART[;:]/i.test(line) || /^\d{4}-?\d{2}-?\d{2}/.test(line)
       ? { kind: "unsupported", reason: `DTSTART must be DTSTART;TZID=<IANA zone>:YYYYMMDDTHHMMSS in ${minYear}–${maxYear} (no UTC, floating or date-only start)` }
       : { kind: "invalid", reason: "Not a DTSTART" }

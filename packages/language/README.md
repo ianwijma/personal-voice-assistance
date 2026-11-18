@@ -193,7 +193,9 @@ elsewhere are expanded by the calendar module with its own library.
 each with `INTERVAL` (1–999), optionally `COUNT` (1–1000) or `UNTIL` (a UTC date-time `YYYYMMDDTHHMMSSZ` in 2000–2199, not before
 DTSTART), and `WKST` only as `MO`. `DTSTART` is `DTSTART;TZID=<the series' zone>:YYYYMMDDTHHMMSS` in 2000–2199 and must itself be an
 instance. `parseRRule` returns `ok` exactly for a rule of this set written by RFC 5545's grammar (a month or a day of the month in one
-or two digits: "BYMONTH=003" is not `ok`), and never `ok` for anything else. Anything else is `unsupported` or `invalid`, each with a
+or two digits: "BYMONTH=003" is not `ok`), and never `ok` for anything else. Rule, DTSTART and time zone text is read as printable
+ASCII only: a character outside 0x20–0x7E (a no-break space, U+2028, a byte-order mark, a tab, a newline) makes `parseRRule` and
+`parseDtstart` refuse the text, and only ASCII spaces are trimmed from either end. Anything else is `unsupported` or `invalid`, each with a
 reason for a person to read; **which of the two is a hint, not a contract**: `unsupported` is meant for valid RFC 5545 outside this
 set (`SECONDLY`, `MINUTELY`, `HOURLY`, `BYSETPOS`, `BYWEEKNO`, `BYYEARDAY`, `BYHOUR`, `BYMINUTE`, `BYSECOND`, X- parts, another `WKST`,
 several `BYMONTH`s, `BYMONTHDAY` without `BYMONTH` in a yearly rule, a plain weekday in a monthly rule, a date-only or floating
