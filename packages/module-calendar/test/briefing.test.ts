@@ -19,7 +19,7 @@ const sectionOf = (kit: Effect.Success<ReturnType<typeof startCalendar>>["kit"],
   })
 
 describe("calendar: the briefing section", () => {
-  it.effect("on the kitchen display: the household's and Sam's events still to come today; Robin's only counted", () =>
+  it.effect("on the kitchen display: the household's and Sam's events still to come today; Robin's are not Sam's briefing's", () =>
     Effect.gen(function*() {
       const { kit } = yield* startCalendar(allFixtures, everyone)
       const gather = yield* sectionOf(kit, "kitchen-display")
@@ -27,7 +27,7 @@ describe("calendar: the briefing section", () => {
         _tag: "section",
         sentences: ["Today on the calendar: Lunch with Marloes at half past twelve, Swimming lesson at four o'clock and Gym at seven o'clock."],
         priority: "normal",
-        withheld: 1,
+        withheld: 0,
         owner: "p-sam"
       })
       // Short: the lead items only, one sentence.
@@ -36,16 +36,26 @@ describe("calendar: the briefing section", () => {
       assert.deepStrictEqual(sentencesOf(yield* gather({ kind: "evening" })), ["Tomorrow on the calendar: Bins out, all day and Dentist at half past two."])
     }))
 
-  it.effect("on the public hall screen: the household's only, no owner, the personal ones counted", () =>
+  it.effect("on the public hall screen: the household's only, no owner, nobody's personal events gathered", () =>
     Effect.gen(function*() {
       const { kit } = yield* startCalendar(allFixtures, everyone)
       const gather = yield* sectionOf(kit, "hall-screen")
       const r = yield* gather()
-      assert.deepStrictEqual(r, { _tag: "section", sentences: ["Today on the calendar: Lunch with Marloes at half past twelve and Swimming lesson at four o'clock."], priority: "normal", withheld: 2 })
+      assert.deepStrictEqual(r, { _tag: "section", sentences: ["Today on the calendar: Lunch with Marloes at half past twelve and Swimming lesson at four o'clock."], priority: "normal", withheld: 0 })
       assert.notInclude(JSON.stringify(r), "Gym")
     }))
 
-  it.effect("on Robin's phone: one person's content at most, so Sam's events are counted, not read", () =>
+  it.effect("a public screen whose default person is Sam: Sam's own events are counted, not read; Robin's are not gathered", () =>
+    Effect.gen(function*() {
+      const { kit } = yield* startCalendar(allFixtures, {
+        ...everyone,
+        household: { devices: [{ id: "hall-screen", name: "Hall screen", room: "Hall", privacy: "public", defaultPerson: "p-sam" }] }
+      })
+      const r = yield* (yield* sectionOf(kit, "hall-screen"))()
+      assert.deepStrictEqual(r, { _tag: "section", sentences: ["Today on the calendar: Lunch with Marloes at half past twelve and Swimming lesson at four o'clock."], priority: "normal", withheld: 1 })
+    }))
+
+  it.effect("on Robin's phone: Robin's own events; Sam's are not Robin's briefing's", () =>
     Effect.gen(function*() {
       const { kit } = yield* startCalendar(allFixtures, everyone)
       const r = yield* (yield* sectionOf(kit, "robins-phone"))()
@@ -54,7 +64,7 @@ describe("calendar: the briefing section", () => {
       assert.strictEqual(r.owner, "p-robin")
       assert.include(r.sentences[0]!, "Divorce lawyer at two o'clock")
       assert.notInclude(r.sentences[0]!, "Gym")
-      assert.strictEqual(r.withheld, 1)
+      assert.strictEqual(r.withheld, 0)
     }))
 
   it.effect("empty when there is nothing; unavailable before the first read; the stale line when a calendar could not be read", () =>

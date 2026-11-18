@@ -46,8 +46,9 @@ is a question ("Whose calendar?"), and on a public screen whose default person i
 calendar whose owner names nobody in Members (or two people) is not read at all. A row is used only while its calendar
 is still configured with the same owner, so a change of the settings never shows an event under its old owner.
 
-The briefing section reads the household's events and the asking person's own (when they may be revealed there) and
-only counts everyone else's: a section holds one person's content at most.
+The briefing section is the asking person's (the contract in `packages/module-contracts/src/briefing.ts`): the
+household's events and the asking person's own, when they may be revealed there; the asking person's events that may
+not (a public screen whose default person is known) are only counted. Other members' events are not gathered at all.
 
 Event titles and places come from outside: they are cut to one line (120 and 80 characters), descriptions, alarms and
 attachments are never read, and every result that holds them says they are calendar text, not instructions.

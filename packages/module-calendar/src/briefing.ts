@@ -9,10 +9,11 @@ import { addDays, dateOf } from "./time.ts"
  * The calendar's part of a briefing (`packages/module-contracts/src/briefing.ts`): today's events (tomorrow's in the
  * evening), in one sentence of at most `BRIEFING_LIMITS.sentenceChars`, from the store's cache.
  *
- * Privacy, the conservative reading of the contract: the household's events, and the asking person's own events when
- * `Privacy.mayReveal(person, request.turn)` says yes now (`owner` then names them). Every other member's event is only
- * counted in `withheld`, never reduced to "Robin has two things": a result holds one person's content at most, and the
- * asking person's comes first. A turn without a person gets the household's events only.
+ * Privacy: a briefing is the asking person's. The household's events, and the asking person's own events when
+ * `Privacy.mayReveal(person, request.turn)` says yes now (`owner` then names them); the asking person's events that may
+ * not be revealed on this device (a public screen whose default person is known) are only counted in `withheld`.
+ * Other members' events are not gathered at all, not even counted or reduced to "Robin has two things". A turn without
+ * a person gets the household's events only.
  */
 
 /** Events listed by length; the rest are "and N more". */
@@ -42,7 +43,8 @@ export const makeBriefingSection = (reader: Reader): BriefingSection => ({
         if (seen.has(key)) continue
         seen.add(key)
         if (r.value.owner === undefined || r.value.owner === own) listed.push(r)
-        else withheld.add(key)
+        else if (person !== undefined && r.value.owner === person) withheld.add(key)
+        // Anyone else's: not this briefing's.
       }
       if (listed.length === 0 && withheld.size === 0) return { _tag: "empty" } satisfies BriefingSectionResult
       const sentences: Array<string> = []
