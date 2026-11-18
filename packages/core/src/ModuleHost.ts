@@ -72,6 +72,7 @@ import { makeStragglers, stragglerIssues } from "./Stragglers.ts"
 import { type ModuleDefinition, type ModuleInstance, ModuleStartError } from "./ModuleDefinition.ts"
 import { type InstanceTarget, type ModuleTarget, planModule, reachedBy, usesOrder } from "./ModulePlanner.ts"
 import type { PartHandle, PartState, Registrar, Registration } from "./ModuleRegistrations.ts"
+import { closedModuleScheduler, type ModuleScheduler, type PartRunner, type SchedulerHook } from "./Scheduler.ts"
 import {
   applicableOwnValues,
   applySettingsPatch,
@@ -412,7 +413,15 @@ export interface ModuleHostOptions {
    * of its context. Absent: none (the CLI modes).
    */
   readonly coreServices?: ReadonlyArray<ProvidedService>
+  /**
+   * P6: `ctx.scheduler` of version 2 modules (`SchedulerEngine.forPart`), given the part and a runner that runs a job as
+   * a call in flight of the part's published module. Absent (the CLI modes): `handle` registers nothing and every other
+   * call fails `unavailable`.
+   */
+  readonly scheduler?: SchedulerHook
 }
+
+const NO_SCHEDULER = closedModuleScheduler("Timers and scheduled jobs run only in the server (pnpm start serve).")
 
 // ---------------------------------------------------------------------------------------------------------------------
 // Internal state
@@ -2580,7 +2589,38 @@ export const makeModuleHost = Effect.fnUntraced(function*(options: ModuleHostOpt
         reportMissingProgram: (tool) => effect(() => reportMissingProgram(entry, tool))
       } satisfies ModuleHostApi,
       store: storeFor(entry, effect),
-      events: eventsFor(entry, part, effect)
+      events: eventsFor(entry, part, effect),
+      // P6: the part's scheduler; like the store handle, every call dies with `ModuleStopped` once the part has closed.
+      scheduler: options.scheduler === undefined ? NO_SCHEDULER : schedulerFor(options.scheduler.forPart(part.handle, runnerFor(entry, part)), effect)
+    }
+  }
+
+  function schedulerFor(s: ModuleScheduler, effect: <A, E = never>(f: () => Effect.Effect<A, E>) => Effect.Effect<A, E>): ModuleScheduler {
+    return {
+      handle: (name, handler) => effect(() => s.handle(name, handler)),
+      schedule: (request) => effect(() => s.schedule(request)),
+      prepare: (request) => effect(() => s.prepare(request)),
+      cancel: (target) => effect(() => s.cancel(target)),
+      reschedule: (id, when) => effect(() => s.reschedule(id, when)),
+      get: (id) => effect(() => s.get(id)),
+      list: (query) => effect(() => s.list(query))
+    }
+  }
+
+  /**
+   * P6: how the scheduler runs a job of `part`: as a call in flight of the module's published run that holds the part
+   * (`guarded`, as a tool call); `ModuleStopped` when the part is not published, or when the grace period of its stop
+   * is over.
+   */
+  function runnerFor(entry: Entry, part: Part): PartRunner {
+    return {
+      inFlight: <A, E>(body: () => Effect.Effect<A, E>) =>
+        Effect.suspend((): Effect.Effect<A, E | ModuleStopped> => {
+          const run = entry.run
+          const stopped = (): Effect.Effect<A, E | ModuleStopped> => Effect.fail(stoppedError(entry))
+          const holds = run !== undefined && (run.shared?.part === part || [...run.instances.values()].some((i) => i.part === part))
+          return holds ? guarded<A, E | ModuleStopped>(run, body, stopped) : stopped()
+        })
     }
   }
 

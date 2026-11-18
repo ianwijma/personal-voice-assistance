@@ -428,8 +428,9 @@ export interface ModuleServicesV2 {
    */
   readonly events: ModuleEvents
   /**
-   * P6: this module's jobs and tasks (docs/SCHEDULING.md). Register handlers with `handle` in `shared`. In the CLI
-   * modes (and without a scheduler) `handle` succeeds and every other call fails `unavailable`.
+   * P6: this module's jobs (docs/SCHEDULING.md): handlers registered with `handle` during `shared` or `start` (published
+   * and withdrawn with the module), and jobs that call them at a time. Every call dies with `ModuleStopped` once the
+   * part has closed. In the CLI modes (no scheduler) `handle` succeeds and every other call fails `unavailable`.
    */
   readonly scheduler: ModuleScheduler
 }

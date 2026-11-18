@@ -15,10 +15,11 @@ import { makeToolRegistry, type ToolRegistry } from "./ToolRegistry.ts"
 import { connectStoreToBus, type EventBusOptions, type HouseholdEvent, makeEventBus } from "./EventBus.ts"
 import type { ModuleStorage } from "./HouseholdStore.ts"
 import { makeMemoryHouseholdStore, type MemoryStoreOptions } from "./MemoryHouseholdStore.ts"
-import type { IssueRegistry } from "./Issues.ts"
-import { type JobTable, memoryJobTable } from "./JobTable.ts"
-import type { DeliveryInfo, NotificationDelivery, NotificationRequest } from "./Scheduler.ts"
+import type { HouseholdStore } from "./HouseholdStore.ts"
+import { type IssueRegistry, makeIssueRegistry } from "./Issues.ts"
 import { makeSchedulerEngine, type SchedulerEngineOptions } from "./SchedulerEngine.ts"
+import { TestClock } from "effect/testing"
+import { schedulerStorage } from "./SchedulerJobs.ts"
 
 export interface Sleep {
   readonly _tag: "Sleep"
@@ -463,65 +464,52 @@ export const makeTestHousehold = (
 ) =>
   Effect.gen(function*() {
     const store = makeMemoryHouseholdStore(options)
-    yield* store.prepare(modules.map((m) => ({ id: m.id, storage: m.storage })))
+    // P6: the scheduler's collections (core.scheduler) are prepared with the modules', as in serve mode.
+    yield* store.prepare(modules.map((m) => ({ id: m.id, storage: m.storage })), [schedulerStorage])
     const recording = makeRecordingEventBus()
     connectStoreToBus(store, recording.bus)
     return { store, bus: recording.bus, events: recording.events, household: { store, events: recording.bus } }
   })
 
 // ---------------------------------------------------------------------------------------------------------------------
-// Scheduler (docs/SCHEDULING.md "Testing")
+// Scheduler (docs/SCHEDULING.md "Testing a module")
 
 /** An in-memory household store (`makeMemoryHouseholdStore`). */
 export type MemoryHouseholdStore = ReturnType<typeof makeMemoryHouseholdStore>
 
-/** A delivery that records every notification it is given (and can be told to fail). */
-export const makeRecordingDelivery = () => {
-  const delivered: Array<{ readonly request: NotificationRequest; readonly info: Omit<DeliveryInfo, "job"> & { readonly jobId: string } }> = []
-  const state = { failNext: 0 }
-  const delivery: NotificationDelivery = {
-    deliver: (request, info) =>
-      Effect.suspend(() => {
-        if (state.failNext > 0) {
-          state.failNext--
-          return Effect.fail(new Error("delivery failed (test)"))
-        }
-        delivered.push({ request, info: { notificationId: info.notificationId, lateByMs: info.lateByMs, inbox: info.inbox, jobId: info.job.id } })
-        return Effect.void
-      })
-  }
-  return { delivery, delivered, state }
-}
-
 /**
- * A scheduler for module tests: the real engine (`makeSchedulerEngine`) on an in-memory job table that joins the
- * in-memory store's transactions, so it behaves as serve mode's does (the same contract tests pass on both,
- * `@pva/core/scheduler-contract`). It runs on the Effect clock: in `it.effect` that is the test clock, moved with
- * `TestClock.adjust`. Give it the module host as `ModuleHostOptions.scheduler`, or call `forModule(id)` directly.
+ * A scheduler for tests: the real engine (`makeSchedulerEngine`) on a household store prepared for `modules` and the
+ * scheduler (`makeTestHousehold`; or the `store` given, which must have been prepared with `schedulerStorage`). It runs
+ * on the Effect clock: in `it.effect` that is the test clock; `advance(ms)` moves it and lets the engine run. Give
+ * `scheduler` to the module host as `ModuleHostOptions.scheduler`, and `household` as its household.
  *
- * A restart is simulated by making a second scheduler on the same `table` (and `store`) after closing the first one's
- * scope: jobs left `running` are recovered as after a crash.
+ * A restart is a second scheduler on the same store after the first one's scope has closed: rows it left `running`
+ * are recovered by the rule in docs/SCHEDULING.md once their handler is published again.
  */
 export const makeTestScheduler = (
   options: {
-    readonly store?: MemoryHouseholdStore
-    readonly table?: JobTable
-    readonly delivery?: NotificationDelivery
-    readonly timeZone?: string
+    /** The modules whose collections the store is prepared for (and whose names the admin list shows). */
+    readonly modules?: ReadonlyArray<{ readonly id: string; readonly name?: string; readonly storage?: ModuleStorage }>
+    readonly store?: HouseholdStore
+    /** `HOME_TIME_ZONE` (default: the server's). */
+    readonly timeZone?: string | (() => string | undefined)
     readonly issues?: IssueRegistry
-  } & Omit<SchedulerEngineOptions, "table" | "delivery" | "timeZone" | "issues"> = {}
+  } & Omit<SchedulerEngineOptions, "store" | "timeZone" | "issues" | "modules"> = {}
 ) =>
   Effect.gen(function*() {
-    const store = options.store ?? makeMemoryHouseholdStore()
-    const table = options.table ?? memoryJobTable(store)
-    const recording = makeRecordingDelivery()
-    const { delivery, store: _s, table: _t, timeZone, ...rest } = options
+    const { issues: given, modules, store: givenStore, timeZone, ...rest } = options
+    const names = (modules ?? []).map((m) => ({ id: m.id, name: m.name ?? m.id }))
+    const made = givenStore === undefined ? yield* makeTestHousehold(modules ?? []) : undefined
+    const store = givenStore ?? made!.store
+    const issues = given ?? makeIssueRegistry()
     const scheduler = yield* makeSchedulerEngine({
       ...rest,
-      table,
-      delivery: delivery ?? recording.delivery,
-      timeZone: () => timeZone,
-      ...(options.issues !== undefined ? { issues: options.issues } : {})
+      store,
+      issues,
+      modules: () => names,
+      timeZone: typeof timeZone === "function" ? timeZone : () => timeZone
     })
-    return { scheduler, store, table, deliveries: recording.delivered, delivery: recording }
+    /** Move the test clock by `ms` and let the engine run until it waits again. */
+    const advance = (ms: number) => Effect.andThen(Effect.andThen(scheduler.settled, TestClock.adjust(ms)), scheduler.settled)
+    return { scheduler, store, issues, advance, household: made?.household }
   })
