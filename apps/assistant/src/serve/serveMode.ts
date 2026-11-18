@@ -110,7 +110,7 @@ import { isTtsProvider, ttsProviderInfo } from "../providers.ts"
 import { DEFAULT_ASSISTANT_VOICE, voiceEngineName, voiceLabel } from "../voiceSelection.ts"
 import { type EnvMover, makeEnvMover } from "./envSettings.ts"
 import { type HttpError, type HttpServer, startHttp, webDirExists } from "./http.ts"
-import { deviceSettingsFrom, makeDeviceRegistry } from "./devices.ts"
+import { type DeviceRegistry, deviceSettingsFrom, makeDeviceRegistry } from "./devices.ts"
 import { type Jobs, makeJobs } from "./jobs.ts"
 import { makeModels, type Models, type PresetDownloader, presetsInUse } from "./models.ts"
 import { type Keys, makeKeys } from "./Keys.ts"
@@ -258,6 +258,8 @@ export interface ServeOptions {
 export interface ServeHandle {
   readonly http: HttpServer
   readonly hub: SessionHub
+  /** The registry of devices (tests: whether declarations are still being written). */
+  readonly devices: DeviceRegistry
   readonly engine: Engine
   /** The voice sessions (one per device). */
   readonly sessions: VoiceSessions
@@ -1805,7 +1807,7 @@ export const startServe = (options: ServeOptions): Effect.Effect<ServeHandle, Ht
     }
     const ready = Effect.asVoid(Effect.all([Fiber.await(modulesStarted), Fiber.await(engineStarted), Fiber.await(resourcesStarted)]))
 
-    return { http, hub: hubNow, engine: theEngine, sessions, host, keys, vault, envView, envMover, jobs, models, favourites, resources, store, ready }
+    return { http, hub: hubNow, devices, engine: theEngine, sessions, host, keys, vault, envView, envMover, jobs, models, favourites, resources, store, ready }
   })
 
 /**
