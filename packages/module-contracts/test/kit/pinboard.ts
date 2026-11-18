@@ -1,45 +1,43 @@
-// The reference module of docs/MODULES.md: real code, small, not in the catalogue. Every part a module PR writes is
-// here once: a settings field, a secret, a collection with an index and paging, a tool that reads, a tool that changes
-// with a risk class, an action, a scheduled job with its handler, a route, a health check, personal content with an
-// owner, and spoken lines in English and Dutch. `pinboard.test.ts` starts it through the test kit and runs every part
-// as a turn, a job or an HTTP caller; it passes `checkModule`. The `#region` blocks are quoted in docs/MODULES.md
-// (`docs.test.ts` keeps the two the same).
-import {
-  ActionError,
-  CurrentJob,
-  CurrentTurn,
-  defineAction,
-  defineCollection,
-  defineModule,
-  type HostView,
-  makeTool,
-  Privacy,
-  type Row,
-  Setting,
-  ToolError
-} from "@pva/core"
+// The reference module of docs/MODULES.md: real code, small, not in the catalogue. Every part a wave A module PR writes
+// is here once: a settings field, a secret, a collection with an index and an honest bounded scan, a tool that reads,
+// a tool that changes with a risk class and asks whose before it writes, a job scheduled from a turn in the same
+// transaction as its row, a daily system job with its handler, an action, a health check, personal content with an
+// owner, and every spoken line in English and Dutch. `pinboard.test.ts` starts it through the test kit and runs every
+// part as a turn or a job; it passes `checkModule`. The `#region` blocks are quoted in docs/MODULES.md (`docs.test.ts`
+// keeps the two the same).
+import { ActionError, CurrentJob, CurrentTurn, defineAction, defineCollection, defineModule, type HostView, makeTool, Privacy, type Row, Setting, ToolError } from "@pva/core"
 import { defineTexts, homeLanguage, say, StoredText } from "@pva/module-contracts"
 import { Clock, Effect, Schema } from "effect"
-import { timingSafeEqual } from "node:crypto"
+import { randomUUID } from "node:crypto"
 
 // #region texts
-/** Every sentence the module speaks, in both languages, with the same placeholders (checkModule compares them). */
+/** Every sentence the module speaks, failures and questions included, in both languages with the same placeholders. */
 export const texts = defineTexts({
   en: {
     pinned: "Pinned: {text}.",
-    pinnedFor: "Pinned for {name}: {text}.",
+    pinnedUntil: "Pinned for {hours} hours: {text}.",
     empty: "The pinboard is empty.",
     cleared: "Cleared {count} old notes.",
+    clearedSome: "Cleared {count} old notes; there are more, so say it again.",
     withheld: "{count} personal notes are not read out here.",
-    noPerson: "I don't know who is asking, so I pinned it for everyone."
+    cut: "I read the newest {count} notes; there are more.",
+    whose: "Who is the note for? I can't tell who is asking here.",
+    unreadable: "The pinboard could not be read.",
+    unsaved: "The note could not be pinned.",
+    uncleared: "The pinboard could not be cleared."
   },
   nl: {
     pinned: "Vastgeprikt: {text}.",
-    pinnedFor: "Vastgeprikt voor {name}: {text}.",
+    pinnedUntil: "Vastgeprikt voor {hours} uur: {text}.",
     empty: "Het prikbord is leeg.",
     cleared: "{count} oude briefjes weggehaald.",
+    clearedSome: "{count} oude briefjes weggehaald; er zijn er meer, zeg het nog eens.",
     withheld: "{count} persoonlijke briefjes lees ik hier niet voor.",
-    noPerson: "Ik weet niet wie het vraagt, dus het hangt er voor iedereen."
+    cut: "Ik heb de nieuwste {count} briefjes gelezen; er zijn er meer.",
+    whose: "Voor wie is het briefje? Ik weet hier niet wie het vraagt.",
+    unreadable: "Het prikbord kon niet worden gelezen.",
+    unsaved: "Het briefje kon niet worden vastgeprikt.",
+    uncleared: "Het prikbord kon niet worden leeggemaakt."
   }
 })
 // #endregion texts
@@ -70,7 +68,7 @@ export const notes = defineCollection({
 // #region settings
 const settings = {
   keepDays: Setting.number({ label: "Keep notes for", description: "Days a note stays pinned.", default: 7, integer: true, min: 1, max: 365, unit: "days" }),
-  signingKey: Setting.secret({ label: "Webhook key", description: "When set, the pin address also needs it in the X-Pinboard-Key header." })
+  printerKey: Setting.secret({ label: "Label printer key", description: "Not used by this example's tools: it shows a secret declared, checked by health and kept out of every result." })
 }
 // #endregion settings
 
@@ -78,18 +76,26 @@ const settings = {
 const languageOf = (view: HostView) => homeLanguage(view)
 
 // #region reading
-/** Every note, newest first, page by page: a list reads at most `maxListRows(notes)` rows, `after` continues. */
-const allNotes = (list: (q: { readonly limit: number; readonly after?: Row<Note> }) => Effect.Effect<ReadonlyArray<Row<Note>>, unknown>) =>
+/** The most notes one answer reads: 20 pages of 25, each one bounded indexed read. A turn never scans further. */
+export const SCAN_ROWS = 500
+const PAGE = 25
+
+/**
+ * The notes in one order, page by page (`after` continues a list), at most `SCAN_ROWS`, and whether there were more:
+ * a bounded scan says so when it is cut short, so nothing calls a partial read "every note".
+ */
+const scanNotes = (list: (q: { readonly limit: number; readonly after?: Row<Note> }) => Effect.Effect<ReadonlyArray<Row<Note>>, unknown>) =>
   Effect.gen(function*() {
-    const out: Array<Row<Note>> = []
+    const rows: Array<Row<Note>> = []
     let after: Row<Note> | undefined
-    for (let page = 0; page < 20; page++) {
-      const rows = yield* list({ limit: 25, ...(after !== undefined ? { after } : {}) })
-      out.push(...rows)
-      if (rows.length < 25) break
-      after = rows.at(-1)
+    for (let page = 0; page < SCAN_ROWS / PAGE; page++) {
+      const got = yield* list({ limit: PAGE, ...(after !== undefined ? { after } : {}) })
+      rows.push(...got)
+      if (got.length < PAGE) return { rows, cut: false }
+      after = got.at(-1)
     }
-    return out
+    const beyond = yield* list({ limit: 1, ...(after !== undefined ? { after } : {}) })
+    return { rows, cut: beyond.length > 0 }
   })
 // #endregion reading
 
@@ -104,8 +110,8 @@ export const pinboardModule = defineModule({
   // #region health
   health: ({ settings }) =>
     Effect.succeed(
-      settings?.signingKey === undefined
-        ? [{ id: "pinboard.no-key", severity: "info" as const, title: "The pin address has no key", detail: "Any LAN caller with a token can pin. Set a webhook key to require it too." }]
+      settings?.printerKey === undefined
+        ? [{ id: "pinboard.no-printer-key", severity: "info" as const, title: "No label printer key", detail: "Set one on the module's page to print notes." }]
         : []
     ),
   // #endregion health
@@ -113,50 +119,45 @@ export const pinboardModule = defineModule({
   shared: (ctx) =>
     Effect.gen(function*() {
       const board = ctx.store.collection(notes)
-      // A handler is registered in `shared` (once per module), with a payload schema, idempotent: running it twice is fine.
+      // Handlers are registered in `shared` (once per module), each with a payload schema. Both are idempotent: running
+      // one twice for the same occurrence does no harm, so a run cut short by a restart is simply run again.
       yield* ctx.scheduler.handle("expire", {
         payload: Schema.Struct({}),
         idempotent: true,
         run: () =>
           Effect.gen(function*() {
-            const keepDays = ctx.settingsFor(undefined)?.keepDays ?? 7
             const job = yield* CurrentJob
+            if (job === undefined) return yield* Effect.die(new Error("expire runs only as a job"))
+            const keepDays = ctx.settingsFor(undefined)?.keepDays ?? 7
             const cutoff = (yield* Clock.currentTimeMillis) - keepDays * 86_400_000
-            const old = (yield* allNotes((q) => board.list({ orderBy: { field: "pinnedAt", direction: "asc" }, ...q }))).filter((r) => r.value.pinnedAt < cutoff)
-            // One synchronous transaction; nothing in it awaits, and no store failure is caught inside it.
-            yield* ctx.store.transaction((tx) => {
-              for (const row of old) tx.collection(notes).remove(row.id, { actor: { kind: "job", jobId: job?.jobId ?? "expire" } })
-            })
+            // Oldest first, a bounded batch per transaction, until a batch reaches a note that stays: maintenance work
+            // goes on in steps that each take a moment, never in one unbounded read.
+            for (let batch = 0; batch < 100; batch++) {
+              const scan = yield* scanNotes((q) => board.list({ orderBy: { field: "pinnedAt", direction: "asc" }, ...q }))
+              const old = scan.rows.filter((r) => r.value.pinnedAt < cutoff)
+              // One synchronous transaction; nothing in it awaits, and no store failure is caught inside it.
+              yield* ctx.store.transaction((tx) => {
+                for (const row of old) tx.collection(notes).remove(row.id, { actor: { kind: "job", jobId: job.jobId } })
+              })
+              if (!scan.cut || old.length < scan.rows.length) return
+              yield* Effect.yieldNow
+            }
+          })
+      }).pipe(Effect.orDie)
+      yield* ctx.scheduler.handle("unpin", {
+        payload: Schema.Struct({ id: Schema.String.check(Schema.isMaxLength(200)) }),
+        idempotent: true,
+        run: ({ id }) =>
+          Effect.gen(function*() {
+            // A job scheduled from a turn runs with that turn's origin (`CurrentJob`: its assistant, device and person).
+            const job = yield* CurrentJob
+            if (job === undefined) return yield* Effect.die(new Error("unpin runs only as a job"))
+            yield* board.remove(id, { actor: { kind: "job", jobId: job.jobId } })
           })
       }).pipe(Effect.orDie)
       // A system job: cron with minute, hour and day of week only. Scheduling the same key again replaces it.
-      yield* ctx.scheduler.schedule({ handler: "expire", key: "expire", payload: {}, cron: "0 4 * * *" }).pipe(Effect.orDie)
-      return {
-        value: undefined,
-        // A route under /api/modules/pinboard/pin: a token of this module AND a LAN caller; a small JSON body.
-        routes: [{
-          method: "POST" as const,
-          path: "pin",
-          guards: ["token", "lan"] as const,
-          token: "pin",
-          bodyLimitBytes: 1_024,
-          description: "Pin a household note from a home automation.",
-          handler: (request) =>
-            Effect.gen(function*() {
-              const key = ctx.settings.signingKey
-              if (key !== undefined) {
-                const given = Buffer.from(request.headers["x-pinboard-key"] ?? "")
-                const want = Buffer.from(key)
-                if (given.length !== want.length || !timingSafeEqual(given, want)) return { status: 401, body: { error: "bad key" } }
-              }
-              const body = request.body as { readonly text?: unknown } | undefined
-              const text = typeof body?.text === "string" ? body.text.trim() : ""
-              if (text === "" || !Schema.is(StoredText(200))(text)) return { status: 400, body: { error: "text: 1 to 200 characters of one line" } }
-              const row = yield* board.insert({ text, pinnedAt: yield* Clock.currentTimeMillis })
-              return { status: 201, body: { id: row.id } }
-            })
-        }]
-      }
+      yield* ctx.scheduler.schedule({ handler: "expire", key: "expire", cron: "0 4 * * *" }).pipe(Effect.orDie)
+      return { value: undefined }
     }),
   // #endregion shared
   start: (ctx) =>
@@ -168,7 +169,7 @@ export const pinboardModule = defineModule({
         description: "Read the notes pinned on the household's pinboard, newest first.",
         parameters: Schema.Struct({}),
         speculative: true, // a plain read: safe to run before the turn is committed; its risk is `read`
-        // The result names whose personal note it holds; the gateway checks it against the asking device (P8).
+        // The result names whose personal note it holds; P8 will check it against the asking device.
         sensitivity: (result) => {
           const owner = (result as { readonly owner?: string }).owner
           return owner === undefined ? { kind: "household" } : { kind: "personal", owner }
@@ -179,14 +180,14 @@ export const pinboardModule = defineModule({
             // Looked up at each use, never kept: `Privacy` is the core's, and decides at the moment of revealing.
             const privacy = ctx.host.service(Privacy)
             const lang = languageOf(ctx.host.view())
-            const rows = yield* allNotes((q) => board.list({ orderBy: { field: "pinnedAt", direction: "desc" }, ...q })).pipe(
-              Effect.mapError(() => new ToolError({ message: "The pinboard could not be read." }))
+            const scan = yield* scanNotes((q) => board.list({ orderBy: { field: "pinnedAt", direction: "desc" }, ...q })).pipe(
+              Effect.mapError(() => new ToolError({ message: say(texts, lang, "unreadable") }))
             )
-            if (rows.length === 0) return { spoken: say(texts, lang, "empty") }
+            if (scan.rows.length === 0) return { spoken: say(texts, lang, "empty") }
             let owner: string | undefined
             let withheld = 0
             const shown: Array<string> = []
-            for (const r of rows) {
+            for (const r of scan.rows) {
               const o = r.value.owner
               // A personal note is read only where the rule allows it now, on the device that will speak it.
               if (o !== undefined && privacy?.mayReveal(o, turn) !== true) {
@@ -200,6 +201,7 @@ export const pinboardModule = defineModule({
               notes: shown.slice(0, 10),
               more: Math.max(0, shown.length - 10),
               ...(withheld > 0 ? { withheld: say(texts, lang, "withheld", { count: withheld }) } : {}),
+              ...(scan.cut ? { cut: say(texts, lang, "cut", { count: SCAN_ROWS }) } : {}),
               ...(owner !== undefined ? { owner } : {})
             }
           })
@@ -208,22 +210,36 @@ export const pinboardModule = defineModule({
       // #region change-tool
       const pin = makeTool({
         name: "pinboard_pin",
-        description: "Pin a short note on the pinboard, for everyone or only for the person asking.",
+        description: "Pin a short note on the pinboard, for everyone or only for the person asking, optionally for some hours.",
         parameters: Schema.Struct({
           text: StoredText(200).annotate({ description: "The note, one short line" }),
-          forMe: Schema.optionalKey(Schema.Boolean.annotate({ description: "Only for the person asking" }))
+          forMe: Schema.optionalKey(Schema.Boolean.annotate({ description: "Only for the person asking" })),
+          hours: Schema.optionalKey(Schema.Int.check(Schema.isBetween({ minimum: 1, maximum: 72 })).annotate({ description: "Take it down after this many hours" }))
         }),
         risk: "change", // it changes household data: declared, never left to be inferred
-        execute: ({ text, forMe }) =>
+        execute: ({ text, forMe, hours }) =>
           Effect.gen(function*() {
             const turn = yield* CurrentTurn
             const lang = languageOf(ctx.host.view())
-            const person = forMe === true ? turn?.person?.id : undefined
-            yield* board.insert({ text, pinnedAt: yield* Clock.currentTimeMillis, ...(person !== undefined ? { owner: person } : {}) }).pipe(
-              Effect.mapError(() => new ToolError({ message: "The note could not be pinned." }))
-            )
-            if (forMe === true && person === undefined) return { spoken: say(texts, lang, "noPerson") }
-            return { spoken: say(texts, lang, "pinned", { text }) }
+            const person = turn?.person?.id
+            // Personal content needs an owner. Nobody known is asking (a public screen, no default person): ask whose,
+            // and write nothing. Never store it as the household's instead, and never repeat the text here.
+            if (forMe === true && person === undefined) return { spoken: say(texts, lang, "whose") }
+            const note: Note = { text, pinnedAt: yield* Clock.currentTimeMillis, ...(forMe === true && person !== undefined ? { owner: person } : {}) }
+            const failed = () => new ToolError({ message: say(texts, lang, "unsaved") })
+            if (hours === undefined) {
+              yield* board.insert(note).pipe(Effect.mapError(failed))
+              return { spoken: say(texts, lang, "pinned", { text }) }
+            }
+            // The note and the job that takes it down are written in one transaction: both or neither. The row's id is
+            // chosen first, so the job's payload can name it; the job inherits this turn's origin.
+            const id = randomUUID()
+            const job = yield* ctx.scheduler.prepare({ handler: "unpin", key: `unpin:${id}`, payload: { id }, inMs: hours * 3_600_000 }).pipe(Effect.mapError(failed))
+            yield* ctx.store.transaction((tx) => {
+              tx.collection(notes).insert(note, { id })
+              job.writeIn(tx)
+            }).pipe(Effect.mapError(failed))
+            return { spoken: say(texts, lang, "pinnedUntil", { hours, text }) }
           })
       })
       // #endregion change-tool
@@ -231,7 +247,7 @@ export const pinboardModule = defineModule({
       const clear = defineAction({
         id: "clear",
         label: "Clear the pinboard",
-        description: "Take down every household note older than a day. Personal notes stay.",
+        description: "Take down household notes older than a day. Personal notes stay.",
         examples: ["clear the pinboard", "take the old notes down", "maak het prikbord leeg"],
         params: {},
         risk: "change",
@@ -239,13 +255,15 @@ export const pinboardModule = defineModule({
           Effect.gen(function*() {
             const lang = languageOf(ctx.host.view())
             const cutoff = (yield* Clock.currentTimeMillis) - 86_400_000
-            const old = (yield* allNotes((q) => board.list({ orderBy: { field: "pinnedAt", direction: "asc" }, ...q })).pipe(
-              Effect.mapError(() => new ActionError({ message: "The pinboard could not be read." }))
-            )).filter((r) => r.value.owner === undefined && r.value.pinnedAt < cutoff)
+            const scan = yield* scanNotes((q) => board.list({ orderBy: { field: "pinnedAt", direction: "asc" }, ...q })).pipe(
+              Effect.mapError(() => new ActionError({ message: say(texts, lang, "unreadable") }))
+            )
+            const old = scan.rows.filter((r) => r.value.owner === undefined && r.value.pinnedAt < cutoff)
             yield* ctx.store.transaction((tx) => {
               for (const row of old) tx.collection(notes).remove(row.id)
-            }).pipe(Effect.mapError(() => new ActionError({ message: "The pinboard could not be cleared." })))
-            return { say: say(texts, lang, "cleared", { count: old.length }) }
+            }).pipe(Effect.mapError(() => new ActionError({ message: say(texts, lang, "uncleared") })))
+            // A bounded scan that was cut short says so: what it did, and that there is more.
+            return { say: say(texts, lang, scan.cut ? "clearedSome" : "cleared", { count: old.length }) }
           })
       })
       // #endregion action
