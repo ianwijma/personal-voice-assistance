@@ -2,7 +2,8 @@
 // a private channel for its answer (its other end is the first and only thing posted on the public port, which is
 // then closed to the task), and silences console and the output streams. Then it loads the task module (through tsx's
 // loader when the task is TypeScript, so it loads the same under tsx, vitest and plain node), runs its default export
-// once on the input, serialises the answer once into one exactly sized buffer, checks its size, and transfers that
+// once on the input, serialises the answer once into one exactly sized buffer, checks its size (a structured answer
+// against the smaller structured limit, from the tag of what it serialised), and transfers that
 // buffer on the private channel. The main thread terminates the worker once the answer has arrived, or at the time
 // limit.
 //
@@ -11,7 +12,7 @@
 import { serialize } from "node:v8"
 import { MessageChannel, parentPort, workerData } from "node:worker_threads"
 
-const { task, input, maxResultBytes, names, codes } = workerData
+const { task, input, maxResultBytes, maxStructuredBytes, markers, names, codes } = workerData
 
 // The private answer channel. The worker stays alive on it until the main thread terminates it, so the answer is
 // never raced by the thread's exit.
@@ -50,6 +51,19 @@ const describe = (e) => {
   return code === undefined ? { name } : { name, code }
 }
 
+// What the serialised answer is, from its first tag (as wireShape in OffThread.ts): one string, one Uint8Array or
+// Buffer, or a structure, which may not be larger than maxStructuredBytes whatever maxResultBytes says.
+const isFlat = (wire) => {
+  if (wire[0] !== 0xff) return false
+  let i = 1
+  while (i < wire.length && (wire[i] & 0x80) !== 0) i++
+  i++
+  while (i < wire.length && wire[i] === 0x00) i++
+  if (i >= wire.length) return false
+  if (markers.text.includes(wire[i])) return true
+  return wire[i] === 0x5c && i + 1 < wire.length && markers.bytes.includes(wire[i + 1])
+}
+
 const load = async () => {
   if (/\.m?ts$/.test(new URL(task).pathname)) {
     const { register } = await import("tsx/esm/api")
@@ -80,6 +94,7 @@ const main = async () => {
     return { kind: "failed", ...describe(e) }
   }
   if (wire.byteLength > maxResultBytes) return { kind: "too-large", size: wire.byteLength }
+  if (wire.byteLength > maxStructuredBytes && !isFlat(wire)) return { kind: "too-large", size: wire.byteLength, structured: true }
   // One exactly sized buffer of its own: that is what crosses, by transfer.
   if (wire.byteOffset === 0 && wire.buffer.byteLength === wire.byteLength) return { kind: "ok", wire: wire.buffer }
   const own = new ArrayBuffer(wire.byteLength)
