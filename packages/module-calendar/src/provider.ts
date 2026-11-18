@@ -1,6 +1,7 @@
-import { offThread, type OffThreadError, offThreadTask } from "@pva/core"
+import { offThread, type OffThreadError, type OffThreadTask, offThreadTask } from "@pva/core"
 import { type Connector, type ContentTypePolicy, type Resolver, safeFetch, type SafeFetchError } from "@pva/net"
 import { Effect, Result } from "effect"
+import { readAnswer, type TaskInput, taskInput } from "./answer.ts"
 import type { ExpandLimits, Occ } from "./expand.ts"
 import { PLACE_CHARS, type SourceError, TITLE_CHARS } from "./store.ts"
 
@@ -51,6 +52,10 @@ export interface IcsDeps {
   readonly fetchTimeoutMs?: number
   /** The reading task's time limit (real time). */
   readonly readTimeoutMs?: number
+  /** The reading task's input limit (tests: a refusal with `input`). */
+  readonly maxInputBytes?: number
+  /** Another reading task (tests: an answer the main thread cannot read). */
+  readonly readTask?: OffThreadTask<TaskInput, string>
 }
 
 export const ICS_MAX_BYTES = 1024 * 1024
@@ -58,6 +63,7 @@ export const FETCH_TIMEOUT_MS = 15_000
 /** The reading task's limits: a few seconds of real time, its own heap, a bounded answer. */
 export const READ_TIMEOUT_MS = 5_000
 const READ_MEMORY_MB = 256
+/** The answer is one string (`answer.ts`), so it may be larger than a structure's 128 KiB: at most 4 MiB. */
 const READ_RESULT_BYTES = 4 * 1024 * 1024
 
 /** Events a file may have, occurrences a calendar may keep, rows they may make, steps of one series. */
@@ -80,6 +86,10 @@ const fetchError = (e: SafeFetchError): SourceError => {
   }
 }
 
+/**
+ * Every reason of the helper as one of the module's reasons; any other (a reason added later) is `failed`. `busy`
+ * (too many calls waiting) is a failed refresh like any other, tried again at the next one.
+ */
 const readError = (e: OffThreadError): SourceError => {
   switch (e.reason) {
     case "timeout":
@@ -88,6 +98,8 @@ const readError = (e: OffThreadError): SourceError => {
       return "too-large"
     case "too-large":
       return "too-many"
+    case "busy":
+      return "busy"
     default:
       return "failed"
   }
@@ -127,14 +139,25 @@ export const makeIcsProvider = (deps: IcsDeps): CalendarProvider => ({
       if (r.status === 304 && request.etag !== undefined) return { kind: "unchanged" } as const
       // A server's error page is never read: its status is the reason.
       if (r.status < 200 || r.status > 299) return yield* Effect.fail("status" as const)
-      const read = yield* offThread(readIcs, {
+      const answer = yield* offThread(deps.readTask ?? readIcs, taskInput({
         text: r.text(),
         from: request.window.from,
         to: request.window.to,
         zone: request.window.zone,
         forbidden: request.forbidden,
         limits: LIMITS
-      }, { timeoutMs: deps.readTimeoutMs ?? READ_TIMEOUT_MS, maxMemoryMb: READ_MEMORY_MB, maxResultBytes: READ_RESULT_BYTES }).pipe(Effect.mapError(readError))
+      }), {
+        timeoutMs: deps.readTimeoutMs ?? READ_TIMEOUT_MS,
+        maxMemoryMb: READ_MEMORY_MB,
+        maxResultBytes: READ_RESULT_BYTES,
+        ...(deps.maxInputBytes !== undefined ? { maxInputBytes: deps.maxInputBytes } : {})
+      }).pipe(
+        Effect.mapError(readError),
+        // No reason of the helper escapes as a defect: a broken call is a failed refresh, which says so on Health.
+        Effect.catchDefect(() => Effect.fail("failed" as const))
+      )
+      // Read in batches with a real yield between them; a line it cannot read fails the whole read.
+      const read = yield* readAnswer(answer, LIMITS).pipe(Effect.mapError(() => "failed" as const))
       if (!read.ok) return yield* Effect.fail(read.reason)
       // Kept only when it is a short, plain validator that holds nothing of a private link (it is the server's text).
       const etag = r.headers["etag"]

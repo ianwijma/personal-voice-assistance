@@ -47,7 +47,16 @@ describe("calendar: the main thread during a refresh, on SQLite (finding 1)", ()
         const rows = yield* store.collection(occurrences).list({ where: { day: 20261119 }, orderBy: { field: "start" }, limit: 20 })
         assert.isTrue(rows.every((r) => r.value.title.startsWith(prefix)))
       }
-      if (process.env.CALENDAR_BENCH === "1") process.stderr.write(`calendar (SQLite): longest stop per refresh ${results.map((r) => r.toFixed(1)).join(", ")} ms\n`)
+      // The largest answer a calendar may give: 46 daily series of the longest two-byte titles and places, 2,898
+      // occurrences, about 2 MiB of text as the helper counts it, read in batches, written, and the last one removed.
+      body = ics(Array.from({ length: 46 }, (_, i) => ({ uid: `s${i}`, summary: `${"ŝ".repeat(110)} ${i}`, location: "ĝ".repeat(80), start: "20261118T100000", end: "20261118T103000", tz: AMS, rrule: "FREQ=DAILY" })))
+      yield* TestClock.adjust(3_600_000)
+      const largest = yield* heartbeat(refresh.run(actor, true))
+      const [after] = yield* store.collection(sources).list({})
+      assert.strictEqual(after?.value.rows, 46 * 63)
+      assert.isUndefined(after?.value.error)
+      results.push(largest.longest)
+      if (process.env.CALENDAR_BENCH === "1") process.stderr.write(`calendar (SQLite): longest stop per refresh ${results.map((r) => r.toFixed(1)).join(", ")} ms (the last: the largest answer, ${46 * 63} rows)\n`)
       for (const r of results) assert.isBelow(r, bound(10), `a refresh held the main thread ${r.toFixed(1)} ms`)
       assert.strictEqual(offThreadWorkers().running, 0)
     })), 120_000)

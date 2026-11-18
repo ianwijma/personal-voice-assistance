@@ -140,11 +140,14 @@ person.
 | Collection | Scope | `maxChars` (rows a list reads) | Indexes | What |
 |---|---|---|---|---|
 | `occurrences` | household | 1,250 (20) | `[day, start]`, `[day, end]`, `start`, `batch` | One occurrence on one local day it touches (`day` is `YYYYMMDD` in the household's zone; an event of several days has a row for every day of the window it covers): its calendar's name, its generation (`batch`), its identity (`key`, a hash of its UID and recurrence id), start and end, all-day, title, place, owner (absent for a household calendar), busy, and whether it goes on after the last day kept |
-| `sources` | household | 1,600 (15) | — | One row per calendar: when it was last tried and last read, why it failed (`unreachable`, `refused`, `too-large`, `status`, `not-calendar`, `too-many`, `too-slow`, `failed`, `owner`, `no-link`, `store`; never a URL or the server's words), its current generation and what it was read from (a fingerprint of the address, the owner, the zone), how many events could not be read, its row count, its last day, the server's `ETag` for a conditional request on the same day, and a generation being written or old ones still to remove |
+| `sources` | household | 1,600 (15) | — | One row per calendar: when it was last tried and last read, why it failed (`unreachable`, `refused`, `too-large`, `status`, `not-calendar`, `too-many`, `too-slow`, `busy`, `failed`, `owner`, `no-link`, `store`; never a URL or the server's words), its current generation and what it was read from (a fingerprint of the address, the owner, the zone), how many events could not be read, its row count, its last day, the server's `ETag` for a conditional request on the same day, and a generation being written or old ones still to remove |
 
 Row ids are hashes (`ev-…`, `src-…`) of the calendar's name, its generation, the event's identity and the day: no title
-or address shows in them. The private links are never stored; a fingerprint of the address (a hash) is, so a changed
-address is noticed. Removed rows are gone for good, but the daily backups keep them up to 14 days.
+or address shows in them. The private links are never stored. What is stored instead, in the `sources` row's `link`,
+is a fingerprint, so a changed address is noticed: the first 16 hex digits (64 bits) of SHA-256 over
+`pva-calendar-link`, a NUL and the address. It cannot be turned back into the address, and it is only compared with
+the fingerprint of the address the settings have now; no tool, action, Health issue or log line holds it (like every
+committed row, the state row's change goes on the server's in-process bus, which sends nothing to voice pages). Removed rows are gone for good, but the daily backups keep them up to 14 days.
 
 **Jobs**: the handler `refresh` (idempotent, one retry, at most 5 minutes) runs as the repeating job `refresh` (cron
 `7 * * * *` by default: `*/15`, `*/30` or `7 */3` by the setting, in the household's zone) and once at every start
@@ -153,15 +156,22 @@ restart, a store failure) leaves the current generation as it was; the next one 
 
 **Bounds of a refresh** (none of it on a turn): a calendar is at most 1 MiB and 15 seconds, `GET` only, the calendar
 content types only (never HTML), public addresses on ports 80 and 443 only (`safeFetch`). It is read in a worker
-(`src/ics.task.ts`) with 5 seconds of real time, 256 MB and an answer of at most 4 MiB; a file over 5,000 events, 3,000
+(`src/ics.task.ts`) with 5 seconds of real time and 256 MB. Its input is one flat record (the file, the window, the
+zone, the forbidden texts as one JSON string, the limits as plain fields); its answer is **one string of JSON lines**
+(at most 4 MiB, `src/answer.ts`), which the main thread reads 200 lines at a time with a real yield between batches,
+checking every line: an answer with a line it cannot read fails the whole refresh, and nothing of it is written. A call
+the helper refuses because too many are waiting is `busy` (tried again at the next refresh); any other refusal of the
+helper is `failed`. A file over 5,000 events, 3,000
 occurrences or 6,000 rows is a failed refresh (`too-many`), as is one that takes longer (`too-slow`: a rule the library
 never finishes, `FREQ=DAILY;BYMONTH=2;BYMONTHDAY=30`, ends there). Within the file, each kept line is at most 8,000
 characters (a schedule line over it leaves its event out), a time zone definition at most 1,000 lines and 40 of them,
 a series at most 200,000 steps (more: the event is left out and counted). Rows are written 25 per transaction and
 removed 20 per transaction, with a yield between them. **Measured** (development machine, `CALENDAR_BENCH=1`): on
 SQLite (`test/latency.test.ts`), a refresh writing 2,900 rows and removing 2,900 from a 1 MiB file holds the main
-thread at most 3.0 to 5.7 ms; in the test kit, the reviewer's 1 MiB file of 6,000 events 3.7 to 4.3 ms, a file of
-5,001 events 2.2 to 3.4 ms, the impossible rule 2.0 to 2.5 ms; the tests fail above 10 ms (30 ms on CI). The worker's own start-up
+thread at most 2.8 to 5.2 ms, and one of the largest answer a calendar may give (2,898 occurrences of the longest
+two-byte titles and places, about 2 MiB as counted) 2.4 to 3.0 ms; reading 3,000 lines of the longest kind (2.16 MiB
+as counted) 1.2 to 2.2 ms; in the test kit, the reviewer's 1 MiB file of 6,000 events 3.8 to 4.2 ms, a file of 5,001
+events 2.3 to 2.9 ms, the impossible rule 2.2 to 2.6 ms; the tests fail above 10 ms (30 ms on CI). The worker's own start-up
 (docs/MODULES.md §15) is paid on its thread, once per calendar per refresh.
 
 ## What it needs

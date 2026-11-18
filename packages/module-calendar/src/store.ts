@@ -74,9 +74,10 @@ export const ROWS_PAGE = 20
 
 /**
  * Why a calendar could not be read at its last refresh (never a URL, never a server's own words):
- * `too-many` and `too-slow` are the reading's own limits (events, occurrences, rows; its time limit).
+ * `too-many` and `too-slow` are the reading's own limits (events, occurrences, rows; its time limit); `busy`: too
+ * many readings were waiting for a worker (tried again at the next refresh).
  */
-export const SourceError = Schema.Literals(["unreachable", "refused", "too-large", "status", "not-calendar", "too-many", "too-slow", "failed", "owner", "no-link", "store"])
+export const SourceError = Schema.Literals(["unreachable", "refused", "too-large", "status", "not-calendar", "too-many", "too-slow", "busy", "failed", "owner", "no-link", "store"])
 export type SourceError = typeof SourceError.Type
 
 /** How one calendar fared, and which generation of its rows is current, read from what. */
@@ -90,7 +91,7 @@ export const SourceState = Schema.Struct({
   /** The current generation: the only one readers use. */
   gen: Schema.optionalKey(GENERATION),
   /** What the current generation was read from: the link's fingerprint (`linkPrint`), the owner, the household's zone. */
-  link: Schema.optionalKey(StoredText(32)),
+  link: Schema.optionalKey(StoredText(16)),
   owner: Schema.optionalKey(StoredText(40)),
   zone: Schema.optionalKey(StoredText(64)),
   /** Events of the file that could not be read and were left out of the current generation. */
@@ -140,10 +141,13 @@ export const batchOf = (name: string, gen: number) =>
   `s${createHash("sha256").update(name.trim().toLowerCase()).digest("hex").slice(0, 16)}.${gen.toString(36)}`
 
 /**
- * The fingerprint of the address a generation was read from: a hash, so a changed address (or private link) is
- * noticed without the address being kept. The decision to keep it is the lead's (the review's fix round, decision 2).
+ * The fingerprint of the address a generation was read from, so a changed address (or private link) is noticed without
+ * the address being kept: the first 16 hex digits (64 bits) of SHA-256 over a fixed label and the address. It cannot
+ * be turned back into the address (a private link is a long random token), says nothing about it to anyone who reads
+ * the row, and is only ever compared with the fingerprint of the address in the settings now: no tool, action, Health
+ * issue or log line holds it. The decision to keep it is the lead's (the review's fix round, decision 2).
  */
-export const linkPrint = (address: string) => createHash("sha256").update(`pva-calendar-link\u0000${address}`).digest("hex").slice(0, 32)
+export const linkPrint = (address: string) => createHash("sha256").update(`pva-calendar-link\u0000${address}`).digest("hex").slice(0, 16)
 
 /** Whose a calendar's rows are, as a source row records it: `household`, or the member's id. */
 export const ownerKey = (owner: { readonly kind: "household" } | { readonly kind: "person"; readonly id: string }) => (owner.kind === "household" ? "household" : owner.id)

@@ -2,13 +2,13 @@
 // changed calendar, and an outside service that is down, slow, answers rubbish or echoes the private link (all
 // through the offline network: no test reaches the network). And how long the main thread is held while it runs.
 import { assert, describe, it } from "@effect/vitest"
-import { CurrentJob, type JobOrigin } from "@pva/core"
+import { CurrentJob, type JobOrigin, offThread, offThreadTask } from "@pva/core"
 import { makeOfflineNet, offThreadWorkers, startTestModule } from "@pva/core/testing"
-import { Effect } from "effect"
+import { Effect, Fiber } from "effect"
 import { bound } from "../../store-sqlite/test/latencyBound.ts"
 import { calendarModule, calendarModuleWith, occurrences, sources } from "../src/index.ts"
 import { ICS_MAX_BYTES } from "../src/provider.ts"
-import { batchOf } from "../src/store.ts"
+import { batchOf, linkPrint } from "../src/store.ts"
 import {
   advanceAndRefresh,
   advanceToNextJob,
@@ -436,6 +436,14 @@ describe("calendar: the refresh job", () => {
       assert.isUndefined(states[0]?.value.etag)
       yield* kit.expectNoSecrets(today, said, yield* kit.tool("calendar_find", { text: "token" }, { device: "robins-phone" }), rows, states, yield* kit.jobs, kit.issues())
       for (const text of [JSON.stringify(rows), JSON.stringify(states), JSON.stringify(yield* kit.jobs)]) assert.notInclude(text, "9f8e7d6c5b4a")
+      // What is kept of the link: 16 hex digits of SHA-256 over a label and the address, in the state row only (and so
+      // in that row's change on the in-process bus, which no page is sent), never in what a tool, an action, a job or
+      // Health says, nor in an occurrence row.
+      const print = linkPrint(secret)
+      assert.match(print, /^[0-9a-f]{16}$/)
+      assert.strictEqual(states[0]?.value.link, print)
+      for (const text of [today.content, JSON.stringify(said), JSON.stringify(yield* kit.jobs), JSON.stringify(kit.issues()), JSON.stringify(rows)]) assert.notInclude(text, print)
+      assert.isTrue(kit.events.filter((e) => JSON.stringify(e).includes(print)).every((e) => e.type === "calendar.sources.changed"))
       // Without the secret: Health names the calendar and the link, and the refresh says why it could not read it.
       const unset = yield* startCalendar({}, { settings })
       assert.deepStrictEqual((yield* unset.kit.checkHealth).map((i) => i.id), ["calendar.no-private-link-1"])
@@ -547,5 +555,86 @@ describe("calendar: the main thread while a calendar is read (finding 1)", () =>
       assert.isBelow(took, 2 * (1_500 + bound(500)))
       assert.isBelow(run.longest, limit, `the main thread was held ${run.longest.toFixed(1)} ms`)
       assert.strictEqual(offThreadWorkers().running, 0)
+    }), 60_000)
+})
+
+describe("calendar: the reading task as the reworked offThread wants it", () => {
+  /** A calendar of one event, then the file the test serves instead. */
+  const one = ics([{ uid: "dentist", summary: "Dentist", start: "20261118T140000", end: "20261118T150000", tz: AMS }])
+
+  /** The last good generation is still the answer, and it says it could not be refreshed. */
+  const keptLast = (kit: Effect.Success<ReturnType<typeof startCalendar>>["kit"]) =>
+    Effect.gen(function*() {
+      const today = (yield* kit.tool("calendar_agenda", {})).value as { stale?: string }
+      assert.deepStrictEqual(eventsOf(today), ["Dentist two o'clock"])
+      assert.include(today.stale!, "could not be refreshed")
+      const state = (yield* stateOf(kit))!
+      assert.isUndefined(state.writing)
+      assert.deepStrictEqual([...new Set((yield* allRows(kit)).map((r) => r.value.batch))], [batchOf("Family", state.gen!)])
+    })
+
+  it.effect("an answer far over the 128 KiB a structure may be (1,000 events) is read whole", () =>
+    Effect.gen(function*() {
+      const body = ics(Array.from({ length: 1_000 }, (_, i) => ({ uid: `e${i}`, summary: `${"Rehearsal ".repeat(11)}${i}`, location: "Hall ".repeat(15), start: "20261119T100000", end: "20261119T110000", tz: AMS })))
+      const { kit } = yield* startCalendar({ "https://cal.example.org/family.ics": served(body) }, familyOnly)
+      const state = (yield* stateOf(kit))!
+      assert.isUndefined(state.error)
+      assert.strictEqual(state.rows, 1_000)
+      assert.strictEqual((yield* allRows(kit)).length, 1_000)
+      // A day reads at most 200 rows, and says so.
+      const tomorrow = (yield* kit.tool("calendar_agenda", { day: "tomorrow" })).value as { more: number; cut?: string }
+      assert.strictEqual(tomorrow.more, 200 - 12)
+      assert.isDefined(tomorrow.cut)
+    }), 60_000)
+
+  it.effect("busy: with the helper's waiting line full, the refresh fails as busy and keeps the last generation", () =>
+    Effect.gen(function*() {
+      let body = one
+      const { kit } = yield* startCalendar({ "https://cal.example.org/family.ics": () => served(body) }, familyOnly)
+      body = ics([{ uid: "dentist", summary: "Dentist", start: "20261118T160000", end: "20261118T170000", tz: AMS }])
+      // Two slots held and 32 calls waiting: the next call is refused at once.
+      const nap = offThreadTask<(input: { readonly ms: number }) => Promise<string>>(new URL("./nap.task.mjs", import.meta.url))
+      const fibers = yield* Effect.forEach(Array.from({ length: 34 }), () => Effect.forkDetach(offThread(nap, { ms: 30_000 }, { timeoutMs: 40_000 })))
+      const refused = yield* Effect.gen(function*() {
+        yield* until(() => offThreadWorkers().queued === 32)
+        yield* advanceToNextJob(kit)
+        yield* refreshed(kit)
+        return (yield* stateOf(kit))!.error
+      }).pipe(Effect.ensuring(Effect.andThen(Fiber.interruptAll(fibers), until(() => offThreadWorkers().running === 0 && offThreadWorkers().queued === 0))))
+      assert.strictEqual(refused, "busy")
+      yield* keptLast(kit)
+      // Tried again at the next refresh, with the slots free: read.
+      yield* advanceAndRefresh(kit, 3_600_000)
+      assert.isUndefined((yield* stateOf(kit))!.error)
+      assert.deepStrictEqual(eventsOf((yield* kit.tool("calendar_agenda", {})).value), ["Dentist four o'clock"])
+    }), 60_000)
+
+  it.effect("input: a call the helper refuses for its input fails the refresh and keeps the last generation", () =>
+    Effect.gen(function*() {
+      let body = one
+      // A small input limit for the test: the first file fits, a longer one does not.
+      const { kit } = yield* startCalendar({ "https://cal.example.org/family.ics": () => served(body) }, { ...familyOnly, deps: { maxInputBytes: 4_000 } })
+      assert.isUndefined((yield* stateOf(kit))!.error)
+      body = ics([{ uid: "dentist", summary: "Dentist", start: "20261118T160000", end: "20261118T170000", tz: AMS, extra: [`DESCRIPTION:${"d".repeat(3_000)}`] }])
+      yield* advanceToNextJob(kit)
+      yield* refreshed(kit)
+      assert.strictEqual((yield* stateOf(kit))!.error, "failed")
+      yield* keptLast(kit)
+    }), 60_000)
+
+  it.effect("a line of the answer that cannot be read fails the whole refresh: nothing of it is written or published", () =>
+    Effect.gen(function*() {
+      let body = one
+      const readTask = offThreadTask<typeof import("./badAnswer.task.ts").default>(new URL("./badAnswer.task.ts", import.meta.url))
+      const { kit } = yield* startCalendar({ "https://cal.example.org/family.ics": () => served(body) }, { ...familyOnly, deps: { readTask } })
+      assert.isUndefined((yield* stateOf(kit))!.error)
+      body = ics([
+        { uid: "dentist", summary: "Dentist", start: "20261118T160000", end: "20261118T170000", tz: AMS },
+        { uid: "gym", summary: "Gym", start: "20261118T190000", end: "20261118T200000", tz: AMS }
+      ], ["X-BROKEN:1"])
+      yield* advanceToNextJob(kit)
+      yield* refreshed(kit)
+      assert.strictEqual((yield* stateOf(kit))!.error, "failed")
+      yield* keptLast(kit)
     }), 60_000)
 })
