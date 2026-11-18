@@ -1,5 +1,5 @@
-// A ring arriving in the middle of a turn does not move the turn's first audio (docs/NOTIFICATIONS.md "Latency"),
-// measured with TurnTrace: the same scripted turn (the real Conversation, zero-delay synthesis and output, a language
+// How far a ring arriving in the middle of a turn moves the turn's first audio (docs/NOTIFICATIONS.md "Latency"),
+// measured with TurnTrace (at most 2 ms is asserted; 0.8 ms measured): the same scripted turn (the real Conversation, zero-delay synthesis and output, a language
 // model whose first token comes 5 ms after the request) with and without a ring sent while the model "thinks". The
 // ring is the heaviest delivery the bounds allow at once: everywhere, to 64 connected devices, every card encoded as
 // the hub encodes a frame, on the SQLite store, in the same process and on the same thread as the turn. Runs are
@@ -23,7 +23,7 @@ const p95 = (xs: ReadonlyArray<number>) => [...xs].sort((a, b) => a - b)[Math.fl
 const DEVICES = Array.from({ length: 64 }, (_, i) => contractDevice(`device-${String(i).padStart(2, "0")}-xxxxxxxx`, `Device ${i}`, `Room ${i % 8}`, "shared", null))
 
 describe("a ring in the middle of a turn", () => {
-  it("does not move end of turn -> playbackStart (TurnTrace, counterbalanced)", async () => {
+  it("moves end of turn -> playbackStart by less than 2 ms (TurnTrace, counterbalanced)", async () => {
     const measure = (withRing: boolean) =>
       Effect.scoped(Effect.gen(function*() {
         const store = yield* makeSqliteStore({ filename: join(mkdtempSync(join(tmpdir(), "pva-notify-turn-")), "household.db") })

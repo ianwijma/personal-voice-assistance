@@ -179,10 +179,23 @@ withheld where the rule says no (no reduced form in this version).
 
 ## Latency
 
-Measured (development machine; `packages/store-sqlite/test/notifyLatency.test.ts` and `notifyTurnLatency.test.ts`
-print them; the bounds are asserted with `bound()`, three times them on CI). See the pull request for the numbers of
-the run that wrote this page; nothing here runs on a turn's path but `send` (one transaction and an enqueue), `resolve`
-and `say` (decisions and an enqueue).
+Measured on the development machine (`packages/store-sqlite/test/notifyLatency.test.ts` and `notifyTurnLatency.test.ts`
+print them; they run in the latency step, and assert their bounds with `bound()`, three times them on CI). SQLite on a
+file, every text at its bound with the costliest characters, 64 devices:
+
+| What | Number |
+|---|---|
+| `send` as a tool calls it (300 calls) | median 0.56 ms, p95 0.74 ms, worst 0.98 ms; longest main-thread stop 2.5 ms |
+| `say` to one device / to every device (64 decisions) | median 0.02 ms / 0.17 ms, worst 0.54 / 0.57 ms; longest stop 1.4 ms |
+| a delivery pass of every open notification to every device (64 × 64: 4,096 decisions and frames, 3.1 MiB encoded), when do not disturb changes | 16.7 ms of work in all, in steps; longest stop 1.5 ms |
+| a device saying hello (64 cards) | 0.33 ms; longest stop 1.0 ms |
+| end of turn → first audio (`TurnTrace`, the real `Conversation`, zero-delay synthesis and output, the model's first token at 5 ms; median of 100 turns × 4 counterbalanced runs) | without a ring 5.48 ms (p95 5.90); with a ring to all 64 devices sent while the model thinks 6.29 ms (p95 7.06) |
+
+So a ring in the middle of a turn, at the heaviest the bounds allow (the `send` transaction, the service's jobs waking the
+scheduler and 64 cards encoded, all on the turn's thread), moved the turn's first audio by a median 0.8 ms, not zero;
+the test asserts it stays under 2 ms. A delivery yields every 8 devices and after each notification of a sweep (before
+that change, measured: a full pass held the thread 4.6 ms at once and the turn moved 0.7 ms, so the steps bounded the
+stop but not the turn's shift, which is mostly the work itself sharing the thread).
 
 ## Testing
 
