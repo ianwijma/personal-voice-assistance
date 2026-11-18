@@ -40,7 +40,11 @@ import type { Json, JsonObject } from "./common.ts"
  * **Changes.** `changes()` makes a stream for the consumer to run in its own part's scope (`Effect.forkScoped` in
  * `shared`). Each run first gets a `snapshot` of the cache now (`reason: "subscribed"`), then one `changed` or
  * `removed` per entity change and a `connection` per change of the connection state. After a reconnect it sends a
- * fresh `snapshot` (`reason: "reconnected"`). When a consumer falls more than `HA_LIMITS.queue` changes behind, the
+ * fresh `snapshot` (`reason: "reconnected"`). **The first successful load is a reconnect too**: a consumer that
+ * subscribed while the cache was empty (`unknown`, an empty `subscribed` snapshot) gets the first loaded state as one
+ * `snapshot` with `reason: "reconnected"`, before any `changed` or `removed`; filling the cache sends no `changed`
+ * per entity (no `previous: undefined` for everything Home Assistant already had). Every provider does the same, so a
+ * consumer has one path: every snapshot replaces what it knew. When a consumer falls more than `HA_LIMITS.queue` changes behind, the
  * changes it has not taken are dropped and the next thing it gets is a `snapshot` (`reason: "overflow"`) of the cache
  * at that moment, followed by the changes after it. **A snapshot is a state, not news**: a consumer compares it with
  * what it knew and never reads it as things having just happened (presence must not announce everyone as having just

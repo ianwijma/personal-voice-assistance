@@ -1,5 +1,5 @@
 import { Context, Effect, Layer, Schema, SchemaAST as AST } from "effect"
-import type { ActionError, ActionOutcome, RegisteredAction } from "./Actions.ts"
+import { type ActionError, type ActionOutcome, actionToolName, type RegisteredAction } from "./Actions.ts"
 import type { ToolCall, ToolResult, ToolSpec } from "./Domain.ts"
 import { type ActionCallOptions, defaultGateway, type ExecutionGateway, prepareTool } from "./Gateway.ts"
 import { registerRegistryGateway } from "./GatewayPrivate.ts"
@@ -77,6 +77,18 @@ export interface ToolRegistryOptions {
    * names it anyway reaches the gateway, which refuses it.
    */
   readonly gateway?: ExecutionGateway
+}
+
+/**
+ * A module's part as one assistant has it: without the tools it switched off (`offTools`: a tool's name, or an
+ * action's generated tool name `<moduleId>_<actionId>`), and without the intent actions whose generated tool name it
+ * switched off. Serve mode builds each assistant's registry, the model's tool list, with it; so does the test kit.
+ */
+export const withoutOffTools = (module: AssistantModule, offTools: ReadonlyArray<string>): AssistantModule => {
+  if (offTools.length === 0) return module
+  const off = new Set(offTools)
+  const intentActions = module.intentActions?.filter((a) => !off.has(actionToolName(a.moduleId, a.definition.id)))
+  return { ...module, tools: (module.tools ?? []).filter((t) => !off.has(t.name)), ...(intentActions !== undefined ? { intentActions } : {}) }
 }
 
 /** A registry of `modules`' tools; each tool belongs to the module whose `name` lists it (the module host names parts by module id). */

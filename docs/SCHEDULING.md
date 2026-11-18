@@ -65,9 +65,10 @@ const job = yield* ctx.scheduler.schedule({
 - **Payload**: JSON of at most 1,000 characters (as `JSON.stringify` writes it, escapes included); anything else is
   `invalid`. An absent payload is `{}`. Keep larger data in your own collection and schedule its id. When the handler
   is published (or registered by the start being published) at the moment of `schedule`, `prepare` or `reschedule`,
-  the payload is checked against its schema there, and one that does not decode is `invalid` (P11). It is decoded by
-  the handler's schema again when the job runs; a payload that does not decode then (a job scheduled before its
-  handler appeared, a schema that decodes asynchronously) fails the job, and it is not retried.
+  the payload is checked against its schema there, and one that does not decode is `invalid` (P11), as is one whose
+  decoder throws. Only a schema that cannot decide synchronously (it decodes asynchronously) is accepted unchecked. It
+  is decoded by the handler's schema again when the job runs; a payload that does not decode then (a job scheduled
+  before its handler appeared, a schema that decodes asynchronously) fails the job, and it is not retried.
 - **Key**: one live (`scheduled` or `running`) job per module and key. Scheduling the same key again replaces the live
   one, which becomes `cancelled` (and its Health issue, if it had one, goes); a finished job of that key, a `failed` one
   too, is not touched. Keys: 1–100 letters, digits and `_ . : @ / -`.

@@ -3,7 +3,7 @@
 // `@pva/core/testing`), programmed with what the contract's documentation allows; the consumer below is the example
 // docs/MODULES.md quotes.
 import { assert, describe, it } from "@effect/vitest"
-import { defineModule, makeTool, type ModuleHostApi } from "@pva/core"
+import { defineModule, makeTool, type ModuleHostApi, NOT_ONE_LINE } from "@pva/core"
 import { fails, provide, startTestModule, STORED_TEXT_PATTERN_SOURCE, stops, stubService } from "@pva/core/testing"
 import { Effect, Schema } from "effect"
 import {
@@ -12,10 +12,13 @@ import {
   HomeAssistant,
   homeLanguage,
   isContractId,
+  isLine,
   Lists,
   ListsError,
   type ListsService,
   Playback,
+  PlaybackError,
+  type PlaybackService,
   ProviderOff,
   providerOffText,
   say,
@@ -103,10 +106,28 @@ describe("the keys and the authoring helpers", () => {
     assert.deepStrictEqual([Lists.id, Timers.id, HomeAssistant.id, Playback.id, BriefingSections.id], ["lists", "timers", "home-assistant", "playback", "briefing.sections"])
   })
 
+  it.effect("a relative volume change without a known level has its own refusal (a stub programmed as the contract says)", () =>
+    Effect.gen(function*() {
+      const playback = stubService<PlaybackService>("playback", { changeVolume: fails(new PlaybackError({ reason: "unknown_level", detail: "no level yet" })) })
+      const refused = yield* Effect.flip(playback.service.changeVolume("Kitchen", { by: 0.1 }))
+      assert.strictEqual(refused.reason, "unknown_level")
+    }))
+
   it("isContractId takes an explicit bound", () => {
     assert.isTrue(isContractId("a".repeat(200), 200))
     assert.isFalse(isContractId("a".repeat(201), 200))
     assert.isFalse(isContractId("a b", 10))
+  })
+
+  it("isLine is the core's one-line rule (NOT_ONE_LINE), with a bound and no lone surrogates", () => {
+    assert.isTrue(isLine("Rice, 2 bags 🍚", 20))
+    assert.isFalse(isLine("x".repeat(21), 20))
+    assert.isFalse(isLine("lone \ud800", 20))
+    // C0, DEL, C1 (NEL, CSI), the line and paragraph separators, a bidirectional control: refused, as NOT_ONE_LINE does.
+    for (const c of ["\n", "\t", "\u007f", "\u0085", "\u009b", "\u2028", "\u2029", "\u202e"]) {
+      assert.isTrue(NOT_ONE_LINE.test(`a${c}b`))
+      assert.isFalse(isLine(`a${c}b`, 20), JSON.stringify(c))
+    }
   })
 
   it("StoredText keeps text whose JSON is at most twice as long, and the kit knows its pattern", () => {

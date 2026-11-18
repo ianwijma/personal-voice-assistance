@@ -1,4 +1,4 @@
-import { isModuleStopped, type ModuleHostApi, type ServiceKey } from "@pva/core"
+import { isModuleStopped, type ModuleHostApi, NOT_ONE_LINE, type ServiceKey } from "@pva/core"
 import { Cause, Data, Effect } from "effect"
 
 /**
@@ -65,9 +65,13 @@ export const useService = <T, A, E, R>(
 export const providerOffText = (language: Language, module: string): string =>
   language === "nl" ? `De module ${module} staat uit.` : `The ${module} module is off.`
 
-/** Whether `text` is a well-formed bounded one-line text: no control characters, no lone surrogates, at most `max` UTF-16 units. */
+/**
+ * Whether `text` is a well-formed bounded one-line text: at most `max` UTF-16 units, no lone surrogates, and none of
+ * the characters the core's own one-line rule refuses (`NOT_ONE_LINE` of `@pva/core`, the rule Members and settings
+ * use: every control character, C0, DEL and C1, the line and paragraph separators, and the bidirectional controls).
+ */
 export const isLine = (text: unknown, max: number): text is string =>
-  typeof text === "string" && text.length <= max && !/[\u0000-\u001f\u007f]/.test(text) && !LONE_SURROGATE.test(text)
+  typeof text === "string" && text.length <= max && !NOT_ONE_LINE.test(text) && !LONE_SURROGATE.test(text)
 
 const LONE_SURROGATE = /[\ud800-\udbff](?![\udc00-\udfff])|(?<![\ud800-\udbff])[\udc00-\udfff]/
 

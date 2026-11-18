@@ -2,7 +2,7 @@
 // the default risk policy enforced by the gateway, a tool without parameters sent as an object schema, bad tool names
 // refused when a module starts, and a job's payload checked when it is scheduled (with the cron check exported).
 import { assert, describe, it } from "@effect/vitest"
-import { Effect, Schema } from "effect"
+import { Effect, Schema, SchemaGetter } from "effect"
 import { defineAction } from "../src/Actions.ts"
 import { makeTool } from "../src/Module.ts"
 import { defineModule, type ModuleDefinition } from "../src/ModuleDefinition.ts"
@@ -195,6 +195,40 @@ describe("the scheduler checks a payload when a job is scheduled", () => {
       yield* core.schedule({ handler: "empty", inMs: 1_000 })
       yield* advance(1_000)
       assert.deepStrictEqual(runs, [{ n: 3 }, {}])
+    }))
+
+  it.effect("a decoder that throws is a refusal at schedule, prepare and reschedule; one that decodes asynchronously is decided when the job runs", () =>
+    Effect.gen(function*() {
+      const { scheduler, advance } = yield* makeTestScheduler()
+      const core = scheduler.forCore("core.test")
+      const runs: Array<unknown> = []
+      const early = yield* core.schedule({ handler: "broken", payload: { n: "x" }, inMs: 60_000 })
+      const broken = Schema.Struct({ n: Schema.String }).check(Schema.makeFilter(() => {
+        throw new Error("decoder broke")
+      }))
+      const slow = Schema.Struct({}).pipe(Schema.decodeTo(Schema.Struct({}), {
+        decode: SchemaGetter.transformEffect((x) => Effect.as(Effect.sleep(1), x)),
+        encode: SchemaGetter.transform((x) => x)
+      }))
+      yield* Effect.forkScoped(core.handle("broken", { payload: broken, run: (p) => Effect.sync(() => void runs.push(p)) }))
+      yield* Effect.forkScoped(core.handle("slow", { payload: slow, run: (p) => Effect.sync(() => void runs.push(p)) }))
+      yield* Effect.yieldNow
+      for (const refused of [
+        yield* Effect.flip(core.schedule({ handler: "broken", payload: { n: "x" }, inMs: 1_000 })),
+        yield* Effect.flip(core.prepare({ handler: "broken", payload: { n: "x" }, inMs: 1_000 })),
+        yield* Effect.flip(core.reschedule(early.id, { inMs: 1_000 }))
+      ]) {
+        assert.strictEqual(refused.reason, "invalid")
+        assert.match(refused.message, /decoder failed \(decoder broke\)/)
+      }
+      // The refused reschedule left the job as it was.
+      assert.strictEqual((yield* core.get(early.id))?.dueAt, early.dueAt)
+      // An asynchronous decoder is accepted when scheduled, and decoded when the job runs.
+      const accepted = yield* core.schedule({ handler: "slow", inMs: 1_000 })
+      yield* advance(1_001)
+      yield* advance(10)
+      assert.deepStrictEqual(runs, [{}])
+      assert.strictEqual((yield* core.get(accepted.id))?.state, "done")
     }))
 
   it("the cron check is exported: what schedule accepts, and why it refuses", () => {

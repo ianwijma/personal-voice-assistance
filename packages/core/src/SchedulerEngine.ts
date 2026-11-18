@@ -716,16 +716,20 @@ export const makeSchedulerEngine = (options: SchedulerEngineOptions): Effect.Eff
         const codec = Schema.toCodecJson(handler.payload)
         decode = Schema.decodeUnknownEffect(codec) as Published["decode"]
         const decodeNow = Schema.decodeUnknownExit(codec)
-        // Only a decoding that fails at once is a problem here; one that cannot be decided synchronously (a schema with
-        // asynchronous decoding) is checked when the job runs, as before.
+        // A decoding that fails at once is a refusal, and so is a decoder that throws (a defect): the payload cannot be
+        // shown to fit. Only one that cannot be decided synchronously (a schema with asynchronous decoding) is left to
+        // the run, which decodes it then.
         payloadProblem = (u) => {
           try {
             const exit = decodeNow(u)
             if (Exit.isSuccess(exit)) return undefined
             const failed = exit.cause.reasons.find(Cause.isFailReason)
-            return failed === undefined ? undefined : messageOf(failed.error)
-          } catch {
-            return undefined
+            if (failed !== undefined) return messageOf(failed.error)
+            const died = exit.cause.reasons.find(Cause.isDieReason)
+            if (died === undefined || Cause.isAsyncFiberError(died.defect)) return undefined
+            return `its payload schema's decoder failed (${messageOf(died.defect)})`
+          } catch (error) {
+            return `its payload schema's decoder failed (${messageOf(error)})`
           }
         }
       } catch (error) {

@@ -1,5 +1,4 @@
 import {
-  actionToolName,
   type AgentTurnSetup,
   type HostResult,
   Llm,
@@ -21,7 +20,8 @@ import {
   type TurnTrace,
   type VoiceRef,
   voiceKey,
-  withinModuleFrame
+  withinModuleFrame,
+  withoutOffTools
 } from "@pva/core"
 import {
   type Assistant,
@@ -37,6 +37,7 @@ import {
   hearerOf,
   homeLineOf,
   linkedModuleDefaults,
+  homeValuesOf,
   engineSummary,
   type VoiceInfo,
   type ServerMessage,
@@ -331,13 +332,7 @@ export const startServe = (options: ServeOptions): Effect.Effect<ServeHandle, Ht
     })
     if (env[MEMBERS_KEY] !== undefined && env[MEMBERS_KEY] !== "") yield* Effect.logWarning(`${MEMBERS_KEY} is set in the environment. ${MEMBERS_ENV_REFUSED}`)
     /** The Home values the modules' linked defaults come from (docs/ASSISTANTS.md §2.6). */
-    const homeDefaults = (moduleId: string) =>
-      linkedModuleDefaults({
-        location: String(sections.value("HOME_LOCATION") ?? ""),
-        units: sections.value("HOME_UNITS") === "imperial" ? "imperial" : "metric",
-        timeZone: String(sections.value("HOME_TIME_ZONE") ?? ""),
-        dateFormat: String(sections.value("HOME_DATE_FORMAT") ?? "en-GB")
-      })[moduleId]
+    const homeDefaults = (moduleId: string) => linkedModuleDefaults(homeValuesOf((key) => sections.value(key)))[moduleId]
     // Module API v2: what the modules need is probed before any starts (concurrently, 5 s at most; never on a turn).
     const checker = makeRequirementChecker({ dataDir: options.dataDir })
     yield* checker.probeCatalog(catalog)
@@ -600,12 +595,7 @@ export const startServe = (options: ServeOptions): Effect.Effect<ServeHandle, Ht
         const choice = assistant.modules[part.moduleId]
         if (choice === undefined || !choice.on) return []
         if (choice.offTools.length === 0) return [part]
-        const off = new Set(choice.offTools)
-        const intentActions = part.module.intentActions?.filter((a) => !off.has(actionToolName(a.moduleId, a.definition.id)))
-        return [{
-          ...part,
-          module: { ...part.module, tools: (part.module.tools ?? []).filter((t) => !off.has(t.name)), ...(intentActions !== undefined ? { intentActions } : {}) }
-        }]
+        return [{ ...part, module: withoutOffTools(part.module, choice.offTools) }]
       })
       /** The modules it has on that run (capabilities; for the turn's configuration snapshot). */
       const modules = parts.reduce((n, p) => (isCapability(p.moduleId) && p.unavailable !== true ? n + 1 : n), 0)

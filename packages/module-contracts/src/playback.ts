@@ -22,8 +22,17 @@ import { Data, type Effect } from "effect"
  * **Operations.** `pause(room)` pauses the room's player if it is playing and answers whether it did (`false`:
  * nothing was playing, or the provider does not know the player's state yet, in which case it does nothing).
  * `changeVolume(room, change)` takes a level from 0 to 1 (`to`) or a step from −1 to 1 (`by`, "louder" is +0.1);
- * another number is `invalid`. It answers the new level from 0 to 1. A room no player serves is `no_player`. Each is
- * one call to the player within `PLAYBACK_LIMITS.callTimeoutMs` (`timeout` after that: it may still have happened).
+ * another number (or not a finite number) is `invalid`. It answers the level the player was set to, from 0 to 1:
+ *
+ * - `to` sets that level.
+ * - `by` is relative to the player's present level, and the result is **clamped to 0 to 1**: "louder" at 0.95 sets 1
+ *   and answers 1, "quieter" at 0.05 sets 0 and answers 0; it is never `invalid` for leaving the range.
+ * - When the provider does not know the player's present level (at its start, or after it lost the player's state),
+ *   a `by` is refused with `unknown_level` and nothing is changed: it never guesses a starting level. A `to` needs
+ *   no present level.
+ *
+ * A room no player serves is `no_player`. Each is one call to the player within `PLAYBACK_LIMITS.callTimeoutMs`
+ * (`timeout` after that: it may still have happened).
  *
  * **Errors.** `PlaybackError.reason` is for the consumer to word in its own two languages; `detail` for the log only.
  *
@@ -37,8 +46,11 @@ export const PLAYBACK_LIMITS = { roomChars: 60, callTimeoutMs: 3_000 } as const
 
 /** A refusal or failure (see "Errors" above). */
 export class PlaybackError extends Data.TaggedError("PlaybackError")<{
-  /** `no_player`: nothing serves that room. `invalid`: a room, level or step out of range. `timeout`, `failed`: the player. */
-  readonly reason: "no_player" | "invalid" | "timeout" | "failed"
+  /**
+   * `no_player`: nothing serves that room. `invalid`: a room, level or step out of range. `unknown_level`: a relative
+   * change while the player's present level is not known (nothing changed). `timeout`, `failed`: the player.
+   */
+  readonly reason: "no_player" | "invalid" | "unknown_level" | "timeout" | "failed"
   readonly detail: string
 }> {}
 
