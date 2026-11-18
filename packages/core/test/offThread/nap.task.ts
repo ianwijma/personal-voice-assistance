@@ -1,6 +1,8 @@
-// Waits `input` ms, and says when it ran (wall clock, comparable across threads).
-export default async (input: number): Promise<{ readonly start: number; readonly end: number }> => {
-  const start = Date.now()
-  await new Promise((resolve) => setTimeout(resolve, input))
-  return { start, end: Date.now() }
+// Waits `ms`, and says which call it was and when it ran (epoch ms with sub-millisecond precision, comparable across
+// threads).
+export default async (input: { readonly ms: number; readonly id: number }): Promise<{ readonly id: number; readonly start: number; readonly end: number }> => {
+  const now = () => performance.timeOrigin + performance.now()
+  const start = now()
+  await new Promise((resolve) => setTimeout(resolve, input.ms))
+  return { id: input.id, start, end: now() }
 }
