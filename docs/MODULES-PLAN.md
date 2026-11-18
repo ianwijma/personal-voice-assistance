@@ -461,6 +461,13 @@ The scheduler does one thing: it calls a module's handler at a time, once.
 - **Limits**: payload size, 200 live jobs per module, cron expressions that never fire are refused when scheduled.
 - **Admin**: a list of jobs, read page by page, with cancel. Cancelling a job that is running does not interrupt the
   run; its outcome is ignored.
+- **As built** (after the rebuild's first review): keys are at most 100 characters and an origin's ids at most 64;
+  the job row is at most 2,500 characters, so `list` and every sweep read 10 rows a page; the admin list serves at
+  most 20 jobs a request, is not a snapshot, and its cursor is a token of the running server (400 after a restart);
+  the Health page shows the 48 newest failures and says how many more there are; a repeating job's failure stays
+  until an occurrence succeeds (a missed one does not clear it); a pass takes one due job per handler per round, so
+  no handler starves another. A module must not catch a failure of scheduling inside its own transaction, other
+  than a refusal, and go on with that transaction: joined code cannot make the outer transaction fail.
 - A core service schedules with the same engine under its own name (P9 for notifications due later and for the end
   of do not disturb), with handlers registered when the server starts.
 
