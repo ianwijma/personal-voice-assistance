@@ -331,6 +331,10 @@ export const makeExecutionGateway = (options: GatewayOptions = {}): ExecutionGat
       if (problem !== undefined) return Effect.succeed(problem)
       let risk: ToolRisk | undefined
       let failure: string | undefined
+      // Only a risk function of the input (module code) has the budget. A fixed or inferred risk is the host's own
+      // lookup: timing it measured whatever else held the thread (a collection, another process on a busy machine)
+      // and refused an ordinary call as unjudged.
+      const judgedByModule = typeof meta.risk === "object"
       const started = performance.now()
       try {
         risk = riskOf(meta, call.input)
@@ -339,7 +343,7 @@ export const makeExecutionGateway = (options: GatewayOptions = {}): ExecutionGat
         failure = "its risk function threw or answered a class it does not declare"
       }
       const ms = performance.now() - started
-      if (failure === undefined && ms > RISK_BUDGET_MS) failure = `its risk function took ${ms.toFixed(1)} ms (at most ${RISK_BUDGET_MS} ms)`
+      if (failure === undefined && judgedByModule && ms > RISK_BUDGET_MS) failure = `its risk function took ${ms.toFixed(1)} ms (at most ${RISK_BUDGET_MS} ms)`
       if (failure !== undefined || risk === undefined) {
         return Effect.as(Effect.logWarning(`Execution gateway: ${call.name} (module ${call.moduleId ?? "none"}) refused: ${failure}`), UNJUDGED)
       }
