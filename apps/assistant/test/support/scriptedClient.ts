@@ -41,6 +41,12 @@ export interface PlayerOptions {
   readonly speed?: number
   /** Report interval (wall clock). Default 250 ms. */
   readonly progressMs?: number
+  /**
+   * The player's clock in ms: how far it has played is this clock's time since its first frame (times `speed`).
+   * Default `performance.now`. A test that needs the page at a given place in the reply gives a clock of its own and
+   * moves it, so a busy machine cannot carry the page further than the test says.
+   */
+  readonly now?: () => number
   /** Reported in playback.started. */
   readonly outputLatencyMs?: number
   /**
@@ -96,6 +102,7 @@ export class ScriptedClient {
       enabled: options.player?.enabled ?? true,
       speed: options.player?.speed ?? 1,
       progressMs: options.player?.progressMs ?? 250,
+      now: options.player?.now ?? (() => performance.now()),
       outputLatencyMs: options.player?.outputLatencyMs ?? 12,
       provisionalStop: options.player?.provisionalStop
     }
@@ -319,8 +326,8 @@ export class ScriptedClient {
     reply.received += pcm.length / 2
     if (!this.player.enabled) return
     if (reply.startedAt === undefined) {
-      reply.firstFrameAt = performance.now()
-      reply.startedAt = performance.now()
+      reply.firstFrameAt = this.player.now()
+      reply.startedAt = this.player.now()
       this.send({ type: "playback.started", turnId, outputLatencyMs: this.player.outputLatencyMs, startDelayMs: 0 })
       reply.timer = setInterval(() => this.tick(reply), this.player.progressMs)
     }
@@ -329,7 +336,7 @@ export class ScriptedClient {
   /** Samples "handed to the device" so far: limited by what arrived and by wall-clock time. */
   private advance(reply: Reply) {
     if (reply.startedAt === undefined) return
-    const elapsed = (performance.now() - reply.startedAt) / 1000
+    const elapsed = (this.player.now() - reply.startedAt) / 1000
     reply.played = Math.max(reply.played, Math.min(reply.received, Math.floor(elapsed * reply.sampleRate * this.player.speed)))
   }
 
