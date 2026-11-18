@@ -1017,6 +1017,7 @@ const endChangedSessions = (before: ReadonlyMap<string, string>, everyone = fals
       // Nothing more is sent on it from here on.
       c.welcomed = false
       conns.delete(c)
+      mockHeld.delete(c.id)
       c.ws.close(CloseCode.settingsChanged, "settings changed")
     }
   }
@@ -1432,11 +1433,21 @@ const requireAdmin = (c: Conn, requestId: string): boolean => {
 
 type NotificationCardWire = Extract<ServerMessage, { type: "notification.ring" }>["notification"]
 /** Open notifications: the card, its device (absent: everywhere), whether its module's handler is down. */
-const mockNotifications = new Map<string, { readonly card: Omit<NotificationCardWire, "show" | "sound">; readonly deviceId?: string; readonly handlerDown: boolean }>()
-/** What each voice connection holds (by connection id), as the server keeps it per connection. */
+const mockNotifications = new Map<string, { readonly card: Omit<NotificationCardWire, "show" | "sound" | "texts">; readonly deviceId?: string; readonly handlerDown: boolean }>()
+/** What each voice connection holds (by connection id), as the server keeps it per connection; gone with the connection. */
 const mockHeld = new Map<string, Set<string>>()
-/** Ids are never reused (a counter, not the map's size). */
+/** Ids are never reused: every id ever issued or named (kept across resets), and a counter that skips them. */
 let mockNotifySeq = 0
+const mockNotifyIds = new Set<string>()
+/**
+ * The service's own words on the card and in its answers, in the saved household language (as `NotifyTexts` in
+ * packages/core: the test compares the two).
+ */
+const MOCK_NOTIFY_TEXTS = {
+  en: { cantNow: "I can't do that right now.", done: "Done.", region: "Notifications", startAudio: "Start audio to hear it." },
+  nl: { cantNow: "Dat kan ik nu niet doen.", done: "Klaar.", region: "Meldingen", startAudio: "Zet het geluid aan om het te horen." }
+} as const
+const mockNotifyTexts = () => (String(valueOf("HOME_LANGUAGE") ?? "").toLowerCase().startsWith("nl") ? MOCK_NOTIFY_TEXTS.nl : MOCK_NOTIFY_TEXTS.en)
 const resetState = () => {
   mockNotifications.clear()
   mockHeld.clear()
@@ -1501,22 +1512,31 @@ const notifyConns = (deviceId: string | undefined) => [...conns].filter((c) => c
  * decision function (`decideDelivery`) over the device's effective outputs (`deviceOutputsFrom`), sent per device; a
  * card the connection holds and may not any more is withdrawn. (The mock has no do not disturb and no personal content.)
  */
-const reconcileMock = (c: Conn) => {
-  if (c.frontend !== "voice" || c.deviceId === undefined || !c.welcomed) return
-  const deviceId = c.deviceId
+/** The shared decision for one notification on a device now. */
+const decideMock = (deviceId: string, n: { readonly card: { readonly priority: "normal" | "ring" } }) => {
   const outputs = deviceOutputsFrom(assistantsMock.deviceFields(deviceId).settings, devices.get(deviceId)?.declared?.capabilities)
+  return decideDelivery({ kind: "notification", priority: n.card.priority, personal: false, mayReveal: true, dnd: false, device: { connected: true, canSpeak: outputs.speak, canShow: outputs.show } })
+}
+const reconcileMock = (c: Conn) => {
+  if (c.frontend !== "voice" || c.deviceId === undefined || !c.welcomed || !conns.has(c)) return
+  const deviceId = c.deviceId
   const held = mockHeld.get(c.id) ?? new Set<string>()
   mockHeld.set(c.id, held)
+  const texts = mockNotifyTexts()
   for (const [id, n] of mockNotifications) {
     if (n.deviceId !== undefined && n.deviceId !== deviceId) continue
-    const d = decideDelivery({ kind: "notification", priority: n.card.priority, personal: false, mayReveal: true, dnd: false, device: { connected: true, canSpeak: outputs.speak, canShow: outputs.show } })
+    const d = decideMock(deviceId, n)
     if (d.deliver) {
-      sendTo(c, { type: "notification.ring", notification: { ...n.card, show: d.show, sound: d.sound } })
+      sendTo(c, { type: "notification.ring", notification: { ...n.card, show: d.show, sound: d.sound, texts: { region: texts.region, startAudio: texts.startAudio } } })
       held.add(id)
     } else if (held.delete(id)) sendTo(c, { type: "notification.resolved", id, outcome: "withdrawn" })
   }
 }
-const notificationsAfterWelcome = reconcileMock
+/** After a hello (which may have changed the device's declaration): every connection of the device, as the server. */
+const notificationsAfterWelcome = (c: Conn) => {
+  if (c.deviceId === undefined) return reconcileMock(c)
+  for (const x of notifyConns(c.deviceId)) reconcileMock(x)
+}
 const resolveMockNotification = (id: string, outcome: string) => {
   const n = mockNotifications.get(id)
   if (n === undefined) return false
@@ -2690,13 +2710,19 @@ const onClientMessage = (c: Conn, m: ClientMessage) => {
       // module's handler (POST /mock/notify with "handlerDown": true makes it answer "I can't do that right now").
       if (c.frontend !== "voice" || c.deviceId === undefined) return result(c, m.requestId, false, { code: "bad_message", message: "A notification is answered from a voice page of its device" })
       const n = mockNotifications.get(m.id)
-      const cant = { type: "result" as const, requestId: m.requestId, ok: false, error: { code: "not_running" as const, message: "I can't do that right now." }, say: "I can't do that right now." }
-      // As the server: only a connection that holds the card may press it (Stop too).
+      const texts = mockNotifyTexts()
+      const cant = { type: "result" as const, requestId: m.requestId, ok: false, error: { code: "not_running" as const, message: texts.cantNow }, say: texts.cantNow }
+      // As the server: only a connection that holds the card may press it (Stop too), and only while the decision
+      // still allows it on the device (a page whose card should have gone is reconciled, and refused).
       if (mockHeld.get(c.id)?.has(m.id) !== true || n === undefined) return sendTo(c, { ...cant, error: { code: "bad_message", message: cant.say } })
+      if (!decideMock(c.deviceId, n).deliver) {
+        for (const x of notifyConns(c.deviceId)) reconcileMock(x)
+        return sendTo(c, { ...cant, error: { code: "bad_message", message: cant.say } })
+      }
       if (m.actionId !== "stop" && !n.card.actions.some((a) => a.id === m.actionId)) return sendTo(c, { ...cant, error: { code: "bad_message", message: cant.say } })
       if (m.actionId !== "stop" && n.handlerDown) return sendTo(c, cant)
       resolveMockNotification(m.id, m.actionId)
-      return sendTo(c, { type: "result", requestId: m.requestId, ok: true, say: "Done." })
+      return sendTo(c, { type: "result", requestId: m.requestId, ok: true, say: texts.done })
     }
     case "device.caps": {
       // Protocol 11: what the device can do changed, or its live state; admin's device list follows.
@@ -2816,6 +2842,7 @@ wss.on("connection", (ws: WebSocket) => {
   })
   ws.on("close", () => {
     conns.delete(c)
+    mockHeld.delete(c.id)
     log(c.id, "closed")
     if (c.deviceId !== undefined) {
       const record = devices.get(c.deviceId)
@@ -3369,23 +3396,29 @@ const http = createServer((req, res) => {
         // P9: a notification delivered as the server would: {"id"?, "title", "text"?, "ring"?, "silent"?, "deviceId"?
         // (absent: everywhere), "actions"? [{ id, label }], "handlerDown"?}. Sent to the voice pages of its device now
         // and to each that says hello while it is open.
-        if (typeof payload.id === "string" && mockNotifications.has(payload.id)) return json(res, 409, { error: "that id belongs to an open notification" })
-        const id = typeof payload.id === "string" ? payload.id : `n-mock-${++mockNotifySeq}`
+        // An id is never used twice: a named one already issued or named is refused; a generated one skips them all.
+        if (typeof payload.id === "string" && mockNotifyIds.has(payload.id)) return json(res, 409, { error: "that id was used already" })
+        let id = typeof payload.id === "string" ? payload.id : `n-mock-${++mockNotifySeq}`
+        while (typeof payload.id !== "string" && mockNotifyIds.has(id)) id = `n-mock-${++mockNotifySeq}`
+        mockNotifyIds.add(id)
         const title = typeof payload.title === "string" ? payload.title.slice(0, 60) : "Notification"
         const ring = payload.ring === true
-        const card: Omit<NotificationCardWire, "show" | "sound"> = {
+        const card: Omit<NotificationCardWire, "show" | "sound" | "texts"> = {
           id,
           title,
           ...(typeof payload.text === "string" ? { text: payload.text.slice(0, 200) } : {}),
           priority: ring ? "ring" : "normal",
           actions: [{ id: "stop", label: "Stop" }, ...(Array.isArray(payload.actions) ? (payload.actions as Array<{ id: string; label: string }>).slice(0, 2) : [])],
-          sentAt: Date.now(),
-          texts: { region: "Notifications", startAudio: "Start audio to hear it." }
+          sentAt: Date.now()
         }
         const deviceId = typeof payload.deviceId === "string" ? payload.deviceId : undefined
         mockNotifications.set(id, { card, ...(deviceId !== undefined ? { deviceId } : {}), handlerDown: payload.handlerDown === true })
         for (const c of notifyConns(deviceId)) reconcileMock(c)
         return json(res, 200, { id })
+      }
+      case "/mock/notify/held": {
+        // The bookkeeping (tests): how many connections the mock keeps what they hold for, and how many are open.
+        return json(res, 200, { held: mockHeld.size, voiceConnections: notifyConns(undefined).length })
       }
       case "/mock/notify/resolve": {
         const id = typeof payload.id === "string" ? payload.id : ""
