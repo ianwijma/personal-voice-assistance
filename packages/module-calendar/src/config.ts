@@ -145,3 +145,43 @@ export const ownerOf = (c: Pick<CalendarConfig, "owner">, people: PeopleService 
 }
 
 export const sameName = (a: string, b: string) => a.trim().toLowerCase() === b.trim().toLowerCase()
+
+const decoded = (s: string) => {
+  try {
+    return decodeURIComponent(s)
+  } catch {
+    return s
+  }
+}
+
+/**
+ * What text read from a calendar must not contain, for a calendar read from a private link (a secret): the address
+ * itself (with and without its scheme, as typed and decoded), its path and query, and each of its parts long enough to
+ * be a token (12 characters or more: `private-0a1b2c…`, a base64 key, an e-mail address). Lower case; compared with
+ * text that is lower-cased and decoded too. A typed address is not a secret: nothing is forbidden for it.
+ */
+export const secretPartsOf = (c: Pick<CalendarConfig, "link">, address: string): ReadonlyArray<string> => {
+  if (c.link === "address") return []
+  const parts = new Set<string>()
+  const add = (s: string) => {
+    const t = s.trim().toLowerCase()
+    if (t.length >= 8) {
+      parts.add(t)
+      parts.add(decoded(t))
+    }
+  }
+  add(address)
+  add(address.replace(/^[a-z]+:\/\//i, ""))
+  let url: URL | undefined
+  try {
+    url = new URL(address)
+  } catch {
+    url = undefined
+  }
+  if (url !== undefined) {
+    add(`${url.host}${url.pathname}${url.search}`)
+    add(`${url.pathname}${url.search}`)
+    for (const piece of `${url.pathname}${url.search}${url.hash}`.split(/[/?&=#;]+/)) if (piece.length >= 12 || decoded(piece).length >= 12) add(piece)
+  }
+  return [...parts].filter((p) => p.length >= 8)
+}

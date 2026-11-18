@@ -5,7 +5,7 @@ import { makeBriefingSection } from "./briefing.ts"
 import { LINK_SLOTS, refreshCron, settings } from "./config.ts"
 import { makeReader, type Reader } from "./read.ts"
 import { type CalendarDeps, makeRefresh } from "./refresh.ts"
-import { occurrences, sources, upcoming, upcomingPersonal } from "./store.ts"
+import { occurrences, sources } from "./store.ts"
 import { makeTools } from "./tools.ts"
 
 /**
@@ -13,14 +13,15 @@ import { makeTools } from "./tools.ts"
  * scheduled job keeps (docs/modules/calendar.md; docs/MODULES-PLAN.md §5.1 row 12, wave A, ICS only).
  *
  * - `shared`: the refresh job's handler (a cron job by the "Read the calendars every" setting, and one run at start),
- *   the reader over the store, and the briefing section (`BriefingSections`).
+ *   which reads each calendar off the main thread and publishes it as a new generation; the reader over the store;
+ *   and the briefing section (`BriefingSections`). Nothing of the calendars goes into the prompt (no ambient line).
  * - `start`: the read tools and the typed actions, all plain reads of the store; nothing on a turn reaches the network.
  *
  * Off by default; with it off, nothing changes for anyone.
  */
 
 export { texts } from "./texts.ts"
-export { occurrences, sources, upcoming, upcomingPersonal } from "./store.ts"
+export { occurrences, sources } from "./store.ts"
 export type { CalendarDeps } from "./refresh.ts"
 
 const SLOT_SETTING = { private1: "privateLink1", private2: "privateLink2", private3: "privateLink3" } as const
@@ -35,7 +36,7 @@ export const calendarModuleWith = (deps: CalendarDeps = {}) =>
     enabledByDefault: false,
     version: "0.1.0",
     settings,
-    storage: { version: 1, collections: [occurrences, sources, upcoming, upcomingPersonal] },
+    storage: { version: 1, collections: [occurrences, sources] },
     requires: [{ network: "internet", why: "Reads the ICS calendar addresses set on the module's page" }],
     health: ({ settings: s }) =>
       Effect.sync(() => {

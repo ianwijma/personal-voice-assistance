@@ -3,7 +3,7 @@ import { assert, describe, it } from "@effect/vitest"
 import type { TestHouseholdInput } from "@pva/core/testing"
 import { BRIEFING_LIMITS, type BriefingRequest, type BriefingSectionResult, BriefingSections } from "@pva/module-contracts"
 import { Effect, Exit } from "effect"
-import { allFixtures, AMS, calendar, everyone, ics, served, startCalendar } from "./fixtures.ts"
+import { advanceAndRefresh, allFixtures, AMS, calendar, everyone, ics, served, startCalendar } from "./fixtures.ts"
 
 const sentencesOf = (r: BriefingSectionResult) => (r._tag === "section" ? r.sentences : [])
 
@@ -67,7 +67,7 @@ describe("calendar: the briefing section", () => {
       assert.strictEqual(r.withheld, 0)
     }))
 
-  it.effect("empty when there is nothing; unavailable before the first read; the stale line when a calendar could not be read", () =>
+  it.effect("empty when there is nothing; unavailable before the first read", () =>
     Effect.gen(function*() {
       const empty = yield* startCalendar(allFixtures, { settings: { calendars: [calendar("Quiet", "https://cal.example.org/quiet.ics")] } })
       // The quiet calendar has no fixture: never read.
@@ -78,6 +78,49 @@ describe("calendar: the briefing section", () => {
       assert.deepStrictEqual(yield* (yield* sectionOf(none.kit, "kitchen-display"))(), { _tag: "empty" })
       const off = yield* startCalendar({}, {})
       assert.deepStrictEqual(yield* (yield* sectionOf(off.kit, "kitchen-display"))(), { _tag: "empty" })
+    }))
+
+  it.effect("finding 21: a calendar that could not be refreshed is said in the briefing, in its only sentence too, and with no events left", () =>
+    Effect.gen(function*() {
+      let down = false
+      let body = ics([{ uid: "dentist", summary: "Dentist", start: "20261118T140000", end: "20261118T150000", tz: AMS }])
+      const { kit } = yield* startCalendar({ "https://cal.example.org/family.ics": () => (down ? { status: 500, ...served("") } : served(body)) }, { settings: { calendars: [calendar("Family", "https://cal.example.org/family.ics")] } })
+      down = true
+      yield* advanceAndRefresh(kit, 3_600_000)
+      const gather = yield* sectionOf(kit, "kitchen-display")
+      assert.deepStrictEqual(sentencesOf(yield* gather()), [
+        "Today on the calendar: Dentist at two o'clock.",
+        "Family could not be refreshed since today at ten o'clock; this is what I had then."
+      ])
+      assert.deepStrictEqual(sentencesOf(yield* gather({ length: "short", maxSentences: 1 })), [
+        "Today on the calendar: Dentist at two o'clock; Family could not be refreshed since today at ten o'clock; this is what I had then."
+      ])
+      // The last good read had nothing left today: still said, never `empty`.
+      yield* kit.advance(5 * 3_600_000) // 16:00, the dentist is over
+      assert.deepStrictEqual(sentencesOf(yield* gather({ maxSentences: 1, now: yield* kit.now })), ["Today: nothing on the calendar; Family could not be refreshed since today at ten o'clock; this is what I had then."])
+      // The calendar has nothing on it at all, as last read: the same.
+      down = false
+      body = ics([])
+      yield* advanceAndRefresh(kit, 3_600_000)
+      down = true
+      yield* advanceAndRefresh(kit, 3_600_000)
+      const r = yield* gather({ now: yield* kit.now })
+      assert.strictEqual(r._tag, "section")
+      assert.include(sentencesOf(r).join(" "), "could not be refreshed")
+    }))
+
+  it.effect("finding 17: a day read only in part is said, not a briefing of nothing", () =>
+    Effect.gen(function*() {
+      const robin = ics(Array.from({ length: 200 }, (_, i) => ({ uid: `r${i}`, summary: `R${i}`, start: "20261118T110000", end: "20261118T113000", tz: AMS })))
+      const family = ics([{ uid: "f", summary: "School play", start: "20261118T150000", end: "20261118T160000", tz: AMS }])
+      const { kit } = yield* startCalendar({ "https://cal.example.org/family.ics": served(family), "https://cal.example.org/robin.ics": served(robin) }, {
+        settings: { calendars: [calendar("Family", "https://cal.example.org/family.ics"), calendar("Robin's", "https://cal.example.org/robin.ics", "Robin")] }
+      })
+      const r = yield* (yield* sectionOf(kit, "hall-screen"))()
+      assert.deepStrictEqual(sentencesOf(r), ["Today: nothing on the calendar.", "There are more events than I read; this is the first part."])
+      assert.deepStrictEqual((yield* kit.tool("calendar_agenda", { who: "household" }, { device: "hall-screen" })).value, {
+        spoken: "Today: nothing on the calendar. There are more events than I read; this is the first part."
+      })
     }))
 
   it.effect("sentences stay within the contract's bound with long titles, and are Dutch in a Dutch household", () =>

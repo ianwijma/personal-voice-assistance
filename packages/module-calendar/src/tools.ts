@@ -1,23 +1,28 @@
 import { ActionError, CurrentTurn, defineAction, makeTool, Param, type Row, type Sensitivity, ToolError } from "@pva/core"
-import { speakList, speakMoment } from "@pva/language"
+import { speakList } from "@pva/language"
 import { isLine, say, StoredText } from "@pva/module-contracts"
 import { Effect, Schema } from "effect"
-import { capital, FIND_ROWS, isSpoken, NEXT_ROWS, type Reader } from "./read.ts"
+import { capital, FIND_ROWS, identityOf, type Moment, NEXT_ROWS, type Notes, noteList, type Reader, resolveDay, type Spoken, type View, type Who } from "./read.ts"
 import { WINDOW_DAYS } from "./refresh.ts"
-import type { Occurrence } from "./store.ts"
+import { type Occurrence, ROWS_PAGE } from "./store.ts"
 import { texts } from "./texts.ts"
-import { addDays, dateOf, daysBetween, instantOf, parseClock, startOfDay, wallTimeOf } from "./time.ts"
+import { addDays, dateOf, daysBetween, instantOf, type LocalDate, parseClock, startOfDay } from "./time.ts"
 
 /**
  * The tools and typed actions (docs/modules/calendar.md, "Tools"). Every one is a plain read of the store's cache:
- * `speculative`, risk `read`, latency `instant`, no network on the turn. Results are small: the answer first, at most a
- * dozen events and "more", and the calendars' own text marked as data (`untrusted`).
+ * `speculative`, risk `read`, no network on the turn. Each reads first (`reader.consistent`: one generation per
+ * calendar), then decides who may hear what for the asking turn (`reader.view`, after the last read), then words the
+ * answer, always with what `coverage` says must be said beside it. Results are small: the answer first, at most a dozen
+ * events and "more", and the calendars' own text marked as data (`untrusted`).
  */
 
 /** The most events an agenda result lists (the rest are counted). */
 export const AGENDA_ITEMS = 12
 const FIND_ITEMS = 10
 const REDUCED_ITEMS = 6
+/** Items a spoken day lists, busy times a spoken day lists (the rest counted: "and 196 more"). */
+const SPOKEN_ITEMS = 5
+const SPOKEN_BUSY = 3
 
 const line = (max: number, description: string) =>
   StoredText(max).check(Schema.makeFilter((t: string) => isLine(t, max) || "one line, without line breaks")).annotate({ description })
@@ -42,209 +47,296 @@ const matches = (query: string, r: Row<Occurrence>) => {
   return words.length > 0 && words.every((w) => hay.includes(w))
 }
 
+/** The first personal owner among shown rows. */
+const ownerAmong = (rows: ReadonlyArray<Row<Occurrence>>) => rows.find((r) => r.value.owner !== undefined)?.value.owner
+
+const spokenWith = (first: string, notes: Notes): Spoken => ({ spoken: [first, ...noteList(notes)].join(" ") })
+
+/** The answer of "next": an event shown, one reduced to busy time, none, or a question; with its notes. */
+type NextAnswer =
+  | { readonly kind: "spoken"; readonly spoken: Spoken }
+  | { readonly kind: "shown"; readonly v: View; readonly r: Row<Occurrence>; readonly notes: Notes }
+  | { readonly kind: "reduced"; readonly v: View; readonly r: Row<Occurrence>; readonly notes: Notes }
+  | { readonly kind: "none"; readonly v: View; readonly cut: boolean; readonly notes: Notes }
+
 export const makeTools = (reader: Reader) => {
   const failedTool = () => Effect.map(reader.moment(undefined), (m) => new ToolError({ message: say(texts, m.lang, "unreadable") }))
   const asToolError = <A, E, R>(e: Effect.Effect<A, E, R>) => e.pipe(Effect.catch(() => Effect.flatMap(failedTool(), Effect.fail)))
 
-  /** The first personal owner among shown rows. */
-  const ownerAmong = (rows: ReadonlyArray<Row<Occurrence>>) => rows.find((r) => r.value.owner !== undefined)?.value.owner
+  const noCalendars = (m: Moment): Spoken | undefined => (m.configs.length === 0 ? { spoken: say(texts, m.lang, "noCalendars") } : undefined)
 
   /** The calendar's answer for some days, for the model. */
   const agenda = (input: { readonly day?: string; readonly days?: number; readonly who?: string }) =>
     Effect.gen(function*() {
-      const turn = yield* CurrentTurn
-      const m = yield* reader.moment(turn)
-      const pre = yield* reader.precheck(m)
-      if (pre !== undefined) return pre
-      const who = reader.resolveWho(m, input.who)
-      if (isSpoken(who)) return who
-      const first = reader.resolveDay(m, input.day)
-      if (isSpoken(first)) return first
+      const m = yield* reader.moment(yield* CurrentTurn)
+      const none = noCalendars(m)
+      if (none !== undefined) return none
+      const first = resolveDay(m, input.day)
+      if ("spoken" in first) return first
       const count = Math.max(1, Math.min(input.days ?? 1, WINDOW_DAYS - daysBetween(m.today, first) + 1))
+      const dates = Array.from({ length: count }, (_, k) => addDays(first, k))
+      const { states, value: reads } = yield* reader.consistent(() => Effect.forEach(dates, (d) => reader.readDay(d)))
+      // Every read is done: who may hear what is decided now.
+      const v = reader.view(m, states)
+      const who = v.who(input.who)
+      if ("spoken" in who) return who
+      const covered = v.relevant(who)
+      const pre = v.precheck(covered)
+      if (pre !== undefined) return pre
       const days: Array<{ day: string; events: Array<unknown> }> = []
       const busy: Array<unknown> = []
       const seen = new Set<string>()
-      const withheldKeys = new Set<string>()
+      const withheld = new Set<string>()
       const shownRows: Array<Row<Occurrence>> = []
-      let listed = 0
+      let continuesAfter: LocalDate | undefined
       let more = 0
-      let cut = false
+      let moreBusy = 0
       for (let k = 0; k < count; k++) {
-        const d = addDays(first, k)
-        const ev = yield* reader.dayEvents(m, d, who)
-        cut ||= ev.cut
+        const d = dates[k]!
         const events: Array<unknown> = []
-        for (const r of ev.show) {
-          // An event of several days is listed on its first day in the range only.
-          if (seen.has(reader.keyOf(r))) continue
-          seen.add(reader.keyOf(r))
-          shownRows.push(r)
-          if (listed < AGENDA_ITEMS) {
-            events.push(reader.shown(m, d, r))
-            listed++
-          } else more++
+        for (const r of reads[k]!.rows) {
+          if (!v.ok(r) || !v.meant(who, r)) continue
+          const id = identityOf(r)
+          // An event of several days is listed once, on its first day in the range, with its real start and end.
+          if (seen.has(id)) continue
+          seen.add(id)
+          const vis = v.visibility(r)
+          if (vis === "withhold") {
+            withheld.add(id)
+            continue
+          }
+          if (vis === "show") {
+            shownRows.push(r)
+            if (shownRows.length > AGENDA_ITEMS) {
+              more++
+              continue
+            }
+            events.push(v.shown(r))
+          } else if (busy.length < REDUCED_ITEMS) busy.push({ day: v.dayWords(d), ...v.reduced(d, r) })
+          else {
+            moreBusy++
+            continue
+          }
+          continuesAfter ??= v.beyondDay(r)
         }
-        for (const r of ev.reduce) {
-          if (seen.has(reader.keyOf(r))) continue
-          seen.add(reader.keyOf(r))
-          if (busy.length < REDUCED_ITEMS) busy.push({ day: reader.dayWords(m, d), ...reader.reduced(m, d, r) })
-          else more++
-        }
-        for (const key of ev.withheldKeys) withheldKeys.add(key)
-        if (events.length > 0) days.push({ day: reader.dayWords(m, d), events })
+        if (events.length > 0) days.push({ day: v.dayWords(d), events })
       }
-      const stale = yield* reader.staleNote(m)
-      const notes = {
-        ...(withheldKeys.size > 0 ? { withheld: say(texts, m.lang, "withheld", { count: withheldKeys.size }) } : {}),
-        ...(stale !== undefined ? { stale } : {}),
-        ...(cut ? { cut: say(texts, m.lang, "cut") } : {})
-      }
+      const notes = v.coverage(covered, { cut: reads.some((r) => r.cut), withheld: withheld.size, ...(continuesAfter !== undefined ? { continuesAfter } : {}) })
       if (days.length === 0 && busy.length === 0) {
-        const when = count === 1 ? reader.dayWords(m, first) : `${reader.dayWords(m, first)} – ${reader.dayWords(m, addDays(first, count - 1))}`
+        const when = count === 1 ? v.dayWords(first) : `${v.dayWords(first)} – ${v.dayWords(addDays(first, count - 1))}`
         const nothing = who.kind === "person" ? say(texts, m.lang, "nothingOnFor", { name: who.name, Day: capital(when) }) : say(texts, m.lang, "nothingOn", { Day: capital(when) })
-        return { spoken: [nothing, notes.withheld, notes.stale].filter((s) => s !== undefined).join(" ") }
+        return spokenWith(nothing, notes)
       }
       const owner = ownerAmong(shownRows)
       return {
-        ...(count === 1 ? { day: reader.dayWords(m, first), events: days[0]?.events ?? [] } : { days }),
+        ...(count === 1 ? { day: v.dayWords(first), events: days[0]?.events ?? [] } : { days }),
         ...(busy.length > 0 ? { busy } : {}),
         ...(more > 0 ? { more } : {}),
+        ...(moreBusy > 0 ? { moreBusy } : {}),
         ...notes,
         untrusted: say(texts, m.lang, "untrusted"),
         ...(owner !== undefined ? { owner } : {})
       }
     })
 
-  /** The first event from now (or, with `match`, the first that matches and has not ended). */
-  const next = (input: { readonly match?: string; readonly who?: string }) =>
-    Effect.gen(function*() {
-      const turn = yield* CurrentTurn
-      const m = yield* reader.moment(turn)
-      const pre = yield* reader.precheck(m)
-      if (pre !== undefined) return { pre }
-      const who = reader.resolveWho(m, input.who)
-      if (isSpoken(who)) return { pre: who }
-      let read = 0
-      for (let k = 0; k <= WINDOW_DAYS && read < NEXT_ROWS; k++) {
-        const d = addDays(m.today, k)
-        const ev = yield* reader.dayEvents(m, d, who, { fromNow: true })
-        read += ev.show.length + ev.reduce.length + ev.withheld
-        const candidates = [
-          ...ev.show.map((r) => ({ r, reduced: false })),
-          // A reduced event is never matched by its title: a match would tell what it is called.
-          ...(input.match === undefined ? ev.reduce.map((r) => ({ r, reduced: true })) : [])
-        ]
-          .filter(({ r }) => (input.match === undefined ? r.value.start >= m.now : matches(input.match, r)))
-          .sort((a, b) => a.r.value.start - b.r.value.start)
-        const hit = candidates[0]
-        if (hit !== undefined) return { m, d, hit }
+  /** The first event from now (or, with `match`, the first that matches and has not ended), with its notes. */
+  const decideNext = (v: View, rows: ReadonlyArray<Row<Occurrence>>, who: Who, match: string | undefined) => {
+    const seen = new Set<string>()
+    const withheld = new Set<string>()
+    for (const r of rows) {
+      if (!v.ok(r) || !v.meant(who, r) || r.value.end <= v.m.now) continue
+      const id = identityOf(r)
+      if (seen.has(id)) continue
+      seen.add(id)
+      const vis = v.visibility(r)
+      if (match !== undefined) {
+        // Only events shown here are searched: whether a hidden title matches changes nothing in the answer.
+        if (vis === "show" && matches(match, r)) return { hit: r, reduced: false, withheld: 0 }
+        continue
       }
-      // Past the bound without a hit, it says so: a partial read is never "nothing in the next 62 days".
-      return { m, none: true as const, cut: read >= NEXT_ROWS }
+      if (r.value.start < v.m.now) continue
+      if (vis === "withhold") withheld.add(id)
+      else return { hit: r, reduced: vis === "reduce", withheld: withheld.size }
+    }
+    return { hit: undefined, reduced: false, withheld: match !== undefined ? 0 : withheld.size }
+  }
+
+  const nextAnswer = (input: { readonly match?: string; readonly who?: string }) =>
+    Effect.gen(function*() {
+      const m = yield* reader.moment(yield* CurrentTurn)
+      const none = noCalendars(m)
+      if (none !== undefined) return { kind: "spoken", spoken: none } as NextAnswer
+      // Day by day from today, until an event is found or `NEXT_ROWS` rows have been read; every row read counts.
+      const { states, value: scan } = yield* reader.consistent((st) =>
+        Effect.gen(function*() {
+          const rows: Array<Row<Occurrence>> = []
+          let read = 0
+          for (let k = 0; k <= WINDOW_DAYS; k++) {
+            if (read >= NEXT_ROWS) return { rows, cut: true, stopped: false }
+            const d = addDays(m.today, k)
+            const day = yield* reader.readDay(d, k === 0 ? m.now : undefined)
+            read += day.read
+            rows.push(...day.rows)
+            rows.sort((a, b) => a.value.start - b.value.start || a.value.end - b.value.end)
+            const v = reader.view(m, st)
+            const who = v.who(input.who)
+            if ("spoken" in who) return { rows, cut: false, stopped: true }
+            const found = decideNext(v, rows, who, input.match)
+            if (day.cut) {
+              // A day read only in part: an event found in what was read is next only if nothing unread starts before it.
+              const last = day.rows.at(-1)?.value.start
+              const sure = k > 0 && found.hit !== undefined && last !== undefined && found.hit.value.start <= last
+              return { rows, cut: !sure, stopped: sure }
+            }
+            if (found.hit !== undefined) return { rows, cut: false, stopped: true }
+          }
+          return { rows, cut: false, stopped: false }
+        })
+      )
+      // Decided again now, after the last read, for this turn.
+      const v = reader.view(m, states)
+      const who = v.who(input.who)
+      if ("spoken" in who) return { kind: "spoken", spoken: who } as NextAnswer
+      const covered = v.relevant(who)
+      const pre = v.precheck(covered)
+      if (pre !== undefined) return { kind: "spoken", spoken: pre } as NextAnswer
+      const found = decideNext(v, scan.rows, who, input.match)
+      const notSearched = input.match !== undefined && v.unsearched(covered)
+      // Read only in part where it stopped: an unread event may come first, so no event is called the next one.
+      if (scan.cut) return { kind: "none", v, cut: true, notes: v.coverage(covered, { withheld: found.withheld, notSearched }) } as NextAnswer
+      if (found.hit === undefined) {
+        // Stopped at an event that is not one now (it changed while reading): the read was not complete either.
+        const cut = scan.cut || scan.stopped
+        return { kind: "none", v, cut, notes: v.coverage(covered, { withheld: found.withheld, notSearched }) } as NextAnswer
+      }
+      const beyond = v.beyondDay(found.hit)
+      const notes = v.coverage(covered, { withheld: found.withheld, notSearched, ...(beyond !== undefined ? { continuesAfter: beyond } : {}) })
+      return { kind: found.reduced ? "reduced" : "shown", v, r: found.hit, notes } as NextAnswer
     })
 
+  /** When the next event is, as a phrase: its start, and its end when that is on another day or after the days kept. */
+  const nextWhen = (v: View, r: Row<Occurrence>) => {
+    const val = r.value
+    const first = dateOf(val.start, v.m.zone)
+    const last = dateOf(val.end > val.start ? val.end - 1 : val.start, v.m.zone)
+    const start = val.allDay ? `${v.dayWords(first)}, ${say(texts, v.m.lang, "allDayBusy")}` : v.momentWords(val.start)
+    const beyond = v.beyondDay(r)
+    if (beyond !== undefined) return say(texts, v.m.lang, "untilAfter", { when: start, day: v.dayWords(beyond) })
+    if (daysBetween(first, last) === 0) return start
+    return say(texts, v.m.lang, "untilTo", { when: start, to: val.allDay ? v.dayWords(last) : v.momentWords(val.end) })
+  }
+
   const nextResult = (input: { readonly match?: string; readonly who?: string }) =>
-    Effect.gen(function*() {
-      const found = yield* next(input)
-      if ("pre" in found) return found.pre
-      const m = found.m
-      if ("none" in found) {
-        if (found.cut) return { spoken: say(texts, m.lang, "nextCut", { count: NEXT_ROWS }) }
-        return input.match === undefined
-          ? { spoken: say(texts, m.lang, "nextNone", { days: WINDOW_DAYS }) }
-          : { spoken: say(texts, m.lang, "nextNoneMatching", { match: input.match, days: WINDOW_DAYS }) }
+    Effect.map(nextAnswer(input), (a) => {
+      if (a.kind === "spoken") return a.spoken
+      const lang = a.v.m.lang
+      if (a.kind === "none") {
+        if (a.cut) return spokenWith(say(texts, lang, "nextCut", { count: NEXT_ROWS }), a.notes)
+        return spokenWith(
+          input.match === undefined ? say(texts, lang, "nextNone", { days: WINDOW_DAYS }) : say(texts, lang, "nextNoneMatching", { match: input.match, days: WINDOW_DAYS }),
+          a.notes
+        )
       }
-      const { d, hit } = found
-      if (hit.reduced) {
-        const red = reader.reduced(m, d, hit.r)
-        return { busy: { day: reader.dayWords(m, d), ...red } }
-      }
-      const v = hit.r.value
-      const w = wallTimeOf(v.start, m.zone)
-      const startDay = dateOf(v.start, m.zone)
-      const when = v.allDay ? `${reader.dayWords(m, startDay)}, ${say(texts, m.lang, "allDayBusy")}` : speakMoment({ date: startDay, time: { hour: w.hour, minute: w.minute } }, m.lang, m.today) ?? reader.dayWords(m, startDay)
+      const d = dateOf(a.r.value.start, a.v.m.zone)
+      if (a.kind === "reduced") return { busy: { day: a.v.dayWords(d), ...a.v.reduced(d, a.r) }, ...a.notes }
+      const val = a.r.value
       return {
-        next: { title: reader.titleOf(m, hit.r), when, calendar: reader.calendarOf(m, hit.r), ...(v.location !== undefined ? { place: v.location } : {}) },
-        untrusted: say(texts, m.lang, "untrusted"),
-        ...(v.owner !== undefined ? { owner: v.owner } : {})
+        next: { title: a.v.titleOf(a.r), when: nextWhen(a.v, a.r), calendar: a.v.calendarOf(a.r), ...(val.location !== undefined ? { place: val.location } : {}) },
+        ...a.notes,
+        untrusted: say(texts, lang, "untrusted"),
+        ...(val.owner !== undefined ? { owner: val.owner } : {})
       }
     })
 
   const find = (input: { readonly text: string; readonly who?: string }) =>
     Effect.gen(function*() {
-      const turn = yield* CurrentTurn
-      const m = yield* reader.moment(turn)
-      const pre = yield* reader.precheck(m)
+      const m = yield* reader.moment(yield* CurrentTurn)
+      const none = noCalendars(m)
+      if (none !== undefined) return none
+      const { states, value: scan } = yield* reader.consistent(() =>
+        Effect.gen(function*() {
+          const rows: Array<Row<Occurrence>> = []
+          let after: Row<Occurrence> | undefined
+          for (;;) {
+            const page = yield* reader.rows.list({ orderBy: { field: "start" }, limit: ROWS_PAGE, ...(after !== undefined ? { after } : {}) })
+            rows.push(...page)
+            if (page.length < ROWS_PAGE) return { rows, cut: false }
+            if (rows.length >= FIND_ROWS) {
+              const beyond = yield* reader.rows.list({ orderBy: { field: "start" }, limit: 1, after: page.at(-1)! })
+              return { rows, cut: beyond.length > 0 }
+            }
+            after = page.at(-1)
+          }
+        })
+      )
+      const v = reader.view(m, states)
+      const who = v.who(input.who)
+      if ("spoken" in who) return who
+      const covered = v.relevant(who)
+      const pre = v.precheck(covered)
       if (pre !== undefined) return pre
-      const who = reader.resolveWho(m, input.who)
-      if (isSpoken(who)) return who
       const found: Array<unknown> = []
       const shownRows: Array<Row<Occurrence>> = []
       const seen = new Set<string>()
-      let more = 0
-      let hidden = false
-      let read = 0
-      let cut = false
-      let after: Row<Occurrence> | undefined
-      for (;;) {
-        const page = yield* reader.rows.list({ orderBy: { field: "start" }, limit: 20, ...(after !== undefined ? { after } : {}) })
-        read += page.length
-        for (const r of page) {
-          if (r.value.end <= m.now || !m.valid(r) || !reader.meant(who, r) || seen.has(reader.keyOf(r))) continue
-          seen.add(reader.keyOf(r))
-          // Only events that may be shown here are searched.
-          if (m.visibility(r) !== "show" || (who.kind === "person" && who.reduced)) {
-            hidden = true
-            continue
-          }
-          if (!matches(input.text, r)) continue
-          shownRows.push(r)
-          if (found.length >= FIND_ITEMS) {
-            more++
-            continue
-          }
-          const d = dateOf(r.value.start, m.zone)
-          const w = wallTimeOf(r.value.start, m.zone)
-          found.push({
-            title: reader.titleOf(m, r),
-            when: r.value.allDay ? reader.dayWords(m, d) : speakMoment({ date: d, time: { hour: w.hour, minute: w.minute } }, m.lang, m.today) ?? reader.dayWords(m, d),
-            calendar: reader.calendarOf(m, r),
-            ...(r.value.location !== undefined ? { place: r.value.location } : {})
-          })
-        }
-        if (page.length < 20) break
-        if (read >= FIND_ROWS) {
-          cut = (yield* reader.rows.list({ orderBy: { field: "start" }, limit: 1, after: page.at(-1)! })).length > 0
-          break
-        }
-        after = page.at(-1)
+      let continuesAfter: LocalDate | undefined
+      for (const r of scan.rows) {
+        if (r.value.end <= m.now || !v.ok(r) || !v.meant(who, r)) continue
+        const id = identityOf(r)
+        if (seen.has(id)) continue
+        seen.add(id)
+        // Only events shown here are searched.
+        if (v.visibility(r) !== "show" || !matches(input.text, r)) continue
+        shownRows.push(r)
+        if (found.length >= FIND_ITEMS) continue
+        found.push({ title: v.titleOf(r), when: nextWhen(v, r), calendar: v.calendarOf(r), ...(r.value.location !== undefined ? { place: r.value.location } : {}) })
+        continuesAfter ??= v.beyondDay(r)
       }
-      const stale = yield* reader.staleNote(m)
-      const notes = [hidden ? say(texts, m.lang, "notSearched") : undefined, stale, cut ? say(texts, m.lang, "cut") : undefined].filter((s): s is string => s !== undefined)
-      if (found.length === 0) return { spoken: [say(texts, m.lang, "findNone", { text: input.text }), ...notes].join(" ") }
+      const notes = v.coverage(covered, { cut: scan.cut, notSearched: v.unsearched(covered), ...(continuesAfter !== undefined ? { continuesAfter } : {}) })
+      if (found.length === 0) return spokenWith(say(texts, m.lang, "findNone", { text: input.text }), notes)
       const owner = ownerAmong(shownRows)
-      return { found, ...(more > 0 ? { more } : {}), ...(notes.length > 0 ? { notes: notes.join(" ") } : {}), untrusted: say(texts, m.lang, "untrusted"), ...(owner !== undefined ? { owner } : {}) }
+      return {
+        found,
+        ...(shownRows.length > found.length ? { more: shownRows.length - found.length } : {}),
+        ...(noteList(notes).length > 0 ? { notes: noteList(notes).join(" ") } : {}),
+        untrusted: say(texts, m.lang, "untrusted"),
+        ...(owner !== undefined ? { owner } : {})
+      }
     })
 
   const free = (input: { readonly day?: string; readonly from?: string; readonly to?: string; readonly minMinutes?: number; readonly who?: string }) =>
     Effect.gen(function*() {
-      const turn = yield* CurrentTurn
-      const m = yield* reader.moment(turn)
-      const pre = yield* reader.precheck(m)
-      if (pre !== undefined) return pre
-      const who = reader.resolveWho(m, input.who)
-      if (isSpoken(who)) return who
-      const d = reader.resolveDay(m, input.day)
-      if (isSpoken(d)) return d
+      const m = yield* reader.moment(yield* CurrentTurn)
+      const none = noCalendars(m)
+      if (none !== undefined) return none
+      const d = resolveDay(m, input.day)
+      if ("spoken" in d) return d
       const from = parseClock(input.from ?? "08:00")!
       const to = parseClock(input.to ?? "21:00")!
       const at = (c: { hour: number; minute: number }) => (c.hour === 24 ? startOfDay(addDays(d, 1), m.zone) : instantOf({ ...d, hour: c.hour, minute: c.minute }, m.zone))
       const lo = at(from)
       const hi = at(to)
       if (hi <= lo) return { spoken: say(texts, m.lang, "badRange") }
-      const ev = yield* reader.dayEvents(m, d, who, { withHousehold: true })
-      const busyRows = [...ev.show, ...ev.reduce].filter((r) => r.value.busy)
-      const intervals = busyRows.map((r) => [Math.max(lo, r.value.start), Math.min(hi, r.value.end)] as const).filter(([a, b]) => b > a).sort((a, b) => a[0] - b[0])
+      const { states, value: day } = yield* reader.consistent(() => reader.readDay(d))
+      const v = reader.view(m, states)
+      const who = v.who(input.who)
+      if ("spoken" in who) return who
+      const covered = v.relevant(who, true)
+      const pre = v.precheck(covered)
+      if (pre !== undefined) return pre
+      const inRange = (r: Row<Occurrence>) => r.value.busy && r.value.start < hi && r.value.end > lo
+      const counted: Array<Row<Occurrence>> = []
+      const shownBusy: Array<Row<Occurrence>> = []
+      const withheld = new Set<string>()
+      for (const r of day.rows) {
+        if (!v.ok(r) || !v.meant(who, r, true) || !inRange(r)) continue
+        const vis = v.visibility(r)
+        if (vis === "withhold") withheld.add(identityOf(r))
+        else {
+          counted.push(r)
+          if (vis === "show") shownBusy.push(r)
+        }
+      }
+      const intervals = counted.map((r) => [Math.max(lo, r.value.start), Math.min(hi, r.value.end)] as const).sort((a, b) => a[0] - b[0])
       const minMs = (input.minMinutes ?? 30) * 60_000
       const slots: Array<readonly [number, number]> = []
       let cursor = lo
@@ -253,21 +345,18 @@ export const makeTools = (reader: Reader) => {
         cursor = Math.max(cursor, b)
       }
       if (hi - cursor >= minMs) slots.push([cursor, hi])
-      const Day = capital(reader.dayWords(m, d))
-      const fromW = reader.timeOf(m, lo)
-      const toW = reader.timeOf(m, hi)
+      const Day = capital(v.dayWords(d))
+      const fromW = v.timeOf(lo)
+      const toW = v.timeOf(hi)
       const sentence = slots.length === 0
         ? say(texts, m.lang, "freeNone", { Day, from: fromW, to: toW, minutes: input.minMinutes ?? 30 })
         : slots.length === 1 && slots[0]![0] === lo && slots[0]![1] === hi
         ? say(texts, m.lang, "freeAll", { Day, from: fromW, to: toW })
-        : say(texts, m.lang, "freeList", { Day, list: speakList(slots.map(([a, b]) => say(texts, m.lang, "freeSlot", { from: reader.timeOf(m, a), to: reader.timeOf(m, b) })), m.lang, { max: 6 }) ?? "" })
-      const stale = yield* reader.staleNote(m)
-      // Only the events in the range that would have counted are left out of this answer.
-      const left = ev.withheldRows.filter((r) => r.value.busy && r.value.start < hi && r.value.end > lo).length
-      const withheld = left > 0 ? say(texts, m.lang, "withheld", { count: left }) : undefined
+        : say(texts, m.lang, "freeList", { Day, list: speakList(slots.map(([a, b]) => say(texts, m.lang, "freeSlot", { from: v.timeOf(a), to: v.timeOf(b) })), m.lang, { max: 6 }) ?? "" })
+      const notes = v.coverage(covered, { cut: day.cut, withheld: withheld.size })
       // Whose busy time the answer is made of: only the events inside the range count.
-      const owner = ownerAmong(ev.show.filter((r) => r.value.busy && r.value.start < hi && r.value.end > lo))
-      return { spoken: [sentence, withheld, stale, ev.cut ? say(texts, m.lang, "cut") : undefined].filter((s) => s !== undefined).join(" "), ...(owner !== undefined ? { owner } : {}) }
+      const owner = ownerAmong(shownBusy)
+      return { ...spokenWith(sentence, notes), ...(owner !== undefined ? { owner } : {}) }
     })
 
   const tools = [
@@ -286,7 +375,7 @@ export const makeTools = (reader: Reader) => {
     }),
     makeTool({
       name: "calendar_next",
-      description: "The next event on the calendars, or the next one whose title or place has some words: \"when is the dentist\", \"what's next\".",
+      description: "The next event on the calendars, or the next one whose title or place has some words: \"when is the dentist\", \"what's next\". For \"my next appointment\" pass who \"me\".",
       parameters: Schema.Struct({ match: Schema.optionalKey(line(80, "Words of the event's title or place (\"dentist\")")), who: Schema.optionalKey(WHO) }),
       speculative: true,
       latency: "quick",
@@ -321,40 +410,70 @@ export const makeTools = (reader: Reader) => {
 
   // ---- typed actions: spoken as they are, with no model ------------------------------------------------------------
 
-  /** A day's events as one or a few sentences: the events, who is busy when, what is not read out, what is stale. */
+  /** A day's events as one or a few sentences: the events, who is busy when, and every note `coverage` gives. */
   const daySentence = (offset: number) =>
     Effect.gen(function*() {
-      const turn = yield* CurrentTurn
-      const m = yield* reader.moment(turn)
-      const pre = yield* reader.precheck(m)
-      if (pre !== undefined) return pre.spoken
+      const m = yield* reader.moment(yield* CurrentTurn)
+      const none = noCalendars(m)
+      if (none !== undefined) return none.spoken
       const d = addDays(m.today, offset)
-      const ev = yield* reader.dayEvents(m, d, { kind: "all" })
-      const parts: Array<string> = []
-      const items = ev.show.slice(0, 100).map((r) => reader.item(m, d, r))
-      const Day = capital(reader.dayWords(m, d))
-      if (items.length > 0) parts.push(say(texts, m.lang, "dayList", { Day, list: speakList(items, m.lang, { max: 5 }) ?? "" }))
-      for (const r of ev.reduce.slice(0, 3)) {
-        const red = reader.reduced(m, d, r)
-        parts.push(say(texts, m.lang, "busy", { name: red.busy, when: say(texts, m.lang, "busyFromTo", { from: red.from, to: red.to }) }))
+      const { states, value: day } = yield* reader.consistent(() => reader.readDay(d))
+      const v = reader.view(m, states)
+      const covered = v.relevant({ kind: "all" })
+      const pre = v.precheck(covered)
+      if (pre !== undefined) return pre.spoken
+      const seen = new Set<string>()
+      const withheld = new Set<string>()
+      const shownRows: Array<Row<Occurrence>> = []
+      const reducedRows: Array<Row<Occurrence>> = []
+      let continuesAfter: LocalDate | undefined
+      for (const r of day.rows) {
+        if (!v.ok(r)) continue
+        const id = identityOf(r)
+        if (seen.has(id)) continue
+        seen.add(id)
+        const vis = v.visibility(r)
+        if (vis === "show") shownRows.push(r)
+        else if (vis === "reduce") reducedRows.push(r)
+        else withheld.add(id)
       }
+      const parts: Array<string> = []
+      const Day = capital(v.dayWords(d))
+      const spokenShown = shownRows.slice(0, SPOKEN_ITEMS)
+      const spokenBusy = reducedRows.slice(0, SPOKEN_BUSY)
+      for (const r of [...spokenShown, ...spokenBusy]) continuesAfter ??= v.beyondDay(r)
+      if (shownRows.length > 0) parts.push(say(texts, m.lang, "dayList", { Day, list: v.listOf(spokenShown.map((r) => v.item(d, r)), shownRows.length, SPOKEN_ITEMS) }))
+      const busyWhen = (r: Row<Occurrence>) => {
+        const red = v.reduced(d, r)
+        return { name: red.busy, when: say(texts, m.lang, "busyFromTo", { from: red.from, to: red.to }) }
+      }
+      if (reducedRows.length === 1) parts.push(say(texts, m.lang, "busy", busyWhen(reducedRows[0]!)))
+      else if (reducedRows.length > 1) parts.push(say(texts, m.lang, "busyList", { list: v.listOf(spokenBusy.map((r) => say(texts, m.lang, "busyItem", busyWhen(r))), reducedRows.length, SPOKEN_BUSY) }))
       if (parts.length === 0) parts.push(say(texts, m.lang, "nothingOn", { Day }))
-      if (ev.withheld > 0) parts.push(say(texts, m.lang, "withheld", { count: ev.withheld }))
-      const stale = yield* reader.staleNote(m)
-      if (stale !== undefined) parts.push(stale)
+      parts.push(...noteList(v.coverage(covered, { cut: day.cut, withheld: withheld.size, ...(continuesAfter !== undefined ? { continuesAfter } : {}) })))
       return parts.join(" ")
     })
 
   const failedAction = () => Effect.map(reader.moment(undefined), (m) => new ActionError({ message: say(texts, m.lang, "unreadable") }))
   const asAction = (e: Effect.Effect<string, unknown>) => e.pipe(Effect.map((s) => ({ say: s })), Effect.catch(() => Effect.flatMap(failedAction(), Effect.fail)))
 
-  const nextSentence = (match: string | undefined) =>
-    Effect.gen(function*() {
-      const r = yield* nextResult(match !== undefined && match.trim() !== "" ? { match } : {})
-      const lang = (yield* reader.moment(undefined)).lang
-      if ("spoken" in r) return r.spoken
-      if ("busy" in r) return say(texts, lang, "busy", { name: r.busy.busy, when: `${r.busy.day} ${say(texts, lang, "busyFromTo", { from: r.busy.from, to: r.busy.to })}` })
-      return say(texts, lang, "nextIs", { title: r.next.title, when: r.next.when })
+  const nextSentence = (input: { readonly match?: string; readonly who?: string }) =>
+    Effect.map(nextAnswer(input), (a) => {
+      if (a.kind === "spoken") return a.spoken.spoken
+      const lang = a.v.m.lang
+      if (a.kind === "none") {
+        if (a.cut) return spokenWith(say(texts, lang, "nextCut", { count: NEXT_ROWS }), a.notes).spoken
+        return spokenWith(
+          input.match === undefined ? say(texts, lang, "nextNone", { days: WINDOW_DAYS }) : say(texts, lang, "nextNoneMatching", { match: input.match, days: WINDOW_DAYS }),
+          a.notes
+        ).spoken
+      }
+      if (a.kind === "reduced") {
+        const d = dateOf(a.r.value.start, a.v.m.zone)
+        const red = a.v.reduced(d, a.r)
+        return spokenWith(say(texts, lang, "busy", { name: red.busy, when: `${a.v.dayWords(d)} ${say(texts, lang, "busyFromTo", { from: red.from, to: red.to })}` }), a.notes).spoken
+      }
+      return spokenWith(say(texts, lang, "nextIs", { title: a.v.titleOf(a.r), when: nextWhen(a.v, a.r) }), a.notes).spoken
     })
 
   const actions = [
@@ -381,12 +500,22 @@ export const makeTools = (reader: Reader) => {
     defineAction({
       id: "next_event",
       label: "The next event",
-      description: "Say the next event on the calendars. Not for a named event (\"when is the dentist\"): that is when_is.",
-      examples: ["what's next on the calendar", "when is my next appointment", "what is my next appointment", "wat is mijn volgende afspraak", "wat staat er hierna in de agenda"],
+      description: "Say the next event on all the calendars. Not for the asker's own (\"my next appointment\"): that is my_next; not for a named event: that is when_is.",
+      examples: ["what's next on the calendar", "what's the next thing on the calendar", "wat staat er hierna in de agenda", "wat is het volgende in de agenda"],
       params: {},
       speculative: true,
       offerAsTool: false,
-      run: () => asAction(nextSentence(undefined))
+      run: () => asAction(nextSentence({}))
+    }),
+    defineAction({
+      id: "my_next",
+      label: "My next appointment",
+      description: "Say the next event on the asking person's own calendars; with nobody known asking, it asks whose.",
+      examples: ["when is my next appointment", "what is my next appointment", "what's next for me", "wat is mijn volgende afspraak", "wanneer is mijn volgende afspraak"],
+      params: {},
+      speculative: true,
+      offerAsTool: false,
+      run: () => asAction(nextSentence({ who: "me" }))
     }),
     defineAction({
       id: "when_is",
@@ -396,10 +525,9 @@ export const makeTools = (reader: Reader) => {
       params: { match: Param.text({ label: "Words of the title", after: ["when is", "when's", "wanneer is"], maxWords: 6 }) },
       speculative: true,
       offerAsTool: false,
-      run: ({ match }) => asAction(nextSentence(match))
+      run: ({ match }) => asAction(nextSentence(match.trim() !== "" ? { match } : {}))
     })
   ]
 
   return { tools, actions, daySentence }
 }
-
