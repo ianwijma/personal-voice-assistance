@@ -4,6 +4,10 @@
  * (`startTestModule`) and fails, naming each rule and the place, for what the docs state as a rule a module can break
  * without noticing. `moduleProblems` answers the list instead of failing. Exported from `@pva/core/testing` only.
  *
+ * It checks the definition, the start, and what the module declares and does **while it starts**: it runs no tool,
+ * action or job, so what those do (their results, the jobs they schedule, what they speak) is for the module's own
+ * tests (docs/MODULES.md, "What your tests must cover").
+ *
  * The rules (`ModuleProblem.rule`):
  *
  * | rule | what fails |
@@ -11,28 +15,33 @@
  * | `api-version` | the module does not declare `apiVersion: 2` |
  * | `off-by-default` | a new module is on before the owner chose (`enabledByDefault` not `false`) |
  * | `form` | its described settings form does not encode with the wire's schema or exceeds its budget |
- * | `start` | it does not start in the real host with the given settings and secrets |
- * | `secret` | a secret's value appears in a status line, an error, a form, a Health issue, a tool's name or description, an action's text, instructions, a route or a context provider's name |
+ * | `start` | it does not start in the real host with the given settings and secrets (the host refuses, among others, a tool name providers refuse, a name used twice, an action whose generated tool name is over 64 characters) |
+ * | `secret` | a secret's value appears in a status line, an error, a form, a Health issue, a tool's name or description, an action's text, instructions or a context provider's name |
  * | `risk` | a tool or action that is not a plain read (`speculative: true`) declares no risk class |
- * | `risk-said` | one that can be `money` or `security` does not say so in its description |
- * | `tool-name` | a tool's name, or an action's generated tool name `<moduleId>_<actionId>`, is not 1–64 of `[A-Za-z0-9_-]`, or a name is used twice |
- * | `tool-description` | a tool's description is empty or over 1,024 characters |
- * | `tool-parameters` | a tool's parameters are not a JSON object schema, or name a property outside 1–64 of `[A-Za-z0-9_.-]` |
+ * | `risk-said` | one that can be `money` or `security` (refused by the gateway's risk policy) does not say so in its description |
+ * | `tool-name` | a tool's name, or an action's generated tool name `<moduleId>_<actionId>`, is not 1–64 of `[A-Za-z0-9_-]`, or a name is used twice in one instance |
+ * | `tool-description` | a tool's description, or an action's generated tool's, is empty or over 1,024 characters |
+ * | `tool-parameters` | a tool's parameters, or an action's generated tool's, are not sent as a JSON object schema, or name a property outside 1–64 of `[A-Za-z0-9_.-]` |
  * | `action-examples` | an action declares no `examples` (the keyword decider and the model have nothing to match) |
- * | `stored-value` | a collection's worst legal value is longer than its `maxChars` (or unbounded: a string or list without a maximum) |
+ * | `stored-value` | a collection the store's declaration check refuses; a root value that is not an object; a worst legal value longer than `maxChars` (or unbounded); an indexed field whose legal values the store's index refuses |
  * | `scheduler-shared` | a scheduler handler is registered in an instance's `start` instead of `shared` |
- * | `cron` | a cron expression it scheduled is outside the accepted grammar (refused by the real engine) |
- * | `job-payload` | a job it scheduled has a payload its handler's schema does not decode (every run of it would fail) |
+ * | `cron` | a cron schedule it asked for while starting is refused by the real engine |
+ * | `job-payload` | a job it asked for while starting has a payload its handler's schema does not decode (refused by the engine, or not checkable then because the handler came later) |
  * | `health` | it requires the network but declares no `health`, or its `health()` fails, dies or does not answer in time |
- * | `texts` | the spoken texts it declares (`options.texts`) differ between English and Dutch in keys or placeholders, or one is empty or not one line |
+ * | `texts` | the spoken texts it declares (`options.texts`) differ between English and Dutch in keys or in the set of placeholder names, or one is empty or not one line |
+ *
+ * Every instance the household's assistants make (one per distinct set of effective settings) is checked; a problem
+ * two instances share is reported once.
  */
 import { Data, Effect, Exit, Schema } from "effect"
-import type { Collection } from "./HouseholdStore.ts"
+import { type Collection, defineCollection, MAX_INDEXED_CHARS, RESERVED_FIELDS } from "./HouseholdStore.ts"
 import type { ModuleDefinition } from "./ModuleDefinition.ts"
 import type { StartedPart } from "./ModuleRegistrations.ts"
 import { toolMetadata, type Tool } from "./Module.ts"
-import { actionToolName, type ActionDefinition } from "./Actions.ts"
+import { type ActionDefinition, actionTool, registerActions } from "./Actions.ts"
+import { toolSpec } from "./ToolRegistry.ts"
 import { recordParts, startTestModule, type StartTestModuleOptions } from "./ModuleTestKit.ts"
+import { isSchedulerCron } from "./SchedulerEngine.ts"
 
 export interface ModuleProblem {
   /** The rule's id (the table above). */
@@ -67,8 +76,11 @@ export class ModuleCheckFailed extends Data.TaggedError("ModuleCheckFailed")<{ r
  */
 export const STORED_TEXT_PATTERN_SOURCE = "^[^\\u0000-\\u0007\\u000b\\u000e-\\u001f\\ud800-\\udfff]*$"
 
-/** The longest JSON text of a JavaScript number (`-1.7976931348623157e+308`). */
-const NUMBER_CHARS = 24
+/**
+ * The most characters `JSON.stringify` writes for a finite JavaScript number: a sign, 17 significant digits, a point
+ * and the longest place for it (`-0.0000010000000000000002` is 25; `-1.7976931348623157e+308` is 24).
+ */
+const NUMBER_CHARS = 25
 
 type Worst = { readonly chars: number } | { readonly unbounded: string }
 
@@ -76,7 +88,7 @@ type Worst = { readonly chars: number } | { readonly unbounded: string }
  * The most characters of JSON a value of this JSON Schema can take (`JSON.stringify`, the store's `maxChars`
  * measure), or the path of the first part that has no bound. Every optional field is counted as present; a string
  * costs 6 characters of JSON per UTF-16 unit (a control character's `\u0000` escape), 2 when it is a `StoredText`;
- * a number 24 (an integer between bounds, the longer bound).
+ * a number 25 (an integer between bounds, the longer bound).
  */
 export const worstJsonChars = (document: { readonly schema: unknown; readonly definitions?: Readonly<Record<string, unknown>> }): Worst => {
   const defs = document.definitions ?? {}
@@ -171,6 +183,93 @@ export const collectionWorst = (collection: Pick<Collection<any>, "schema">): Wo
   }
 }
 
+type JsonNode = Record<string, unknown>
+
+/**
+ * What the store would refuse of a collection, before any write: its declaration (the store's own `defineCollection`
+ * check, run again on what the module declares), a stored value that is not an object, and an indexed field whose
+ * legal values the index refuses (an index holds a string of at most 500 characters without NUL or a lone surrogate, a
+ * finite number or a boolean, or nothing).
+ */
+export const collectionProblems = (collection: Collection<any>): ReadonlyArray<string> => {
+  try {
+    defineCollection({
+      name: collection.name,
+      scope: collection.scope,
+      schema: collection.schema,
+      maxChars: collection.maxChars,
+      indexes: collection.indexes,
+      migrate: collection.migrate,
+      ...(collection.ambient !== undefined ? { ambient: collection.ambient, ambientRows: collection.ambientRows } : {}),
+      ...(collection.project !== undefined ? { project: collection.project } : {})
+    })
+  } catch (e) {
+    return [`the store refuses its declaration: ${e instanceof Error ? e.message : String(e)}`]
+  }
+  let document: { readonly schema: unknown; readonly definitions: Readonly<Record<string, unknown>> }
+  try {
+    document = Schema.toJsonSchemaDocument(Schema.toCodecJson(collection.schema as Schema.Codec<unknown, unknown>))
+  } catch {
+    return [] // `stored-value` reports a schema without a JSON form
+  }
+  const deref = (node: unknown, depth = 0): JsonNode | undefined => {
+    if (typeof node !== "object" || node === null || depth > 32) return undefined
+    const n = node as JsonNode
+    return typeof n.$ref === "string" ? deref(document.definitions[n.$ref.replace(/^#\/(\$defs|definitions)\//, "")], depth + 1) : n
+  }
+  const members = (n: JsonNode): ReadonlyArray<unknown> | undefined => (Array.isArray(n.anyOf) ? n.anyOf : Array.isArray(n.oneOf) ? n.oneOf : undefined)
+  const isObject = (node: unknown): boolean => {
+    const n = deref(node)
+    if (n === undefined) return false
+    const m = members(n)
+    return m !== undefined ? m.length > 0 && m.every(isObject) : n.type === "object"
+  }
+  const out: Array<string> = []
+  const root = deref(document.schema)
+  if (root === undefined || !isObject(root)) {
+    out.push("its value is not always an object, and the store keeps only objects: make its schema a Schema.Struct")
+    return out
+  }
+  const scalar = (v: unknown) => typeof v === "boolean" || (typeof v === "number" && Number.isFinite(v)) || (typeof v === "string" && v.length <= MAX_INDEXED_CHARS && !v.includes("\u0000"))
+  const indexProblem = (node: unknown): string | undefined => {
+    const n = deref(node)
+    if (n === undefined) return "has no schema the check can read"
+    if (Array.isArray(n.enum)) return n.enum.every(scalar) ? undefined : "can hold a value an index cannot (only strings of at most 500, finite numbers and booleans)"
+    if ("const" in n) return scalar(n.const) ? undefined : "can hold a value an index cannot (only strings of at most 500, finite numbers and booleans)"
+    const m = members(n)
+    if (m !== undefined) return m.map(indexProblem).find((p) => p !== undefined)
+    switch (n.type) {
+      case "string":
+        if (typeof n.maxLength !== "number" || n.maxLength > MAX_INDEXED_CHARS) return `can be longer than the ${MAX_INDEXED_CHARS} characters an index holds: give it a maximum of at most ${MAX_INDEXED_CHARS}`
+        if (typeof n.pattern !== "string") return "can hold a NUL or a lone surrogate, which an index refuses: use StoredText(n) or a pattern"
+        return undefined
+      case "number":
+      case "integer":
+      case "boolean":
+        return undefined
+      case "null":
+        return "can be null, which an index refuses: leave the field out instead"
+      default:
+        return "is not a string, a number or a boolean, so an index cannot hold it"
+    }
+  }
+  const propertyOf = (field: string): unknown => {
+    const shapes = members(root) ?? [root]
+    for (const shape of shapes) {
+      const props = deref(shape)?.properties as Record<string, unknown> | undefined
+      if (props !== undefined && field in props) return props[field]
+    }
+    return undefined
+  }
+  for (const field of collection.fields) {
+    if (RESERVED_FIELDS.has(field)) continue // refused by the declaration check above
+    const property = propertyOf(field)
+    const problem = property === undefined ? "is not a field of its schema" : indexProblem(property)
+    if (problem !== undefined) out.push(`the indexed field "${field}" ${problem}`)
+  }
+  return out
+}
+
 // ---------------------------------------------------------------------------------------------------------------------
 // The check
 
@@ -178,7 +277,8 @@ const TOOL_NAME = /^[A-Za-z0-9_-]{1,64}$/
 const PROPERTY_NAME = /^[A-Za-z0-9_.-]{1,64}$/
 const MAX_TOOL_DESCRIPTION = 1_024
 const SENTINEL = (key: string) => `pva-check-secret-${key}-7d1f`
-const PLACEHOLDERS = (text: string) => [...text.matchAll(/\{([a-zA-Z0-9_]+)\}/g)].map((m) => m[1]!).sort()
+/** The names of a text's placeholders, each once, sorted (`say` fills every occurrence of a name). */
+const PLACEHOLDERS = (text: string) => [...new Set([...text.matchAll(/\{([a-zA-Z0-9_]+)\}/g)].map((m) => m[1]!))].sort()
 
 const textsProblems = (texts: NonNullable<CheckModuleOptions["texts"]>): Array<ModuleProblem> => {
   const out: Array<ModuleProblem> = []
@@ -195,10 +295,27 @@ const textsProblems = (texts: NonNullable<CheckModuleOptions["texts"]>): Array<M
       if (/[\u0000-\u001f]/.test(t)) out.push({ rule: "texts", where: `text "${key}"`, message: `the ${lang} text is not one line` })
     }
     if (PLACEHOLDERS(en).join(",") !== PLACEHOLDERS(nl).join(",")) {
-      out.push({ rule: "texts", where: `text "${key}"`, message: `its placeholders differ: {${PLACEHOLDERS(en).join("}, {")}} in English, {${PLACEHOLDERS(nl).join("}, {")}} in Dutch` })
+      out.push({ rule: "texts", where: `text "${key}"`, message: `its placeholder names differ: {${PLACEHOLDERS(en).join("}, {")}} in English, {${PLACEHOLDERS(nl).join("}, {")}} in Dutch` })
     }
   }
   return out
+}
+
+/** The rules every tool the model is sent keeps: an own tool, or an action's generated tool (as the host makes it). */
+const wireProblems = (where: string, tool: Tool, out: Array<ModuleProblem>) => {
+  if (tool.description.trim() === "" || tool.description.length > MAX_TOOL_DESCRIPTION) {
+    out.push({ rule: "tool-description", where, message: `a description is 1 to ${MAX_TOOL_DESCRIPTION} characters (it has ${tool.description.length}${tool.action !== undefined ? ", with the action's label the host puts before it" : ""})` })
+  }
+  try {
+    // The schema exactly as it is sent (`toolSpec`): a tool without parameters is `{ type: "object", properties: {} }`.
+    const top = toolSpec(tool).inputSchema as Record<string, unknown>
+    if (top.type !== "object") out.push({ rule: "tool-parameters", where, message: "its parameters must be an object (a Schema.Struct): model providers take only an object as a tool's input" })
+    for (const name of Object.keys((top.properties ?? {}) as object)) {
+      if (!PROPERTY_NAME.test(name)) out.push({ rule: "tool-parameters", where, message: `the parameter "${name}" is not 1–64 of A–Z, a–z, 0–9, _ . and -` })
+    }
+  } catch (e) {
+    out.push({ rule: "tool-parameters", where, message: `its parameters have no JSON Schema (${e instanceof Error ? e.message : String(e)})` })
+  }
 }
 
 const toolProblems = (moduleId: string, tools: ReadonlyArray<Tool>, actions: ReadonlyArray<ActionDefinition<any>>): Array<ModuleProblem> => {
@@ -207,7 +324,7 @@ const toolProblems = (moduleId: string, tools: ReadonlyArray<Tool>, actions: Rea
   const riskSaid = (where: string, description: string, meta: Parameters<typeof toolMetadata>[0]) => {
     for (const c of toolMetadata(meta).risks) {
       if ((c === "money" || c === "security") && !description.toLowerCase().includes(c)) {
-        out.push({ rule: "risk-said", where, message: `it can be "${c}" (refused in this stack), and its description does not say "${c}"` })
+        out.push({ rule: "risk-said", where, message: `it can be "${c}" (the gateway's risk policy refuses it), and its description does not say "${c}"` })
       }
     }
   }
@@ -216,35 +333,28 @@ const toolProblems = (moduleId: string, tools: ReadonlyArray<Tool>, actions: Rea
     if (!TOOL_NAME.test(tool.name)) out.push({ rule: "tool-name", where, message: "a tool name is 1–64 of A–Z, a–z, 0–9, _ and - (what Anthropic and OpenAI accept)" })
     if (seen.has(tool.name)) out.push({ rule: "tool-name", where, message: "the name is used twice" })
     seen.add(tool.name)
-    if (tool.description.trim() === "" || tool.description.length > MAX_TOOL_DESCRIPTION) {
-      out.push({ rule: "tool-description", where, message: `a description is 1 to ${MAX_TOOL_DESCRIPTION} characters (it has ${tool.description.length})` })
-    }
     if (tool.risk === undefined && tool.speculative !== true) {
       out.push({ rule: "risk", where, message: "it is not a plain read (speculative: true) and declares no risk: declare risk: \"change\" (or the class it is)" })
     }
     riskSaid(where, tool.description, tool)
-    try {
-      const doc = Schema.toJsonSchemaDocument(tool.parameters)
-      const top = doc.schema as Record<string, unknown>
-      // `Schema.Struct({})` (no parameters) has the JSON Schema `{ not: { type: "null" } }`: accepted as the empty object.
-      const emptyStruct = JSON.stringify(top) === JSON.stringify({ not: { type: "null" } })
-      if (top.type !== "object" && !emptyStruct) out.push({ rule: "tool-parameters", where, message: "its parameters must be an object (a Schema.Struct): model providers take only an object as a tool's input" })
-      for (const name of Object.keys((top.properties ?? {}) as object)) {
-        if (!PROPERTY_NAME.test(name)) out.push({ rule: "tool-parameters", where, message: `the parameter "${name}" is not 1–64 of A–Z, a–z, 0–9, _ . and -` })
-      }
-    } catch (e) {
-      out.push({ rule: "tool-parameters", where, message: `its parameters have no JSON Schema (${e instanceof Error ? e.message : String(e)})` })
-    }
+    wireProblems(where, tool, out)
   }
   for (const action of actions) {
     const name = `${moduleId}_${action.id}`
     const where = `action ${action.id}`
-    if (name.length > 64 || actionToolName(moduleId, action.id) !== name) {
-      out.push({ rule: "tool-name", where, message: `its generated tool name "${name}" is over 64 characters (it would be cut): shorten the action id` })
+    if (!TOOL_NAME.test(name)) {
+      out.push({ rule: "tool-name", where, message: `its generated tool name "${name}" is not 1–64 of A–Z, a–z, 0–9, _ and -: shorten the action id` })
     }
     if (action.offerAsTool !== false) {
       if (seen.has(name)) out.push({ rule: "tool-name", where, message: `its generated tool name "${name}" is also a tool's name` })
       seen.add(name)
+      try {
+        // The tool the host offers the model for it: its name, its description (the label before it), its parameters.
+        const [registered] = registerActions(moduleId, [action])
+        wireProblems(where, actionTool(registered!), out)
+      } catch (e) {
+        out.push({ rule: "tool-parameters", where, message: `it cannot be offered as a tool (${e instanceof Error ? e.message : String(e)})` })
+      }
     }
     if (action.risk === undefined && action.speculative !== true) {
       out.push({ rule: "risk", where, message: "it is not a plain read (speculative: true) and declares no risk: declare risk: \"change\" (or the class it is)" })
@@ -266,12 +376,18 @@ export const moduleProblems = (definition: ModuleDefinition<any>, options: Check
     }
     const hasNetwork = (definition.requires ?? []).some((r) => "network" in r)
     if (hasNetwork && definition.health === undefined) out.push({ rule: "health", where: "definition", message: "it needs the network: declare health() so the Health page and doctor can say what is wrong" })
+    let storable = true
     for (const c of definition.storage?.collections ?? []) {
+      const refused = collectionProblems(c)
+      for (const message of refused) out.push({ rule: "stored-value", where: `collection ${c.name}`, message })
+      if (refused.some((m) => m.startsWith("the store refuses its declaration"))) storable = false
       const w = collectionWorst(c)
       if ("unbounded" in w) out.push({ rule: "stored-value", where: `collection ${c.name}`, message: `its worst legal value has no bound: ${w.unbounded}; give every string a maximum (StoredText) and every list a maximum number of items` })
       else if (w.chars > c.maxChars) out.push({ rule: "stored-value", where: `collection ${c.name}`, message: `its worst legal value takes ${w.chars} characters of JSON, over its maxChars of ${c.maxChars}: a legal value would be refused at write. Raise maxChars or lower the bounds (StoredText counts 2 a character, a plain string 6)` })
     }
     if (options.texts !== undefined) out.push(...textsProblems(options.texts))
+    // A collection the store refuses would stop the test household from being made: nothing more can be checked.
+    if (!storable) return out
 
     // Secrets: the given ones, else a recognisable value for every secret field.
     const secretKeys = Object.entries(definition.settings as Record<string, { readonly secret?: boolean }>).filter(([, s]) => s.secret === true).map(([k]) => k)
@@ -296,41 +412,57 @@ export const moduleProblems = (definition: ModuleDefinition<any>, options: Check
     const mine = parts.filter((p) => p.handle.moduleId === id)
     const tools = mine.flatMap((p) => p.instance?.tools ?? [])
     const actions = mine.flatMap((p) => p.instance?.actions ?? [])
-    // One instance per distinct settings: the same tools appear once per instance; check each name once.
-    const firstInstance = mine.find((p) => p.instance !== undefined)?.instance
-    out.push(...toolProblems(id, firstInstance?.tools ?? [], firstInstance?.actions ?? []))
-    for (const use of harness.schedulerUses) {
+    // Every instance (one per distinct effective settings), each on its own; a problem two share is reported once.
+    const reported = new Set(out.map((p) => `${p.rule}\u0000${p.where}\u0000${p.message}`))
+    for (const part of mine) {
+      if (part.instance === undefined) continue
+      for (const p of toolProblems(id, part.instance.tools ?? [], part.instance.actions ?? [])) {
+        const key = `${p.rule}\u0000${p.where}\u0000${p.message}`
+        if (!reported.has(key)) out.push(p)
+        reported.add(key)
+      }
+    }
+    // What it did with the scheduler while it started (the kit's observations of this module only).
+    const uses = harness.schedulerUses.filter((u) => u.moduleId === id)
+    for (const use of uses) {
       if (use.kind === "handle" && use.part === "instance") {
         out.push({ rule: "scheduler-shared", where: `handler ${use.name}`, message: "register job handlers in shared: an instance runs once per distinct settings, and two handlers of one name refuse the start" })
       }
-      if (use.kind === "refused" && use.cron !== undefined) out.push({ rule: "cron", where: `cron "${use.cron}"`, message: use.message })
+      if (use.kind === "refused") {
+        if (use.cron !== undefined && isSchedulerCron(use.cron) !== undefined) out.push({ rule: "cron", where: `cron "${use.cron}"`, message: use.message })
+        else if (/payload/.test(use.message)) out.push({ rule: "job-payload", where: `a ${use.call}`, message: use.message })
+      }
       if (use.kind === "scheduled") {
-        const handler = harness.schedulerUses.find((u) => u.kind === "handle" && u.name === use.handler)
+        // The engine checks a payload against a handler published or registered by then; one registered later is checked here.
+        const handler = uses.find((u) => u.kind === "handle" && u.name === use.handler)
         if (handler?.kind === "handle" && Exit.isFailure(Schema.decodeUnknownExit(Schema.toCodecJson(handler.payload))(use.payload))) {
-          out.push({ rule: "job-payload", where: `job of ${use.handler}`, message: `its payload ${JSON.stringify(use.payload)?.slice(0, 80)} does not decode with the handler's payload schema, so every run fails (an absent payload is null: pass payload: {} for Schema.Struct({}))` })
+          out.push({ rule: "job-payload", where: `job of ${use.handler}`, message: `its payload ${JSON.stringify(use.payload)?.slice(0, 80)} does not decode with the handler's payload schema, so every run fails` })
         }
       }
     }
-    // Health: run it once, as "Check again" does.
+    // Health: run it once, as "Check again" does (the kit moves the clock past the host's limit if it does not answer).
     const issues = yield* harness.checkHealth
     for (const i of issues) {
       if (i.id === `${id}.health` && /health check (did not finish|failed)/.test(i.title)) {
         out.push({ rule: "health", where: "health()", message: `${i.title}: ${i.detail} (it must answer within 5 s, without failing: return issues instead)` })
       }
     }
-    // Secrets in what the module wrote (raw), and in what the host shows after its page boundary ("[secret]").
-    const routes = mine.flatMap((p) => p.shared?.routes ?? [])
+    // Secrets in what the module wrote (raw), and in what the host shows after its page boundary ("[secret]"). Values it
+    // returns from tools, speaks or stores are for its own tests (`harness.expectNoSecrets`).
     const written: Array<[string, string]> = [
       ...tools.map((t): [string, string] => [`tool ${t.name}`, `${t.name} ${t.description}`]),
       ...actions.map((a): [string, string] => [`action ${a.id}`, `${a.label} ${a.description} ${(a.examples ?? []).join(" ")}`]),
       ...mine.flatMap((p): Array<[string, string]> => [
         ...(p.instance?.instructions !== undefined ? [["instructions", p.instance.instructions] as [string, string]] : []),
         ...(p.instance?.context ?? []).map((c): [string, string] => ["context provider", c.name])
-      ]),
-      ...routes.map((r): [string, string] => [`route ${r.method} ${r.path}`, `${r.path} ${r.description ?? ""} ${r.token ?? ""}`])
+      ])
     ]
+    const leaked = new Set<string>()
     for (const [where, text] of written) {
-      if (needles.some((n) => text.includes(n))) out.push({ rule: "secret", where, message: "it holds a secret's value" })
+      if (!leaked.has(where) && needles.some((n) => text.includes(n))) {
+        leaked.add(where)
+        out.push({ rule: "secret", where, message: "it holds a secret's value" })
+      }
     }
     const shown = JSON.stringify({ info: harness.info(), issues: harness.issues() })
     if (shown.includes("[secret]") || needles.some((n) => shown.includes(n))) {

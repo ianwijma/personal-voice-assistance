@@ -521,3 +521,4 @@ export const makeTestScheduler = (
 export * from "./ModuleTestKit.ts"
 export * from "./ModuleCheck.ts"
 export * from "./OfflineNet.ts"
+export * from "./ModuleStubs.ts"
