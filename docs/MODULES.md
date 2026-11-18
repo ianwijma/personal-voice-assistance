@@ -1005,38 +1005,86 @@ into text 50 to 200 ms, much longer for a deeply nested one; a 1 MB RSS feed 52 
 milliseconds** (pages, feeds, calendars, documents, dictionaries) runs through `offThread` from `@pva/core`: a pure
 function in a fresh worker thread, started for the call and terminated after it.
 
-- **The task module** is a file of your own package (`src/<name>.task.ts`) that default-exports one function
-  `(input) => output` or a promise of it, and imports what it needs (the libraries are your package's dependencies).
-  Input and output are plain data the structured clone carries: strings, numbers, booleans, arrays, plain objects,
-  `Uint8Array`. Name it once with `offThreadTask`, with its type, so nothing of it is loaded on the main thread.
-- **The call**: `offThread(task, input, { timeoutMs, maxMemoryMb, maxResultBytes })`. `timeoutMs` is required (at most
-  60 s) and counts from the call, also while it waits: at most two workers run at once in the process, later calls
-  wait in turn. `maxMemoryMb` is the worker's heap (default 128, at most 1,024); `maxResultBytes` the largest answer
-  (default 1 MiB, at most 16 MiB). It is an Effect: call it from a tool, a job or a part's start. Interrupting it
-  (barge-in, the module stopping) terminates the worker, whatever it is doing. The limit is real time, so it holds
-  under the test kit's clock too.
+It is made for **trusted code on untrusted input**: your task file and the library it imports are compiled in and do
+not attack the helper; the input (a page, a feed, a calendar file) may be huge, deeply nested, or built to make a parser
+loop or allocate. What a worker thread cannot guarantee is said below.
+
+- **The task module** is a file of your own package (`src/<name>.task.ts`): an ES module, `.ts`, `.mts` or `.mjs`,
+  that default-exports one function `(input) => output` or a promise of it, and imports what it needs (the libraries
+  are your package's dependencies). A `.js`, `.cjs` or `.cts` task is refused (`load`) before a worker starts. A `.ts`
+  or `.mts` task is loaded through tsx in the worker; an `.mjs` one is not, so it can import JavaScript only. Name it
+  once with `offThreadTask`, with its type, so nothing of it is loaded on the main thread.
+- **The input has one narrow shape**: a string, a `Uint8Array` (a `Buffer` too), or one plain object or array, one
+  level deep with at most 32 entries, whose values are strings, `Uint8Array`s, finite numbers, booleans or `null`.
+  Anything else (a nested object or array, `undefined`, a `Date`, a class instance, another typed array, bytes on
+  shared memory) is refused with `input` before a worker starts. Its size (string code units × 2, plus bytes, plus 8
+  per other value, keys included) is at most `maxInputBytes`: 4 MiB, the default and the most a call may ask for,
+  checked before anything is copied. Bytes are copied onto a buffer of their own before they cross: the task never
+  sees the bytes beside them in a pooled `Buffer`, and what it writes stays in the worker. Pass a fetched body as it
+  is (cap the fetch first: `safeFetch`'s `maxBytes`), and the settings the task needs as a few plain fields.
+- **The answer** is anything the structured clone carries. The worker serialises it once, into one buffer that is
+  checked against `maxResultBytes` (default 1 MiB, at most 4 MiB), transferred, checked again and read on the main
+  thread; the task's value itself never crosses. Reading it is the main thread's work, and it costs by the object, not
+  by the byte: answer a string or a small result, and set `maxResultBytes` to what the task needs (an answer of
+  objects at most 128 KiB; the numbers are below).
+- **The call**: `offThread(task, input, { timeoutMs, maxMemoryMb, maxResultBytes, maxInputBytes })`. It is an Effect:
+  call it from a tool, a job or a part's start; only from the main thread (a task that calls it is refused with
+  `nested`: tasks do not nest).
+  - `timeoutMs` is required (at most 60 s). It is one deadline, taken when the call begins: the time waiting for a
+    slot counts, a call whose deadline has passed is never started, and an answer after it is a `timeout`. It is real
+    time, so it holds under the test kit's clock too.
+  - The time limit stops **pure JavaScript**: loops, regular expressions, `Atomics.wait`. A **synchronous native call**
+    (`crypto.*Sync`, `fs.*Sync`, a native addon) cannot be stopped: it holds its slot until it returns, and the call
+    with it. A task must not make one whose cost depends on the input.
+  - Interrupting the call (barge-in, the module stopping) terminates the worker the same way.
+  - **At most two workers run at once** in the process, and **at most 32 calls wait** for a slot, in the order made;
+    one more fails at once with `busy` and keeps nothing. A module that fans out (a feed per source, a page per
+    result) must expect `busy` and treat it like a failed fetch.
+  - `maxMemoryMb` (default 128, 16 to 1,024) limits the worker's **JavaScript heap** as V8 enforces it (with it its
+    young generation, an eighth of it from 8 to 32 MB, and a 4 MB stack; one very large string may still get through
+    before the worker is stopped), not buffers outside the heap (an `ArrayBuffer`, a typed array). The real
+    protection against a huge allocation is the input limit above and your task's own caps on what it builds (a limit
+    on entries, on nodes, on characters).
+- **Output**: in the worker, `console.*` and `process.stdout.write` / `process.stderr.write` write nowhere before the
+  task is loaded (what a library prints could quote the input, and passing it on would cost the main thread). Writes
+  to the raw descriptors (`fs.writeSync(2, …)`) are not caught; a task does not make them.
 - **Each failure is an `OffThreadError`** with a `reason`, and a one-line `message` for the log that names the task and
-  never quotes the input:
+  never quotes the input: of a thrown value only its name, when it is a built-in one (`Error`, `TypeError`,
+  `RangeError`, `SyntaxError`, …), and its code, when it is one of a fixed list of Node's (`ERR_MODULE_NOT_FOUND`, …);
+  anything else is `other error`.
 
   | `reason` | What happened | What the person hears |
   |---|---|---|
-  | `timeout` | the time limit passed; the worker was terminated | it took too long to read |
+  | `timeout` | the time limit passed (waiting included); the worker was terminated | it took too long to read |
   | `memory` | the worker ran out of `maxMemoryMb` | it could not be read |
   | `too-large` | the answer was over `maxResultBytes` | it could not be read (or: it is too long) |
-  | `failed` | the task threw or rejected (a stack overflow too), or its answer cannot be cloned | it could not be read |
-  | `exited` | the worker ended without answering | it could not be read |
-  | `load` | the task module is missing or has no default function: a bug of the module | it could not be read |
+  | `failed` | the task threw or rejected (a stack overflow too), or its answer cannot be serialised | it could not be read |
+  | `exited` | the worker ended without answering, or could not start | it could not be read |
+  | `load` | the task module is missing, has no default function, or is not a `.ts`, `.mts` or `.mjs` file: a bug of the module | it could not be read |
+  | `input` | the input is not of the shape above, or over `maxInputBytes`: a bug of the module (cap first) | it could not be read |
+  | `busy` | 32 calls were already waiting | as for a failed fetch: try later |
+  | `nested` | called from a worker thread (from a task): a bug of the module | it could not be read |
 
 - **Not**: no state shared between calls (each call is a fresh thread: a global set in one call is gone in the next),
   no network and no store from the task (fetch first, store after, on the main thread), no secrets in the input
-  unless the task needs them (the worker gets none of the server's environment either). Never from a context provider
-  or anywhere else on the turn path: the start-up cost below is more than a context provider's 50 ms.
-- **Start-up cost, paid on every call by design** (`packages/core/test/OffThread.test.ts` prints it; the median of 5
-  calls on the development machine): the thread alone 28 ms; a TypeScript task without imports 111 ms (tsx's loader
-  is started in each worker, so a `.ts` task loads the same under tsx, vitest and plain node); a task importing
-  `linkedom` 232 ms; one importing `feedsmith` 230 ms. Add it to the tool's `latency` (a tool that parses a page is
-  `slow`). The main thread's own share is small: starting a worker, posting 1 MiB in and receiving 100 KiB holds it
-  1.8 ms at most; a task that loops forever ends 4 ms after its time limit.
+  unless the task needs them (the worker gets none of the server's environment variables either). It is not a
+  sandbox: the worker keeps the server's working directory and file access, because the task is trusted code. Never
+  from a context provider or anywhere else on the turn path: the start-up cost below is more than a context
+  provider's 50 ms.
+- **The numbers** (`packages/core/test/OffThread.test.ts` prints them; development machine, two runs):
+  - Start-up, paid on every call by design (median of 5 calls): the thread alone 26 ms; a TypeScript task without
+    imports 110 ms (tsx's loader is started in each worker, so a `.ts` task loads the same under tsx, vitest and plain
+    node); a task importing `linkedom` 229 to 230 ms; one importing `feedsmith` 215 to 224 ms. Add it to the tool's
+    `latency` (a tool that parses a page is `slow`).
+  - The main thread's own share, the longest stop of a 1 ms timer over 5 calls: 1 MiB in and 100 KiB out 1.8 ms; the
+    largest legal input (4 MiB as counted) 3.6 to 4.0 ms as a string of two-byte characters, 1.8 to 1.9 ms as bytes,
+    1.5 to 1.9 ms as an object of 30 strings; a task writing 80 MB to console and the streams 1.2 to 1.5 ms.
+  - Answers: a 4 MiB string 3.2 ms; small objects 5.3 to 6.3 ms for 128 KiB of them, 19 to 21 ms for 1 MiB, 107 to
+    120 ms for 4 MiB (over the audio budget: keep answers of objects small).
+  - A task that loops forever ends 4 ms after its time limit; an interrupted one is gone 3 to 4 ms after the
+    interruption.
+  - A rare stop of 6 to 8 ms on the main thread is its own garbage collection, not the helper's work (a GC observer
+    saw a major collection of about 7 ms, or a scavenge of 4 to 6 ms, during each such call).
 
 <!-- region: packages/module-contracts/test/kit/pageText.task.ts#offthread-task -->
 ```ts
