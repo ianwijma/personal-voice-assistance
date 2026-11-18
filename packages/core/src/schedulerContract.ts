@@ -67,7 +67,24 @@ export const engineOn = (store: HouseholdStore, options: Partial<SchedulerEngine
     const scope = yield* Scope.fork(yield* Effect.scope)
     const issues = options.issues ?? makeIssueRegistry()
     const engine = yield* Scope.provide(scope)(makeSchedulerEngine({ retryBaseMs: SECOND, outcomeRetryMs: [100, 200], ...options, store, issues }))
-    const advance = (ms: number) => Effect.andThen(Effect.andThen(engine.settled, TestClock.adjust(ms)), engine.settled)
+    /**
+     * Move the test clock `ms` on, stopping at each of the engine's passes on the way and letting it settle there: a pass
+     * that waits for the store's write lock (on a file, while the checkpoint worker holds it) waits on real timers, and a
+     * clock moved past it in one go would make what it claims late.
+     */
+    const advance = (ms: number) =>
+      Effect.gen(function*() {
+        yield* engine.settled
+        const end = (yield* Clock.currentTimeMillis) + ms
+        for (;;) {
+          const t = yield* Clock.currentTimeMillis
+          const pass = engine.nextPassAt()
+          const to = pass !== undefined && pass > t && pass < end ? pass : end
+          yield* TestClock.adjust(to - t)
+          yield* engine.settled
+          if (to >= end) return
+        }
+      })
     return { engine, issues, advance, stop: Scope.close(scope, Exit.void), scope }
   })
 
