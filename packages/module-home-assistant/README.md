@@ -1,10 +1,10 @@
 # @pva/module-home-assistant
 
 Lights, switches, heating and blinds by room through the owner's Home Assistant; locks, alarm panels and garage doors
-only read. Module id `home-assistant`, module API v2, **off by default**. Nothing happens on import; nothing contacts
-Home Assistant until an assistant has it on.
+only read; the `HomeAssistant` service (polled) for presence and music. Module id `home-assistant`, module API v2,
+**off by default**. Nothing happens on import; nothing contacts Home Assistant until an assistant has it on.
 
-What it does, its actions and tools, settings, what it stores (nothing) and what was left out:
+What it does, its actions and tools, settings, what it stores (nothing; people are read for the service only) and what was left out:
 [docs/modules/home-assistant.md](../../docs/modules/home-assistant.md).
 
 ## Files
@@ -16,7 +16,9 @@ What it does, its actions and tools, settings, what it stores (nothing) and what
   covers.
 - `src/module.ts`: the definition: the `shared` part (client, cache, background read), the instance (actions, the
   `home_state` tool, status line, form values), health, the Test button.
-- `src/texts.ts`: every spoken sentence in English and Dutch.
+- `src/service.ts`: the `HomeAssistant` transport of `@pva/module-contracts` over the polled cache (state, the change
+  stream with its snapshots, `callService`), and the one checked path every service call takes, the module's own too.
+- `src/texts.ts`: every spoken sentence in English and Dutch (`defineTexts` and `say` of `@pva/module-contracts`).
 
 ## Tests
 

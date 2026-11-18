@@ -19,7 +19,13 @@ export interface FakeEntity {
   unit?: string | null
   title?: string | null
   artist?: string | null
+  volume?: number | null
+  /** Home Assistant's `last_changed`, epoch seconds (default: a fixed time). */
+  changed?: number | null
 }
+
+/** The default `last_changed` of the fake's entities: 2026-11-18 08:00 UTC, in seconds. */
+export const CHANGED_AT = Date.UTC(2026, 10, 18, 8, 0, 0) / 1000
 
 export interface FakeRequest {
   readonly method: string
@@ -98,18 +104,24 @@ export const makeFakeHa = (options: { readonly token?: string; readonly areas?: 
       features: e.features ?? null,
       unit: e.unit ?? null,
       title: e.title ?? null,
-      artist: e.artist ?? null
+      artist: e.artist ?? null,
+      volume: e.volume ?? null,
+      changed: e.changed === undefined ? CHANGED_AT : e.changed
     }))
   })
 
   const json = (status: number, payload: unknown, type = "application/json") =>
     new Response(typeof payload === "string" ? payload : JSON.stringify(payload), { status, headers: { "content-type": type } })
 
-  const service = (domain: string, name: string, data: Record<string, unknown>): Response => {
+  /** What a service answers with `?return_response` (its `service_response`). */
+  let serviceResponse: unknown = { ok: true }
+  const service = (domain: string, name: string, data: Record<string, unknown>, returnResponse: boolean): Response => {
     const ids = Array.isArray(data.entity_id) ? (data.entity_id as Array<string>) : typeof data.entity_id === "string" ? [data.entity_id] : []
     for (const id of ids) {
       const e = entities[id]
-      if (e === undefined || !id.startsWith(`${domain}.`)) return json(400, { message: `Entity ${id} not found for ${domain}` })
+      if (e === undefined) return json(400, { message: `Entity ${id} not found for ${domain}` })
+      // A service of another domain on it (music_assistant on a media player) changes nothing here.
+      if (!id.startsWith(`${domain}.`)) continue
       if (name === "turn_on") e.state = domain === "scene" ? "2026-11-18T09:00:00+00:00" : "on"
       if (name === "turn_off") e.state = "off"
       if (typeof data.brightness_pct === "number") {
@@ -121,8 +133,9 @@ export const makeFakeHa = (options: { readonly token?: string; readonly areas?: 
       if (name === "open_cover") (e.state = "open"), (e.position = 100)
       if (name === "close_cover") (e.state = "closed"), (e.position = 0)
       if (name === "set_cover_position") e.position = data.position as number
+      e.changed = Date.now() / 1000
     }
-    return json(200, [])
+    return returnResponse ? json(200, { changed_states: [], service_response: serviceResponse }) : json(200, [])
   }
 
   const fetch: Fetch = async (input, init) => {
@@ -151,7 +164,7 @@ export const makeFakeHa = (options: { readonly token?: string; readonly areas?: 
       return json(200, JSON.stringify(render()), "text/plain; charset=utf-8")
     }
     const match = /^\/api\/services\/([a-z_]+)\/([a-z_]+)$/.exec(path)
-    if (init?.method === "POST" && match !== null) return service(match[1]!, match[2]!, (body ?? {}) as Record<string, unknown>)
+    if (init?.method === "POST" && match !== null) return service(match[1]!, match[2]!, (body ?? {}) as Record<string, unknown>, url.searchParams.has("return_response"))
     return json(404, { message: "Not found" })
   }
 
@@ -167,6 +180,8 @@ export const makeFakeHa = (options: { readonly token?: string; readonly areas?: 
     down: (route?: Route) => void (route === undefined ? ["config", "template", "service"] : [route]).forEach((r) => behaviour.set(r as Route, { kind: "down" })),
     hang: (route?: Route) => void (route === undefined ? ["config", "template", "service"] : [route]).forEach((r) => behaviour.set(r as Route, { kind: "hang" })),
     answer: (route: Route, answer: (init?: RequestInit) => Response | Promise<Response>) => void behaviour.set(route, { kind: "answer", answer }),
+    /** What a service call with `returnResponse` answers. */
+    respondWith: (response: unknown) => void (serviceResponse = response),
     ok: () => behaviour.clear()
   }
 }

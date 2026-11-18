@@ -18,6 +18,7 @@ import {
   ToolError
 } from "@pva/core"
 import { Clock, Effect, Schema } from "effect"
+import { type HaServiceCall, HomeAssistant, homeLanguage, type JsonObject, type Language, say } from "@pva/module-contracts"
 import { checkAddressSetting, type HomeAssistantClient, HomeAssistantError, makeHomeAssistantClient, normalizeBaseUrl } from "./client.ts"
 import {
   ALL,
@@ -40,7 +41,8 @@ import {
   targetOptions
 } from "./house.ts"
 import { addressSecrets, clip, fromUpstream, sanitize, type Secrets, secretList } from "./redact.ts"
-import { homeLanguage, joinList, type Language, say, sentence, spokenNumber, type TextKey } from "./texts.ts"
+import { type CallProblem, exposedKinds, makeTransport } from "./service.ts"
+import { joinList, sentence, spokenNumber, type TextKey, texts } from "./texts.ts"
 
 export interface HomeAssistantDeps {
   /** Injected in tests (an in-process fake: no test reaches the network). Default: the global `fetch`. */
@@ -133,17 +135,34 @@ type HomeAssistantSettings = SettingsOf<typeof settings>
 const failureText = (lang: Language, e: HomeAssistantError, change: boolean): string => {
   switch (e.kind) {
     case "unreachable":
-      return say(lang, "unreachable")
+      return say(texts, lang, "unreachable")
     case "timeout":
-      return say(lang, change ? "timeoutChange" : "timeoutRead")
+      return say(texts, lang, change ? "timeoutChange" : "timeoutRead")
     case "unauthorized":
-      return say(lang, "unauthorized")
+      return say(texts, lang, "unauthorized")
     case "forbidden":
-      return say(lang, "forbidden")
+      return say(texts, lang, "forbidden")
     case "http":
-      return say(lang, e.status === 503 ? "restarting" : "failed")
+      return say(texts, lang, e.status === 503 ? "restarting" : "failed")
     case "invalid":
-      return say(lang, "invalid")
+      return say(texts, lang, "invalid")
+  }
+}
+
+/** What a failed own call is called: the client's error when Home Assistant was asked, else the transport's reason. */
+const problemText = (lang: Language, p: CallProblem): string => {
+  if (p.cause !== undefined) return failureText(lang, p.cause, true)
+  switch (p.reason) {
+    case "not_connected":
+      return say(texts, lang, "unreachable")
+    case "timeout":
+      return say(texts, lang, "timeoutChange")
+    case "refused":
+      return say(texts, lang, "refused")
+    case "invalid":
+    case "unknown_entity":
+    case "failed":
+      return say(texts, lang, "failed")
   }
 }
 
@@ -184,7 +203,8 @@ export interface HomeAssistantShared {
   readonly config: () => { readonly version: string | undefined; readonly locationName: string | undefined } | undefined
   /** Read the house now (one request, at most `timeoutMs`); the cache follows unless a newer answer is already kept. */
   readonly load: (timeoutMs: number) => Effect.Effect<House, HomeAssistantError>
-  readonly call: (domain: string, service: string, data: Readonly<Record<string, unknown>>, timeoutMs: number) => Effect.Effect<void, HomeAssistantError>
+  /** The module's own service calls, through the transport's one checked path (`service.ts`). */
+  readonly call: (call: HaServiceCall, timeoutMs: number) => Effect.Effect<void, CallProblem>
   /** The kinds the house had when this run started (`undefined`: not read yet): the instances offer actions for these. */
   readonly kindsAtStart: ReadonlySet<Kind> | undefined
   /** Read the house again soon, off the turn (a name was not found). */
@@ -196,14 +216,22 @@ export interface HomeAssistantShared {
   readonly timeoutMs: number
 }
 
-/** The kinds a house has: each kind with at least one entity; scenes only those the owner named. */
+/** The kinds a house has for the module's own actions: each kind with an entity; scenes only those the owner named; never people. */
 export const kindsOf = (house: House): ReadonlySet<Kind> => {
   const kinds = new Set<Kind>()
-  for (const e of house.entities) if (e.kind !== "scene" || e.runnable) kinds.add(e.kind)
+  for (const e of house.entities) if (e.kind !== "person" && (e.kind !== "scene" || e.runnable)) kinds.add(e.kind)
   return kinds
 }
 
-const sameKinds = (a: ReadonlySet<Kind> | undefined, b: ReadonlySet<Kind>) => a !== undefined && a.size === b.size && [...a].every((k) => b.has(k))
+/** Every kind an instance may offer before the house was read (scenes need a read: they must be named and present). */
+const BEFORE_FIRST_READ: ReadonlySet<Kind> = new Set<Kind>(["light", "switch", "climate", "cover", "media_player", "sensor", "lock"])
+
+/**
+ * Whether the house now has a kind the running instances do not offer: then the module starts again with it. A kind
+ * that disappears restarts nothing (its actions say there is none), so a consumer of the service is not cut off for
+ * that; nor does the first good read after a start without one, unless it brings a named scene.
+ */
+const newKinds = (offeredAtStart: ReadonlySet<Kind> | undefined, now: ReadonlySet<Kind>) => [...now].some((k) => !(offeredAtStart ?? BEFORE_FIRST_READ).has(k))
 
 /** The address and token, checked: a start error says what to fix, never repeating the address's credentials. */
 const checkedConnection = (s: Partial<HomeAssistantSettings>): Effect.Effect<{ readonly baseUrl: string; readonly token: string }, ModuleStartError> =>
@@ -227,6 +255,14 @@ const makeShared = (deps: HomeAssistantDeps, ctx: SharedContext<HomeAssistantSet
     const client: HomeAssistantClient = makeHomeAssistantClient({ baseUrl, token, timeoutMs, fetch: deps.fetch })
     const scope = yield* Effect.scope
     const listeners = new Set<() => void>()
+    // The `HomeAssistant` transport over this cache: every kept read below is one of its polls.
+    const transport = makeTransport({
+      kinds: () => exposedKinds(ctx.settingsFor(undefined)?.domains),
+      call: (domain, service, data, limits) => client.callService(domain, service, data, limits),
+      timeoutMs,
+      secrets
+    })
+    yield* Effect.addFinalizer(() => Effect.sync(transport.close))
     let house: House | undefined
     let problem: HomeAssistantError | undefined
     let config: { readonly version: string | undefined; readonly locationName: string | undefined } | undefined
@@ -267,14 +303,16 @@ const makeShared = (deps: HomeAssistantDeps, ctx: SharedContext<HomeAssistantSet
         kept = n
         if (got._tag === "Failure") {
           problem = got.failure
+          transport.failed()
           notify()
           return yield* got.failure
         }
         house = got.success
         problem = undefined
+        transport.polled(house)
         notify()
         // The actions offered follow the kinds of devices: when they change, the module starts again with the new set.
-        if (started && !sameKinds(kindsAtStart, kindsOf(house))) yield* ctx.host.requestRestart("the kinds of devices in Home Assistant changed")
+        if (started && newKinds(kindsAtStart, kindsOf(house))) yield* ctx.host.requestRestart("Home Assistant has a new kind of device")
         return house
       })
 
@@ -294,6 +332,7 @@ const makeShared = (deps: HomeAssistantDeps, ctx: SharedContext<HomeAssistantSet
       } else {
         house = loaded.success
         kindsAtStart = kindsOf(house)
+        transport.polled(house)
       }
     }
     started = true
@@ -313,7 +352,7 @@ const makeShared = (deps: HomeAssistantDeps, ctx: SharedContext<HomeAssistantSet
       problem: () => problem,
       config: () => config,
       load: (limitMs) => load(limitMs),
-      call: (domain, service, data, limitMs) => client.callService(domain, service, data, { timeoutMs: limitMs }),
+      call: (call, limitMs) => Effect.asVoid(transport.checked(call, "own", limitMs)),
       kindsAtStart,
       refreshSoon,
       onChange: (listener) => {
@@ -324,7 +363,7 @@ const makeShared = (deps: HomeAssistantDeps, ctx: SharedContext<HomeAssistantSet
       secrets,
       timeoutMs
     }
-    return { value }
+    return { value, services: [HomeAssistant.of(transport.service)] }
   }).pipe(
     // The last resort: anything unexpected leaves as a sanitised start error.
     Effect.catchDefect((defect) => Effect.fail(moduleStartError(secrets, { message: `Home Assistant could not start: ${fromUpstream(defect, secrets)}`, cause: defect }))),
@@ -339,12 +378,12 @@ const KIND_NOUN: Readonly<Record<ChangeKind, TextKey>> = { light: "kindLights", 
 
 /** "the lights in Kitchen", "all the blinds", "Desk lamp". */
 const whatOf = (lang: Language, kind: ChangeKind, r: Extract<Resolved, { _tag: "things" }>): string => {
-  const things = say(lang, KIND_NOUN[kind])
+  const things = say(texts, lang, KIND_NOUN[kind])
   switch (r.scope._tag) {
     case "area":
-      return say(lang, "whatArea", { things, area: r.scope.area.name })
+      return say(texts, lang, "whatArea", { things, area: r.scope.area.name })
     case "all":
-      return say(lang, "whatAll", { things })
+      return say(texts, lang, "whatAll", { things })
     case "one":
       return r.scope.entity.name
   }
@@ -354,13 +393,13 @@ const whatOf = (lang: Language, kind: ChangeKind, r: Extract<Resolved, { _tag: "
 const unresolvedText = (lang: Language, kind: ChangeKind, r: Exclude<Resolved, { _tag: "things" }>): { readonly ask: string } | { readonly error: string } => {
   switch (r._tag) {
     case "noRoom":
-      return { ask: say(lang, "whichRoom") }
+      return { ask: say(texts, lang, "whichRoom") }
     case "roomUnknown":
-      return { ask: say(lang, "roomUnknown", { room: r.room }) }
+      return { ask: say(texts, lang, "roomUnknown", { room: r.room }) }
     case "empty":
-      return r.area === undefined ? { ask: say(lang, "nothingAtAll", { things: say(lang, KIND_NOUN[kind]) }) } : { ask: say(lang, "nothingThere", { things: say(lang, KIND_NOUN[kind]), area: r.area.name }) }
+      return r.area === undefined ? { ask: say(texts, lang, "nothingAtAll", { things: say(texts, lang, KIND_NOUN[kind]) }) } : { ask: say(texts, lang, "nothingThere", { things: say(texts, lang, KIND_NOUN[kind]), area: r.area.name }) }
     case "unknown":
-      return { error: say(lang, "unknownTarget", { name: r.value.replace(/^area:/, "").replace(/^[a-z0-9_]+\./, "").replace(/_/g, " ") }) }
+      return { error: say(texts, lang, "unknownTarget", { name: r.value.replace(/^area:/, "").replace(/^[a-z0-9_]+\./, "").replace(/_/g, " ") }) }
   }
 }
 
@@ -385,6 +424,9 @@ const describeEntity = (e: Entity): string => {
       return `${e.name}: ${e.domain}`
     case "switch":
       return `${e.name}: ${e.state}`
+    case "person":
+      // Never reached: the module's own tools never show a person (only the HomeAssistant service carries them).
+      return e.name
   }
 }
 
@@ -419,7 +461,7 @@ const testConnection = (deps: HomeAssistantDeps, settings: HomeAssistantSettings
     const took = (yield* Clock.currentTimeMillis) - started
     return {
       ok: true,
-      text: clip(`Connected to ${where} in ${took} ms: ${decoded.house.areas.length} areas, ${decoded.house.entities.length} devices.`, secrets, 400),
+      text: clip(`Connected to ${where} in ${took} ms: ${decoded.house.areas.length} areas, ${decoded.house.entities.filter((e) => e.kind !== "person").length} devices.`, secrets, 400),
       tone: "ok" as const
     }
   })
@@ -515,15 +557,18 @@ const defineHomeAssistant = (deps: HomeAssistantDeps) =>
           const house = shared.house()
           if (house !== undefined) return Effect.succeed(house)
           const problem = shared.problem()
-          return Effect.fail(new ActionError({ message: problem === undefined ? say(lang(), "notLoaded") : failureText(lang(), problem, false) }))
+          return Effect.fail(new ActionError({ message: problem === undefined ? say(texts, lang(), "notLoaded") : failureText(lang(), problem, false) }))
         })
         /** The house now, for a question (one request, at most 3 s). */
         const live = Effect.suspend(() => shared.load(Math.min(shared.timeoutMs, TURN_CALL_MS))).pipe(Effect.mapError((e) => new ActionError(sanitize(secrets, { message: failureText(lang(), e, false) }))))
 
-        /** Run the service calls of one command, in parallel, each within 3 s; the first failure is what is said. */
-        const callAll = (calls: ReadonlyArray<{ readonly domain: string; readonly service: string; readonly data: Readonly<Record<string, unknown>> }>) =>
-          Effect.all(calls.map((c) => shared.call(c.domain, c.service, c.data, Math.min(shared.timeoutMs, TURN_CALL_MS))), { concurrency: "unbounded", discard: true }).pipe(
-            Effect.mapError((e) => new ActionError(sanitize(secrets, { message: failureText(lang(), e, true) })))
+        /**
+         * Run the service calls of one command through the transport's checked path, in parallel, each within 3 s; the
+         * first failure is what is said.
+         */
+        const callAll = (calls: ReadonlyArray<HaServiceCall>) =>
+          Effect.all(calls.map((c) => shared.call(c, Math.min(shared.timeoutMs, TURN_CALL_MS))), { concurrency: "unbounded", discard: true }).pipe(
+            Effect.mapError((p) => new ActionError(sanitize(secrets, { message: problemText(lang(), p) })))
           )
 
         /**
@@ -533,7 +578,7 @@ const defineHomeAssistant = (deps: HomeAssistantDeps) =>
         const command = (
           kind: ChangeKind,
           value: string,
-          calls: (things: ReadonlyArray<Entity>) => ReadonlyArray<{ readonly domain: string; readonly service: string; readonly data: Readonly<Record<string, unknown>> }> | { readonly say: string },
+          calls: (things: ReadonlyArray<Entity>) => ReadonlyArray<HaServiceCall> | { readonly say: string },
           done: (what: string, things: ReadonlyArray<Entity>) => string
         ) =>
           Effect.gen(function*() {
@@ -549,7 +594,7 @@ const defineHomeAssistant = (deps: HomeAssistantDeps) =>
             }
             // The second guard (the first is the risk class of a `secure:` target): "here" in the garage, or a cover
             // whose class changed since the option was chosen.
-            if (r.things.some((e) => e.security)) return yield* new ActionError({ message: say(l, "securityCover") })
+            if (r.things.some((e) => e.security)) return yield* new ActionError({ message: say(texts, l, "securityCover") })
             const planned = calls(r.things)
             if ("say" in planned) return { say: planned.say }
             yield* callAll(planned)
@@ -568,8 +613,8 @@ const defineHomeAssistant = (deps: HomeAssistantDeps) =>
               return house === undefined ? [] : targetOptions(house, kind)
             }
           })
-        const turnCalls = (service: string, data: Readonly<Record<string, unknown>> = {}) => (things: ReadonlyArray<Entity>) =>
-          callsByDomain(things).map((c) => ({ domain: c.domain, service, data: { ...data, entity_id: c.ids } }))
+        const turnCalls = (service: string, data: JsonObject = {}) => (things: ReadonlyArray<Entity>): ReadonlyArray<HaServiceCall> =>
+          callsByDomain(things).map((c) => ({ domain: c.domain, service, target: { entityIds: c.ids }, data }))
 
         const lightTarget = target("light", "Room or light")
         const switchTarget = target("switch", "Room or switch")
@@ -621,11 +666,11 @@ const defineHomeAssistant = (deps: HomeAssistantDeps) =>
               Effect.map(live, (house) => {
                 const l = lang()
                 const lights = house.entities.filter((e) => e.kind === "light")
-                if (lights.length === 0) return { say: say(l, "nothingAtAll", { things: say(l, "kindLights") }) }
+                if (lights.length === 0) return { say: say(texts, l, "nothingAtAll", { things: say(texts, l, "kindLights") }) }
                 const on = lights.filter((e) => e.state === "on")
-                if (on.length === 0) return { say: say(l, "lightsAllOff") }
-                if (on.length === lights.length && lights.length > 1) return { say: say(l, "lightsAllOn") }
-                return { say: say(l, on.length === 1 ? "lightsOneOn" : "lightsSomeOn", { names: joinList(l, on.map((e) => e.name)) }) }
+                if (on.length === 0) return { say: say(texts, l, "lightsAllOff") }
+                if (on.length === lights.length && lights.length > 1) return { say: say(texts, l, "lightsAllOn") }
+                return { say: say(texts, l, on.length === 1 ? "lightsOneOn" : "lightsSomeOn", { names: joinList(l, on.map((e) => e.name)) }) }
               })
           })
         ]
@@ -715,14 +760,14 @@ const defineHomeAssistant = (deps: HomeAssistantDeps) =>
                   })
                   if (able.length === 0) {
                     const l = lang()
-                    const what = things.length === 1 ? things[0]!.name : say(l, "whatAll", { things: say(l, "kindClimate") })
-                    return { say: sentence(l, "modeUnsupported", { what, mode: say(l, MODE_TEXT[mode]) }) }
+                    const what = things.length === 1 ? things[0]!.name : say(texts, l, "whatAll", { things: say(texts, l, "kindClimate") })
+                    return { say: sentence(l, "modeUnsupported", { what, mode: say(texts, l, MODE_TEXT[mode]) }) }
                   }
                   const byMode = new Map<string, Array<Entity>>()
                   for (const { e, m } of able) byMode.set(m, [...(byMode.get(m) ?? []), e])
-                  return [...byMode].flatMap(([m, es]) => callsByDomain(es).map((c) => ({ domain: c.domain, service: "set_hvac_mode", data: { hvac_mode: m, entity_id: c.ids } })))
+                  return [...byMode].flatMap(([m, es]) => turnCalls("set_hvac_mode", { hvac_mode: m })(es))
                 },
-                (what) => sentence(lang(), "mode", { what, mode: say(lang(), MODE_TEXT[mode]) })
+                (what) => sentence(lang(), "mode", { what, mode: say(texts, lang(), MODE_TEXT[mode]) })
               )
           })
         ]
@@ -744,17 +789,17 @@ const defineHomeAssistant = (deps: HomeAssistantDeps) =>
               const area = value === HERE ? areaOfRoom(house, turn?.room) : house.areas.find((a) => `area:${a.id}` === value)
               const inScope = house.entities.filter((e) => isTemp(e) && (area === undefined || e.areaId === area.id))
               const things = inScope.length > 0 || area === undefined ? inScope : house.entities.filter(isTemp)
-              if (things.length === 0) return { say: say(l, "nothingAtAll", { things: say(l, "kindTemperature") }) }
+              if (things.length === 0) return { say: say(texts, l, "nothingAtAll", { things: say(texts, l, "kindTemperature") }) }
               const items = things.map((e) => {
                 const name = e.name
                 const current = e.kind === "climate" ? e.currentTemperature : Number.isFinite(Number(e.state)) ? Number(e.state) : undefined
-                if (e.kind === "climate" && e.state === "off" && current !== undefined) return say(l, "climateItemOff", { name, current: spokenNumber(l, current) })
-                if (current !== undefined && e.targetTemperature !== undefined) return say(l, "climateItem", { name, current: spokenNumber(l, current), target: spokenNumber(l, e.targetTemperature) })
-                if (current !== undefined) return say(l, "climateItemCurrent", { name, current: spokenNumber(l, current) })
-                if (e.targetTemperature !== undefined) return say(l, "climateItemTarget", { name, target: spokenNumber(l, e.targetTemperature) })
-                return say(l, "climateItemUnknown", { name })
+                if (e.kind === "climate" && e.state === "off" && current !== undefined) return say(texts, l, "climateItemOff", { name, current: spokenNumber(l, current) })
+                if (current !== undefined && e.targetTemperature !== undefined) return say(texts, l, "climateItem", { name, current: spokenNumber(l, current), target: spokenNumber(l, e.targetTemperature) })
+                if (current !== undefined) return say(texts, l, "climateItemCurrent", { name, current: spokenNumber(l, current) })
+                if (e.targetTemperature !== undefined) return say(texts, l, "climateItemTarget", { name, target: spokenNumber(l, e.targetTemperature) })
+                return say(texts, l, "climateItemUnknown", { name })
               })
-              return { say: say(l, "statusLine", { items: joinList(l, items, 4) }) }
+              return { say: say(texts, l, "statusLine", { items: joinList(l, items, 4) }) }
             })
         })
 
@@ -801,7 +846,7 @@ const defineHomeAssistant = (deps: HomeAssistantDeps) =>
                   const able = things.filter((e) => e.supportedFeatures === undefined || (e.supportedFeatures & COVER_SET_POSITION) !== 0)
                   if (able.length === 0) {
                     const l = lang()
-                    return { say: sentence(l, "positionUnsupported", { what: things.length === 1 ? things[0]!.name : say(l, "whatAll", { things: say(l, "kindCovers") }) }) }
+                    return { say: sentence(l, "positionUnsupported", { what: things.length === 1 ? things[0]!.name : say(texts, l, "whatAll", { things: say(texts, l, "kindCovers") }) }) }
                   }
                   return turnCalls("set_cover_position", { position: Math.round(position) })(able)
                 },
@@ -833,10 +878,10 @@ const defineHomeAssistant = (deps: HomeAssistantDeps) =>
               const e = house.byId.get(scene)
               if (e === undefined || !e.runnable) {
                 yield* shared.refreshSoon
-                return yield* new ActionError({ message: say(l, "unknownTarget", { name: scene.replace(/^[a-z0-9_]+\./, "").replace(/_/g, " ") }) })
+                return yield* new ActionError({ message: say(texts, l, "unknownTarget", { name: scene.replace(/^[a-z0-9_]+\./, "").replace(/_/g, " ") }) })
               }
-              yield* callAll([{ domain: e.domain, service: "turn_on", data: { entity_id: [e.entityId] } }])
-              return { say: say(l, "started", { name: e.name }) }
+              yield* callAll([{ domain: e.domain, service: "turn_on", target: { entityIds: [e.entityId] } }])
+              return { say: say(texts, l, "started", { name: e.name }) }
             })
         })
 
@@ -851,14 +896,14 @@ const defineHomeAssistant = (deps: HomeAssistantDeps) =>
             Effect.map(live, (house) => {
               const l = lang()
               const things = house.entities.filter((e) => (e.kind === "lock" && chosen.has("lock")) || (e.security && chosen.has("cover")))
-              if (things.length === 0) return { say: say(l, "nothingAtAll", { things: say(l, "kindLocks") }) }
+              if (things.length === 0) return { say: say(texts, l, "nothingAtAll", { things: say(texts, l, "kindLocks") }) }
               const items = things.map((e) => {
                 const name = e.name
-                if (e.domain === "lock") return say(l, e.state === "locked" ? "lockLocked" : e.state === "unlocked" ? "lockUnlocked" : "lockOther", { name, state: e.state })
-                if (e.domain === "alarm_control_panel") return e.state === "disarmed" ? say(l, "alarmDisarmed", { name }) : e.state.startsWith("armed") ? say(l, "alarmArmed", { name }) : say(l, "lockOther", { name, state: e.state })
-                return say(l, e.state === "open" ? "coverOpen" : e.state === "closed" ? "coverClosed" : "lockOther", { name, state: e.state })
+                if (e.domain === "lock") return say(texts, l, e.state === "locked" ? "lockLocked" : e.state === "unlocked" ? "lockUnlocked" : "lockOther", { name, state: e.state })
+                if (e.domain === "alarm_control_panel") return e.state === "disarmed" ? say(texts, l, "alarmDisarmed", { name }) : e.state.startsWith("armed") ? say(texts, l, "alarmArmed", { name }) : say(texts, l, "lockOther", { name, state: e.state })
+                return say(texts, l, e.state === "open" ? "coverOpen" : e.state === "closed" ? "coverClosed" : "lockOther", { name, state: e.state })
               })
-              return { say: say(l, "statusLine", { items: joinList(l, items, 6) }) }
+              return { say: say(texts, l, "statusLine", { items: joinList(l, items, 6) }) }
             })
         })
 
@@ -881,14 +926,14 @@ const defineHomeAssistant = (deps: HomeAssistantDeps) =>
               if (area !== undefined && area.trim() !== "") {
                 const options: Array<ParamOption> = house.areas.map((a) => ({ value: a.id, label: a.name, aliases: a.aliases }))
                 const named = ["here", "in here", "this room", "hier"].includes(area.trim().toLowerCase()) ? areaOfRoom(house, turn?.room)?.id : resolveOption(options, area)?.value
-                if (named === undefined) return { spoken: say(l, turn?.room === undefined && area.trim().toLowerCase() === "here" ? "whichRoom" : "roomUnknown", { room: area }) }
+                if (named === undefined) return { spoken: say(texts, l, turn?.room === undefined && area.trim().toLowerCase() === "here" ? "whichRoom" : "roomUnknown", { room: area }) }
                 only = named
               }
               const shown = house.entities.filter((e) => visible(e) && (kind === undefined || e.kind === kind) && (only === undefined || e.areaId === only))
               const rooms: Array<{ readonly room: string; readonly things: Array<string> }> = []
               let lines = 0
               let more = 0
-              for (const a of [...house.areas.map((a) => ({ id: a.id as string | undefined, name: a.name })), { id: undefined, name: say(l, "roomless") }]) {
+              for (const a of [...house.areas.map((a) => ({ id: a.id as string | undefined, name: a.name })), { id: undefined, name: say(texts, l, "roomless") }]) {
                 const here = shown.filter((e) => e.areaId === a.id)
                 if (here.length === 0) continue
                 const things: Array<string> = []

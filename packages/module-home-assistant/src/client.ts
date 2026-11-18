@@ -68,8 +68,16 @@ export interface HomeAssistantClient {
   readonly config: (limits?: CallLimits) => Effect.Effect<{ readonly version: string | undefined; readonly locationName: string | undefined }, HomeAssistantError>
   /** `POST /api/template`: the rendered text. */
   readonly renderTemplate: (template: string, limits?: CallLimits) => Effect.Effect<string, HomeAssistantError>
-  /** `POST /api/services/<domain>/<service>` with `data` as the body. */
-  readonly callService: (domain: string, service: string, data: Readonly<Record<string, unknown>>, limits?: CallLimits) => Effect.Effect<void, HomeAssistantError>
+  /**
+   * `POST /api/services/<domain>/<service>` with `data` as the body (`?return_response` when `returnResponse`): the
+   * answer's text (the changed states, or with `returnResponse` `{ changed_states, service_response }`).
+   */
+  readonly callService: (
+    domain: string,
+    service: string,
+    data: Readonly<Record<string, unknown>>,
+    limits?: CallLimits & { readonly returnResponse?: boolean | undefined }
+  ) => Effect.Effect<string, HomeAssistantError>
 }
 
 /** Read a body as text up to `maxBytes`, stopping (and cancelling the rest) as soon as it is longer. */
@@ -274,6 +282,7 @@ export const makeHomeAssistantClient = (options: HomeAssistantClientOptions): Ho
     config,
     // The template endpoint is admin only: a 401 there with a token that passed /api/config means "not an admin".
     renderTemplate: (template, limits) => request("POST", "/api/template", { template }, true, limits),
-    callService: (domain, service, data, limits) => Effect.asVoid(request("POST", `/api/services/${domain}/${service}`, data, false, limits))
+    callService: (domain, service, data, limits) =>
+      request("POST", `/api/services/${domain}/${service}${limits?.returnResponse === true ? "?return_response" : ""}`, data, false, limits)
   }
 }

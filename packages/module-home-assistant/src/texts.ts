@@ -1,16 +1,11 @@
-import type { HostView } from "@pva/core"
+import { defineTexts, type Language, say } from "@pva/module-contracts"
 
 /**
  * Every sentence the module speaks, failures, questions and refusals included, in English and Dutch with the same
  * placeholders (docs/MODULES.md §16). Fragments (`whatArea`, `kindLights`, …) are filled into the sentences in the
  * household's language, so a sentence never mixes the two.
- *
- * **Local helpers.** `homeLanguage` and `say` below do what `@pva/module-contracts` exports under the same names. This
- * package does not depend on `@pva/module-contracts` (the scaffold did not add it, and a module pull request may not
- * change the lockfile), so they are written out here, four lines each. When the dependency is added they are replaced
- * by the imports, unchanged in behaviour (the texts table already has `defineTexts`'s shape).
  */
-export const texts = {
+export const texts = defineTexts({
   en: {
     unreachable: "I couldn't reach Home Assistant.",
     timeoutChange: "Home Assistant didn't answer in time, so I don't know whether it happened.",
@@ -71,7 +66,8 @@ export const texts = {
     modeAuto: "automatic",
     modeOff: "off",
     unknownName: "an unnamed device",
-    roomless: "Without a room"
+    roomless: "Without a room",
+    refused: "I'm not allowed to do that through Home Assistant."
   },
   nl: {
     unreachable: "Ik kon Home Assistant niet bereiken.",
@@ -133,26 +129,17 @@ export const texts = {
     modeAuto: "automatisch",
     modeOff: "uit",
     unknownName: "een apparaat zonder naam",
-    roomless: "Zonder kamer"
+    roomless: "Zonder kamer",
+    refused: "Dat mag ik niet via Home Assistant doen."
   }
-} as const
+})
 
 export type TextKey = keyof typeof texts.en
-export type Language = "en" | "nl"
-
-/** The household's language from the Home section (`HOME_LANGUAGE`: `nl-…` is Dutch, anything else English). */
-export const homeLanguage = (view: Pick<HostView, "home">): Language => {
-  const value = view.home.HOME_LANGUAGE
-  return typeof value === "string" && value.toLowerCase().startsWith("nl") ? "nl" : "en"
-}
-
-/** One text in `language`, its placeholders filled; a placeholder without a value stays as written. */
-export const say = (language: Language, key: TextKey, values: Readonly<Record<string, string | number>> = {}): string =>
-  texts[language][key].replace(/\{([a-zA-Z0-9_]+)\}/g, (whole, name: string) => (Object.hasOwn(values, name) ? String(values[name]) : whole))
+export type { Language }
 
 /** The same with its first letter in upper case: a sentence that starts with a filled-in fragment ("the lights in …"). */
 export const sentence = (language: Language, key: TextKey, values: Readonly<Record<string, string | number>> = {}): string => {
-  const text = say(language, key, values)
+  const text = say(texts, language, key, values)
   return text.length === 0 ? text : text[0]!.toUpperCase() + text.slice(1)
 }
 
@@ -160,7 +147,7 @@ export const sentence = (language: Language, key: TextKey, values: Readonly<Reco
 export const joinList = (language: Language, items: ReadonlyArray<string>, max = 6): string => {
   const shown = items.slice(0, max)
   const rest = items.length - shown.length
-  const parts = rest > 0 ? [...shown, say(language, "more", { count: rest })] : shown
+  const parts = rest > 0 ? [...shown, say(texts, language, "more", { count: rest })] : shown
   const and = language === "nl" ? " en " : " and "
   return parts.length <= 1 ? (parts[0] ?? "") : `${parts.slice(0, -1).join(", ")}${and}${parts[parts.length - 1]}`
 }

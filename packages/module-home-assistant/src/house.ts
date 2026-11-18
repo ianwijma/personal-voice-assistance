@@ -1,4 +1,5 @@
 import { NOT_ONE_LINE, normalizePhrase, type ParamOption } from "@pva/core"
+import { HA_LIMITS, SECURITY_COVER_CLASSES } from "@pva/module-contracts"
 
 /**
  * The house as Home Assistant describes it: areas, and the entities of the domains this module knows, read with ONE
@@ -7,8 +8,9 @@ import { NOT_ONE_LINE, normalizePhrase, type ParamOption } from "@pva/core"
  *
  * What is read, and what is left out on purpose:
  *
- * - **Domains**: `DOMAINS` only. No `person`, `device_tracker`, `zone`, `camera`, `calendar`: where a person is and
- *   what a camera sees are personal, and they belong to other modules (presence) or to later versions.
+ * - **Domains**: `DOMAINS` only. No `device_tracker`, `zone`, `camera`, `calendar`. A `person` is read with its id,
+ *   name, state and last change and nothing else (no attributes: no coordinates, no device), for the `HomeAssistant`
+ *   service only (presence); the module's own tools never read or mention one (`Kind` "person" is never offered).
  * - **Sensors**: only the device classes in `SENSOR_CLASSES` (temperatures, humidity, doors, windows, leaks, smoke). A
  *   sensor without a class is never read: Home Assistant's companion app makes classless sensors that say where a
  *   phone is ("geocoded location"), and Home Assistant's own list of what is exposed to Assist cannot be read without
@@ -34,7 +36,8 @@ export const DOMAINS = [
   "lock",
   "alarm_control_panel",
   "scene",
-  "script"
+  "script",
+  "person"
 ] as const
 export type Domain = (typeof DOMAINS)[number]
 
@@ -56,15 +59,14 @@ export const SENSOR_CLASSES = [
   "gas"
 ] as const
 
-/** Cover device classes that are `security` (a garage door is, a blind is not): never moved by this module. */
-export const SECURITY_COVER_CLASSES: ReadonlyArray<string> = ["garage", "gate", "door"]
-
+/** The contract's bounds (`HA_LIMITS` of `@pva/module-contracts`), and the module's own for what only it reads. */
 export const HOUSE_LIMITS = {
-  entities: 5_000,
-  areas: 500,
-  idChars: 255,
-  nameChars: 200,
-  stateChars: 255,
+  entities: HA_LIMITS.entities,
+  areas: HA_LIMITS.areas,
+  idChars: HA_LIMITS.idChars,
+  nameChars: HA_LIMITS.nameChars,
+  stateChars: HA_LIMITS.stateChars,
+  aliases: HA_LIMITS.aliases,
   modes: 20,
   answerBytes: 1024 * 1024
 } as const
@@ -73,7 +75,7 @@ export const HOUSE_LIMITS = {
  * The kinds of things the module offers, each a choice of the `domains` setting. `scene` is not a choice there: a
  * scene or script is offered only when the owner names it in "Other names" (`runnable`).
  */
-export type Kind = "light" | "switch" | "climate" | "cover" | "media_player" | "sensor" | "lock" | "scene"
+export type Kind = "light" | "switch" | "climate" | "cover" | "media_player" | "sensor" | "lock" | "scene" | "person"
 
 export const kindOf = (domain: Domain): Kind => {
   switch (domain) {
@@ -98,6 +100,8 @@ export const kindOf = (domain: Domain): Kind => {
     case "scene":
     case "script":
       return "scene"
+    case "person":
+      return "person"
   }
 }
 
@@ -109,7 +113,11 @@ export const INVENTORY_TEMPLATE = String.raw`{%- set ns = namespace(areas=[], en
 {%- set ns.areas = ns.areas + [{"id": a, "name": area_name(a)}] -%}
 {%- endfor -%}
 {%- for s in states if s.domain in [${list(DOMAINS)}] and (s.domain not in ["sensor", "binary_sensor"] or (s.attributes.device_class | default("")) in [${list(SENSOR_CLASSES)}]) -%}
-{%- set ns.entities = ns.entities + [{"id": s.entity_id, "name": s.name, "state": s.state, "area": area_id(s.entity_id), "class": s.attributes.device_class | default(none), "brightness": s.attributes.brightness | default(none), "current": s.attributes.current_temperature | default(none), "target": s.attributes.temperature | default(none), "modes": s.attributes.hvac_modes | default(none), "position": s.attributes.current_position | default(none), "features": s.attributes.supported_features | default(none), "unit": s.attributes.unit_of_measurement | default(none), "title": s.attributes.media_title | default(none), "artist": s.attributes.media_artist | default(none)}] -%}
+{%- if s.domain == "person" -%}
+{%- set ns.entities = ns.entities + [{"id": s.entity_id, "name": s.name, "state": s.state, "changed": as_timestamp(s.last_changed, none)}] -%}
+{%- else -%}
+{%- set ns.entities = ns.entities + [{"id": s.entity_id, "name": s.name, "state": s.state, "changed": as_timestamp(s.last_changed, none), "area": area_id(s.entity_id), "class": s.attributes.device_class | default(none), "brightness": s.attributes.brightness | default(none), "current": s.attributes.current_temperature | default(none), "target": s.attributes.temperature | default(none), "modes": s.attributes.hvac_modes | default(none), "position": s.attributes.current_position | default(none), "features": s.attributes.supported_features | default(none), "unit": s.attributes.unit_of_measurement | default(none), "title": s.attributes.media_title | default(none), "artist": s.attributes.media_artist | default(none), "volume": s.attributes.volume_level | default(none)}] -%}
+{%- endif -%}
 {%- endfor -%}
 {{ {"areas": ns.areas, "entities": ns.entities} | to_json }}`
 
@@ -144,6 +152,10 @@ export interface Entity {
   readonly unit: string | undefined
   readonly mediaTitle: string | undefined
   readonly mediaArtist: string | undefined
+  /** A media player's volume, 0 to 1. */
+  readonly volumeLevel: number | undefined
+  /** Epoch ms of the last state change (0 when Home Assistant did not say). */
+  readonly lastChanged: number
   /** A garage door, a gate or a door (`SECURITY_COVER_CLASSES`): read, never moved. */
   readonly security: boolean
   /** A scene or script the owner named in "Other names", so it may be run. */
@@ -261,12 +273,16 @@ export const decodeHouse = (text: string, aliasText: string, fetchedAt: number):
     if (seen.has(id)) continue
     seen.add(id)
     const name = line(e.name, HOUSE_LIMITS.nameChars) ?? prettyId(id)
-    const area = typeof e.area === "string" && areaIds.has(e.area) ? e.area : undefined
-    const deviceClass = line(e.class, HOUSE_LIMITS.idChars)
     const kind = kindOf(domain)
-    const brightness = finite(e.brightness)
-    const position = finite(e.position)
-    const ownNames = ownerAliases(id, name)
+    // A person carries its name, state and last change only: whatever else an answer holds for one is not kept.
+    const person = kind === "person"
+    const area = !person && typeof e.area === "string" && areaIds.has(e.area) ? e.area : undefined
+    const deviceClass = person ? undefined : line(e.class, HOUSE_LIMITS.idChars)
+    const brightness = person ? undefined : finite(e.brightness)
+    const position = person ? undefined : finite(e.position)
+    const ownNames = person ? [] : ownerAliases(id, name)
+    const changed = finite(e.changed)
+    const volume = person ? undefined : finite(e.volume)
     entities.push({
       entityId: id,
       domain,
@@ -277,14 +293,17 @@ export const decodeHouse = (text: string, aliasText: string, fetchedAt: number):
       areaId: area,
       deviceClass,
       brightnessPct: brightness === undefined ? undefined : Math.max(0, Math.min(100, Math.round((brightness / 255) * 100))),
-      currentTemperature: finite(e.current),
-      targetTemperature: finite(e.target),
-      hvacModes: Array.isArray(e.modes) ? e.modes.flatMap((m) => (typeof m === "string" && m.length <= 40 ? [m] : [])).slice(0, HOUSE_LIMITS.modes) : [],
+      currentTemperature: person ? undefined : finite(e.current),
+      targetTemperature: person ? undefined : finite(e.target),
+      hvacModes: !person && Array.isArray(e.modes) ? e.modes.flatMap((m) => (typeof m === "string" && m.length <= 40 ? [m] : [])).slice(0, HOUSE_LIMITS.modes) : [],
       position: position === undefined ? undefined : Math.max(0, Math.min(100, Math.round(position))),
-      supportedFeatures: finite(e.features),
-      unit: line(e.unit, 20),
-      mediaTitle: line(e.title, HOUSE_LIMITS.nameChars),
-      mediaArtist: line(e.artist, HOUSE_LIMITS.nameChars),
+      supportedFeatures: person ? undefined : finite(e.features),
+      unit: person ? undefined : line(e.unit, 20),
+      mediaTitle: person ? undefined : line(e.title, HOUSE_LIMITS.nameChars),
+      mediaArtist: person ? undefined : line(e.artist, HOUSE_LIMITS.nameChars),
+      volumeLevel: volume === undefined ? undefined : Math.max(0, Math.min(1, volume)),
+      // Home Assistant gives seconds; a value that is not a plausible time is "not said".
+      lastChanged: changed !== undefined && changed > 0 && changed < 8_640_000_000_000 ? Math.round(changed * 1000) : 0,
       security: domain === "cover" && deviceClass !== undefined && SECURITY_COVER_CLASSES.includes(deviceClass),
       // Ticked one by one: only a line whose left side is this scene's or script's own entity id.
       runnable: kind === "scene" && aliases.has(normalizePhrase(id))
@@ -293,14 +312,18 @@ export const decodeHouse = (text: string, aliasText: string, fetchedAt: number):
   return { ok: true, house: { areas, entities, byId: new Map(entities.map((e) => [e.entityId, e])), leftOut, fetchedAt } }
 }
 
+/** Names without repeats (ignoring case and punctuation) and without `exclude`, each one line within the bounds, at most `HOUSE_LIMITS.aliases`. */
 const unique = (values: ReadonlyArray<string>, exclude: string): Array<string> => {
   const seen = new Set([normalizePhrase(exclude)])
   const out: Array<string> = []
-  for (const v of values) {
+  for (const raw of values) {
+    const v = line(raw, HOUSE_LIMITS.nameChars)
+    if (v === undefined) continue
     const k = normalizePhrase(v)
     if (k === "" || seen.has(k)) continue
     seen.add(k)
     out.push(v)
+    if (out.length === HOUSE_LIMITS.aliases) break
   }
   return out
 }
