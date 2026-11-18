@@ -4,6 +4,7 @@
 import { assert, describe, it } from "@effect/vitest"
 import { checkModule, startTestModule } from "@pva/core/testing"
 import { Effect, Fiber } from "effect"
+import { bound } from "../../store-sqlite/test/latencyBound.ts"
 import { BOUNDS, makeKnowledge, MAX_RESULT_CHARS, texts } from "../src/knowledge.ts"
 import { hangingNet, netWith } from "./support.ts"
 
@@ -106,7 +107,7 @@ describe("knowledge", () => {
       clearInterval(beat)
       assert.isTrue(r.ok, r.content)
       assert.deepStrictEqual({ title: (r.value as any).title, extract: (r.value as any).extract, description: (r.value as any).description }, { title: "Eiffel Tower…", extract: "", description: undefined })
-      assert.isBelow(longest, 10, `the event loop stopped for ${longest.toFixed(1)} ms`)
+      assert.isBelow(longest, bound(10), `the event loop stopped for ${longest.toFixed(1)} ms`)
     }))
 
   it.effect("every field of a result is short and one line, and the whole result has a stated maximum", () =>

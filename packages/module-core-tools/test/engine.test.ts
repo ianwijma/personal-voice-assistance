@@ -1,5 +1,6 @@
 // The calculator's bound (src/engine.ts): hostile inputs are refused or answered in a few milliseconds, never run long.
 import { assert, describe, it } from "@effect/vitest"
+import { bound } from "../../store-sqlite/test/latencyBound.ts"
 import { create, all } from "mathjs"
 import { makeEngine, MAX_CHARS } from "../src/engine.ts"
 
@@ -78,7 +79,7 @@ describe("the bounded evaluator", () => {
     ]
     for (const text of hostile) {
       const { result, ms } = timed(text)
-      assert.isTrue(ms < 25, `${text.slice(0, 40)} took ${ms.toFixed(1)} ms`)
+      assert.isTrue(ms < bound(25), `${text.slice(0, 40)} took ${ms.toFixed(1)} ms`)
       if (result.ok) assert.isTrue(Number.isFinite(result.value), text.slice(0, 40))
     }
   })
