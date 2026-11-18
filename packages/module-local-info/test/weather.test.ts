@@ -246,9 +246,9 @@ describe("weather: actions, settings and the outside service", () => {
 })
 
 describe("weather: the briefing", () => {
-  const sections = (kit: { readonly contributions: any }) =>
-    Effect.map(kit.contributions(BriefingSections) as Effect.Effect<ReadonlyArray<BriefingSection>>, (all) => all.filter((s) => s.id.startsWith("weather")))
-  const request = (kit: { readonly turn: (as?: any) => any }, over: Partial<BriefingRequest> = {}, as?: any): BriefingRequest => ({
+  type Kit = Effect.Success<ReturnType<typeof startTestModule>>
+  const sections = (kit: Kit) => Effect.map(kit.contributions(BriefingSections), (all: ReadonlyArray<BriefingSection>) => all.filter((s) => s.id.startsWith("weather")))
+  const request = (kit: Kit, over: Partial<BriefingRequest> = {}, as?: Parameters<Kit["turn"]>[0]): BriefingRequest => ({
     turn: kit.turn(as), kind: "morning", length: "normal", maxSentences: 2, language: "en", now: Date.UTC(2026, 10, 18, 9), ...over
   })
 
@@ -263,7 +263,7 @@ describe("weather: the briefing", () => {
       assert.strictEqual((r as { priority: string }).priority, "lead")
       assert.strictEqual((r as { sentences: ReadonlyArray<string> }).sentences.length, 2)
       assert.match((r as { sentences: ReadonlyArray<string> }).sentences[0]!, /^Dry until about/)
-      assert.strictEqual((yield* weather.gather(request(kit, { maxSentences: 1 })) as any).sentences.length, 1)
+      assert.strictEqual(((yield* weather.gather(request(kit, { maxSentences: 1 }))) as { sentences: ReadonlyArray<string> }).sentences.length, 1)
       const nl = yield* weather.gather(request(kit, { language: "nl" }))
       assert.match((nl as { sentences: ReadonlyArray<string> }).sentences[0]!, /^Droog tot ongeveer/)
     }))

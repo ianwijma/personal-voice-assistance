@@ -21,7 +21,7 @@ const pad = (n: number) => String(n).padStart(2, "0")
  * A forecast for Utrecht from 10:00 on the 18th: `rain` is the eight quarter-hours of precipitation (mm) from 10:00, the daily
  * rows are a week from the 18th, and the hourly rows are three days of `temperature(hour)`.
  */
-export const forecast = (options: { readonly rain?: ReadonlyArray<number | null> | undefined; readonly noRain?: boolean } = {}) => {
+export const forecast = (options: { readonly rain?: ReadonlyArray<number | null> | undefined; readonly noRain?: boolean | undefined } = {}) => {
   const rain = options.rain ?? [0, 0, 0, 0, 0, 0, 0, 0]
   const minutely = rain.map((_, i) => `2026-11-18T${pad(10 + Math.floor(i / 4))}:${pad((i % 4) * 15)}`)
   const hours = Array.from({ length: 72 }, (_, h) => `2026-11-${pad(18 + Math.floor(h / 24))}T${pad(h % 24)}:00`)

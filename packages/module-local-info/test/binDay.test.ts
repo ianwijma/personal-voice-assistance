@@ -259,9 +259,9 @@ describe("bin-day: the stored copy, the jobs and the briefing section", () => {
       assert.deepStrictEqual(yield* kit.moduleStore().collection(collections).list({}), [])
     }))
 
-  const section = (kit: { readonly contributions: any }) =>
-    Effect.map(kit.contributions(BriefingSections) as Effect.Effect<ReadonlyArray<BriefingSection>>, (all) => all.find((s) => s.id === "bin-day")!)
-  const request = (kit: { readonly turn: () => any }, over: Partial<BriefingRequest>, now: number): BriefingRequest => ({
+  type Kit = Effect.Success<ReturnType<typeof startTestModule>>
+  const section = (kit: Kit) => Effect.map(kit.contributions(BriefingSections), (all: ReadonlyArray<BriefingSection>) => all.find((s) => s.id === "bin-day")!)
+  const request = (kit: Kit, over: Partial<BriefingRequest>, now: number): BriefingRequest => ({
     turn: kit.turn(), kind: "morning", length: "normal", maxSentences: 2, language: "en", now, ...over
   })
 
