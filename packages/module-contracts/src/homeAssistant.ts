@@ -5,8 +5,15 @@ import type { Json, JsonObject } from "./common.ts"
 /**
  * `HomeAssistant`: the smart-home module's connection to Home Assistant, as a **transport** (docs/MODULES-PLAN.md §2
  * row 18, §5.2; docs/research/modules/smart-home.md §5, §7). Provided by `home-assistant`
- * (`packages/module-home-assistant`, rewritten by its PR around one WebSocket in its `shared` part), used by `music`
- * (media players through Music Assistant) and `presence` (HA `person` entities).
+ * (`packages/module-home-assistant`), used by `music` (media players through Music Assistant) and `presence` (HA
+ * `person` entities).
+ *
+ * **In this version the provider polls.** The network helpers offer no WebSocket yet, so the provider reads Home
+ * Assistant over its REST interface on an interval (about a minute) and keeps a cache. Everything below holds with
+ * these two readings: "exposed" means the entities of the kinds the owner chose in the module's settings, plus the
+ * `person` entities (for `presence` only: the provider's own tools never read them); and "the socket" means the
+ * provider's last poll: `connected` while polls succeed, `reconnecting` after one failed, and a change reaches a
+ * subscriber at the next poll, so up to an interval late. A consumer must not assume anything faster.
  *
  * **A transport, not a domain service.** It carries what the owner exposed in Home Assistant (the Assist exposure list)
  * and nothing else. It is never offered to the model as a tool of its own. A consumer classifies and filters its own
