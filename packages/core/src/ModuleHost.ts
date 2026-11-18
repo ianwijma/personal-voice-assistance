@@ -397,7 +397,8 @@ export interface ModuleHostOptions {
   readonly household?: { readonly store: HouseholdStore; readonly events: EventBus }
   /**
    * More kinds of registration (`ModuleRegistrations.ts`), after the host's own: for a kind the app keeps itself, and
-   * for tests. A kind the core keeps (P3's routes, P6's job handlers) goes in the host's `registrars` list instead.
+   * for tests. A kind the core keeps (P3's routes) goes in the host's `registrars` list instead. P6's job handlers are
+   * neither: the part's scheduler (`scheduler` below) registers them through `part.register` while the part starts.
    */
   readonly registrars?: ReadonlyArray<Registrar>
   /** P3: where route tokens are kept (serve mode: the key vault). Absent: `host.routeTokens` fails `unavailable`. */
@@ -2591,7 +2592,7 @@ export const makeModuleHost = Effect.fnUntraced(function*(options: ModuleHostOpt
       store: storeFor(entry, effect),
       events: eventsFor(entry, part, effect),
       // P6: the part's scheduler; like the store handle, every call dies with `ModuleStopped` once the part has closed.
-      scheduler: options.scheduler === undefined ? NO_SCHEDULER : schedulerFor(options.scheduler.forPart(part.handle, runnerFor(entry, part)), effect)
+      scheduler: schedulerFor(options.scheduler === undefined ? NO_SCHEDULER : options.scheduler.forPart(part.handle, runnerFor(entry, part)), effect)
     }
   }
 

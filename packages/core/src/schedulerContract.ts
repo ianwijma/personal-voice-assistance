@@ -20,15 +20,24 @@ import { makeModuleHost, type ModuleHostOptions, readOnlyPersistence } from "./M
 import {
   type DueInfo,
   type JobRow,
-  MAX_JOB_PAGE,
+  MAX_ERROR_CHARS,
   MAX_LIVE_JOBS,
   MAX_PAYLOAD_CHARS,
   type ModuleScheduler,
   SCHEDULER_OWNER,
   SchedulerError
 } from "./Scheduler.ts"
-import { type CoreScheduler, MAX_JOB_ISSUES, makeSchedulerEngine, RETENTION_ROWS_PER_PASS, type SchedulerEngine, type SchedulerEngineOptions } from "./SchedulerEngine.ts"
-import { JOB_MAX_CHARS, jobs, schedulerStorage, withIndexes } from "./SchedulerJobs.ts"
+import {
+  type CoreScheduler,
+  MAX_ADMIN_JOB_PAGE,
+  MAX_JOB_ISSUES,
+  makeSchedulerEngine,
+  RETENTION_ROWS_PER_PASS,
+  RETENTION_STEP_ROWS,
+  type SchedulerEngine,
+  type SchedulerEngineOptions
+} from "./SchedulerEngine.ts"
+import { JOB_MAX_CHARS, jobCounts, jobs, MAX_JOB_PAGE, schedulerStorage, storedError, withIndexes } from "./SchedulerJobs.ts"
 import { CurrentJob, CurrentTurn, type JobOrigin, type TurnContext } from "./TurnContext.ts"
 
 /** A store for one case; `reopen` closes it and opens the same data again (in memory: the same store). */
@@ -208,7 +217,7 @@ export const schedulerContract = (name: string, open: OpenStore) =>
 
     // ---- Payloads
 
-    it.effect("a payload is JSON of at most 2,000 characters; it is decoded by the handler's schema", () =>
+    it.effect("a payload is JSON of at most 1,000 characters; it is decoded by the handler's schema", () =>
       Effect.gen(function*() {
         const { advance, core } = yield* setup()
         const r = recorder()
@@ -297,13 +306,28 @@ export const schedulerContract = (name: string, open: OpenStore) =>
     it.effect("cron: an expression that does not parse, or never fires, is refused when scheduled (invalid, not a defect)", () =>
       Effect.gen(function*() {
         const { core } = yield* setup()
-        for (const cron of ["not a cron", "0 0 31 2 *", "61 * * * *"]) {
+        for (const cron of ["not a cron", "61 * * * *", "* * * * * * *"]) {
           const exit = yield* Effect.exit(core.schedule({ handler: "tick", cron, timeZone: "UTC" }))
           assert.isTrue(Exit.isFailure(exit) && Cause.findErrorOption(exit.cause)._tag === "Some", cron)
           assert.strictEqual((failureOf(exit) as SchedulerError).reason, "invalid", cron)
         }
         const zone = failureOf(yield* Effect.exit(core.schedule({ handler: "tick", cron: "0 7 * * *", timeZone: "Mars/Olympus" })))
         assert.strictEqual((zone as SchedulerError).reason, "invalid")
+      }))
+
+    it.effect("cron is for system jobs: a day of month or a month is refused (invalid: a one-off job rescheduled from its handler)", () =>
+      Effect.gen(function*() {
+        const { core } = yield* setup()
+        // Among them the costliest for Cron.next: a date that comes every few years, and one that never comes.
+        for (const cron of ["0 0 31 2 *", "0 0 29 2 */7", "0 7 1 * *", "0 7 * 1 *", "0 0 7 1-12 *", "0 0 0 */2 * *", "0 0 0 * JAN *"]) {
+          const e = failureOf(yield* Effect.exit(core.schedule({ handler: "tick", cron, timeZone: "Europe/Amsterdam" })))
+          assert.strictEqual((e as SchedulerError).reason, "invalid", cron)
+          assert.match((e as SchedulerError).message, /day of month and month must be \*.*one-off job/, cron)
+        }
+        // Minute, hour and day-of-week patterns, with or without seconds, are accepted.
+        for (const cron of ["*/15 * * * *", "0 7 * * 1-5", "30 2 * * SUN", "*/10 * * * * *", "0 0,30 6-22 * * MON-FRI"]) {
+          assert.strictEqual((yield* core.schedule({ handler: "tick", cron, timeZone: "Europe/Amsterdam" })).state, "scheduled", cron)
+        }
       }))
 
     it.effect("cron without a zone: the household's zone each time it is planned; a planned occurrence does not move", () =>
@@ -591,7 +615,7 @@ export const schedulerContract = (name: string, open: OpenStore) =>
         const { advance, core, engine } = yield* setup()
         const other = engine.forCore("core.other")
         const mine: Array<string> = []
-        for (let i = 0; i < 2 * MAX_JOB_PAGE + 5; i++) mine.push((yield* core.schedule({ handler: "ping", inMs: (100 - i) * SECOND })).id)
+        for (let i = 0; i < 2 * MAX_JOB_PAGE + 5; i++) mine.push((yield* core.schedule({ handler: "ping", inMs: (100 - 3 * i) * SECOND })).id)
         const theirs = yield* other.schedule({ handler: "ping", inMs: SECOND })
         assert.isUndefined(yield* core.get(theirs.id))
         assert.isFalse(yield* core.cancel(theirs.id))
@@ -609,6 +633,8 @@ export const schedulerContract = (name: string, open: OpenStore) =>
         assert.isTrue(seen.every((j) => j.module === "core.test"))
         const tooMany = failureOf(yield* Effect.exit(core.list({ limit: MAX_JOB_PAGE + 1 })))
         assert.strictEqual((tooMany as SchedulerError).reason, "invalid")
+        // The default page is the most (a list of `jobs` reads at most MAX_JOB_PAGE rows).
+        assert.strictEqual((yield* core.list()).length, MAX_JOB_PAGE)
         const copy = failureOf(yield* Effect.exit(core.list({ after: { ...seen[0]! } })))
         assert.strictEqual((copy as SchedulerError).reason, "invalid")
         const otherQuery = failureOf(yield* Effect.exit(core.list({ key: "x", after: seen[0]! })))
@@ -993,37 +1019,134 @@ export const schedulerContract = (name: string, open: OpenStore) =>
 
     // ---- Retention and issues
 
-    it.effect("finished rows are removed seven days after they finished, also when nothing is due, a bounded number a pass", () =>
+    it.effect("finished rows are removed seven days after they finished, also when nothing is due: 200 a pass in transactions of RETENTION_STEP_ROWS, the rest a second later", () =>
       Effect.gen(function*() {
-        const { advance, core, engine, issues } = yield* setup()
-        yield* core.handle("ping", { payload: Schema.Unknown, run: () => Effect.fail("no") })
-        const failed = yield* core.schedule({ handler: "ping", inMs: 0 })
-        const n = RETENTION_ROWS_PER_PASS + 30
-        for (let i = 0; i < n; i++) {
-          const j = yield* core.schedule({ handler: "none", inMs: DAY * 365 })
-          yield* core.cancel(j.id)
-        }
-        yield* advance(SECOND)
-        assert.include(issueIds(issues), `core.scheduler.failed.${failed.id}`)
-        yield* advance(7 * DAY - 2 * SECOND)
-        assert.strictEqual((yield* core.get(failed.id))?.state, "failed")
-        // Past seven days: the first pass removes RETENTION_ROWS_PER_PASS, the next (a second later) the rest.
+        const opened = yield* open()
+        const store = yield* prepared(opened.store)
+        // 231 rows that finished eight days ago (the first one failed: a Health issue), before the engine starts.
+        yield* TestClock.adjust(8 * DAY)
+        const n = RETENTION_ROWS_PER_PASS + 31
+        yield* store.transaction((htx) => {
+          const c = htx.forCore(SCHEDULER_OWNER).collection(jobs)
+          for (let i = 0; i < n; i++) {
+            const failed = i === 0
+            c.insert(withIndexes({ module: "core.test", handler: "none", payload: null, state: failed ? "failed" : "cancelled", dueAt: i, late: "run", origin: {}, attempt: failed ? 1 : 0, finishedAt: i, ...(failed ? { failedAt: i, lastError: "no" } : {}) }), { id: `job_old${String(i).padStart(3, "0")}`, actor: { kind: "admin" } })
+          }
+        })
+        const steps: Array<number> = []
+        const issues = makeIssueRegistry()
+        issues.set("scheduler", [{ id: "core.scheduler.failed.job_old000", severity: "warning", title: "t", detail: "d" }])
+        const { advance, engine } = yield* engineOn(store, { issues, observe: (e) => void (e.kind === "retention-step" && steps.push(e.removed)) })
+        const finished = Effect.gen(function*() {
+          let count = 0
+          let cursor: string | undefined = "finished"
+          while (cursor !== undefined) {
+            const page: { readonly jobs: ReadonlyArray<unknown>; readonly next?: string } = yield* engine.listAll({ cursor })
+            count += page.jobs.length
+            cursor = page.next
+          }
+          return count
+        })
+        // The first pass (nothing advanced): exactly RETENTION_ROWS_PER_PASS, in transactions of RETENTION_STEP_ROWS.
+        yield* engine.settled
+        assert.strictEqual(yield* finished, 31)
+        assert.deepStrictEqual(steps, Array.from({ length: RETENTION_ROWS_PER_PASS / RETENTION_STEP_ROWS }, () => RETENTION_STEP_ROWS))
+        assert.notInclude(issueIds(issues), "core.scheduler.failed.job_old000")
+        // The rest a second later, not before.
+        yield* advance(999)
+        assert.strictEqual(yield* finished, 31)
+        yield* advance(1)
+        assert.strictEqual(yield* finished, 0)
+        assert.strictEqual(steps.reduce((x, y) => x + y, 0), n)
+        assert.isTrue(steps.every((k) => k <= RETENTION_STEP_ROWS))
+        // A row is kept for seven days.
+        const core = engine.forCore("core.test")
+        const fresh = yield* core.schedule({ handler: "none", inMs: DAY })
+        yield* core.cancel(fresh.id)
+        yield* advance(7 * DAY - SECOND)
+        assert.strictEqual((yield* core.get(fresh.id))?.state, "cancelled")
         yield* advance(11 * MINUTE)
-        assert.isUndefined(yield* core.get(failed.id))
-        const page = yield* engine.listAll({ limit: MAX_JOB_PAGE })
-        assert.strictEqual(page.jobs.length, 0)
-        assert.notInclude(issueIds(issues), `core.scheduler.failed.${failed.id}`)
+        assert.isUndefined(yield* core.get(fresh.id))
       }))
 
-    it.effect("Health issues are bounded: the newest failed jobs and one issue saying there are more", () =>
+    it.effect("Health issues: the 48 newest failures by failure time, and an issue saying how many only when there are more", () =>
       Effect.gen(function*() {
-        const { advance, core, issues } = yield* setup()
-        yield* core.handle("bad", { payload: Schema.Unknown, run: () => Effect.fail("no") })
-        for (let i = 0; i < MAX_JOB_ISSUES + 10; i++) yield* core.schedule({ handler: "bad", inMs: i * 10 })
-        yield* advance(MINUTE)
-        const ids = issueIds(issues).filter((id) => id.startsWith("core.scheduler."))
-        assert.strictEqual(ids.length, MAX_JOB_ISSUES + 1)
-        assert.include(ids, "core.scheduler.failed.more")
+        for (const n of [MAX_JOB_ISSUES - 1, MAX_JOB_ISSUES, MAX_JOB_ISSUES + 1, MAX_JOB_ISSUES + 12]) {
+          const opened = yield* open()
+          const store = yield* prepared(opened.store)
+          // Failed rows written at one instant in id order, the oldest failure last: an order by update time, creation
+          // time or id would keep the oldest failure and leave out the newest.
+          yield* store.transaction((htx) => {
+            const c = htx.forCore(SCHEDULER_OWNER).collection(jobs)
+            for (let i = 0; i < n; i++) {
+              c.insert(withIndexes({ module: "core.test", handler: "bad", payload: null, state: "failed", dueAt: 0, late: "run", origin: {}, attempt: 1, finishedAt: n - i, failedAt: n - i, lastError: "no" }), { id: `job_f${String(i).padStart(3, "0")}`, actor: { kind: "admin" } })
+            }
+          })
+          const { advance, core, issues } = yield* engineOn(store).pipe(Effect.map((e) => ({ ...e, core: e.engine.forCore("core.test") })))
+          yield* advance(0)
+          const ids = issueIds(issues).filter((id) => id.startsWith("core.scheduler."))
+          const newest = Array.from({ length: Math.min(n, MAX_JOB_ISSUES) }, (_, i) => `core.scheduler.failed.job_f${String(i).padStart(3, "0")}`)
+          const more = issues.all().find((i) => i.id === "core.scheduler.failed.more")
+          assert.deepStrictEqual(ids.filter((id) => id !== "core.scheduler.failed.more").sort(), newest.sort(), `${n}`)
+          if (n <= MAX_JOB_ISSUES) assert.isUndefined(more, `${n}`)
+          else assert.strictEqual(more?.title, `${n} scheduled jobs have failed`)
+          // Dismissing one: the next newest takes its place, and the number follows at once.
+          assert.isTrue(yield* core.cancel("job_f000"))
+          yield* advance(0)
+          const after = issueIds(issues).filter((id) => id.startsWith("core.scheduler."))
+          assert.notInclude(after, "core.scheduler.failed.job_f000")
+          if (n > MAX_JOB_ISSUES) assert.include(after, `core.scheduler.failed.job_f${String(MAX_JOB_ISSUES).padStart(3, "0")}`)
+          const left = issues.all().find((i) => i.id === "core.scheduler.failed.more")
+          if (n - 1 <= MAX_JOB_ISSUES) assert.isUndefined(left, `${n} - 1`)
+          else assert.strictEqual(left?.title, `${n - 1} scheduled jobs have failed`)
+        }
+      }))
+
+    it.effect("a repeating job's failure stays a Health issue through a missed occurrence; only a success clears it", () =>
+      Effect.gen(function*() {
+        const { advance, core, engine, issues } = yield* setup()
+        let fail = true
+        const handler = { payload: Schema.Unknown, run: () => (fail ? Effect.fail(new Error("boom")) : Effect.void) }
+        const h = yield* coreHandler(core, "tick", handler)
+        const job = yield* core.schedule({ handler: "tick", cron: "*/10 * * * * *", timeZone: "UTC", late: { withinMs: 2 * SECOND } })
+        yield* advance(10 * SECOND)
+        assert.include(issueIds(issues), `core.scheduler.failed.${job.id}`)
+        // Down from 10 s to 25 s: the 20 s occurrence is found 5 s late and missed.
+        yield* h.withdraw
+        yield* advance(15 * SECOND)
+        fail = false
+        yield* coreHandler(core, "tick", handler)
+        yield* advance(0)
+        const missed = yield* core.get(job.id)
+        assert.strictEqual(missed?.dueAt, 30 * SECOND)
+        assert.strictEqual(missed?.lastError, "boom")
+        assert.strictEqual(missed?.failedAt, 10 * SECOND)
+        yield* engine.refreshIssues
+        assert.include(issueIds(issues), `core.scheduler.failed.${job.id}`)
+        // The 30 s occurrence succeeds: now it is cleared.
+        yield* advance(5 * SECOND)
+        assert.isUndefined((yield* core.get(job.id))?.lastError)
+        assert.notInclude(issueIds(issues), `core.scheduler.failed.${job.id}`)
+      }))
+
+    it.effect("replacing a failed repeating job by its key clears its Health issue at once (schedule and writeIn)", () =>
+      Effect.gen(function*() {
+        const opened = yield* open()
+        const store = yield* prepared(opened.store, [{ id: "kit", storage: { collections: [notes] } }])
+        const { advance, engine, issues } = yield* engineOn(store, { maintenanceMs: DAY })
+        const core = engine.forCore("core.test")
+        yield* core.handle("tick", { payload: Schema.Unknown, run: () => Effect.fail("no") })
+        const a = yield* core.schedule({ handler: "tick", key: "a", cron: "*/10 * * * * *", timeZone: "UTC" })
+        const b = yield* core.schedule({ handler: "tick", key: "b", cron: "*/10 * * * * *", timeZone: "UTC" })
+        yield* advance(10 * SECOND)
+        assert.includeMembers(issueIds(issues), [`core.scheduler.failed.${a.id}`, `core.scheduler.failed.${b.id}`])
+        yield* core.schedule({ handler: "tick", key: "a", inMs: DAY })
+        yield* advance(0)
+        assert.notInclude(issueIds(issues), `core.scheduler.failed.${a.id}`)
+        const job = yield* core.prepare({ handler: "tick", key: "b", inMs: DAY })
+        yield* store.forModule("kit").transaction((tx) => void job.writeIn(tx))
+        yield* advance(0)
+        assert.notInclude(issueIds(issues), `core.scheduler.failed.${b.id}`)
       }))
 
     // ---- The admin list
@@ -1047,7 +1170,14 @@ export const schedulerContract = (name: string, open: OpenStore) =>
           cursor = page.next
         }
         assert.strictEqual(all.length, 2 * MAX_JOB_PAGE + 5)
-        assert.isTrue(pages >= 6)
+        assert.strictEqual(pages, Math.ceil(all.length / 10))
+        assert.strictEqual(new Set(all.map((j) => j.id)).size, all.length)
+        // The most a page holds: two reads of MAX_JOB_PAGE (the default); one more is invalid.
+        const big = yield* engine.listAll()
+        assert.strictEqual(big.jobs.length, MAX_ADMIN_JOB_PAGE)
+        assert.deepStrictEqual(big.jobs.map((v) => v.job.id), all.slice(0, MAX_ADMIN_JOB_PAGE).map((j) => j.id))
+        const over = failureOf(yield* Effect.exit(engine.listAll({ limit: MAX_ADMIN_JOB_PAGE + 1 })))
+        assert.strictEqual((over as SchedulerError).reason, "invalid")
         const live = all.filter((j) => j.state === "scheduled")
         const finished = all.filter((j) => j.state === "done")
         assert.strictEqual(all.indexOf(finished[0]!), live.length)
@@ -1224,27 +1354,226 @@ export const schedulerContract = (name: string, open: OpenStore) =>
         for (let scenario = 0; scenario < MODEL_SCENARIOS; scenario++) yield* modelScenario(open, 0x5eed + scenario)
       }), { timeout: 120_000 })
 
-    it.effect("the row of a 2,000-character payload with every field at its longest fits maxChars", () =>
+    it.effect("the worst legal row fits maxChars: every field at its longest, with the costliest JSON characters in every free-text field", () =>
       Effect.gen(function*() {
-        const id = "x".repeat(200)
-        const v = withIndexes({
+        // The payload: exactly MAX_PAYLOAD_CHARS of JSON, nearly all of it unpaired surrogates (six characters each).
+        let text = ""
+        while (JSON.stringify({ s: `${text}\ud800` }).length <= MAX_PAYLOAD_CHARS) text += "\ud800"
+        const payload = { s: text.padEnd(text.length + MAX_PAYLOAD_CHARS - JSON.stringify({ s: text }).length, "x") }
+        assert.strictEqual(JSON.stringify(payload).length, MAX_PAYLOAD_CHARS)
+        // The costliest failure text: quotes, backslashes, unpaired surrogates and control characters, well past the bound.
+        const failure = storedError(`${'"\\'.repeat(300)}${"\ud800\udc00".repeat(50)}${"\udfff\u0001".repeat(300)}`)
+        assert.isAtMost(JSON.stringify(failure).length - 2, MAX_ERROR_CHARS)
+        const id = "x".repeat(64)
+        const own = {
           module: "m".repeat(40),
-          handler: "h".repeat(64),
-          key: "k".repeat(200),
-          payload: { s: "p".repeat(MAX_PAYLOAD_CHARS - 8) },
-          state: "scheduled",
+          handler: `h${"h".repeat(63)}`,
+          key: "k".repeat(100),
+          payload,
           dueAt: 8.64e15,
-          cron: "1".repeat(120),
-          timeZone: "z".repeat(64),
+          cron: `${"0,".repeat(48)}0 * * * *`.slice(0, 100),
+          timeZone: "z".repeat(48),
           late: { withinMs: 8.64e15 },
-          origin: { assistantId: id, deviceId: id, person: { id, how: "device-default", confidence: 0.123456789 } },
+          origin: { assistantId: id, deviceId: id, person: { id, how: "device-default" as const, confidence: -1.2345678901234567e-300 } },
           attempt: 11,
-          occurrenceAt: 8.64e15,
-          lastError: '"'.repeat(300),
-          failedAt: 8.64e15,
-          finishedAt: 8.64e15
+          lastError: failure,
+          failedAt: 8.64e15
+        }
+        // Live: a retry of an occurrence after an earlier one failed (every live field). Finished: every finished one.
+        const rows = [
+          withIndexes({ ...own, state: "scheduled", occurrenceAt: 8.64e15 }),
+          withIndexes({ ...own, state: "running", occurrenceAt: 8.64e15 }),
+          ...(["done", "failed", "cancelled", "missed"] as const).map((state) => withIndexes({ ...own, state, finishedAt: 8.64e15 }))
+        ]
+        for (const v of rows) assert.isAtMost(JSON.stringify(v).length, JOB_MAX_CHARS, v.state)
+        assert.strictEqual(MAX_JOB_PAGE, Math.min(100, Math.floor(25_000 / JOB_MAX_CHARS)))
+      }))
+
+    it.effect("a failure text of unpaired surrogates and quotes is stored bounded: a repeating job at every limit moves on, with its issue", () =>
+      Effect.gen(function*() {
+        const { advance, core, issues } = yield* setup()
+        const id = "x".repeat(64)
+        let text = ""
+        while (JSON.stringify({ s: `${text}\ud800` }).length <= MAX_PAYLOAD_CHARS) text += "\ud800"
+        yield* core.handle(`h${"h".repeat(63)}`, { payload: Schema.Unknown, run: () => Effect.fail(new Error(`${"\ud800".repeat(300)}${'"'.repeat(300)}`)) })
+        const job = yield* core.schedule({
+          handler: `h${"h".repeat(63)}`,
+          payload: { s: text },
+          key: "k".repeat(100),
+          cron: "*/10 * * * * *",
+          timeZone: "America/Argentina/ComodRivadavia",
+          late: { withinMs: 8.64e15 },
+          origin: { assistantId: id, deviceId: id, person: { id, how: "chosen", confidence: 0.123456789 } }
         })
-        assert.isTrue(JSON.stringify(v).length <= JOB_MAX_CHARS, `${JSON.stringify(v).length}`)
+        yield* advance(10 * SECOND)
+        const after = yield* core.get(job.id)
+        assert.strictEqual(after?.state, "scheduled")
+        assert.strictEqual(after?.dueAt, 20 * SECOND)
+        assert.isAtMost(JSON.stringify(after?.lastError).length - 2, MAX_ERROR_CHARS)
+        assert.match(after?.lastError ?? "", /^\ufffd{199}…$/)
+        assert.include(issueIds(issues), `core.scheduler.failed.${job.id}`)
+      }))
+
+    // ---- Review round 1 of the rebuild
+
+    it.effect("writeIn refuses before it writes: a caught refusal (the limit, an id in use) leaves the key's live job and the count as they were", () =>
+      Effect.gen(function*() {
+        const opened = yield* open()
+        const store = yield* prepared(opened.store, [{ id: "kit", storage: { collections: [notes] } }])
+        const ids = ["job_a", "job_b", "job_a"]
+        const { engine } = yield* engineOn(store, { newId: () => ids.shift() ?? `job_${Math.random().toString(36).slice(2)}` })
+        const core = engine.forCore("core.test")
+        const counted = Effect.map(store.forCore(SCHEDULER_OWNER).collection(jobCounts).get("core.test"), (r) => r?.value.live)
+        yield* core.schedule({ handler: "ping", inMs: MINUTE })
+        const keyed = yield* core.schedule({ handler: "ping", key: "k", inMs: MINUTE })
+        const kit = store.forModule("kit")
+        // An id in use (job_a): refused before the key's live job is cancelled.
+        const reused = yield* core.prepare({ handler: "ping", key: "k", inMs: MINUTE })
+        const first = yield* kit.transaction((tx) => {
+          tx.collection(notes).insert({ text: "kept" })
+          try {
+            reused.writeIn(tx)
+            return "written"
+          } catch (e) {
+            return (e as StoreError).reason
+          }
+        })
+        assert.strictEqual(first, "invalid")
+        assert.strictEqual((yield* core.get(keyed.id))?.state, "scheduled")
+        assert.strictEqual(yield* counted, 2)
+        // At the limit: refused before anything is written.
+        for (let i = 2; i < MAX_LIVE_JOBS; i++) yield* core.schedule({ handler: "ping", inMs: MINUTE })
+        const over = yield* core.prepare({ handler: "ping", key: "other", inMs: MINUTE })
+        const second = yield* kit.transaction((tx) => {
+          tx.collection(notes).insert({ text: "kept too" })
+          try {
+            over.writeIn(tx)
+            return "written"
+          } catch (e) {
+            return (e as StoreError).reason
+          }
+        })
+        assert.strictEqual(second, "invalid")
+        assert.strictEqual((yield* core.get(keyed.id))?.state, "scheduled")
+        assert.strictEqual(yield* counted, MAX_LIVE_JOBS)
+        assert.strictEqual((yield* kit.collection(notes).list()).length, 2)
+        // The key's job is still replaced normally.
+        const replacing = yield* core.prepare({ handler: "ping", key: "k", inMs: MINUTE })
+        yield* kit.transaction((tx) => void replacing.writeIn(tx))
+        assert.strictEqual((yield* core.get(keyed.id))?.state, "cancelled")
+        assert.strictEqual(yield* counted, MAX_LIVE_JOBS)
+      }))
+
+    it.effect("the maintenance pass recounts each module's live jobs: a wrong counter (too high or too low) is repaired", () =>
+      Effect.gen(function*() {
+        const { advance, core, engine, store } = yield* setup()
+        for (let i = 0; i < 2 * MAX_JOB_PAGE + 3; i++) yield* core.schedule({ handler: "ping", inMs: DAY })
+        const counts = store.forCore(SCHEDULER_OWNER).collection(jobCounts)
+        for (const planted of [5, 2 * MAX_JOB_PAGE + 40]) {
+          yield* counts.update("core.test", () => ({ live: planted }))
+          engine.maintainSoon()
+          yield* advance(0)
+          assert.strictEqual((yield* counts.get("core.test"))?.value.live, 2 * MAX_JOB_PAGE + 3, `${planted}`)
+        }
+        // Right counters are left alone.
+        const rev = (yield* counts.get("core.test"))?.rev
+        engine.maintainSoon()
+        yield* advance(0)
+        assert.strictEqual((yield* counts.get("core.test"))?.rev, rev)
+      }))
+
+    it.effect("fairness: a handler with many due jobs does not keep another's waiting; the next free run goes to the next handler", () =>
+      Effect.gen(function*() {
+        const { advance, engine } = yield* setup({ maxRuns: 2 })
+        const started: Array<[string, number]> = []
+        const slow = (name: string) => ({
+          payload: Schema.Unknown,
+          run: () => Effect.andThen(Effect.flatMap(Clock.currentTimeMillis, (t) => Effect.sync(() => void started.push([name, t]))), Effect.sleep(10 * SECOND))
+        })
+        const a = engine.forCore("core.a")
+        const b = engine.forCore("core.b")
+        yield* a.handle("work", slow("a"))
+        yield* b.handle("work", slow("b"))
+        for (let i = 0; i < MAX_LIVE_JOBS; i++) yield* a.schedule({ handler: "work", inMs: 0 })
+        yield* b.schedule({ handler: "work", inMs: 5 * SECOND })
+        yield* advance(0)
+        assert.deepStrictEqual(started, [["a", 0], ["a", 0]])
+        // Due at 5 s while both runs are taken; at 10 s two runs end: b's job takes the first free one.
+        yield* advance(10 * SECOND)
+        assert.deepStrictEqual(started.slice(2), [["b", 10 * SECOND], ["a", 10 * SECOND]])
+        assert.strictEqual(engine.runsInFlight(), 2)
+      }))
+
+    it.effect("closing the engine interrupts every run, a core handler's too; closing a handler's registration interrupts its runs", () =>
+      Effect.gen(function*() {
+        const opened = yield* open()
+        const store = yield* prepared(opened.store)
+        // The registration outlives the engine (as a core service registered in a longer scope).
+        const outer = yield* Scope.make()
+        const first = yield* engineOn(store)
+        const gate = yield* Deferred.make<void>()
+        let interrupted = 0
+        let effectAfter = false
+        const hold = { payload: Schema.Unknown, run: () => Deferred.await(gate).pipe(Effect.andThen(Effect.sync(() => void (effectAfter = true))), Effect.onInterrupt(() => Effect.sync(() => void interrupted++))) }
+        yield* Scope.provide(outer)(first.engine.forCore("core.test").handle("hold", hold))
+        const job = yield* first.engine.forCore("core.test").schedule({ handler: "hold", inMs: 0 })
+        yield* first.advance(0)
+        assert.strictEqual(first.engine.runsInFlight(), 1)
+        yield* first.stop
+        assert.strictEqual(interrupted, 1)
+        assert.strictEqual(first.engine.runsInFlight(), 0)
+        yield* Deferred.succeed(gate, undefined)
+        for (let i = 0; i < 100; i++) yield* Effect.yieldNow
+        assert.isFalse(effectAfter)
+        assert.strictEqual((yield* store.forCore(SCHEDULER_OWNER).collection(jobs).get(job.id))?.value.state, "running")
+        yield* Scope.close(outer, Exit.void)
+        // A registration closing while its handler runs: interrupted, and nothing is left running in this process.
+        const second = yield* engineOn(store)
+        const gate2 = yield* Deferred.make<void>()
+        const reg = yield* Scope.make()
+        yield* Scope.provide(reg)(second.engine.forCore("core.test").handle("hold2", { payload: Schema.Unknown, run: () => Deferred.await(gate2).pipe(Effect.onInterrupt(() => Effect.sync(() => void interrupted++))) }))
+        yield* second.engine.forCore("core.test").schedule({ handler: "hold2", inMs: 0 })
+        yield* second.advance(0)
+        assert.strictEqual(second.engine.runsInFlight(), 1)
+        yield* Scope.close(reg, Exit.void)
+        assert.strictEqual(interrupted, 2)
+        assert.strictEqual(second.engine.runsInFlight(), 0)
+      }))
+
+    it.effect("ctx.scheduler of a host without an engine: every call, handle too, stops with ModuleStopped once the part has closed", () =>
+      Effect.gen(function*() {
+        const opened = yield* open()
+        const store = yield* prepared(opened.store, [{ id: "kit", storage: { collections: [notes] } }])
+        const held: { scheduler?: ModuleScheduler } = {}
+        const kit = kitModule("kit", (s) => s.handle("ring", { payload: Schema.Unknown, run: () => Effect.void }), held)
+        const host = yield* makeModuleHost({ catalog: [kit], persistence: readOnlyPersistence(), env: {}, household: { store, events: makeEventBus() }, graceMs: 0 })
+        yield* host.startEnabled
+        const live = failureOf(yield* Effect.exit(held.scheduler!.list()))
+        assert.strictEqual((live as SchedulerError).reason, "unavailable")
+        const old = held.scheduler!
+        yield* host.disable("kit")
+        for (const call of [old.handle("ring", { payload: Schema.Unknown, run: () => Effect.void }), old.list(), old.get("x"), old.schedule({ handler: "ring", inMs: 0 }), old.prepare({ handler: "ring", inMs: 0 }), old.cancel("x"), old.reschedule("x", { inMs: 0 })]) {
+          const stopped = yield* Effect.exit(call as Effect.Effect<unknown, unknown>)
+          assert.isTrue(Exit.isFailure(stopped) && isModuleStopped(Cause.squash(stopped.cause)))
+        }
+      }))
+
+    it.effect("admin cursors belong to their engine: one from before a restart is refused, even after the new engine gave out others", () =>
+      Effect.gen(function*() {
+        const opened = yield* open()
+        const store = yield* prepared(opened.store)
+        const first = yield* engineOn(store)
+        for (let i = 0; i < 12; i++) yield* first.engine.forCore("core.test").schedule({ handler: "ping", inMs: (i + 1) * MINUTE })
+        const saved = (yield* first.engine.listAll({ limit: 2 })).next!
+        yield* first.stop
+        const second = yield* engineOn(store)
+        for (let i = 0; i < 20; i++) yield* second.engine.listAll({ limit: 2 + (i % 6) })
+        const old = failureOf(yield* Effect.exit(second.engine.listAll({ cursor: saved })))
+        assert.strictEqual((old as SchedulerError).reason, "invalid")
+        // A cursor of this engine continues where its page ended.
+        const page1 = yield* second.engine.listAll({ limit: 2 })
+        const page2 = yield* second.engine.listAll({ limit: 2, cursor: page1.next! })
+        assert.deepStrictEqual(page2.jobs.map((v) => v.job.dueAt), [3 * MINUTE, 4 * MINUTE])
       }))
   })
 

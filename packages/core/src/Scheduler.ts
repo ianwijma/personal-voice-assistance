@@ -28,15 +28,25 @@ import type { TurnPerson } from "./TurnContext.ts"
 /** The owner of the scheduler's collections in the household store. */
 export const SCHEDULER_OWNER = "core.scheduler" as const
 /** The most characters of a job's payload, as JSON. */
-export const MAX_PAYLOAD_CHARS = 2_000
+export const MAX_PAYLOAD_CHARS = 1_000
 /** The most live (`scheduled` or `running`) jobs of one module. */
 export const MAX_LIVE_JOBS = 200
 /** A handler's name: lower case letters, digits and `_ . -`, starting with a letter, at most 64. */
 export const HANDLER_NAME = /^[a-z][a-z0-9_.-]{0,63}$/
-/** A job's key: 1–200 letters, digits and `_ . : @ / -`. */
-export const JOB_KEY = /^[A-Za-z0-9_.:@/-]{1,200}$/
-/** The longest `cron` expression. */
-export const MAX_CRON_CHARS = 120
+/** A job's key: 1–100 letters, digits and `_ . : @ / -`. */
+export const JOB_KEY = /^[A-Za-z0-9_.:@/-]{1,100}$/
+/** An id in a job's origin (an assistant, a device, a person): 1–64 letters, digits and `_ . : -` (every real one fits). */
+export const ORIGIN_ID = /^[A-Za-z0-9_.:-]{1,64}$/
+/**
+ * The longest `cron` expression. `cron` is for system jobs (refreshing a cache): minute, hour and day-of-week patterns,
+ * with an optional seconds field first; its day-of-month and month fields must be `*`. A date ("the 1st of each month")
+ * is a one-off job that schedules the next one from its handler.
+ */
+export const MAX_CRON_CHARS = 100
+/** The latest time a job can be due (epoch ms; the end of JavaScript's date range). Times are whole milliseconds. */
+export const MAX_TIME = 8.64e15
+/** The most characters a stored failure text takes as JSON (`JobRow.lastError`; well-formed, one line). */
+export const MAX_ERROR_CHARS = 200
 /** A handler's time limit when it declares none (it covers decoding the payload too). */
 export const DEFAULT_HANDLER_TIMEOUT_MS = 60_000
 /** The longest time limit a handler may declare. */
@@ -47,9 +57,6 @@ export const DEFAULT_RETRIES = 3
 export const MAX_RETRIES = 10
 /** Finished jobs (`done`, `failed`, `cancelled`, `missed`) are removed this long after they finished. */
 export const KEEP_FINISHED_MS = 7 * 24 * 60 * 60 * 1000
-/** The most rows one page of `list` (and of the admin list) returns: `maxListRows(jobs)` (see `SchedulerJobs.ts`). */
-export const MAX_JOB_PAGE = 24
-
 // ---------------------------------------------------------------------------------------------------------------------
 // Jobs
 
@@ -121,9 +128,15 @@ export interface JobRow {
   readonly origin: ScheduleOrigin
   /** Runs of its current occurrence so far (0 before the first). */
   readonly attempt: number
-  /** Why its last run failed (module text: it passes the page boundary before the admin page shows it). */
+  /**
+   * Why its last run failed: passed through the page boundary of its module in full, then made one well-formed line of
+   * at most `MAX_ERROR_CHARS` characters as JSON.
+   */
   readonly lastError?: string
-  /** When its last run failed (a repeating job keeps it until an occurrence succeeds: a Health issue meanwhile). */
+  /**
+   * When its last run failed. A repeating job keeps it (and `lastError`) until an occurrence succeeds, however many it
+   * misses meanwhile: a Health issue until then.
+   */
   readonly failedAt?: number
   readonly finishedAt?: number
   readonly createdAt: number
@@ -165,14 +178,14 @@ export interface JobListQuery {
   readonly key?: string
   /** The last row of the previous page of the same query (a row `list` returned; not a copy). */
   readonly after?: JobRow
-  /** Default 20, at most `MAX_JOB_PAGE`. */
+  /** Default and at most `MAX_JOB_PAGE` (`maxListRows(jobs)`). */
   readonly limit?: number
 }
 
 /**
  * Why a scheduler call failed. `unavailable`: no scheduler here (the CLI modes; a module words it: "timers run only on
- * the server"); `invalid`: the request is wrong (an unknown field, a cron expression that does not parse or never
- * fires, a payload that is not JSON or too long); `state`: the job cannot do that now (reschedule a finished job, a
+ * the server"); `invalid`: the request is wrong (an unknown field, a cron expression that does not parse, never
+ * fires, or names a day of month or a month (`MAX_CRON_CHARS`), a payload that is not JSON or too long); `state`: the job cannot do that now (reschedule a finished job, a
  * handler registered after the start); `limit`: `MAX_LIVE_JOBS` live jobs already; `busy`: the store was busy, try
  * again; `failed`: the store said no.
  */
@@ -191,8 +204,11 @@ export interface PreparedJob {
   /**
    * Write the job inside a running transaction of the module (`ctx.store.transaction((tx) => … job.writeIn(tx) …)`):
    * synchronous, part of that transaction (it commits or rolls back with the module's own writes), and the engine is
-   * woken after the commit. A refusal is thrown as a store failure (so an uncaught one rolls the transaction back):
-   * `StoreError` `invalid` for `MAX_LIVE_JOBS` and for a handle used outside its function. Write a prepared job once.
+   * woken after the commit. Everything that can refuse is checked before its first write, so a refusal leaves the
+   * transaction as it was: `StoreError` `invalid` for `MAX_LIVE_JOBS`, for a prepared job written already and for a
+   * handle used outside its function (it may be caught to commit the rest). Any other failure is the store's, in the
+   * middle of the job's writes: it must not be caught to go on with the same transaction (docs/SCHEDULING.md "Inside
+   * your own transaction"). Write a prepared job once.
    */
   readonly writeIn: (tx: StoreTx) => JobRow
 }

@@ -7,6 +7,7 @@ import {
   type CoreOwner,
   type HouseholdStore,
   isStoreFailure,
+  maxListRows,
   type Row,
   SAFE_ID,
   StoreError,
@@ -32,12 +33,14 @@ import {
   KEEP_FINISHED_MS,
   type LatePolicy,
   MAX_CRON_CHARS,
+  MAX_ERROR_CHARS,
   MAX_HANDLER_TIMEOUT_MS,
-  MAX_JOB_PAGE,
   MAX_LIVE_JOBS,
   MAX_PAYLOAD_CHARS,
   MAX_RETRIES,
+  MAX_TIME,
   type ModuleScheduler,
+  ORIGIN_ID,
   type PartRunner,
   type PreparedJob,
   type RescheduleWhen,
@@ -47,7 +50,20 @@ import {
   SchedulerError,
   type SchedulerHook
 } from "./Scheduler.ts"
-import { type JobCount, jobCounts, type JobFields, jobRowOf, jobs, fieldsOf, isLive, type StoredJob, withIndexes } from "./SchedulerJobs.ts"
+import { MAX_CHECKED_LENGTH } from "./PageBoundary.ts"
+import {
+  type JobCount,
+  jobCounts,
+  type JobFields,
+  jobRowOf,
+  jobs,
+  fieldsOf,
+  isLive,
+  MAX_JOB_PAGE,
+  storedError,
+  type StoredJob,
+  withIndexes
+} from "./SchedulerJobs.ts"
 import { CurrentJob, CurrentTurn, type JobOrigin, type TurnPerson } from "./TurnContext.ts"
 
 /**
@@ -68,8 +84,10 @@ import { CurrentJob, CurrentTurn, type JobOrigin, type TurnPerson } from "./Turn
  *   a handler's rows when the handler is published (so at start, as each handler first appears) and to every published
  *   handler's rows by the maintenance pass.
  * - **Maintenance**, every `maintenanceMs` and also when nothing is due: finished rows older than `keepFinishedMs` are
- *   removed (at most `RETENTION_ROWS_PER_PASS` a pass, `BULK_STEP_ROWS` a transaction), the recovery rule, the Health
- *   issues.
+ *   removed (at most `RETENTION_ROWS_PER_PASS` a pass, `RETENTION_STEP_ROWS` a transaction), the recovery rule, the
+ *   recount of each module's live jobs (a counter that disagrees with the rows is repaired), the Health issues.
+ * - **Fairness**: a pass claims at most one due job per published handler per round, and starts at the handler after
+ *   the one whose job it last started, so one handler with many due jobs cannot keep another's waiting.
  */
 
 export interface SchedulerEngineOptions {
@@ -133,13 +151,17 @@ export interface SchedulerEngine extends SchedulerHook {
 
 /** Finished rows removed by one maintenance pass at most (more: the next pass follows a second later). */
 export const RETENTION_ROWS_PER_PASS = 200
-/** Failed jobs shown as Health issues at most (the newest; one more issue says that there are more). */
-export const MAX_JOB_ISSUES = 2 * MAX_JOB_PAGE
+/** Finished rows removed by one transaction of retention: `BULK_STEP_ROWS`, at most one list of `jobs`. */
+export const RETENTION_STEP_ROWS = Math.min(BULK_STEP_ROWS, MAX_JOB_PAGE)
+/** Failed jobs shown as Health issues at most (the newest failures; one more issue says how many there are). */
+export const MAX_JOB_ISSUES = 48
+/** The most jobs one page of the admin list holds (`listAll`): two reads of `MAX_JOB_PAGE`, with a yield between. */
+export const MAX_ADMIN_JOB_PAGE = 2 * MAX_JOB_PAGE
 
+const COUNTER_PAGE = maxListRows(jobCounts)
 const JUMP_MS = 2_000
 const MAX_BACKOFF_MS = 10 * 60_000
-const ERROR_CHARS = 300
-const ZONE = /^[A-Za-z0-9_/+-]{1,64}$/
+const ZONE = /^[A-Za-z0-9_/+-]{1,48}$/
 const CRON_TEXT = /^[0-9A-Za-z*/,?#LW -]+$/
 const SYSTEM: Actor = { kind: "system", name: "scheduler" }
 const ADMIN: Actor = { kind: "admin" }
@@ -154,6 +176,9 @@ class RunRefused extends Schema.TaggedError<RunRefused>()("RunRefused", { reason
 class PayloadInvalid extends Schema.TaggedError<PayloadInvalid>()("PayloadInvalid", { message: Schema.String }) {}
 class RunTimeout extends Schema.TaggedError<RunTimeout>()("RunTimeout", { ms: Schema.Number }) {}
 
+/** The scheduler's collections inside one transaction (its own, or a module's it joined). */
+type TxParts = { readonly jobs: TxCollection<StoredJob>; readonly counts: TxCollection<typeof JobCount.Type>; readonly tx: StoreTx }
+
 /** A handler as the engine keeps it while it is published. */
 interface Published {
   readonly owner: string
@@ -167,14 +192,23 @@ interface Published {
   readonly run: (payload: any, due: DueInfo) => Effect.Effect<void, unknown>
   /** A module part's: how it runs as a call in flight. Absent for a core handler. */
   readonly runner?: PartRunner
-  /** Where a core handler's runs are forked (its registration's scope). */
+  /**
+   * Where a core handler's runs are forked: a scope of the engine's run scope that its registration's scope also
+   * closes, so either lifetime ending interrupts them. Absent (a module part's): the run scope itself.
+   */
   readonly scope?: Scope.Scope
 }
 
-const messageOf = (error: unknown): string => {
-  const m = error instanceof Error ? error.message : typeof error === "object" && error !== null && "message" in error ? String((error as { message: unknown }).message) : String(error)
-  return oneLine(m, ERROR_CHARS)
+/** What an error says, in full (a handler's failure: the page boundary sees all of it before it is shortened). */
+const textOf = (error: unknown): string => {
+  try {
+    return error instanceof Error ? error.message : typeof error === "object" && error !== null && "message" in error ? String((error as { message: unknown }).message) : String(error)
+  } catch {
+    return "(an error that cannot be shown as text)"
+  }
 }
+/** An error for a log line or a refusal: one line, shortened. */
+const messageOf = (error: unknown): string => oneLine(textOf(error), 300)
 
 const failedWith = (reason: SchedulerError["reason"], message: string) => new SchedulerError({ reason, message })
 const invalid = (message: string) => failedWith("invalid", message)
@@ -200,7 +234,7 @@ const payloadOf = (payload: unknown): { readonly ok: true; readonly value: Schem
 const personProblem = (p: unknown): string | undefined => {
   if (typeof p !== "object" || p === null) return "origin.person must be { id, how }"
   const { confidence, how, id } = p as Partial<TurnPerson>
-  if (typeof id !== "string" || !SAFE_ID.test(id)) return "origin.person.id must be 1–200 letters, digits and _ . : -"
+  if (typeof id !== "string" || !ORIGIN_ID.test(id)) return "origin.person.id must be 1–64 letters, digits and _ . : -"
   if (how !== "device-default" && how !== "voice" && how !== "chosen") return "origin.person.how must be device-default, voice or chosen"
   if (confidence !== undefined && !Number.isFinite(confidence)) return "origin.person.confidence must be a number"
   return undefined
@@ -211,7 +245,7 @@ const checkedOrigin = (o: unknown): ScheduleOrigin | string => {
   if (typeof o !== "object" || o === null) return "origin must be an object"
   const { assistantId, deviceId, person } = o as ScheduleOrigin
   for (const [name, v] of [["assistantId", assistantId], ["deviceId", deviceId]] as const) {
-    if (v !== undefined && (typeof v !== "string" || !SAFE_ID.test(v))) return `origin.${name} must be 1–200 letters, digits and _ . : -`
+    if (v !== undefined && (typeof v !== "string" || !ORIGIN_ID.test(v))) return `origin.${name} must be 1–64 letters, digits and _ . : -`
   }
   if (person !== undefined) {
     const problem = personProblem(person)
@@ -231,17 +265,20 @@ const originNow: Effect.Effect<ScheduleOrigin> = Effect.gen(function*() {
   const from = job ?? turn
   if (from === undefined) return {}
   const checked = checkedOrigin({
-    ...(from.assistantId !== undefined && SAFE_ID.test(from.assistantId) ? { assistantId: from.assistantId } : {}),
-    ...(from.deviceId !== undefined && SAFE_ID.test(from.deviceId) ? { deviceId: from.deviceId } : {}),
+    ...(from.assistantId !== undefined && ORIGIN_ID.test(from.assistantId) ? { assistantId: from.assistantId } : {}),
+    ...(from.deviceId !== undefined && ORIGIN_ID.test(from.deviceId) ? { deviceId: from.deviceId } : {}),
     ...(from.person !== undefined && personProblem(from.person) === undefined ? { person: from.person } : {})
   })
   return typeof checked === "string" ? {} : checked
 })
 
+/** A time in epoch ms, as a job keeps it: a whole number from 0 to `MAX_TIME`. */
+const isTime = (t: number) => Number.isFinite(t) && t >= 0 && t <= MAX_TIME
+
 const lateProblem = (late: unknown): string | undefined =>
-  late === undefined || late === "run" || (typeof late === "object" && late !== null && Number.isFinite((late as { withinMs: number }).withinMs) && (late as { withinMs: number }).withinMs >= 0 && Object.keys(late).length === 1)
+  late === undefined || late === "run" || (typeof late === "object" && late !== null && isTime((late as { withinMs: number }).withinMs) && Object.keys(late).length === 1)
     ? undefined
-    : 'late must be "run" or { withinMs } (0 or more)'
+    : 'late must be "run" or { withinMs } (0 to 8.64e15)'
 
 const REQUEST_KEYS = new Set(["handler", "payload", "key", "late", "origin", "at", "inMs", "cron", "timeZone"])
 
@@ -257,6 +294,8 @@ export const makeSchedulerEngine = (options: SchedulerEngineOptions): Effect.Eff
     const outcomeRetryMs = options.outcomeRetryMs ?? [250, 1_000, 4_000]
     const newId = options.newId ?? (() => `job_${crypto.randomUUID().replace(/-/g, "").slice(0, 20)}`)
     const pageText = options.pageText ?? ((_m: string, text: unknown, max: number) => oneLine(text, max))
+    /** A failure text of `owner`'s handler as it is stored: through the page boundary in full, then `storedError`. */
+    const errorText = (owner: string, text: string): string => storedError(pageText(owner, text, MAX_CHECKED_LENGTH))
     const engineScope = yield* Effect.scope
     // Runs and the loop use the engine's context, never a caller's: no turn, no transaction of someone else.
     const engineContext = yield* Effect.context<never>()
@@ -265,6 +304,7 @@ export const makeSchedulerEngine = (options: SchedulerEngineOptions): Effect.Eff
     const monotonicMs = Effect.map(Clock.monotonicTimeNanos, (n) => Number(n / 1_000_000n))
     const core = store.forCore(SCHEDULER_OWNER)
     const jobsOut = core.collection(jobs)
+    const countsOut = core.collection(jobCounts)
 
     // ---- State of this process
 
@@ -277,13 +317,24 @@ export const makeSchedulerEngine = (options: SchedulerEngineOptions): Effect.Eff
     /** Handlers published since the loop last applied the recovery rule to them. */
     const pendingRecovery = new Set<string>()
     let runCount = 0
+    /** The handler whose job the loop started last: the next pass starts at the one after it (fairness). */
+    let lastClaimed: string | undefined
     let issuesDirty = true
+    /**
+     * Rows with a Health issue, when known: counted when the Health issues are read (exactly, when they fit the bound;
+     * else by reading the rest of the index, at each maintenance pass), and kept up by every committed change since.
+     */
+    let issueTotal: number | undefined
     let nextMaintenance = 0
     let closing = false
     let waiting = false
     /** Counts what the engine did (passes, runs, outcomes): `settled` waits until it stops moving. */
     let progress = 0
-    /** Admin list cursors: a token for the last row of a page (the store continues only after a row a list returned). */
+    /**
+     * Admin list cursors: an unguessable token of this engine for the last row of a page. The store continues a list
+     * only after a row object one of its lists returned (`ListQuery.after`), not after a row read by `get`, so a cursor
+     * cannot be the row's id; a token from another engine (before a restart) is unknown here: 400, start again.
+     */
     const cursors = new Map<string, { readonly phase: "live" | "finished"; readonly row: Row<StoredJob> }>()
     /** The store's rows behind the `JobRow`s `list` returned (`after`). */
     const listedRows = new WeakMap<JobRow, { readonly owner: string; readonly key: string | undefined; readonly row: Row<StoredJob> }>()
@@ -357,15 +408,20 @@ export const makeSchedulerEngine = (options: SchedulerEngineOptions): Effect.Eff
       if (row === undefined) counts.insert({ live }, { id: owner, actor })
       else counts.update(owner, () => ({ live }), { actor })
     }
+    /** A committed change of rows with a Health issue: they are read again after the pass, and counted. */
+    const issueChanged = (delta: number) => {
+      issuesDirty = true
+      if (issueTotal !== undefined) issueTotal = Math.max(0, issueTotal + delta)
+    }
+    /** After the commit of `t`: the issues changed when `before` or `after` had one. */
+    const noteIssue = (t: TxParts, before: boolean, after: boolean) => {
+      if (before || after) t.tx.afterCommit(() => issueChanged((after ? 1 : 0) - (before ? 1 : 0)))
+    }
     /** Replace `before` with `next` (with `expectRev` of `before`), and keep the counter. */
-    const put = (
-      t: { readonly jobs: TxCollection<StoredJob>; readonly counts: TxCollection<typeof JobCount.Type> },
-      before: Row<StoredJob>,
-      next: JobFields,
-      actor: Actor
-    ): Row<StoredJob> => {
+    const put = (t: TxParts, before: Row<StoredJob>, next: JobFields, actor: Actor): Row<StoredJob> => {
       const row = t.jobs.update(before.id, () => withIndexes(next), { expectRev: before.rev, actor })
       adjust(t.counts, next.module, (isLive(next.state) ? 1 : 0) - (isLive(before.value.state) ? 1 : 0), actor)
+      noteIssue(t, before.value.issue === true, row.value.issue === true)
       return row
     }
     const clean = (f: { readonly [K in keyof JobFields]?: JobFields[K] | undefined }): JobFields => {
@@ -375,7 +431,7 @@ export const makeSchedulerEngine = (options: SchedulerEngineOptions): Effect.Eff
     }
 
     /** One transaction on the scheduler's collections. */
-    const tx = <X>(f: (t: { readonly jobs: TxCollection<StoredJob>; readonly counts: TxCollection<typeof JobCount.Type>; readonly tx: StoreTx }) => X) =>
+    const tx = <X>(f: (t: TxParts) => X) =>
       store.transaction((htx) => {
         const own = htx.forCore(SCHEDULER_OWNER)
         return f({ jobs: own.collection(jobs), counts: own.collection(jobCounts), tx: own }) as never
@@ -383,8 +439,13 @@ export const makeSchedulerEngine = (options: SchedulerEngineOptions): Effect.Eff
 
     const backoff = (attempt: number) => Math.min(MAX_BACKOFF_MS, retryBaseMs * 2 ** Math.max(0, attempt - 1))
 
-    /** A repeating job after an occurrence: its next one (from the first after `from`), or failed when it has none. */
-    const movedOn = (f: JobFields, from: number, at: number, failure?: string): JobFields => {
+    /**
+     * A repeating job after an occurrence: its next one (from the first after `from`), or failed when it has none. How
+     * the occurrence ended: it succeeded (`"done"`: an earlier failure is cleared), it failed (its text), or it was
+     * missed (`"missed"`: an earlier failure stays, with its issue, until an occurrence succeeds).
+     */
+    const movedOn = (f: JobFields, from: number, at: number, ended: "done" | "missed" | { readonly failure: string }): JobFields => {
+      const failure = typeof ended === "object" ? ended.failure : undefined
       const next = nextOccurrence(f, from)
       if (next === undefined) {
         return clean({ ...f, state: "failed", finishedAt: at, failedAt: at, occurrenceAt: undefined, lastError: failure ?? `Its cron schedule "${f.cron}" has no next time` })
@@ -395,8 +456,7 @@ export const makeSchedulerEngine = (options: SchedulerEngineOptions): Effect.Eff
         dueAt: next,
         attempt: 0,
         occurrenceAt: undefined,
-        lastError: failure,
-        failedAt: failure === undefined ? undefined : at
+        ...(ended === "done" ? { lastError: undefined, failedAt: undefined } : failure !== undefined ? { lastError: failure, failedAt: at } : {})
       })
     }
 
@@ -422,20 +482,25 @@ export const makeSchedulerEngine = (options: SchedulerEngineOptions): Effect.Eff
         ...(request.key !== undefined ? { key: request.key } : {}),
         payload: payload.value,
         state: "scheduled" as const,
-        late: request.late === undefined || request.late === "run" ? "run" as const : { withinMs: request.late.withinMs },
+        late: request.late === undefined || request.late === "run" ? "run" as const : { withinMs: Math.round(request.late.withinMs) },
         origin,
         attempt: 0
       }
       if (request.at !== undefined) {
-        if (typeof request.at !== "number" || !Number.isFinite(request.at)) return "at must be a time in epoch milliseconds"
+        if (typeof request.at !== "number" || !isTime(request.at)) return "at must be a time in epoch milliseconds (0 to 8.64e15)"
         return { ...base, dueAt: Math.round(request.at) }
       }
       if (request.inMs !== undefined) {
-        if (typeof request.inMs !== "number" || !Number.isFinite(request.inMs) || request.inMs < 0) return "inMs must be 0 or more"
+        if (typeof request.inMs !== "number" || !isTime(at + request.inMs) || request.inMs < 0) return "inMs must be 0 or more (and end before 8.64e15)"
         return { ...base, dueAt: at + Math.round(request.inMs) }
       }
       const expr = request.cron
       if (typeof expr !== "string" || expr.length > MAX_CRON_CHARS || !CRON_TEXT.test(expr)) return `cron must be a cron expression of at most ${MAX_CRON_CHARS} characters`
+      // Checked before it is parsed or planned: a day of month or a month can make `Cron.next` search for years.
+      const segments = expr.trim().split(/\s+/)
+      if ((segments.length !== 5 && segments.length !== 6) || segments[segments.length - 3] !== "*" || segments[segments.length - 2] !== "*") {
+        return `"${expr}": cron is for system jobs, with minute, hour and day-of-week fields (and seconds first, if you like); day of month and month must be *. For a date, schedule a one-off job (at) and schedule the next one from its handler`
+      }
       const tz = request.timeZone
       if (tz !== undefined && (typeof tz !== "string" || !ZONE.test(tz))) return "timeZone must be a time zone name (Europe/Amsterdam)"
       const parsed = cronIn(expr, tz ?? householdZone())
@@ -446,17 +511,34 @@ export const makeSchedulerEngine = (options: SchedulerEngineOptions): Effect.Eff
       return { ...fields, dueAt: first }
     }
 
-    type Written = { readonly _tag: "ok"; readonly row: Row<StoredJob>; readonly replaced: boolean } | { readonly _tag: "limit" }
+    type Written = { readonly _tag: "ok"; readonly row: Row<StoredJob> } | { readonly _tag: "limit" } | { readonly _tag: "used" }
 
-    /** Write a new job in a transaction of the scheduler's collections (the caller's own, or joined). Checks before writes. */
-    const writeJob = (t: { readonly jobs: TxCollection<StoredJob>; readonly counts: TxCollection<typeof JobCount.Type> }, id: string, fields: JobFields, actor: Actor): Written => {
+    /**
+     * Write a new job in a transaction of the scheduler's collections (the caller's own, or joined). Everything that can
+     * refuse is decided before the first write (the live-job limit, the key's live job, an id in use; the values are
+     * made, and fit `jobs`, by construction), so a refusal leaves the transaction untouched, and what follows can fail
+     * only as the store itself fails. The writes: the counter first (always written, so its rev changes whenever a
+     * module's live jobs do: the recount relies on it), then the key's old job cancelled, then the new one: cut short by
+     * a store failure, the counter is at worst too high, which refuses early and is repaired by the recount.
+     */
+    const writeJob = (t: TxParts, id: string, fields: JobFields, actor: Actor): Written => {
       const at = now()
       const old = fields.key === undefined ? undefined : t.jobs.list({ where: { liveKey: `${fields.module}/${fields.key}` }, limit: 1 })[0]
-      if (old === undefined && (counterOf(t.counts, fields.module)?.value.live ?? 0) >= MAX_LIVE_JOBS) return { _tag: "limit" }
-      if (old !== undefined) put(t, old, clean({ ...fieldsOf(old.value), state: "cancelled", finishedAt: at }), actor)
-      const row = t.jobs.insert(withIndexes(fields), { id, actor })
-      adjust(t.counts, fields.module, 1, actor)
-      return { _tag: "ok", row, replaced: old !== undefined }
+      const counter = counterOf(t.counts, fields.module)
+      const live = counter?.value.live ?? 0
+      if (old === undefined && live >= MAX_LIVE_JOBS) return { _tag: "limit" }
+      if (t.jobs.get(id) !== undefined) return { _tag: "used" }
+      const value = withIndexes(fields)
+      const cancelled = old === undefined ? undefined : withIndexes(clean({ ...fieldsOf(old.value), state: "cancelled", finishedAt: at }))
+      // Writes from here on.
+      const count = { live: old === undefined ? live + 1 : live }
+      if (counter === undefined) t.counts.insert(count, { id: fields.module, actor })
+      else t.counts.update(fields.module, () => count, { actor })
+      if (old !== undefined) {
+        t.jobs.update(old.id, () => cancelled!, { expectRev: old.rev, actor })
+        noteIssue(t, old.value.issue === true, false)
+      }
+      return { _tag: "ok", row: t.jobs.insert(value, { id, actor }) }
     }
 
     const limitMessage = (owner: string) => `${owner} has ${MAX_LIVE_JOBS} live jobs already (the most); cancel one first`
@@ -486,12 +568,16 @@ export const makeSchedulerEngine = (options: SchedulerEngineOptions): Effect.Eff
               // Refused (a `StoreError`) when the handle is not live: the job joins only a running transaction.
               moduleTx.afterCommit(wake)
               if (written) throw new StoreError({ reason: "invalid", message: "This prepared job was written already; prepare another" })
+              // Joins the module's transaction (the store's transactions are flat). A refusal comes before any write. A
+              // store failure in the middle of the writes is thrown too; the store has no way for joined code to make
+              // the transaction fail whatever its caller catches, so the module must not catch that one and go on.
               const exit = Effect.runSyncExitWith(engineContext)(tx((t) => writeJob(t, id, fields, actor)))
               if (Exit.isFailure(exit)) {
                 const error = Cause.squash(exit.cause)
                 throw isStoreFailure(error) ? error : new StoreError({ reason: "failed", message: `The job could not be written: ${messageOf(error)}` })
               }
               if (exit.value._tag === "limit") throw new StoreError({ reason: "invalid", message: limitMessage(owner) })
+              if (exit.value._tag === "used") throw new StoreError({ reason: "invalid", message: "This prepared job was written already; prepare another" })
               written = true
               return viewOf(owner, undefined, exit.value.row)
             }
@@ -506,6 +592,7 @@ export const makeSchedulerEngine = (options: SchedulerEngineOptions): Effect.Eff
             return writeJob(t, job.id, job.fields, actor)
           }).pipe(Effect.mapError(fromStore))
           if (written._tag === "limit") return yield* failedWith("limit", limitMessage(owner))
+          if (written._tag === "used") return yield* failedWith("failed", `The job id ${job.id} is in use`)
           return viewOf(owner, undefined, written.row)
         })
 
@@ -525,7 +612,7 @@ export const makeSchedulerEngine = (options: SchedulerEngineOptions): Effect.Eff
           const hasIn = typeof when === "object" && when !== null && when.inMs !== undefined
           if (hasAt === hasIn) return yield* invalid("give exactly one of at or inMs")
           const dueAt = hasAt ? when.at! : at + (when.inMs ?? NaN)
-          if (!Number.isFinite(dueAt) || (hasIn && when.inMs! < 0)) return yield* invalid(hasAt ? "at must be a time in epoch milliseconds" : "inMs must be 0 or more")
+          if (!isTime(dueAt) || (hasIn && when.inMs! < 0)) return yield* invalid(hasAt ? "at must be a time in epoch milliseconds (0 to 8.64e15)" : "inMs must be 0 or more (and end before 8.64e15)")
           const out = yield* tx((t) => {
             const row = t.jobs.get(id)
             if (row === undefined || row.value.module !== owner) return { _tag: "none" as const }
@@ -548,7 +635,7 @@ export const makeSchedulerEngine = (options: SchedulerEngineOptions): Effect.Eff
 
       const list = (query: JobListQuery = {}): Effect.Effect<ReadonlyArray<JobRow>, SchedulerError> =>
         Effect.suspend(() => {
-          const limit = query.limit ?? 20
+          const limit = query.limit ?? MAX_JOB_PAGE
           if (!Number.isInteger(limit) || limit < 1 || limit > MAX_JOB_PAGE) return Effect.fail(invalid(`limit must be 1 to ${MAX_JOB_PAGE}`))
           if (query.key !== undefined && (typeof query.key !== "string" || !JOB_KEY.test(query.key))) return Effect.fail(invalid(`key must match ${JOB_KEY}`))
           let after: Row<StoredJob> | undefined
@@ -575,12 +662,8 @@ export const makeSchedulerEngine = (options: SchedulerEngineOptions): Effect.Eff
         if (row === undefined || (owner !== undefined && row.value.module !== owner)) return false
         const state = row.value.state
         if (state !== "scheduled" && state !== "running" && state !== "failed") return false
-        const issue = row.value.issue === true
         put(t, row, clean({ ...fieldsOf(row.value), state: "cancelled", finishedAt: now() }), actor)
-        t.tx.afterCommit(() => {
-          if (issue) issuesDirty = true
-          wake()
-        })
+        t.tx.afterCommit(wake)
         return true
       }).pipe(Effect.mapError(fromStore))
 
@@ -655,8 +738,11 @@ export const makeSchedulerEngine = (options: SchedulerEngineOptions): Effect.Eff
             const checked = checkedHandler(owner, name, handler)
             if (typeof checked === "string") return yield* invalid(checked)
             if (published.has(checked.key)) return yield* failedWith("state", `${owner} has a job handler named "${name}" already`)
-            const scope = yield* Effect.scope
-            const entry: Published = { ...checked, scope }
+            // Its runs: in a scope of the engine's run scope (closing the engine interrupts them), which the
+            // registration's scope closes too, after the handler is withdrawn (finalizers run last added first).
+            const runs = yield* Scope.fork(runScope)
+            yield* Effect.addFinalizer(() => Scope.close(runs, Exit.void))
+            const entry: Published = { ...checked, scope: runs }
             yield* Effect.acquireRelease(
               Effect.sync(() => {
                 published.set(entry.key, entry)
@@ -683,25 +769,25 @@ export const makeSchedulerEngine = (options: SchedulerEngineOptions): Effect.Eff
       const error = Cause.findErrorOption(cause)
       if (error._tag === "Some") {
         const e = error.value
-        if (e instanceof RunRefused) return { _tag: "failed", message: `Not run: ${e.reason}`, retriable: false }
-        if (e instanceof PayloadInvalid) return { _tag: "failed", message: `Its payload does not fit the handler: ${e.message}`, retriable: false }
+        if (e instanceof RunRefused) return { _tag: "failed", message: errorText(entry.owner, `Not run: ${e.reason}`), retriable: false }
+        if (e instanceof PayloadInvalid) return { _tag: "failed", message: errorText(entry.owner, `Its payload does not fit the handler: ${e.message}`), retriable: false }
         if (e instanceof RunTimeout) return { _tag: "failed", message: `It did not finish within ${Math.round(e.ms / 100) / 10} s`, retriable: true }
-        return { _tag: "failed", message: messageOf(e), retriable: true }
+        return { _tag: "failed", message: errorText(entry.owner, textOf(e)), retriable: true }
       }
-      return { _tag: "failed", message: `It crashed: ${messageOf(Cause.squash(cause))}`, retriable: true }
+      return { _tag: "failed", message: errorText(entry.owner, `It crashed: ${textOf(Cause.squash(cause))}`), retriable: true }
     }
 
     /** What a claimed occurrence becomes. */
     const outcomeOf = (entry: Published, f: JobFields, verdict: Exclude<Verdict, { _tag: "stopped" }>, at: number): JobFields => {
       const occurrence = f.occurrenceAt ?? f.dueAt
       if (verdict._tag === "done") {
-        return f.cron !== undefined ? movedOn(f, Math.max(at, occurrence), at) : clean({ ...f, state: "done", finishedAt: at, occurrenceAt: undefined })
+        return f.cron !== undefined ? movedOn(f, Math.max(at, occurrence), at, "done") : clean({ ...f, state: "done", finishedAt: at, occurrenceAt: undefined })
       }
       if (verdict.retriable && entry.idempotent && f.attempt <= entry.retries) {
         return clean({ ...f, state: "scheduled", dueAt: at + backoff(f.attempt), lastError: verdict.message })
       }
       return f.cron !== undefined
-        ? movedOn(f, Math.max(at, occurrence), at, verdict.message)
+        ? movedOn(f, Math.max(at, occurrence), at, { failure: verdict.message })
         : clean({ ...f, state: "failed", finishedAt: at, failedAt: at, occurrenceAt: undefined, lastError: verdict.message })
     }
 
@@ -710,11 +796,7 @@ export const makeSchedulerEngine = (options: SchedulerEngineOptions): Effect.Eff
       Effect.gen(function*() {
         for (let attempt = 0;; attempt++) {
           const exit = yield* Effect.exit(tx((t) => {
-            const next = outcomeOf(entry, fieldsOf(claimed.value), verdict, now())
-            const row = put(t, claimed, next, SYSTEM)
-            t.tx.afterCommit(() => {
-              if (row.value.issue === true || claimed.value.issue === true) issuesDirty = true
-            })
+            put(t, claimed, outcomeOf(entry, fieldsOf(claimed.value), verdict, now()), SYSTEM)
           }))
           if (Exit.isSuccess(exit)) return
           const error = Cause.findErrorOption(exit.cause)
@@ -749,7 +831,7 @@ export const makeSchedulerEngine = (options: SchedulerEngineOptions): Effect.Eff
               const principal = yield* gateway.principal
               if ("refused" in principal) return yield* new RunRefused({ reason: principal.refused })
             }
-            const payload = yield* entry.decode(f.payload).pipe(Effect.mapError((e) => new PayloadInvalid({ message: oneLine(e.message, 200) })))
+            const payload = yield* entry.decode(f.payload).pipe(Effect.mapError((e) => new PayloadInvalid({ message: e.message })))
             yield* Effect.suspend(() => entry.run(payload, due))
           })
         ).pipe(Effect.timeoutOrElse({ duration: entry.timeoutMs, orElse: () => Effect.fail(new RunTimeout({ ms: entry.timeoutMs })) }))
@@ -800,7 +882,7 @@ export const makeSchedulerEngine = (options: SchedulerEngineOptions): Effect.Eff
         const lateMs = Math.max(0, at - occurrence)
         const late: LatePolicy = f.late
         if (typeof late === "object" && lateMs > late.withinMs) {
-          put(t, row, f.cron !== undefined ? movedOn(clean({ ...f, occurrenceAt: undefined }), at, at) : clean({ ...f, state: "missed", finishedAt: at, occurrenceAt: undefined }), SYSTEM)
+          put(t, row, f.cron !== undefined ? movedOn(clean({ ...f, occurrenceAt: undefined }), at, at, "missed") : clean({ ...f, state: "missed", finishedAt: at, occurrenceAt: undefined }), SYSTEM)
           return { _tag: "missed" }
         }
         const claimed = put(t, row, { ...f, state: "running", attempt: f.attempt + 1, occurrenceAt: occurrence, dueAt: occurrence }, SYSTEM)
@@ -828,7 +910,7 @@ export const makeSchedulerEngine = (options: SchedulerEngineOptions): Effect.Eff
               const next = entry.idempotent && f.attempt <= entry.retries
                 ? clean({ ...f, state: "scheduled", dueAt: at, lastError: `${why}; it runs again` })
                 : f.cron !== undefined
-                ? movedOn(f, Math.max(at, f.occurrenceAt ?? f.dueAt), at, `${why}; it is not run again for that time`)
+                ? movedOn(f, Math.max(at, f.occurrenceAt ?? f.dueAt), at, { failure: `${why}; it is not run again for that time` })
                 : clean({ ...f, state: "failed", finishedAt: at, failedAt: at, occurrenceAt: undefined, lastError: `${why}; it is not run again (its handler is not idempotent)` })
               put(t, row, next, SYSTEM)
             }))
@@ -838,10 +920,7 @@ export const makeSchedulerEngine = (options: SchedulerEngineOptions): Effect.Eff
           after = page[page.length - 1]
           yield* Effect.yieldNow
         }
-        if (n > 0) {
-          issuesDirty = true
-          log(`Scheduler: ${n} job(s) left running without a run were recovered`)
-        }
+        if (n > 0) log(`Scheduler: ${n} job(s) left running without a run were recovered`)
         return n
       })
 
@@ -854,15 +933,15 @@ export const makeSchedulerEngine = (options: SchedulerEngineOptions): Effect.Eff
       while (removed < RETENTION_ROWS_PER_PASS) {
         const began = performance.now()
         const step = yield* tx((t) => {
-          const page = t.jobs.list({ where: { list: "finished" }, orderBy: { field: "at" }, limit: BULK_STEP_ROWS })
+          const page = t.jobs.list({ where: { list: "finished" }, orderBy: { field: "at" }, limit: RETENTION_STEP_ROWS })
           let n = 0
           for (const row of page) {
             if (row.value.at >= cutoff) break
             t.jobs.remove(row.id, { expectRev: row.rev, actor: SYSTEM })
-            if (row.value.issue === true) issuesDirty = true
+            noteIssue(t, row.value.issue === true, false)
             n++
           }
-          return { n, more: n === BULK_STEP_ROWS }
+          return { n, more: n === RETENTION_STEP_ROWS }
         })
         removed += step.n
         options.observe?.({ kind: "retention-step", ms: performance.now() - began, removed: step.n })
@@ -878,7 +957,7 @@ export const makeSchedulerEngine = (options: SchedulerEngineOptions): Effect.Eff
       const v = row.value
       const name = names.get(v.module) ?? v.module
       const what = `${v.handler}${v.key !== undefined ? ` (${v.key})` : ""}`
-      const reason = pageText(v.module, v.lastError ?? "", ERROR_CHARS)
+      const reason = pageText(v.module, v.lastError ?? "", MAX_ERROR_CHARS)
       const live = isLive(v.state)
       return {
         id: `core.scheduler.failed.${row.id}`,
@@ -890,38 +969,102 @@ export const makeSchedulerEngine = (options: SchedulerEngineOptions): Effect.Eff
       }
     }
 
-    const refreshIssues: Effect.Effect<void> = options.issues === undefined ? Effect.sync(() => void (issuesDirty = false)) : Effect.gen(function*() {
+    /** The rows of the issue index, newest failure first, a page at a time, after `after`. */
+    const issuePage = (after: Row<StoredJob> | undefined) =>
+      jobsOut.list({ where: { issue: true }, orderBy: { field: "failedAt", direction: "desc" }, limit: MAX_JOB_PAGE, ...(after !== undefined ? { after } : {}) })
+
+    /**
+     * The Health issues: the `MAX_JOB_ISSUES` newest failures (the issue index is ordered by failure time), and, only when
+     * there are more, one issue with how many there are. `recount` (the maintenance pass): that number is counted again
+     * by reading the rest of the index, a page at a time; between maintenance passes it is kept up by every committed
+     * change (`issueChanged`).
+     */
+    const refresh = (recount: boolean): Effect.Effect<void> => options.issues === undefined ? Effect.sync(() => void (issuesDirty = false)) : Effect.gen(function*() {
       issuesDirty = false
       const rows: Array<Row<StoredJob>> = []
-      let after: Row<StoredJob> | undefined
-      let more = false
-      for (;;) {
-        const page = yield* jobsOut.list({ where: { issue: true }, limit: MAX_JOB_PAGE, ...(after !== undefined ? { after } : {}) })
+      let last: Row<StoredJob> | undefined
+      let end = false
+      while (rows.length <= MAX_JOB_ISSUES) {
+        const page = yield* issuePage(last)
         rows.push(...page)
-        if (page.length < MAX_JOB_PAGE) break
-        if (rows.length >= MAX_JOB_ISSUES) {
-          more = true
+        if (page.length < MAX_JOB_PAGE) {
+          end = true
           break
         }
-        after = page[page.length - 1]
+        last = page[page.length - 1]
+        yield* Effect.yieldNow
+      }
+      if (end && rows.length <= MAX_JOB_ISSUES) issueTotal = rows.length
+      else if (recount || issueTotal === undefined || issueTotal <= MAX_JOB_ISSUES) {
+        let n = rows.length
+        while (!end) {
+          yield* Effect.yieldNow
+          const page = yield* issuePage(last)
+          n += page.length
+          end = page.length < MAX_JOB_PAGE
+          last = page[page.length - 1]
+        }
+        issueTotal = n
       }
       const names = moduleNames()
       const list = rows.slice(0, MAX_JOB_ISSUES).map((r) => issueOf(r, names))
-      if (more) {
+      if (rows.length > MAX_JOB_ISSUES) {
         list.push({
           id: "core.scheduler.failed.more",
           severity: "warning",
-          title: `More than ${MAX_JOB_ISSUES} scheduled jobs failed`,
-          detail: "Only the newest are listed here. The Scheduled jobs page has them all.",
+          title: `${issueTotal} scheduled jobs have failed`,
+          detail: `The ${MAX_JOB_ISSUES} newest failures are listed here. The Scheduled jobs page has them all.`,
           fix: { kind: "link", label: "Open Scheduled jobs", value: "#settings/diagnostics/scheduled" }
         })
       }
       options.issues!.set("scheduler", list)
     }).pipe(Effect.catch((e) => Effect.sync(() => log(`Scheduler: the Health issues were not refreshed: ${e.message}`))))
+    const refreshIssues = refresh(true)
+
+    /**
+     * The recount of every module's live jobs: a counter that disagrees with the rows (left so by a module that caught
+     * a store failure in the middle of `writeIn` and committed the rest) is set to what the rows say. A module's live
+     * rows are read a page at a time in `createdAt` order (a job that becomes live meanwhile comes last); the counter is
+     * written only if its rev is still the one read before counting, since every change of a module's live jobs writes
+     * its counter. Paged, with a yield between pages.
+     */
+    const recount: Effect.Effect<number, StoreFailure> = Effect.gen(function*() {
+      let repaired = 0
+      let afterCounter: Row<typeof JobCount.Type> | undefined
+      for (;;) {
+        const counters = yield* countsOut.list({ orderBy: { field: "createdAt", direction: "asc" }, limit: COUNTER_PAGE, ...(afterCounter !== undefined ? { after: afterCounter } : {}) })
+        for (const counter of counters) {
+          let n = 0
+          let after: Row<StoredJob> | undefined
+          for (;;) {
+            const page = yield* jobsOut.list({ where: { liveModule: counter.id }, orderBy: { field: "createdAt", direction: "asc" }, limit: MAX_JOB_PAGE, ...(after !== undefined ? { after } : {}) })
+            n += page.length
+            if (page.length < MAX_JOB_PAGE) break
+            after = page[page.length - 1]
+            yield* Effect.yieldNow
+          }
+          if (n === counter.value.live) continue
+          const fixed = yield* tx((t) => {
+            if (t.counts.get(counter.id)?.rev !== counter.rev) return false
+            t.counts.update(counter.id, () => ({ live: n }), { expectRev: counter.rev, actor: SYSTEM })
+            return true
+          })
+          if (fixed) {
+            repaired++
+            log(`Scheduler: the live-job count of ${counter.id} was ${counter.value.live}; its rows say ${n}, so it is ${n} now`)
+          }
+          yield* Effect.yieldNow
+        }
+        if (counters.length < COUNTER_PAGE) break
+        afterCounter = counters[counters.length - 1]
+      }
+      return repaired
+    })
 
     const maintain: Effect.Effect<void, StoreFailure> = Effect.gen(function*() {
       const removed = yield* retention
       yield* recover(undefined)
+      yield* recount
       yield* refreshIssues
       // A backlog of old rows drains a pass a second (each pass bounded).
       nextMaintenance = now() + (removed >= RETENTION_ROWS_PER_PASS ? 1_000 : maintenanceMs)
@@ -929,7 +1072,11 @@ export const makeSchedulerEngine = (options: SchedulerEngineOptions): Effect.Eff
 
     // ---- The loop
 
-    /** One pass: the recovery rule for new handlers, maintenance when due, then every published handler's due jobs. */
+    /**
+     * One pass: the recovery rule for new handlers, maintenance when due, then the published handlers' due jobs, in
+     * rounds of at most one job per handler, starting at the handler after the one whose job it started last, until
+     * `maxRuns` run or nothing more is due.
+     */
     const pass: Effect.Effect<number, StoreFailure> = Effect.gen(function*() {
       progress++
       if (pendingRecovery.size > 0) {
@@ -942,23 +1089,28 @@ export const makeSchedulerEngine = (options: SchedulerEngineOptions): Effect.Eff
       const began = performance.now()
       let claimed = 0
       const entries = [...published.values()]
-      for (const entry of entries) {
-        while (runCount < maxRuns && published.get(entry.key) === entry) {
+      const first = entries.findIndex((e) => e.key === lastClaimed) + 1
+      let round = [...entries.slice(first), ...entries.slice(0, first)]
+      while (round.length > 0 && runCount < maxRuns) {
+        const again: Array<Published> = []
+        for (const entry of round) {
+          if (runCount >= maxRuns) break
+          if (published.get(entry.key) !== entry) continue
           const step = yield* claimNext(entry)
-          if (step._tag === "none") break
-          if (step._tag === "later") {
-            next = Math.min(next, step.at)
-            break
-          }
-          if (step._tag === "claimed") {
+          if (step._tag === "later") next = Math.min(next, step.at)
+          else if (step._tag === "missed") again.push(entry)
+          else if (step._tag === "claimed") {
             claimed++
+            lastClaimed = entry.key
             yield* startRun(entry, step.row, step.due)
+            again.push(entry)
           }
+          yield* Effect.yieldNow
         }
-        yield* Effect.yieldNow
+        round = again
       }
       options.observe?.({ kind: "pass", ms: performance.now() - began, handlers: entries.length, claimed })
-      if (issuesDirty) yield* refreshIssues
+      if (issuesDirty) yield* refresh(false)
       return next
     })
 
@@ -1006,15 +1158,14 @@ export const makeSchedulerEngine = (options: SchedulerEngineOptions): Effect.Eff
       const job = jobRowOf(row)
       const isCore = job.module.startsWith("core.")
       return {
-        job: job.lastError === undefined ? job : { ...job, lastError: pageText(job.module, job.lastError, ERROR_CHARS) },
+        job: job.lastError === undefined ? job : { ...job, lastError: pageText(job.module, job.lastError, MAX_ERROR_CHARS) },
         moduleName: names.get(job.module) ?? job.module,
         orphaned: !isCore && options.modules !== undefined && !names.has(job.module)
       }
     }
 
-    let nextCursor = 0
     const remember = (phase: "live" | "finished", row: Row<StoredJob>) => {
-      const token = `${phase}.${(++nextCursor).toString(36)}`
+      const token = `${phase}.${crypto.randomUUID().replace(/-/g, "")}`
       cursors.set(token, { phase, row })
       // The newest 256 cursors are kept: an older one asks the page to start again.
       if (cursors.size > 256) cursors.delete(cursors.keys().next().value!)
@@ -1023,8 +1174,8 @@ export const makeSchedulerEngine = (options: SchedulerEngineOptions): Effect.Eff
 
     const listAll: SchedulerEngine["listAll"] = (o = {}) =>
       Effect.gen(function*() {
-        const limit = o.limit ?? 20
-        if (!Number.isInteger(limit) || limit < 1 || limit > MAX_JOB_PAGE) return yield* invalid(`limit must be 1 to ${MAX_JOB_PAGE}`)
+        const limit = o.limit ?? MAX_ADMIN_JOB_PAGE
+        if (!Number.isInteger(limit) || limit < 1 || limit > MAX_ADMIN_JOB_PAGE) return yield* invalid(`limit must be 1 to ${MAX_ADMIN_JOB_PAGE}`)
         let phase: "live" | "finished" = "live"
         let after: Row<StoredJob> | undefined
         if (o.cursor !== undefined && o.cursor !== "") {
@@ -1038,8 +1189,10 @@ export const makeSchedulerEngine = (options: SchedulerEngineOptions): Effect.Eff
         }
         const names = moduleNames()
         const out: Array<JobView> = []
-        for (;;) {
-          const want = limit - out.length
+        // Reads of at most one list each (`MAX_JOB_PAGE`), with a yield between them.
+        for (let reads = 0;; reads++) {
+          if (reads > 0) yield* Effect.yieldNow
+          const want = Math.min(limit - out.length, MAX_JOB_PAGE)
           const rows = yield* jobsOut.list({
             where: { list: phase },
             orderBy: { field: "at", direction: phase === "live" ? "asc" : "desc" },
@@ -1047,7 +1200,11 @@ export const makeSchedulerEngine = (options: SchedulerEngineOptions): Effect.Eff
             ...(after !== undefined ? { after } : {})
           }).pipe(Effect.mapError(fromStore))
           out.push(...rows.map((r) => viewFor(r, names)))
-          if (rows.length === want) return { jobs: out, next: remember(phase, rows[rows.length - 1]!) }
+          if (rows.length === want) {
+            if (out.length === limit) return { jobs: out, next: remember(phase, rows[rows.length - 1]!) }
+            after = rows[rows.length - 1]
+            continue
+          }
           if (phase === "finished") return { jobs: out }
           phase = "finished"
           after = undefined

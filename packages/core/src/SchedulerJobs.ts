@@ -1,6 +1,7 @@
 import { Schema } from "effect"
 import { type CoreStorage, defineCollection, maxListRows, type Row } from "./HouseholdStore.ts"
-import { type JobRow, type JobState, MAX_JOB_PAGE, SCHEDULER_OWNER } from "./Scheduler.ts"
+import { oneLine } from "./Issues.ts"
+import { type JobRow, type JobState, MAX_ERROR_CHARS, SCHEDULER_OWNER } from "./Scheduler.ts"
 
 /**
  * The scheduler's data in the household store (docs/SCHEDULING.md "How it is stored"): the collection `jobs` of the
@@ -16,11 +17,11 @@ import { type JobRow, type JobState, MAX_JOB_PAGE, SCHEDULER_OWNER } from "./Sch
  * |---|---|---|---|---|
  * | `ready` | `"<module>/<handler>"` | only while `scheduled` | `[ready, at]` | the loop: per published handler, its earliest job |
  * | `liveKey` | `"<module>/<key>"` | only while live | `liveKey` | one live job per key; `cancel({ key })`, `list({ key })` |
- * | `liveModule` | the module | only while live | `[liveModule, at]` | a module's `list` |
+ * | `liveModule` | the module | only while live | `[liveModule, at]`, `liveModule` | a module's `list`; the recount of its live jobs (by `createdAt`) |
  * | `list` | `"live"` / `"finished"` | always | `[list, at]` | the admin list; retention (finished, oldest first) |
  * | `at` | live: `dueAt`; finished: `finishedAt` | always | (the order of the four pairs) | |
  * | `state` | the state | always | `[state, at]` | the recovery rule (`running` rows) |
- * | `issue` | `true` | a failed job, or a live one whose last occurrence failed | `issue` | the Health issues |
+ * | `issue` | `true` | a failed job, or a live one whose last occurrence failed | `[issue, failedAt]` | the Health issues, newest failure first |
  */
 
 const Person = Schema.Struct({
@@ -69,20 +70,30 @@ export type StoredJob = typeof StoredJob.Type
 export type JobFields = Omit<StoredJob, "ready" | "liveKey" | "liveModule" | "list" | "at" | "issue">
 
 /**
- * The most characters of a row's JSON. The worst legal row is about 4,400 characters: a payload of 2,000, a key of 200
- * (twice: `key`, `liveKey`), a module id of 40 (three times), a handler of 64 (twice), a cron of 120, a zone of 64, three
- * origin ids of 200, a last error of 300 that JSON may double, the numbers and the field names
- * (`SchedulerJobs.test.ts` builds it). So one list returns at most `floor(120,000 / 5,000)` = 24 rows (`MAX_JOB_PAGE`).
+ * The most characters of a row's JSON. The worst legal row is under 2,500 characters: a live repeating job whose
+ * occurrence is retried after an earlier one failed, with a payload of 1,000 characters of JSON (`MAX_PAYLOAD_CHARS`),
+ * a key of 100 (twice: `key`, `liveKey`), a module id of 40 (four times: `module`, `ready`, `liveKey`, `liveModule`), a
+ * handler of 64 (twice), a cron of 100, a zone of 48, three origin ids of 64 (`ORIGIN_ID`), a failure text of 200
+ * characters as JSON (`MAX_ERROR_CHARS`), times of 16 digits (`MAX_TIME`), a confidence of 24 characters, and the field
+ * names. The contract's case "the worst legal row fits maxChars" builds it, with the costliest characters JSON has
+ * in every free-text field. So one `list` of `jobs` reads at most `maxListRows(jobs)` = 10 rows (`MAX_JOB_PAGE`).
  */
-export const JOB_MAX_CHARS = 5_000
+export const JOB_MAX_CHARS = 2_500
 
 export const jobs = defineCollection({
   name: "jobs",
   scope: "household",
   schema: StoredJob,
   maxChars: JOB_MAX_CHARS,
-  indexes: [["ready", "at"], "liveKey", ["liveModule", "at"], ["list", "at"], ["state", "at"], "issue"]
+  indexes: [["ready", "at"], "liveKey", ["liveModule", "at"], "liveModule", ["list", "at"], ["state", "at"], ["issue", "failedAt"]]
 })
+
+/**
+ * The most rows one `list` of `jobs` reads (`maxListRows(jobs)`): the page of a module's `list` (its default and its
+ * most), and of every read of the engine that sweeps (the loop, the recovery rule, retention, the Health issues, the
+ * live-job recount, the admin list, which reads two of them per request).
+ */
+export const MAX_JOB_PAGE = maxListRows(jobs)
 
 /** Live jobs per module (the row's id is the module id): the `MAX_LIVE_JOBS` check is one read. */
 export const JobCount = Schema.Struct({ live: Schema.Finite })
@@ -91,7 +102,28 @@ export const jobCounts = defineCollection({ name: "job_counts", scope: "househol
 /** What `prepare` declares for the scheduler (data version 1). */
 export const schedulerStorage: CoreStorage = { owner: SCHEDULER_OWNER, storage: { version: 1, collections: [jobs, jobCounts] } }
 
-if (maxListRows(jobs) !== MAX_JOB_PAGE) throw new Error(`MAX_JOB_PAGE must be maxListRows(jobs) = ${maxListRows(jobs)}`)
+/** The characters `c` takes inside a JSON string (`"` and `\\` two, a control character six, others one). */
+const jsonChars = (c: string): number => JSON.stringify(c).length - 2
+
+/**
+ * A failure text as it is stored (`JobRow.lastError`): one line (no control characters), well-formed (an unpaired
+ * surrogate becomes U+FFFD), and at most `MAX_ERROR_CHARS` characters as JSON, shortened with "…" when longer (never
+ * inside a surrogate pair). The caller passes it through its module's page boundary first, in full.
+ */
+export const storedError = (text: string): string => {
+  const line = oneLine(text, Number.MAX_SAFE_INTEGER).replace(/[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/g, "\uFFFD")
+  let size = 0
+  let cut = -1
+  let i = 0
+  for (const c of line) {
+    size += jsonChars(c)
+    // Where the text would end if it is shortened: room for the "…".
+    if (cut < 0 && size > MAX_ERROR_CHARS - 1) cut = i
+    if (size > MAX_ERROR_CHARS) return `${line.slice(0, cut)}…`
+    i += c.length
+  }
+  return line
+}
 
 export const isLive = (state: JobState): boolean => state === "scheduled" || state === "running"
 
