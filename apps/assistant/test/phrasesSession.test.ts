@@ -128,7 +128,7 @@ const session = async (o: {
       ringing: o.ringing ?? (() => undefined),
       ports: {
         notify: () => ({
-          ringingOn: () => o.ringing?.() ?? [],
+          ringingOn: () => (o.ringing?.() ?? []).map((c) => ({ ...c, module: "egg", title: "Egg" })),
           stopRinging: (d) => Effect.sync(() => (stopped.push(d), 1)),
           stopSpeech: () => Effect.succeed(false),
           press: (r) => Effect.sync(() => (pressed.push(r.actionId), { ok: true, say: "Snoozed." }))
