@@ -1,7 +1,8 @@
 /**
  * A network that has no network, for module tests (docs/MODULES.md, "The network" and "Testing"): a resolver and a
  * connector for `@pva/net`'s `safeFetch` and `fetchOwnerConfiguredLan` (their `resolver` and `connector` options) that
- * serve fixtures by URL and fail every other host as a lookup failure. The types are `@pva/net`'s, written out here so
+ * serve fixtures by URL and fail every other host: the resolver as a lookup failure, and the connector refuses any
+ * host that is not listed too, a literal address included (`safeFetch` does not look a literal address up). The types are `@pva/net`'s, written out here so
  * the core does not depend on it; `packages/module-contracts/test` passes them to the real `safeFetch`.
  *
  * Every host of a fixture resolves to an address of its own in a public range (`93.184.216.<n>`), so `safeFetch`'s
@@ -37,7 +38,8 @@ export interface OfflineResponse {
 
 /**
  * Fixtures by URL: an exact `href` ("https://api.example.org/v1/x?q=1"), or a URL without a query, which then answers
- * that path whatever the query. A function answers per request. A known host with no fixture for the path answers 404.
+ * that path whatever the query. A function answers per request. A listed host (of a fixture, or `lan`) with no fixture
+ * for the path answers 404; that is the only answer made up. Any other host, a name or a literal address, is refused.
  */
 export type OfflineFixtures = Readonly<Record<string, OfflineResponse | ((request: OfflineConnectRequest) => OfflineResponse)>>
 
@@ -47,7 +49,7 @@ export const makeOfflineNet = (fixtures: OfflineFixtures, options: { readonly la
     const host = new URL(key).hostname
     if (!hosts.has(host) && options.lan?.[host] === undefined) hosts.set(host, `93.184.216.${(hosts.size % 250) + 1}`)
   }
-  for (const [host, address] of Object.entries(options.lan ?? {})) hosts.set(host, address)
+  for (const [host, address] of Object.entries(options.lan ?? {})) hosts.set(host.toLowerCase(), address)
   const requests: Array<{ readonly url: string; readonly method: string; readonly address: string; readonly headers: Readonly<Record<string, string>> }> = []
   const resolver: OfflineResolver = (host) => {
     const address = hosts.get(host.toLowerCase())
@@ -56,6 +58,11 @@ export const makeOfflineNet = (fixtures: OfflineFixtures, options: { readonly la
   }
   const connector: OfflineConnector = (request) => {
     requests.push({ url: request.url.href, method: request.method, address: request.address, headers: request.headers })
+    // A literal address never reaches the resolver: the connector refuses every host that is not listed itself.
+    const host = request.url.hostname.toLowerCase()
+    if (!hosts.has(host)) {
+      return Promise.reject(Object.assign(new Error(`connect ECONNREFUSED ${host} (the test network has no such host)`), { code: "ECONNREFUSED" }))
+    }
     const url = new URL(request.url.href)
     url.hash = ""
     const exact = fixtures[url.href]

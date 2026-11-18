@@ -6,7 +6,8 @@
  * does is written in its contract's documentation, and a consumer's test programs the answers that documentation
  * allows for the case it tests (a value, a typed failure, the provider stopping mid-call, or a function of the
  * arguments). A method called without a programmed answer throws `UnprogrammedStubCall`, and the test kit fails the
- * test with it at the end of the tool, action or job that made the call, whatever the module did with the error.
+ * test with it whatever the module did with the error: after the start, after each tool, action, job, health check and
+ * lifecycle step of the kit, and when the test's scope closes (a call from a background fiber of the module).
  *
  * ```ts
  * const lists = stubService<ListsService>("lists", {
@@ -34,7 +35,11 @@ export class UnprogrammedStubCall extends Error {
 
 const unprogrammed: Array<UnprogrammedStubCall> = []
 
-/** The unprogrammed calls since the last time this was asked, oldest first (the test kit asks after every call it makes). */
+/**
+ * The unprogrammed calls since the last time this was asked, oldest first, and forgets them. The test kit asks after
+ * each of its steps and fails the test with them; a test that calls a stub directly, outside a kit, and expects the
+ * throw takes them itself (a kit that starts later fails on any left over).
+ */
 export const takeUnprogrammedStubCalls = (): ReadonlyArray<UnprogrammedStubCall> => unprogrammed.splice(0, unprogrammed.length)
 
 type Methods<T> = { readonly [K in keyof T]: T[K] extends (...args: infer A) => infer R ? (...args: A) => R : never }

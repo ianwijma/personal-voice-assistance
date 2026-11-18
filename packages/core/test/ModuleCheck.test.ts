@@ -2,13 +2,24 @@
 // and the place, and stays quiet on one that keeps it. The reference module that keeps them all is in
 // packages/module-contracts/test/kit.
 import { assert, describe, it } from "@effect/vitest"
-import { Effect, Exit, Schema } from "effect"
+import { Effect, Exit, Schema, SchemaGetter } from "effect"
 import { defineAction, Param } from "../src/Actions.ts"
 import { defineCollection } from "../src/HouseholdStore.ts"
+import { ServiceKey } from "../src/ModuleApi.ts"
 import { makeTool } from "../src/Module.ts"
 import { defineModule } from "../src/ModuleDefinition.ts"
 import { Setting } from "../src/Settings.ts"
-import { checkModule, collectionWorst, makeTestHousehold, type ModuleProblem, moduleProblems, STORED_TEXT_PATTERN_SOURCE, worstJsonChars } from "../src/testing.ts"
+import {
+  checkModule,
+  collectionWorst,
+  makeTestHousehold,
+  type ModuleProblem,
+  moduleProblems,
+  provide,
+  STORED_TEXT_PATTERN_SOURCE,
+  stubService,
+  worstJsonChars
+} from "../src/testing.ts"
 
 const rules = (problems: ReadonlyArray<ModuleProblem>) => problems.map((p) => `${p.rule} ${p.where}`)
 const ok = defineModule({ apiVersion: 2, id: "fine", name: "Fine", description: "Keeps every rule.", enabledByDefault: false, start: () => Effect.succeed({}) })
@@ -133,23 +144,30 @@ describe("checkModule", () => {
       assert.match(problems[1]!.message, /takes 311 characters of JSON, over its maxChars of 100/)
     }))
 
-  it.effect("stored-value: what the store refuses is found before a write: a value that is not an object, an indexed field the index cannot hold", () =>
+  it.effect("collection: a declaration the store's own check refuses; indexed values are not judged (the store does that at write)", () =>
     Effect.gen(function*() {
-      const scalar = defineCollection({ name: "scalar", scope: "household", maxChars: 100, schema: Schema.String.check(Schema.isMaxLength(10)) as never })
-      const tagged = defineCollection({ name: "tagged", scope: "household", maxChars: 4_000, indexes: ["tag"], schema: Schema.Struct({ tag: Schema.String.check(Schema.isMaxLength(600), Schema.isPattern(/^[a-z]*$/)) }) })
-      const raw = defineCollection({ name: "raw", scope: "household", maxChars: 2_000, indexes: ["tag"], schema: Schema.Struct({ tag: Schema.String.check(Schema.isMaxLength(50)) }) })
-      const store = defineModule({ apiVersion: 2, id: "kept", name: "Kept", description: "Collections.", enabledByDefault: false, storage: { collections: [scalar, tagged, raw] }, start: () => Effect.succeed({}) })
-      const problems = yield* moduleProblems(store)
-      assert.deepStrictEqual(rules(problems), ["stored-value collection scalar", "stored-value collection tagged", "stored-value collection raw"])
-      assert.match(problems[0]!.message, /not always an object/)
-      assert.match(problems[1]!.message, /indexed field "tag" can be longer than the 500/)
-      assert.match(problems[2]!.message, /indexed field "tag" can hold a NUL/)
-      // The store really refuses each of them.
-      const household = yield* makeTestHousehold([store])
-      const handle = household.store.forModule("kept")
-      assert.isTrue(Exit.isFailure(yield* Effect.exit(handle.collection(scalar).insert("short" as never))))
-      assert.isTrue(Exit.isFailure(yield* Effect.exit(handle.collection(tagged).insert({ tag: "a".repeat(600) }))))
-      assert.isTrue(Exit.isFailure(yield* Effect.exit(handle.collection(raw).insert({ tag: "a\u0000b" }))))
+      const good = defineCollection({ name: "good", scope: "household", maxChars: 2_000, indexes: ["tag"], schema: Schema.Struct({ tag: Schema.String.check(Schema.isMaxLength(50)) }) })
+      // Made by hand, past defineCollection: an index on a row's own field.
+      const handMade = { ...good, name: "hand", indexes: ["createdAt"], fields: ["createdAt"] } as typeof good
+      const declared = defineModule({ apiVersion: 2, id: "declared", name: "Declared", description: "Collections.", enabledByDefault: false, storage: { collections: [handMade] }, start: () => Effect.succeed({}) })
+      const problems = yield* moduleProblems(declared)
+      assert.deepStrictEqual(rules(problems), ["collection collection hand"])
+      assert.match(problems[0]!.message, /store refuses its declaration: .*"createdAt" is a row's own field/)
+      // Indexes the old analysis judged wrongly, both ways, are left to the store: a module's tests write the rows.
+      const free = defineCollection({
+        name: "free",
+        scope: "household",
+        maxChars: 2_000,
+        indexes: ["tag", "empty", "gone"],
+        schema: Schema.Struct({ tag: Schema.String.check(Schema.isMaxLength(50), Schema.isPattern(/^[a-z]*$/)), empty: Schema.String.check(Schema.isMaxLength(0)) })
+      })
+      const fine = defineModule({ apiVersion: 2, id: "fine2", name: "Fine", description: "Collections.", enabledByDefault: false, storage: { collections: [free] }, start: () => Effect.succeed({}) })
+      assert.deepStrictEqual(rules(yield* moduleProblems(fine)), [])
+      // The store itself refuses an illegal indexed value when it is written.
+      const household = yield* makeTestHousehold([fine])
+      const handle = household.store.forModule("fine2").collection(free)
+      yield* handle.insert({ tag: "a".repeat(50), empty: "" })
+      assert.isTrue(Exit.isFailure(yield* Effect.exit(handle.insert({ tag: "a\u0000b", empty: "" }))))
     }))
 
   it.effect("stored-value: the longest number is 25 characters of JSON, and a collection sized for it stores it", () =>
@@ -180,7 +198,7 @@ describe("checkModule", () => {
     assert.deepStrictEqual(worst, { chars: JSON.stringify({ a: -0.0000010000000000000002, b: [false, false, false], c: "long" }).length })
   })
 
-  it.effect("scheduler-shared, cron and job-payload", () =>
+  it.effect("scheduler-shared, and scheduler-refused: what the real engine refused while it started, in the engine's words", () =>
     Effect.gen(function*() {
       const jobs = defineModule({
         apiVersion: 2,
@@ -191,27 +209,37 @@ describe("checkModule", () => {
         shared: (ctx) =>
           Effect.gen(function*() {
             yield* ctx.scheduler.handle("tick", { payload: Schema.Struct({ n: Schema.Finite }), run: () => Effect.void }).pipe(Effect.orDie)
-            yield* ctx.scheduler.schedule({ handler: "tick", key: "monthly", cron: "0 7 1 * *" }).pipe(Effect.ignore)
-            // Refused by the scheduler itself now: an absent payload is {}, which { n } does not decode.
+            // Each refusal caught, as a careless module might: the engine refused it, so the check reports it.
+            yield* ctx.scheduler.schedule({ handler: "tick", key: "monthly", payload: { n: 1 }, cron: "0 7 1 * *" }).pipe(Effect.ignore)
+            yield* ctx.scheduler.schedule({ handler: "tick", key: "zoned", payload: { n: 1 }, cron: "0 4 * * *", timeZone: "Not/AZone" }).pipe(Effect.ignore)
             yield* ctx.scheduler.schedule({ handler: "tick", key: "bare", inMs: 1000 }).pipe(Effect.ignore)
             return { value: undefined }
           }),
         start: (ctx) => Effect.as(ctx.scheduler.handle("in_instance", { payload: Schema.Struct({}), run: () => Effect.void }).pipe(Effect.orDie), {})
       })
-      assert.deepStrictEqual(rules(yield* moduleProblems(jobs)).sort(), ['cron cron "0 7 1 * *"', "job-payload a schedule", "scheduler-shared handler in_instance"].sort())
+      const problems = yield* moduleProblems(jobs)
+      assert.deepStrictEqual(rules(problems), ["scheduler-refused a schedule", "scheduler-refused a schedule", "scheduler-refused a schedule", "scheduler-shared handler in_instance"])
+      const said = problems.filter((p) => p.rule === "scheduler-refused").map((p) => p.message)
+      assert.match(said[0]!, /^refused \(invalid\): .*day of month and month must be \*/)
+      assert.match(said[1]!, /^refused \(invalid\): .*Not\/AZone/)
+      assert.match(said[2]!, /^refused \(invalid\): the payload does not fit the handler "tick"/)
     }))
 
-  it.effect("job-payload: a handler of another module with the same name is not this module's", () =>
+  it.effect("scheduler-refused: another module's refusals are not this module's, and an asynchronous payload decoder is no problem", () =>
     Effect.gen(function*() {
       const other = defineModule({
         apiVersion: 2,
         id: "other",
         name: "Other",
-        description: "Has a tick of its own.",
+        description: "Has a refusal of its own.",
         enabledByDefault: false,
-        shared: (ctx) => Effect.as(ctx.scheduler.handle("tick", { payload: Schema.Struct({ b: Schema.String }), run: () => Effect.void }).pipe(Effect.orDie), { value: undefined }),
+        shared: (ctx) => Effect.as(Effect.ignore(ctx.scheduler.schedule({ handler: "nothing", inMs: 1_000 })), { value: undefined }),
         start: () => Effect.succeed({})
       })
+      const slow = Schema.Struct({}).pipe(Schema.decodeTo(Schema.Struct({}), {
+        decode: SchemaGetter.transformEffect((x) => Effect.as(Effect.sleep(1), x)),
+        encode: SchemaGetter.transform((x) => x)
+      }))
       const mine = defineModule({
         apiVersion: 2,
         id: "mine",
@@ -220,13 +248,40 @@ describe("checkModule", () => {
         enabledByDefault: false,
         shared: (ctx) =>
           Effect.gen(function*() {
-            yield* ctx.scheduler.handle("tick", { payload: Schema.Struct({ a: Schema.String }), run: () => Effect.void }).pipe(Effect.orDie)
-            yield* ctx.scheduler.schedule({ handler: "tick", payload: { a: "ok" }, inMs: 1_000 }).pipe(Effect.orDie)
+            yield* ctx.scheduler.handle("tick", { payload: slow, run: () => Effect.void }).pipe(Effect.orDie)
+            yield* ctx.scheduler.schedule({ handler: "tick", inMs: 1_000 }).pipe(Effect.orDie)
             return { value: undefined }
           }),
         start: () => Effect.succeed({})
       })
       assert.deepStrictEqual(rules(yield* moduleProblems(mine, { others: [other] })), [])
+    }))
+
+  it.effect("an unprogrammed stub call its start catches fails the check", () =>
+    Effect.gen(function*() {
+      interface Greeter {
+        readonly greet: (name: string) => string
+      }
+      const Greeters = ServiceKey<Greeter>("greeter")
+      const greeter = stubService<Greeter>("greeter")
+      const eager = defineModule({
+        apiVersion: 2,
+        id: "eager",
+        name: "Eager",
+        description: "Greets as it starts.",
+        enabledByDefault: false,
+        start: (ctx) =>
+          Effect.sync(() => {
+            try {
+              ctx.host.service(Greeters)?.greet("x")
+            } catch {
+              // Swallowed: the kit still fails the test.
+            }
+            return {}
+          })
+      })
+      const exit = yield* Effect.exit(checkModule(eager, { provide: [provide("greeter", { services: [Greeters.of(greeter.service)] })] }))
+      assert.include(String(Exit.isFailure(exit) ? exit.cause : "passed"), "without a programmed answer")
     }))
 
   it.effect("secret: a secret's value in a tool description, and one shown on the admin page", () =>
@@ -270,9 +325,10 @@ describe("checkModule", () => {
 
   it.effect("texts: both languages, same keys and placeholders, one line each", () =>
     Effect.gen(function*() {
-      const texts = { en: { a: "Hello {name}.", b: "Only English.", c: "", d: "{name}, hello {name}." }, nl: { a: "Hallo {naam}.", c: "Leeg.", d: "Hallo {name}." } }
-      // "d" uses the same name a different number of times: `say` fills each, so it keeps the rule.
-      assert.deepStrictEqual(rules(yield* moduleProblems(ok, { texts })), ['texts text "a"', 'texts text "b"', 'texts text "c"'])
+      const texts = { en: { a: "Hello {name}.", b: "Only English.", c: "", d: "{name}, hello {name}.", e: "Two\u2028lines." }, nl: { a: "Hallo {naam}.", c: "Leeg.", d: "Hallo {name}.", e: "Twee regels." } }
+      // "d" uses the same name a different number of times: `say` fills each, so it keeps the rule. "e" holds a line
+      // separator, which the core's one-line rule refuses.
+      assert.deepStrictEqual(rules(yield* moduleProblems(ok, { texts })), ['texts text "a"', 'texts text "b"', 'texts text "c"', 'texts text "e"'])
     }))
 
   it.effect("the failure names every rule and place", () =>

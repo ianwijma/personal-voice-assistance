@@ -56,6 +56,21 @@ describe("the network in a module's test", () => {
     }))
   // #endregion net-test
 
+  it.effect("an unlisted literal address is refused like an unlisted name, directly and after a redirect; only a listed host's unlisted path is a 404", () =>
+    Effect.gen(function*() {
+      const net = makeOfflineNet({
+        "https://api.example.org/forecast": { body: { rain: true } },
+        "https://api.example.org/moved": { status: 302, headers: { location: "https://8.8.8.8/forecast" } }
+      })
+      const deps = { resolver: net.resolver, connector: net.connector }
+      for (const url of ["https://8.8.8.8/", "https://[2606:4700::1111]/", "https://api.example.org/moved"]) {
+        const failed = yield* Effect.flip(safeFetch(url, { accept: contentTypes.json, ...deps }))
+        assert.strictEqual(failed._tag, "NetFailure", url)
+      }
+      const missing = yield* safeFetch("https://api.example.org/nothing-here", { accept: contentTypes.webPage, ...deps })
+      assert.strictEqual(missing.status, 404)
+    }))
+
   it.effect("the contact goes into the User-Agent only when the owner set one", () =>
     Effect.gen(function*() {
       const net = makeOfflineNet({ "https://api.example.org/forecast": { body: { rain: false } } })

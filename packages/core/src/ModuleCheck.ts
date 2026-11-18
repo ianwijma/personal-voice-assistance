@@ -23,25 +23,30 @@
  * | `tool-description` | a tool's description, or an action's generated tool's, is empty or over 1,024 characters |
  * | `tool-parameters` | a tool's parameters, or an action's generated tool's, are not sent as a JSON object schema, or name a property outside 1–64 of `[A-Za-z0-9_.-]` |
  * | `action-examples` | an action declares no `examples` (the keyword decider and the model have nothing to match) |
- * | `stored-value` | a collection the store's declaration check refuses; a root value that is not an object; a worst legal value longer than `maxChars` (or unbounded); an indexed field whose legal values the store's index refuses |
+ * | `collection` | the store's declaration check (`defineCollection`, and `prepare` on an empty store) refuses a collection it declares |
+ * | `stored-value` | a collection's worst legal value is longer than its `maxChars`, or has no bound |
  * | `scheduler-shared` | a scheduler handler is registered in an instance's `start` instead of `shared` |
- * | `cron` | a cron schedule it asked for while starting is refused by the real engine |
- * | `job-payload` | a job it asked for while starting has a payload its handler's schema does not decode (refused by the engine, or not checkable then because the handler came later) |
+ * | `scheduler-refused` | a `schedule`, `prepare` or `reschedule` it made while starting was refused by the real engine (a cron or time zone, a payload, a limit), with the engine's reason |
  * | `health` | it requires the network but declares no `health`, or its `health()` fails, dies or does not answer in time |
  * | `texts` | the spoken texts it declares (`options.texts`) differ between English and Dutch in keys or in the set of placeholder names, or one is empty or not one line |
  *
  * Every instance the household's assistants make (one per distinct set of effective settings) is checked; a problem
  * two instances share is reported once.
+ *
+ * What it does not judge: whether an indexed value is legal for the store (the store refuses an illegal one when it
+ * is written, and a module's own tests write a row with every indexed field at its largest), and any value a tool,
+ * an action or a job produces.
  */
-import { Data, Effect, Exit, Schema } from "effect"
-import { type Collection, defineCollection, MAX_INDEXED_CHARS, RESERVED_FIELDS } from "./HouseholdStore.ts"
+import { Data, Effect, Schema } from "effect"
+import { type Collection, defineCollection } from "./HouseholdStore.ts"
 import type { ModuleDefinition } from "./ModuleDefinition.ts"
 import type { StartedPart } from "./ModuleRegistrations.ts"
 import { toolMetadata, type Tool } from "./Module.ts"
 import { type ActionDefinition, actionTool, registerActions } from "./Actions.ts"
 import { toolSpec } from "./ToolRegistry.ts"
 import { recordParts, startTestModule, type StartTestModuleOptions } from "./ModuleTestKit.ts"
-import { isSchedulerCron } from "./SchedulerEngine.ts"
+import { makeMemoryHouseholdStore } from "./MemoryHouseholdStore.ts"
+import { NOT_ONE_LINE } from "./SettingsExtra.ts"
 
 export interface ModuleProblem {
   /** The rule's id (the table above). */
@@ -183,13 +188,10 @@ export const collectionWorst = (collection: Pick<Collection<any>, "schema">): Wo
   }
 }
 
-type JsonNode = Record<string, unknown>
-
 /**
- * What the store would refuse of a collection, before any write: its declaration (the store's own `defineCollection`
- * check, run again on what the module declares), a stored value that is not an object, and an indexed field whose
- * legal values the index refuses (an index holds a string of at most 500 characters without NUL or a lone surrogate, a
- * finite number or a boolean, or nothing).
+ * Why the store's declaration check refuses a collection, or nothing: its own `defineCollection`, run again on what the
+ * module declares (a collection object made by hand does not pass through it). It judges the declaration only; what a
+ * value may hold, an indexed value included, the store checks when the value is written.
  */
 export const collectionProblems = (collection: Collection<any>): ReadonlyArray<string> => {
   try {
@@ -203,71 +205,10 @@ export const collectionProblems = (collection: Collection<any>): ReadonlyArray<s
       ...(collection.ambient !== undefined ? { ambient: collection.ambient, ambientRows: collection.ambientRows } : {}),
       ...(collection.project !== undefined ? { project: collection.project } : {})
     })
+    return []
   } catch (e) {
     return [`the store refuses its declaration: ${e instanceof Error ? e.message : String(e)}`]
   }
-  let document: { readonly schema: unknown; readonly definitions: Readonly<Record<string, unknown>> }
-  try {
-    document = Schema.toJsonSchemaDocument(Schema.toCodecJson(collection.schema as Schema.Codec<unknown, unknown>))
-  } catch {
-    return [] // `stored-value` reports a schema without a JSON form
-  }
-  const deref = (node: unknown, depth = 0): JsonNode | undefined => {
-    if (typeof node !== "object" || node === null || depth > 32) return undefined
-    const n = node as JsonNode
-    return typeof n.$ref === "string" ? deref(document.definitions[n.$ref.replace(/^#\/(\$defs|definitions)\//, "")], depth + 1) : n
-  }
-  const members = (n: JsonNode): ReadonlyArray<unknown> | undefined => (Array.isArray(n.anyOf) ? n.anyOf : Array.isArray(n.oneOf) ? n.oneOf : undefined)
-  const isObject = (node: unknown): boolean => {
-    const n = deref(node)
-    if (n === undefined) return false
-    const m = members(n)
-    return m !== undefined ? m.length > 0 && m.every(isObject) : n.type === "object"
-  }
-  const out: Array<string> = []
-  const root = deref(document.schema)
-  if (root === undefined || !isObject(root)) {
-    out.push("its value is not always an object, and the store keeps only objects: make its schema a Schema.Struct")
-    return out
-  }
-  const scalar = (v: unknown) => typeof v === "boolean" || (typeof v === "number" && Number.isFinite(v)) || (typeof v === "string" && v.length <= MAX_INDEXED_CHARS && !v.includes("\u0000"))
-  const indexProblem = (node: unknown): string | undefined => {
-    const n = deref(node)
-    if (n === undefined) return "has no schema the check can read"
-    if (Array.isArray(n.enum)) return n.enum.every(scalar) ? undefined : "can hold a value an index cannot (only strings of at most 500, finite numbers and booleans)"
-    if ("const" in n) return scalar(n.const) ? undefined : "can hold a value an index cannot (only strings of at most 500, finite numbers and booleans)"
-    const m = members(n)
-    if (m !== undefined) return m.map(indexProblem).find((p) => p !== undefined)
-    switch (n.type) {
-      case "string":
-        if (typeof n.maxLength !== "number" || n.maxLength > MAX_INDEXED_CHARS) return `can be longer than the ${MAX_INDEXED_CHARS} characters an index holds: give it a maximum of at most ${MAX_INDEXED_CHARS}`
-        if (typeof n.pattern !== "string") return "can hold a NUL or a lone surrogate, which an index refuses: use StoredText(n) or a pattern"
-        return undefined
-      case "number":
-      case "integer":
-      case "boolean":
-        return undefined
-      case "null":
-        return "can be null, which an index refuses: leave the field out instead"
-      default:
-        return "is not a string, a number or a boolean, so an index cannot hold it"
-    }
-  }
-  const propertyOf = (field: string): unknown => {
-    const shapes = members(root) ?? [root]
-    for (const shape of shapes) {
-      const props = deref(shape)?.properties as Record<string, unknown> | undefined
-      if (props !== undefined && field in props) return props[field]
-    }
-    return undefined
-  }
-  for (const field of collection.fields) {
-    if (RESERVED_FIELDS.has(field)) continue // refused by the declaration check above
-    const property = propertyOf(field)
-    const problem = property === undefined ? "is not a field of its schema" : indexProblem(property)
-    if (problem !== undefined) out.push(`the indexed field "${field}" ${problem}`)
-  }
-  return out
 }
 
 // ---------------------------------------------------------------------------------------------------------------------
@@ -292,7 +233,7 @@ const textsProblems = (texts: NonNullable<CheckModuleOptions["texts"]>): Array<M
     }
     for (const [lang, t] of [["English", en], ["Dutch", nl]] as const) {
       if (t.trim() === "") out.push({ rule: "texts", where: `text "${key}"`, message: `the ${lang} text is empty` })
-      if (/[\u0000-\u001f]/.test(t)) out.push({ rule: "texts", where: `text "${key}"`, message: `the ${lang} text is not one line` })
+      if (NOT_ONE_LINE.test(t)) out.push({ rule: "texts", where: `text "${key}"`, message: `the ${lang} text is not one line` })
     }
     if (PLACEHOLDERS(en).join(",") !== PLACEHOLDERS(nl).join(",")) {
       out.push({ rule: "texts", where: `text "${key}"`, message: `its placeholder names differ: {${PLACEHOLDERS(en).join("}, {")}} in English, {${PLACEHOLDERS(nl).join("}, {")}} in Dutch` })
@@ -379,11 +320,22 @@ export const moduleProblems = (definition: ModuleDefinition<any>, options: Check
     let storable = true
     for (const c of definition.storage?.collections ?? []) {
       const refused = collectionProblems(c)
-      for (const message of refused) out.push({ rule: "stored-value", where: `collection ${c.name}`, message })
-      if (refused.some((m) => m.startsWith("the store refuses its declaration"))) storable = false
+      for (const message of refused) out.push({ rule: "collection", where: `collection ${c.name}`, message })
+      if (refused.length > 0) storable = false
       const w = collectionWorst(c)
       if ("unbounded" in w) out.push({ rule: "stored-value", where: `collection ${c.name}`, message: `its worst legal value has no bound: ${w.unbounded}; give every string a maximum (StoredText) and every list a maximum number of items` })
       else if (w.chars > c.maxChars) out.push({ rule: "stored-value", where: `collection ${c.name}`, message: `its worst legal value takes ${w.chars} characters of JSON, over its maxChars of ${c.maxChars}: a legal value would be refused at write. Raise maxChars or lower the bounds (StoredText counts 2 a character, a plain string 6)` })
+    }
+    if (storable && definition.storage !== undefined) {
+      // The store's own check of the module's whole declaration, on an empty store (what the test household runs).
+      const store = makeMemoryHouseholdStore()
+      const prepared = yield* Effect.exit(store.prepare([{ id, storage: definition.storage }]))
+      const unavailable = store.availability(id)
+      const why = prepared._tag === "Failure" ? String(prepared.cause) : unavailable !== undefined ? JSON.stringify(unavailable) : undefined
+      if (why !== undefined) {
+        out.push({ rule: "collection", where: "storage", message: `the store refuses the module's storage: ${why}` })
+        storable = false
+      }
     }
     if (options.texts !== undefined) out.push(...textsProblems(options.texts))
     // A collection the store refuses would stop the test household from being made: nothing more can be checked.
@@ -428,17 +380,8 @@ export const moduleProblems = (definition: ModuleDefinition<any>, options: Check
       if (use.kind === "handle" && use.part === "instance") {
         out.push({ rule: "scheduler-shared", where: `handler ${use.name}`, message: "register job handlers in shared: an instance runs once per distinct settings, and two handlers of one name refuse the start" })
       }
-      if (use.kind === "refused") {
-        if (use.cron !== undefined && isSchedulerCron(use.cron) !== undefined) out.push({ rule: "cron", where: `cron "${use.cron}"`, message: use.message })
-        else if (/payload/.test(use.message)) out.push({ rule: "job-payload", where: `a ${use.call}`, message: use.message })
-      }
-      if (use.kind === "scheduled") {
-        // The engine checks a payload against a handler published or registered by then; one registered later is checked here.
-        const handler = uses.find((u) => u.kind === "handle" && u.name === use.handler)
-        if (handler?.kind === "handle" && Exit.isFailure(Schema.decodeUnknownExit(Schema.toCodecJson(handler.payload))(use.payload))) {
-          out.push({ rule: "job-payload", where: `job of ${use.handler}`, message: `its payload ${JSON.stringify(use.payload)?.slice(0, 80)} does not decode with the handler's payload schema, so every run fails` })
-        }
-      }
+      // What the real engine refused, in its own words; the check judges nothing again itself.
+      if (use.kind === "refused") out.push({ rule: "scheduler-refused", where: `a ${use.call}`, message: `refused (${use.reason}): ${use.message}` })
     }
     // Health: run it once, as "Check again" does (the kit moves the clock past the host's limit if it does not answer).
     const issues = yield* harness.checkHealth

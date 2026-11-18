@@ -7,27 +7,41 @@
  * first module that has one, in the app's serve tests. Exported from `@pva/core/testing` only.
  *
  * Run it inside `it.effect` (the test clock): `startTestModule` sets the clock to `startAt` first, and `advance(ms)`
- * moves it and lets the scheduler run what came due. Where the kit waits on one of the host's time limits (a start, a
- * health check), it moves the test clock past that limit when the module has not answered, so a module that never
- * answers fails its test instead of hanging it. Everything it makes lives in the test's scope.
+ * moves it and lets the scheduler run what came due. Where the kit waits on the module's own code (a start, a stop, a
+ * restart, a settings change, a health check, closing the test's modules), it **drives the test clock** until the wait
+ * is over: from one pending timer to the next, at most `KIT_WAIT_CAP_MS` of test-clock time, after which it fails the
+ * test naming what did not finish (it never hangs, and never waits for the unfinished work). Everything it makes lives
+ * in the test's scope; when that closes, the kit stops the modules (driving the clock the same way).
+ *
+ * A stub's method called without a programmed answer (`stubService`) fails the test: the kit asserts it after the
+ * start, after each of its calls and lifecycle steps, and when the test's scope closes.
  */
-import { BUILT_IN_PLACE, type DeviceCapabilities, type DevicePrivacy, type HealthIssue, type ModuleInfo, type SettingsPatch, type SettingValue } from "@pva/protocol"
-import { Clock, Effect, Fiber, type Schema } from "effect"
+import {
+  BUILT_IN_PLACE,
+  type DeviceCapabilities,
+  type DevicePrivacy,
+  type HealthIssue,
+  homeValuesOf,
+  linkedModuleDefaults,
+  type ModuleInfo,
+  type SettingsPatch,
+  type SettingValue
+} from "@pva/protocol"
+import { Clock, Effect, Exit, Fiber, type Schema, Scope } from "effect"
 import { TestClock } from "effect/testing"
 import type { ActionRunResult, ContributionKey, ModuleHostApi, ProvidedContribution, ProvidedService, ServiceKey } from "./ModuleApi.ts"
 import { type KnownDevice, Devices, makeDevices } from "./Devices.ts"
-import type { HouseholdStore, ModuleStore, Row } from "./HouseholdStore.ts"
-import { maxListRows } from "./HouseholdStore.ts"
+import type { HouseholdStore, ModuleStore } from "./HouseholdStore.ts"
 import { defineModule, type ModuleDefinition } from "./ModuleDefinition.ts"
 import { makeModuleHost, type ModuleHost, readOnlyPersistence } from "./ModuleHost.ts"
 import type { Registrar, StartedPart } from "./ModuleRegistrations.ts"
-import { takeUnprogrammedStubCalls } from "./ModuleStubs.ts"
+import { takeUnprogrammedStubCalls, UnprogrammedStubCall } from "./ModuleStubs.ts"
 import { type Diet, EMPTY_DIET, effectiveDiet, findPerson, People, type PeopleService, type Person, peopleError } from "./People.ts"
 import { makePrivacy, Privacy } from "./Privacy.ts"
 import { defaultRiskPolicy } from "./RiskPolicy.ts"
 import type { JobRow, ModuleScheduler, SchedulerHook } from "./Scheduler.ts"
 import { NOT_ONE_LINE } from "./SettingsExtra.ts"
-import { makeToolRegistry } from "./ToolRegistry.ts"
+import { makeToolRegistry, withoutOffTools } from "./ToolRegistry.ts"
 import { type ConnectionRef, CurrentTurn, makeConnectionRef, type Principal, type TurnContext, type TurnSource } from "./TurnContext.ts"
 import { connectStoreToBus, type HouseholdEvent, makeEventBus } from "./EventBus.ts"
 import { makeIssueRegistry } from "./Issues.ts"
@@ -192,18 +206,22 @@ export interface TestTurnInput {
   /** The answering assistant (default: the device's first). */
   readonly assistant?: string
   /**
-   * Who is speaking: `null` for nobody; default the device's default person (as serve mode does). Any other person is
-   * refused by the gateway, as in serve mode (a turn's person is its device's default person).
+   * Who is speaking: `null` for nobody. Through the harness (`kit.turn`, `kit.tool(…, as)`), the default is the
+   * device's default person, as serve mode does; `makeTestTurn` alone has no household and gives no person unless
+   * named. Any person but the device's default is refused by the gateway, as in serve mode.
    */
   readonly person?: string | null
   readonly source?: TurnSource
+  /** Default 1: every turn the kit makes has the same id unless given; a multi-turn test gives each its own. */
   readonly turnId?: number
+  /** Default "conversation-1", the same for every turn unless given. */
   readonly conversationId?: string
 }
 
 /**
- * A `CurrentTurn` as serve mode makes it, from the input alone (device `kitchen-display`, assistant `jeff`), with the
- * device's connection (`testConnectionOf`). `harness.turn` makes one from the test household's device instead.
+ * A synthetic `CurrentTurn` from the input alone (device `kitchen-display`, assistant `jeff`, with that device's
+ * connection, `testConnectionOf`): no person, room or device name unless given, because it knows no household. For a
+ * turn of the test household, as serve mode makes it, use `harness.turn` (or pass a `TestTurnInput` to a handle).
  */
 export const makeTestTurn = (input: TestTurnInput & { readonly deviceName?: string; readonly room?: string } = {}): TurnContext => {
   const deviceId = input.device ?? "kitchen-display"
@@ -248,12 +266,13 @@ const standIn = (p: ProvidedModule): ModuleDefinition<{}> =>
 
 /**
  * A use of `ctx.scheduler` the kit saw, with the module that made it: where a handler was registered, a job written
- * (its payload as stored, a copy), and every `invalid` refusal of a schedule.
+ * (its payload as stored, a copy), and every refusal of a `schedule`, `prepare` or `reschedule` by the real engine,
+ * with the engine's own reason and message.
  */
 export type SchedulerUse =
   | { readonly kind: "handle"; readonly moduleId: string; readonly part: "shared" | "instance"; readonly name: string; readonly payload: Schema.Codec<unknown, unknown> }
   | { readonly kind: "scheduled"; readonly moduleId: string; readonly call: "schedule" | "prepare"; readonly handler: string; readonly payload: unknown }
-  | { readonly kind: "refused"; readonly moduleId: string; readonly call: "schedule" | "prepare" | "reschedule"; readonly cron: string | undefined; readonly message: string }
+  | { readonly kind: "refused"; readonly moduleId: string; readonly call: "schedule" | "prepare" | "reschedule"; readonly reason: string; readonly message: string }
 
 /** A JSON copy of a payload as the scheduler stores it (an absent payload is `{}`). */
 const storedForm = (payload: unknown): unknown => {
@@ -270,11 +289,8 @@ const observedScheduler = (hook: SchedulerHook, uses: Array<SchedulerUse>): Sche
   forPart: (part, runner) => {
     const inner = hook.forPart(part, runner)
     const moduleId = part.moduleId
-    const watch = <A, E extends { readonly reason?: unknown; readonly message?: unknown }>(call: "schedule" | "prepare" | "reschedule", cron: string | undefined, effect: Effect.Effect<A, E>) =>
-      Effect.tapError(effect, (e) =>
-        Effect.sync(() => {
-          if (e.reason === "invalid") uses.push({ kind: "refused", moduleId, call, cron, message: String(e.message) })
-        }))
+    const watch = <A, E extends { readonly reason?: unknown; readonly message?: unknown }>(call: "schedule" | "prepare" | "reschedule", effect: Effect.Effect<A, E>) =>
+      Effect.tapError(effect, (e) => Effect.sync(() => void uses.push({ kind: "refused", moduleId, call, reason: String(e.reason), message: String(e.message) })))
     const scheduler: ModuleScheduler = {
       ...inner,
       handle: (name, handler) =>
@@ -282,44 +298,123 @@ const observedScheduler = (hook: SchedulerHook, uses: Array<SchedulerUse>): Sche
           Effect.sync(() => void uses.push({ kind: "handle", moduleId, part: part.kind, name, payload: handler.payload as Schema.Codec<unknown, unknown> }))),
       schedule: (request) => {
         const payload = storedForm(request.payload)
-        return Effect.tap(watch("schedule", (request as { readonly cron?: string }).cron, inner.schedule(request)), () =>
+        return Effect.tap(watch("schedule", inner.schedule(request)), () =>
           Effect.sync(() => void uses.push({ kind: "scheduled", moduleId, call: "schedule", handler: request.handler, payload })))
       },
       prepare: (request) => {
         const payload = storedForm(request.payload)
-        return Effect.tap(watch("prepare", (request as { readonly cron?: string }).cron, inner.prepare(request)), () =>
+        return Effect.tap(watch("prepare", inner.prepare(request)), () =>
           Effect.sync(() => void uses.push({ kind: "scheduled", moduleId, call: "prepare", handler: request.handler, payload })))
       },
-      reschedule: (id, when) => watch("reschedule", undefined, inner.reschedule(id, when))
+      reschedule: (id, when) => watch("reschedule", inner.reschedule(id, when))
     }
     return scheduler
   }
 })
 
 // ---------------------------------------------------------------------------------------------------------------------
-// Waiting on the host's time limits under the test clock
+// Waiting on the module's code under the test clock
 
 /**
- * Run `effect` (which waits on one of the host's time limits of `limitMs`) and, while it has not finished after the
- * module had every chance to answer, move the test clock past that limit, at most `rounds` times. A module that answers
- * in time never sees the clock move.
+ * The most test-clock time one wait of the kit may take (a start with every `others` module, a stop with its grace
+ * periods and finalizers, a restart, a settings change, a health check, closing the test's modules): 10 minutes.
  */
-const drivenPast = <A, E>(effect: Effect.Effect<A, E>, limitMs: number, rounds = 4): Effect.Effect<A, E> =>
+export const KIT_WAIT_CAP_MS = 10 * 60_000
+
+/** The earliest pending timer of the test clock, in ms from now; `undefined` when none is pending, `null` when unknown. */
+const nextTimer = TestClock.testClockWith((clock) =>
+  Effect.sync((): number | undefined | null => {
+    // The test clock keeps its pending sleeps sorted latest first; it has no public reader for them.
+    const sleeps = (clock as unknown as { readonly sleeps?: unknown }).sleeps
+    if (!Array.isArray(sleeps)) return null
+    const earliest = (sleeps as ReadonlyArray<{ readonly timestamp?: unknown }>).at(-1)?.timestamp
+    return typeof earliest === "number" ? Math.max(1, earliest - clock.currentTimeMillisUnsafe()) : undefined
+  })
+)
+
+/** Let `fiber` run as far as it can without the test clock moving: fibers first, then a few real event-loop turns. */
+const letRun = (fiber: Fiber.Fiber<unknown, unknown>) =>
   Effect.gen(function*() {
-    const fiber = yield* Effect.forkChild(effect)
-    for (let round = 0; round <= rounds; round++) {
-      for (let i = 0; i < 200 && fiber.pollUnsafe() === undefined; i++) yield* Effect.yieldNow
-      if (fiber.pollUnsafe() !== undefined || round === rounds) break
-      yield* TestClock.adjust(limitMs + 1)
+    for (let i = 0; i < 200 && fiber.pollUnsafe() === undefined; i++) yield* Effect.yieldNow
+    for (let turn = 0; turn < 20 && fiber.pollUnsafe() === undefined; turn++) {
+      yield* Effect.promise(() => new Promise<void>((resolve) => setTimeout(resolve, 1)))
+      for (let i = 0; i < 50 && fiber.pollUnsafe() === undefined; i++) yield* Effect.yieldNow
     }
-    return yield* Fiber.join(fiber)
   })
 
-/** The host's time limits the kit waits on (`makeModuleHost`'s defaults). */
-const START_LIMIT_MS = 10_000
-const HEALTH_LIMIT_MS = 5_000
+/**
+ * Run `effect`, which waits on module code, and drive the test clock until it has finished: while it has not, move the
+ * clock to the next pending timer. A wait that has not finished after `KIT_WAIT_CAP_MS` of test-clock time, or that
+ * waits on nothing the clock can move, fails the test naming `what`; the unfinished work is interrupted without being
+ * waited for. A wait that finishes at once never sees the clock move.
+ */
+const driven = <A, E>(what: string, effect: Effect.Effect<A, E>): Effect.Effect<A, E> =>
+  Effect.gen(function*() {
+    // Detached: a wait that is given up must not hold the test's own fiber when it ends.
+    const fiber = yield* Effect.forkDetach(effect)
+    const startedAt = yield* Clock.currentTimeMillis
+    for (;;) {
+      yield* letRun(fiber)
+      if (fiber.pollUnsafe() !== undefined) return yield* Fiber.join(fiber)
+      const elapsed = (yield* Clock.currentTimeMillis) - startedAt
+      const next = yield* nextTimer
+      const step = next === null ? 1_000 : next
+      if (step === undefined || elapsed + step > KIT_WAIT_CAP_MS) {
+        fiber.interruptUnsafe()
+        const why = step === undefined ? "it waits on nothing the test clock can move" : `${KIT_WAIT_CAP_MS / 60_000} minutes of test-clock time passed`
+        return yield* Effect.die(new Error(`The test kit gave up waiting for ${what}: ${why} (it moved the clock ${elapsed} ms). Some code of a module under test does not finish.`))
+      }
+      yield* TestClock.adjust(step)
+    }
+  })
+
 /** The host's shortest distance between two restarts a module asks for. */
 const RESTART_INTERVAL_MS = 5_000
+
+/** The most pages of the scheduler's job list `jobs` reads before it fails (each page holds every module's jobs). */
+const MAX_JOB_LIST_PAGES = 1_000
+
+/** A stub's method was called without an answer: the test fails with it, whatever the module did with the error. */
+const failOnUnprogrammedStubs = (when: string) =>
+  Effect.suspend(() => {
+    const calls = takeUnprogrammedStubCalls()
+    if (calls.length === 0) return Effect.void
+    const first = calls[0]!
+    return Effect.die(Object.assign(new UnprogrammedStubCall(first.service, first.method), {
+      message: `${first.message} (found ${when}${calls.length > 1 ? `; ${calls.length - 1} more unprogrammed call${calls.length > 2 ? "s" : ""}` : ""})`
+    }))
+  })
+
+/** `effect`, then the unprogrammed stub calls it made fail the test (also when `effect` failed). */
+const checked = <A, E, R>(when: string, effect: Effect.Effect<A, E, R>): Effect.Effect<A, E, R> =>
+  Effect.flatMap(Effect.exit(effect), (exit) => Effect.andThen(failOnUnprogrammedStubs(when), exit))
+
+/** Every string a value holds, its keys included, decoded: a string that is JSON is parsed and walked too. */
+const stringsOf = (value: unknown, out: Array<string> = [], seen = new Set<object>(), depth = 0): Array<string> => {
+  if (depth > 64) return out
+  if (typeof value === "string") {
+    out.push(value)
+    const t = value.trim()
+    if (t.startsWith("{") || t.startsWith("[") || t.startsWith("\"")) {
+      try {
+        stringsOf(JSON.parse(t), out, seen, depth + 1)
+      } catch {
+        // Not JSON: the text itself was taken.
+      }
+    }
+    return out
+  }
+  if (typeof value !== "object" || value === null || seen.has(value)) return out
+  seen.add(value)
+  if (value instanceof Error) stringsOf(value.message, out, seen, depth + 1)
+  const entries = value instanceof Map ? [...value.entries()] : value instanceof Set ? [...value].map((v, i) => [i, v] as const) : Object.entries(value)
+  for (const [k, v] of entries) {
+    if (typeof k === "string") out.push(k)
+    else stringsOf(k, out, seen, depth + 1)
+    stringsOf(v, out, seen, depth + 1)
+  }
+  return out
+}
 
 // ---------------------------------------------------------------------------------------------------------------------
 // startTestModule
@@ -355,12 +450,6 @@ export interface TestToolResult {
   readonly value: unknown
 }
 
-/** A stub's method was called without an answer during the call: the test fails with it, whatever the module did. */
-const failOnUnprogrammedStubs = Effect.suspend(() => {
-  const calls = takeUnprogrammedStubCalls()
-  return calls.length === 0 ? Effect.void : Effect.die(calls[0])
-})
-
 /**
  * Start `definition` in the real module host, as serve mode runs it: demanded by the test household's assistants (the
  * module and every stand-in on for each, unless an assistant switches it off), with the gateway's access checks and
@@ -369,8 +458,9 @@ const failOnUnprogrammedStubs = Effect.suspend(() => {
  */
 export const startTestModule = (definition: ModuleDefinition<any>, options: StartTestModuleOptions = {}) =>
   Effect.gen(function*() {
+    // Unprogrammed calls nobody reported yet (a stub called outside any kit) fail here, never cleared silently.
+    yield* failOnUnprogrammedStubs("before the test kit started (a stub was called outside a kit; read them with takeUnprogrammedStubCalls)")
     yield* TestClock.setTime(options.startAt ?? DEFAULT_TEST_START)
-    takeUnprogrammedStubCalls()
     const id = definition.id
     // The module's own host handles, as its parts receive them: `restart` asks the host for a real restart through the
     // newest live one (the host has no other call that restarts one module with its demand kept).
@@ -400,6 +490,12 @@ export const startTestModule = (definition: ModuleDefinition<any>, options: Star
     const assistants = input.assistants ?? DEFAULT_TEST_HOUSEHOLD.assistants
     const deviceList = input.devices ?? DEFAULT_TEST_HOUSEHOLD.devices
 
+    // Everything the modules run in lives in a scope of the kit's, closed when the test's scope closes: the kit drives
+    // the clock through the modules' stops and finalizers there, and then asserts the stubs, so neither hangs nor hides.
+    const lifetime = yield* Scope.make()
+    yield* Effect.addFinalizer(() =>
+      Effect.andThen(driven(`the modules of the test to stop (${id})`, Scope.close(lifetime, Exit.void)), failOnUnprogrammedStubs("when the test's scope closed"))
+    )
     // The household store and bus, and the scheduler engine, exactly as makeTestHousehold and makeTestScheduler make them.
     const store: HouseholdStore = makeMemoryHouseholdStore()
     yield* store.prepare(catalog.map((m) => ({ id: m.id, storage: m.storage })), [schedulerStorage]).pipe(Effect.orDie)
@@ -415,7 +511,7 @@ export const startTestModule = (definition: ModuleDefinition<any>, options: Star
       timeZone: () => (typeof home.HOME_TIME_ZONE === "string" ? home.HOME_TIME_ZONE : undefined),
       gateway: () => hostRef?.gateway,
       pageText: (moduleId, text, max) => hostRef?.pageText(moduleId, text, max) ?? String(text).slice(0, max)
-    })
+    }).pipe(Scope.provide(lifetime))
     const schedulerUses: Array<SchedulerUse> = []
 
     // Who has which module on: every assistant has the module and the stand-ins on unless it says otherwise.
@@ -457,8 +553,11 @@ export const startTestModule = (definition: ModuleDefinition<any>, options: Star
       }
       return undefined
     }
+    // Home-linked defaults exactly as serve mode resolves them (`linkedModuleDefaults` over the Home values).
+    const homeDefaults = (moduleId: string) => linkedModuleDefaults(homeValuesOf((key) => home[key]))[moduleId]
     const host = yield* makeModuleHost({
       catalog,
+      defaults: homeDefaults,
       persistence: readOnlyPersistence({
         modules: { [id]: { enabled: true, ...(options.settings !== undefined ? { settings: options.settings } : {}) } },
         secrets: options.secrets !== undefined ? { [id]: options.secrets } : {}
@@ -490,9 +589,9 @@ export const startTestModule = (definition: ModuleDefinition<any>, options: Star
         home: () => home,
         devices: () => people.devices.list().map((d) => ({ id: d.id, name: d.name, kind: d.kind, connections: d.connected ? 1 : 0 }))
       }
-    })
+    }).pipe(Scope.provide(lifetime))
     hostRef = host
-    yield* drivenPast(host.startEnabled, START_LIMIT_MS)
+    yield* checked("after the start", driven(`the start of ${id}${(options.others ?? []).length > 0 ? " and the modules beside it" : ""}`, host.startEnabled))
 
     const settle = Effect.andThen(engine.settled, Effect.repeat(Effect.yieldNow, { times: 20 }))
 
@@ -513,24 +612,21 @@ export const startTestModule = (definition: ModuleDefinition<any>, options: Star
     /** A whole `TurnContext` is used as given (the gateway checks it like serve mode); a `TestTurnInput` is built by `turn`. */
     const asTurn = (t: TurnContext | TestTurnInput | undefined) => (t !== undefined && "turnId" in t && "source" in t && "conversationId" in t ? (t as TurnContext) : turn(t as TestTurnInput | undefined))
     let calls = 0
+    /** Every part the turn's assistant runs, whole: what the gateway gets a call for (it refuses a switched-off tool). */
     const registryFor = (t: TurnContext) => makeToolRegistry((host.snapshot().assistantParts.get(t.assistantId ?? "") ?? []).map((p) => p.module), { gateway: host.gateway })
-
-    const allRows = Effect.gen(function*() {
-      const out: Array<[string, ReadonlyArray<Row<unknown>>]> = []
-      for (const c of definition.storage?.collections ?? []) {
-        const handle = store.forModule(id).collection(c)
-        const rows: Array<Row<unknown>> = []
-        let after: Row<unknown> | undefined
-        for (;;) {
-          const page = yield* handle.list({ orderBy: { field: "createdAt" }, limit: maxListRows(c), ...(after !== undefined ? { after } : {}) }).pipe(Effect.orDie)
-          rows.push(...page)
-          if (page.length < maxListRows(c)) break
-          after = page.at(-1)
-        }
-        out.push([c.name, rows])
-      }
-      return out
-    })
+    /**
+     * The registry serve mode makes for the model (`modulesFor` in serve mode): the assistant's parts of the modules it
+     * has on, each without the tools it switched off (`withoutOffTools`, the function serve mode uses), the risk
+     * policy applied by the gateway's `offers`.
+     */
+    const offeredFor = (t: TurnContext) => {
+      const assistant = assistants.find((a) => a.id === t.assistantId)
+      const parts = (host.snapshot().assistantParts.get(t.assistantId ?? "") ?? []).flatMap((p) => {
+        const choice = assistant === undefined ? undefined : choiceOf(assistant, p.moduleId)
+        return choice === undefined ? [] : [withoutOffTools(p.module, choice.offTools ?? [])]
+      })
+      return makeToolRegistry(parts, { gateway: host.gateway })
+    }
 
     const harness = {
       host,
@@ -549,51 +645,61 @@ export const startTestModule = (definition: ModuleDefinition<any>, options: Star
       info: (): ModuleInfo | undefined => host.modules().find((m) => m.id === id),
       issues: (): ReadonlyArray<HealthIssue> => host.issues.all().filter((i) => i.module === id),
       /** Run every module's `health()` now (as "Check again" does) and answer the module's issues; one that never answers times out. */
-      checkHealth: Effect.map(drivenPast(host.checkHealth, HEALTH_LIMIT_MS), () => host.issues.all().filter((i) => i.module === id)),
-      /** The tools the turn's assistant is offered (names), as its registry has them: what the model would be sent. */
-      toolNames: (as?: TurnContext | TestTurnInput) => registryFor(asTurn(as)).specs.map((s) => s.name),
+      checkHealth: checked("after the health check", Effect.map(driven(`the health checks (${id})`, host.checkHealth), () => host.issues.all().filter((i) => i.module === id))),
+      /**
+       * The tools the turn's model is sent (names): what serve mode offers, the modules the assistant has on without
+       * the tools it switched off, and without those the risk policy refuses.
+       */
+      toolNames: (as?: TurnContext | TestTurnInput) => offeredFor(asTurn(as)).specs.map((s) => s.name),
       /**
        * Call a tool as the model's tool loop does, through the assistant's registry and the real gateway, as the turn
-       * (`TurnContext`, or a `TestTurnInput` resolved against the household; default the first device's).
+       * (`TurnContext`, or a `TestTurnInput` resolved against the household; default the first device's). A tool the
+       * assistant switched off is called too, and the gateway refuses it, as it does on every path.
        */
       tool: (name: string, input: unknown, as?: TurnContext | TestTurnInput) =>
-        Effect.gen(function*() {
-          const t = asTurn(as)
-          const result = yield* registryFor(t).run({ id: `kit-${++calls}`, name, input }).pipe(Effect.provideService(CurrentTurn, t))
-          yield* failOnUnprogrammedStubs
-          let value: unknown = result.content
-          try {
-            value = JSON.parse(result.content)
-          } catch {
-            // Plain text.
-          }
-          return { ok: !result.isError, content: result.content, value } satisfies TestToolResult
-        }),
+        checked(
+          `after the tool ${name}`,
+          Effect.gen(function*() {
+            const t = asTurn(as)
+            const result = yield* registryFor(t).run({ id: `kit-${++calls}`, name, input }).pipe(Effect.provideService(CurrentTurn, t))
+            let value: unknown = result.content
+            try {
+              value = JSON.parse(result.content)
+            } catch {
+              // Plain text.
+            }
+            return { ok: !result.isError, content: result.content, value } satisfies TestToolResult
+          })
+        ),
       /** Run one of the module's actions with its values in tool input form, as `host.actions.run` does (routines). */
       action: (actionId: string, params: Readonly<Record<string, unknown>> = {}, as?: TurnContext | TestTurnInput): Effect.Effect<ActionRunResult> =>
-        Effect.tap(host.actions.run({ moduleId: id, actionId, params }).pipe(Effect.provideService(CurrentTurn, asTurn(as))), () => failOnUnprogrammedStubs),
+        checked(`after the action ${actionId}`, host.actions.run({ moduleId: id, actionId, params }).pipe(Effect.provideService(CurrentTurn, asTurn(as)))),
       /** Run `effect` as a turn: what a tool's code would see (`CurrentTurn`), for calling services directly. */
-      asTurn: <A, E, R>(effect: Effect.Effect<A, E, R>, as?: TurnContext | TestTurnInput) => Effect.provideService(effect, CurrentTurn, asTurn(as)),
+      asTurn: <A, E, R>(effect: Effect.Effect<A, E, R>, as?: TurnContext | TestTurnInput) => checked("after asTurn", Effect.provideService(effect, CurrentTurn, asTurn(as))),
       /** A service published now (the module's own, a stand-in's, or the core's). */
       service: <T>(key: ServiceKey<T>): T | undefined => host.service(key),
       /** The contributions under `key` that a turn's assistant sees (default the first device's turn). */
-      contributions: <T>(key: ContributionKey<T>, as?: TurnContext | TestTurnInput) => host.contributions(key).pipe(Effect.provideService(CurrentTurn, asTurn(as))),
-      /** The module's live and finished jobs (the admin list, filtered to it). */
+      contributions: <T>(key: ContributionKey<T>, as?: TurnContext | TestTurnInput) => checked("after reading contributions", host.contributions(key).pipe(Effect.provideService(CurrentTurn, asTurn(as)))),
+      /**
+       * The module's live and finished jobs: the scheduler's whole job list, every module's, read to its end and
+       * filtered to this module, so other modules' jobs never hide one of its own. Past `MAX_JOB_LIST_PAGES` pages it
+       * fails instead of answering part of the list.
+       */
       jobs: Effect.gen(function*() {
         const out: Array<JobRow> = []
         let cursor: string | undefined
-        for (let i = 0; i < 100; i++) {
-          const page = yield* engine.listAll(cursor === undefined ? {} : { cursor })
-          out.push(...page.jobs.filter((j) => j.job.module === id).map((j) => j.job))
-          if (page.next === undefined) break
-          cursor = page.next
+        for (let page = 0;; page++) {
+          if (page === MAX_JOB_LIST_PAGES) return yield* Effect.die(new Error(`The test kit read ${MAX_JOB_LIST_PAGES} pages of jobs and the list goes on: it does not answer part of it`))
+          const got = yield* engine.listAll(cursor === undefined ? {} : { cursor }).pipe(Effect.orDie)
+          out.push(...got.jobs.filter((j) => j.job.module === id).map((j) => j.job))
+          if (got.next === undefined) return out as ReadonlyArray<JobRow>
+          cursor = got.next
         }
-        return out as ReadonlyArray<JobRow>
       }),
       /** Now, on the test clock (epoch ms). */
       now: Clock.currentTimeMillis,
       /** Move the test clock by `ms` and let the scheduler run what came due (handlers run through the gateway). */
-      advance: (ms: number) => Effect.andThen(Effect.andThen(Effect.andThen(settle, TestClock.adjust(ms)), settle), failOnUnprogrammedStubs),
+      advance: (ms: number) => checked(`after advancing the clock ${ms} ms`, Effect.andThen(Effect.andThen(settle, TestClock.adjust(ms)), settle)),
       /** Move the clock to a job's due time and let it run (and anything else due by then, as the engine does). */
       runJob: (jobId: string) =>
         Effect.gen(function*() {
@@ -603,58 +709,67 @@ export const startTestModule = (definition: ModuleDefinition<any>, options: Star
           yield* harness.advance(Math.max(0, job.dueAt - now))
         }),
       /** Switch the module off for every assistant (its parts close) and wait until it has stopped. */
-      stop: Effect.suspend(() => {
-        running = false
-        return host.refresh
-      }),
+      stop: checked(
+        "after the stop",
+        Effect.suspend(() => {
+          running = false
+          return driven(`the stop of ${id}`, host.refresh)
+        })
+      ),
       /** Switch it on again and wait until it runs (or failed). */
-      start: Effect.suspend(() => {
-        running = true
-        return drivenPast(host.refresh, START_LIMIT_MS)
-      }),
+      start: checked(
+        "after the start",
+        Effect.suspend(() => {
+          running = true
+          return driven(`the start of ${id}`, host.refresh)
+        })
+      ),
       /**
        * One real restart of the module, its demand kept: the host's own restart (`requestRestart`, through the module's
        * newest live part), which withdraws it, closes its parts and starts a new shared part and new instances once. Its
        * jobs, rows and settings stay. The same engine and host go on (this is not a restart of the server).
        */
-      restart: Effect.gen(function*() {
-        const live = partHosts.at(-1)
-        if (live === undefined || harness.info()?.state !== "running") return yield* Effect.die(new Error(`${id} is not running, so it cannot be restarted (start it first)`))
-        const before = partHosts.length
-        yield* live.requestRestart("restarted by the test")
-        yield* drivenPast(host.refresh, START_LIMIT_MS)
-        if (partHosts.length === before) {
-          // A restart within the host's interval of the last one is held for it (`RESTART_INTERVAL_MS`): let it pass.
-          yield* TestClock.adjust(RESTART_INTERVAL_MS + 1)
-          yield* drivenPast(host.refresh, START_LIMIT_MS)
-        }
-      }),
-      /** Change its saved settings and secrets as the owner would on its page (a module that runs is started again with them). */
-      configure: (values: SettingsPatch["values"], secrets: SettingsPatch["secrets"] = {}) => drivenPast(host.configure(id, { values, secrets }), START_LIMIT_MS),
-      /**
-       * Fail the test when the value of a secret given to the kit (`options.secrets`, four characters or more) appears in
-       * any of `outputs` (tool results, spoken lines, action outcomes), in a row of the module's collections, in an event,
-       * or on the module's admin line and Health issues. A module asserts it in its own tests after exercising its paths.
-       */
-      expectNoSecrets: (...outputs: ReadonlyArray<unknown>) =>
+      restart: checked(
+        "after the restart",
         Effect.gen(function*() {
+          const live = partHosts.at(-1)
+          if (live === undefined || harness.info()?.state !== "running") return yield* Effect.die(new Error(`${id} is not running, so it cannot be restarted (start it first)`))
+          const before = partHosts.length
+          yield* driven(
+            `the restart of ${id}`,
+            Effect.gen(function*() {
+              yield* live.requestRestart("restarted by the test")
+              yield* host.refresh
+              // A restart within the host's interval of the last one is held for it: let the interval pass.
+              if (partHosts.length === before) {
+                yield* Effect.sleep(RESTART_INTERVAL_MS + 1)
+                yield* host.refresh
+              }
+            })
+          )
+        })
+      ),
+      /** Change its saved settings and secrets as the owner would on its page (a module that runs is started again with them). */
+      configure: (values: SettingsPatch["values"], secrets: SettingsPatch["secrets"] = {}) =>
+        checked("after the settings change", driven(`the settings change of ${id}`, host.configure(id, { values, secrets }))),
+      /**
+       * Fail the test when the value of a secret given to the kit (`options.secrets`, four characters or more) is in
+       * any string of `values` (what the test passes: tool results, action outcomes, spoken lines, rows it read), each
+       * decoded: an object's keys and values, and a string that is JSON parsed and walked as well, so an escaped secret
+       * is found. It also looks at every event on the bus and the module's admin line and Health issues. It reads no
+       * collection of its own: a test passes the rows its module wrote.
+       */
+      expectNoSecrets: (...values: ReadonlyArray<unknown>) =>
+        Effect.suspend(() => {
           const needles = Object.values(options.secrets ?? {}).filter((v) => v.length >= 4)
-          if (needles.length === 0) return
-          const text = (u: unknown) => {
-            try {
-              return typeof u === "string" ? u : JSON.stringify(u) ?? ""
-            } catch {
-              return String(u)
-            }
-          }
-          const places: Array<[string, string]> = [
-            ...outputs.map((o, i): [string, string] => [`output ${i + 1}`, text(o)]),
-            ...(yield* allRows).map(([name, rows]): [string, string] => [`collection ${name}`, text(rows.map((r) => r.value))]),
-            ["the events", text(recording.events)],
-            ["the admin page", text({ info: harness.info(), issues: harness.issues() })]
+          if (needles.length === 0) return Effect.void
+          const places: ReadonlyArray<readonly [string, unknown]> = [
+            ...values.map((v, i) => [`value ${i + 1}`, v] as const),
+            ["the events", recording.events],
+            ["the admin page", { info: harness.info(), issues: harness.issues() }]
           ]
-          const leaks = places.filter(([, t]) => needles.some((n) => t.includes(n))).map(([where]) => where)
-          if (leaks.length > 0) return yield* Effect.die(new Error(`A secret's value appears in ${leaks.join(", ")}`))
+          const leaks = places.filter(([, v]) => stringsOf(v).some((t) => needles.some((n) => t.includes(n)))).map(([where]) => where)
+          return leaks.length === 0 ? Effect.void : Effect.die(new Error(`A secret's value appears in ${leaks.join(", ")}`))
         })
     }
     return harness
