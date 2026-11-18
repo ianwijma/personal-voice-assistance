@@ -17,9 +17,11 @@ import {
   type DndState,
   KEEP_RESOLVED_MS,
   lineProblem,
-  MAINTENANCE_CRON,
-  MAINTENANCE_HANDLER,
+  DUE_HANDLER,
+  HOURLY_CRON,
+  HOURLY_HANDLER,
   MAINTENANCE_ROWS,
+  RETRY_AFTER_MS,
   MAX_ANSWER_CHARS,
   MAX_DND_MS,
   MAX_EXPIRY_MS,
@@ -80,8 +82,10 @@ import { CurrentJob, CurrentPrincipal, CurrentTurn, type Principal } from "./Tur
  *   synchronous step (the store's synchronous reader), yields, and ends with a step that reads every card the device's
  *   connections hold that the pass did not see, again deciding and sending in the same step. So no send rests on a row
  *   or a decision from before a wait. Passes run one at a time in one fiber; a pass that fails marks its device, and
- *   the next trigger or the maintenance job repeats it.
- * - **The maintenance job** (`maintain`, every minute, under `core.notify`) is the service's only job.
+ *   the next trigger or the maintenance work repeats it.
+ * - **Maintenance** has two jobs under `core.notify`: `due`, one-shot, which `plan()` keeps set to the next thing that is
+ *   due (an expiry, do not disturb's end, retention, a stale claim, a failed pass; none when nothing is), and `hourly`,
+ *   the safety net that repairs a lost plan within the hour.
  * - **A press** is admitted only for a connection (or device) that holds the notification and that the decision still
  *   allows; a module action is claimed on the row in one transaction first.
  */
@@ -152,8 +156,19 @@ export interface NotifyEngineOptions {
   readonly newId?: () => string
   /** Every decision made (must not throw). */
   readonly onDecision?: (record: DecisionRecord) => void
-  /** Measurements (the latency test): one reconciliation step's wall time and its size. Must not throw. */
-  readonly observe?: (event: { readonly kind: "step"; readonly ms: number; readonly rows: number; readonly connections: number }) => void
+  /**
+   * Measurements (tests): one reconciliation step's wall time and its size; one retention transaction and how many rows
+   * it removed. Must not throw.
+   */
+  readonly observe?: (
+    event: { readonly kind: "step"; readonly ms: number; readonly rows: number; readonly connections: number } | { readonly kind: "retention"; readonly removed: number }
+  ) => void
+  /**
+   * The wall clock (epoch ms) for what is stored and compared with stored times: sending, expiry, do not disturb's end,
+   * durable claims, retention. Default `wallNow`. Monotonic waits (a handler's time limit, retries) never
+   * use it. Tests move it independently of monotonic time.
+   */
+  readonly now?: Effect.Effect<number>
   /** Pauses before writing a press's outcome again when the store fails. Default 100, 400, 1600 ms. */
   readonly outcomeRetryMs?: ReadonlyArray<number>
 }
@@ -175,10 +190,16 @@ export interface NotifyEngine extends NotifyHook {
   readonly onRingingChanged: (listener: (deviceId: string) => void) => () => void
   /** Do not disturb as the engine holds it now (`known: false`: not read yet, so it counts as on). */
   readonly dnd: () => DndState & { readonly known: boolean }
-  /** Whether the maintenance job is scheduled. */
+  /** Whether the hourly safety-net job is scheduled. */
   readonly maintenanceScheduled: () => boolean
-  /** Run the maintenance work now (tests; the job does the same every minute). */
+  /** When the `due` job is planned for (as far as this process knows); `undefined`: nothing is due. */
+  readonly plannedAt: () => number | undefined
+  /** Plan again now and wait for it (tests; every state change does this by itself). */
+  readonly planNow: Effect.Effect<void>
+  /** Run the maintenance work now (tests; the `due` and `hourly` jobs do the same). */
   readonly maintainNow: Effect.Effect<void, NotifyError>
+  /** The answer to a press refused because too much is pending at once (the hub's admission bound), in the household's language. */
+  readonly busyAnswer: () => PressAnswer
   /** Tests: completes once nothing is waiting to be reconciled (after at most a few thousand yields). */
   readonly settled: Effect.Effect<void>
 }
@@ -294,6 +315,7 @@ export const makeNotifyEngine = (options: NotifyEngineOptions): Effect.Effect<No
     const jobs = options.scheduler.forCore(NOTIFY_OWNER)
     const lang = () => options.language()
     const outcomeRetryMs = options.outcomeRetryMs ?? [100, 400, 1_600]
+    const wallNow: Effect.Effect<number> = options.now ?? Clock.currentTimeMillis
     const decided = (record: DecisionRecord) => {
       try {
         options.onDecision?.(record)
@@ -319,16 +341,28 @@ export const makeNotifyEngine = (options: NotifyEngineOptions): Effect.Effect<No
     let dndNow: DndState & { readonly known: boolean } = { on: true, known: false }
     const dndOf = (row: Row<{ readonly on: boolean; readonly until?: number }> | undefined): DndState =>
       row === undefined || !row.value.on ? { on: false } : { on: true, ...(row.value.until !== undefined ? { until: row.value.until } : {}) }
-    const loadDnd = Effect.gen(function*() {
+    /**
+     * THE read of do not disturb: a successful read updates the engine's state (and reconciles every device when it
+     * changed); a failed read, at start or later, makes it unknown, which counts as on (silence is the safe side), and
+     * reconciles every device. A later successful read restores it.
+     */
+    const readDnd: Effect.Effect<DndState, NotifyError> = Effect.gen(function*() {
       const exit = yield* Effect.exit(core.collection(notifyDnd).get("house"))
-      if (Exit.isSuccess(exit)) {
-        const before = dndNow
-        dndNow = { ...dndOf(exit.value), known: true }
-        if (!before.known || before.on !== dndNow.on) enqueueAll()
-        return
+      const before = dndNow
+      if (Exit.isFailure(exit)) {
+        dndNow = { on: true, known: false }
+        if (before.known || !before.on) enqueueAll()
+        requestPlan()
+        log("Notifications: do not disturb could not be read; it counts as on until it can be read")
+        return yield* Effect.failCause(Cause.map(exit.cause, notifyFailure))
       }
-      log("Notifications: do not disturb could not be read; it counts as on until it can be read")
+      const state = dndOf(exit.value)
+      dndNow = { ...state, known: true }
+      if (!before.known || before.on !== state.on) enqueueAll()
+      if (!before.known) requestPlan()
+      return state
     })
+    const loadDnd = Effect.ignore(readDnd)
 
     // ---- What every connection holds
 
@@ -348,6 +382,15 @@ export const makeNotifyEngine = (options: NotifyEngineOptions): Effect.Effect<No
       const ids = new Set<string>()
       for (const by of held.values()) if (by.deviceId === deviceId) for (const [id, h] of by.cards) if (isRinging(h)) ids.add(id)
       return [...ids].sort().join(",")
+    }
+    /** What rings on each device as last told to the listeners: a change against it is told, whenever it happens. */
+    const reported = new Map<string, string>()
+    const reportRinging = (deviceId: string) => {
+      const key = ringingKey(deviceId)
+      if ((reported.get(deviceId) ?? "") === key) return
+      if (key === "") reported.delete(deviceId)
+      else reported.set(deviceId, key)
+      ringingChanged(deviceId)
     }
     const connectionsOf = (deviceId: string): ReadonlyArray<{ readonly id: string; readonly send: (m: NotifyMessage) => void }> => {
       try {
@@ -426,7 +469,14 @@ export const makeNotifyEngine = (options: NotifyEngineOptions): Effect.Effect<No
     const heldOf = (deviceId: string): ReadonlyArray<HeldBy> => {
       const conns = connectionsOf(deviceId)
       const open = new Set(conns.map((c) => c.id))
-      for (const [cid, by] of held) if (by.deviceId === deviceId && !open.has(cid)) held.delete(cid)
+      let dropped = false
+      for (const [cid, by] of held) {
+        if (by.deviceId === deviceId && !open.has(cid)) {
+          held.delete(cid)
+          dropped = true
+        }
+      }
+      if (dropped) reportRinging(deviceId)
       return conns.map((c) => {
         let by = held.get(c.id)
         if (by === undefined || by.deviceId !== deviceId) {
@@ -440,7 +490,6 @@ export const makeNotifyEngine = (options: NotifyEngineOptions): Effect.Effect<No
     /** One pass over a device: pages of open rows (read, decide, send in one step each), then what is held but unseen. */
     const passDevice = (deviceId: string): Effect.Effect<void, unknown> =>
       Effect.gen(function*() {
-        const ringBefore = ringingKey(deviceId)
         const seen = new Set<string>()
         let after: Row<StoredNotification> | undefined
         for (let read = 0; read < SWEEP_ROWS;) {
@@ -457,6 +506,8 @@ export const makeNotifyEngine = (options: NotifyEngineOptions): Effect.Effect<No
             }
             read += page.length
             after = page[page.length - 1]
+            // What this step changed is told now, whatever a later step does.
+            reportRinging(deviceId)
             options.observe?.({ kind: "step", ms: performance.now() - started, rows: page.length, connections: bys.length })
             return page.length < MAX_NOTIFY_PAGE
           })
@@ -470,8 +521,8 @@ export const makeNotifyEngine = (options: NotifyEngineOptions): Effect.Effect<No
           const ids = new Set<string>()
           for (const by of bys) for (const id of by.cards.keys()) if (!seen.has(id)) ids.add(id)
           for (const id of ids) syncRow(deviceId, bys, id, readRow(id), device)
+          reportRinging(deviceId)
         })
-        if (ringingKey(deviceId) !== ringBefore) ringingChanged(deviceId)
       })
 
     // ---- The reconciliation fiber: coalesced devices, one pass at a time
@@ -518,6 +569,7 @@ export const makeNotifyEngine = (options: NotifyEngineOptions): Effect.Effect<No
           const exit = yield* Effect.exit(passDevice(next.value))
           if (Exit.isFailure(exit)) {
             failed.add(next.value)
+            requestPlan()
             log(`Notifications: reconciling ${next.value} failed (${Cause.pretty(exit.cause).split("\n")[0]}); the next trigger or the maintenance job repeats it`)
           }
           yield* Effect.yieldNow
@@ -542,13 +594,22 @@ export const makeNotifyEngine = (options: NotifyEngineOptions): Effect.Effect<No
       t.tx.afterCommit(() => {
         for (const d of holdersOf(row.id)) dirty.add(d)
         kick()
+        requestPlan()
       })
     }
+
+    /** After a press's outcome that did not resolve (kept open, claim released): its holders reconciled, failed work repeated. */
+    const afterOutcome = (t: StoreTx, id: string) =>
+      t.afterCommit(() => {
+        for (const d of holdersOf(id)) dirty.add(d)
+        kick()
+        requestPlan()
+      })
 
     /** Resolve an open row (one transaction). False: not open (or not this module's). */
     const resolveRow = (id: string, outcome: string, by: string, onlyModule?: string): Effect.Effect<boolean, NotifyError> =>
       Effect.gen(function*() {
-        const at = yield* Clock.currentTimeMillis
+        const at = yield* wallNow
         return yield* tx((t) => {
           const row = t.n.get(id)
           if (row === undefined || row.value.state !== "open") return false
@@ -569,28 +630,40 @@ export const makeNotifyEngine = (options: NotifyEngineOptions): Effect.Effect<No
       }
     }
 
-    // ---- The maintenance job: scheduled once by key; tried again at the next send or hello while it is not
+    // ---- Maintenance (D2b): a one-shot `due` job planned for the next thing that is due, and an hourly safety net
+
+    /** Claims held by a press running in this process: notification id → the claim's `at`. Never released by wall time. */
+    const alive = new Map<string, number>()
+    /** A claim no run here holds is released once it is old by wall time, or dated in the future (the clock moved back). */
+    const staleClaim = (id: string, claim: { readonly at: number } | undefined, now: number) =>
+      claim !== undefined && alive.get(id) !== claim.at && (claim.at + CLAIM_RELEASE_MS <= now || claim.at > now)
+
+    const issues = new Map<string, { readonly id: string; readonly severity: "warning"; readonly title: string; readonly detail: string }>()
+    const setIssue = (key: string, issue: { readonly title: string; readonly detail: string } | undefined) => {
+      if (issue === undefined) issues.delete(key)
+      else issues.set(key, { id: `core.notify.${key}`, severity: "warning", ...issue })
+      options.issues?.set(ISSUE_SOURCE, [...issues.values()])
+    }
 
     let scheduled = false
     let scheduling = false
+    /** The hourly safety net, scheduled by key; tried again at the next send or hello while it is not. */
     const ensureMaintenance = (): void => {
       if (scheduled || scheduling) return
       scheduling = true
       fork(
-        jobs.schedule({ handler: MAINTENANCE_HANDLER, key: MAINTENANCE_HANDLER, cron: MAINTENANCE_CRON, origin: {} }).pipe(
+        jobs.schedule({ handler: HOURLY_HANDLER, key: HOURLY_HANDLER, cron: HOURLY_CRON, origin: {} }).pipe(
           Effect.match({
             onSuccess: () => {
               scheduled = true
-              options.issues?.set(ISSUE_SOURCE, [])
+              setIssue("maintenance", undefined)
             },
             onFailure: (e) => {
-              log(`Notifications: the maintenance job could not be scheduled (${e.message}); tried again at the next send or hello`)
-              options.issues?.set(ISSUE_SOURCE, [{
-                id: "core.notify.maintenance",
-                severity: "warning",
-                title: "Notifications cannot expire or be cleaned up yet",
-                detail: "Their maintenance job could not be scheduled. It is tried again with the next notification or page; sending and stopping work meanwhile."
-              }])
+              log(`Notifications: the hourly maintenance job could not be scheduled (${e.message}); tried again at the next send or hello`)
+              setIssue("maintenance", {
+                title: "Notifications have no hourly maintenance yet",
+                detail: "Its job could not be scheduled. It is tried again with the next notification or page; sending, stopping and the planned maintenance work meanwhile."
+              })
             }
           }),
           Effect.ensuring(Effect.sync(() => void (scheduling = false)))
@@ -598,21 +671,117 @@ export const makeNotifyEngine = (options: NotifyEngineOptions): Effect.Effect<No
       )
     }
 
+    /** What the `due` job is set to, as far as this process knows (`undefined`: none). */
+    let plannedAt: number | undefined
+    let planning = false
+    let planAgain = false
+    /**
+     * How the last maintenance run ended: `"done"` (within its bounds: what is still overdue failed, and is tried again
+     * a minute later rather than at once), `"more"` (it stopped at its bound: the rest runs at once), or `undefined`.
+     */
+    let lastRun: "done" | "more" | undefined
+    const planIdle: Array<Deferred.Deferred<void>> = []
+
+    /**
+     * When maintenance is next needed: the earliest of the next expiry, the end of do not disturb (or a retry soon while
+     * it is unknown), the time the oldest resolved row leaves retention, the time a stale claim may be released, and a
+     * minute from now while a device needs another pass. Bounded reads: the open rows (at most the total bound, a page
+     * at a time with the synchronous reader) and the first resolved row by `finishedAt`.
+     */
+    const nextDue = (now: number): number | undefined => {
+      const r = reader()
+      let next: number | undefined
+      const consider = (t: number) => void (next = next === undefined ? t : Math.min(next, t))
+      let after: Row<StoredNotification> | undefined
+      for (let read = 0; read < SWEEP_ROWS;) {
+        const page = r.list({ where: { state: "open" }, orderBy: { field: "sentAt" }, limit: MAX_NOTIFY_PAGE, scope: HOUSEHOLD_SCOPE, ...(after !== undefined ? { after } : {}) })
+        for (const row of page) {
+          consider(row.value.expiresAt)
+          const claim = row.value.claim
+          if (claim !== undefined && alive.get(row.id) !== claim.at) consider(claim.at > now ? now : claim.at + CLAIM_RELEASE_MS)
+        }
+        read += page.length
+        if (page.length < MAX_NOTIFY_PAGE) break
+        after = page[page.length - 1]
+      }
+      const oldest = r.list({ where: { state: "resolved" }, orderBy: { field: "finishedAt" }, limit: 1, scope: HOUSEHOLD_SCOPE })[0]
+      if (oldest !== undefined) consider((oldest.value.finishedAt ?? 0) + KEEP_RESOLVED_MS)
+      if (!dndNow.known) consider(now + RETRY_AFTER_MS)
+      else if (dndNow.on && dndNow.until !== undefined) consider(dndNow.until)
+      if (failed.size > 0) consider(now + RETRY_AFTER_MS)
+      return next
+    }
+
+    /** Make the `due` job match `nextDue`: none, scheduled, or moved. Idempotent. */
+    const planOnce: Effect.Effect<void, unknown> = Effect.gen(function*() {
+      const now = yield* wallNow
+      const next = yield* Effect.try(() => nextDue(now))
+      if (next === undefined) {
+        if (plannedAt !== undefined) {
+          yield* jobs.cancel({ key: DUE_HANDLER })
+          plannedAt = undefined
+        }
+        return
+      }
+      const ran = lastRun
+      lastRun = undefined
+      const at = next > now ? next : ran === "done" ? now + RETRY_AFTER_MS : now
+      if (at === plannedAt || (plannedAt !== undefined && next <= now && plannedAt <= now + RETRY_AFTER_MS && ran === undefined)) return
+      yield* jobs.schedule({ handler: DUE_HANDLER, key: DUE_HANDLER, at, origin: {} })
+      plannedAt = at
+    })
+
+    /** `plan()`, serialised: one at a time in the service's own fiber; a request while one runs plans once more after it. */
+    const requestPlan = (): void => {
+      if (planning) {
+        planAgain = true
+        return
+      }
+      planning = true
+      fork(
+        Effect.gen(function*() {
+          do {
+            planAgain = false
+            const exit = yield* Effect.exit(planOnce)
+            if (Exit.isFailure(exit)) {
+              log(`Notifications: maintenance could not be planned (${Cause.pretty(exit.cause).split("\n")[0]}); planned again at the next change, and the hourly job runs meanwhile`)
+              setIssue("plan", {
+                title: "Notifications' maintenance could not be planned",
+                detail: "Expiry, the end of do not disturb and clean-up may be up to an hour late until it can be planned again (at the next change, or by the hourly job)."
+              })
+            } else setIssue("plan", undefined)
+          } while (planAgain)
+        }).pipe(Effect.ensuring(Effect.sync(() => {
+          planning = false
+          for (const d of planIdle.splice(0)) Deferred.doneUnsafe(d, Effect.void)
+        })))
+      )
+    }
+    const planNow: Effect.Effect<void> = Effect.suspend(() => {
+      const d = Deferred.makeUnsafe<void>()
+      planIdle.push(d)
+      requestPlan()
+      return Deferred.await(d)
+    })
+
     /** The maintenance work: do not disturb's end, expiry and stale claims, retention, then every device reconciled. */
     const maintain: Effect.Effect<void, NotifyError> = Effect.gen(function*() {
-      if (!dndNow.known) yield* loadDnd
-      const now = yield* Clock.currentTimeMillis
-      const dnd = yield* dndGet
-      if (dnd.on && dnd.until !== undefined && dnd.until <= now) yield* dndWrite({ on: false }, dnd)
+      lastRun = undefined
+      let more = false
+      const now = yield* wallNow
+      // A failed read makes do not disturb unknown (on) and plans a retry; the rest of the work goes on.
+      const dnd = yield* Effect.exit(readDnd)
+      if (Exit.isSuccess(dnd) && dnd.value.on && dnd.value.until !== undefined && dnd.value.until <= now) yield* dndWrite({ on: false }, dnd.value)
       // Open rows past their expiry, or with a stale claim: found with the reader, acted on in transactions of a page.
       const due: Array<string> = []
       const r = yield* Effect.try({ try: reader, catch: notifyFailure })
       let after: Row<StoredNotification> | undefined
       for (let read = 0; read < MAINTENANCE_ROWS;) {
         const page = yield* Effect.try({ try: () => r.list({ where: { state: "open" }, orderBy: { field: "sentAt" }, limit: MAX_NOTIFY_PAGE, scope: HOUSEHOLD_SCOPE, ...(after !== undefined ? { after } : {}) }), catch: notifyFailure })
-        for (const row of page) if (row.value.expiresAt <= now || (row.value.claim !== undefined && row.value.claim.at + CLAIM_RELEASE_MS <= now)) due.push(row.id)
+        for (const row of page) if (row.value.expiresAt <= now || staleClaim(row.id, row.value.claim, now)) due.push(row.id)
         read += page.length
         if (page.length < MAX_NOTIFY_PAGE) break
+        if (read >= MAINTENANCE_ROWS) more = true
         after = page[page.length - 1]
         yield* Effect.yieldNow
       }
@@ -623,7 +792,10 @@ export const makeNotifyEngine = (options: NotifyEngineOptions): Effect.Effect<No
             const row = t.n.get(id)
             if (row === undefined || row.value.state !== "open") continue
             if (row.value.expiresAt <= now) resolveIn(t, row, "expired", "expiry", now)
-            else if (row.value.claim !== undefined && row.value.claim.at + CLAIM_RELEASE_MS <= now) t.n.update(id, (v) => withIndexes(withoutClaim(fieldsOf(v))), { expectRev: row.rev })
+            else if (staleClaim(id, row.value.claim, now)) {
+              t.n.update(id, (v) => withIndexes(withoutClaim(fieldsOf(v))), { expectRev: row.rev })
+              afterOutcome(t.tx, id)
+            }
           }
         })
         yield* Effect.yieldNow
@@ -633,16 +805,23 @@ export const makeNotifyEngine = (options: NotifyEngineOptions): Effect.Effect<No
       for (let removed = 0; removed < MAINTENANCE_ROWS;) {
         const gone = yield* tx(({ n }) => {
           const page = n.list({ where: { state: "resolved" }, orderBy: { field: "finishedAt" }, limit: MAX_NOTIFY_PAGE })
-          const old = page.filter((row) => (row.value.finishedAt ?? 0) < cutoff)
+          const old = page.filter((row) => (row.value.finishedAt ?? 0) <= cutoff)
           for (const row of old) n.remove(row.id)
+          options.observe?.({ kind: "retention", removed: old.length })
           return { old: old.length, more: old.length === page.length && page.length === MAX_NOTIFY_PAGE }
         })
         removed += gone.old
         if (!gone.more) break
+        if (removed >= MAINTENANCE_ROWS) more = true
         yield* Effect.yieldNow
       }
       enqueueAll()
-    })
+      lastRun = more ? "more" : "done"
+    }).pipe(Effect.ensuring(Effect.sync(() => {
+      // A run that failed is tried again a minute later (or by the hourly job), never in a tight loop.
+      if (lastRun === undefined) lastRun = "done"
+      requestPlan()
+    })))
 
     // ---- Action handlers (registrations of a module's part)
 
@@ -706,7 +885,7 @@ export const makeNotifyEngine = (options: NotifyEngineOptions): Effect.Effect<No
         const target = request.target ?? "origin"
         if (target === "origin" && deviceId === undefined) return yield* invalid("this call has no origin device (a turn, a job or a press made for one): send it everywhere instead")
         ensureMaintenance()
-        const now = yield* Clock.currentTimeMillis
+        const now = yield* wallNow
         const priority = request.priority ?? "normal"
         const fields: Fields = {
           module: moduleId,
@@ -734,7 +913,11 @@ export const makeNotifyEngine = (options: NotifyEngineOptions): Effect.Effect<No
           if ((counts.get("total")?.value.live ?? 0) >= MAX_OPEN_TOTAL) return { _tag: "limit", message: `${MAX_OPEN_TOTAL} notifications are open already` }
           const row = n.insert(withIndexes(fields), { id })
           bump(t, moduleId, 1)
-          t.afterCommit(() => (target === "everywhere" ? enqueueAll() : enqueue(deviceId!)))
+          t.afterCommit(() => {
+            if (target === "everywhere") enqueueAll()
+            else enqueue(deviceId!)
+            requestPlan()
+          })
           return { _tag: "sent", row }
         })
         if (out._tag === "limit") return yield* new NotifyError({ reason: "limit", message: out.message })
@@ -767,7 +950,7 @@ export const makeNotifyEngine = (options: NotifyEngineOptions): Effect.Effect<No
         }
         if (typeof target === "object" && target !== null) {
           if (typeof target.key !== "string" || !NOTIFY_KEY.test(target.key)) return yield* invalid(`key must match ${NOTIFY_KEY}`)
-          const at = yield* Clock.currentTimeMillis
+          const at = yield* wallNow
           return yield* tx((t) => {
             const row = t.n.list({ where: { dedupe: `${moduleId}|${target.key}` }, limit: 1 })[0]
             if (row === undefined || row.value.state !== "open") return false
@@ -781,12 +964,12 @@ export const makeNotifyEngine = (options: NotifyEngineOptions): Effect.Effect<No
 
     // ---- Do not disturb
 
-    const dndGet: Effect.Effect<DndState, NotifyError> = Effect.map(core.collection(notifyDnd).get("house").pipe(Effect.mapError(notifyFailure)), dndOf)
+    const dndGet: Effect.Effect<DndState, NotifyError> = readDnd
 
     /** Write do not disturb; `expected` (the maintenance job's end): only if it is still that state. */
     const dndWrite = (state: DndState, expected?: DndState): Effect.Effect<DndState, NotifyError> =>
       Effect.gen(function*() {
-        const at = yield* Clock.currentTimeMillis
+        const at = yield* wallNow
         const wrote = yield* tx(({ tx: t }) => {
           const d = t.collection(notifyDnd)
           const current = d.get("house")
@@ -799,8 +982,9 @@ export const makeNotifyEngine = (options: NotifyEngineOptions): Effect.Effect<No
           else d.update("house", () => value)
           t.afterCommit(() => {
             dndNow = { ...(state.on ? { on: true, ...(state.until !== undefined ? { until: state.until } : {}) } : { on: false }), known: true }
-            // What rings follows do not disturb: every device is reconciled.
+            // What rings follows do not disturb: every device is reconciled; its end moves the plan.
             enqueueAll()
+            requestPlan()
           })
           return true
         })
@@ -809,7 +993,7 @@ export const makeNotifyEngine = (options: NotifyEngineOptions): Effect.Effect<No
 
     const dndSet = (o: { readonly until?: number } = {}) =>
       Effect.gen(function*() {
-        const now = yield* Clock.currentTimeMillis
+        const now = yield* wallNow
         if (o.until !== undefined && (!Number.isInteger(o.until) || o.until <= now || o.until > now + MAX_DND_MS)) return yield* invalid(`until is a time after now, at most ${MAX_DND_MS / 3_600_000} hours ahead`)
         ensureMaintenance()
         return yield* dndWrite(o.until === undefined ? { on: true } : { on: true, until: o.until })
@@ -826,9 +1010,21 @@ export const makeNotifyEngine = (options: NotifyEngineOptions): Effect.Effect<No
      * notification, of a row that is open and that the decision allows on the device now. Synchronous: no wait between
      * the read and the answer. A read that fails is a failure, never "it has ended".
      */
+    const holdsCard = (request: PressRequest, bys: ReadonlyArray<HeldBy>) =>
+      bys.some((by) => by.cards.has(request.notificationId) && (request.connection === undefined || held.get(request.connection.id) === by))
+
+    /** Admission against the state at this moment (synchronous): the card is held there and the decision allows it. */
+    const allowedNow = (request: PressRequest, row: Row<StoredNotification>): boolean => {
+      const bys = heldOf(request.deviceId)
+      if (!holdsCard(request, bys)) return false
+      const device = deviceOf(request.deviceId)
+      const decision = device === undefined ? undefined : decideNotification(row.id, row.value, device, bys.length > 0)
+      return decision?.deliver === true && targets(row.value, request.deviceId)
+    }
+
     const admit = (request: PressRequest): Admission => {
       const bys = heldOf(request.deviceId)
-      const holds = bys.some((by) => by.cards.has(request.notificationId) && (request.connection === undefined || held.get(request.connection.id) === by))
+      const holds = holdsCard(request, bys)
       let row: Row<StoredNotification> | undefined
       try {
         row = readRow(request.notificationId)
@@ -869,31 +1065,60 @@ export const makeNotifyEngine = (options: NotifyEngineOptions): Effect.Effect<No
         const v = row.value
         if (request.actionId === STOP_ACTION) {
           // The host's: needs no handler and wins over a module action under way (its outcome is then dropped).
-          const at = yield* Clock.currentTimeMillis
-          const stopped = yield* Effect.exit(tx((t) => {
+          const at = yield* wallNow
+          const stopped = yield* Effect.exit(tx((t): "stopped" | "over" | "refused" => {
             const now = t.n.get(row.id)
-            if (now === undefined || now.value.state !== "open") return false
+            if (now === undefined || now.value.state !== "open") return "over"
+            // Admitted again against this moment: a wait on a busy store may have changed what the device holds.
+            if (!allowedNow(request, now)) return "refused"
             resolveIn(t, now, STOP_ACTION, request.deviceId, at)
-            return true
+            return "stopped"
           }))
           if (Exit.isFailure(stopped)) return answer(false, "cantNow", "failed")
-          return stopped.value ? answer(true, "done") : answer(true, "over")
+          if (stopped.value === "refused") {
+            enqueue(request.deviceId)
+            return answer(false, "cantNow", "unknown")
+          }
+          return stopped.value === "stopped" ? answer(true, "done") : answer(true, "over")
         }
         if (!v.actions.some((a) => a.id === request.actionId) || v.handler === undefined) return answer(false, "cantNow", "unknown")
         const entry = published.get(`${v.module}/${v.handler}`)
         if (entry === undefined) return answer(false, "cantNow", "not_running")
         // The claim: one module action at a time per notification, in one transaction, before any module code runs.
-        const claimAt = yield* Clock.currentTimeMillis
-        const claimed = yield* Effect.exit(tx((t): "claimed" | "busy" | "over" => {
+        const claimAt = yield* wallNow
+        const claimed = yield* Effect.exit(tx((t): "claimed" | "busy" | "over" | "refused" => {
           const now = t.n.get(row.id)
           if (now === undefined || now.value.state !== "open") return "over"
-          if (now.value.claim !== undefined && now.value.claim.at + CLAIM_RELEASE_MS > claimAt) return "busy"
+          // A claim of a run alive here is never taken over, whatever the wall clock says; one no run here holds only
+          // when it is stale (old, or dated in the future).
+          if (alive.has(row.id) || (now.value.claim !== undefined && !staleClaim(row.id, now.value.claim, claimAt))) return "busy"
+          // Admitted again against this moment: a wait on a busy store may have changed what the device holds.
+          if (!allowedNow(request, now)) return "refused"
           t.n.update(row.id, (x) => withIndexes({ ...fieldsOf(x), claim: { action: request.actionId, by: request.deviceId, at: claimAt } }), { expectRev: now.rev })
+          // Recorded before the commit returns, so nothing in this process sees the claim without its run.
+          alive.set(row.id, claimAt)
+          t.tx.onRollback(() => void (alive.get(row.id) === claimAt && alive.delete(row.id)))
           return "claimed"
         }))
-        if (Exit.isFailure(claimed)) return answer(false, "cantNow", "failed")
+        if (Exit.isFailure(claimed)) {
+          if (alive.get(row.id) === claimAt) alive.delete(row.id)
+          return answer(false, "cantNow", "failed")
+        }
         if (claimed.value === "busy") return answer(false, "handling", "busy")
         if (claimed.value === "over") return answer(false, "over", "unknown")
+        if (claimed.value === "refused") {
+          enqueue(request.deviceId)
+          return answer(false, "cantNow", "unknown")
+        }
+        return yield* runClaimed(request, row, claimAt)
+      })
+
+    /** A claimed module action: its handler under the time limit, then its outcome; the claim is alive here meanwhile. */
+    const runClaimed = (request: PressRequest, row: Row<StoredNotification>, claimAt: number): Effect.Effect<PressAnswer> =>
+      Effect.gen(function*() {
+        const v = row.value
+        const entry = published.get(`${v.module}/${v.handler}`)
+        if (entry === undefined) return answer(false, "cantNow", "not_running")
         const principal: Principal = {
           _tag: "notification",
           notification: {
@@ -926,24 +1151,36 @@ export const makeNotifyEngine = (options: NotifyEngineOptions): Effect.Effect<No
           yield* writeOutcome(tx((t) => {
             const now = t.n.get(row.id)
             if (mine(now)) t.n.update(row.id, (x) => withIndexes(withoutClaim(fieldsOf(x))), { expectRev: now.rev })
+            afterOutcome(t.tx, row.id)
           }))
           return stopped ? answer(false, "cantNow", "not_running") : answer(false, "failed", "failed")
         }
         const said = exit.value as ActionAnswer | void
-        const at = yield* Clock.currentTimeMillis
+        const at = yield* wallNow
         const wrote = yield* writeOutcome(tx((t): "written" | "dropped" => {
           const now = t.n.get(row.id)
           // `stop` won meanwhile (or the claim was released and taken again): this outcome is dropped.
           if (!mine(now)) return "dropped"
-          if (said?.keepOpen === true) t.n.update(row.id, (x) => withIndexes(withoutClaim(fieldsOf(x))), { expectRev: now.rev })
-          else resolveIn(t, now, request.actionId, request.deviceId, at)
+          if (said?.keepOpen === true) {
+            t.n.update(row.id, (x) => withIndexes(withoutClaim(fieldsOf(x))), { expectRev: now.rev })
+            afterOutcome(t.tx, row.id)
+          } else resolveIn(t, now, request.actionId, request.deviceId, at)
           return "written"
         }))
         if (!wrote.ok) return answer(false, "failed", "failed")
         if (wrote.value === "dropped") return answer(false, "over", "unknown")
         const text = said?.say === undefined ? "" : options.pageText(v.module, said.say, MAX_ANSWER_CHARS)
         return { ok: true, say: text === "" ? notifyText(lang(), "done") : text }
-      })
+      }).pipe(
+        // The run is over: its claim is no longer alive here. One left on the row (its outcome could not be written)
+        // becomes a durable claim, released by maintenance when it is stale; the plan and the holders follow.
+        Effect.ensuring(Effect.sync(() => {
+          if (alive.get(row.id) === claimAt) alive.delete(row.id)
+          for (const d of holdersOf(row.id)) dirty.add(d)
+          kick()
+          requestPlan()
+        }))
+      )
 
     // ---- Speech
 
@@ -1095,11 +1332,25 @@ export const makeNotifyEngine = (options: NotifyEngineOptions): Effect.Effect<No
 
     // ---- The job, do not disturb, the counters, the fiber
 
-    yield* jobs.handle(MAINTENANCE_HANDLER, {
+    yield* jobs.handle(DUE_HANDLER, {
       payload: Schema.Struct({}),
       idempotent: true,
       timeoutMs: 50_000,
-      run: () => maintain
+      // This job has run: whatever it leaves due is planned afresh (maintenance plans at its end).
+      run: () => Effect.suspend(() => {
+        plannedAt = undefined
+        return maintain
+      })
+    }).pipe(Effect.orDie)
+    yield* jobs.handle(HOURLY_HANDLER, {
+      payload: Schema.Struct({}),
+      idempotent: true,
+      timeoutMs: 50_000,
+      run: () => Effect.suspend(() => {
+        // The safety net does not trust what this process believes is planned.
+        plannedAt = undefined
+        return maintain
+      })
     }).pipe(Effect.orDie)
     yield* loadDnd
     yield* Effect.gen(function*() {
@@ -1126,6 +1377,7 @@ export const makeNotifyEngine = (options: NotifyEngineOptions): Effect.Effect<No
     }).pipe(Effect.catch((e) => Effect.sync(() => log(`Notifications: the open counters could not be recounted (${notifyFailure(e).message})`))))
     yield* Effect.forkIn(loop, scope)
     ensureMaintenance()
+    requestPlan()
 
     // ---- The module host's side
 
@@ -1176,14 +1428,20 @@ export const makeNotifyEngine = (options: NotifyEngineOptions): Effect.Effect<No
         return [...out.values()].sort((a, b) => a.sentAt - b.sentAt).map((h) => ({ id: h.id, module: h.module, title: h.title, actions: h.actions }))
       },
       stopRinging: (deviceId) =>
-        Effect.gen(function*() {
-          let n = 0
-          for (const r of engine.ringingOn(deviceId)) {
-            const a = yield* press({ notificationId: r.id, actionId: STOP_ACTION, deviceId })
-            if (a.ok && a.code === undefined) n++
-          }
-          return n
-        }),
+        // What rings is recorded in one synchronous step and stopped by work the service owns: a caller that is
+        // interrupted (or leaves) does not leave part of it undone. Each card is still admitted on its own.
+        Effect.uninterruptible(Effect.gen(function*() {
+          const ids = engine.ringingOn(deviceId).map((r) => r.id)
+          const work = Effect.gen(function*() {
+            let n = 0
+            for (const id of ids) {
+              const a = yield* press({ notificationId: id, actionId: STOP_ACTION, deviceId })
+              if (a.ok && a.code === undefined) n++
+            }
+            return n
+          })
+          return yield* Effect.forkIn(work, scope)
+        })).pipe(Effect.flatMap((fiber) => Fiber.join(fiber))),
       stopSpeech: (deviceId) => Effect.sync(() => stopItems((i) => i.deviceId === deviceId && queues.get(deviceId)?.current?.item === i)),
       onRingingChanged: (listener) => {
         listeners.add(listener)
@@ -1191,7 +1449,10 @@ export const makeNotifyEngine = (options: NotifyEngineOptions): Effect.Effect<No
       },
       dnd: () => dndNow,
       maintenanceScheduled: () => scheduled,
+      plannedAt: () => plannedAt,
+      planNow,
       maintainNow: maintain,
+      busyAnswer: () => answer(false, "busy", "busy"),
       settled: Effect.gen(function*() {
         for (let i = 0; i < 5_000 && (working || all || dirty.size > 0); i++) yield* Effect.yieldNow
       })
