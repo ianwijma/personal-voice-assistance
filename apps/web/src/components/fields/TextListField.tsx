@@ -20,6 +20,13 @@ export const addItems = (list: ReadonlyArray<string>, text: string, max: number,
 }
 
 /**
+ * The input's placeholder: the field's example while the list is empty, the generic "Add…" once it has an item (an
+ * example beside real chips reads as one more item), nothing when it is full.
+ */
+export const textListPlaceholder = (example: string | undefined, count: number, max: number): string =>
+  count >= max ? "" : count > 0 ? "Add…" : example ?? "Add…"
+
+/**
  * A list of short texts (protocol 10, `textList`): chips with a remove button, and an input that adds what was typed
  * on Enter, a comma or leaving the input (Backspace in the empty input removes the last chip). A counter shows near
  * `maxItems`.
@@ -74,7 +81,7 @@ export function TextListField({ field, id, describedBy, value, onChange, disable
           type="text"
           value={text}
           disabled={disabled || (list.length >= max && text === "")}
-          placeholder={list.length >= max ? "" : field.placeholder ?? "Add…"}
+          placeholder={textListPlaceholder(field.placeholder, list.length, max)}
           aria-describedby={describedBy}
           aria-invalid={invalid || problem !== undefined}
           autoComplete="off"
