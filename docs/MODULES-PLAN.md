@@ -325,6 +325,10 @@ Two new packages with no dependency on the rest of the stack, plus household set
   and port of `Origin` with `Host`; the proxy must pass `Host` through.
 - A module's described form is checked once against the wire schema and a size budget; a module whose form does not
   encode or is too large does not start. Runtime options and `info` values are trimmed to the budget.
+- The complete form of a module as it is sent is limited to 48 KiB; a save over it is refused. `admin.snapshot`
+  carries each module's details while they fit their share of the frame; a module that does not fit is sent as a
+  short entry followed at once by its own `module.changed` frame, so nothing is withheld because of other modules.
+- A "Test" press runs to its result or its time limit whether or not the page that pressed it is still connected.
 - A field's default goes through its own decoder; a default the field rejects is a declaration error.
 
 ### P4. Household store and event bus
@@ -382,6 +386,12 @@ version in §5 needs them.
   most 16,000) and a list may ask for at most `min(100, LIST_BUDGET_CHARS / maxChars)` rows. The budget is set by
   measuring structured values so the worst legal list stays well under 10 ms.
 - `list` takes `after: <the last row of the previous page>` to continue; nothing else pages.
+- As measured in round 5 with the costliest ordinary schema shapes (an untagged union of four structs; nested
+  optional fields and literal unions), `LIST_BUDGET_CHARS` is 25,000: one `list` reads at most 100 rows of values up
+  to 250 characters, 62 at 400, 12 at the default 2,000 and 1 at 16,000. **A module declares `maxChars` as small as
+  its values really are**, and reads longer lists page by page. The worst legal list measured 4.4 ms.
+- A write waits about a second, on timers, for the write lock before it fails `busy`, so the store's own checkpoint
+  worker never makes a module's write fail.
 - Migrations run only when the store is prepared; a read never migrates.
 - `updatedAt`, `createdAt`, `id`, `rev` and `scope` cannot be named in an index declaration.
 - Shape detection covers a schema's structure and built-in checks. Changing a custom check's function needs a
