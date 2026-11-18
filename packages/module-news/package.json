@@ -13,6 +13,7 @@
   "dependencies": {
     "@mozilla/readability": "catalog:",
     "@pva/core": "workspace:*",
+    "@pva/language": "workspace:*",
     "@pva/module-contracts": "workspace:*",
     "@pva/net": "workspace:*",
     "effect": "catalog:",
