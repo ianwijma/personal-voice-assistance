@@ -35,7 +35,12 @@ How it works:
   has one of them; when the kinds in the house change (a first thermostat), the module starts again with the new set.
   Before the first successful read it offers every kind the assistant chose.
 - **Every service call names its entities by id** (never an area), at most 50 per call, all in parallel, each within
-  3 s, so an action keeps within its 5 s. A call that gets no answer says it may have happened.
+  3 s, so an action keeps within its 5 s. A call that gets no answer says it may have happened. The module's own
+  actions and the `HomeAssistant` service's consumers take **one checked path** (`src/service.ts`): what may be called
+  is decided in one place.
+- **How fresh things are.** This version polls: the cache is what Home Assistant said at the last read, at most about
+  a minute old (a question reads again at once; a command uses the cache). A change in the house reaches a subscriber
+  of the service at the next poll, so up to a minute late. Nothing here assumes anything faster.
 
 ## Tools
 
@@ -73,6 +78,44 @@ Failures, each one sentence: unreachable, didn't answer in time (a command: "so 
 the token refused, the user not an administrator, restarting (503), an error, an answer it cannot read. Every sentence
 is in English and Dutch (`HOME_LANGUAGE`); names come from Home Assistant as the owner wrote them.
 
+## The `HomeAssistant` service
+
+The module publishes the transport of `packages/module-contracts/src/homeAssistant.ts` from its `shared` part, under
+the contract's key, for presence and music (wave B). It is never offered to the model. "In this version the provider
+polls": the polled cache above is its state.
+
+- **Exposed**: the entities of the kinds chosen in the module's shared `domains` (read at each poll), plus every
+  `person` entity. Scenes and scripts are not exposed. Ids are Home Assistant's, never cut: an entity whose id breaks
+  the contract's bounds is left out. `aliases` are the owner's "Other names" (Home Assistant's own aliases need the
+  WebSocket). `attributes` are the ones the module reads, under Home Assistant's names (`device_class`,
+  `current_temperature`, `temperature`, `hvac_modes`, `current_position`, `supported_features`, `unit_of_measurement`,
+  `media_title`, `media_artist`, `volume_level`; `brightness_pct` for a light); a person has none.
+- **`entities()`, `entity(id)`, `areas()`, `people()`, `connection()`** answer from the cache, no network.
+  `people()` is the person entities in the contract's person shape (id, name, state, since). `connection()` is
+  `unknown` until the first good poll, `connected` while polls succeed, `reconnecting` after one fails (the cache
+  stays as it was).
+- **`changes()`**: each subscription is its own stream. It starts with a `snapshot` (`subscribed`). After a good poll
+  that follows a good one: one `changed` or `removed` per entity that differs, in entity id order (a new entity is a
+  `changed` without `previous`). After the first good poll following `unknown` or `reconnecting`: a `connection` and
+  one `snapshot` (`reconnected`), never changes, so a consumer cannot mistake what it shows for things that just
+  happened. A failed poll after a good one: a `connection` (`reconnecting`). A subscriber more than 1,000 changes
+  behind loses them and next gets a `snapshot` (`overflow`) of the cache at that moment. Areas come only in snapshots.
+  A stream ends when the consumer's scope or the module's part closes.
+- **`callService`**: entity ids only (`target.entityIds`, 1 to 50). Refused before anything reaches Home Assistant: any
+  other target key, a target key anywhere in `data`, the contract's `REFUSED_DOMAINS` (locks, alarm panels, scripts,
+  `homeassistant`, …) and any entity of those domains, garage doors, gates and doors; `unknown_entity` for an id that
+  is not exposed; `invalid` outside the bounds (`data` at most 4,000 characters of JSON). `not_connected` at once
+  while the last poll failed (never queued); `timeout` past 5 s (it may have happened); `failed` when Home Assistant
+  answers with an error. With `returnResponse` it asks for the service's response (at most 16,000 characters of JSON,
+  else `responseCut`). Errors carry a reason and a log line without the token.
+- **Scripts**: the transport refuses every script to every consumer, because what a script does cannot be seen from
+  outside it. The module's own `scene_activate` may run the scenes and scripts the owner named under "Other names",
+  through the same checked path.
+- **When the module stops**: the service is gone (`host.service(HomeAssistant)` is `undefined`), every stream it gave
+  ends, and the old object's methods throw `ModuleStopped` (`callService` dies with it), which `useService` turns into
+  `ProviderOff`. After a start it is a new object. The module also starts again when the house gains a kind of device
+  no instance offers yet (a first thermostat, a newly named scene): a consumer then looks the service up again.
+
 ## Settings
 
 The fields, their keys and their order are the ones an owner already has; saved values keep working.
@@ -90,11 +133,17 @@ The fields, their keys and their order are the ones an owner already has; saved 
 ## What it stores
 
 Nothing in the household store: no collection, no job. The cache of the house is in memory and is read again at each
-start. **Nothing personal is read or kept**: the template reads only the kinds above, no `person`, `device_tracker`,
-`zone` or camera, and only sensors of a named class (temperature, humidity, light level, pressure, CO₂, fine dust,
-doors, windows, leaks, smoke, CO, gas). A sensor without a class is never read, because Home Assistant's companion app
-makes classless sensors that say where a phone is; the decoder drops them too if an answer carries them. So nothing it
-says is about one person, and it calls no `Privacy.mayReveal`.
+start. The template reads only the kinds above, no `device_tracker`, `zone` or camera, and only sensors of a named
+class (temperature, humidity, light level, pressure, CO₂, fine dust, doors, windows, leaks, smoke, CO, gas). A sensor
+without a class is never read, because Home Assistant's companion app makes classless sensors that say where a phone
+is; the decoder drops them too if an answer carries them.
+
+**People are read for other modules only.** Each `person` entity is read with its id, name, state and last change,
+nothing else (no coordinates, no device, no attributes), kept in memory, and handed to the `HomeAssistant` service's
+consumers as the contract says: where a person is is that person's personal data, and the consumer (presence) maps it
+to a member and passes it through `Privacy.mayReveal` when it says anything. The module's own tools and actions never
+read, mention or count a person, so nothing the module says is about one person, and it calls no
+`Privacy.mayReveal` itself.
 
 ## What it needs
 
@@ -102,27 +151,21 @@ says is about one person, and it calls no `Privacy.mayReveal`.
   token.
 - `health`: no address, no token, `GET /api/config` unreachable, the token refused, the user not an administrator
   (each with what to do). Nothing while it is not set up and off.
-- `uses`: none. Provides: nothing yet (the `HomeAssistant` service is left out, below). Consumes: no service.
+- `uses`: none. Provides: the `HomeAssistant` service (above). Consumes: no service.
 
 ## What was left out
 
-**Left out because something is missing below (reported in the pull request):**
+**Later (the network helpers have no WebSocket yet; this version polls):**
 
 - **The WebSocket entity cache, with Home Assistant's registries and its list of what is exposed to Assist.**
   `docs/MODULES.md` §12 allows outgoing HTTP only through `@pva/net`, `GET` and `HEAD` only, and `@pva/net` has no
-  WebSocket; "a streamed request" is named as not in this wave. So the module keeps its existing transport (REST:
-  `GET /api/config`, `POST /api/template`, `POST /api/services/…`, through `fetch`, with a time limit and a size limit
-  on every call), polls every minute, and cannot read the exposure list, the area aliases or the entity aliases (they
-  are WebSocket-only). Until then **every device of a chosen kind is used**: the owner narrows it with `domains` per
-  assistant. Needs: a WebSocket to an owner-configured LAN address in `@pva/net` (with the same address rules as
-  `fetchOwnerConfiguredLan`), allowed for this module by the guide, and a fixture for it in the test kit's offline
-  network.
-- **The `HomeAssistant` service** (`packages/module-contracts/src/homeAssistant.ts`), for presence and music. This
-  package does not depend on `@pva/module-contracts`, so it cannot import the key, and a module pull request may not
-  change the lockfile; and the contract promises the exposure list, which needs the WebSocket above. Needs:
-  `"@pva/module-contracts": "workspace:*"` in this package's `package.json` (and the matching lockfile line), then the
-  service over this cache with the contract's refusals. Until then `texts.ts` carries local copies of `homeLanguage`
-  and `say`.
+  WebSocket. So the module keeps its existing transport (REST: `GET /api/config`, `POST /api/template`,
+  `POST /api/services/…`, through `fetch`, with a time limit and a size limit on every call) and polls every minute.
+  Without the WebSocket it cannot read the exposure list, the area aliases or the entity aliases, and gets no push.
+  Until then **every device of a chosen kind is used**, by the module's actions and by the service's consumers: the
+  owner narrows it with `domains`. Needs: a WebSocket to an owner-configured LAN address in `@pva/net` (with the same
+  address rules as `fetchOwnerConfiguredLan`), allowed for this module by the guide, and a fixture for it in the test
+  kit's offline network.
 - **A connection instead of the module's secret fields**: connections are deferred (P8); the address and token fields
   stay.
 - **Hiding single entities and choosing scenes from a list**: a new settings field would change the form the app's
