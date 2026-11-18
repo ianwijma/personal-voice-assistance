@@ -427,10 +427,11 @@ export class ClaudeSession {
    * An MCP tool call from Claude Code: run by the turn whose stream announced it. Claude Code sends the model's
    * `tool_use` id with the request (`_meta["claudecode/toolUseId"]`): the call is matched to the announcement with that
    * id, and to nothing else. Only a call without one (an older Claude Code) is matched by name and input to the oldest
-   * unanswered announcement; there, an identical call of a turn that was cancelled, arriving after its announcements
-   * were purged, can take the next turn's claim (the effect is one refused tool call for that turn). A call whose turn
-   * ended or was interrupted is refused; so is one no turn announced within `CLAIM_WAIT_MS`. It is never given to
-   * whatever turn happens to be in progress.
+   * unanswered announcement. There, an identical call of a turn that ended or was cancelled, arriving after its
+   * announcements were purged, can take a later turn's matching claim and run with that later turn's handler and
+   * context; the later turn's own call is then refused. For a call that carries an id (what Claude Code sends): a call
+   * whose turn ended or was interrupted is refused, so is one no turn announced within `CLAIM_WAIT_MS`, and it is
+   * never given to whatever turn happens to be in progress.
    */
   private async callTool(name: string, args: Record<string, unknown>, toolUseId?: string): Promise<{ readonly content: string; readonly isError: boolean }> {
     const deadline = this.now() + CLAIM_WAIT_MS

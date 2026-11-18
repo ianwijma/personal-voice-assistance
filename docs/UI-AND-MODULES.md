@@ -637,8 +637,11 @@ opaque reference to the connection the request came in on (a voice turn: the tab
 turn starts; a typed turn: the tab that typed it, `TextInput.connection`). The Claude Code bridge captures it at the
 turn's start and gives it to every tool call the SDK makes **for that turn**: Claude Code announces each tool use in
 the turn's stream before it calls the tool, and the bridge routes a call only to the turn whose stream announced it
-(same name and input), never to "the turn in progress now"; a call of a turn that ended or was interrupted is refused,
-and one waiting inside the bridge when its turn is cancelled does not start. It is `undefined` in the CLI modes; a job
+(the same `tool_use` id, which Claude Code sends with the call), never to "the turn in progress now"; a call of a turn
+that ended or was interrupted is refused, and one waiting inside the bridge when its turn is cancelled does not start.
+A call that arrives without an id (an older Claude Code) is matched by name and input instead; then a late identical
+call of an ended turn can take a later turn's matching claim and run with that later turn's handler and context, and
+the later turn's own call is refused. The guarantee above holds for calls that carry an id. It is `undefined` in the CLI modes; a job
 carries its own origin (`CurrentJob`, P6).
 
 Every tool call and action run goes through one **execution gateway** (`Gateway.ts`): `ToolRegistry.run` (the model's
