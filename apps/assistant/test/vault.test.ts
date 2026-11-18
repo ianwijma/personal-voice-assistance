@@ -192,7 +192,9 @@ describe("vault: file and crypto", () => {
     expect(await vault.unlock("correct horse")).toEqual({ ok: true })
     const ms = performance.now() - start
     console.log(`vault unlock (scrypt N=2^17, r=8, p=1): ${ms.toFixed(0)} ms`)
-    expect(ms).toBeLessThan(1_000)
+    // Shared CI runners are several times slower than a development machine (2.6 s there on 2026-11-18): three times the
+    // bound on CI, as the store's latency tests (`bound()` in packages/store-sqlite/test/latencyBound.ts).
+    expect(ms).toBeLessThan(process.env.CI ? 3 * 1_000 : 1_000)
   })
 })
 
