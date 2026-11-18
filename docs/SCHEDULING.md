@@ -273,7 +273,7 @@ The development machine (16-thread AMD Ryzen 9 7945HX laptop, shared with other 
 | `schedule` replacing the live job of its key, 30 calls | 1.7 ms | worst 0.97 ms |
 | Cron planning (`Cron.next` and `Cron.prev`; 8 accepted expressions, weekly ones among them, in 4 zones with DST, from 5 dates at the changes) | (synchronous) | worst 0.80 ms; `schedule` with a cron, worst 1.2 ms |
 | one loop pass, nothing due (50 indexed reads, yielding between handlers), 20 passes | 1.7 ms | 4.4 ms a pass |
-| a pass claiming 40 due jobs (32, then 8 as runs end) | 2.6 ms | 41 ms (it yields between claims) |
+| 40 due jobs of 20 handlers: two passes of 20 (one job per handler a pass) | 2.1 ms | worst 29 ms a pass (it yields between claims) |
 | retention of 400 rows in transactions of 10, with the recovery rule, the recount and the Health issues | 2.6 ms | worst 1.5 ms a transaction |
 
 A refused date expression (`0 0 31 2 *`) costs 0.5 ms: it is refused before it is parsed.

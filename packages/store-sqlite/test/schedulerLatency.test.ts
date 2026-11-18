@@ -169,7 +169,7 @@ describe("scheduler latency on SQLite at the limits", () => {
       assert.isAtLeast(idlePasses.length, 20)
       assert.isTrue(idlePasses.every((p) => p.handlers === OWNERS * HANDLERS_PER_OWNER && Number.isFinite(p.ms)))
       const idleWorst = Math.max(...idlePasses.map((p) => p.ms))
-      // A pass that claims: 40 jobs made due now; it claims as many as may run at once (32) and the rest follow.
+      // Passes that claim: 40 jobs made due now, of 20 handlers; a pass takes one job per handler, so two passes of 20.
       for (const core of owners.slice(0, 2)) {
         let after: JobRow | undefined
         for (let n = 0; n < 20;) {
