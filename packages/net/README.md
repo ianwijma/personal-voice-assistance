@@ -8,7 +8,7 @@ Outgoing HTTP for URLs a model or a user chose, and for public APIs. No dependen
   `contentTypes.json` (`application/json` and any `+json`), `contentTypes.feed` (RSS, Atom, RDF, JSON Feed, XML) and
   `contentTypes.image` (PNG, JPEG, GIF, WebP, AVIF; no SVG), or a policy of its own. A response without a Content-Type or with one the
   policy does not list is refused before its body is read (an error page outside 200–299 is returned with its status and an empty body
-  instead). A final response with more than one Content-Type (two header lines, or one value listing two media types; a comma inside a quoted parameter does not count) is refused with `content-type` before its body is read. The guard: resolves the host itself, refuses every address the IANA special-purpose registries do not mark globally
+  instead). The `Content-Type` is read by one parser, `parseContentType(lines)`, from the raw field lines (never joined) by RFC 9110: more than one line is refused whatever they contain; one line must be `type/subtype` followed by `; name=value` parameters (a token or a quoted string, quoted-pairs unescaped; a trailing `;` is tolerated), and anything else (an unterminated quote, a comma or other text after the type or a parameter, a control character, an empty type or value, a parameter without `=`) is refused. Parameter names are case-insensitive, the first of a name wins, the type is lower-cased. A refusal is `content-type`, before the body is read; the same parse gives `contentType` and the `charset` for `text()`. The guard: resolves the host itself, refuses every address the IANA special-purpose registries do not mark globally
   reachable (loopback, private, link-local incl. cloud metadata, CGNAT, unique-local, multicast, documentation incl. `3fff::/20`,
   benchmarking, reserved, the IETF protocol blocks, and IPv4-mapped / NAT64 / 6to4 forms of those; `Address.ts` cites the registries),
   connects to the address it checked (no second lookup), re-checks every redirect (default 3), allows `http`/`https` only, no
@@ -29,7 +29,7 @@ Outgoing HTTP for URLs a model or a user chose, and for public APIs. No dependen
   header and the TLS name come from the URL only; a redirect to another origin keeps only `Accept`, `Accept-Language` and
   `User-Agent`, and any redirect drops the conditional headers (`If-None-Match`, …: a validator is about the URL it was sent to).
   A name with several addresses: they are tried in order, each attempt with an equal share of the time left (the last one all of
-  it), so a black-holed first address does not use up the deadline; an attempt that runs out of its share is cancelled. `SafeResponse` has `contentType`, `encoding` and a `text()` that honours the charset. HEAD reads no body and is not
+  it), so a black-holed first address does not use up the deadline; an attempt that runs out of its share is cancelled. `SafeResponse` has `contentType`, `encoding` and a `text()` that decodes by the `charset` parameter (UTF-8 when it has none or one this machine does not know). HEAD reads no body and is not
   limited by one.
 - There is no LAN option on `safeFetch`. `fetchOwnerConfiguredLan` is the separate function for endpoints the owner configured (Home
   Assistant, a LAN SearXNG): it also allows private, unique-local and CGNAT addresses, local names and other ports; loopback,
