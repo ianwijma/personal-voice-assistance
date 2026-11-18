@@ -188,6 +188,11 @@ export interface EffectiveMembers {
   /** Whether the saved value passes the Members field's validation as a whole (absent: the empty default does). */
   readonly valid: boolean
   /**
+   * Why it does not (the field's own message), when not `valid`. Then everyone is nobody in memory, but nothing is
+   * written because of it (no reference cleared, no id retired): correcting the list keeps every identity.
+   */
+  readonly problem?: string
+  /**
    * The validated records (as the field decodes them), each with a unique, well-formed id that is not retired; empty
    * when the saved value is not valid.
    */
@@ -215,7 +220,13 @@ const personOf = (m: Readonly<Record<string, unknown>>, id: string): Person => (
   diet: { allergies: strings(m.allergies), diets: strings(m.diets), dislikes: strings(m.dislikes) }
 })
 
-const membersOf = (value: ReadonlyArray<Readonly<Record<string, unknown>>>, ambiguous: ReadonlySet<string>, valid: boolean, repaired: boolean): EffectiveMembers => {
+const membersOf = (
+  value: ReadonlyArray<Readonly<Record<string, unknown>>>,
+  ambiguous: ReadonlySet<string>,
+  valid: boolean,
+  repaired: boolean,
+  problem?: string
+): EffectiveMembers => {
   const people = value.map((m) => personOf(m, m.id as string))
   const ids = new Set(people.map((p) => p.id))
   return {
@@ -226,12 +237,13 @@ const membersOf = (value: ReadonlyArray<Readonly<Record<string, unknown>>>, ambi
     ids,
     ambiguous,
     referenceable: new Set([...ids].filter((id) => !ambiguous.has(id))),
-    repaired
+    repaired,
+    ...(problem !== undefined ? { problem } : {})
   }
 }
 
 const NO_MEMBERS = membersOf([], new Set(), true, false)
-const INVALID_MEMBERS = membersOf([], new Set(), false, false)
+const invalidMembers = (problem: string) => membersOf([], new Set(), false, false, problem)
 const effectiveCache = new WeakMap<object, { readonly retired: unknown; readonly members: EffectiveMembers }>()
 
 /**
@@ -245,7 +257,7 @@ export const effectiveMembersOf = (assistant: Readonly<Record<string, unknown>>)
   const raw = assistant[MEMBERS_KEY]
   const retired = assistant[RETIRED_KEY]
   if (raw === undefined) return NO_MEMBERS
-  if (!Array.isArray(raw)) return INVALID_MEMBERS
+  if (!Array.isArray(raw)) return invalidMembers("Must be a list")
   const hit = effectiveCache.get(raw)
   if (hit !== undefined && hit.retired === retired) return hit.members
   const members = computeMembers(raw, retiredIdsOf(retired))
@@ -255,7 +267,7 @@ export const effectiveMembersOf = (assistant: Readonly<Record<string, unknown>>)
 
 const computeMembers = (raw: ReadonlyArray<unknown>, retired: ReadonlySet<string>): EffectiveMembers => {
   const decoded = membersField.decode(raw)
-  if (!decoded.ok) return INVALID_MEMBERS
+  if (!decoded.ok) return invalidMembers(decoded.error)
   const records = decoded.value as ReadonlyArray<Readonly<Record<string, unknown>>>
   const taken = new Set<string>([...retired, ...mentionedIdsOf(raw)])
   const counts = new Map<string, number>()
@@ -298,9 +310,13 @@ export const withLoadedMembers = (stored: Readonly<Record<string, unknown>>): Re
  * Saved values with an id for every person, all issued by the server: an incoming id is kept only when it is the id of
  * a member of the committed effective Members (`effectiveMembersOf(committed)`, so never a retired one), for the first
  * row that carries it; any other row gets a fresh id, whatever it supplied (a new row, a copied row, a stale tab's row
- * of a person removed since, an id pasted into the file). Every id the committed values mention that the new list
- * does not keep is added to `RETIRED_KEY`, and a fresh id is none of the committed, mentioned, retired or supplied
- * ones: an id is never issued twice in the life of the settings file. Other keys are left as they are.
+ * of a person removed since, an id pasted into the file). When the committed value is not valid as a whole (a
+ * hand-edited file with a typo), the save that corrects it keeps an incoming id that a record of the committed value
+ * carries, is well formed and is not retired, for the first row that carries it: correcting the list keeps every
+ * identity, and with it the devices' default persons and the people's stored rows. Every id the committed values
+ * mention that the new list does not keep is added to `RETIRED_KEY`, and a fresh id is none of the committed,
+ * mentioned, retired or supplied ones: an id is never issued twice in the life of the settings file. Other keys are
+ * left as they are.
  */
 export const withPersonIds = (
   values: Readonly<Record<string, SettingValue>>,
@@ -311,13 +327,14 @@ export const withPersonIds = (
   const members = effectiveMembersOf(committed)
   const retiredBefore = retiredIdsOf(committed[RETIRED_KEY])
   const mentioned = new Set([...members.ids, ...mentionedIdsOf(committed[MEMBERS_KEY])])
+  const keepable: ReadonlySet<string> = members.valid ? members.ids : new Set([...mentionedIdsOf(committed[MEMBERS_KEY])].filter((id) => !retiredBefore.has(id)))
   if (!Array.isArray(list)) return { ...values, [RETIRED_KEY]: [...retiredBefore] }
   const supplied = new Set(list.flatMap((m) => (isRecord(m) && typeof m.id === "string" ? [m.id] : [])))
   const used = new Set<string>()
   const next = list.map((m) => {
     if (!isRecord(m)) return m
     const id = typeof m.id === "string" ? m.id : undefined
-    if (id !== undefined && members.ids.has(id) && !retiredBefore.has(id) && !used.has(id)) {
+    if (id !== undefined && keepable.has(id) && !retiredBefore.has(id) && !used.has(id)) {
       used.add(id)
       return m
     }
