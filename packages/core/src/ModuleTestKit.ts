@@ -18,6 +18,9 @@
  */
 import {
   BUILT_IN_PLACE,
+  REPLY_VOLUME,
+  ringingWithoutWake,
+  stepReplyVolume,
   type DeviceCapabilities,
   type DevicePrivacy,
   type HealthIssue,
@@ -52,6 +55,12 @@ import { type DndState, type Notification, notifications as notificationRows, NO
 import { type DecisionRecord, makeNotifyEngine, notificationView, type NotifyMessage, type SpeechPort } from "./NotifyEngine.ts"
 import { deviceOutputsFrom } from "./Notify.ts"
 import { notifyLanguageOf } from "./NotifyTexts.ts"
+import { decideUtterance, type Taken } from "./PhraseDecision.ts"
+import { type PhraseOutcome, runTaken } from "./PhraseRunner.ts"
+import { buildCommandSet, type CommandSet, phraseLanguageOf } from "./Phrases.ts"
+import { Playback } from "./Playback.ts"
+import type { RouteTarget } from "./RouteGate.ts"
+import type { RegisteredAction } from "./Actions.ts"
 
 // ---------------------------------------------------------------------------------------------------------------------
 // The household
@@ -79,6 +88,8 @@ export interface TestDevice {
   readonly capabilities?: DeviceCapabilities
   readonly connected?: boolean
   readonly kind?: string
+  /** P7: "while ringing" (`place.ringingWithoutWake`): `false` switches the ringing window off. Default on. */
+  readonly ringingWithoutWake?: boolean
 }
 
 /** An assistant and the modules it has on. The module under test and every `provide` stand-in are on unless listed off. */
@@ -165,7 +176,7 @@ export const makeTestPeople = (input: TestHouseholdInput = {}, live?: { readonly
       name: d.name,
       kind: d.kind ?? "web-voice",
       room: room === "" ? undefined : room,
-      place: { ...BUILT_IN_PLACE, room, privacy: d.privacy ?? "shared", defaultPerson },
+      place: { ...BUILT_IN_PLACE, room, privacy: d.privacy ?? "shared", defaultPerson, ...(d.ringingWithoutWake !== undefined ? { ringingWithoutWake: d.ringingWithoutWake } : {}) },
       capabilities: d.capabilities ?? { v: 1 },
       declared: undefined,
       connected: d.connected ?? true,
@@ -463,6 +474,33 @@ export interface StartTestModuleOptions {
 
 export const DEFAULT_TEST_START = Date.UTC(2026, 10, 18, 9, 0, 0)
 
+/** How a test says a phrase on a device (`kit.phrases.say`). */
+export interface KitPhraseInput {
+  /** The device (default: the household's first). */
+  readonly device?: string
+  /** The assistant whose wake phrase starts it (default: the device's first). */
+  readonly assistant?: string
+  /**
+   * After the wake phrase (default `true`; a follow-up window behaves the same), or without it (`false`: the device
+   * answers nobody without a phrase in the kit, so only the ringing window can take it).
+   */
+  readonly wake?: boolean
+  /** The text of a reply this utterance cut short (it was playing when the utterance began): said again after "louder". */
+  readonly interrupting?: string
+}
+
+/** What one phrase came to: not taken (it would go on to the assistant as a turn), or what took it and what happened. */
+export type KitPhraseResult =
+  | { readonly taken: false }
+  | { readonly taken: true; readonly by: "ringing" | "control" | "command"; readonly outcome: PhraseOutcome }
+
+/** One line the kit's device said for a phrase (a canned reply in serve mode). */
+export interface KitSpoken {
+  readonly deviceId: string
+  readonly assistant: string | undefined
+  readonly text: string
+}
+
 /** What one tool call answered, as the model receives it. */
 export interface TestToolResult {
   readonly ok: boolean
@@ -715,6 +753,74 @@ export const startTestModule = (definition: ModuleDefinition<any>, options: Star
       return makeToolRegistry(parts, { gateway: host.gateway })
     }
 
+    // ---- P7: phrase commands, on the real decision, matcher, runner and gateway
+    const language = () => phraseLanguageOf(home.HOME_LANGUAGE)
+    const outcomes: Array<{ readonly deviceId: string; readonly text: string; readonly outcome: PhraseOutcome }> = []
+    const spoken: Array<KitSpoken> = []
+    const sessionCalls: Array<{ readonly deviceId: string; readonly call: "stop" | "cancel" }> = []
+    const lastReplies = new Map<string, { readonly assistant: string; readonly text: string }>()
+    const volumes = new Map<string, number>()
+    let phraseTurns = 1000
+    /** An assistant's set as serve mode builds it: its registry's actions (modules on, switched-off and refused tools out). */
+    const commandsFor = (assistant: string): CommandSet => buildCommandSet(language(), offeredFor(turn({ assistant })).actions ?? [])
+    const isPublished = (assistant: string, action: RegisteredAction) => (offeredFor(turn({ assistant })).actions ?? []).includes(action)
+    /** The decision for one final, with the route the kit stands in for: the wake phrase's assistant, or nobody. */
+    const decidePhrase = (text: string, as: KitPhraseInput): { readonly deviceId: string; readonly taken: Taken | undefined } => {
+      const deviceId = as.device ?? deviceList[0]?.id ?? "kitchen-display"
+      const assistant = as.assistant ?? people.assistantsOn(deviceId)[0] ?? "jeff"
+      const wake = as.wake !== false
+      const route: RouteTarget = wake ? { assistant, by: "phrase", phrase: "hey jeff" } : { by: "dropped", reason: "asleep" }
+      // The window is closed while a reply is spoken there (its own line may be what was heard), and by the setting.
+      const open = !replying.has(deviceId) && ringingWithoutWake(people.devices.get(deviceId)?.place)
+      const d = decideUtterance({
+        final: { _tag: "EndOfTurn", text },
+        language: language(),
+        ringing: open ? notify.ringingOn(deviceId) : undefined,
+        wakeAtStart: () => wake,
+        gates: (final) => [{ events: [final], target: route }],
+        commandsFor: (a) => commandsFor(a ?? assistant)
+      })
+      return { deviceId, taken: d.taken }
+    }
+    const phrasePorts = (deviceId: string, as: KitPhraseInput) => ({
+      deviceId,
+      language,
+      notify: () => notify,
+      session: {
+        replyActive: () => replying.has(deviceId) || as.interrupting !== undefined,
+        stopReply: Effect.suspend(() => {
+          sessionCalls.push({ deviceId, call: "stop" })
+          const was = replying.has(deviceId) || as.interrupting !== undefined
+          return Effect.as(Effect.andThen(harness.notify.replying(deviceId, false), notify.stopSpeech(deviceId)), was)
+        }),
+        cancelPending: Effect.suspend(() => {
+          sessionCalls.push({ deviceId, call: "cancel" })
+          const was = replying.has(deviceId) || as.interrupting !== undefined
+          return Effect.as(harness.notify.replying(deviceId, false), was)
+        }),
+        lastReply: () => lastReplies.get(deviceId),
+        interruptedReply: () => (as.interrupting === undefined ? undefined : { assistant: as.assistant ?? people.assistantsOn(deviceId)[0] ?? "jeff", text: as.interrupting }),
+        answering: () => people.assistantsOn(deviceId)[0],
+        say: (assistant: string | undefined, text: string) =>
+          Effect.sync(() => {
+            spoken.push({ deviceId, assistant, text })
+            lastReplies.set(deviceId, { assistant: assistant ?? people.assistantsOn(deviceId)[0] ?? "jeff", text })
+          })
+      },
+      volume: (direction: "louder" | "quieter") =>
+        Effect.sync(() => {
+          const change = stepReplyVolume(volumes.get(deviceId) ?? REPLY_VOLUME.default, direction)
+          volumes.set(deviceId, change.level)
+          return change
+        }),
+      playback: () => host.service(Playback),
+      room: () => people.devices.get(deviceId)?.room,
+      gateway: () => host.gateway,
+      turn: (assistant: string) => turn({ device: deviceId, assistant, source: "phrase", turnId: ++phraseTurns }),
+      isPublished,
+      pageText: (moduleId: string, text: unknown, max: number) => host.pageText(moduleId, text, max)
+    })
+
     const harness = {
       host,
       moduleId: id,
@@ -839,6 +945,44 @@ export const startTestModule = (definition: ModuleDefinition<any>, options: Star
       /** Change its saved settings and secrets as the owner would on its page (a module that runs is started again with them). */
       configure: (values: SettingsPatch["values"], secrets: SettingsPatch["secrets"] = {}) =>
         checked("after the settings change", driven(`the settings change of ${id}`, host.configure(id, { values, secrets }))),
+      /**
+       * P7: phrase commands as serve mode runs them (docs/PHRASES.md "Testing"): the real decision (`decideUtterance`),
+       * the real matcher over the assistant's set as serve mode builds it (its registry's actions: the modules it has on,
+       * without what it switched off or the risk policy refuses, the host's controls first), and the real runner through
+       * the gateway, the notification service and the volume step.
+       */
+      phrases: {
+        /**
+         * Say `text` on a device as its recogniser's final transcript: after the wake phrase (the default), or without
+         * it (only the ringing window can take it then: open while the kit's notification service says something rings
+         * there, the device's "while ringing" is on, and no reply is being spoken there, `notify.replying`).
+         */
+        say: (text: string, as: KitPhraseInput = {}): Effect.Effect<KitPhraseResult> =>
+          checked(`after saying "${text}"`, Effect.andThen(settle, Effect.flatMap(Effect.sync(() => decidePhrase(text, as)), (d) => {
+            if (d.taken === undefined) return Effect.succeed<KitPhraseResult>({ taken: false })
+            const taken = d.taken
+            const by = taken.by === "ringing" ? "ringing" as const : taken.match.kind === "control" ? "control" as const : "command" as const
+            return Effect.map(
+              Effect.andThen(driven(`the phrase "${text}"`, runTaken(taken, phrasePorts(d.deviceId, as))), (outcome) => Effect.as(settle, outcome)),
+              (outcome): KitPhraseResult => {
+                outcomes.push({ deviceId: d.deviceId, text, outcome })
+                return { taken: true, by, outcome }
+              }
+            )
+          }))),
+        /** What every taken phrase came to, in order. */
+        answered: outcomes as ReadonlyArray<{ readonly deviceId: string; readonly text: string; readonly outcome: PhraseOutcome }>,
+        /** Every line the kit's devices said for phrases, in order (canned replies in serve mode). */
+        spoken: spoken as ReadonlyArray<KitSpoken>,
+        /** A reply was spoken on the device (what "repeat" says again; serve mode keeps the last committed reply). */
+        replied: (deviceId: string, text: string, assistant?: string) => void lastReplies.set(deviceId, { assistant: assistant ?? people.assistantsOn(deviceId)[0] ?? "jeff", text }),
+        /** The device's reply volume now (`REPLY_VOLUME`; what serve mode would send as `output.volume`). */
+        volume: (deviceId: string): number => volumes.get(deviceId) ?? REPLY_VOLUME.default,
+        /** The assistant's set now, as serve mode builds it (with its conflicts, which serve mode names on the Health page). */
+        commandsFor: (assistant?: string): CommandSet => commandsFor(assistant ?? assistants[0]?.id ?? "jeff"),
+        /** What the session control was asked to do (stop, cancel): the kit has no conversation, so it records the calls. */
+        sessionCalls: sessionCalls as ReadonlyArray<{ readonly deviceId: string; readonly call: "stop" | "cancel" }>
+      },
       /**
        * P9: the notification service as the module's tests see it: the real service on the kit's store, clock and
        * gateway, with the pages and the devices' voices recorded (docs/NOTIFICATIONS.md "Testing").

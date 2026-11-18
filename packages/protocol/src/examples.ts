@@ -787,6 +787,7 @@ export const serverExamples: { readonly [T in ServerMessageType]: Extract<Server
     }
   },
   "notification.resolved": { type: "notification.resolved", id: "n-4f2a", outcome: "stop" },
+  "output.volume": { type: "output.volume", volume: 0.6 },
   ...assistantsServerExamples
 }
 

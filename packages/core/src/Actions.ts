@@ -1,6 +1,7 @@
 import { Effect, Schema } from "effect"
 import { ToolError } from "./Errors.ts"
 import { makeTool, type RiskByInput, type Tool, type ToolMetadata } from "./Module.ts"
+import type { ActionPhrases } from "./Phrases.ts"
 import { editDistance, normalizePhrase, phoneticKey } from "./TextMatching.ts"
 import { parseDuration } from "./ValueParsing.ts"
 
@@ -180,6 +181,18 @@ export interface ActionDefinition<P extends ActionParams = ActionParams> extends
    * is committed. Leave it out for queries, whose answer comes from `run`.
    */
   readonly announce?: (params: ParamValues<P>) => string
+  /**
+   * P7 (docs/PHRASES.md): phrase commands that run this action without the language model, per language, after the
+   * wake phrase or in a follow-up window: words and `{param}` slots ("set a timer for {duration}"), at most
+   * `PHRASE_LIMITS` (8 a language, 8 words, 2 slots, every required parameter a slot; the host's own phrases are
+   * reserved). Checked when the module starts: a phrase outside the rules refuses the start, naming it.
+   */
+  readonly phrases?: ActionPhrases
+  /**
+   * P7: run by a phrase that interrupted a reply, the action is meant to end that reply (default false: the interrupted
+   * reply is spoken again after the action's answer, as after "louder").
+   */
+  readonly endsReply?: boolean
   /**
    * Do it. Must finish well within 5 s (the intent agent's limit); it is not interrupted once started. Read the turn
    * it runs in with `yield* CurrentTurn` (`undefined` when run outside a turn: a routine from a job, a test).

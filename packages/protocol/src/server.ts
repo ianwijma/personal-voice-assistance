@@ -22,6 +22,7 @@ import { ConversationId, ConversationReason, SessionInfo, SessionKey } from "./s
 import { HealthInfo } from "./health.ts"
 import { HouseholdEventMessage, HouseholdGapMessage, HouseholdSnapshotMessage } from "./household.ts"
 import { NotificationResolvedMessage, NotificationRingMessage } from "./notifications.ts"
+import { OutputVolumeMessage } from "./volume.ts"
 import { FieldActionResult } from "./settings.ts"
 
 /**
@@ -449,7 +450,8 @@ export const ServerMessage = Schema.Union([
   HouseholdEventMessage,
   HouseholdGapMessage,
   NotificationRingMessage,
-  NotificationResolvedMessage
+  NotificationResolvedMessage,
+  OutputVolumeMessage
 ]).pipe(Schema.toTaggedUnion("type"))
 export type ServerMessage = typeof ServerMessage.Type
 export type ServerMessageType = ServerMessage["type"]

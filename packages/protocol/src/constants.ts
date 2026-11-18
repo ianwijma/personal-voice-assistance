@@ -86,6 +86,10 @@
  * pages; a page that does not know them ignores them), `notification.action` (a request a newer page sends; an older
  * page never sends it, and the server needs nothing from a page that does not) and `Result.say`. No closed set
  * gains a member: a press of an action whose handler is not running is answered with the existing `not_running`.
+ * P7, additive within 11 (docs/PHRASES.md): `output.volume` (server → the voice connections of one device: the reply
+ * output's gain; a page that does not know it ignores it and the server needs nothing from it) and the optional
+ * `DevicePlace.ringingWithoutWake` (absent means on; an older peer ignores the key, a newer one accepts its absence). No
+ * closed set gains a member, so the version stays 11.
  */
 export const PROTOCOL_VERSION = 11
 
