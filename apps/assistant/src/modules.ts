@@ -1,6 +1,25 @@
 import { claudeSubscriptionAgent } from "@pva/agent-claude-code"
 import { makeModuleHost, type ModuleDefinition, type ModuleDemand, type ModuleHost, type ModulePersistence, type ModuleSnapshot, readOnlyPersistence, type TurnSetup, withContextProvider } from "@pva/core"
 import { homeAssistantModule } from "@pva/module-home-assistant"
+import { catalog as assistantControlsModules } from "@pva/module-assistant-controls"
+import { catalog as briefingModules } from "@pva/module-briefing"
+import { catalog as broadcastModules } from "@pva/module-broadcast"
+import { catalog as calendarModules } from "@pva/module-calendar"
+import { catalog as coreToolsModules } from "@pva/module-core-tools"
+import { catalog as imagesModules } from "@pva/module-images"
+import { catalog as kitchenModules } from "@pva/module-kitchen"
+import { catalog as listsModules } from "@pva/module-lists"
+import { catalog as localInfoModules } from "@pva/module-local-info"
+import { catalog as mcpModules } from "@pva/module-mcp"
+import { catalog as memoryModules } from "@pva/module-memory"
+import { catalog as musicModules } from "@pva/module-music"
+import { catalog as newsModules } from "@pva/module-news"
+import { catalog as notificationsModules } from "@pva/module-notifications"
+import { catalog as presenceModules } from "@pva/module-presence"
+import { catalog as remindersModules } from "@pva/module-reminders"
+import { catalog as routinesModules } from "@pva/module-routines"
+import { catalog as timersModules } from "@pva/module-timers"
+import { catalog as webSearchModules } from "@pva/module-web-search"
 import { clockModule, weatherModule } from "@pva/modules-builtin"
 import type { Assistant, ModuleInfo } from "@pva/protocol"
 import { Config, Effect, type Scope } from "effect"
@@ -21,6 +40,29 @@ export const moduleCatalog: ReadonlyArray<ModuleDefinition<any>> = [
   weatherModule(),
   // Lights by room through the owner's Home Assistant (address and token shared; `domains` per assistant).
   homeAssistantModule(),
+  // The module packages of docs/MODULES-PLAN.md §5.1 (waves A and B), in the plan's order. Each is off until an assistant
+  // switches it on, so an installation that has not chosen them runs exactly as before. Each package exports its
+  // `catalog` (the production definition of each of its module ids): a module's pull request changes its package, never
+  // this list (docs/MODULES.md, "What a module pull request may touch").
+  ...assistantControlsModules,
+  ...timersModules,
+  ...coreToolsModules,
+  ...webSearchModules,
+  ...listsModules,
+  ...notificationsModules,
+  ...kitchenModules,
+  ...musicModules,
+  ...remindersModules,
+  ...imagesModules,
+  ...calendarModules,
+  ...memoryModules,
+  ...broadcastModules,
+  ...briefingModules,
+  ...localInfoModules,
+  ...presenceModules,
+  ...newsModules,
+  ...routinesModules,
+  ...mcpModules,
   // Off by default and behind its own opt-in switch; answers when LLM_PROVIDER=claude-subscription.
   claudeSubscriptionAgent
 ]

@@ -1,0 +1,28 @@
+{
+  "name": "@pva/module-news",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "scripts": {
+    "check": "tsc -p tsconfig.json",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "@mozilla/readability": "catalog:",
+    "@pva/core": "workspace:*",
+    "@pva/module-contracts": "workspace:*",
+    "@pva/net": "workspace:*",
+    "effect": "catalog:",
+    "feedsmith": "catalog:",
+    "linkedom": "catalog:"
+  },
+  "devDependencies": {
+    "@effect/vitest": "catalog:",
+    "@types/node": "catalog:",
+    "typescript": "catalog:",
+    "vitest": "catalog:"
+  }
+}
