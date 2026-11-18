@@ -54,7 +54,7 @@ const holding = () => {
 describe("HomeAssistant: reads that overlap", () => {
   const begin = Effect.gen(function*() {
     const h = holding()
-    const kit = yield* startTestModule(homeAssistantModule({ fetch: h.ha.fetch }), configured())
+    const kit = yield* startTestModule(homeAssistantModule({ net: h.ha.net }), configured())
     const service = kit.service(HomeAssistant)!
     const sub = yield* subscribe(service)
     // 59 s in: the next background read is a second away.
@@ -136,7 +136,7 @@ describe("HomeAssistant: a subscriber that falls behind", () => {
       const entities: Record<string, FakeEntity> = {}
       for (let i = 0; i < HA_LIMITS.queue + 100; i++) entities[`light.l${String(i).padStart(4, "0")}`] = { state: "off" }
       const ha = makeFakeHa({ entities })
-      const kit = yield* startTestModule(homeAssistantModule({ fetch: ha.fetch }), configured())
+      const kit = yield* startTestModule(homeAssistantModule({ net: ha.net }), configured())
       const service = kit.service(HomeAssistant)!
       const release = yield* Deferred.make<void>()
       const got: Array<HaChange> = []
@@ -186,7 +186,7 @@ describe("HomeAssistant: lifetimes", () => {
   it.effect("a kind that disappears keeps the same provider and the same stream: the consumer is not cut off", () =>
     Effect.gen(function*() {
       const ha = makeFakeHa()
-      const kit = yield* startTestModule(homeAssistantModule({ fetch: ha.fetch }), configured())
+      const kit = yield* startTestModule(homeAssistantModule({ net: ha.net }), configured())
       const service = kit.service(HomeAssistant)!
       const { got, fiber } = yield* subscribe(service)
       delete ha.entities["climate.living_room"]
@@ -207,24 +207,24 @@ describe("HomeAssistant: lifetimes", () => {
           "person.sam": { name: "Sam", state: "home", extra: { area: "kitchen", class: "presence", brightness: 5, title: "Sam's song", artist: "x", unit: "m", current: 3, latitude: 52.1, attributes: { gps: [52.1, 5.1] } } }
         }
       })
-      const kit = yield* startTestModule(homeAssistantModule({ fetch: ha.fetch }), configured())
+      const kit = yield* startTestModule(homeAssistantModule({ net: ha.net }), configured())
       const sam = kit.service(HomeAssistant)!.entity("person.sam")
       assert.deepStrictEqual(sam, { entityId: "person.sam", domain: "person", name: "Sam", aliases: [], state: "home", attributes: {}, attributesCut: false, lastChanged: (Date.UTC(2026, 10, 18, 8, 0, 0)) })
     }))
 })
 
 describe("HomeAssistant: answers too large to read", () => {
-  it.effect("a successful answer over the response bound, or over the transport's byte limit, is a success with responseCut; an error answer stays failed", () =>
+  it.effect("a successful answer over the response bound, or over the transport's byte limit, is a success with responseCut; a short error answer stays failed", () =>
     Effect.gen(function*() {
       const ha = makeFakeHa()
-      const kit = yield* startTestModule(homeAssistantModule({ fetch: ha.fetch }), configured())
+      const kit = yield* startTestModule(homeAssistantModule({ net: ha.net }), configured())
       const service = kit.service(HomeAssistant)!
       const call = { domain: "music_assistant", service: "get_queue", target: { entityIds: ["media_player.kitchen"] }, returnResponse: true } as const
       ha.respondWith({ big: "x".repeat(HA_LIMITS.responseChars + 10) })
       assert.deepStrictEqual(yield* service.callService(call), { responseCut: true })
       ha.respondWith({ huge: "x".repeat(300_000) })
       assert.deepStrictEqual(yield* service.callService(call), { responseCut: true })
-      ha.answer("service", () => new Response(JSON.stringify({ message: "x".repeat(300_000) }), { status: 500 }))
+      ha.answer("service", () => new Response(JSON.stringify({ message: "boom" }), { status: 500, headers: { "content-type": "application/json" } }))
       assert.strictEqual((yield* Effect.flip(service.callService(call))).reason, "failed")
       assert.strictEqual(ha.calls().length, 3)
     }))

@@ -12,7 +12,7 @@ import { configured, type FakeEntity, type FakeHaOptions, makeFakeHa } from "./f
 const start = (options: FakeHaOptions & { readonly aliases?: string; readonly home?: Record<string, string>; readonly devices?: ReadonlyArray<{ readonly id: string; readonly name: string; readonly room?: string }> } = {}) =>
   Effect.gen(function*() {
     const ha = makeFakeHa(options)
-    const kit = yield* startTestModule(homeAssistantModule({ fetch: ha.fetch }), {
+    const kit = yield* startTestModule(homeAssistantModule({ net: ha.net }), {
       ...configured({ aliases: options.aliases ?? "" }),
       household: { ...(options.home !== undefined ? { home: options.home } : {}), ...(options.devices !== undefined ? { devices: options.devices } : {}) }
     })
@@ -178,6 +178,9 @@ describe("home-assistant: temperatures in the household's unit", () => {
       const { ha, kit } = yield* start({ entities, unit: "°F" })
       assert.deepStrictEqual(yield* kit.action("climate_set", { target: "living room", temperature: 21 }), { ok: true, say: "I've set the heating in Living room to 21 degrees; it's 22 degrees now." })
       assert.deepStrictEqual(ha.calls(), [{ service: "climate.set_temperature", body: { temperature: 69.8, entity_id: ["climate.living_room"] } }])
+      // As the kit's offline network recorded what was sent: a POST, its body exactly this.
+      const sent = ha.sent.at(-1)!
+      assert.deepStrictEqual([sent.method, sent.url, sent.body], ["POST", "http://ha.test:8123/api/services/climate/set_temperature", "{\"temperature\":69.8,\"entity_id\":[\"climate.living_room\"]}"])
       assert.deepStrictEqual(yield* kit.action("climate_status", { room: "living room" }), { ok: true, say: "Living room thermostat is 22 degrees, set to 21 and Porch is 10 degrees." })
       const state = yield* kit.tool("home_state", { kind: "climate" })
       assert.include(state.content, "Living room thermostat: heat, 22° now, set to 21°")

@@ -28,7 +28,7 @@ describe("home-assistant: the house in pages", () => {
     Effect.gen(function*() {
       const entities: Record<string, FakeEntity> = { ...lights(450), "person.sam": { name: "Sam", state: "home" }, "climate.hall": { name: "Hall", state: "heat", area: "area_1" } }
       const ha = makeFakeHa({ areas: areas40(), entities })
-      const kit = yield* startTestModule(homeAssistantModule({ fetch: ha.fetch }), configured({ domains: ["light"] }))
+      const kit = yield* startTestModule(homeAssistantModule({ net: ha.net }), configured({ domains: ["light"] }))
       const pages = ha.pages()
       assert.deepStrictEqual(pages.map((p) => [p.domains.join(","), p.after, p.size]), [
         ["person", "", HOUSE_LIMITS.pageRows],
@@ -49,7 +49,7 @@ describe("home-assistant: the house in pages", () => {
       // Each light's name is control characters, six characters of JSON each: about 1.7 KB a row, so 200 rows are over the limit.
       for (let i = 0; i < 300; i++) entities[`light.q${String(i).padStart(3, "0")}`] = { name: "\u0001".repeat(300), state: "off" }
       const ha = makeFakeHa({ entities })
-      const kit = yield* startTestModule(homeAssistantModule({ fetch: ha.fetch }), configured({ domains: ["light"] }))
+      const kit = yield* startTestModule(homeAssistantModule({ net: ha.net }), configured({ domains: ["light"] }))
       assert.strictEqual(kit.service(HomeAssistant)!.entities().length, 300)
       assert.include(ha.pages().map((p) => p.size), HOUSE_LIMITS.pageRows / 8)
     }))
@@ -59,7 +59,7 @@ describe("home-assistant: the supported size", () => {
   it.effect("a house of more than the supported size is incomplete: \"all\" asks for a room, the status questions and home_state say so, nothing claims a total", () =>
     Effect.gen(function*() {
       const ha = makeFakeHa({ areas: areas40(), entities: lights(HOUSE_LIMITS.supported + 1) })
-      const kit = yield* startTestModule(homeAssistantModule({ fetch: ha.fetch }), configured())
+      const kit = yield* startTestModule(homeAssistantModule({ net: ha.net }), configured())
       ha.requests.length = 0
       // The provider keeps the supported number: one less than Home Assistant has.
       assert.strictEqual(kit.service(HomeAssistant)!.entities().length, HOUSE_LIMITS.supported)
@@ -78,7 +78,7 @@ describe("home-assistant: the supported size", () => {
       assert.include(kit.info()?.status?.text ?? "", "incomplete")
       // Exactly the supported size, read in full: complete.
       const full = makeFakeHa({ areas: areas40(), entities: lights(HOUSE_LIMITS.supported) })
-      const ok = yield* startTestModule(homeAssistantModule({ fetch: full.fetch }), configured())
+      const ok = yield* startTestModule(homeAssistantModule({ net: full.net }), configured())
       assert.deepStrictEqual(yield* ok.action("lights_off", { target: "all lights" }), { ok: true, say: "I've turned off all the lights." })
       assert.strictEqual(full.calls().flatMap((c) => (c.body as { entity_id: Array<string> }).entity_id).length, HOUSE_LIMITS.supported)
       assert.deepStrictEqual(yield* ok.action("lights_status"), { ok: true, say: "All the lights are off." })
@@ -89,7 +89,7 @@ describe("home-assistant: the supported size", () => {
       const entities: Record<string, FakeEntity> = { "media_player.kitchen": { name: "Kitchen speaker", state: "idle" }, "person.sam": { name: "Sam", state: "home" } }
       for (let i = 0; i < HOUSE_LIMITS.supported + 100; i++) entities[`climate.c${String(i).padStart(4, "0")}`] = { name: `Thermostat ${i}`, state: "heat" }
       const ha = makeFakeHa({ entities })
-      const kit = yield* startTestModule(homeAssistantModule({ fetch: ha.fetch }), configured({ domains: ["media_player"] }))
+      const kit = yield* startTestModule(homeAssistantModule({ net: ha.net }), configured({ domains: ["media_player"] }))
       const service = kit.service(HomeAssistant)!
       assert.deepStrictEqual(service.entities().map((e) => e.entityId), ["media_player.kitchen", "person.sam"])
       assert.deepStrictEqual(service.people().map((p) => p.name), ["Sam"])
@@ -100,7 +100,7 @@ describe("home-assistant: the supported size", () => {
       const entities = lights(HOUSE_LIMITS.supported - 1)
       entities["person.sam"] = { name: "Sam", state: "home" }
       const ha = makeFakeHa({ areas: areas40(), entities })
-      const kit = yield* startTestModule(homeAssistantModule({ fetch: ha.fetch }), configured())
+      const kit = yield* startTestModule(homeAssistantModule({ net: ha.net }), configured())
       const service = kit.service(HomeAssistant)!
       for (const e of Object.values(entities)) e.state = e.state === "off" ? "on" : "not_home"
       // A 1 ms timer: the longest gap between its ticks is the longest the main thread was held.
@@ -144,7 +144,7 @@ describe("home-assistant: what holds a configured secret is left out whole", () 
         "person.sam": { name: "Sam", state: TOKEN }
       }
       const ha = makeFakeHa({ entities, areas: { kitchen: "Kitchen", secret_room: `Room ${TOKEN}` } })
-      const kit = yield* startTestModule(homeAssistantModule({ fetch: ha.fetch }), configured())
+      const kit = yield* startTestModule(homeAssistantModule({ net: ha.net }), configured())
       const service = kit.service(HomeAssistant)!
       assert.deepStrictEqual(service.entities().map((e) => e.entityId), ["light.basic", "light.kitchen"])
       assert.deepStrictEqual(service.areas().map((a) => a.id), ["kitchen"])
@@ -170,7 +170,7 @@ describe("home-assistant: what holds a configured secret is left out whole", () 
   it.effect("a location name that holds the token is not shown; a service answer that holds it is cut", () =>
     Effect.gen(function*() {
       const ha = makeFakeHa({ locationName: `Home ${TOKEN}` })
-      const kit = yield* startTestModule(homeAssistantModule({ fetch: ha.fetch }), configured())
+      const kit = yield* startTestModule(homeAssistantModule({ net: ha.net }), configured())
       assert.notInclude(JSON.stringify(kit.info()), TOKEN)
       assert.include(String(kit.info()?.settings.values.server), "Home Assistant at")
       ha.respondWith({ echo: `queue of ${TOKEN}` })

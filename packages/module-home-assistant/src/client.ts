@@ -1,29 +1,28 @@
+import { type Connector, type ContentTypePolicy, fetchOwnerConfiguredLan, NetTimeout, type Resolver, type SafeFetchError } from "@pva/net"
 import { Effect, Schema } from "effect"
 import { addressSecrets, checkAddress, clip, fromUpstream, sanitize, type Secrets, secretList } from "./redact.ts"
 
 /**
  * A minimal client for Home Assistant's REST API
  * (https://developers.home-assistant.io/docs/api/rest/, now served at
- * https://contributors.home-assistant.io/core/internals/rest-api/).
+ * https://contributors.home-assistant.io/core/internals/rest-api/), through `@pva/net` only
+ * (`fetchOwnerConfiguredLan`, docs/MODULES.md §12): the address is the one the owner typed, loopback only as typed
+ * (`typedLoopback`), no redirect is followed (a redirect answer is a failure), the answer must be JSON or text, and
+ * every call has its own time limit and byte limit.
  *
- * Three calls only: `GET /api/config` (reachability and token check at
- * start), `POST /api/template` (one rendered template returns areas and
- * entities; admin only) and `POST /api/services/<domain>/<service>` (actions).
- * Every call has its own short timeout and a size limit on the answer
- * (`maxBytes`, read as it arrives and cut off past it), and is aborted when the
- * fiber is interrupted. Failures are `HomeAssistantError`s: `kind` says what
- * happened (the module words it in the household's language), `message` is an
- * English sentence for the settings card and `detail` a technical line.
- *
- * This is the module's existing transport, kept as it was (docs/MODULES.md §12
- * allows only `GET` and `HEAD` through `@pva/net`, which has no WebSocket
- * either; Home Assistant takes service calls and templates only as `POST`):
- * see docs/modules/home-assistant.md, "What was left out".
+ * Three calls only: `GET /api/config` (reachability, the token, the temperature unit), `POST /api/template` with a JSON
+ * body (one page of the house; admin only) and `POST /api/services/<domain>/<service>` with a JSON body (actions). A
+ * POST is sent once and never again: when it fails after it may have reached Home Assistant, the failure is
+ * `unconfirmed` (it may or may not have happened). Failures are `HomeAssistantError`s: `kind` says what happened (the
+ * module words it in the household's language), `message` is an English sentence for the settings card and `detail` a
+ * technical line, never with the token.
  */
 
 export type HomeAssistantErrorKind =
-  /** Connection refused, DNS failure, TLS error. */
+  /** Not reached, and nothing was carried out: the name not found, the connection refused, an address or a redirect refused. */
   | "unreachable"
+  /** A POST that may have reached Home Assistant failed before its answer was read: it may or may not have happened. */
+  | "unconfirmed"
   /** No answer within the call's time limit (a service call may still have happened). */
   | "timeout"
   /** 401: the token is missing, wrong or revoked. */
@@ -38,7 +37,7 @@ export type HomeAssistantErrorKind =
 export class HomeAssistantError extends Schema.TaggedError<HomeAssistantError>()("HomeAssistantError", {
   /** One spoken sentence: "I couldn't reach Home Assistant." */
   message: Schema.String,
-  kind: Schema.Literals(["unreachable", "timeout", "unauthorized", "forbidden", "http", "invalid"]),
+  kind: Schema.Literals(["unreachable", "unconfirmed", "timeout", "unauthorized", "forbidden", "http", "invalid"]),
   status: Schema.optional(Schema.Number),
   /** Technical detail for logs and the settings card; never contains the token. */
   detail: Schema.String
@@ -50,8 +49,18 @@ export interface HomeAssistantClientOptions {
   readonly token: string
   /** Per request. */
   readonly timeoutMs: number
-  readonly fetch?: typeof globalThis.fetch | undefined
+  /** The resolver and connector (tests: the kit's offline network); absent, `@pva/net`'s own. */
+  readonly net?: NetDeps | undefined
 }
+
+/** What the client takes from its tests: `@pva/net`'s resolver and connector (absent: the real ones). */
+export interface NetDeps {
+  readonly resolver?: Resolver | undefined
+  readonly connector?: Connector | undefined
+}
+
+/** What Home Assistant answers: JSON (config, services, errors) or text (a rendered template, some errors). */
+const HA_ANSWER: ContentTypePolicy = { name: "Home Assistant answer", types: ["application/json", "text/plain"] }
 
 /** What one call may override: its time limit (default the client's `timeoutMs`) and the largest answer it reads. */
 export interface CallLimits {
@@ -88,36 +97,6 @@ export interface HomeAssistantClient {
     data: Readonly<Record<string, unknown>>,
     limits?: CallLimits & { readonly returnResponse?: boolean | undefined }
   ) => Effect.Effect<string | undefined, HomeAssistantError>
-}
-
-/** Read a body as text up to `maxBytes`, stopping (and cancelling the rest) as soon as it is longer. */
-const readBounded = async (response: Response, maxBytes: number): Promise<string | undefined> => {
-  const declared = Number(response.headers.get("content-length") ?? "")
-  if (Number.isFinite(declared) && declared > maxBytes) {
-    await response.body?.cancel().catch(() => undefined)
-    return undefined
-  }
-  if (response.body === null) return ""
-  const reader = response.body.getReader()
-  const chunks: Array<Uint8Array> = []
-  let total = 0
-  for (;;) {
-    const { done, value } = await reader.read()
-    if (done) break
-    total += value.byteLength
-    if (total > maxBytes) {
-      await reader.cancel().catch(() => undefined)
-      return undefined
-    }
-    chunks.push(value)
-  }
-  const bytes = new Uint8Array(total)
-  let at = 0
-  for (const c of chunks) {
-    bytes.set(c, at)
-    at += c.byteLength
-  }
-  return new TextDecoder().decode(bytes)
 }
 
 /** The rules for the address: http(s), no user-info, no query (the token has its own setting; see `redact.ts`). */
@@ -165,14 +144,14 @@ export const makeHomeAssistantClient = (options: HomeAssistantClientOptions): Ho
   // Read and checked once, inside the boundary: a getter that throws or a refused address makes every
   // call fail with a sanitised error; constructing the client never throws.
   let secrets: Secrets = []
-  let setup: { readonly baseUrl: string; readonly fetchFn: typeof globalThis.fetch; readonly timeoutMs: number; readonly token: string } | string
+  let setup: { readonly baseUrl: string; readonly timeoutMs: number; readonly token: string } | string
   try {
     secrets = secretList(options.token)
     secrets = secretList(secrets, addressSecrets(options.baseUrl))
     const baseUrl = normalizeBaseUrl(options.baseUrl)
     setup = baseUrl === undefined
       ? `the address ${checkAddressSetting(options.baseUrl)?.toLowerCase() ?? "is empty"}`
-      : { baseUrl, fetchFn: options.fetch ?? globalThis.fetch, timeoutMs: options.timeoutMs, token: options.token }
+      : { baseUrl, timeoutMs: options.timeoutMs, token: options.token }
   } catch (e) {
     setup = `the settings could not be read (${fromUpstream(e, secrets)})`
   }
@@ -181,90 +160,78 @@ export const makeHomeAssistantClient = (options: HomeAssistantClientOptions): Ho
   // Only the credential-free form is ever shown; a refused address is shown as nothing at all.
   const shownUrl = typeof setup === "string" ? "" : setup.baseUrl
 
+  const net = { ...(options.net?.resolver !== undefined ? { resolver: options.net.resolver } : {}), ...(options.net?.connector !== undefined ? { connector: options.net.connector } : {}) }
+
+  /** One request through `@pva/net`: the status and the text, or `undefined` for a successful answer too large to read. */
   const send = (method: "GET" | "POST", path: string, body: unknown | undefined, adminOnly: boolean, limits: CallLimits, oversizedOk = false) =>
-    Effect.suspend(() => {
+    Effect.suspend((): Effect.Effect<string | undefined, HomeAssistantError> => {
       if (typeof setup === "string") {
         return Effect.fail(haError({ message: "I couldn't reach Home Assistant.", kind: "unreachable", detail: `${method} ${path}: ${setup}` }))
       }
-      const { baseUrl, fetchFn, token } = setup
+      const { baseUrl, token } = setup
       const timeoutMs = limits.timeoutMs ?? setup.timeoutMs
       const maxBytes = limits.maxBytes ?? DEFAULT_MAX_BYTES
-      return Effect.tryPromise({
-      try: async (signal) => {
-        // Inside the boundary: serialising can throw (a value with a throwing `toJSON`).
-        const payload = body !== undefined ? JSON.stringify(body) : undefined
-        const response = await fetchFn(`${baseUrl}${path}`, {
-          method,
-          signal,
-          headers: {
-            Authorization: `Bearer ${token}`,
-            ...(payload !== undefined ? { "Content-Type": "application/json" } : {})
-          },
-          ...(payload !== undefined ? { body: payload } : {})
+      const common = {
+        accept: HA_ANSWER,
+        maxBytes,
+        timeoutMs,
+        // Never followed: a redirect answer is a failure with its own rule (a POST's is `post-redirect`).
+        maxRedirects: 0,
+        // The owner may have typed http://localhost:8123 (Home Assistant on this machine): loopback only as typed.
+        typedLoopback: true,
+        headers: { authorization: `Bearer ${token}` },
+        ...net
+      }
+      const url = `${baseUrl}${path}`
+      const fetched = method === "POST" ? fetchOwnerConfiguredLan(url, { ...common, method: "POST", body: { json: body } }) : fetchOwnerConfiguredLan(url, common)
+      return fetched.pipe(
+        // The same limit on the fiber's clock (a test drives it; in the app both are real time): whichever ends first.
+        // Interrupting the request closes its connection.
+        Effect.timeoutOrElse({ duration: timeoutMs, orElse: () => Effect.fail(new NetTimeout({ url: shownUrl, timeoutMs })) }),
+        Effect.mapError((e: SafeFetchError): HomeAssistantError | { readonly tooLarge: true } => {
+          const at = `${method} ${path}`
+          switch (e._tag) {
+            case "NetTooLarge":
+              return { tooLarge: true }
+            case "NetTimeout":
+              return haError({ message: "Home Assistant didn't answer in time.", kind: "timeout", detail: `${at}: no answer within ${timeoutMs} ms` })
+            case "NetRefused":
+              return haError({ message: "I couldn't reach Home Assistant.", kind: "unreachable", detail: `${at}: refused (${e.rule}): ${fromUpstream(e.detail, secrets)}` })
+            case "NetAborted":
+              return haError({ message: "I couldn't reach Home Assistant.", kind: "unreachable", detail: `${at}: aborted` })
+            case "NetFailure": {
+              // A POST that failed after it may have been written: it may or may not have been carried out.
+              const maybe = method === "POST" && (e.stage === "response" || e.detail.includes("may or may not"))
+              return haError({
+                message: maybe ? "Home Assistant may or may not have done it: its answer did not come." : "I couldn't reach Home Assistant.",
+                kind: maybe ? "unconfirmed" : "unreachable",
+                detail: `${at}: ${e.stage}: ${fromUpstream(e.detail, secrets)}`
+              })
+            }
+          }
+        }),
+        Effect.flatMap((response) => {
+          const status = response.status
+          const text = response.text()
+          if (status >= 200 && status < 300) return Effect.succeed(text)
+          // A proxy in front of Home Assistant may echo the Authorization header: `clip` redacts the whole body before shortening.
+          const snippet = clip(fromUpstream(text, secrets).replace(/\s+/g, " ").trim(), secrets, 200)
+          if (status === 401 && !adminOnly) {
+            return Effect.fail(haError({ message: "Home Assistant rejected the access token.", kind: "unauthorized", status, detail: `${method} ${path}: 401` }))
+          }
+          if (status === 401 || status === 403) {
+            return Effect.fail(haError({ message: "Home Assistant refused the request: the token's user may not be an administrator.", kind: "forbidden", status, detail: `${method} ${path}: ${status} ${snippet}` }))
+          }
+          return Effect.fail(haError({ message: status === 503 ? "Home Assistant is restarting." : "Home Assistant reported an error.", kind: "http", status, detail: `${method} ${path}: HTTP ${status} ${snippet}` }))
+        }),
+        Effect.catch((e): Effect.Effect<string | undefined, HomeAssistantError> => {
+          if (!("tooLarge" in e)) return Effect.fail(e)
+          // A successful service answer too large to read: the call happened, its answer is cut (Home Assistant's error
+          // answers are short; `@pva/net` does not say the status of an answer it did not read).
+          if (oversizedOk) return Effect.succeed(undefined)
+          return Effect.fail(haError({ message: "Home Assistant sent an answer that is too large.", kind: "invalid", detail: `${method} ${path}: more than ${maxBytes} bytes` }))
         })
-        // Raw here. A successful answer is content (room and light names feed targeting and the house
-        // state the model sees) and passes through untouched: generic token patterns would turn a room
-        // called "Basic Bedroom" into "Basic [redacted]" (fourth review, finding 4). Only diagnostics are
-        // redacted: an error body below (`clip`: the whole text redacted, then shortened), and whatever a
-        // caller puts in an error detail or a status line (`sanitize`, the status wrapper in `module.ts`).
-        const text = await readBounded(response, maxBytes)
-        return { status: response.status, text }
-      },
-      catch: (cause) =>
-        haError({
-          message: "I couldn't reach Home Assistant.",
-          kind: "unreachable",
-          detail: `${method} ${path}: ${describeCause(cause, secrets)}`
-        })
-    }).pipe(
-      Effect.timeoutOrElse({
-        duration: timeoutMs,
-        orElse: () =>
-          Effect.fail(
-            haError({
-              message: "Home Assistant didn't answer in time.",
-              kind: "timeout",
-              detail: `${method} ${path}: no answer within ${timeoutMs} ms`
-            })
-          )
-      }),
-      Effect.flatMap(({ status, text: body }): Effect.Effect<string | undefined, HomeAssistantError> => {
-        let text = body
-        // A successful answer too large to read: the call happened (a service call's caller says so, `responseCut`).
-        if (text === undefined && oversizedOk && status >= 200 && status < 300) return Effect.succeed(undefined)
-        // An error answer too large to read is still that error (its body is not needed to say so).
-        if (text === undefined && (status < 200 || status >= 300)) text = ""
-        if (text === undefined) {
-          return Effect.fail(haError({ message: "Home Assistant sent an answer that is too large.", kind: "invalid", status, detail: `${method} ${path}: more than ${maxBytes} bytes` }))
-        }
-        if (status >= 200 && status < 300) return Effect.succeed(text)
-        // A proxy in front of Home Assistant may echo the Authorization header: `clip` redacts the whole body before shortening.
-        const snippet = clip(fromUpstream(text, secrets).replace(/\s+/g, " ").trim(), secrets, 200)
-        if (status === 401 && !adminOnly) {
-          return Effect.fail(
-            haError({ message: "Home Assistant rejected the access token.", kind: "unauthorized", status, detail: `${method} ${path}: 401` })
-          )
-        }
-        if (status === 401 || status === 403) {
-          return Effect.fail(
-            haError({
-              message: "Home Assistant refused the request: the token's user may not be an administrator.",
-              kind: "forbidden",
-              status,
-              detail: `${method} ${path}: ${status} ${snippet}`
-            })
-          )
-        }
-        return Effect.fail(
-          haError({
-            message: status === 503 ? "Home Assistant is restarting." : "Home Assistant reported an error.",
-            kind: "http",
-            status,
-            detail: `${method} ${path}: HTTP ${status} ${snippet}`
-          })
-        )
-      })
-    )
+      )
     })
 
   // The last resort: anything unexpected (a defect) leaves as a sanitised `HomeAssistantError`.

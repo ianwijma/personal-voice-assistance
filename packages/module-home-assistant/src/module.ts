@@ -20,7 +20,7 @@ import {
 } from "@pva/core"
 import { Clock, Effect, Schema } from "effect"
 import { type HaServiceCall, HomeAssistant, homeLanguage, type JsonObject, type Language, say } from "@pva/module-contracts"
-import { checkAddressSetting, type HomeAssistantClient, type HomeAssistantConfig, HomeAssistantError, makeHomeAssistantClient, normalizeBaseUrl } from "./client.ts"
+import { checkAddressSetting, type HomeAssistantClient, type HomeAssistantConfig, HomeAssistantError, makeHomeAssistantClient, type NetDeps, normalizeBaseUrl } from "./client.ts"
 import {
   ALL,
   areaOfRoom,
@@ -54,8 +54,8 @@ import { type CallProblem, makeTransport } from "./service.ts"
 import { listOf, numberOf, sentence, type TextKey, texts } from "./texts.ts"
 
 export interface HomeAssistantDeps {
-  /** Injected in tests (an in-process fake: no test reaches the network). Default: the global `fetch`. */
-  readonly fetch?: typeof globalThis.fetch | undefined
+  /** `@pva/net`'s resolver and connector: in tests the kit's offline network (no test reaches the network). Default: the real ones. */
+  readonly net?: NetDeps | undefined
   /** How often the house is read again in the background. Default 60 s. */
   readonly refreshMs?: number | undefined
 }
@@ -151,6 +151,9 @@ const failureText = (lang: Language, e: HomeAssistantError): string => {
   switch (e.kind) {
     case "unreachable":
       return say(texts, lang, "unreachable")
+    case "unconfirmed":
+      // A read that was cut off: it changed nothing, so it is only that Home Assistant was not reached.
+      return say(texts, lang, "unreachable")
     case "timeout":
       return say(texts, lang, "timeoutRead")
     case "unauthorized":
@@ -189,6 +192,7 @@ const moduleStartError = (secrets: Secrets, fields: ConstructorParameters<typeof
 const startErrorFields = (e: HomeAssistantError, baseUrl: string): ConstructorParameters<typeof ModuleStartError>[0] => {
   switch (e.kind) {
     case "unreachable":
+    case "unconfirmed":
     case "timeout":
       return { message: `Could not reach Home Assistant at ${baseUrl} (${e.detail}). Check the address.`, cause: e }
     case "unauthorized":
@@ -328,7 +332,7 @@ const makeShared = (deps: HomeAssistantDeps, ctx: SharedContext<HomeAssistantSet
     const { baseUrl, token } = yield* checkedConnection(s)
     const timeoutMs = s.timeoutMs ?? 2000
     const aliases = s.aliases ?? ""
-    const client: HomeAssistantClient = makeHomeAssistantClient({ baseUrl, token, timeoutMs, fetch: deps.fetch })
+    const client: HomeAssistantClient = makeHomeAssistantClient({ baseUrl, token, timeoutMs, net: deps.net })
     const scope = yield* Effect.scope
     const listeners = new Set<() => void>()
     // The `HomeAssistant` transport over this cache: every kept read below is one of its polls.
@@ -566,7 +570,7 @@ const testConnection = (deps: HomeAssistantDeps, settings: HomeAssistantSettings
     const baseUrl = normalizeBaseUrl(settings.baseUrl)
     if (baseUrl === undefined) return { ok: false, text: "Enter the address of your Home Assistant server first.", tone: "error" as const }
     if (settings.token === undefined) return { ok: false, text: "Enter and save a long-lived access token first.", tone: "error" as const }
-    const client = makeHomeAssistantClient({ baseUrl, token: settings.token, timeoutMs: Math.min(settings.timeoutMs, START_CALL_MS), fetch: deps.fetch })
+    const client = makeHomeAssistantClient({ baseUrl, token: settings.token, timeoutMs: Math.min(settings.timeoutMs, START_CALL_MS), net: deps.net })
     const started = yield* Clock.currentTimeMillis
     const failed = (e: HomeAssistantError) => ({ ok: false, text: clip(startErrorFields(e, baseUrl).message, secrets, 400), tone: "error" as const })
     const config = yield* Effect.result(client.config())
@@ -604,7 +608,7 @@ const checkHealth = (deps: HomeAssistantDeps, settings: HomeAssistantSettings | 
     if (settings.token === undefined) {
       return [{ id: "home-assistant.no-token", severity: "error" as const, title: "No Home Assistant token", detail: "Enter a long-lived access token from your Home Assistant profile on the module's page." }]
     }
-    const client = makeHomeAssistantClient({ baseUrl, token: settings.token, timeoutMs: Math.min(settings.timeoutMs, START_CALL_MS), fetch: deps.fetch })
+    const client = makeHomeAssistantClient({ baseUrl, token: settings.token, timeoutMs: Math.min(settings.timeoutMs, START_CALL_MS), net: deps.net })
     const got = yield* Effect.result(client.config())
     if (got._tag === "Success") return []
     const e = got.failure
@@ -1198,5 +1202,5 @@ const defineHomeAssistant = (deps: HomeAssistantDeps) =>
 /** Lights, switches, heating and blinds through Home Assistant (docs/modules/home-assistant.md). */
 export const homeAssistantModule = (deps: HomeAssistantDeps = {}) => defineHomeAssistant(deps)
 
-/** The module as registered in the app's catalogue (real `fetch`, 60 s refresh). */
+/** The module as registered in the app's catalogue (`@pva/net`'s own resolver and connector, 60 s refresh). */
 export const homeAssistant = homeAssistantModule()

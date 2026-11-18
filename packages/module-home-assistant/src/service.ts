@@ -285,14 +285,17 @@ export const makeTransport = (deps: TransportDeps) => {
       const returnResponse = call.returnResponse === true
       return deps.call(domain, service, { ...data, entity_id: [...ids] }, { timeoutMs: Math.min(limitMs, HA_LIMITS.callTimeoutMs), maxBytes: 256 * 1024, returnResponse }).pipe(
         Effect.mapError((e): CallProblem => {
-          // Home Assistant answered with an error: it says so. Anything else (no answer, a broken connection, an answer
-          // that could not be read) after the request was sent: it may or may not have happened, and is never retried.
-          const answered = e.kind === "http" || e.kind === "unauthorized" || e.kind === "forbidden"
+          // Home Assistant answered with an error: it says so. Not reached at all (the connection refused, a redirect
+          // answer, which is never followed): nothing happened. Anything else after the request may have reached it (no
+          // answer in time, a connection broken mid-way, an answer that could not be read): it may or may not have
+          // happened, and is never sent again.
+          if (e.kind === "http" || e.kind === "unauthorized" || e.kind === "forbidden") return { reason: "failed", detail: fromUpstream(`${domain}.${service}: ${e.detail}`, deps.secrets), cause: e }
+          if (e.kind === "unreachable") return { reason: "not_connected", detail: fromUpstream(`${domain}.${service}: not sent: ${e.detail}`, deps.secrets), cause: e }
           return {
-            reason: answered ? "failed" : "timeout",
-            detail: fromUpstream(`${domain}.${service}: ${answered ? "" : "no confirmed answer (it may or may not have happened): "}${e.detail}`, deps.secrets),
+            reason: "timeout",
+            detail: fromUpstream(`${domain}.${service}: no confirmed answer (it may or may not have happened): ${e.detail}`, deps.secrets),
             cause: e,
-            ...(answered ? {} : { unconfirmed: true })
+            unconfirmed: true
           }
         }),
         Effect.map((text): HaServiceResult => {

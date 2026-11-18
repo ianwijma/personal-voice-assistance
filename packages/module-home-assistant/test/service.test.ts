@@ -18,7 +18,7 @@ const start = (options: { readonly entities?: Record<string, FakeEntity>; readon
   Effect.gen(function*() {
     const ha = makeFakeHa(options.entities !== undefined ? { entities: options.entities } : {})
     if (options.down === true) ha.down()
-    const kit = yield* startTestModule(homeAssistantModule({ fetch: ha.fetch }), configured({ aliases: "scene.movie_time: movie time", ...options.settings }))
+    const kit = yield* startTestModule(homeAssistantModule({ net: ha.net }), configured({ aliases: "scene.movie_time: movie time", ...options.settings }))
     const service = kit.service(HomeAssistant)
     assert.isDefined(service)
     ha.requests.length = 0
@@ -328,8 +328,10 @@ describe("HomeAssistant service: callService", () => {
       const through = yield* Effect.flip(service.callService({ domain: "homeassistant", service: "turn_on", target: { entityIds: ["script.goodnight"] } }))
       assert.strictEqual(through.reason, "refused")
       assert.deepStrictEqual(ha.calls(), [])
-      // Not even read: no script is in the house the module knows.
-      assert.isFalse(ha.pages().some((p) => p.domains.includes("script") || (p.ids ?? []).includes("script.goodnight")))
+      // Not even read: no page since the start asked for a script (the kit's network recorded every request).
+      const asked = ha.sent.filter((r) => r.url.endsWith("/api/template")).map((r) => (JSON.parse(r.body!) as { variables: { domains: Array<string>; ids: Array<string> | null } }).variables)
+      assert.isAbove(asked.length, 0)
+      assert.isFalse(asked.some((p) => p.domains.includes("script") || (p.ids ?? []).includes("script.goodnight")))
     }))
 })
 
@@ -374,7 +376,7 @@ describe("HomeAssistant service: a consumer beside it", () => {
   it.effect("finds the service through useService, calls it as its own tool's call, and words the provider being off", () =>
     Effect.gen(function*() {
       const ha = makeFakeHa()
-      const kit = yield* startTestModule(homeAssistantModule({ fetch: ha.fetch }), { ...configured(), others: [consumer] })
+      const kit = yield* startTestModule(homeAssistantModule({ net: ha.net }), { ...configured(), others: [consumer] })
       assert.strictEqual((yield* kit.tool("consumer_people", {})).value, "Robin: not_home")
       assert.strictEqual((yield* kit.tool("consumer_pause", {})).value, "Paused.")
       assert.deepStrictEqual(ha.calls(), [{ service: "media_player.media_pause", body: { entity_id: ["media_player.kitchen"] } }])

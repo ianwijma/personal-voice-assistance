@@ -54,7 +54,7 @@ describe("credentials never leak (module-home-assistant)", () => {
             const logs: Array<string> = []
             const ha = makeFakeHa({ token: key })
             ha.answer(route, answer)
-            const kit = yield* startTestModule(homeAssistantModule({ fetch: ha.fetch }), { settings: { baseUrl: URL_BASE }, secrets: { token: key } }).pipe(Effect.provide(captureLogs(logs)))
+            const kit = yield* startTestModule(homeAssistantModule({ net: ha.net }), { settings: { baseUrl: URL_BASE }, secrets: { token: key } }).pipe(Effect.provide(captureLogs(logs)))
             assertNoLeak([key], `${route} ${what}`, `${serialise(kit.info())}\n${serialise(kit.issues())}\n${logs.join("\n")}`)
             assert.match(serialise(kit.info()), /Home Assistant/, `${route} ${what}`)
             if (key.length >= 4) yield* kit.expectNoSecrets()
@@ -68,7 +68,7 @@ describe("credentials never leak (module-home-assistant)", () => {
         for (const [what, failure] of failures(p)) {
           const logs: Array<string> = []
           const ha = makeFakeHa({ token: key })
-          const kit = yield* startTestModule(homeAssistantModule({ fetch: ha.fetch }), { settings: { baseUrl: URL_BASE }, secrets: { token: key } }).pipe(Effect.provide(captureLogs(logs)))
+          const kit = yield* startTestModule(homeAssistantModule({ net: ha.net }), { settings: { baseUrl: URL_BASE }, secrets: { token: key } }).pipe(Effect.provide(captureLogs(logs)))
           ha.answer("template", failure)
           ha.answer("service", failure)
           ha.answer("config", failure)
@@ -90,11 +90,11 @@ describe("credentials never leak (module-home-assistant)", () => {
       const { user, password, query } = ADDRESS_SECRETS
       const address = `http://${user}:${password}@ha.test:8123?token=${query}`
       const ha = makeFakeHa()
-      const kit = yield* startTestModule(homeAssistantModule({ fetch: ha.fetch }), { settings: { baseUrl: address }, secrets: { token: KEYS[0] } })
+      const kit = yield* startTestModule(homeAssistantModule({ net: ha.net }), { settings: { baseUrl: address }, secrets: { token: KEYS[0] } })
       assert.notStrictEqual(kit.info()?.state, "running")
       const problem = checkAddressSetting(address)
       assert.isDefined(problem)
-      const client = makeHomeAssistantClient({ baseUrl: address, token: KEYS[0], timeoutMs: 300, fetch: ha.fetch })
+      const client = makeHomeAssistantClient({ baseUrl: address, token: KEYS[0], timeoutMs: 300, net: ha.net })
       const exit = yield* Effect.exit(client.config())
       assertNoLeak([KEYS[0], user, password, query], "address", `${serialise(kit.info())}\n${serialise(kit.issues())}\n${problem}\n${serialise(exit)}\n${client.baseUrl}`)
       assert.deepStrictEqual(ha.requests, [])

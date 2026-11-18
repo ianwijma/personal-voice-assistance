@@ -10,7 +10,7 @@ import { configured, makeFakeHa } from "./fakeHa.ts"
 const start = (options: { readonly aliases?: string; readonly dutch?: boolean; readonly devices?: ReadonlyArray<{ readonly id: string; readonly name: string; readonly room?: string }> } = {}) =>
   Effect.gen(function*() {
     const ha = makeFakeHa()
-    const kit = yield* startTestModule(homeAssistantModule({ fetch: ha.fetch }), {
+    const kit = yield* startTestModule(homeAssistantModule({ net: ha.net }), {
       ...configured({ aliases: options.aliases ?? "scene.movie_time: movie time, filmavond\nLiving room: lounge, woonkamer" }),
       ...(options.dutch === true || options.devices !== undefined
         ? { household: { ...(options.dutch === true ? { home: { HOME_LANGUAGE: "nl-NL" } } : {}), ...(options.devices !== undefined ? { devices: options.devices } : {}) } }
@@ -207,7 +207,7 @@ describe("home-assistant: home_state", () => {
       const entities: Record<string, { name: string; state: string; area: string }> = {}
       for (let i = 0; i < 75; i++) entities[`light.lamp_${String(i).padStart(2, "0")}`] = { name: `Lamp ${i}`, state: "off", area: "kitchen" }
       const ha = makeFakeHa({ entities })
-      const kit = yield* startTestModule(homeAssistantModule({ fetch: ha.fetch }), configured())
+      const kit = yield* startTestModule(homeAssistantModule({ net: ha.net }), configured())
       for (const input of [{}, { area: "kitchen" }, { kind: "light" as const }]) {
         const r = yield* kit.tool("home_state", input)
         const value = r.value as { readonly rooms: ReadonlyArray<{ readonly things: ReadonlyArray<string> }>; readonly more: number }

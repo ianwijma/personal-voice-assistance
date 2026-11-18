@@ -13,7 +13,7 @@ describe("home-assistant: the module", () => {
   it.effect("passes the conformance check, with its texts in both languages", () =>
     Effect.gen(function*() {
       const ha = makeFakeHa()
-      yield* checkModule(homeAssistantModule({ fetch: ha.fetch }), { ...configured({ aliases: "scene.movie_time: movie time" }), texts })
+      yield* checkModule(homeAssistantModule({ net: ha.net }), { ...configured({ aliases: "scene.movie_time: movie time" }), texts })
     }))
 
   it.effect("is off by default, and the package's catalogue holds the production definition", () =>
@@ -27,7 +27,7 @@ describe("home-assistant: the module", () => {
   it.effect("keeps the settings an owner already has: the same fields, in the same order, with the same switches", () =>
     Effect.gen(function*() {
       const ha = makeFakeHa()
-      const kit = yield* startTestModule(homeAssistantModule({ fetch: ha.fetch }), configured())
+      const kit = yield* startTestModule(homeAssistantModule({ net: ha.net }), configured())
       assert.deepStrictEqual(kit.info()?.settings.fields.map((f) => [f.key, f.overridable === true]), [
         ["baseUrl", false],
         ["token", false],
@@ -39,7 +39,7 @@ describe("home-assistant: the module", () => {
         ["test", false]
       ])
       // An owner's old choice ("lights only") is still a valid value.
-      const old = yield* startTestModule(homeAssistantModule({ fetch: ha.fetch }), configured({ domains: ["light"], aliases: "Living room: lounge", timeoutMs: 2000 }))
+      const old = yield* startTestModule(homeAssistantModule({ net: ha.net }), configured({ domains: ["light"], aliases: "Living room: lounge", timeoutMs: 2000 }))
       assert.strictEqual(old.info()?.state, "running")
       assert.deepStrictEqual(old.toolNames(), ["home_state", "home-assistant_lights_on", "home-assistant_lights_off", "home-assistant_set_brightness", "home-assistant_lights_status"])
     }))
@@ -47,7 +47,7 @@ describe("home-assistant: the module", () => {
   it.effect("starts with one config request and the house in pages; its status line and form say what it read", () =>
     Effect.gen(function*() {
       const ha = makeFakeHa()
-      const kit = yield* startTestModule(homeAssistantModule({ fetch: ha.fetch }), configured({ aliases: "scene.movie_time: movie time" }))
+      const kit = yield* startTestModule(homeAssistantModule({ net: ha.net }), configured({ aliases: "scene.movie_time: movie time" }))
       assert.strictEqual(kit.info()?.state, "running")
       // The config, then one page each: the people (with the areas), the kinds the service exposes, the named scene.
       assert.deepStrictEqual(ha.requests.map((r) => `${r.method} ${r.path}`), ["GET /api/config", "POST /api/template", "POST /api/template", "POST /api/template"])
@@ -86,7 +86,7 @@ describe("home-assistant: the module", () => {
   it.effect("an assistant that chose fewer kinds of devices gets only their actions; scenes need a name under Other names", () =>
     Effect.gen(function*() {
       const ha = makeFakeHa()
-      const kit = yield* startTestModule(homeAssistantModule({ fetch: ha.fetch }), {
+      const kit = yield* startTestModule(homeAssistantModule({ net: ha.net }), {
         ...configured(),
         household: { assistants: [{ id: "jeff", modules: { "home-assistant": { own: { domains: ["light", "lock"] } } } }] }
       })
@@ -108,7 +108,7 @@ describe("home-assistant: the module", () => {
   it.effect("a house without a kind offers none of its actions; when one appears, the module starts again with them", () =>
     Effect.gen(function*() {
       const ha = makeFakeHa({ entities: { "light.kitchen": { name: "Kitchen light", state: "off", area: "kitchen" } } })
-      const kit = yield* startTestModule(homeAssistantModule({ fetch: ha.fetch }), configured())
+      const kit = yield* startTestModule(homeAssistantModule({ net: ha.net }), configured())
       assert.deepStrictEqual(kit.toolNames(), ["home_state", "home-assistant_lights_on", "home-assistant_lights_off", "home-assistant_set_brightness", "home-assistant_lights_status"])
       ha.entities["climate.kitchen"] = { name: "Kitchen thermostat", state: "heat", area: "kitchen", current: 19, target: 20 }
       yield* kit.advance(60_000)
@@ -121,7 +121,7 @@ describe("home-assistant: the module", () => {
   it.effect("a restart reads the house again and offers the same", () =>
     Effect.gen(function*() {
       const ha = makeFakeHa()
-      const kit = yield* startTestModule(homeAssistantModule({ fetch: ha.fetch }), configured())
+      const kit = yield* startTestModule(homeAssistantModule({ net: ha.net }), configured())
       const before = kit.toolNames()
       const templates = () => ha.requests.filter((r) => r.path === "/api/template").length
       // Everything so far is the start's one read.
@@ -139,12 +139,12 @@ describe("home-assistant: settings that are invalid", () => {
   it.effect("no address, no token, an address with a password: the module is down and says what to fix, never repeating it", () =>
     Effect.gen(function*() {
       const ha = makeFakeHa()
-      const none = yield* startTestModule(homeAssistantModule({ fetch: ha.fetch }), { secrets: { token: TOKEN } })
+      const none = yield* startTestModule(homeAssistantModule({ net: ha.net }), { secrets: { token: TOKEN } })
       assert.strictEqual(none.info()?.state, "error")
       assert.include(none.info()?.error ?? "", "Enter the address of your Home Assistant server")
-      const noToken = yield* startTestModule(homeAssistantModule({ fetch: ha.fetch }), { settings: { baseUrl: URL_BASE } })
+      const noToken = yield* startTestModule(homeAssistantModule({ net: ha.net }), { settings: { baseUrl: URL_BASE } })
       assert.strictEqual(noToken.info()?.state, "error")
-      const withPassword = yield* startTestModule(homeAssistantModule({ fetch: ha.fetch }), { settings: { baseUrl: "http://sam:hunter2-secret@ha.test:8123" }, secrets: { token: TOKEN } })
+      const withPassword = yield* startTestModule(homeAssistantModule({ net: ha.net }), { settings: { baseUrl: "http://sam:hunter2-secret@ha.test:8123" }, secrets: { token: TOKEN } })
       assert.strictEqual(withPassword.info()?.state, "error")
       assert.notInclude(JSON.stringify(withPassword.info()), "hunter2-secret")
       assert.notInclude(JSON.stringify(withPassword.issues()), "hunter2-secret")
@@ -155,21 +155,21 @@ describe("home-assistant: settings that are invalid", () => {
   it.effect("other names that are not \"name: other names\", and a timeout out of range, are refused with the field's reason", () =>
     Effect.gen(function*() {
       const ha = makeFakeHa()
-      const bad = yield* startTestModule(homeAssistantModule({ fetch: ha.fetch }), configured({ aliases: "just words without a colon" }))
+      const bad = yield* startTestModule(homeAssistantModule({ net: ha.net }), configured({ aliases: "just words without a colon" }))
       assert.notStrictEqual(bad.info()?.state, "running")
       assert.include(JSON.stringify(bad.info()?.settings.errors), "Line 1")
-      const slow = yield* startTestModule(homeAssistantModule({ fetch: ha.fetch }), configured({ timeoutMs: 60_000 }))
+      const slow = yield* startTestModule(homeAssistantModule({ net: ha.net }), configured({ timeoutMs: 60_000 }))
       assert.notStrictEqual(slow.info()?.state, "running")
     }))
 
   it.effect("a token Home Assistant refuses, or a user who is not an administrator, is a start error the owner can act on", () =>
     Effect.gen(function*() {
       const wrong = makeFakeHa({ token: "another-token" })
-      const refused = yield* startTestModule(homeAssistantModule({ fetch: wrong.fetch }), configured())
+      const refused = yield* startTestModule(homeAssistantModule({ net: wrong.net }), configured())
       assert.strictEqual(refused.info()?.state, "error")
       assert.include(refused.info()?.error ?? "", "rejected the token")
       const user = makeFakeHa({ nonAdmin: true })
-      const notAdmin = yield* startTestModule(homeAssistantModule({ fetch: user.fetch }), configured())
+      const notAdmin = yield* startTestModule(homeAssistantModule({ net: user.net }), configured())
       assert.strictEqual(notAdmin.info()?.state, "error")
       assert.include(notAdmin.info()?.error ?? "", "must be an administrator")
       yield* refused.expectNoSecrets()
@@ -180,7 +180,7 @@ describe("home-assistant: health and the Test button", () => {
   it.effect("health: nothing and no request while it is off, set up or not; the address, the token and the server while it runs", () =>
     Effect.gen(function*() {
       const ha = makeFakeHa()
-      const health = homeAssistantModule({ fetch: ha.fetch }).health!
+      const health = homeAssistantModule({ net: ha.net }).health!
       const base = { baseUrl: "", token: undefined, domains: ["light"] as const, aliases: "", timeoutMs: 2000, server: "", lists: "" } as never
       assert.deepStrictEqual(yield* health({ settings: base, running: false }), [])
       // Configured, and off: Home Assistant is not contacted at all.
@@ -197,18 +197,18 @@ describe("home-assistant: health and the Test button", () => {
       assert.deepStrictEqual(ids(yield* health({ settings: good, running: true })), ["home-assistant.unreachable"])
       ha.ok()
       const wrong = makeFakeHa({ token: "another-token" })
-      assert.deepStrictEqual(ids(yield* homeAssistantModule({ fetch: wrong.fetch }).health!({ settings: good, running: true })), ["home-assistant.token-refused"])
+      assert.deepStrictEqual(ids(yield* homeAssistantModule({ net: wrong.net }).health!({ settings: good, running: true })), ["home-assistant.token-refused"])
     }))
 
   it.effect("configured but switched off: no request at the start, on Check again or from the host's own health run; the Test button is the owner's to press", () =>
     Effect.gen(function*() {
       const ha = makeFakeHa()
-      const kit = yield* startTestModule(homeAssistantModule({ fetch: ha.fetch }), { ...configured(), started: false })
+      const kit = yield* startTestModule(homeAssistantModule({ net: ha.net }), { ...configured(), started: false })
       assert.notStrictEqual(kit.info()?.state, "running")
       assert.deepStrictEqual(yield* kit.checkHealth, [])
       yield* kit.advance(5 * 60_000)
       assert.deepStrictEqual(ha.requests, [])
-      const test = homeAssistantModule({ fetch: ha.fetch }).fieldActions!.test!
+      const test = homeAssistantModule({ net: ha.net }).fieldActions!.test!
       const pressed = yield* test({ settings: { baseUrl: URL_BASE, token: TOKEN, domains: ["light"], aliases: "", timeoutMs: 2000, server: "", lists: "" } as never, draft: false })
       assert.isTrue(pressed.ok)
       assert.isAbove(ha.requests.length, 0)
@@ -217,7 +217,7 @@ describe("home-assistant: health and the Test button", () => {
   it.effect("health through the host: Check again reports an unreachable Home Assistant, and clears when it answers", () =>
     Effect.gen(function*() {
       const ha = makeFakeHa()
-      const kit = yield* startTestModule(homeAssistantModule({ fetch: ha.fetch }), configured())
+      const kit = yield* startTestModule(homeAssistantModule({ net: ha.net }), configured())
       assert.deepStrictEqual(yield* kit.checkHealth, [])
       ha.down()
       assert.deepStrictEqual((yield* kit.checkHealth).map((i) => i.id), ["home-assistant.unreachable"])
@@ -228,7 +228,7 @@ describe("home-assistant: health and the Test button", () => {
   it.effect("the Test button connects with the given settings and says what it found", () =>
     Effect.gen(function*() {
       const ha = makeFakeHa()
-      const test = homeAssistantModule({ fetch: ha.fetch }).fieldActions!.test!
+      const test = homeAssistantModule({ net: ha.net }).fieldActions!.test!
       const settings = { baseUrl: URL_BASE, token: TOKEN, domains: ["light"], aliases: "", timeoutMs: 2000, server: "", lists: "" } as never
       const ok = yield* test({ settings, draft: true })
       assert.isTrue(ok.ok)

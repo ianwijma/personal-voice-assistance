@@ -13,7 +13,7 @@ describe("home-assistant: unreachable", () => {
     Effect.gen(function*() {
       const ha = makeFakeHa()
       ha.down()
-      const kit = yield* startTestModule(homeAssistantModule({ fetch: ha.fetch }), configured())
+      const kit = yield* startTestModule(homeAssistantModule({ net: ha.net }), configured())
       assert.strictEqual(kit.info()?.state, "running")
       assert.strictEqual(kit.info()?.status?.tone, "warning")
       assert.include(kit.info()?.status?.text ?? "", "Can't read Home Assistant yet")
@@ -35,7 +35,7 @@ describe("home-assistant: unreachable", () => {
   it.effect("down later: the last list is kept, the status says since when, and a command says it could not reach it", () =>
     Effect.gen(function*() {
       const ha = makeFakeHa()
-      const kit = yield* startTestModule(homeAssistantModule({ fetch: ha.fetch }), configured())
+      const kit = yield* startTestModule(homeAssistantModule({ net: ha.net }), configured())
       ha.down()
       yield* kit.advance(60_000)
       assert.strictEqual(kit.info()?.status?.tone, "warning")
@@ -47,9 +47,9 @@ describe("home-assistant: unreachable", () => {
   it.effect("in Dutch", () =>
     Effect.gen(function*() {
       const ha = makeFakeHa()
-      const kit = yield* startTestModule(homeAssistantModule({ fetch: ha.fetch }), { ...configured(), household: { home: { HOME_LANGUAGE: "nl-NL" } } })
+      const kit = yield* startTestModule(homeAssistantModule({ net: ha.net }), { ...configured(), household: { home: { HOME_LANGUAGE: "nl-NL" } } })
       ha.down("service")
-      assert.deepStrictEqual(yield* kit.action("lights_off", { target: "kitchen" }), { ok: false, code: "failed", message: "Ik heb het naar Home Assistant gestuurd, maar kon niet nagaan of het gebeurd is; misschien wel, misschien niet." })
+      assert.deepStrictEqual(yield* kit.action("lights_off", { target: "kitchen" }), { ok: false, code: "failed", message: "Ik kon Home Assistant niet bereiken." })
     }))
 })
 
@@ -57,7 +57,7 @@ describe("home-assistant: slow", () => {
   it.effect("a command that gets no answer stops after 3 s, within the action's 5 s, says it may or may not have happened, and is not sent again", () =>
     Effect.gen(function*() {
       const ha = makeFakeHa()
-      const kit = yield* startTestModule(homeAssistantModule({ fetch: ha.fetch }), configured({ timeoutMs: 10_000 }))
+      const kit = yield* startTestModule(homeAssistantModule({ net: ha.net }), configured({ timeoutMs: 10_000 }))
       ha.hang("service")
       const fiber = yield* Effect.forkChild(kit.action("lights_off", { target: "kitchen" }))
       yield* kit.advance(3_000)
@@ -73,7 +73,7 @@ describe("home-assistant: slow", () => {
   it.effect("a question on a turn never waits behind a slow background read", () =>
     Effect.gen(function*() {
       const ha = makeFakeHa()
-      const kit = yield* startTestModule(homeAssistantModule({ fetch: ha.fetch }), configured({ timeoutMs: 10_000 }))
+      const kit = yield* startTestModule(homeAssistantModule({ net: ha.net }), configured({ timeoutMs: 10_000 }))
       // The next template request (the background read, a minute on, with a 10 s limit) hangs.
       let hung = false
       ha.answer("template", (init) => {
@@ -93,7 +93,7 @@ describe("home-assistant: slow", () => {
     Effect.gen(function*() {
       const ha = makeFakeHa()
       ha.hang("template")
-      const kit = yield* startTestModule(homeAssistantModule({ fetch: ha.fetch }), configured({ timeoutMs: 10_000 }))
+      const kit = yield* startTestModule(homeAssistantModule({ net: ha.net }), configured({ timeoutMs: 10_000 }))
       assert.strictEqual(kit.info()?.state, "running")
       assert.strictEqual(kit.info()?.status?.tone, "warning")
     }))
@@ -105,7 +105,7 @@ describe("home-assistant: rubbish", () => {
       for (const body of ["<html>proxy error</html>", "{\"areas\": 5}", "null", "[]"]) {
         const ha = makeFakeHa()
         ha.answer("template", respond(200, body, "text/plain"))
-        const kit = yield* startTestModule(homeAssistantModule({ fetch: ha.fetch }), configured())
+        const kit = yield* startTestModule(homeAssistantModule({ net: ha.net }), configured())
         assert.strictEqual(kit.info()?.state, "running", body)
         assert.include(kit.info()?.status?.text ?? "", "cannot read", body)
         assert.deepStrictEqual(yield* kit.action("lights_on", {}), { ok: false, code: "failed", message: "Home Assistant sent an answer I can't read." }, body)
@@ -131,42 +131,24 @@ describe("home-assistant: rubbish", () => {
           7
         ]
       }), "text/plain"))
-      const kit = yield* startTestModule(homeAssistantModule({ fetch: ha.fetch }), configured())
+      const kit = yield* startTestModule(homeAssistantModule({ net: ha.net }), configured())
       const r = yield* kit.tool("home_state", {})
       assert.deepStrictEqual(r.value, { note: OUTSIDE_NOTE, rooms: [{ room: "Kitchen", things: ["Kitchen light: on, 100%"] }, { room: "Without a room", things: ["Nameless: unknown"] }] })
     }))
 
-  it.effect("an answer larger than the limit is not read past it", () =>
+  it.effect("a page larger than the limit is asked again smaller, and an answer that stays too large is refused, not read", () =>
     Effect.gen(function*() {
       const ha = makeFakeHa()
-      let cancelled = false
-      ha.answer("template", () => {
-        const chunk = new TextEncoder().encode("x".repeat(64 * 1024))
-        let sent = 0
-        const body = new ReadableStream<Uint8Array>({
-          pull: (controller) => {
-            sent += chunk.byteLength
-            controller.enqueue(chunk)
-            if (sent > 64 * HOUSE_LIMITS.pageBytes) controller.close()
-          },
-          cancel: () => void (cancelled = true)
-        })
-        return new Response(body, { status: 200, headers: { "content-type": "text/plain" } })
-      })
-      const kit = yield* startTestModule(homeAssistantModule({ fetch: ha.fetch }), configured())
-      assert.isTrue(cancelled)
+      ha.answer("template", () => ({ status: 200, headers: { "content-type": "text/plain" }, body: "x".repeat(HOUSE_LIMITS.pageBytes + 1) }))
+      const kit = yield* startTestModule(homeAssistantModule({ net: ha.net }), configured())
       assert.include(kit.info()?.status?.text ?? "", "too large")
-      // A declared length over the limit is refused before the body is read.
-      const declared = makeFakeHa()
-      declared.answer("template", () => new Response("{}", { status: 200, headers: { "content-length": String(HOUSE_LIMITS.pageBytes + 1) } }))
-      const other = yield* startTestModule(homeAssistantModule({ fetch: declared.fetch }), configured())
-      assert.include(other.info()?.status?.text ?? "", "too large")
+      assert.deepStrictEqual(ha.pages().map((p) => p.size), [HOUSE_LIMITS.pageRows, HOUSE_LIMITS.pageRows / 8, 3, 1])
     }))
 
   it.effect("errors from Home Assistant: 503 restarting, 500, a token refused later", () =>
     Effect.gen(function*() {
       const ha = makeFakeHa()
-      const kit = yield* startTestModule(homeAssistantModule({ fetch: ha.fetch }), configured())
+      const kit = yield* startTestModule(homeAssistantModule({ net: ha.net }), configured())
       ha.answer("service", respond(503, "{\"message\": \"starting\"}"))
       assert.deepStrictEqual(yield* kit.action("lights_on", { target: "kitchen" }), { ok: false, code: "failed", message: "Home Assistant is restarting. Try again in a minute." })
       ha.answer("service", respond(500, "{\"message\": \"boom\"}"))
@@ -178,7 +160,7 @@ describe("home-assistant: rubbish", () => {
   it.effect("a device removed in Home Assistant since: after the next read it is no longer a name the command takes", () =>
     Effect.gen(function*() {
       const ha = makeFakeHa()
-      const kit = yield* startTestModule(homeAssistantModule({ fetch: ha.fetch }), configured())
+      const kit = yield* startTestModule(homeAssistantModule({ net: ha.net }), configured())
       delete ha.entities["light.bedside"]
       yield* kit.advance(60_000)
       const r = yield* kit.action("lights_on", { target: "bedside lamp" })

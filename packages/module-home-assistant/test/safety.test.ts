@@ -22,7 +22,7 @@ const UNMOVED: Record<string, FakeEntity> = {
 const start = (entities: Record<string, FakeEntity>, aliases = "") =>
   Effect.gen(function*() {
     const ha = makeFakeHa({ entities })
-    const kit = yield* startTestModule(homeAssistantModule({ fetch: ha.fetch }), {
+    const kit = yield* startTestModule(homeAssistantModule({ net: ha.net }), {
       ...configured({ aliases }),
       household: { devices: [{ id: "garage-speaker", name: "Garage speaker", room: "Garage" }, { id: "kitchen-display", name: "Kitchen display", room: "Kitchen" }] }
     })
