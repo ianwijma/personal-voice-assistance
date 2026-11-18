@@ -1,8 +1,8 @@
 // Serve mode driven by the scripted client, with injected providers (docs/UI-AND-MODULES.md §6.1).
 import { endOfTurn, eagerEndOfTurn, interim, speechStarted } from "@pva/core/testing"
 import { CloseCode, PROTOCOL_VERSION } from "@pva/protocol"
-import { defineModule, type ModuleDefinition } from "@pva/core"
-import { Effect } from "effect"
+import { defineModule, type ModuleDefinition, Tts } from "@pva/core"
+import { Effect, Stream } from "effect"
 import { readFileSync, statSync, writeFileSync } from "node:fs"
 import { join } from "node:path"
 import { afterEach, describe, expect, it, vi } from "vitest"
@@ -120,7 +120,13 @@ describe("serve: handshake", () => {
 
 describe("serve: a voice turn", () => {
   it("claim, microphone frames reach the recogniser, and the message sequence of §2.5", async () => {
-    const { stt } = await basic((t) => `It's sunny in ${t.replace(/\?$/, "").split(" ").at(-1)}, eighteen degrees. Light wind.`)
+    // The voice notes each clause it is given: a clause reaches it right after the conversation queued it.
+    const voiced: Array<string> = []
+    const tone = toneTts()
+    const tts = Tts.of({ sampleRate: tone.sampleRate, synthesize: (clauses) => tone.synthesize(clauses.pipe(Stream.tap((c) => Effect.sync(() => voiced.push(c))))) })
+    const stt = controlledStt()
+    const llm = scriptedLlm((t) => `It's sunny in ${t.replace(/\?$/, "").split(" ").at(-1)}, eighteen degrees. Light wind.`)
+    server = await startTestServer({ build: fakeBuild({ stt: stt.stt, llm: llm.llm, tts }) })
     const owner = await connect()
     await owner.hello()
     const from = owner.messages.length
@@ -133,7 +139,11 @@ describe("serve: a voice turn", () => {
 
     stt.emit(speechStarted, interim("what's the"), interim("what's the weather in Paris"), eagerEndOfTurn("What's the weather in Paris?"))
     await owner.waitFor("state", (m) => m.state === "hearing", { from })
-    await sleep(30)
+    // The speculative turn has queued its first clause before it is promoted, so that clause's `assistant.text` goes
+    // out with the promotion, before the reply starts. (Promoted before its first clause, the reply starts first: a
+    // turn's reply starts at its promotion, its clauses as the model writes them.)
+    for (let i = 0; i < 500 && voiced.length === 0; i++) await sleep(10)
+    expect(voiced[0]).toBe("It's sunny in Paris,")
     stt.emit(endOfTurn("What's the weather in Paris?"))
     const end = await owner.waitFor("turn.end", () => true, { from, timeoutMs: 10_000 })
     expect(end.outcome).toBe("completed")

@@ -212,22 +212,26 @@ describe("finding 1: the cache key includes the request headers", () => {
 describe("finding 23: concurrent misses share one request", () => {
   const gate = () => {
     const pending: Array<(r: SafeResponse) => void> = []
+    /** Resolved once a request is waiting for its answer (made in a fiber of its own: not at once on a busy machine). */
+    let markWaiting!: () => void
+    const waiting = new Promise<void>((resolve) => (markWaiting = resolve))
     let calls = 0
     let signal: AbortSignal | undefined
     const fetch = (_url: string, _o: SafeFetchOptions) => {
       calls++
-      return Effect.tryPromise({ try: (s) => { signal = s; return new Promise<SafeResponse>((r) => { pending.push(r) }) }, catch: () => new NetFailure({ url: "x", stage: "connect", detail: "x" }) })
+      return Effect.tryPromise({ try: (s) => { signal = s; return new Promise<SafeResponse>((r) => { pending.push(r); markWaiting() }) }, catch: () => new NetFailure({ url: "x", stage: "connect", detail: "x" }) })
     }
     /** Answers every request still waiting. */
     const open = (r: SafeResponse) => { for (const p of pending.splice(0)) p(r) }
-    return { fetch, open, calls: () => calls, signal: () => signal }
+    return { fetch, open, waiting, calls: () => calls, signal: () => signal }
   }
   it("two callers, one request, both get the value", async () => {
     const g = gate()
     const api = makeCachedJson({ fetch: g.fetch })
     const a = Effect.runPromise(api.getJson("http://x/a", { ttlMs: 1000 }))
     const b = Effect.runPromise(api.getJson("http://x/a", { ttlMs: 1000 }))
-    await new Promise((r) => setTimeout(r, 5))
+    // Answered once the shared request waits (both callers joined it before it was made).
+    await g.waiting
     g.open(json(200, '{"v":1}'))
     expect([(await a).value, (await b).value]).toEqual([{ v: 1 }, { v: 1 }])
     expect(g.calls()).toBe(1)
