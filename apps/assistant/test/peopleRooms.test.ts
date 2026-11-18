@@ -84,6 +84,21 @@ describe("Members: ids and the People service", () => {
     expect(forced[RETIRED_KEY]).toEqual(["p-sam00001"])
   })
 
+  it("round 4 follow-up: over a committed value invalid as a whole, a save keeps the ids that value carries (not retired ones); over a valid one, only members' ids", () => {
+    const committed = { [MEMBERS_KEY]: [{ id: "p-sam00001", name: "Sam", aliases: 17 }, { id: "p-robin001", name: "Robin" }, { id: "p-jo000001", name: "Jo" }], [RETIRED_KEY]: ["p-jo000001", "p-old00001"] }
+    expect(effectiveMembersOf(committed).valid).toBe(false)
+    const out = withPersonIds({ [MEMBERS_KEY]: [{ id: "p-sam00001", name: "Sam" }, { id: "p-robin001", name: "Robin" }, { id: "p-sam00001", name: "Copy" }, { id: "p-jo000001", name: "Kim" }, { id: "p-old00001", name: "Ed" }, { id: "p-madeup01", name: "Di" }] as never }, committed)
+    const ids = (out[MEMBERS_KEY] as unknown as ReadonlyArray<Json>).map((m) => m.id as string)
+    expect(ids.slice(0, 2)).toEqual(["p-sam00001", "p-robin001"])
+    for (const [i, not] of [[2, "p-sam00001"], [3, "p-jo000001"], [4, "p-old00001"], [5, "p-madeup01"]] as const) expect(ids[i]).not.toBe(not)
+    expect(new Set(ids).size).toBe(6)
+    // Nothing kept is retired; nothing new is retired either (Sam and Robin stay; Jo was retired already).
+    expect(out[RETIRED_KEY]).toEqual(["p-jo000001", "p-old00001"])
+    // The valid rule is unchanged: an id the committed value merely mentions (a retired record pasted back) is not kept.
+    const valid = { [MEMBERS_KEY]: [{ id: "p-robin001", name: "Robin" }], [RETIRED_KEY]: [] }
+    expect((withPersonIds({ [MEMBERS_KEY]: [{ id: "p-robin001", name: "Robin" }, { id: "p-sam00001", name: "Sam" }] as never }, valid)[MEMBERS_KEY] as unknown as ReadonlyArray<Json>)[1]!.id).not.toBe("p-sam00001")
+  })
+
   it("review round 3: Members are read repaired at load: a second record with an id already seen gets a fresh, stable id; the shared id is ambiguous", () => {
     const raw = [{ id: "p-same0001", name: "Ann" }, { id: "p-same0001", name: "Bo" }, { name: "Cy" }]
     const a = effectiveMembersOf({ [MEMBERS_KEY]: raw })

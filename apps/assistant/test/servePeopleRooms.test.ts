@@ -1297,11 +1297,109 @@ describe("review round 4: Members that do not pass validation as a whole are nob
   })
 })
 
+// Follow-up to review round 4: an invalid Members value withholds everything personal in memory, but nothing is
+// written because of it, and correcting it keeps every identity.
+describe("review round 4 follow-up: a Members typo in the settings file destroys nothing", () => {
+  const invalidIssue = () => server!.handle.host.issues.all().find((i) => i.id === "core.members.invalid")
+  /** Members with a wrong field type; the kitchen tablet names Sam; Jo was added and removed before (`joId` retired). */
+  const startInvalid = async () => {
+    let written = ""
+    let joId = ""
+    const started = await startFromEditedFile(
+      (file, { samId, robinId }) => {
+        file.assistant.HOUSEHOLD_MEMBERS = [{ id: samId, name: "Sam", aliases: 17 }, { id: robinId, name: "Robin" }]
+        expect(file.devices["kitchen-r4-01"].own.place.defaultPerson).toBe(samId)
+        expect(file.assistant.HOUSEHOLD_MEMBERS_RETIRED).toEqual([joId])
+        written = JSON.stringify(file)
+      },
+      async (admin) => {
+        const now = () => server!.handle.store.settings().assistant.HOUSEHOLD_MEMBERS as ReadonlyArray<Json>
+        const two = now()
+        expect((await request(admin, { type: "settings.update", sectionId: "members", patch: { values: { HOUSEHOLD_MEMBERS: [...two, { name: "Jo" }] as never }, secrets: {} } })).ok).toBe(true)
+        joId = now()[2]!.id as string
+        expect((await request(admin, { type: "settings.update", sectionId: "members", patch: { values: { HOUSEHOLD_MEMBERS: two as never }, secrets: {} } })).ok).toBe(true)
+      }
+    )
+    // The start-up pass (clean-up of references, repair) has run: its Health issue is there; give it time to write.
+    await until("the Members issue", () => invalidIssue() !== undefined)
+    await sleep(500)
+    return { ...started, written, joId }
+  }
+
+  it("(a) while it is invalid: nothing personal reaches the feed, the ambient facts or Privacy; the file is byte for byte as it was", async () => {
+    const { admin, path, samId, written } = await startInvalid()
+    expect(readFileSync(path, "utf8")).toBe(written)
+    expect(invalidIssue()).toMatchObject({ severity: "warning", title: "Members cannot be read" })
+    expect(invalidIssue()!.detail).toMatch(/personal content is shown and told nowhere/)
+    const people = hostRef!.service(People)!
+    const privacy = hostRef!.service(Privacy)!
+    expect(people.list()).toEqual([])
+    expect(hostRef!.service(Devices)!.get("kitchen-r4-01")?.place.defaultPerson).toBeNull()
+    expect(privacy.mayReveal(samId, "kitchen-r4-01")).toBe(false)
+    expect(await gatewayFor("kitchen-r4-01", samId)).toBe("Not run: the person is not in Members.")
+    // A device save naming Sam is refused, and writes nothing.
+    expect((await saveDevice(admin, "kitchen-r4-01", { place: placeOf(samId) })).ok).toBe(false)
+    expect(readFileSync(path, "utf8")).toBe(written)
+    const page = await pageOn("kitchen-r4-01")
+    expect(await snapshotRows(page)).toEqual([])
+    const turn = await probedTurn(page, "what is on my list?")
+    expect(turn.seen.turn?.person).toBeUndefined()
+    expect(privacy.mayReveal(samId, turn.seen.turn)).toBe(false)
+    expect(turn.context).not.toContain("Sam's appointment")
+    expect(turn.context).not.toContain("Robin's note")
+    // The stored references and the retired list are untouched.
+    const onDisk = JSON.parse(readFileSync(path, "utf8")) as Json
+    expect(onDisk.devices["kitchen-r4-01"].own.place.defaultPerson).toBe(samId)
+    expect(onDisk.assistant.HOUSEHOLD_MEMBERS).toEqual(JSON.parse(written).assistant.HOUSEHOLD_MEMBERS)
+    expect(onDisk.assistant.HOUSEHOLD_MEMBERS_RETIRED).toEqual(JSON.parse(written).assistant.HOUSEHOLD_MEMBERS_RETIRED)
+  })
+
+  it("(b) corrected in admin with the same ids: the ids are kept, the tablet names Sam again untouched, Sam's rows are revealed again", async () => {
+    const { admin, samId, robinId } = await startInvalid()
+    const store = server!.handle.store
+    const page = await pageOn("kitchen-r4-01")
+    expect(await snapshotRows(page)).toEqual([])
+    const fixed = [{ id: samId, name: "Sam", aliases: ["Sammie"] }, { id: robinId, name: "Robin" }]
+    expect((await request(admin, { type: "settings.update", sectionId: "members", patch: { values: { HOUSEHOLD_MEMBERS: fixed as never }, secrets: {} } })).ok).toBe(true)
+    expect((store.settings().assistant.HOUSEHOLD_MEMBERS as ReadonlyArray<Json>).map((m) => m.id)).toEqual([samId, robinId])
+    expect(store.settings().assistant.HOUSEHOLD_MEMBERS_RETIRED).toHaveLength(1)
+    expect(invalidIssue()).toBeUndefined()
+    const people = hostRef!.service(People)!
+    expect(people.list().map((p) => p.id)).toEqual([samId, robinId])
+    // Nobody touched the device: its stored default person is Sam's again, and counts.
+    expect(store.settings().devices["kitchen-r4-01"]!.own.place?.defaultPerson).toBe(samId)
+    expect(hostRef!.service(Devices)!.get("kitchen-r4-01")?.place.defaultPerson).toBe(samId)
+    expect(hostRef!.service(Privacy)!.mayReveal(samId, "kitchen-r4-01")).toBe(true)
+    expect(hostRef!.service(Privacy)!.mayReveal(robinId, "kitchen-r4-01")).toBe(false)
+    // The page's boundary changed (a default person who now counts): it starts again, with Sam's rows only.
+    const next = await reconnect(page)
+    expect(await snapshotRows(next)).toEqual(["Sam's appointment"])
+    const turn = await probedTurn(next, "what is on my list?")
+    expect(turn.seen.turn?.person).toEqual({ id: samId, how: "device-default" })
+    expect(turn.context).toContain("Item: Sam's appointment")
+    expect(turn.context).not.toContain("Robin's note")
+  })
+
+  it("(c) corrected in admin with a retired id on a new row: that row gets a fresh id; the others keep theirs", async () => {
+    const { admin, samId, robinId, joId } = await startInvalid()
+    const store = server!.handle.store
+    const fixed = [{ id: samId, name: "Sam" }, { id: robinId, name: "Robin" }, { id: joId, name: "Kim" }]
+    expect((await request(admin, { type: "settings.update", sectionId: "members", patch: { values: { HOUSEHOLD_MEMBERS: fixed as never }, secrets: {} } })).ok).toBe(true)
+    const ids = (store.settings().assistant.HOUSEHOLD_MEMBERS as ReadonlyArray<Json>).map((m) => m.id as string)
+    expect(ids.slice(0, 2)).toEqual([samId, robinId])
+    expect(ids[2]).not.toBe(joId)
+    expect(ids[2]).toMatch(/^p-/)
+    expect(store.settings().assistant.HOUSEHOLD_MEMBERS_RETIRED).toEqual([joId])
+    expect(hostRef!.service(People)!.get(joId)).toBeUndefined()
+  })
+})
+
 describe("review round 4: every membership predicate in the server agrees with People", () => {
   it("for generated Members values (valid, invalid fields, repeated ids, retired ids, repeated names), stored as a hand edit would", async () => {
     const POOL = Array.from({ length: 5 }, (_, i) => `p-pool000${i + 1}`)
     const NAMES = ["Ann", "Bo", "Cy", "Di", "Ed", "Flo"]
-    const { admin, store } = await boot({ env: AMBIENT })
+    let { admin, store } = await boot({ env: AMBIENT })
+    const settingsPath = join(server!.dataDir, "settings.json")
     // Every pool id a member once, with a personal row each (rows of a person outside Members cannot be written).
     await Effect.runPromise(store.saveAssistant(["HOUSEHOLD_MEMBERS"], { HOUSEHOLD_MEMBERS: POOL.map((id, i) => ({ id, name: NAMES[i]! })) as never }, {}))
     await until("the probe's store", () => storeRef !== undefined)
@@ -1332,11 +1430,29 @@ describe("review round 4: every membership predicate in the server agrees with P
       const retired = POOL.filter(() => rand() < (mode === 4 ? 0.6 : 0.2))
       return { list, retired }
     }
-    const privacy = hostRef!.service(Privacy)!
-    const people = hostRef!.service(People)!
-    const devicesService = hostRef!.service(Devices)!
+    let privacy = hostRef!.service(Privacy)!
+    let people = hostRef!.service(People)!
+    let devicesService = hostRef!.service(Devices)!
+    /** The server started again from the settings file as it is (a value written by hand is read at start). */
+    const restart = async () => {
+      for (const c of clients.splice(0)) c.close()
+      const dataDir = server!.dataDir
+      await server!.close()
+      hostRef = undefined
+      storeRef = undefined
+      server = await startTestServer({ build: fakeBuild({ stt: controlledStt().stt, llm: scriptedLlm(() => "").llm }), buildLlm: toolThenText, dataDir, catalog: [greeterModule, probe], env: AMBIENT })
+      await until("the probe", () => hostRef !== undefined && storeRef !== undefined)
+      admin = await ScriptedClient.connect({ url: server.url })
+      clients.push(admin)
+      await admin.admin(TEST_ADMIN_PASSWORD)
+      store = server.handle.store
+      privacy = hostRef!.service(Privacy)!
+      people = hostRef!.service(People)!
+      devicesService = hostRef!.service(Devices)!
+    }
+    let restarts = 0
     const { boundaryIn, membersRemoved } = await import("../src/serve/deviceFacts.ts")
-    const { referenceableIdsOf } = await import("../src/serve/people.ts")
+    const { effectiveMembersOf, referenceableIdsOf } = await import("../src/serve/people.ts")
     let invalid = 0
     let checked = 0
     for (let i = 0; i < 30; i++) {
@@ -1364,6 +1480,18 @@ describe("review round 4: every membership predicate in the server agrees with P
         out["private-r4-0"] = { ...out["private-r4-0"]!, own: { ...out["private-r4-0"]!.own, place: placeOf(POOL[0]!, "private") }, rev: out["private-r4-0"]!.rev + 1 }
         return out
       }))
+      // Follow-up: a value that is not valid as a whole is read at start too, and nothing is written because of it (no
+      // reference cleared, no id retired): the file is byte for byte as it was.
+      const invalidNow = !effectiveMembersOf(store.settings().assistant).valid
+      const bytes = readFileSync(settingsPath, "utf8")
+      if (invalidNow && restarts < 8) {
+        restarts++
+        await restart()
+        await until("the Members issue", () => server!.handle.host.issues.all().some((x) => x.id === "core.members.invalid"))
+        await sleep(300)
+        expect(readFileSync(settingsPath, "utf8")).toBe(bytes)
+        expect(people.list()).toEqual([])
+      }
       const file = store.settings()
       expect([...referenceableIdsOf(file.assistant)].sort()).toEqual(candidates.filter(member).sort())
       expect(membersRemoved(file, { ...file, assistant: { ...file.assistant, HOUSEHOLD_MEMBERS: [] } })).toBe(candidates.some(member))
@@ -1379,6 +1507,12 @@ describe("review round 4: every membership predicate in the server agrees with P
         // A device save naming the person: accepted only for a member.
         expect((await saveDevice(admin, shared, { place: placeOf(c) })).ok).toBe(member(c))
       }
+      if (invalidNow) {
+        // Everyone is nobody, as People says, and none of the checks above wrote anything.
+        expect(listed).toEqual([])
+        expect(candidates.filter(member)).toEqual([])
+        expect(readFileSync(settingsPath, "utf8")).toBe(bytes)
+      }
       // The feed's person rule and the ambient facts, on the private tablet (it may see every member's rows).
       const page = await pageOn("private-r4-0")
       expect(await snapshotRows(page)).toEqual(POOL.filter(member).map((id) => `row of ${id}`).sort())
@@ -1389,6 +1523,7 @@ describe("review round 4: every membership predicate in the server agrees with P
     }
     // The generated values covered every kind.
     expect(invalid).toBeGreaterThan(4)
+    expect(restarts).toBeGreaterThan(4)
     expect(checked).toBeGreaterThan(50)
   }, 240_000)
 })

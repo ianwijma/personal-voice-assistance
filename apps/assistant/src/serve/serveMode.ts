@@ -1516,7 +1516,21 @@ export const startServe = (options: ServeOptions): Effect.Effect<ServeHandle, Ht
     // P5: the device boundary (`deviceFacts.ts`), in the step that commits a settings change: a device whose privacy,
     // default person or output overrides changed (its own or its type's), or every device when a person left Members,
     // has its session ended with its connections before anything else runs for it. The pages reconnect afresh.
+    // Follow-up to review round 4: a Members value that does not pass its checks as a whole (a typo in a hand-edited
+    // file) makes everyone nobody in memory (`effectiveMembersOf`), and nothing is written because of it; the owner is
+    // told here, and correcting the list keeps every identity (`withPersonIds`).
+    const membersInvalidIssue = () => {
+      const now = members()
+      host.issues.set("members-invalid", now.valid ? [] : [{
+        id: "core.members.invalid",
+        severity: "warning" as const,
+        title: "Members cannot be read",
+        detail: `Shared settings › Members does not pass its checks (${now.problem ?? "not valid"}). Until it is corrected, nobody counts as a member: personal content is shown and told nowhere, and no turn has a person. Nothing was changed or removed: devices keep their default person, and correcting the list keeps everyone's id and data.`.slice(0, 1900)
+      }])
+    }
+    membersInvalidIssue()
     const stopBoundary = store.onCommitted((before, after) => {
+      if (effectiveMembersOf(before.assistant) !== effectiveMembersOf(after.assistant)) membersInvalidIssue()
       const everyone = membersRemoved(before, after)
       const ended = hubNow.endSessions((deviceId, kind) => everyone || boundaryChanged(before, after, deviceId, kind))
       if (ended > 0) runFork(Effect.logInfo(`Settings that decide what ${ended === 1 ? "a device" : `${ended} connections`} may be sent changed: the session started again`))
@@ -1526,8 +1540,9 @@ export const startServe = (options: ServeOptions): Effect.Effect<ServeHandle, Ht
     })
     yield* Effect.addFinalizer(() => Effect.sync(stopBoundary))
     // P5: a person removed from Members is no device's default person any more (also at start, after a crash between
-    // the two saves); devices and voice pages then follow the new places.
-    const clearDangling = Effect.suspend(() => store.clearDefaultPeople(members().referenceable)).pipe(
+    // the two saves); devices and voice pages then follow the new places. Not while Members cannot be read as a whole:
+    // then nobody is a member in memory only, and no stored reference is cleared because of it.
+    const clearDangling = Effect.suspend(() => (members().valid ? store.clearDefaultPeople(members().referenceable) : Effect.succeed(0))).pipe(
       Effect.flatMap((n) => (n === 0 ? Effect.void : Effect.sync(() => hubNow.entitiesChanged())))
     )
     const clearRemovedPeople = clearDangling.pipe(
@@ -1547,7 +1562,7 @@ export const startServe = (options: ServeOptions): Effect.Effect<ServeHandle, Ht
     })
     // At start: a hand-edited Members value is already read repaired (`effectiveMembersOf`: every reader sees unique,
     // unretired ids, and a reference to an id two records shared counts as none; a value that is not valid as a whole
-    // is no members, and is left for admin to correct). Writing that back is ordinary persistence: first
+    // is no members in memory, and nothing is written for it: `membersInvalidIssue`). Writing that back is ordinary persistence: first
     // the references to such an id are cleared, then the repaired list is saved through the section (so its ids are
     // the committed ones). If either fails, a Health issue says so and the server goes on with the repaired list.
     const repairIssue = (message: string | undefined) =>
