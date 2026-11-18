@@ -17,10 +17,12 @@ import type { DatabaseSync, StatementSync } from "node:sqlite"
 import { basename, dirname, join } from "node:path"
 import {
   BEFORE,
+  checkpointerOf,
   copyDatabase,
   copyFilePrivately,
   DAILY,
   type FileGuard,
+  JOURNAL_SIZE_LIMIT,
   lastBackupIn,
   makeCheckpointer,
   narrow,
@@ -44,7 +46,8 @@ import {
  * a lock (`busy_timeout = 0`: a lock held elsewhere is a `busy` failure, which a transaction retries a few times on a
  * timer, off the event loop). What is long runs elsewhere: backups on a connection of their own (one step on SQLite's
  * worker thread), checkpoints on a worker thread of their own (passive ones regularly, a truncating one after a
- * removal and at start).
+ * removal and at start), which also starts the new log after one, so the header sync that costs is its own and not the
+ * main thread's next commit (docs/STORING-DATA.md "The write-ahead log").
  *
  * The value of every indexed field is kept in a column of its own (`k0` … `k7`), bound from JavaScript: SQLite never
  * re-parses a number from the row's JSON (its parser is not exact), so filters and orders see exactly the values the
@@ -393,7 +396,7 @@ export const makeSqliteStore = (options: SqliteStoreOptions): Effect.Effect<Sqli
         if (serving) {
           db.exec("PRAGMA journal_mode = WAL")
           // The log is cut back to this size when it is reset after a complete checkpoint.
-          db.exec("PRAGMA journal_size_limit = 4194304")
+          db.exec(`PRAGMA journal_size_limit = ${JOURNAL_SIZE_LIMIT}`)
         }
         if (!readOnly) {
           // This connection never checkpoints: the checkpointer's worker thread does (`makeCheckpointer`).
@@ -768,5 +771,6 @@ export const makeSqliteStore = (options: SqliteStoreOptions): Effect.Effect<Sqli
       scrubbed,
       check: step("The quick check", () => all<Record<string, unknown>>("PRAGMA quick_check").map((x) => String(Object.values(x)[0])).join("; "))
     }
+    if (checkpointer !== undefined) checkpointerOf.set(store, checkpointer)
     return store
   })
