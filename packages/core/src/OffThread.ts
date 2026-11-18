@@ -53,6 +53,12 @@ export const OFF_THREAD_DEFAULT_RESULT_BYTES = 128 * 1024
  * one costs the main thread by the object (128 KiB of small objects about 5 ms, 1 MiB about 20 ms).
  */
 export const OFF_THREAD_MAX_STRUCTURED_RESULT_BYTES = 128 * 1024
+/**
+ * The most values an answer may hold in all (objects, array entries, properties, map and set entries): no structure
+ * that fits in 128 KiB has more. Arrays with holes are refused too (no sparse arrays): the main thread would allocate
+ * them whole, however small their serialised form.
+ */
+export const OFF_THREAD_MAX_ANSWER_NODES = 131_072
 /** The largest result limit a call may ask for. */
 export const OFF_THREAD_MAX_RESULT_BYTES = 4 * 1024 * 1024
 /** The input limit, the default and the most a call may ask for (`maxInputBytes`): string code units × 2 + bytes. */
@@ -70,7 +76,8 @@ const TERMINATE_WAIT_MS = 2_000
  * Why a call failed:
  * - `timeout`: the time limit passed (waiting for a slot included); the worker, if it had started, was terminated;
  * - `memory`: the worker ran out of its heap (`maxMemoryMb`);
- * - `too-large`: the answer was over `maxResultBytes`, or is structured and over `OFF_THREAD_MAX_STRUCTURED_RESULT_BYTES`;
+ * - `too-large`: the answer was over `maxResultBytes`, or is structured and over `OFF_THREAD_MAX_STRUCTURED_RESULT_BYTES`,
+ *   or holds an array with holes or more than `OFF_THREAD_MAX_ANSWER_NODES` values;
  * - `failed`: the task threw or rejected (a stack overflow too), or its answer cannot be serialised;
  * - `exited`: the worker ended without answering (the task called `process.exit`, or the thread could not start);
  * - `load`: the task module could not be loaded, has no default-exported function, or is not a supported form;
@@ -279,8 +286,9 @@ export const offThreadInput = (input: unknown, maxBytes: number): Crossing | str
   }
   const transfer: Array<ArrayBuffer> = []
   if (Array.isArray(input)) return { value: entries.map(([, v]) => crossLeaf(v, transfer)), transfer }
+  // Defined, not assigned: an own `__proto__` key stays an own field (assignment would call the inherited setter).
   const value: Record<string, unknown> = {}
-  for (const [key, v] of entries) value[key] = crossLeaf(v, transfer)
+  for (const [key, v] of entries) Object.defineProperty(value, key, { value: crossLeaf(v, transfer), enumerable: true, writable: true, configurable: true })
   return { value, transfer }
 }
 
@@ -510,6 +518,9 @@ const run = <O>(rt: Runtime, url: URL, crossing: Crossing, limits: Limits, deadl
       }
       if (kind === "too-large") {
         const size: unknown = (m as { size?: unknown }).size
+        const shape: unknown = (m as { shape?: unknown }).shape
+        if (shape === "sparse") return decide(Effect.fail(fail("too-large", "answered an array with holes (no sparse arrays)")))
+        if (shape === "nodes") return decide(Effect.fail(fail("too-large", `answered more than ${OFF_THREAD_MAX_ANSWER_NODES} values`)))
         if ((m as { structured?: unknown }).structured === true) return decide(Effect.fail(structuredTooLarge(typeof size === "number" && Number.isSafeInteger(size) && size > OFF_THREAD_MAX_STRUCTURED_RESULT_BYTES ? size : undefined)))
         const shown = typeof size === "number" && Number.isSafeInteger(size) && size > limits.resultBytes ? `answered ${sized(size)}` : "answered too much"
         return decide(Effect.fail(fail("too-large", `${shown}, over its limit of ${sized(limits.resultBytes)}`)))
@@ -533,6 +544,7 @@ const run = <O>(rt: Runtime, url: URL, crossing: Crossing, limits: Limits, deadl
             input: crossing.value,
             maxResultBytes: limits.resultBytes,
             maxStructuredBytes: OFF_THREAD_MAX_STRUCTURED_RESULT_BYTES,
+            maxNodes: OFF_THREAD_MAX_ANSWER_NODES,
             markers: rt.markers,
             names: OFF_THREAD_ERROR_NAMES,
             codes: OFF_THREAD_ERROR_CODES
