@@ -27,3 +27,10 @@ export const householdCalendar = calendar([
 export const icsHeaders = { "content-type": "text/calendar; charset=utf-8" }
 export const calendarUrl = "https://afval.example.org/calendar.ics?token=s3cr3t-token"
 export const calendarPath = "https://afval.example.org/calendar.ics"
+
+/** The reviewer's hostile calendars (local-info-r1, finding 1). 163 bytes: a repeat every second, every 30 February. */
+export const secondlyCalendar = calendar([allDay("x", "20260101", "GFT", ["RRULE:FREQ=SECONDLY;BYMONTH=2;BYMONTHDAY=30"])])
+/** 1,600 distinct daily series of 400 collections each, about 180 KB: valid, and far more repeating than a bin calendar. */
+export const denseCalendar = calendar(Array.from({ length: 1_600 }, (_, i) => allDay(`x${i}`, "20261118", `Special ${i}`, ["RRULE:FREQ=DAILY;COUNT=400"])))
+/** A daily rule ical.js never finishes expanding (every 30 February): only the reader's time limit stops it. */
+export const impossibleCalendar = calendar([allDay("x", "20260101", "GFT", ["RRULE:FREQ=DAILY;BYMONTH=2;BYMONTHDAY=30"])])
