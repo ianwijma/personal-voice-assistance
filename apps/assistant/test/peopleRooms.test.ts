@@ -787,4 +787,35 @@ describe("review round 2: declarations are ordered by their number of arrival, a
     // 12 changes in about 1.3 s: no more writes than the gap allows.
     expect(writes.length).toBeLessThanOrEqual(Math.ceil((12 * 110) / gap) + 2)
   })
+
+  it("a slow write does not shorten the gap to the next one: the gap is counted from the end of the last write", async () => {
+    const writes: Array<number> = []
+    let holdNext = false
+    const store = await run(openStore(tmp(), {
+      beforeStep: async (step) => {
+        if (step !== "settings") return
+        // A slow disk (or a save queued behind others): this write reaches its file 200 ms after it was asked for.
+        if (holdNext) {
+          holdNext = false
+          await wait(200)
+        }
+        writes.push(performance.now())
+      }
+    }))
+    const gap = 300
+    const registry = makeDeviceRegistry({ store, declareGapMs: gap })
+    await run(registry.seen({ id: "tab-r2-slow1", kind: WEB_VOICE_KIND, name: "Tablet" }, new Set()))
+    writes.length = 0
+    holdNext = true
+    expect(registry.declare("tab-r2-slow1", phone)).toBe(true)
+    const writing = run(registry.persist)
+    // Once that write is held at its file: another material change, for the next round.
+    for (let i = 0; i < 200 && holdNext; i++) await wait(5)
+    expect(holdNext).toBe(false)
+    expect(registry.declare("tab-r2-slow1", tablet)).toBe(true)
+    await writing
+    expect(store.settings().devices["tab-r2-slow1"]!.declared!.capabilities).toEqual(tablet)
+    expect(writes.length).toBe(2)
+    expect(writes[1]! - writes[0]!).toBeGreaterThanOrEqual(gap - 15)
+  })
 })

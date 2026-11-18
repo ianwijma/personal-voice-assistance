@@ -28,6 +28,13 @@ jobs:
       # `pnpm check` also builds the audio worklets the web tests need,
       # so it must run before `pnpm test`.
       - name: Typecheck
+        id: check
         run: pnpm check
+      # Everything but the latency tests (files that import latencyBound.ts: vitest.latency.ts), files in parallel.
       - name: Test
-        run: pnpm test
+        run: pnpm test --project node --project web
+      # The latency tests after the rest, one file at a time: nothing else keeps the two cores busy while they measure
+      # how long the main thread stops. Also when the step before failed, so both results are seen.
+      - name: Latency tests
+        if: ${{ !cancelled() && steps.check.outcome == 'success' }}
+        run: pnpm test --project latency --no-file-parallelism
