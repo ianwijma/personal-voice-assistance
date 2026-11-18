@@ -292,7 +292,7 @@ defineModule({
 })
 SharedContext<A>      = { settings: Partial<A> /* no overridable fields */; settingsFor(assistantId?): A | undefined } & ModuleServicesV2
 ModuleContextV2<A, X> = ModuleContext<A> & ModuleServicesV2 & { shared: X }
-ModuleServicesV2      = { host: ModuleHostApi; store: ModuleStore; events: ModuleEvents }   // later PRs add scheduler, speech, notify, present, connections
+ModuleServicesV2      = { host: ModuleHostApi; store: ModuleStore; events: ModuleEvents; scheduler: ModuleScheduler }   // later PRs add speech, notify, present, connections
 SharedPart<X>         = { value: X; services?: [ServiceKey<T>.of(impl)]; contributions?: [ContributionKey<T>.of(value)];
                           routes?: ReadonlyArray<ModuleRoute> }   // P3: HTTP routes under /api/modules/<id>/ (ModuleRoutes.ts)
 ModuleHostApi = {
@@ -712,52 +712,61 @@ quotedName(text), plainName(text), QUOTED_NAMES_NOTE (PromptText.ts)          //
 
 ### Scheduler (docs/MODULES-PLAN.md §4 P6; how to use it: [docs/SCHEDULING.md](SCHEDULING.md))
 
+It calls a module's handler at a time, once. Nothing else (no pause, no background tasks, no notification jobs).
+
 ```ts
 ModuleScheduler (ctx.scheduler) = {
-  schedule({ kind: "timer" | "alarm" | "reminder" | "recurring" | "deferred", key?, label?,
-             when: { at } | { inMs } | { cron, timeZone? }, scope?, origin?,
-             onDue: { notify: NotificationRequest } | { handler, payload },
-             missed?: "fire-late" | "skip" | "inbox" | { fireIfWithinMs, otherwise?: "missed" | "inbox" },
-             idempotent?, retryLimit? }): Effect<JobRow, SchedulerError>
-  handle(name, payloadSchema, (payload, due: DueInfo) => Effect<void, unknown>, { timeoutMs? }?): Effect<void, never, Scope>
-  pause(id); resume(id); reschedule(id, when); cancel(id); list({ kind?, key?, scope?, states? }?); get(id)
-  runTask({ label, key?, scope?, origin?, work: Effect<A, E>, result?, onDone?(a): NotificationRequest, onFailed? }): Effect<JobRow>
+  handle(name, { payload: Schema.Codec<P, I>, idempotent?, retries?, timeoutMs?, run(payload: P, due: DueInfo): Effect<void, unknown> }): Effect<void, SchedulerError>
+  schedule(ScheduleRequest): Effect<JobRow, SchedulerError>
+  prepare(ScheduleRequest): Effect<PreparedJob, SchedulerError>     // PreparedJob = { id, dueAt, writeIn(tx: StoreTx): JobRow }
+  cancel(id | { key }): Effect<boolean, SchedulerError>
+  reschedule(id, { at } | { inMs }): Effect<JobRow | undefined, SchedulerError>
+  get(id): Effect<JobRow | undefined, SchedulerError>
+  list({ key?, after?: JobRow, limit? }?): Effect<ReadonlyArray<JobRow>, SchedulerError>   // live jobs by due time, ≤ 24 a page
 }
-JobRow = { id, module, kind, key?, label?, state: "scheduled" | "paused" | "running" | "done" | "cancelled" | "failed" | "missed",
-           dueAt?, remainingMs?, cron?, timeZone?, scope, origin, onDue?, missed, idempotent, retryLimit, attempts,
-           occurrenceAt?, waiting, lastRunAt?, lastError?, lastFailedAt?, delivered?, result?, skipped?, rev, … }
-DueInfo = { job, occurrenceKey: "<jobId>@<dueAt>", dueAt, lateByMs, attempt, inbox, skipped }
-NotificationDelivery = { deliver(request, { notificationId, lateByMs, inbox, job }): Effect<void, unknown> }   // P9 replaces it
-Scheduler (app) = { forModule(id); setDelivery(d); listAll(); cancelAny(id); counts }
-SchedulerError = { reason: "unavailable" | "invalid" | "not_found" | "state" | "conflict" | "failed", message }
+ScheduleRequest = { handler, payload?, key?, late?: "run" | { withinMs }, origin?: { assistantId?, deviceId?, person? } }
+                  & ({ at } | { inMs } | { cron, timeZone? })
+JobRow  = { id, module, handler, key?, payload, state: "scheduled" | "running" | "done" | "failed" | "cancelled" | "missed",
+            dueAt, cron?, timeZone?, late, origin, attempt, lastError?, failedAt?, finishedAt?, createdAt, updatedAt, rev }
+DueInfo = { jobId, key?, dueAt, lateMs, attempt }
+SchedulerError = { reason: "unavailable" | "invalid" | "state" | "limit" | "busy" | "failed", message }
+SchedulerHook (ModuleHostOptions.scheduler) = { forPart(part: PartHandle, runner: PartRunner): ModuleScheduler }
+PartRunner = { inFlight(body): Effect<A, E | ModuleStopped> }        // the host's guard: a call in flight of the part's run
+SchedulerEngine = SchedulerHook & { forCore(owner: CoreOwner): CoreScheduler; listAll({ cursor?, limit? }): Effect<JobPage>;
+                                    cancelAny(id); wake(); refreshIssues; maintainSoon(); runsInFlight(); settled }
 ```
 
-- **Where**: `Scheduler.ts` (the contract), `SchedulerEngine.ts` (the engine), `JobTable.ts` (`core_scheduler__jobs` through
-  `store.core("scheduler")`, or an in-memory table on the in-memory store). Serve mode makes it on the household store
-  before the module host (`serve/scheduler.ts`) and passes it as `ModuleHostOptions.scheduler`; one line in the host's
-  `servicesFor` gives each version 2 module `ctx.scheduler = scheduler.forModule(id)`. The CLI modes have none: `handle`
-  succeeds, every other call fails `unavailable` (`closedModuleScheduler`).
-- **One fiber** sleeps until the earliest due time (an indexed one-row read), at most 10 s at a time, and is woken by
-  every change. Due times are absolute wall-clock ms; after each sleep it compares how far the wall clock and the
-  monotonic clock moved, and a jump makes it check again. `Cron` jobs are computed in their zone (default
-  `HOME_TIME_ZONE`, read at each computation), so DST does not move "7:00".
-- **Exactly once as far as one process can give it**: a due job is claimed (`scheduled → running`, compare-and-set on
-  `rev`) before its run starts in a fiber of its own (a slow handler never holds up the engine). Only an `idempotent`
-  handler, or a `{ notify }` job (redelivered under the same occurrence key), is run again for the same occurrence:
-  after a failure (back-off 5 s doubling, up to `retryLimit`) or when it is found `running` at start. Any other
-  failure or interruption marks it `failed` and raises a Health issue. Completing an occurrence and scheduling a
-  recurring job's next one are one write; a recurring job always moves on, and after downtime runs only its last
-  missed occurrence. A schedule inside `ctx.store.transaction` commits or rolls back with the module's own writes.
-- **Not running**: `{ notify }` jobs fire anyway; a `{ handler }` job found due without its handler is marked `waiting`
-  (Health, admin) and fires when the handler is registered, as its missed policy allows. Jobs do not keep a module
-  demanded. A job of a module no longer in the catalogue is listed for the owner to cancel.
-- **Tasks**: `runTask` forks the work in the scheduler's scope (not the turn's), two at a time, the rest queued;
-  `cancel` interrupts it; its row records the result or the failure; a restart marks it `failed` ("Interrupted by a
-  restart").
-- **Admin and doctor**: `GET /api/scheduler/jobs`, `POST /api/scheduler/jobs/<id>/cancel` (`serve/schedulerApi.ts`,
-  `@pva/protocol` `scheduledJobs.ts`, no protocol bump), shown under Diagnostics › Scheduled jobs; issues under the
-  source `scheduler`; `doctor` reads the table read-only and prints the counts.
-- **Turn path**: only a `schedule` (or `pause`, `cancel` …) called by a tool, at most two single-row writes.
+- **Where**: `Scheduler.ts` (the contract), `SchedulerEngine.ts` (the engine), `SchedulerJobs.ts` (the collections
+  `jobs` and `job_counts` of the core owner `core.scheduler`, `schedulerStorage` for `prepare`). Serve mode makes the
+  engine on the household store before the module host (`serve/scheduler.ts`) and passes it as
+  `ModuleHostOptions.scheduler`; in `servicesFor` the host gives each version 2 part `ctx.scheduler =
+  scheduler.forPart(part.handle, runner)`, every call guarded by the part's lifetime (`ModuleStopped` once it closed),
+  and `runner.inFlight` runs a job as a call in flight of the part's published run (`guarded`). The CLI modes have
+  none: `handle` succeeds, every other call fails `unavailable`.
+- **Handlers are registrations** (`ModuleRegistrations.ts`): `handle` stages a `job-handler` registration through
+  `part.register`; the host publishes and withdraws it with the module in its one step. Its callbacks write only the
+  engine's table (`validate` refuses two handlers of one module with the same name; `publish` wakes the loop). A core
+  service registers with `engine.forCore("core.<name>").handle(…)` for a scope (the server's life), outside any module.
+- **The loop** is one fiber: per published handler, one indexed read of its earliest `scheduled` job (`[ready, at]`); it
+  sleeps until the minimum or the maintenance pass (10 min: retention of finished rows older than 7 days in bounded
+  steps, the recovery rule, the Health issues), at most 10 s at a time with the wall-clock jump check, and is woken by
+  a schedule, reschedule, cancel, publication and a run's end. A job without a published handler is never read.
+- **A run**: claim (`running`, attempt + 1, the row's `rev` kept) in one transaction; the handler in a fiber of its own,
+  through `PartRunner.inFlight`, with `CurrentJob` = the job's origin as its principal (the gateway admits it first),
+  within its time limit (decoding included); the outcome with `expectRev` of the claim (a conflict: rescheduled or
+  cancelled meanwhile, dropped; a busy store: tried again, then left `running`). Interrupted because its module stopped
+  or the server is stopping: left `running`. **Recovery rule**: a `running` row with no run alive here failed without
+  telling (idempotent: run again within its retries; otherwise one-off `failed`, repeating moves on), applied when its
+  handler is published and by the maintenance pass.
+- **Inside a module's transaction**: `prepare` (an Effect, outside) then `job.writeIn(tx)` (synchronous, inside): it
+  joins the running transaction (the store's flat transactions) and wakes the engine after the commit.
+- **Admin and doctor**: `GET /api/scheduler/jobs?cursor=&limit=` (pages: live by due time, then finished newest first;
+  the cursor is a token for the last row of a page, kept by the engine for its newest 256 pages),
+  `POST /api/scheduler/jobs/<id>/cancel` (`serve/schedulerApi.ts`, `@pva/protocol` `scheduledJobs.ts`, no protocol
+  bump), shown under Diagnostics › Scheduled jobs; issues under the source `scheduler`; `doctor` reads the failed jobs
+  read-only.
+- **Turn path**: only a `schedule` (or `cancel`, `reschedule`, `prepare`) called by a tool: one synchronous transaction
+  of at most a few single-row writes (measured in docs/SCHEDULING.md "Latency").
 - **Testing**: `makeTestScheduler` (`@pva/core/testing`) is the same engine on the in-memory store and the test clock;
   `@pva/core/scheduler-contract` runs the same suite on it and on SQLite.
 
