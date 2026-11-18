@@ -16,8 +16,7 @@
     "@pva/module-contracts": "workspace:*",
     "@pva/net": "workspace:*",
     "effect": "catalog:",
-    "ical.js": "catalog:",
-    "tsdav": "catalog:"
+    "ical.js": "catalog:"
   },
   "devDependencies": {
     "@effect/vitest": "catalog:",

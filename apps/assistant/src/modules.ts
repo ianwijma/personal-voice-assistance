@@ -10,7 +10,6 @@ import { catalog as imagesModules } from "@pva/module-images"
 import { catalog as kitchenModules } from "@pva/module-kitchen"
 import { catalog as listsModules } from "@pva/module-lists"
 import { catalog as localInfoModules } from "@pva/module-local-info"
-import { catalog as mcpModules } from "@pva/module-mcp"
 import { catalog as memoryModules } from "@pva/module-memory"
 import { catalog as musicModules } from "@pva/module-music"
 import { catalog as newsModules } from "@pva/module-news"
@@ -62,7 +61,6 @@ export const moduleCatalog: ReadonlyArray<ModuleDefinition<any>> = [
   ...presenceModules,
   ...newsModules,
   ...routinesModules,
-  ...mcpModules,
   // Off by default and behind its own opt-in switch; answers when LLM_PROVIDER=claude-subscription.
   claudeSubscriptionAgent
 ]

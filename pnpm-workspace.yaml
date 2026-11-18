@@ -19,7 +19,6 @@ catalog:
   semver: 7.8.6
   "@types/semver": 7.7.1
   # Module libraries (docs/MODULES-PLAN.md Appendix A), pinned by the scaffold (P11) for the module packages.
-  "@modelcontextprotocol/client": 2.4.0
   "@mozilla/readability": 0.6.0
   "@types/nspell": 2.1.6
   "@types/suncalc": 1.9.2
@@ -35,7 +34,6 @@ catalog:
   nspell: 2.1.5
   pdfjs-dist: 6.5.438
   suncalc: 2.1.4
-  tsdav: 2.5.1
   turndown: 7.2.5
 
 # pdfjs-dist renders pages with this native canvas when it is there; reading a PDF's text (web-search's read_page) does

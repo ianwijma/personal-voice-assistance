@@ -30,7 +30,6 @@
     "@pva/module-kitchen": "workspace:*",
     "@pva/module-lists": "workspace:*",
     "@pva/module-local-info": "workspace:*",
-    "@pva/module-mcp": "workspace:*",
     "@pva/module-memory": "workspace:*",
     "@pva/module-music": "workspace:*",
     "@pva/module-news": "workspace:*",
