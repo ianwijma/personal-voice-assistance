@@ -849,6 +849,9 @@ export const notifyContract = (name: string, open: OpenNotifyStore) =>
         assert.isFalse(world.holds(world.firstTab("hall-screen")).has(n.notification.id))
         for (const action of ["snooze", "stop"]) assert.deepStrictEqual(yield* world.pressOn("hall-screen", n.notification.id, action), { ok: false, say: "I can't do that right now.", code: "unknown" })
         assert.deepStrictEqual(world.presses, [])
+        // A press must come from a page that holds it: the kitchen's press naming Robin's phone's page is refused.
+        assert.strictEqual((yield* world.pressOn("kitchen-display", n.notification.id, "snooze", world.firstTab("robins-phone"))).code, "unknown")
+        assert.deepStrictEqual(world.presses, [])
         // Held on the kitchen display; then the kitchen becomes Robin's: a press with the id it learned is refused, and the card goes.
         assert.isTrue(world.holds(world.firstTab("kitchen-display")).has(n.notification.id))
         world.places.set("kitchen-display", { privacy: "shared", defaultPerson: "p-robin" })
