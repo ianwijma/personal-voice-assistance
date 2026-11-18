@@ -118,16 +118,19 @@ describe("the scheduler in serve mode", () => {
     const api = (path: string, init: RequestInit = {}) =>
       fetch(`${server!.url}/api/${path}`, { ...init, headers: { Authorization: `Bearer ${token}`, ...init.headers } })
     expect((await fetch(`${server.url}/api/scheduler/jobs`)).status).toBe(401)
-    const all: Array<ScheduledJob> = []
+    const listed: Array<ScheduledJob> = []
     let cursor: string | undefined
     for (;;) {
       const page = await (await api(`scheduler/jobs?limit=10${cursor !== undefined ? `&cursor=${encodeURIComponent(cursor)}` : ""}`)).json() as ScheduledJobsResponse
       expect(page.available).toBe(true)
       expect(page.jobs.length).toBeLessThanOrEqual(10)
-      all.push(...page.jobs)
+      listed.push(...page.jobs)
       if (page.next === undefined) break
       cursor = page.next
     }
+    // P9: the notification service's own system job (its retention pass) is listed too, under its core owner.
+    expect(listed.filter((j) => j.module === "core.notify").map((j) => [j.handler, j.state, j.cron])).toEqual([["retention", "scheduled", "*/10 * * * *"]])
+    const all = listed.filter((j) => j.module !== "core.notify")
     expect(all).toHaveLength(LATER + 6)
     // Live first, by due time, then the finished ones; no payload on the wire.
     const states = all.map((j) => j.state)
