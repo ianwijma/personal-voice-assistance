@@ -5,64 +5,75 @@ for their module and their module's research document (`docs/research/modules/<n
 what a module is, the rules the preparation stack (P1 to P6) settled, and how to test a module so that it keeps them.
 Where this page and a research document disagree, the plan and this page win.
 
+> **Wave A: what does not exist yet.** You are writing on the scaffold (P11), before P7 to P10. **Phrase commands,
+> presentations (a checklist, a card, the timer view), notifications (ringing, delivery, notification actions) and a
+> module's own speech (`ctx.speech`, `ctx.present`) do not exist.** Where your row in the plan's §5.1 names one of them,
+> that part waits for wave B: build the rest, and list the part under "Left out" on your page and in your pull request.
+> Also later, for everyone: connections and OAuth, CalDAV, an MCP client, and any outgoing HTTP but `GET` and `HEAD`
+> (§12). The plan's "Order from here" (§4) has the waves.
+
 The deeper references, only when this page is not enough: [ARCHITECTURE.md](ARCHITECTURE.md) (the host, the gateway,
 the store, the scheduler, people), [UI-AND-MODULES.md](UI-AND-MODULES.md) §1.10–§1.11 (API v2, settings fields,
 routes), [STORING-DATA.md](STORING-DATA.md), [SCHEDULING.md](SCHEDULING.md).
 
-Every code block on this page is quoted from a test file that compiles and runs (`docs.test.ts` in
-`packages/module-contracts/test` keeps them the same). The **reference module** is
-`packages/module-contracts/test/kit/pinboard.ts`: short notes pinned for the household or one person. It has one of
-everything (a setting, a secret, a collection with an index and paging, a tool that reads, a tool that changes, an
-action, a scheduled job, a route, a health check, personal content, two languages) and `pinboard.test.ts` runs each
-part through the test kit.
+Every code block on this page is quoted from a file that compiles and runs (`docs.test.ts` in
+`packages/module-contracts/test` keeps them the same, and fails on a block that is not quoted from one). The
+**reference module** is `packages/module-contracts/test/kit/pinboard.ts`: short notes pinned for the household or one
+person. It has one of everything a wave A module needs (a setting, a secret, a collection with an index and a bounded
+scan, a tool that reads, a tool that changes and asks whose, a job scheduled from a turn, a daily job, an action, a
+health check, personal content, two languages) and `pinboard.test.ts` runs each part through the test kit.
 
 ## Contents
 
 1. [What you start from](#1-what-you-start-from)
 2. [The shape of a module](#2-the-shape-of-a-module)
 3. [The turn: who is asking](#3-the-turn-who-is-asking)
-4. [Risk classes and what the gateway refuses](#4-risk-classes-and-what-the-gateway-refuses)
+4. [Risk classes and the risk policy](#4-risk-classes-and-the-risk-policy)
 5. [Storing data](#5-storing-data)
 6. [Scheduling](#6-scheduling)
 7. [People and privacy](#7-people-and-privacy)
 8. [Secrets](#8-secrets)
 9. [Settings forms](#9-settings-forms)
-10. [HTTP routes](#10-http-routes)
-11. [The network](#11-the-network)
-12. [Services and contributions between modules](#12-services-and-contributions-between-modules)
-13. [What a module survives, and what it must not do](#13-what-a-module-survives-and-what-it-must-not-do)
-14. [Latency](#14-latency)
-15. [Speaking](#15-speaking)
-16. [Testing: the kit and checkModule](#16-testing-the-kit-and-checkmodule)
-17. [What a module pull request may touch](#17-what-a-module-pull-request-may-touch)
-18. [The modules](#18-the-modules)
+10. [Typed actions](#10-typed-actions)
+11. [HTTP routes](#11-http-routes)
+12. [The network](#12-the-network)
+13. [Services and contributions between modules](#13-services-and-contributions-between-modules)
+14. [What a module survives, and what it must not do](#14-what-a-module-survives-and-what-it-must-not-do)
+15. [Latency](#15-latency)
+16. [Speaking](#16-speaking)
+17. [Testing: the kit and checkModule](#17-testing-the-kit-and-checkmodule)
+18. [What a module pull request may touch](#18-what-a-module-pull-request-may-touch)
+19. [The modules](#19-the-modules)
 
 ## 1. What you start from
 
-The scaffold (P11) has made your package, `packages/module-<id>/`: a `package.json` with the libraries the plan's
-Appendix A gives your module and the workspace packages it needs, a `tsconfig.json`, and `src/index.ts`, which exports
-your module (`defineModule`, `apiVersion: 2`, off by default, no tools) and a `catalog` array with it. The app lists
-that array once (`apps/assistant/src/modules.ts`), so **you never edit the catalogue**: what your package's `catalog`
-holds is what the app runs. Keep the module's id; you may turn the definition into a factory that takes test
-dependencies (`listsModule(deps)`) as long as `catalog` holds the production one.
+The scaffold has made your package, `packages/module-<pkg>/` (the table in §19 names it; one package can hold several
+module ids): a `package.json` with the libraries the plan's Appendix A gives your module and the workspace packages it
+needs, a `tsconfig.json`, and `src/index.ts`, which exports your module (`defineModule`, `apiVersion: 2`, off by
+default, no tools) and a `catalog` array with it. The app lists that array once (`apps/assistant/src/modules.ts`), so
+**you never edit the catalogue**: what your package's `catalog` holds is what the app runs. Keep the module's id; you
+may turn the definition into a factory that takes test dependencies (`listsModule(deps)`) as long as `catalog` holds
+the production one.
 
-`test/module.test.ts` already runs the conformance check (§16) on it. Your page is `docs/modules/<id>.md`, a stub with
-its headings (§17).
+`test/module.test.ts` already runs the conformance check (§17) on it. Your page is `docs/modules/<id>.md`, a stub with
+its headings (§18).
 
-The contracts you provide or consume are in `@pva/module-contracts` (§12); their fakes for your tests in
-`@pva/module-contracts/fakes`. Spoken numbers, times, dates, durations, quantities and recurrences are
-`@pva/language`; outgoing HTTP is `@pva/net`.
+The contracts you provide or consume are in `@pva/module-contracts` (§13); your tests give a consumer a **stub** of a
+contract (`stubService` in `@pva/core/testing`), never an imitation of the provider. Spoken numbers, times, dates,
+durations, quantities and recurrences are `@pva/language`; outgoing HTTP is `@pva/net`, `GET` and `HEAD` only (§12).
 
 ## 2. The shape of a module
 
 A module is one `defineModule({...})` with two lifetimes:
 
 - **`shared(ctx)`** runs **once per module** while it is demanded (a switched-on assistant has it on, or a demanded
-  module names it in `uses`), with the module's shared settings only. Sockets, caches, job handlers, event
-  subscriptions, services, contributions and routes belong here. What it returns as `value`, every instance gets as
-  `ctx.shared`. 10 s to start.
+  module names it in `uses`). Its `ctx.settings` holds the module's **shared** fields only: an `overridable` field is
+  not in it (an assistant may own its value), so shared code that acts for a caller reads that caller's values with
+  `ctx.settingsFor(assistantId)` at that moment (§9). Sockets, caches, job handlers, event subscriptions, services and
+  contributions belong here. What it returns as `value`, every instance gets as `ctx.shared`. 10 s to start.
 - **`start(ctx)`** runs once per **distinct set of effective settings** (assistants with equal settings share one
-  instance): tools, actions, context providers, instructions. 10 s to start.
+  instance; its `ctx.settings` has every field, the assistant's own values over the shared ones): tools, actions,
+  context providers, instructions. 10 s to start.
 
 They start, stop and are replaced **together**: any change of what the module runs (a shared setting, an assistant
 joining with new values, a secret, a restart) withdraws everything it published, gives its calls in flight 10 s, closes
@@ -78,7 +89,7 @@ server), `health` (below), `templates` (suggested assistants), `declaredActions`
 ```ts
 const settings = {
   keepDays: Setting.number({ label: "Keep notes for", description: "Days a note stays pinned.", default: 7, integer: true, min: 1, max: 365, unit: "days" }),
-  signingKey: Setting.secret({ label: "Webhook key", description: "When set, the pin address also needs it in the X-Pinboard-Key header." })
+  printerKey: Setting.secret({ label: "Label printer key", description: "Not used by this example's tools: it shows a secret declared, checked by health and kept out of every result." })
 }
 ```
 
@@ -87,56 +98,50 @@ const settings = {
 shared: (ctx) =>
   Effect.gen(function*() {
     const board = ctx.store.collection(notes)
-    // A handler is registered in `shared` (once per module), with a payload schema, idempotent: running it twice is fine.
+    // Handlers are registered in `shared` (once per module), each with a payload schema. Both are idempotent: running
+    // one twice for the same occurrence does no harm, so a run cut short by a restart is simply run again.
     yield* ctx.scheduler.handle("expire", {
       payload: Schema.Struct({}),
       idempotent: true,
       run: () =>
         Effect.gen(function*() {
-          const keepDays = ctx.settingsFor(undefined)?.keepDays ?? 7
           const job = yield* CurrentJob
+          if (job === undefined) return yield* Effect.die(new Error("expire runs only as a job"))
+          const keepDays = ctx.settingsFor(undefined)?.keepDays ?? 7
           const cutoff = (yield* Clock.currentTimeMillis) - keepDays * 86_400_000
-          const old = (yield* allNotes((q) => board.list({ orderBy: { field: "pinnedAt", direction: "asc" }, ...q }))).filter((r) => r.value.pinnedAt < cutoff)
-          // One synchronous transaction; nothing in it awaits, and no store failure is caught inside it.
-          yield* ctx.store.transaction((tx) => {
-            for (const row of old) tx.collection(notes).remove(row.id, { actor: { kind: "job", jobId: job?.jobId ?? "expire" } })
-          })
+          // Oldest first, a bounded batch per transaction, until a batch reaches a note that stays: maintenance work
+          // goes on in steps that each take a moment, never in one unbounded read.
+          for (let batch = 0; batch < 100; batch++) {
+            const scan = yield* scanNotes((q) => board.list({ orderBy: { field: "pinnedAt", direction: "asc" }, ...q }))
+            const old = scan.rows.filter((r) => r.value.pinnedAt < cutoff)
+            // One synchronous transaction; nothing in it awaits, and no store failure is caught inside it.
+            yield* ctx.store.transaction((tx) => {
+              for (const row of old) tx.collection(notes).remove(row.id, { actor: { kind: "job", jobId: job.jobId } })
+            })
+            if (!scan.cut || old.length < scan.rows.length) return
+            yield* Effect.yieldNow
+          }
+        })
+    }).pipe(Effect.orDie)
+    yield* ctx.scheduler.handle("unpin", {
+      payload: Schema.Struct({ id: Schema.String.check(Schema.isMaxLength(200)) }),
+      idempotent: true,
+      run: ({ id }) =>
+        Effect.gen(function*() {
+          // A job scheduled from a turn runs with that turn's origin (`CurrentJob`: its assistant, device and person).
+          const job = yield* CurrentJob
+          if (job === undefined) return yield* Effect.die(new Error("unpin runs only as a job"))
+          yield* board.remove(id, { actor: { kind: "job", jobId: job.jobId } })
         })
     }).pipe(Effect.orDie)
     // A system job: cron with minute, hour and day of week only. Scheduling the same key again replaces it.
-    yield* ctx.scheduler.schedule({ handler: "expire", key: "expire", payload: {}, cron: "0 4 * * *" }).pipe(Effect.orDie)
-    return {
-      value: undefined,
-      // A route under /api/modules/pinboard/pin: a token of this module AND a LAN caller; a small JSON body.
-      routes: [{
-        method: "POST" as const,
-        path: "pin",
-        guards: ["token", "lan"] as const,
-        token: "pin",
-        bodyLimitBytes: 1_024,
-        description: "Pin a household note from a home automation.",
-        handler: (request) =>
-          Effect.gen(function*() {
-            const key = ctx.settings.signingKey
-            if (key !== undefined) {
-              const given = Buffer.from(request.headers["x-pinboard-key"] ?? "")
-              const want = Buffer.from(key)
-              if (given.length !== want.length || !timingSafeEqual(given, want)) return { status: 401, body: { error: "bad key" } }
-            }
-            const body = request.body as { readonly text?: unknown } | undefined
-            const text = typeof body?.text === "string" ? body.text.trim() : ""
-            if (text === "" || !Schema.is(StoredText(200))(text)) return { status: 400, body: { error: "text: 1 to 200 characters of one line" } }
-            const row = yield* board.insert({ text, pinnedAt: yield* Clock.currentTimeMillis })
-            return { status: 201, body: { id: row.id } }
-          })
-      }]
-    }
+    yield* ctx.scheduler.schedule({ handler: "expire", key: "expire", cron: "0 4 * * *" }).pipe(Effect.orDie)
+    return { value: undefined }
   }),
 ```
 
-What `start` returns (`ModuleInstance`): `tools` (for the model), `actions` (typed actions: each is a generated tool
-`<moduleId>_<actionId>` and an intent for the fast path; give `examples`, English and Dutch), `context` (context
-providers, §14), `instructions` (one stable sentence or two appended to the system prompt while the module is on;
+What `start` returns (`ModuleInstance`): `tools` (for the model), `actions` (typed actions, §10), `context` (context
+providers, §15), `instructions` (one stable sentence or two appended to the system prompt while the module is on;
 never changing data), and `info` / `settingOptions` / `fieldActions` for the form. A tool that reads:
 
 <!-- region: packages/module-contracts/test/kit/pinboard.ts#read-tool -->
@@ -146,7 +151,7 @@ const read = makeTool({
   description: "Read the notes pinned on the household's pinboard, newest first.",
   parameters: Schema.Struct({}),
   speculative: true, // a plain read: safe to run before the turn is committed; its risk is `read`
-  // The result names whose personal note it holds; the gateway checks it against the asking device (P8).
+  // The result names whose personal note it holds; P8 will check it against the asking device.
   sensitivity: (result) => {
     const owner = (result as { readonly owner?: string }).owner
     return owner === undefined ? { kind: "household" } : { kind: "personal", owner }
@@ -157,14 +162,14 @@ const read = makeTool({
       // Looked up at each use, never kept: `Privacy` is the core's, and decides at the moment of revealing.
       const privacy = ctx.host.service(Privacy)
       const lang = languageOf(ctx.host.view())
-      const rows = yield* allNotes((q) => board.list({ orderBy: { field: "pinnedAt", direction: "desc" }, ...q })).pipe(
-        Effect.mapError(() => new ToolError({ message: "The pinboard could not be read." }))
+      const scan = yield* scanNotes((q) => board.list({ orderBy: { field: "pinnedAt", direction: "desc" }, ...q })).pipe(
+        Effect.mapError(() => new ToolError({ message: say(texts, lang, "unreadable") }))
       )
-      if (rows.length === 0) return { spoken: say(texts, lang, "empty") }
+      if (scan.rows.length === 0) return { spoken: say(texts, lang, "empty") }
       let owner: string | undefined
       let withheld = 0
       const shown: Array<string> = []
-      for (const r of rows) {
+      for (const r of scan.rows) {
         const o = r.value.owner
         // A personal note is read only where the rule allows it now, on the device that will speak it.
         if (o !== undefined && privacy?.mayReveal(o, turn) !== true) {
@@ -178,44 +183,62 @@ const read = makeTool({
         notes: shown.slice(0, 10),
         more: Math.max(0, shown.length - 10),
         ...(withheld > 0 ? { withheld: say(texts, lang, "withheld", { count: withheld }) } : {}),
+        ...(scan.cut ? { cut: say(texts, lang, "cut", { count: SCAN_ROWS }) } : {}),
         ...(owner !== undefined ? { owner } : {})
       }
     })
 })
 ```
 
-A tool that changes, with its risk class, and an action:
+A tool that changes, with its risk class: it asks whose before it writes anything personal, and writes a note and the
+job that takes it down in one transaction (§6):
 
 <!-- region: packages/module-contracts/test/kit/pinboard.ts#change-tool -->
 ```ts
 const pin = makeTool({
   name: "pinboard_pin",
-  description: "Pin a short note on the pinboard, for everyone or only for the person asking.",
+  description: "Pin a short note on the pinboard, for everyone or only for the person asking, optionally for some hours.",
   parameters: Schema.Struct({
     text: StoredText(200).annotate({ description: "The note, one short line" }),
-    forMe: Schema.optionalKey(Schema.Boolean.annotate({ description: "Only for the person asking" }))
+    forMe: Schema.optionalKey(Schema.Boolean.annotate({ description: "Only for the person asking" })),
+    hours: Schema.optionalKey(Schema.Int.check(Schema.isBetween({ minimum: 1, maximum: 72 })).annotate({ description: "Take it down after this many hours" }))
   }),
   risk: "change", // it changes household data: declared, never left to be inferred
-  execute: ({ text, forMe }) =>
+  execute: ({ text, forMe, hours }) =>
     Effect.gen(function*() {
       const turn = yield* CurrentTurn
       const lang = languageOf(ctx.host.view())
-      const person = forMe === true ? turn?.person?.id : undefined
-      yield* board.insert({ text, pinnedAt: yield* Clock.currentTimeMillis, ...(person !== undefined ? { owner: person } : {}) }).pipe(
-        Effect.mapError(() => new ToolError({ message: "The note could not be pinned." }))
-      )
-      if (forMe === true && person === undefined) return { spoken: say(texts, lang, "noPerson") }
-      return { spoken: say(texts, lang, "pinned", { text }) }
+      const person = turn?.person?.id
+      // Personal content needs an owner. Nobody known is asking (a public screen, no default person): ask whose,
+      // and write nothing. Never store it as the household's instead, and never repeat the text here.
+      if (forMe === true && person === undefined) return { spoken: say(texts, lang, "whose") }
+      const note: Note = { text, pinnedAt: yield* Clock.currentTimeMillis, ...(forMe === true && person !== undefined ? { owner: person } : {}) }
+      const failed = () => new ToolError({ message: say(texts, lang, "unsaved") })
+      if (hours === undefined) {
+        yield* board.insert(note).pipe(Effect.mapError(failed))
+        return { spoken: say(texts, lang, "pinned", { text }) }
+      }
+      // The note and the job that takes it down are written in one transaction: both or neither. The row's id is
+      // chosen first, so the job's payload can name it; the job inherits this turn's origin.
+      const id = randomUUID()
+      const job = yield* ctx.scheduler.prepare({ handler: "unpin", key: `unpin:${id}`, payload: { id }, inMs: hours * 3_600_000 }).pipe(Effect.mapError(failed))
+      yield* ctx.store.transaction((tx) => {
+        tx.collection(notes).insert(note, { id })
+        job.writeIn(tx)
+      }).pipe(Effect.mapError(failed))
+      return { spoken: say(texts, lang, "pinnedUntil", { hours, text }) }
     })
 })
 ```
+
+And an action (§10):
 
 <!-- region: packages/module-contracts/test/kit/pinboard.ts#action -->
 ```ts
 const clear = defineAction({
   id: "clear",
   label: "Clear the pinboard",
-  description: "Take down every household note older than a day. Personal notes stay.",
+  description: "Take down household notes older than a day. Personal notes stay.",
   examples: ["clear the pinboard", "take the old notes down", "maak het prikbord leeg"],
   params: {},
   risk: "change",
@@ -223,35 +246,48 @@ const clear = defineAction({
     Effect.gen(function*() {
       const lang = languageOf(ctx.host.view())
       const cutoff = (yield* Clock.currentTimeMillis) - 86_400_000
-      const old = (yield* allNotes((q) => board.list({ orderBy: { field: "pinnedAt", direction: "asc" }, ...q })).pipe(
-        Effect.mapError(() => new ActionError({ message: "The pinboard could not be read." }))
-      )).filter((r) => r.value.owner === undefined && r.value.pinnedAt < cutoff)
+      const scan = yield* scanNotes((q) => board.list({ orderBy: { field: "pinnedAt", direction: "asc" }, ...q })).pipe(
+        Effect.mapError(() => new ActionError({ message: say(texts, lang, "unreadable") }))
+      )
+      const old = scan.rows.filter((r) => r.value.owner === undefined && r.value.pinnedAt < cutoff)
       yield* ctx.store.transaction((tx) => {
         for (const row of old) tx.collection(notes).remove(row.id)
-      }).pipe(Effect.mapError(() => new ActionError({ message: "The pinboard could not be cleared." })))
-      return { say: say(texts, lang, "cleared", { count: old.length }) }
+      }).pipe(Effect.mapError(() => new ActionError({ message: say(texts, lang, "uncleared") })))
+      // A bounded scan that was cut short says so: what it did, and that there is more.
+      return { say: say(texts, lang, scan.cut ? "clearedSome" : "cleared", { count: old.length }) }
     })
 })
 ```
 
 **`health`** is a cheap check (at start, on "Check again", by `pnpm start doctor`; never on a turn; 5 s) that returns
 issues with a fix. A module that depends on anything outside the process declares `requires` and `health` (§3.3 of the
-plan); `checkModule` fails one that requires the network without a `health`. Issue ids are prefixed with the module id
-by the host.
+plan); `checkModule` fails one that requires the network without a `health`. The host puts the module's id before each
+issue's id. `health` receives the settings and whether the module runs, nothing else (no store, no services).
 
 <!-- region: packages/module-contracts/test/kit/pinboard.ts#health -->
 ```ts
 health: ({ settings }) =>
   Effect.succeed(
-    settings?.signingKey === undefined
-      ? [{ id: "pinboard.no-key", severity: "info" as const, title: "The pin address has no key", detail: "Any LAN caller with a token can pin. Set a webhook key to require it too." }]
+    settings?.printerKey === undefined
+      ? [{ id: "pinboard.no-printer-key", severity: "info" as const, title: "No label printer key", detail: "Set one on the module's page to print notes." }]
       : []
   ),
 ```
 
+**What a failure does.** It depends on where it happens:
+
+| What fails | What happens |
+|---|---|
+| `shared` or `start` fails, dies or takes over 10 s; the settings do not decode or a field's check refuses them; a tool name the host refuses (§17) | the module is **down**: `error` on the admin page and a Health issue, until the settings change, the owner presses Check again, or a restart |
+| a tool's `execute`, an action's `run` | that call fails: the model gets the error as the tool result, a typed action says its error; the module runs on |
+| a job's handler | that run fails: retried if the handler is idempotent, else `failed` on the Health page; the module runs on |
+| `health()` fails, dies or takes over 5 s | a Health issue; the module runs on |
+| a risk function throws, answers a class it did not declare, or takes over 2 ms | that call is refused with a generic sentence (details in the log); the module runs on |
+| a context provider takes over 50 ms or fails | it contributes nothing to that turn |
+
 **A module never keeps what the host gave it past its part.** Every member of `ctx` (`host`, `store`, `events`,
 `scheduler`, the core services) answers `ModuleStopped` once the part that got it has closed. Look services up at each
-use (§12), and ask `ctx.settingsFor(assistantId)` each time shared code acts for a caller: a change that keeps the run
+use (§13), and ask `ctx.settingsFor(assistantId)` each time shared code acts for a caller: a change that keeps the run
 (an assistant joining an existing instance) changes its answer without a restart.
 
 ## 3. The turn: who is asking
@@ -268,11 +304,18 @@ the call first:
   claimed by the page, not authenticated: never treat "the turn is Sam's" as proof that Sam is there.
 
 What it may not assume: that there is a person (a shared device without a default person, a public screen), a room, or
-a screen. Outside a turn there is no `CurrentTurn`: a job runs with `CurrentJob` (its origin: the module, and the
-assistant, device and person it was scheduled for), a route handler and `shared` code with neither. Code that awaits
-inside native callbacks loses the fiber's context: read `CurrentTurn` first and pass it on.
+a screen. Code that awaits inside native callbacks loses the fiber's context: read `CurrentTurn` first and pass it on.
 
-## 4. Risk classes and what the gateway refuses
+**Outside a turn.** `shared` code has no `CurrentTurn`. A job runs with **`CurrentJob`**, its **origin**: the job, the
+module, and the assistant, device and person it was scheduled for. A job scheduled while a turn or another job runs
+**inherits that turn's or job's origin** (a request's own `origin` replaces it; a job scheduled in `shared` at start has
+none). The gateway admits the job's calls for that assistant. Its person is who it was for **when it was scheduled**:
+when it runs, the device's default person may be someone else (a job is not a turn, so the gateway does not tie the two
+together). So a job never asks the device who its person is now; it works on its origin's person's data, and checks
+`Privacy.mayReveal(owner, device)` at the moment it reveals anything (§7). The reference module's "pin for two hours"
+job and its test (§17) show the origin arriving.
+
+## 4. Risk classes and the risk policy
 
 Every tool and action has a class: `read` (lookups), `change` (household state: lights, timers, lists, speaking on the
 house's own devices), `message` (sent to people outside the house, or in the owner's name on an outside channel),
@@ -282,16 +325,24 @@ depends on the input is `risk: { classes: ["change", "security"], of: (input) =>
 input, at most 2 ms, that answers one of its declared classes (otherwise the call is refused with a generic sentence).
 
 What the gateway does, in order, on every path (a model's tool call, the Claude Code bridge, the intent agent, a
-routine step through `host.actions.run`, a job): checks the principal (above), that the assistant has the module on and
-the tool is not switched off, runs the risk function, then the risk policy. In this stack the policy is fixed: `read`
-and `change` run; `message` is refused as needing a confirmation; **`money` and `security` are refused everywhere**
-(devices are not authenticated). An action declared `confirm: true` is refused on every path (confirmation is off).
-A refusal comes back to the model as a tool result "Not run: …" and the module's code never runs. So: do not build
-anything whose first version needs `message`, `money` or `security`; say in the description of a tool that can be
-`money` or `security` that it is (`checkModule`'s `risk-said`), so the model is not surprised by the refusal.
+routine step through `host.actions.run`, a job): checks the principal (§3), that the assistant has the module on and
+the tool is not switched off, runs the risk function, then the **risk policy** on the class. The policy is the core's
+`defaultRiskPolicy`, the same in serve mode, the CLI modes and the test kit: **`read` and `change` run; `message` is
+refused as needing a confirmation the assistant cannot ask for yet; `money` and `security` are denied everywhere**
+(devices are not authenticated), each refusal with its own sentence. An action declared `confirm: true` is refused on
+every path (confirmation is off).
+
+- A tool or action **every** declared class of which is refused is **not offered**: it is left out of the model's tool
+  list and of the turn's action catalogue. One that can also be `change` (a cover: a blind or a garage door) is offered,
+  and each call is refused when its input makes it `security`.
+- A refusal comes back to the model as a tool result "Not run: …" (a typed action: its error), and the module's code
+  never runs.
+- So: build nothing whose first version needs `message`, `money` or `security`; and say in the description of a tool
+  that can be `money` or `security` that it is (`checkModule`'s `risk-said`), so the model is not surprised.
 
 `sensitivity` (`household`, `personal` with an owner, or a function of the result) says whose a result is; the gateway
-carries it and P8 checks it against the asking device. `latency` (`instant`, `quick`, `slow`, `background`) is metadata.
+carries it and P8 will check it against the asking device, so today **your code checks privacy itself** (§7).
+`latency` (`instant`, `quick`, `slow`, `background`) is metadata.
 
 ## 5. Storing data
 
@@ -325,32 +376,50 @@ export const notes = defineCollection({
 
 The rules:
 
-- **`maxChars` and the rows a list may read.** A value is a JSON object of at most `maxChars` characters of JSON
-  (default 2,000, at most 16,000). A `list` asks for at most `maxListRows(c) = min(100, floor(25,000 / maxChars))` rows
-  (12 at 2,000; 62 at 400; 100 at 250). **Declare `maxChars` as small as your values really are**, and bound every
-  field so the worst legal value fits it: `checkModule`'s `stored-value` computes the worst from the schema (a string
-  costs 6 characters of JSON per character, the worst JSON escape; `StoredText(n)` from `@pva/module-contracts` costs 2,
-  because it refuses control characters and lone surrogates; a string or list without a maximum cannot fit at all).
+- **A value is an object.** A collection's schema is a `Schema.Struct` (or a union of them): the store keeps JSON
+  objects only (`checkModule`'s `stored-value`).
+- **`maxChars` and the rows a list may read.** A value is at most `maxChars` characters of JSON (default 2,000, at most
+  16,000). A `list` asks for at most `maxListRows(c) = min(100, floor(25,000 / maxChars))` rows (12 at 2,000; 62 at 400;
+  100 at 250). **Declare `maxChars` as small as your values really are**, and bound every field so the worst legal value
+  fits it: `checkModule`'s `stored-value` computes the worst from the schema (a string costs 6 characters of JSON per
+  character, the worst JSON escape; `StoredText(n)` from `@pva/module-contracts` costs 2, because it refuses control
+  characters other than tab, line feed, carriage return, backspace and form feed, and lone surrogates; a number 25; a
+  string or list without a maximum cannot fit at all).
+- **Indexes.** At most 8, of at most 8 distinct top-level fields (`[A-Za-z_][A-Za-z0-9_]{0,63}`); a row's own names
+  `id`, `rev`, `scope`, `createdAt` and `updatedAt` cannot be indexed. **An indexed value is a scalar, and bounded**: a
+  string of at most 500 characters without NUL or a lone surrogate, a finite number, a boolean, or missing; `null` is
+  refused at write. `checkModule` fails an indexed field whose legal values the index refuses (give a string a maximum
+  of at most 500 and `StoredText` or a pattern).
 - **Lists** are one index range: no filter (ordered by `updatedAt`, `createdAt` or an indexed field), an equality
   filter on one indexed field, or a filter on `f` ordered by `g` with the pair `[f, g]` declared. Anything else is
   `invalid`: store a combined field and index it. Ties go by `createdAt`, then id.
 - **Paging with `after`**: to read more than one list returns, pass the last row of a page as `after` in the same query.
-  `after` must be a row a list returned, not a copy.
+  `after` must be a row a list returned, not a copy. **A scan on a turn is bounded, and says when it was cut short**:
+  never call a partial read "every note", and never remove the bound with an unbounded turn-time scan. Maintenance work
+  (a nightly clean-up) goes in batches, each its own transaction, with a yield between them.
 
 <!-- region: packages/module-contracts/test/kit/pinboard.ts#reading -->
 ```ts
-/** Every note, newest first, page by page: a list reads at most `maxListRows(notes)` rows, `after` continues. */
-const allNotes = (list: (q: { readonly limit: number; readonly after?: Row<Note> }) => Effect.Effect<ReadonlyArray<Row<Note>>, unknown>) =>
+/** The most notes one answer reads: 20 pages of 25, each one bounded indexed read. A turn never scans further. */
+export const SCAN_ROWS = 500
+const PAGE = 25
+
+/**
+ * The notes in one order, page by page (`after` continues a list), at most `SCAN_ROWS`, and whether there were more:
+ * a bounded scan says so when it is cut short, so nothing calls a partial read "every note".
+ */
+const scanNotes = (list: (q: { readonly limit: number; readonly after?: Row<Note> }) => Effect.Effect<ReadonlyArray<Row<Note>>, unknown>) =>
   Effect.gen(function*() {
-    const out: Array<Row<Note>> = []
+    const rows: Array<Row<Note>> = []
     let after: Row<Note> | undefined
-    for (let page = 0; page < 20; page++) {
-      const rows = yield* list({ limit: 25, ...(after !== undefined ? { after } : {}) })
-      out.push(...rows)
-      if (rows.length < 25) break
-      after = rows.at(-1)
+    for (let page = 0; page < SCAN_ROWS / PAGE; page++) {
+      const got = yield* list({ limit: PAGE, ...(after !== undefined ? { after } : {}) })
+      rows.push(...got)
+      if (got.length < PAGE) return { rows, cut: false }
+      after = got.at(-1)
     }
-    return out
+    const beyond = yield* list({ limit: 1, ...(after !== undefined ? { after } : {}) })
+    return { rows, cut: beyond.length > 0 }
   })
 ```
 
@@ -364,12 +433,13 @@ const allNotes = (list: (q: { readonly limit: number; readonly after?: Row<Note>
   catch rolls it back; one it catches is a failed call and the rest commits. A scheduler's `writeIn` that fails with
   anything but a refusal must not be caught (§6): committing after it could keep half a write.
 - `update(id, f, { expectRev })` reads, applies `f` and writes in one step; `expectRev` makes an edit from an older
-  read a `StoreConflict`. Write amounts as deltas. Pass `{ actor }` from jobs and routes.
+  read a `StoreConflict`. Write amounts as deltas. Pass `{ actor }` from jobs.
 - **Data versions and migrations.** One `storage.version` per module (default 1). **Any change of a collection's
   schema, indexes or `maxChars` needs a higher version**, and `migrate: { [fromVersion]: (json) => json }` where the
   values change; changing a custom check's function needs one too. The upgrade runs once at start, before the module,
   after a backup, all collections in one transaction (at most 20,000 rows); a failure leaves the module `unavailable`
-  and the data as it was. Data written by a newer version makes the module `unavailable` and is never touched.
+  and the data as it was. **A read never migrates a row**: only that upgrade does. Data written by a newer version
+  makes the module `unavailable` and is never touched.
 - **`remove` removes for good** (secure delete, the log checkpointed), but the daily backups keep a row up to 14 days:
   say so where a person asks to forget something.
 - **What must not be stored**: secrets, passwords, door codes (refuse them: "I don't keep codes"); anything a person
@@ -385,27 +455,48 @@ The scheduler calls a handler of your module at a time, once. **Register handler
 per distinct settings, and two handlers of one name refuse the start); see the reference module's `shared` above. Then:
 
 - **`schedule({ handler, payload, at | inMs | cron, key?, late?, origin? })`**. The payload is JSON of at most 1,000
-  characters (keep data in your own collection and schedule its id); **an absent payload is `null`**, so a handler with
-  `Schema.Struct({})` needs `payload: {}` (`checkModule`'s `job-payload`). A `key` keeps one live job per key: scheduling
-  it again replaces the old one. At most 200 live jobs per module.
-- **Idempotency and retries**: a handler that declares `idempotent: true` is retried with back-off (5 s, 10 s, 20 s, …)
-  up to `retries` (default 3, at most 10) when it fails, times out (`timeoutMs`, default 60 s) or is cut short by a
-  crash; one that does not is run at most once per occurrence and a failure is `failed` on the Health page. Declare it
-  only if running twice is harmless (it checks what it already did).
+  characters (keep data in your own collection and schedule its id); **an absent payload is `{}`**. While the handler
+  is published (always, for a module scheduling its own jobs while it runs), **a payload its schema does not decode is
+  refused at once**, `invalid`, at `schedule`, `prepare` and `reschedule`. A `key` keeps one live job per key:
+  scheduling it again replaces the old one. At most 200 live jobs per module (`limit` past that). The job's origin is
+  the calling turn's or job's (§3).
+- **A handler**: `payload` (a schema), `run(payload, due)`, `idempotent` (default false), `retries` (0 to 10, default 3),
+  `timeoutMs` (100 ms to 10 minutes, default 60 s). A handler that declares `idempotent: true` is retried with back-off
+  (5 s, 10 s, 20 s, …) up to `retries` when it fails, times out or is cut short by a crash; one that does not is run at
+  most once per occurrence and a failure is `failed` on the Health page. Declare it only if running twice is harmless
+  (it checks what it already did).
 - **The late rule**: `late: "run"` (the default) runs a job found late once, however late; `late: { withinMs }` runs it
-  only that late at most, else the job is `missed` and the handler is not called. A repeating job that missed several
-  occurrences runs once, for the latest. The handler is told how late it is (`due.lateMs`).
+  only that late at most, else the job is `missed` and **the handler is not called**. A repeating job that missed
+  several occurrences runs once, for the latest. The handler is told how late it is (`due.lateMs`). A handler that
+  plans the next occurrence of a series must always run, so it keeps `late: "run"` and decides inside whether the
+  occurrence is still worth delivering (below).
 - **The cron grammar** is for system jobs (a cache refresh, a nightly clean-up): minute, hour and day-of-week fields
-  (and seconds first), **day of month and month must be `*`**, at most 100 characters. `0 7 1 * *` is refused
-  (`checkModule`'s `cron`). A cron job without a `timeZone` uses the household's.
+  (and seconds first), **day of month and month must be `*`**, at most 100 characters. `0 7 1 * *` is refused. A cron
+  job without a `timeZone` uses the household's. `isSchedulerCron(expr, timeZone?)` from `@pva/core` answers why one
+  would be refused (or `undefined`), for checking a schedule your module builds.
 - **A spoken recurrence** ("every second Tuesday") is an `RRULE` kept in **your own row**, with **one job for the next
-  occurrence**; the handler plans the one after. `@pva/language` reads the phrase (`parseRecurrence`, never guessing:
-  ambiguous is a question) and computes the next time (`nextOccurrence`):
+  occurrence**; the handler plans the one after, always after now, so an occurrence missed during an outage is skipped,
+  never planned in the past. `@pva/language` reads the phrase (`parseRecurrence`, never guessing: ambiguous is a
+  question) and computes the next time (`nextOccurrence`). The rule and its first job are written in one transaction:
 
 <!-- region: packages/module-contracts/test/kit/examples.test.ts#recurrence -->
 ```ts
 const Rule = Schema.Struct({ text: StoredText(120), rrule: StoredText(200), dtstart: StoredText(80), timeZone: StoredText(64) })
 const rules = defineCollection({ name: "rules", scope: "household", schema: Rule, maxChars: 1_100 })
+
+const nagTexts = defineTexts({
+  en: { when: "When exactly? I didn't understand when.", saved: "Every time: {text}.", unsaved: "I couldn't save that." },
+  nl: { when: "Wanneer precies? Ik begreep niet wanneer.", saved: "Elke keer: {text}.", unsaved: "Dat kon ik niet bewaren." }
+})
+
+/** The household's zone: `HOME_TIME_ZONE`, and when it is empty (the default), this machine's, as the Home section means. */
+const homeZone = (home: Readonly<Record<string, unknown>>): string => {
+  const zone = home.HOME_TIME_ZONE
+  return typeof zone === "string" && zone.trim() !== "" ? zone : Intl.DateTimeFormat().resolvedOptions().timeZone
+}
+
+/** An occurrence found later than this is not delivered (the moment has passed), but the series goes on. */
+const DELIVER_WITHIN_MS = 15 * 60_000
 
 export const nagModule = defineModule({
   apiVersion: 2,
@@ -417,43 +508,56 @@ export const nagModule = defineModule({
   shared: (ctx) =>
     Effect.gen(function*() {
       const store = ctx.store.collection(rules)
-      /** One job for the next occurrence only; its handler plans the one after. The rule stays in our own row. */
-      const planNext = (id: string, rule: typeof Rule.Type, after: number) => {
+      /** The job for the next occurrence after `after`, prepared (not written): `undefined` when the series has ended. */
+      const prepareNext = (id: string, rule: typeof Rule.Type, after: number): Effect.Effect<Option.Option<PreparedJob>, SchedulerError> => {
         const at = nextOccurrence(rule, after)
-        return at === undefined
-          ? Effect.void // the series has ended
-          : Effect.asVoid(ctx.scheduler.schedule({ handler: "due", key: `rule:${id}`, payload: { id }, at, late: { withinMs: 15 * 60_000 } }))
+        // The handler always runs, however late (`late: "run"`, the default), so the series is never lost to an outage.
+        return at === undefined ? Effect.succeed(Option.none()) : Effect.asSome(ctx.scheduler.prepare({ handler: "due", key: `rule:${id}`, payload: { id }, at }))
       }
       yield* ctx.scheduler.handle("due", {
-        payload: Schema.Struct({ id: Schema.String }),
+        payload: Schema.Struct({ id: Schema.String.check(Schema.isMaxLength(200)) }),
+        // Running it twice for one occurrence plans the same next job again (same key: it replaces): safe to retry.
+        idempotent: true,
         run: ({ id }, due) =>
           Effect.gen(function*() {
             const row = yield* store.get(id)
-            if (row === undefined) return // removed meanwhile: nothing to do, nothing to plan
-            // … deliver it (P9's notifications, once they exist) …
-            yield* planNext(id, row.value, due.dueAt)
+            if (row === undefined) return // removed meanwhile: nothing to deliver, nothing to plan
+            const now = yield* Clock.currentTimeMillis
+            if (due.lateMs <= DELIVER_WITHIN_MS) {
+              // … deliver it (P9's notifications, once they exist) …
+            }
+            // Always the next occurrence after now: one missed during an outage is skipped, never planned in the past.
+            const next = yield* prepareNext(id, row.value, Math.max(now, due.dueAt))
+            if (Option.isSome(next)) yield* ctx.store.transaction((tx) => void next.value.writeIn(tx))
           })
       }).pipe(Effect.orDie)
-      return { value: { store, planNext } }
+      return { value: { store, prepareNext } }
     }),
   start: (ctx) =>
     Effect.succeed({
       tools: [makeTool({
         name: "nag_every",
         description: "Repeat a line on a schedule said in words (\"every Tuesday at half seven\").",
-        parameters: Schema.Struct({ text: StoredText(120), when: Schema.String.check(Schema.isMaxLength(120)) }),
+        parameters: Schema.Struct({ text: StoredText(120), when: StoredText(120) }),
         risk: "change",
         execute: ({ text, when }) =>
           Effect.gen(function*() {
-            const timeZone = String(ctx.host.view().home.HOME_TIME_ZONE ?? "Europe/Amsterdam")
+            const view = ctx.host.view()
+            const lang = homeLanguage(view)
             const now = yield* Clock.currentTimeMillis
-            const said = parseRecurrence(when, homeLanguage(ctx.host.view()), { now, timeZone })
+            const said = parseRecurrence(when, lang, { now, timeZone: homeZone(view.home) })
             // Never guessed: ambiguous or not understood becomes a question for the person.
-            if (said.kind !== "ok") return { spoken: `When exactly? I didn't understand "${when}".` }
+            if (said.kind !== "ok") return { spoken: say(nagTexts, lang, "when") }
             const rule = { text, rrule: said.value.rrule, dtstart: said.value.dtstart, timeZone: said.value.timeZone }
-            const row = yield* ctx.shared.store.insert(rule).pipe(Effect.mapError(() => new ToolError({ message: "It could not be saved." })))
-            yield* ctx.shared.planNext(row.id, rule, now).pipe(Effect.mapError(() => new ToolError({ message: "It could not be planned." })))
-            return { spoken: `Every time: ${text}.`, first: said.value.startInstant }
+            // The rule and its first job in one transaction: both or neither (at the job limit, neither).
+            const id = randomUUID()
+            const unsaved = () => new ToolError({ message: say(nagTexts, lang, "unsaved") })
+            const first = yield* ctx.shared.prepareNext(id, rule, now).pipe(Effect.mapError(unsaved))
+            yield* ctx.store.transaction((tx) => {
+              tx.collection(rules).insert(rule, { id })
+              if (Option.isSome(first)) first.value.writeIn(tx)
+            }).pipe(Effect.mapError(unsaved))
+            return { spoken: say(nagTexts, lang, "saved", { text }), first: said.value.startInstant }
           })
       })]
     })
@@ -461,8 +565,11 @@ export const nagModule = defineModule({
 ```
 
 - **Inside your own transaction**: `prepare(request)` (an Effect, outside), then `job.writeIn(tx)` (synchronous,
-  inside): the job commits or rolls back with your rows. A refusal (`invalid` at the limit) may be caught and the rest
-  committed; any other failure of `writeIn` must not be caught.
+  inside): the job commits or rolls back with your rows, so a refused job (`limit`) leaves neither. A refusal may be
+  caught and the rest committed; any other failure of `writeIn` must not be caught. Choose a row's id first
+  (`insert(value, { id })`) when the job's payload names it.
+- The Home section's `HOME_TIME_ZONE` is empty by default, meaning this machine's zone
+  (`Intl.DateTimeFormat().resolvedOptions().timeZone`); never substitute a fixed zone for it.
 - No pause and resume (cancel and schedule again), no background tasks (a fiber in your own scope), no notification
   jobs (P9's service has its own). `cancel`, `reschedule`, `get` and `list` (your live jobs, 10 a page, `after`).
 
@@ -482,10 +589,13 @@ It fails closed: an unknown or missing owner, a person no longer in Members, an 
 content with no known owner is treated as someone else's. So:
 
 - **Put an owner on personal content** when you store it (a person-scoped row, or an owner field), and keep household
-  data in the household.
-- **Ask `Privacy.mayReveal` at the moment of revealing**, for that device (the reference module's read tool above): on
-  a shared device that is not the owner's, reduce it ("Sam: busy 12:30 to 13:30") or leave it out and say so; on a
-  public one leave it out.
+  data in the household. **No person, no personal write**: when a turn asks for something personal and has no person
+  (a public screen, a shared device without a default person), ask whose and write nothing; never store it as the
+  household's instead, and do not repeat the private text on that device (the reference module's `pinboard_pin`).
+- **Ask `Privacy.mayReveal` at the moment of revealing**, for that device (the reference module's read tool above). When
+  it says no: on a known `shared` device, for a member, you may reduce it to what names no detail ("Sam has two things
+  today") where your module's document says so; on a `public` or unknown device, or for an owner who is not a member,
+  say nothing personal (at most an anonymous count: "2 personal notes are not read out here").
 - **Never cache** the answer of `mayReveal`, of `settingsFor`, or a membership (`People.get`): a device's place, its
   default person and Members change while the module runs (a change of privacy or default person also ends that
   device's session). Look them up when acting.
@@ -496,31 +606,45 @@ content with no known owner is treated as someone else's. So:
 
 ## 8. Secrets
 
-A secret is a settings field of kind secret: `Setting.secret({ label, required? })`. It lives in the key vault, never on
-a page, never overridable by an assistant, and the module receives it in `settings` only while the vault is unlocked.
-**Never put a secret, or anything derived from one, in a status line, an error, a log line, a tool result, an action's
-text, an option label or value, a description, an `info` value, a route path or token name, or a Health issue.** Say
+A secret is a settings field of kind secret: `Setting.secret({ label, required? })`, never overridable by an assistant
+and never on a page. Its value comes from the **key vault**, from the **environment** (the field's `env` variable,
+which wins and is not protected by the vault), or, before a vault exists, from the old secrets file. The module
+receives it in `settings` when its part starts. **A running module keeps the secrets it started with when the vault
+locks**, and a restart with the same configuration reuses them: locking the vault is not a way to revoke a client a
+module made with a key. While the vault is locked when the module starts, a vault secret is absent.
+
+**Never put a secret, or anything derived from one, in a status line, an error, a log line, a tool result, a spoken
+line, a stored row, an action's text, an option label or value, a description, an `info` value or a Health issue.** Say
 what happened instead ("The key was refused"). The host's page boundary replaces exact occurrences of a secret on admin
-pages with `[secret]`, but that is a safety net, not a licence (it cannot see an encoded or cut secret); `checkModule`
-starts the module with recognisable secret values and fails (`secret`) when one reaches what the module wrote or what
-the admin page shows. Compare a secret with `timingSafeEqual` (the reference module's route). A route's callers use
-route tokens the owner mints (§10), not module secrets.
+pages with `[secret]`, but that is a safety net, not a licence (it cannot see an encoded or cut secret, and model
+results never pass it). `checkModule` starts the module with recognisable secret values and fails (`secret`) when one
+reaches what the module declares or what the admin page shows; what your tools return, speak and store, **your tests
+assert** with the kit's `expectNoSecrets` (§17). Compare a secret with `timingSafeEqual`.
 
 ## 9. Settings forms
 
 Field kinds (`Setting.*` from `@pva/core`): `text`, `secret`, `number`, `boolean`, `choice`, `multichoice`, `textList`,
 `records` (a list of flat items), `combo` (a choice with suggestions the instance fills), `action` (a button: a "Test"
-handler in `fieldActions`, 8 s) and `info` (a read-only value the instance sets). A field may be `overridable` (an
+handler in `fieldActions`) and `info` (a read-only value the instance sets). A field may be `overridable` (an
 assistant may own its value; never a secret, and modules do not mark addresses) and `visibleWhen` another field has one
-of some values. Precedence: environment, then saved, then default.
+of some values.
+
+**Which value a field has.** A shared field: the environment, then the saved value, then a linked default (a Home
+section value, where the field follows one), then the field's default. An `overridable` field: **the assistant's own
+value over all of those**. `start` gets the result for its instance. `shared` gets no overridable field at all: read
+one with `ctx.settingsFor(assistantId)` (the assistant's effective settings, or the shared ones for `undefined`) at the
+moment it acts for that assistant.
 
 - **`records` stay flat**: an item is text, number, boolean, choice, multichoice or text-list fields. **Nested
-  configuration** (a routine's steps, an MCP server's tool policy) is **JSON in a text field**, validated with a schema
-  and explained on error. Nobody builds a nested editor in this stack.
-- **Size budgets**: the described form at most 8 KiB as the wire encodes it (the module does not start otherwise:
-  `checkModule`'s `form`); the complete form as sent, with values and tools, at most 48 KiB (a save over it is
-  refused); a `records` or `textList` value at most 32 KB of JSON; a `combo` at most 200 options; `info` values cut to
-  1,000 characters, Test results to 500.
+  configuration** (a routine's steps) is **JSON in a text field**, validated with a schema and explained on error.
+  Nobody builds a nested editor in this stack.
+- **Size budgets**: the described form at most 8 KiB as the wire encodes it (bytes; the module does not start
+  otherwise: `checkModule`'s `form`); the complete form as sent, with values and tools, at most 48 KiB (bytes; a save
+  over it is refused); a `records` or `textList` value at most 32,768 characters of its `JSON.stringify` text (string
+  length, not bytes); a `combo` at most 200 options; `info` values cut to 1,000 characters, Test results to 500.
+- **Buttons** (`action` fields): a press has 8 s. One button runs one press at a time: it stays busy until its press has
+  really ended. A module runs at most 4 presses at once (a fifth is refused `busy`, and Health says so). A "Test" press
+  runs to its result or its time limit whether or not the page that pressed it is still connected.
 
 <!-- region: packages/module-contracts/test/kit/examples.test.ts#settings-form -->
 ```ts
@@ -549,51 +673,104 @@ export const formSettings = {
 }
 ```
 
-## 10. HTTP routes
+## 10. Typed actions
 
-A `shared` part may return `routes`, answered under `/api/modules/<moduleId>/<path>` only while that part is the
-published one (404 when the module is stopped, 503 while it restarts). Each route declares **guards, every one of which
-must pass**: `admin` (the admin session), `token` (a route token of this module with the route's `token` name, minted by
-the owner on the module's page, one per caller, revocable), `lan` (a private or loopback caller; refused for everyone
-when the server is behind a declared proxy). A route without guards must be `public: true`, a GET with no body. Also:
-`body` (`json`, `bytes`, `none`), `bodyLimitBytes` (8 KB, at most 1 MB), `rateLimit` (30 a minute per caller, 120 in
-all), `timeoutMs` (5 s, at most 30 s). A handler runs outside any turn, in a slot of the module (at most 16 at once),
-and is interrupted when its part closes. Requests a browser marks as from another site are refused before the guards.
+An action (`defineAction`) is a command with typed parameters that can run without the language model: the intent
+agent matches it from its `examples` (give English and Dutch), and the model is offered it as the generated tool
+`<moduleId>_<actionId>` (unless `offerAsTool: false`). Its identity is `<moduleId>.<actionId>`. An action id is 1 to 40
+lower case letters, digits and `_`, starting with a letter (a module id: lower case letters, digits and `-`), and the
+generated tool name must fit 64 characters (the host refuses the start otherwise). Parameters (`Param.*`): `choice` (a fixed list), `dynamic` (a list the module knows at run time,
+read synchronously from its own cache), `number`, `duration`, `boolean`, `text`; `optional` with a `default`.
 
-The reference module's route is in its `shared` part above; its test:
-
-<!-- region: packages/module-contracts/test/kit/pinboard.test.ts#route -->
+<!-- region: packages/module-contracts/test/kit/examples.test.ts#param-action -->
 ```ts
-it.effect("the pin address needs a token of the module and a LAN caller, and the key when one is set", () =>
-  Effect.gen(function*() {
-    const board = yield* startTestModule(pinboardModule, { secrets: { signingKey: "k3y-for-tests" } })
-    const { secret } = yield* board.mintRouteToken("pin", "Home Assistant")
-    const body = { text: "Washing done" }
-    assert.strictEqual((yield* board.route({ method: "POST", path: "pin", body })).status, 401)
-    assert.strictEqual((yield* board.route({ method: "POST", path: "pin", body, as: { token: secret, address: "8.8.8.8" } })).status, 403)
-    assert.strictEqual((yield* board.route({ method: "POST", path: "pin", body, as: { token: secret } })).status, 401)
-    const ok = yield* board.route({ method: "POST", path: "pin", body, headers: { "X-Pinboard-Key": "k3y-for-tests" }, as: { token: secret } })
-    assert.strictEqual(ok.status, 201)
-    const read = yield* board.tool("pinboard_read", {})
-    assert.deepStrictEqual((read.value as { notes: Array<string> }).notes, ["Washing done"])
-  }))
+/** A typed action with parameters: a choice the module fixes, a dynamic choice from its own cache, a number. */
+const rooms = (): ReadonlyArray<{ readonly value: string; readonly label: string; readonly aliases?: ReadonlyArray<string> }> => [
+  { value: "kitchen", label: "Kitchen", aliases: ["keuken"] },
+  { value: "living", label: "Living room", aliases: ["woonkamer", "lounge"] }
+]
+const fanTexts = defineTexts({ en: { set: "The {room} fan is on {speed} for {minutes} minutes." }, nl: { set: "De ventilator in {room} staat {minutes} minuten op {speed}." } })
+
+export const fanModule = defineModule({
+  apiVersion: 2,
+  id: "fan",
+  name: "Fan",
+  description: "Turns a room's fan on for a while.",
+  enabledByDefault: false,
+  start: (ctx) =>
+    Effect.succeed({
+      actions: [defineAction({
+        // Its id is `fan.run` (`<moduleId>.<actionId>`), and the model is offered it as the tool `fan_run`.
+        id: "run",
+        label: "Run the fan",
+        description: "Run a room's fan at a speed for some minutes.",
+        examples: ["run the kitchen fan on high for ten minutes", "zet de ventilator in de keuken tien minuten hoog"],
+        params: {
+          room: Param.dynamic({ label: "Room", options: rooms }),
+          speed: Param.choice({ label: "Speed", options: [{ value: "low", label: "low" }, { value: "high", label: "high" }], default: "low", optional: true }),
+          minutes: Param.number({ label: "Minutes", min: 1, max: 60, integer: true })
+        },
+        risk: "change",
+        run: ({ room, speed, minutes }) =>
+          Effect.succeed({ say: say(fanTexts, homeLanguage(ctx.host.view()), "set", { room: rooms().find((r) => r.value === room)?.label ?? room, speed: speed ?? "low", minutes }) })
+      })]
+    })
+})
 ```
 
-## 11. The network
+A routine step, and a test, runs one through **`host.actions.run({ moduleId, actionId, params })`**, with the values
+in their tool input form (a dynamic choice by its value, a duration as a phrase), through the gateway and as the
+calling turn:
 
-Outgoing HTTP is `@pva/net`, never `fetch`:
+<!-- region: packages/module-contracts/test/kit/examples.test.ts#param-action-test -->
+```ts
+const run = yield* kit.action("run", { room: "kitchen", speed: "high", minutes: 10 })
+assert.deepStrictEqual(run, { ok: true, say: "The Kitchen fan is on high for 10 minutes." })
+// The same through its generated tool, as the model calls it.
+const tool = yield* kit.tool("fan_run", { room: "kitchen", minutes: 5 })
+assert.strictEqual(tool.value, "The Kitchen fan is on low for 5 minutes.")
+```
+
+**An action's `run` has 5 s** (`ACTION_TIMEOUT_MS`), on every path; past that it is interrupted and fails. That is
+shorter than `safeFetch`'s default of 6 s: a network call inside an action takes an explicit `timeoutMs` (3 s leaves time
+to answer), and work that may take longer is scheduled (`inMs: 0`) or started in the module's shared part while the
+action answers what it started. It returns `{ say }`, spoken as it is with no model (in the household's language, §16).
+
+## 11. HTTP routes
+
+**No module of wave A has a route**, and the test kit does not imitate the server's router. A `shared` part may return
+`routes`, answered under `/api/modules/<moduleId>/<path>` (at most 32 routes, a path at most 200 characters) only while
+that part is the published one. Each route declares **guards, every one of which must pass**: `admin` (the admin
+session), `token` (a route token of this module with the route's `token` name, minted by the owner on the module's page,
+kept in the key vault: while the vault is locked a token route cannot check its caller and answers 503), `lan` (a private or
+loopback caller; refused for everyone when the server is behind a declared proxy). A route without guards must be
+`public: true`, a GET with no body. Also: `body` (`json`, `bytes`, `none`), `bodyLimitBytes` (8 KB, at most 1 MB),
+`rateLimit` (30 a minute per caller, 120 in all), `timeoutMs` (5 s, at most 30 s). A handler runs outside any turn and
+any job (no principal: it cannot run actions as anyone), in a slot of the module (at most 16 at once), and is
+interrupted when its part closes. While the module is stopped or being replaced its routes are withdrawn: **a new
+request gets 404**; only a request already admitted when the module stops gets 503. Requests a browser marks as from
+another site are refused before the guards. The first module that has a route brings its route tests, in the app's
+serve tests (`apps/assistant/test/moduleRoutes*.test.ts` show how).
+
+## 12. The network
+
+Outgoing HTTP is `@pva/net`, never `fetch`, and **in this wave it is `GET` and `HEAD` only**: a module whose first
+version needs another method (a `POST`, a WebDAV verb, a streamed request) or a library that makes its own requests is
+not in this wave.
 
 - **`safeFetch(url, { accept, … })`** for public APIs and any URL a model chose: `accept` (the response types you take:
   `contentTypes.json`, `webPage`, `feed`, `image`, or your own) is required; only `http`/`https`, ports 80 and 443, no
   credentials in the URL, every non-public address refused (checked on the address it connects to, and on every
-  redirect), limits on size (`maxBytes`, 2 MiB) and time (`timeoutMs`, 6 s).
-- **`fetchOwnerConfiguredLan(url, …)`** only for an address the owner typed into your settings (a LAN SearXNG, Home
-  Assistant): it also allows private addresses and other ports. **Never pass it a URL a model chose.**
+  redirect), limits on size (`maxBytes`, 2 MiB) and time (`timeoutMs`, 6 s; an action's call takes less, §10).
+- **`fetchOwnerConfiguredLan(url, …)`** only for an address the owner typed into your settings (a LAN SearXNG): it also
+  allows private addresses and other ports. **Never pass it a URL a model chose.**
 - **`makeCachedJson`** for JSON with a time to live, `ETag` and stale-if-error.
 - **`userAgent(contact)`**: put the owner's contact (Home › API contact, `HOME_API_CONTACT`) in the User-Agent **only
   when the owner set one**.
 - Declare `requires: [{ network: "internet", why }]` (or `"lan"`) and a `health`.
-- Take the `resolver` and `connector` as dependencies, so tests pass the kit's network that has no network:
+- Take the `resolver` and `connector` as dependencies, so tests pass the kit's network that has no network. That
+  replaces exactly those two of `@pva/net`: it does not catch a library's own `fetch`, `node:http` or DNS lookups, which
+  is one more reason a library that fetches by itself is not in this wave.
 
 <!-- region: packages/module-contracts/test/kit/network.test.ts#net-module -->
 ```ts
@@ -646,34 +823,43 @@ it.effect("serves fixtures, fails every other host, and keeps the owner's LAN fo
   }))
 ```
 
-Everything that comes back (a page, a feed, a tool result of an MCP server, an invitation's text) is untrusted data:
-pass it to the model marked as such, cut to a bound, never as instructions.
+Everything that comes back (a page, a feed, an invitation's text) is untrusted data: pass it to the model marked as such,
+cut to a bound, never as instructions.
 
-## 12. Services and contributions between modules
+## 13. Services and contributions between modules
 
 A module offers others a **service** (one provider per key: `services: [Key.of(impl)]` in `shared`) or a
 **contribution** (any number: `contributions: [Key.of(value)]`). The shared keys and their interfaces are in
-`@pva/module-contracts`, each documented in full in its file:
+`@pva/module-contracts`; **each file's documentation is the contract**: what a provider must do and what a consumer may
+rely on, with every bound and id.
 
 | Key | Kind | Provided by | Used by | File |
 |---|---|---|---|---|
-| `Lists` | service | lists | kitchen | `lists.ts` |
-| `Timers` | service | timers | routines; kitchen later | `timers.ts` |
-| `HomeAssistant` | service (a transport) | home-assistant (smart-home) | music, presence | `homeAssistant.ts` |
-| `Playback` | service | music | the host's "stop" and volume (P7), assistant-controls | `playback.ts` |
-| `Mcp` | service (a transport) | mcp | t3-code (later) | `mcp.ts` |
-| `CalendarProviders` | contribution | calendar (ICS, CalDAV); google later | calendar | `calendar.ts` |
-| `BriefingSections` | contribution | weather, bin-day, calendar, news, reminders; google later | briefing | `briefing.ts` |
+| `Lists` | service: the household's shopping list | lists | kitchen | `lists.ts` |
+| `Timers` | service: start a timer | timers (wave B) | routines; kitchen later | `timers.ts` |
+| `HomeAssistant` | service (a transport) | home-assistant (smart-home) | music (wave B), presence | `homeAssistant.ts` |
+| `Playback` | service: pause, volume | music (wave B) | the host's "stop" and volume (P7) | `playback.ts` |
+| `BriefingSections` | contribution | weather, bin-day, calendar, news; reminders later | briefing | `briefing.ts` |
 
-The core's own are `People`, `Privacy`, `Devices` in `@pva/core` (later `SessionControl`, `DeviceControl`).
+The core's own are `People`, `Privacy`, `Devices` in `@pva/core` (later `SessionControl`, `DeviceControl`). The
+calendar module keeps its own provider interface (ICS) inside its package: no other module provides a calendar in
+this wave.
 
 - **Look a service up at each use** (`ctx.host.service(Key)`), never keep it: `undefined` means its module is off, and
   the consumer says so in one sentence. A call made while the provider stops may die with `ModuleStopped`.
-  `useService(host, Key, "name", use)` turns both into `ProviderOff`:
+  `useService(host, Key, use)` turns both into `ProviderOff`, which carries the service's id; `providerOffText(lang,
+  name)` gives the sentence in both languages. A contract's errors carry a `reason`, which the consumer words in its
+  own two-language texts, and a `detail` for the log:
 
 <!-- region: packages/module-contracts/test/contracts.test.ts#consumer -->
 ```ts
-/** A consumer: asks the lists module through useService and says so when it is off. */
+/** The consumer's own sentences, in both languages; a contract's errors carry a reason, which it words itself. */
+const consumerTexts = defineTexts({
+  en: { added: "Rice is on the shopping list.", full: "The shopping list is full.", failed: "I couldn't reach the shopping list." },
+  nl: { added: "Rijst staat op het boodschappenlijstje.", full: "Het boodschappenlijstje is vol.", failed: "Ik kon het boodschappenlijstje niet bereiken." }
+})
+
+/** A consumer: asks the lists module through useService, and says so in the household's language when it is off. */
 const consumer = defineModule({
   apiVersion: 2,
   id: "consumer",
@@ -687,12 +873,14 @@ const consumer = defineModule({
         description: "Add rice to the shopping list.",
         parameters: Schema.Struct({}),
         risk: "change",
-        execute: () =>
-          useService(ctx.host, Lists, "lists", (lists) => lists.addItem({ list: { kind: "shopping" }, text: "Rice", source: { module: "consumer" }, dedupeKey: "consumer:rice" })).pipe(
-            Effect.map((r) => r.outcome),
-            Effect.catchTag("ProviderOff", (off) => Effect.succeed(off.message)),
-            Effect.catchTag("ListsError", (e) => Effect.succeed(e.message))
+        execute: () => {
+          const lang = homeLanguage(ctx.host.view())
+          return useService(ctx.host, Lists, (lists) => lists.addItem({ text: "Rice", dedupeKey: "consumer:rice" })).pipe(
+            Effect.map(() => say(consumerTexts, lang, "added")),
+            Effect.catchTag("ProviderOff", () => Effect.succeed(providerOffText(lang, "Lists"))),
+            Effect.catchTag("ListsError", (e) => Effect.succeed(say(consumerTexts, lang, e.reason === "limit" ? "full" : "failed")))
           )
+        }
       })]
     })
 })
@@ -700,32 +888,46 @@ const consumer = defineModule({
 
 - **A service call runs on behalf of the call that made it**: the gateway admitted the consumer's tool or job, and the
   provider does not ask again. So a service offers only what any caller may do (reads and `change` on household
-  data). The two transports (`HomeAssistant`, `Mcp`) are never offered to the model as tools: the consumer classifies
-  its own tools, and each call it makes must fit the call the gateway admitted.
+  data). The transport (`HomeAssistant`) is never offered to the model as a tool: the consumer classifies its own
+  tools, and each call it makes must fit the call the gateway admitted; it targets entities by id only, and the
+  provider refuses anything else.
 - **Contributions** are read live: `host.contributions(Key)` (an Effect; inside a turn only those of modules the turn's
   assistant has on). Native code names the assistant: `host.contributionsFor(Key, assistantId)`.
 - A module that **cannot run at all** without a provider names it in `uses`; one that works without it does not.
 - Events (`ctx.events.publish("item.completed", …)`, published as `<moduleId>.item.completed`) may be listened to, but
   nothing may depend on an event for correctness: they are lost at a restart. Consume a subscription in the part's
   scope (`Effect.forkScoped` in `shared`).
-- **Testing a consumer**: give it the contract's fake through the kit's `provide`, which publishes it from a stand-in
-  module of the provider's id, exactly as the real one would be found:
+- **Testing a consumer**: give it a **stub** of the contract through the kit's `provide`, which publishes it from a
+  stand-in module of the provider's id, exactly as the real one would be found. A stub (`stubService`) has no behaviour
+  of its own: it records its calls and answers what the test programs (a value, a function of the arguments, a typed
+  failure with `fails`, the provider stopping with `stops`); program only answers the contract's documentation allows.
+  A method called without an answer fails the test. Testing a provider: its own tests, against its contract's text.
 
 <!-- region: packages/module-contracts/test/contracts.test.ts#consumer-test -->
 ```ts
-const fake = makeFakeLists()
-const on = yield* startTestModule(consumer, { provide: [provide("lists", { services: [Lists.of(fake.service)] })] })
-assert.strictEqual((yield* on.tool("consumer_add", {})).value, "added")
-const off = yield* startTestModule(consumer)
-assert.strictEqual((yield* off.tool("consumer_add", {})).value, "The lists module is off.")
+// A stub answers what the test programs, and records what it was asked; it does nothing of its own.
+const lists = stubService<ListsService>("lists", {
+  addItem: (request) => Effect.succeed({ outcome: "added", item: { id: "item-1", text: request.text, status: "open", ...(request.dedupeKey !== undefined ? { dedupeKey: request.dedupeKey } : {}) } })
+})
+const on = yield* startTestModule(consumer, { provide: [provide("lists", { services: [Lists.of(lists.service)] })] })
+assert.strictEqual((yield* on.tool("consumer_add", {})).value, "Rice is on the shopping list.")
+assert.deepStrictEqual(lists.calls.addItem, [[{ text: "Rice", dedupeKey: "consumer:rice" }]])
+// The answers the contract allows: full, and the provider stopping during the call.
+lists.answer("addItem", fails(new ListsError({ reason: "limit", detail: "500 open items" })))
+assert.strictEqual((yield* on.tool("consumer_add", {})).value, "The shopping list is full.")
+lists.answer("addItem", stops())
+assert.strictEqual((yield* on.tool("consumer_add", {})).value, "The Lists module is off.")
+// No lists module at all, in a Dutch household.
+const off = yield* startTestModule(consumer, { household: { home: { HOME_LANGUAGE: "nl-NL" } } })
+assert.strictEqual((yield* off.tool("consumer_add", {})).value, "De module Lists staat uit.")
 ```
 
-## 13. What a module survives, and what it must not do
+## 14. What a module survives, and what it must not do
 
 Modules are compiled into the app and trusted. The host handles correctly an Effect of yours that fails, dies or takes
 too long **and stops when it is interrupted**, and a plain function you hand it (a settings check, a decoder, a risk
-function) that throws: that becomes your module's error, and the module is down until it is fixed. It does **not**
-promise anything for code that breaks the runtime's rules. So:
+function) that throws: what that does depends on where (the table in §2). It does **not** promise anything for code that
+breaks the runtime's rules. So:
 
 - **Stop when interrupted.** A turn is cut off by barge-in all the time; a stop gives your calls 10 s, then interrupts
   them. Never make long work uninterruptible; wait with `Effect.sleep`, never a busy loop; pass the `AbortSignal` on.
@@ -740,7 +942,7 @@ promise anything for code that breaks the runtime's rules. So:
 - Event handlers are not calls in flight: they get no grace period and are interrupted when the part closes. Do what
   must not be cut short in one store transaction.
 
-## 14. Latency
+## 15. Latency
 
 Nothing slow on the turn path; a claim about latency needs `TurnTrace` numbers, not reasoning.
 
@@ -750,78 +952,95 @@ Nothing slow on the turn path; a claim about latency needs `TurnTrace` numbers, 
 - A read tool that is safe to run early is `speculative: true`: it may run before the turn is committed. A tool's
   `latency` says what to expect (`instant` < 50 ms, `quick` < 1 s, `slow` seconds).
 - Store calls are synchronous: one `list` holds the main thread at most a few milliseconds (§5); a `schedule` from a
-  tool is a fraction of a millisecond. A risk function has 2 ms.
-- Slow work (a feed refresh, a calendar sync) is a job or a fiber in `shared` that keeps a cache; the turn reads the
+  tool is a fraction of a millisecond. A risk function has 2 ms; an action 5 s (§10).
+- Slow work (a feed refresh, a calendar refresh) is a job or a fiber in `shared` that keeps a cache; the turn reads the
   cache.
 
-## 15. Speaking
+## 16. Speaking
 
 What a tool returns goes to the model, which words the reply. Return **a `spoken` line** (one or two sentences, ready to
 say) or **a small result the model can word in a sentence or two**: the answer first, then at most a few items with "and
 N more". Never markup, never a URL to read out, never a list of fifty things. Typed actions return `{ say }`, spoken as
 it is with no model.
 
-Every sentence the module says itself is in **English and Dutch**, chosen by the household's language
-(`homeLanguage(ctx.host.view())`, `HOME_LANGUAGE`; anything that is not Dutch is English), British conventions
-("half seven" is 7:30; Dutch "half zeven" is 6:30). Numbers, times, dates, durations, amounts and lists are worded by
-`@pva/language` (`speakTime`, `speakDate`, `speakDuration`, `speakAmount`, `speakList`) so every module sounds the same.
-Keep the texts in one table with the same placeholders in both languages (`checkModule(definition, { texts })` compares
-them):
+**Every sentence the module says itself is in English and Dutch**, failures, questions and refusals included, chosen
+by the household's language (`homeLanguage(ctx.host.view())`, `HOME_LANGUAGE`; anything that is not Dutch is English),
+British conventions ("half seven" is 7:30; Dutch "half acht" is 7:30). A `ToolError`'s and an `ActionError`'s message is
+spoken too: take it from the table. Numbers, times, dates, durations, amounts and lists are worded by `@pva/language`
+(`speakTime`, `speakDate`, `speakDuration`, `speakAmount`, `speakList`) so every module sounds the same. Keep the texts
+in one table (`defineTexts`) with the same placeholder names in both languages (`checkModule(definition, { texts })`
+compares them; `say` fills every occurrence of a name):
 
 <!-- region: packages/module-contracts/test/kit/pinboard.ts#texts -->
 ```ts
-/** Every sentence the module speaks, in both languages, with the same placeholders (checkModule compares them). */
+/** Every sentence the module speaks, failures and questions included, in both languages with the same placeholders. */
 export const texts = defineTexts({
   en: {
     pinned: "Pinned: {text}.",
-    pinnedFor: "Pinned for {name}: {text}.",
+    pinnedUntil: "Pinned for {hours} hours: {text}.",
     empty: "The pinboard is empty.",
     cleared: "Cleared {count} old notes.",
+    clearedSome: "Cleared {count} old notes; there are more, so say it again.",
     withheld: "{count} personal notes are not read out here.",
-    noPerson: "I don't know who is asking, so I pinned it for everyone."
+    cut: "I read the newest {count} notes; there are more.",
+    whose: "Who is the note for? I can't tell who is asking here.",
+    unreadable: "The pinboard could not be read.",
+    unsaved: "The note could not be pinned.",
+    uncleared: "The pinboard could not be cleared."
   },
   nl: {
     pinned: "Vastgeprikt: {text}.",
-    pinnedFor: "Vastgeprikt voor {name}: {text}.",
+    pinnedUntil: "Vastgeprikt voor {hours} uur: {text}.",
     empty: "Het prikbord is leeg.",
     cleared: "{count} oude briefjes weggehaald.",
+    clearedSome: "{count} oude briefjes weggehaald; er zijn er meer, zeg het nog eens.",
     withheld: "{count} persoonlijke briefjes lees ik hier niet voor.",
-    noPerson: "Ik weet niet wie het vraagt, dus het hangt er voor iedereen."
+    cut: "Ik heb de nieuwste {count} briefjes gelezen; er zijn er meer.",
+    whose: "Voor wie is het briefje? Ik weet hier niet wie het vraagt.",
+    unreadable: "Het prikbord kon niet worden gelezen.",
+    unsaved: "Het briefje kon niet worden vastgeprikt.",
+    uncleared: "Het prikbord kon niet worden leeggemaakt."
   }
 })
 ```
 
-## 16. Testing: the kit and checkModule
+**One line or stored text.** `StoredText(n)` bounds a stored text and keeps its JSON cost at 2 a character; it allows
+tab, line feed, carriage return, backspace and form feed. Where a value must be **one line** (a name, a list item, a
+route's field), check that separately: `isLine(text, n)` from `@pva/module-contracts` (no control characters, no lone
+surrogates), as a filter on the schema or in code.
+
+## 17. Testing: the kit and checkModule
 
 Tests never reach the network and leave nothing on disk. The kit is `@pva/core/testing`; run tests inside `it.effect`
 (the test clock).
 
 **`startTestModule(definition, options)`** starts your module in the **real** module host, as serve mode runs it: the
-real execution gateway with serve mode's checks, the real scheduler engine on the in-memory household store, the
-core's `People`, `Privacy` and `Devices` rules over a test household (default: Sam and Robin; a shared kitchen display
-whose default person is Sam, Robin's private phone, a public hall screen; the assistant `jeff` on all three; English,
-Amsterdam; the clock at Wednesday 18 November 2026, 10:00 in Amsterdam). Options: `settings`, `secrets`, `provide`
-(fakes of other modules), `others` (real modules beside it), `household` (people, devices with their privacy and
-default person, assistants with their module choices, `offTools` and own values, Home values), `startAt`. It returns
-handles:
+real execution gateway with serve mode's checks and risk policy, the real scheduler engine on the in-memory household
+store, and the core's `Privacy` rule over a test household that is **fixed for the test**. The default household: Sam,
+Robin and Alex; a shared kitchen display whose default person is Sam, Robin's private phone, a public hall screen
+(Alex is nobody's default person); the assistant `jeff` on all three; English, Amsterdam; the clock at Wednesday 18
+November 2026, 10:00 in Amsterdam. Options: `settings`, `secrets`, `provide` (stubs of other modules' services, and
+contributions), `others` (real modules beside it), `household` (people with their diets as the server keeps them,
+devices with their privacy and default person, assistants with their module choices, `offTools` and own values, Home
+values), `startAt`, `started`. It returns handles:
 
 | Handle | What it does |
 |---|---|
-| `tool(name, input, as?)` | a tool call as the model's tool loop makes it, through the assistant's registry and the gateway, as a turn (`{ device, assistant, person, room, source }` resolved against the household, or a `TurnContext`); answers `{ ok, content, value }` as the model gets it |
+| `tool(name, input, as?)` | a tool call as the model's tool loop makes it, through the assistant's registry and the gateway, as a turn (`{ device, assistant, person, source }` resolved against the household, or a whole `TurnContext`, checked as serve mode checks it); answers `{ ok, content, value }` as the model gets it |
 | `action(id, params, as?)` | an action through `host.actions.run` (as a routine step runs it) |
-| `asTurn(effect, as?)` | run code as a turn (to call a service directly) |
-| `jobs`, `runJob(id)`, `advance(ms)`, `now` | the module's jobs; move the test clock and let the scheduler run what came due, through the gateway with the job's origin |
-| `route({ method, path, body, headers, query, as })` | an HTTP route with its guards checked against the caller (`admin`, a token `secret`, an `address`), its body mode and time limit; `mintRouteToken(name)` mints one as the owner would |
+| `asTurn(effect, as?)`, `turn(as?)` | run code as a turn (to call a service directly); the `CurrentTurn` the kit makes (with its device's connection) |
+| `jobs`, `runJob(id)`, `advance(ms)`, `now` | the module's jobs; move the test clock and let the scheduler run what came due, through the gateway with each job's origin |
 | `service(Key)`, `contributions(Key, as?)` | what is published now, as a turn's assistant sees it |
-| `stop`, `start`, `restart`, `configure(patch)` | the lifecycle: switched off for every assistant, on again, a new start, a settings change |
-| `info()`, `issues()`, `checkHealth`, `toolNames(as?)` | the admin page's view of it, its Health issues, the tools a turn is offered |
-| `moduleStore()`, `store`, `events`, `people` | the module's store, the household store, every event on the bus, the household (change a device's privacy or default person, remove a person) |
+| `stop`, `start`, `restart`, `configure(values, secrets?)` | switched off for every assistant, on again; one real restart of the module with its demand kept (the same host and store: not a restart of the server); a settings change as the owner saves it |
+| `info()`, `issues()`, `checkHealth`, `toolNames(as?)` | the admin page's view of it, its Health issues (health run now), the tools a turn's model is sent |
+| `expectNoSecrets(...outputs)` | fails when the value of a secret given to the kit is in any of `outputs`, a row of the module's collections, an event, or the admin page |
+| `moduleStore()`, `store`, `events`, `people`, `schedulerUses` | the module's store, the household store, every event on the bus, the household's core services, what the kit saw of the scheduler |
 
-Also: `makeTestTurn` (a `CurrentTurn`), `makeTestPeople` (the core services over a household), `provide(moduleId, {
-services, contributions })`, `makeOfflineNet(fixtures, { lan })` (§11), `expectOffByDefault(catalog)`. The fakes of
-every contract are in `@pva/module-contracts/fakes` (`makeFakeLists`, `makeFakeTimers`, `makeFakeHomeAssistant` with
-`set`, `setConnection`, `overflow`, `makeFakePlayback`, `makeFakeMcp`, `makeFakeCalendarProvider`,
-`makeFakeBriefingSection`).
+Where the kit waits on one of the host's time limits (a start, a health check), it moves the test clock past the limit
+when the module has not answered, so a module that never answers fails its test instead of hanging it. Also:
+`makeTestTurn`, `makeTestPeople`, `testConnectionOf`, `dietProblem`, `provide(moduleId, { services, contributions })`,
+`stubService(name, answers)` with `succeeds`, `fails`, `stops` and `returns`, `makeOfflineNet(fixtures, { lan })` (§12),
+`expectOffByDefault(catalog)`.
 
 <!-- region: packages/module-contracts/test/kit/pinboard.test.ts#turns -->
 ```ts
@@ -832,86 +1051,151 @@ it.effect("a personal note is read where the privacy rule allows it, and withhel
     const pinned = yield* board.tool("pinboard_pin", { text: "Dentist at 3", forMe: true }, { device: "kitchen-display" })
     assert.deepStrictEqual(pinned.value, { spoken: "Pinned: Dentist at 3." })
     yield* board.advance(60_000)
+    // Robin, on Robin's private phone.
+    yield* board.tool("pinboard_pin", { text: "Call the vet", forMe: true }, { device: "robins-phone" })
+    yield* board.advance(60_000)
     yield* board.tool("pinboard_pin", { text: "Bins out tonight" }, { device: "kitchen-display" })
 
+    // The kitchen display is shared and Sam's: Sam's note, not Robin's.
     const kitchen = yield* board.tool("pinboard_read", {}, { device: "kitchen-display" })
-    assert.deepStrictEqual(kitchen.value, { notes: ["Bins out tonight", "Dentist at 3"], more: 0, owner: "p-sam" })
+    assert.deepStrictEqual(kitchen.value, { notes: ["Bins out tonight", "Dentist at 3"], more: 0, withheld: "1 personal notes are not read out here.", owner: "p-sam" })
     // A public hall screen: the household note only, and a sentence about what was left out.
     const hall = yield* board.tool("pinboard_read", {}, { device: "hall-screen" })
-    assert.deepStrictEqual(hall.value, { notes: ["Bins out tonight"], more: 0, withheld: "1 personal notes are not read out here." })
-    // Robin's private phone: a private device may be told anyone's personal content.
+    assert.deepStrictEqual(hall.value, { notes: ["Bins out tonight"], more: 0, withheld: "2 personal notes are not read out here." })
+    // Robin's private phone: a private device may be told any member's personal content.
     const phone = yield* board.tool("pinboard_read", {}, { device: "robins-phone" })
-    assert.deepStrictEqual((phone.value as { notes: Array<string> }).notes, ["Bins out tonight", "Dentist at 3"])
+    assert.deepStrictEqual((phone.value as { notes: Array<string> }).notes, ["Bins out tonight", "Call the vet", "Dentist at 3"])
+  }))
+```
+
+<!-- region: packages/module-contracts/test/kit/pinboard.test.ts#whose -->
+```ts
+it.effect("a note for 'me' when nobody known is asking: it asks whose, and writes nothing", () =>
+  Effect.gen(function*() {
+    const board = yield* startTestModule(pinboardModule)
+    const asked = yield* board.tool("pinboard_pin", { text: "Private appointment", forMe: true }, { device: "hall-screen" })
+    assert.deepStrictEqual(asked.value, { spoken: "Who is the note for? I can't tell who is asking here." })
+    assert.notInclude(asked.content, "Private appointment")
+    assert.deepStrictEqual(yield* board.moduleStore().collection(notes).list({}), [])
   }))
 ```
 
 <!-- region: packages/module-contracts/test/kit/pinboard.test.ts#job -->
 ```ts
-it.effect("the daily job takes down notes older than the setting, at 04:00, with the job's origin", () =>
+it.effect("a note pinned for some hours: the note and its job in one transaction; the job runs with the turn's origin", () =>
+  Effect.gen(function*() {
+    const board = yield* startTestModule(pinboardModule)
+    const r = yield* board.tool("pinboard_pin", { text: "Oven is hot", forMe: true, hours: 2 }, { device: "kitchen-display" })
+    assert.deepStrictEqual(r.value, { spoken: "Pinned for 2 hours: Oven is hot." })
+    const [note] = yield* board.moduleStore().collection(notes).list({})
+    const job = (yield* board.jobs).find((j) => j.handler === "unpin")!
+    assert.deepStrictEqual(job.payload, { id: note!.id })
+    // Its origin is the turn that scheduled it: the assistant, the device and the person.
+    assert.strictEqual(job.origin.assistantId, "jeff")
+    assert.strictEqual(job.origin.deviceId, "kitchen-display")
+    assert.strictEqual(job.origin.person?.id, "p-sam")
+    // It outlives a restart of the module, and then takes the note down as the job.
+    yield* board.restart
+    yield* board.runJob(job.id)
+    assert.deepStrictEqual(yield* board.moduleStore().collection(notes).list({}), [])
+    const removed = board.events.find((e) => e.type === "pinboard.notes.changed" && e.actor?.kind === "job")
+    assert.deepStrictEqual(removed?.actor, { kind: "job", jobId: job.id })
+  }))
+
+it.effect("the daily job takes down notes older than the setting, at 04:00", () =>
   Effect.gen(function*() {
     const board = yield* startTestModule(pinboardModule, { settings: { keepDays: 1 } })
-    const [job] = yield* board.jobs
+    const job = (yield* board.jobs).find((j) => j.handler === "expire")
     assert.strictEqual(job?.cron, "0 4 * * *")
     const store = board.moduleStore().collection(notes)
     const now = yield* board.now
     yield* store.insert({ text: "stale", pinnedAt: now - 2 * 86_400_000 })
     yield* store.insert({ text: "fresh", pinnedAt: now })
     yield* board.runJob(job!.id)
-    const left = yield* store.list({})
-    assert.deepStrictEqual(left.map((r) => r.value.text), ["fresh"])
+    assert.deepStrictEqual((yield* store.list({})).map((r) => r.value.text), ["fresh"])
   }))
 ```
 
-**`checkModule(definition, { settings?, secrets?, texts?, provide?, household? })`**, which every module's test calls,
-starts the module through the kit and fails with every rule it breaks, each named with its place:
+<!-- region: packages/module-contracts/test/kit/pinboard.test.ts#secrets -->
+```ts
+it.effect("health says when there is no printer key, and no result, spoken line or stored row holds the key", () =>
+  Effect.gen(function*() {
+    const plain = yield* startTestModule(pinboardModule)
+    assert.deepStrictEqual((yield* plain.checkHealth).map((i) => i.id), ["pinboard.no-printer-key"])
+    const board = yield* startTestModule(pinboardModule, { secrets: { printerKey: "printer-k3y-for-tests" } })
+    assert.deepStrictEqual(yield* board.checkHealth, [])
+    const pinned = yield* board.tool("pinboard_pin", { text: "Keep me" })
+    const read = yield* board.tool("pinboard_read", {})
+    const cleared = yield* board.action("clear")
+    yield* board.expectNoSecrets(pinned, read, cleared)
+  }))
+```
+
+**`checkModule(definition, { settings?, secrets?, texts?, provide?, others?, household? })`**, which every module's test
+calls, starts the module through the kit and fails with every rule it breaks, each named with its place. It checks the
+definition, the start, and what the module declares and does **while it starts**, for every instance the household's
+assistants make; it runs no tool, action or job:
 
 | Rule | Fails when |
 |---|---|
 | `api-version` | the module does not declare `apiVersion: 2` |
 | `off-by-default` | a new module is on before the owner chose (`enabledByDefault` not `false`) |
 | `form` | its described settings form does not encode with the wire's schema, or exceeds 8 KiB |
-| `start` | it does not start in the real host with the given settings and secrets |
-| `secret` | a secret's value is in a status line, an error, the form, a Health issue, a tool's name or description, an action's text, instructions, a route or a context provider's name |
+| `start` | it does not start in the real host with the given settings and secrets (the host also refuses a tool name providers refuse, a name used twice, and an action whose generated tool name is over 64 characters) |
+| `secret` | a secret's value is in a status line, an error, the form, a Health issue, a tool's name or description, an action's text, instructions or a context provider's name |
 | `risk` | a tool or action that is not a plain read (`speculative: true`) declares no risk class |
-| `risk-said` | one that can be `money` or `security` does not say so in its description |
-| `tool-name` | a tool's name, or an action's generated `<moduleId>_<actionId>`, is not 1–64 of `[A-Za-z0-9_-]`, or is used twice |
-| `tool-description` | a tool's description is empty or over 1,024 characters |
-| `tool-parameters` | a tool's parameters are not an object schema (`Schema.Struct`), or a property name is outside 1–64 of `[A-Za-z0-9_.-]` |
+| `risk-said` | one that can be `money` or `security` (which the risk policy refuses) does not say so in its description |
+| `tool-name` | a tool's name, or an action's generated `<moduleId>_<actionId>`, is not 1–64 of `[A-Za-z0-9_-]`, or is used twice in one instance |
+| `tool-description` | a tool's description, or an action's generated tool's (its label first), is empty or over 1,024 characters |
+| `tool-parameters` | a tool's or an action's generated tool's parameters are not sent as an object schema, or a property name is outside 1–64 of `[A-Za-z0-9_.-]` |
 | `action-examples` | an action declares no `examples` |
-| `stored-value` | a collection's worst legal value is longer than its `maxChars`, or unbounded |
+| `stored-value` | the store refuses a collection's declaration; its value is not always an object; its worst legal value is longer than its `maxChars`, or unbounded; an indexed field can hold a value the index refuses |
 | `scheduler-shared` | a job handler is registered in `start` instead of `shared` |
-| `cron` | a cron expression it schedules is outside the accepted grammar |
-| `job-payload` | a job it schedules has a payload its handler's schema does not decode |
-| `health` | it requires the network and declares no `health`, or its `health()` fails or does not answer |
-| `texts` | its texts differ between English and Dutch in keys or placeholders, or one is empty or not one line |
+| `cron` | a cron schedule it asked for while starting is refused |
+| `job-payload` | a job it asked for while starting has a payload its handler's schema does not decode |
+| `health` | it requires the network and declares no `health`, or its `health()` fails or does not answer in time |
+| `texts` | its texts differ between English and Dutch in keys or in the placeholder names they use, or one is empty or not one line |
 
 <!-- region: packages/module-contracts/test/kit/pinboard.test.ts#check -->
 ```ts
 it.effect("passes the conformance check, with its texts in both languages", () => checkModule(pinboardModule, { texts }))
 ```
 
-What `checkModule` cannot see stays your test's job: what a tool answers, privacy on each kind of device, that a
-person-scoped call without a person asks "whose", the late rule of your jobs, a restart in the middle, a provider that
-is off. Run your package's tests and `pnpm check` behind the shared lock
-(`flock /workspace/build-cache/ian/pva-heavy.lock …`, `VITEST_MAX_WORKERS=4`).
+**What your tests must cover**, because `checkModule` cannot see it: what each tool and action answers, in both
+languages, and its failure paths; privacy on each kind of device (a private one, a shared one that is the owner's and
+one that is not, a public one, a shared one without a default person); that a personal request without a person asks
+whose and writes nothing; the jobs your tools schedule (the scheduler refuses a payload that does not fit, so test the
+path), their origin and their late rule; a restart in the middle; a provider that is off or stops; and that no tool
+result, spoken line or stored row holds a secret (`expectNoSecrets`). The secret scan of `checkModule` sees only what the
+module declares (above) and secrets of four characters or more, exactly as given. Run your package's tests and `pnpm
+check` behind the shared lock (`flock /workspace/build-cache/ian/pva-heavy.lock …`, `VITEST_MAX_WORKERS=4`).
 
-## 17. What a module pull request may touch
+## 18. What a module pull request may touch
 
-- Its own package under `packages/module-<id>/` (source, tests, `package.json`).
-- **Its own page, `docs/modules/<id>.md`** (one per module id; a package with several ids has one page each), filled in
-  under the stub's headings: what it does, its tools, settings, what it stores, what it needs, and what was left out.
-  This replaces the plan's "own section in `docs/MODULES.md`", so twenty pull requests never edit the same file.
+- Its own package (§19) under `packages/module-<pkg>/` (source, tests, `package.json`).
+- **Its own pages, `docs/modules/<id>.md`** (one per module id), filled in under the stub's headings: what it does, its
+  tools, settings, what it stores, what it needs, and what was left out. **In wave A, "Left out" lists every part of
+  the plan's row that needs a phrase command, a presentation, a notification or a module's speech (P7, P9, P10): they
+  do not exist yet, and come with wave B.** This replaces the plan's "own section in `docs/MODULES.md`", so twenty pull
+  requests never edit the same file.
 - `pnpm-lock.yaml`, only when it adds a dependency the scaffold did not foresee; the description names it.
 - **Nothing else.** The scaffold has created the package, registered it in the catalogue, added the dependencies of
   Appendix A and defined the contracts it shares. If the core lacks something the module needs, stop and report it
   instead of editing shared files.
-- Four have a wider reach, limited to these files: core-tools: `packages/modules-builtin/src/clock.ts` and new files
-  beside it, and `docs/modules/clock.md`; local-info: `packages/modules-builtin/src/weather.ts` and new files beside it,
-  and `docs/modules/weather.md` (the package's `package.json` and `index.ts` are ready: `index.ts` re-exports everything
-  `clock.ts` and `weather.ts` export, so a new file is exported from one of those two); smart-home: all of
-  `packages/module-home-assistant/`; calls-and-intercom (later): the files its own plan names.
+- **The packages with more than one module**: one pull request owns each. `module-core-tools` holds `calculator`,
+  `knowledge` and `system-status` (the core-tools PR); `module-timers` holds `timers` and `alarms` (wave B);
+  `module-local-info` holds `bin-day` (the local-info PR).
+- **Two pull requests reach into `packages/modules-builtin`**, and only into their own files: core-tools changes
+  `src/clock.ts` and adds new files only under `src/clock/`, exported from `clock.ts`, with `docs/modules/clock.md`;
+  local-info changes `src/weather.ts` and adds new files only under `src/weather/`, exported from `weather.ts`, with
+  `docs/modules/weather.md`. `index.ts` and `package.json` are ready (`index.ts` re-exports all of `clock.ts` and
+  `weather.ts`); nobody adds other shared files there. Smart-home owns all of `packages/module-home-assistant/`.
+- **Libraries.** A provider SDK is imported only inside its adapter package, and a module's libraries only inside its
+  own package. Import a large library (`pdfjs-dist`, `mathjs`, `linkedom`, `date-holidays`) where it is used, with
+  `await import(…)` inside `shared` or a tool, not at the top of `src/index.ts`, so the app's start does not load it
+  for a module that is off.
 
-## 18. The modules
+## 19. The modules
 
 | Module | Package | Wave | Page |
 |---|---|---|---|
@@ -926,7 +1210,7 @@ is off. Run your package's tests and `pnpm check` behind the shared lock
 | Smart home | `module-home-assistant` | A | [home-assistant](modules/home-assistant.md) |
 | Reminders | `module-reminders` | B | [reminders](modules/reminders.md) |
 | Images | `module-images` | B | [images](modules/images.md) |
-| Calendar | `module-calendar` | A | [calendar](modules/calendar.md) |
+| Calendar (ICS) | `module-calendar` | A | [calendar](modules/calendar.md) |
 | Memory and notes | `module-memory` | A | [memory](modules/memory.md) |
 | Broadcast | `module-broadcast` | B | [broadcast](modules/broadcast.md) |
 | Briefing | `module-briefing` | A | [briefing](modules/briefing.md) |
@@ -934,7 +1218,7 @@ is off. Run your package's tests and `pnpm check` behind the shared lock
 | Presence | `module-presence` | A | [presence](modules/presence.md) |
 | News and feeds | `module-news` | A | [news](modules/news.md) |
 | Routines | `module-routines` | B | [routines](modules/routines.md) |
-| MCP client | `module-mcp` | A | [mcp](modules/mcp.md) |
 
 Wave A is written on this scaffold now; wave B after the first versions of P7 to P10 (notifications, phrase commands,
-presentation, the risk policy). Google, T3 Code and calls-and-intercom have their own plan later.
+presentation, the risk policy in admin), with the parts of wave A that needed them. Later, with their own plan: the
+MCP client, Google, T3 Code, calls and intercom, and CalDAV in the calendar module.

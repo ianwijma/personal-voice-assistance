@@ -32,4 +32,5 @@ To be written: `requires`, `uses`, the services and contributions it provides or
 
 ## What was left out
 
-To be written.
+To be written. In wave A this lists, among the rest, every part of the plan's row that needs a phrase command, a
+presentation, a notification or a module's own speech (P7, P9, P10): those do not exist yet and come with wave B.

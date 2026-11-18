@@ -1,6 +1,6 @@
 # Calendar (`calendar`)
 
-Calendars from ICS links and CalDAV: what is on, when, free time, and adding an event.
+Calendars from ICS links: what is on, when, and free time (CalDAV, and with it adding events, is later).
 
 - Package: `packages/module-calendar`
 - Plan: [docs/MODULES-PLAN.md](../MODULES-PLAN.md) §5.1 row 12 (wave A)
@@ -32,4 +32,5 @@ To be written: `requires`, `uses`, the services and contributions it provides or
 
 ## What was left out
 
-To be written.
+To be written. In wave A this lists, among the rest, every part of the plan's row that needs a phrase command, a
+presentation, a notification or a module's own speech (P7, P9, P10): those do not exist yet and come with wave B.

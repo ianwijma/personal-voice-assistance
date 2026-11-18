@@ -75,7 +75,8 @@ that work can start. Each is cheap to change before the PR that builds it is mer
 ### 3.2 What a module PR may touch
 
 - Its own package under `packages/module-<id>/` (source, tests, `package.json`).
-- Its own section in `docs/MODULES.md`.
+- Its own file `docs/modules/<id>.md` (P11 creates a stub for each and links it from `docs/MODULES.md`, so no two
+  module PRs edit the same file).
 - `pnpm-lock.yaml`, only when it adds a dependency the scaffold did not foresee; the PR description names it. The
   lead resolves lockfile conflicts between module PRs with `pnpm install` when restacking.
 - Nothing else. The scaffold PR (§4, P11) has already created the package, registered it in the catalogue, added
@@ -101,7 +102,7 @@ document is not built now. Every module:
 - offers its fast-path commands as typed actions with `examples` (and phrase commands where §5 says so), so they can
   run without the language model;
 - is tested against fakes of every outside service, with no network in tests;
-- writes its section in `docs/MODULES.md`: what it does, its tools, settings, what it stores, what it needs, and what
+- writes its file `docs/modules/<id>.md`: what it does, its tools, settings, what it stores, what it needs, and what
   was left out.
 
 Nested configuration (the steps of a routine, the tool policy of an MCP server) is authored as JSON in a text field
@@ -116,6 +117,39 @@ editor in this stack.
 - No force pushes. A lower PR's fixes reach the PRs above it by merge commits.
 - A PR description says what was built, what was left out, how it was tested, and carries a screenshot where
   something is visible.
+
+### 3.5 What host code must survive
+
+Decided after the fourth review round of P1, and applied to every preparation PR. Modules are compiled into the
+app and trusted. This says which faults host code must handle correctly, and which it only has to fail loudly on.
+Reviewers judge "blocking" against it.
+
+Host code behaves correctly for:
+
+- **Anything from outside the process**: network requests, the admin pages, settings files, environment values,
+  what a model produces, what a person says, and the timing of all of these.
+- **Ordinary module faults**: a module's Effect fails, dies with a thrown exception, or takes too long and stops
+  when it is interrupted. A function a module supplies as plain code (a settings check, a decoder, a classifier)
+  that throws is caught where it is called and becomes that module's error.
+- **Callers that are interrupted at any point**: a turn is cut off by barge-in all the time, so a request a caller
+  made (a restart request, a save, a schedule) is either recorded whole or not at all.
+- **Operational faults**: a full disk, a locked vault, a lost connection, the process killed at any point. Durable
+  state stays consistent.
+
+Host code does not have to behave correctly, only to avoid corrupting durable state and to cross no security
+boundary, for:
+
+- **Module code that breaks the rules of the runtime**: it ignores interruption, blocks the event loop, or hands
+  the host an object whose properties throw when read or change between reads. Where the host already gives up on
+  such code after a time limit, that is best effort; nothing is promised about what remains afterwards except that
+  the owner is told (a Health issue or a log line) and that stopping the process works.
+- **The host's own dependencies misbehaving**: persistence, a registry, the clock, a registrar the app supplies
+  that throws or never returns. That is a defect in host code and may crash loudly.
+- **Code in the process going around a seam on purpose**: sealing of executors, private handles and the like stop
+  accidental direct calls. They are not a security boundary against compiled-in code.
+- **Constructor options no caller in the app or the test kit uses.**
+
+A finding that needs one of the second list's conditions is reported as a note, never as blocking.
 
 ## 4. The preparation stack
 
@@ -144,6 +178,29 @@ and the additions below.
 Service keys and interfaces that the core provides or calls (`People`, `Privacy`, `SessionControl`,
 `DeviceControl`, `Playback`) are defined in `@pva/core` by the PR that implements or first uses them. Keys that a module provides are defined in
 `@pva/module-contracts` by P11.
+
+### Order from here (decided when P1 to P6 were done)
+
+P1 to P6 each needed four to seven review rounds at the size first planned, and converged only after their scope
+was cut. P7 to P10 as first written below are each that large again. So from here the work is ordered to get
+modules built early, and P7 to P10 are built as small first versions:
+
+1. **P11, the scaffold**, on top of P6: packages, contracts, the test kit for what exists (store, scheduler,
+   gateway, people), `docs/MODULES.md`.
+2. **Wave A: the eleven modules that need only P1 to P6**, each its own PR on P11, written in parallel: core-tools,
+   web-search, lists, kitchen, smart-home, calendar (ICS only), memory-and-notes, briefing, local-info,
+   presence-and-people, news-and-feeds. Where a first version in §5.1 names a phrase command or a presentation, that part
+   waits for wave B and the PR says so.
+3. **P7 to P10 as first versions** (each section below starts with what is built now), stacked on P11 in the order
+   P9 (notifications, speech, ringing), P7 (phrases and controls), P10 (presentation), P8 (risk policy in admin).
+   P9 comes first because timers, reminders and the "stop" of P7 all need it.
+4. **Wave B: the modules that need them**: timers-and-alarms, reminders, notifications, assistant-controls, music,
+   routines-and-automations, broadcast, images-and-photos; and the phrase commands and presentations wave A left
+   out, as one small PR per module.
+5. **Later, not in this piece of work**: connections and OAuth (the rest of P8) with the google and t3-code
+   modules; mcp-client, because `@pva/net` fetches with GET and HEAD only and an MCP client needs POST with
+   streamed answers to an address the owner typed; CalDAV in the calendar module, for the same reason; and
+   calls-and-intercom with the `call` guard. They get their own plan.
 
 ### P1. Module API v2, tool context, the execution gateway
 
@@ -223,6 +280,30 @@ Service keys and interfaces that the core provides or calls (`People`, `Privacy`
 - Templates: plain data on the manifest; the new-assistant wizard offers them.
 - Protocol: `ModuleState` gains `unavailable`; version bump.
 
+**Decided after review round 4** (the host keeps its shape; these narrow what it promises):
+
+- The grace period at a stop covers calls admitted to the stopping module itself (tools, actions, context, routes,
+  field actions). A call another module makes into its service while it stops may fail; the consumer handles that
+  failure like any other.
+- The restart limiter's promise is that a module cannot restart itself in a tight loop: at most one request is
+  taken up per interval. It does not promise a minimum distance between two restarts.
+- A restart request counts only from a part that is live. A part that is starting, failed or being closed cannot
+  ask (a "restart on disconnect" handler that fires while the host closes the part is dropped).
+- A request is recorded in one synchronous step, so interrupting the caller cannot lose it or leave a timer flag
+  set.
+- At host shutdown every module's registrations are withdrawn first, in one step, before any part is closed.
+- Registrar callbacks (`validate`, `publish`, `withdraw`) are host code: they write their own table and must not
+  read the host or throw. Reading a part handle's own state through the seam is allowed. Registrars receive what the host has; they are not a boundary.
+- "Check again" always starts a fresh attempt for every demanded module that is not live.
+- Field actions get their time limit and their place in a stop in P3, which owns them.
+- An intent action's success sentence is still synthesised during the speculative window and played at promotion.
+  If access to the action is withdrawn in the fraction of a second between the eager end of turn and promotion, the
+  person may hear the start of that sentence followed by the refusal; the action is not run. Closing this was
+  measured to delay the first audio of every held intent turn by one synthesis and was reversed. A playback gate in
+  `Conversation` could close it later without that cost.
+- A tool call from the Claude Code bridge is matched to its turn by the model's `tool_use` id, which the bridge
+  receives with the call.
+
 ### P2. Language and network helpers
 
 Two new packages with no dependency on the rest of the stack, plus household settings several modules read.
@@ -255,6 +336,24 @@ Two new packages with no dependency on the rest of the stack, plus household set
   its guards, and **all** declared guards must pass: an admin session, a bearer token from the vault (revocable, one
   per caller), LAN only. It also declares a body limit and a rate limit. Used by inbound notification hooks and
   OAuth callbacks.
+
+**Decided after review round 4**:
+
+- Route handlers and "Test" presses run in **slots**: a slot of the module is taken before the fiber starts and
+  given back when the fiber has really ended, whatever ended the wait for it. At most 16 handlers and 4 presses per
+  module at once; at the cap a request gets 503 and a press is refused as busy, and a Health issue says so until a
+  slot is free. This replaces the counting of stragglers after the fact.
+- An answer never waits for cleanup: the response is decided by the first of the handler's result, its deadline,
+  the host's stop signal after the grace period, or the caller going away.
+- With `SERVE_BEHIND_PROXY` set, the same-origin check for non-public routes ignores the scheme and compares host
+  and port of `Origin` with `Host`; the proxy must pass `Host` through.
+- A module's described form is checked once against the wire schema and a size budget; a module whose form does not
+  encode or is too large does not start. Runtime options and `info` values are trimmed to the budget.
+- The complete form of a module as it is sent is limited to 48 KiB; a save over it is refused. `admin.snapshot`
+  carries each module's details while they fit their share of the frame; a module that does not fit is sent as a
+  short entry followed at once by its own `module.changed` frame, so nothing is withheld because of other modules.
+- A "Test" press runs to its result or its time limit whether or not the page that pressed it is still connected.
+- A field's default goes through its own decoder; a default the field rejects is a declaration error.
 
 ### P4. Household store and event bus
 
@@ -305,6 +404,26 @@ version in §5 needs them.
   at 600 characters, behind a household switch that is off until the owner has measured, with `bench --live
   --ambient`, what the added context costs their model's first token.
 
+**Decided after review round 4**:
+
+- The work of a `list` is bounded by a product: a collection declares `maxChars` for its values (default 2,000, at
+  most 16,000) and a list may ask for at most `min(100, LIST_BUDGET_CHARS / maxChars)` rows. The budget is set by
+  measuring structured values so the worst legal list stays well under 10 ms.
+- `list` takes `after: <the last row of the previous page>` to continue; nothing else pages.
+- As measured in round 5 with the costliest ordinary schema shapes (an untagged union of four structs; nested
+  optional fields and literal unions), `LIST_BUDGET_CHARS` is 25,000: one `list` reads at most 100 rows of values up
+  to 250 characters, 62 at 400, 12 at the default 2,000 and 1 at 16,000. **A module declares `maxChars` as small as
+  its values really are**, and reads longer lists page by page. The worst legal list measured 4.4 ms.
+- A write waits about a second, on timers, for the write lock before it fails `busy`, so the store's own checkpoint
+  worker never makes a module's write fail.
+- Migrations run only when the store is prepared; a read never migrates.
+- `updatedAt`, `createdAt`, `id`, `rev` and `scope` cannot be named in an index declaration.
+- Shape detection covers a schema's structure and built-in checks. Changing a custom check's function needs a
+  version bump by the author.
+- The second backup directory is reconciled hourly by name; a copy keeps its archive's time.
+- Event handlers are not calls in flight: a handler running when its module stops is interrupted when the part
+  closes.
+
 ### P5. People, rooms and device capabilities
 
 - `hello.device.capabilities` (`DeviceCapabilities`: display class and size, touch, renderable kinds, speaker,
@@ -321,22 +440,80 @@ version in §5 needs them.
 
 ### P6. Scheduler
 
-- `ctx.scheduler` as in shared-state §6.2: `schedule` (at, in, cron), `handle`, `pause`, `resume`, `reschedule`,
-  `cancel`, `list`, `runTask`. A `jobs` table, one fiber sleeping until the earliest due time, wall-clock due times,
-  a re-check on clock jumps. Handlers are registered in a module's `shared` part.
-- Missed-while-down policies `fire-late`, `{ fireIfWithinMs }`, `skip`, `inbox`, and "run the last missed occurrence
-  once" for recurring jobs.
-- Exactly-once as far as one process can give it. Every occurrence has a stable key (job id and due time). A due
-  job is claimed in a transaction (P4's synchronous kind; scheduling from a module's transaction uses its handle). A handler declares whether it is idempotent. Only an idempotent handler is ever
-  run again for the same occurrence, whether it failed (retried with back-off up to a declared limit) or was found
-  `running` at start; any other handler that fails or was interrupted is marked failed and reported on the Health
-  page. A `{ notify }` job is delivered again under the same notification id, which the notification service
-  dedupes. Completing or failing an occurrence and scheduling the next one of a recurring job happen in one
-  transaction, so a recurring job always moves on.
-- `{ notify }` jobs are accepted and stored in P6 and delivered once P9 exists; until then they log.
-- Admin: a list of scheduled jobs with cancel.
+Cut down after its first review (21 blocking findings, and a rewrite was due anyway for the new store and host).
+The scheduler does one thing: it calls a module's handler at a time, once.
+
+- **`ctx.scheduler`**: `schedule({ handler, payload, at | inMs | cron, key?, late?, origin? })`, `cancel(id | { key })`,
+  `reschedule(id, { at | inMs })`, `get(id)`, `list({ key?, after?, limit? })` (live jobs), and `handle(name, { payload: schema,
+  idempotent?, retries?, run })` during `shared` or `start`. Nothing else: **no pause and resume** (a module cancels
+  and schedules again; a paused timer is the module's own row), **no `runTask`** (long work is a fiber in the
+  module's own scope with its progress in the module's own collection), **no `{ notify }` jobs and no `inbox`
+  policy** (P9 registers a handler of its own for notifications that are due later, and lateness of a notification
+  is P9's delivery policy).
+- **A job** is one row in a collection of the owner `core.scheduler`: module, handler name, an optional key (one
+  live job per module and key; scheduling the same key again replaces it), a JSON payload of at most 1,000
+  characters, the due time, for a repeating job its cron expression and zone, its origin (device, assistant and
+  person, taken from the turn or job that scheduled it unless given), a state (`scheduled`, `running`, `done`,
+  `failed`, `cancelled`, `missed`) and an attempt count. Modules that repeat by `RRULE` keep the rule themselves
+  and schedule one job for the next occurrence (§2); `cron` is for system jobs such as refreshing a cache, and takes minute, hour and day-of-week patterns only
+  (day of month and month must be `*`); anything else is a one-off job rescheduled from its handler.
+- **The loop**: one fiber sleeps until the earliest due time among jobs whose handler is published, and is woken by
+  a schedule, a cancel, a handler being published, and a clock jump. Per published handler it reads the due jobs
+  through an index, so a job whose module is off or down just stays `scheduled` and is run when its handler
+  appears: there is no waiting state. Finished rows are removed after seven days by a pass that also runs when
+  nothing is due.
+- **Late jobs**: `late` is `"run"` (the default: run once, however late) or `{ withinMs }` (run only if it is at
+  most that late, otherwise the job becomes `missed` and the handler is not called). There is no grace beyond what
+  the job says. A repeating job that missed several occurrences runs once, for the latest one, and then continues
+  from the first occurrence after now. The handler is told how late it is.
+- **Once**: a due job is claimed in a transaction (`running`, attempt + 1) and its outcome is written in another
+  that also plans the next occurrence of a repeating job. That second write is conditional on the row's revision at
+  the claim, so a job that was rescheduled or cancelled while it ran ignores the old run's outcome. A handler that
+  fails or times out: if it declared itself idempotent it is retried with back-off up to its limit, otherwise the
+  occurrence is `failed` and shows on the Health page. A row found `running` with no run alive (after a crash, or
+  when the outcome could not be written) is treated the same way. A repeating job always moves on to its next
+  occurrence, whatever happened to this one. A handler that ends interrupted, other than by its module stopping or
+  the server shutting down, has failed.
+- **Handlers and the host**: a handler is a registration of its part (P1's seam), so it is published and withdrawn
+  with its module in the same step as its tools. A run is a call in flight of its module: it gets the grace period
+  at a stop and is then interrupted, and its job is retried or failed by the rule above. The handler runs with the
+  job's origin as its principal (`CurrentJob`), through the gateway like any call; a job scheduled from inside a
+  handler inherits that origin.
+- **Time zones**: a cron job without a zone uses the household's zone each time its next occurrence is planned. A
+  change of the household's zone therefore takes effect from the occurrence after the one already planned; the
+  admin page shows each job's next time.
+- **Limits**: payload size, 200 live jobs per module, cron expressions that never fire are refused when scheduled.
+- **Admin**: a list of jobs, read page by page, with cancel. Cancelling a job that is running does not interrupt the
+  run; its outcome is ignored.
+- **As built** (after the rebuild's first review): keys are at most 100 characters and an origin's ids at most 64;
+  the job row is at most 2,500 characters, so `list` and every sweep read 10 rows a page; the admin list serves at
+  most 20 jobs a request, is not a snapshot, and its cursor is a token of the running server (400 after a restart);
+  the Health page shows the 48 newest failures and says how many more there are; a repeating job's failure stays
+  until an occurrence succeeds (a missed one does not clear it); a pass takes one due job per handler per round, so
+  no handler starves another. A module must not catch a failure of scheduling inside its own transaction, other
+  than a refusal, and go on with that transaction: joined code cannot make the outer transaction fail.
+- A core service schedules with the same engine under its own name (P9 for notifications due later and for the end
+  of do not disturb), with handlers registered when the server starts.
 
 ### P7. Phrase commands, windows, session and device control
+
+**First version (what is built now).** Everything in this section that is not named here is later.
+
+- Phrase commands `after-wake` only: a module's instance declares phrases per language with typed slots and a
+  handler; after the wake phrase (or inside the follow-up window) a matching utterance runs the handler through the
+  gateway with no model call and answers with an optional spoken line. Longest phrase wins; duplicates within one
+  assistant are both left out and named on the Health page; the host's phrases are reserved.
+- The host's essential controls after the wake phrase: stop, never mind, repeat, louder, quieter. "Stop" stops, in
+  this order, what is ringing on the device (P9), the reply or announcement being spoken, and media the `Playback`
+  service says is playing in the room.
+- One window, owned by the host: `ringing` (opened and closed by P9), in which "stop" and the ringing
+  notification's action phrases are accepted without the wake phrase. Taken utterances never become a turn. No
+  module windows, no `capture`, no guards, no `audible` window.
+- `SessionControl`: stop the reply, cancel a pending interaction, repeat the last reply, start a new conversation.
+  `DeviceControl`: the reply volume (`output.volume` and a gain node on the voice page). The `Playback` key.
+- An utterance that is not taken goes through the gates exactly as today; the PR shows that with `TurnTrace`.
+- Not now: typed actions before the model, switching the assistant, sleep, microphone mute, earcons, wake-free
+  control while a reply is audible.
 
 The fast path the basics need: commands that run without the language model.
 
@@ -405,6 +582,18 @@ The fast path the basics need: commands that run without the language model.
 
 ### P8. Connections and risk policy
 
+**First version (what is built now).** Everything in this section that is not named here is later.
+
+- The risk policy the gateway already enforces (P1: `read` and `change` allowed, `message` refused as needing
+  confirmation, `money` and `security` denied) becomes a household setting in admin: per class `allow`, `confirm`
+  (which refuses, with its own sentence) or `deny`, with `money` and `security` fixed at `deny`. One level only: no
+  narrowing by assistant or device.
+- A tool whose every declared class is refused is left out of the turn's tool list; every call is checked again
+  at execution with its validated input, on every entry path; the trace records the outcome.
+- `sensitivity`: a `personal` result is passed through `Privacy.mayReveal` for the asking device before it goes
+  back to the model.
+- Not now: connections, OAuth flows, `ctx.connections`.
+
 - Connection types (declared by modules) and connection records in settings, credentials in the vault, owned by the
   household or a person, with a status (`ok`, `locked`, `needs-reauth`) and a test call.
 - Flows: authorization code with PKCE and a loopback redirect with "paste the address you ended on", the device
@@ -422,6 +611,29 @@ The fast path the basics need: commands that run without the language model.
 - Admin: Connections, and the risk policy for the household, an assistant and a device.
 
 ### P9. Notification service, speech sequences, ringing
+
+**First version (what is built now).** Everything in this section that is not named here is later.
+
+- `ctx.notify`: `send` (title, text, priority `normal` or `ring`, an owner for `Privacy.mayReveal`, a target of the
+  origin device or everywhere, a dedupe key, an expiry, and actions) and `resolve`; notifications are rows of a
+  core collection, with `list` for the notifications module. Sending at a later time is a scheduler job of the
+  service's own core handler.
+- **One delivery decision** per notification and device, when it is delivered: do not disturb (for the house, on
+  or off with an optional end time kept by the scheduler; `notify.dnd` to read, set and clear it), a device that
+  cannot speak or show, and `Privacy.mayReveal`. Under do not disturb a `ring` is kept silent and listed; nothing
+  rings. Nothing may send above `ring`.
+- **Actions**: `stop` is the host's and always works. A request may name further actions (`snooze`, or a custom
+  id) with a handler the owning module registers in its `shared` part; a press or a ringing phrase reaches it
+  through the gateway with the notification id. While the handler cannot be reached, the action answers "I can't
+  do that right now".
+- **Speech**: `ctx.speech.say(target, text, { cue? })` speaks one announcement on a device, a room's devices or
+  everywhere, after whatever is being spoken there, through the same delivery decision; it returns a handle that
+  can be awaited (outside a turn only) and stopped; the host's "stop" stops it.
+- **Ringing**: `notification.ring` and `notification.resolved` messages; the voice page loops a local cue and shows
+  a plain card with the actions; the `ringing` window of P7 while it rings.
+- Not now: quiet hours and quiet rooms, per-device do not disturb, acceptance settings, ring policies beyond the
+  two targets, `update`, multi-segment sequences with skip, recording announcements in the conversation, the
+  missed badge, the admin inbox page.
 
 - **One delivery policy** for everything the house says or shows that nobody on that device just asked for. A
   notification and a spoken sequence both pass through it, per target device: do not disturb, quiet hours, quiet
@@ -462,6 +674,24 @@ The fast path the basics need: commands that run without the language model.
 
 ### P10. Presentation
 
+**First version (what is built now).** Everything in this section that is not named here is later.
+
+- Kinds: `card` (title, text, facts), `list` (bullets or a checklist with ticks), `timer` (a countdown to an
+  instant, with a label), `image` (one image with a credit) and `weather`; each with a `spoken` fallback and a
+  sensitivity.
+- Two ways in: a tool or action returns `{ forModel, present }`, and `ctx.present.show(target, presentation)`
+  returning a handle with `update` and `dismiss`, where the target is a device or a room.
+- The Presenter per device: a device that cannot show gets nothing and the note for the model says so;
+  `Privacy.mayReveal` for the device that would show it; one transient presentation at a time and pinned ones
+  (timers, a list) restored on reconnect; `present.show`, `present.update`, `present.dismiss`, and
+  `present.action` for a tick or a button, which runs through the gateway.
+- `/media/<hash>`: the server fetches an image once through `safeFetch`, checks its type and size, and serves it for
+  a day. No resizing.
+- P9's ring card is drawn by the presentation stage. One stage layout beside the character; every existing
+  character keeps working unchanged (`docs/CHARACTERS.md`).
+- Not now: `facts` as its own kind, `table`, `gallery`, `progress`, `confirm`, `handoff`, the `show` and `show_on`
+  tools, `present.status`, the reveal rule tied to clauses, resizing with `sharp`.
+
 - `packages/protocol/src/presentation.ts`: the kinds `text`, `card`, `facts`, `list` (bullets, numbered, checklist,
   pick), `table`, `image`, `gallery`, `timer`, `progress`, `weather`, `confirm`, `handoff`, each versioned, with
   `fallback`, `spoken`, `lifetime`, `sensitivity` and actions. `steps`, `map`, `chart` and `media` come later.
@@ -498,11 +728,28 @@ The fast path the basics need: commands that run without the language model.
 - A module test kit in `@pva/core/testing`: an in-memory store, a scheduler on a test clock, recorders for
   notifications, speech and presentations, a `CurrentTurn` builder, a fake connection, a fake `host` with services
   and contributions, and a helper that runs a tool or a phrase command through the real gateway.
-- `docs/MODULES.md`: how to write a module against API v2, and one section per module to be filled by its PR.
+- `docs/MODULES.md`: how to write a module against API v2, with a reference module that is real code; and one stub
+  file per module under `docs/modules/`, to be filled by its PR.
+- A conformance check, `checkModule`, that every module's tests call: form budgets, risk classes, store limits,
+  scheduler rules, name and text bounds.
+- Packages only for the modules of waves A and B; no `sharp`.
+- **Decided after the scaffold's first review**: the shared contracts are `Lists` (the default shopping list
+  only), `Timers`, `HomeAssistant`, `Playback` and `BriefingSection`; `Mcp` and `CalendarProvider` are not shared
+  (their cross-module consumers are deferred). Test doubles of a contract are programmable stubs with no behaviour
+  of their own. The test kit starts a module in the real host, gateway, store and scheduler with a household fixed
+  for the test; it does not imitate the HTTP router. With the scaffold, four things below it are fixed: the default
+  risk policy is enforced by the gateway (it was only a hook), a tool without parameters is sent as an object
+  schema, the host refuses bad tool names at a module's start, and the scheduler checks a payload when a job is
+  scheduled.
 
 ## 5. The modules
 
 ### 5.1 One PR each
+
+**Waves** (see "Order from here" in §4). Wave A, on P11: rows 3, 4, 5, 7, 9, 12, 13, 17, 18, 19, 20. Wave B,
+after the first versions of P7 to P10: rows 1, 2, 6, 8, 10, 11, 16, 21, and the parts of wave A that needed them.
+Later, with their own plan: rows 14, 15, 22 and 23. Where a row below asks for something the first versions of P7 to
+P10 leave out (a `capture` window, a guard, a `gallery`, connections), that part of the row is later too.
 
 "Model" is who writes it: Opus for open-ended work, Sonnet where the first version is well defined. All are based on
 P11. Wave B starts when the module it waits for is written. Where a first version is larger than the research
@@ -563,6 +810,8 @@ Events follow §2 row 12. Other modules may subscribe; nothing may depend on an 
 - At most five rounds; up to ten when a round still finds real problems. A finding in round *n* that was already in
   the diff at round *n − 1* is recorded as a miss of the earlier review, so the reviewer is told to be exhaustive in
   one pass: every file in the diff is read, and the review says which files it read.
+- "Blocking" is judged against §3.5: a finding that needs module code to break the runtime's rules, a host
+  dependency to misbehave, or in-process code to go around a seam on purpose is a note.
 - A PR that still has blocking findings when the rounds run out is not approved: its description says so and lists
   them, and the owner is told. Work above it continues only where those findings do not touch a contract it uses.
 - Fixes to a lower PR are merged up through the stack.

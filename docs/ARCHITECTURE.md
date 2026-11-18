@@ -340,8 +340,15 @@ CurrentPrincipal: Context.Reference<Principal | undefined>       // the admitted
   assistant has the module on; the tool is not in its `offTools` (`ModuleHostOptions.access`; skipped for the local
   principal and a notification); only then the module's **risk function** (`risk: { classes, of }`, else the declared
   or inferred class: `read` for speculative tools, else `change`), run on the validated input (a generated action
-  tool's input is resolved to the action's values once; those are classified, admitted and run); then the risk hook
-  (`ModuleHostOptions.gatewayHooks.risk`, empty until P8). A risk function that throws, answers a class it did not
+  tool's input is resolved to the action's values once; those are classified, admitted and run); then the **risk
+  policy** on that class (`ModuleHostOptions.gatewayHooks.riskPolicy`: `defaultRiskPolicy` in serve mode, the CLI modes
+  and the module test kit; `read` and `change` run, `message` is refused as needing confirmation, `money` and
+  `security` are denied, each with its own sentence); then the later hook (`gatewayHooks.risk`, empty). A tool or
+  action whose every declared class the policy refuses is left out of every registry's `specs` and `actions` and of the
+  host's action catalogue (`ExecutionGateway.offers`); a call that names it is still refused. A tool without
+  parameters is sent to a model as `{ "type": "object", "properties": {} }` (`toolSpec`). The host refuses, when a
+  module starts, a tool name outside `[A-Za-z0-9_-]{1,64}`, a duplicate, and an action whose generated tool name is
+  over 64 characters, naming it. A risk function that throws, answers a class it did not
   declare or takes longer than `RISK_BUDGET_MS` (2 ms: it is synchronous code on the turn path, so it must be pure and
   bounded) refuses the call with "what it would do could not be judged"; what went wrong goes to the log only. An
   action declared `confirm: true` is refused on every public path (confirmation is off in this stack); only core's own
@@ -967,14 +974,14 @@ packages/
                     `index.ts` re-exports all of `clock.ts` and `weather.ts`, so their two extending module PRs never meet (P11)
   module-home-assistant/ lights by room through the owner's Home Assistant (REST, actions); in the app's catalog since WP-12c
   module-contracts/ `@pva/module-contracts` (P11): the service and contribution keys modules share (`Lists`, `Timers`,
-                    `HomeAssistant`, `Playback`, `Mcp`, `CalendarProviders`, `BriefingSections`), each interface documented in its
-                    file; `useService` (a missing or stopping provider as `ProviderOff`); `defineTexts` / `say` / `homeLanguage`
-                    (spoken texts in English and Dutch); `StoredText` (bounded stored text); `/fakes`: an in-memory fake of each
-                    contract; `test/kit/`: the reference module of docs/MODULES.md
+                    `HomeAssistant`, `Playback`, `BriefingSections`), each interface and its bounds documented in its file (the
+                    contract); `useService` (a missing or stopping provider as `ProviderOff`) and `providerOffText`; `defineTexts` /
+                    `say` / `homeLanguage` (spoken texts in English and Dutch); `StoredText` (bounded stored text), `isLine`;
+                    `test/kit/`: the reference module of docs/MODULES.md. Consumers' tests use stubs (`stubService`), no fakes
   module-<id>/      one package per module of docs/MODULES-PLAN.md §5.1 waves A and B (P11 scaffold: off by default, no tools
                     yet): assistant-controls, timers (timers, alarms), core-tools (calculator, knowledge, system-status),
                     web-search, lists, notifications, kitchen, music, reminders, images, calendar, memory, broadcast, briefing,
-                    local-info (bin-day), presence, news, routines, mcp; each exports `catalog`, which `apps/assistant/src/modules.ts`
+                    local-info (bin-day), presence, news, routines; each exports `catalog`, which `apps/assistant/src/modules.ts`
                     lists once; how to write one: docs/MODULES.md, each module's page: docs/modules/<id>.md
 models/             downloaded model files (git-ignored; `pnpm download-models`, or Settings › Models in the web UI)
 apps/
@@ -994,10 +1001,11 @@ apps/
 - `core` is tested entirely with the in-memory fakes from `@pva/core/testing` (scripted `Stt` events, scripted `Llm` events, a `Tts` that reads clauses eagerly, records when each arrived, and turns each into a marker chunk tagged with its clause index, a tone `Tts` at a chosen sample rate, a recording `AudioOutput`, a reporting `AudioOutput` that behaves like the browser, a scripted `AudioInput`) and `TestClock`.
 - Serve mode is tested with a scripted client (`apps/assistant/test/support/scriptedClient.ts`: a Node `ws` client that speaks the protocol and simulates the browser's player) against the real server with injected providers, plus one live test with the local models. Gotcha: `TestClock.adjust` waits only one scheduler hop before advancing, so let freshly forked fibers run first (see `advance` in `Conversation.test.ts`). The Conversation table above — speculation, promotion, discard, barge-in, tool loop — each has a test.
 - Adapters have unit tests for their protocol mapping against recorded/mock messages (a local mock WebSocket server), and an opt-in live test that runs only when the provider's API key is set.
-- Modules are tested with the module test kit (`@pva/core/testing`, P11; docs/MODULES.md §16): `startTestModule` runs one
-  definition in the real module host with serve mode's gateway checks, the real scheduler engine on the in-memory store,
-  the core's `People` / `Privacy` / `Devices` rules over a test household, stand-ins for the modules it uses (`provide`,
-  with the fakes of `@pva/module-contracts/fakes`) and in-memory route tokens, and runs its tools, actions, jobs and
-  routes as a given turn; `makeOfflineNet` gives `@pva/net` a resolver and connector that serve fixtures; `checkModule`
-  is the conformance check every module's test calls (`ModuleCheck.ts` lists its rules).
+- Modules are tested with the module test kit (`@pva/core/testing`, P11; docs/MODULES.md §17): `startTestModule` runs one
+  definition in the real module host with serve mode's gateway checks and risk policy, the real scheduler engine on the
+  in-memory store, the core's `Privacy` rule over a test household fixed for the test, and stand-ins for the modules it
+  uses (`provide`, with stubs of their services: `stubService` records calls and answers what the test programs), and
+  runs its tools, actions and jobs as a given turn; it does not imitate the HTTP router. `makeOfflineNet` gives
+  `@pva/net` a resolver and connector that serve fixtures; `checkModule` is the conformance check every module's test
+  calls (`ModuleCheck.ts` lists its rules).
 - `pnpm check` (typecheck all), `pnpm test` (all unit tests) must pass before any change is considered done.

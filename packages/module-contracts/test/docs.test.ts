@@ -19,7 +19,22 @@ const regionOf = (file: string, name: string): string => {
   return `${body.map((l) => l.slice(indent)).join("\n")}\n`
 }
 
+/** Every ```ts block of `text`, and whether the line before it is a region marker. */
+const tsBlocks = (text: string) => {
+  const lines = text.split("\n")
+  return lines.flatMap((line, i) => (line.trim() === "```ts" ? [{ line: i + 1, marked: /^<!-- region: [^#\s]+#[a-z0-9-]+ -->$/.test(lines[i - 1] ?? "") }] : []))
+}
+
 describe("docs/MODULES.md", () => {
+  it("quotes every TypeScript block from a region of a test or source file", () => {
+    const blocks = tsBlocks(readFileSync(guide, "utf8"))
+    expect(blocks.length).toBeGreaterThan(10)
+    expect(blocks.filter((b) => !b.marked).map((b) => `line ${b.line}`)).toEqual([])
+    // The check itself: a block without its marker is found.
+    expect(tsBlocks("text\n```ts\nconst x = 1\n```\n")).toEqual([{ line: 2, marked: false }])
+  })
+
+
   it("quotes the regions of the files it names, exactly", () => {
     const text = readFileSync(guide, "utf8")
     const marks = [...text.matchAll(MARK)]

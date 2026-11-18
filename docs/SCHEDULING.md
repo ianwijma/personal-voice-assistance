@@ -60,10 +60,14 @@ const job = yield* ctx.scheduler.schedule({
   parsed: schedule a one-off job (`at`) and schedule the next one from its handler (a module that repeats by an
   `RRULE` keeps the rule itself and does exactly this). An expression that does not parse and a zone that is not
   known are `invalid` too, never a defect. Planning an accepted expression (`Cron.next`, inside `schedule`) is under
-  a millisecond ("Latency").
+  a millisecond ("Latency"). `isSchedulerCron(expr, timeZone?)` (`@pva/core`) makes the same checks and answers why an
+  expression would be refused, or `undefined`.
 - **Payload**: JSON of at most 1,000 characters (as `JSON.stringify` writes it, escapes included); anything else is
-  `invalid`. Keep larger data in your own collection and schedule its id. It is decoded by the handler's schema when
-  the job runs; a payload that does not decode fails the job, and it is not retried.
+  `invalid`. An absent payload is `{}`. Keep larger data in your own collection and schedule its id. When the handler
+  is published (or registered by the start being published) at the moment of `schedule`, `prepare` or `reschedule`,
+  the payload is checked against its schema there, and one that does not decode is `invalid` (P11). It is decoded by
+  the handler's schema again when the job runs; a payload that does not decode then (a job scheduled before its
+  handler appeared, a schema that decodes asynchronously) fails the job, and it is not retried.
 - **Key**: one live (`scheduled` or `running`) job per module and key. Scheduling the same key again replaces the live
   one, which becomes `cancelled` (and its Health issue, if it had one, goes); a finished job of that key, a `failed` one
   too, is not touched. Keys: 1–100 letters, digits and `_ . : @ / -`.

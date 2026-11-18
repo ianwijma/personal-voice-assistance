@@ -1,7 +1,7 @@
 // Two more pieces docs/MODULES.md quotes, compiled and run: a settings form with the extended fields and nested
 // configuration as validated JSON text; and a spoken recurrence kept as an RRULE with one job for its next occurrence.
 import { assert, describe, it } from "@effect/vitest"
-import { defineCollection, defineModule, makeTool, MAX_LIVE_JOBS, type PreparedJob, type Row, type SchedulerError, Setting, ToolError } from "@pva/core"
+import { defineAction, defineCollection, defineModule, makeTool, Param, MAX_LIVE_JOBS, type PreparedJob, type Row, type SchedulerError, Setting, ToolError } from "@pva/core"
 import { checkModule, startTestModule } from "@pva/core/testing"
 import { nextOccurrence, parseRecurrence } from "@pva/language"
 import { Clock, Effect, Exit, Option, Schema } from "effect"
@@ -129,6 +129,41 @@ export const nagModule = defineModule({
 })
 // #endregion recurrence
 
+// #region param-action
+/** A typed action with parameters: a choice the module fixes, a dynamic choice from its own cache, a number. */
+const rooms = (): ReadonlyArray<{ readonly value: string; readonly label: string; readonly aliases?: ReadonlyArray<string> }> => [
+  { value: "kitchen", label: "Kitchen", aliases: ["keuken"] },
+  { value: "living", label: "Living room", aliases: ["woonkamer", "lounge"] }
+]
+const fanTexts = defineTexts({ en: { set: "The {room} fan is on {speed} for {minutes} minutes." }, nl: { set: "De ventilator in {room} staat {minutes} minuten op {speed}." } })
+
+export const fanModule = defineModule({
+  apiVersion: 2,
+  id: "fan",
+  name: "Fan",
+  description: "Turns a room's fan on for a while.",
+  enabledByDefault: false,
+  start: (ctx) =>
+    Effect.succeed({
+      actions: [defineAction({
+        // Its id is `fan.run` (`<moduleId>.<actionId>`), and the model is offered it as the tool `fan_run`.
+        id: "run",
+        label: "Run the fan",
+        description: "Run a room's fan at a speed for some minutes.",
+        examples: ["run the kitchen fan on high for ten minutes", "zet de ventilator in de keuken tien minuten hoog"],
+        params: {
+          room: Param.dynamic({ label: "Room", options: rooms }),
+          speed: Param.choice({ label: "Speed", options: [{ value: "low", label: "low" }, { value: "high", label: "high" }], default: "low", optional: true }),
+          minutes: Param.number({ label: "Minutes", min: 1, max: 60, integer: true })
+        },
+        risk: "change",
+        run: ({ room, speed, minutes }) =>
+          Effect.succeed({ say: say(fanTexts, homeLanguage(ctx.host.view()), "set", { room: rooms().find((r) => r.value === room)?.label ?? room, speed: speed ?? "low", minutes }) })
+      })]
+    })
+})
+// #endregion param-action
+
 describe("examples of docs/MODULES.md", () => {
   it.effect("the form: every field kind, a JSON text field explained on error, a Test button", () =>
     Effect.gen(function*() {
@@ -137,6 +172,19 @@ describe("examples of docs/MODULES.md", () => {
       assert.match(explainSteps("{\"say\": 1}") ?? "", /JSON list/)
       const kit = yield* startTestModule(formModule, { settings: { baseUrl: "http://searx.lan:8080" } })
       assert.deepStrictEqual(yield* kit.host.fieldAction("form-example", "test"), { ok: true, result: { ok: true, text: "Reachable." } })
+    }))
+
+  it.effect("a parameterised action, run as a routine runs it (host.actions.run, values in its tool input form)", () =>
+    Effect.gen(function*() {
+      yield* checkModule(fanModule, { texts: fanTexts })
+      const kit = yield* startTestModule(fanModule)
+      // #region param-action-test
+      const run = yield* kit.action("run", { room: "kitchen", speed: "high", minutes: 10 })
+      assert.deepStrictEqual(run, { ok: true, say: "The Kitchen fan is on high for 10 minutes." })
+      // The same through its generated tool, as the model calls it.
+      const tool = yield* kit.tool("fan_run", { room: "kitchen", minutes: 5 })
+      assert.strictEqual(tool.value, "The Kitchen fan is on low for 5 minutes.")
+      // #endregion param-action-test
     }))
 
   it.effect("a spoken recurrence: the RRULE in the module's row, one job for the next occurrence, planned again by its handler", () =>

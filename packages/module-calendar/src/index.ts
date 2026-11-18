@@ -11,7 +11,7 @@ export const calendarModule = defineModule({
   apiVersion: 2,
   id: "calendar",
   name: "Calendar",
-  description: "Calendars from ICS links and CalDAV: what is on, when, free time, and adding an event.",
+  description: "Calendars from ICS links: what is on, when, and free time.",
   enabledByDefault: false,
   start: () => Effect.succeed({})
 })
