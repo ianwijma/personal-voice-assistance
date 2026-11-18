@@ -954,13 +954,15 @@ SpeechPort    = { speak(deviceId, text, { cue, gate: () => "go" | "wait" | NotDe
   page of open rows with the store's synchronous reader (`HouseholdStore.reader`), decides and sends in that step,
   yields, and ends with a step that rereads every held card it did not see. Passes run one at a time in one fiber; a
   failed pass marks its device for the next trigger or the maintenance run planned a minute later. At a page's bound
-  (64) it withdraws what has ended before it adds. `onRingingChanged` compares with what it last told, after each step.
+  (64) it withdraws what has ended before it adds. `onRingingChanged` compares with what it last told, in a finaliser of
+  each step. A repaired pass plans again. After a run that succeeded, overdue work is planned for now; after one that
+  failed, a minute later. When nothing is due, the stored `due` job is cancelled unless this process knows there is none.
 - **Two jobs** (D2b): `plan()` (bounded indexed reads: the open rows, the oldest resolved row) keeps the one-shot
   `core.notify/due` (key `due`) at the earliest of the next expiry, do not disturb's end, the oldest resolved row leaving
   retention (a day), a stale claim's release and, while a device is marked for another pass or do not disturb is unknown,
   a minute from now; none when nothing is due. It runs, serialised, after every change that can move that time, at the
   end of every maintenance run and at start; a failure is a Health issue, planned again at the next change.
-  `core.notify/hourly` (cron `0 * * * *`, by key at every start) runs the same full pass, so a lost plan leaves nothing
+  `core.notify/hourly` (cron `0 * * * *` in UTC, by key at every start) runs the same full pass, so a lost plan leaves nothing
   overdue for more than an hour. A run: the end of do not disturb, expiry and stale claims, retention, each in bounded
   transactions, then every device reconciled, then `plan()`. Do not disturb is read by one function: a failed read makes
   it unknown (on) and reconciles every device. A claim of a run alive in this process is never released by the wall
