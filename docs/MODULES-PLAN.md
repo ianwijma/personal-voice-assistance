@@ -269,7 +269,7 @@ Service keys and interfaces that the core provides or calls (`People`, `Privacy`
   set.
 - At host shutdown every module's registrations are withdrawn first, in one step, before any part is closed.
 - Registrar callbacks (`validate`, `publish`, `withdraw`) are host code: they write their own table and must not
-  read the host or throw. Registrars receive what the host has; they are not a boundary.
+  read the host or throw. Reading a part handle's own state through the seam is allowed. Registrars receive what the host has; they are not a boundary.
 - "Check again" always starts a fresh attempt for every demanded module that is not live.
 - Field actions get their time limit and their place in a stop in P3, which owns them.
 - An intent action's success sentence is still synthesised during the speculative window and played at promotion.
@@ -420,18 +420,19 @@ Cut down after its first review (21 blocking findings, and a rewrite was due any
 The scheduler does one thing: it calls a module's handler at a time, once.
 
 - **`ctx.scheduler`**: `schedule({ handler, payload, at | inMs | cron, key?, late?, origin? })`, `cancel(id | { key })`,
-  `reschedule(id, { at | inMs })`, `get(id)`, `list({ key?, after?, limit? })`, and `handle(name, { payload: schema,
+  `reschedule(id, { at | inMs })`, `get(id)`, `list({ key?, after?, limit? })` (live jobs), and `handle(name, { payload: schema,
   idempotent?, retries?, run })` during `shared` or `start`. Nothing else: **no pause and resume** (a module cancels
   and schedules again; a paused timer is the module's own row), **no `runTask`** (long work is a fiber in the
   module's own scope with its progress in the module's own collection), **no `{ notify }` jobs and no `inbox`
   policy** (P9 registers a handler of its own for notifications that are due later, and lateness of a notification
   is P9's delivery policy).
 - **A job** is one row in a collection of the owner `core.scheduler`: module, handler name, an optional key (one
-  live job per module and key; scheduling the same key again replaces it), a JSON payload of at most 2,000
+  live job per module and key; scheduling the same key again replaces it), a JSON payload of at most 1,000
   characters, the due time, for a repeating job its cron expression and zone, its origin (device, assistant and
   person, taken from the turn or job that scheduled it unless given), a state (`scheduled`, `running`, `done`,
   `failed`, `cancelled`, `missed`) and an attempt count. Modules that repeat by `RRULE` keep the rule themselves
-  and schedule one job for the next occurrence (§2); `cron` is for system jobs such as refreshing a cache.
+  and schedule one job for the next occurrence (§2); `cron` is for system jobs such as refreshing a cache, and takes minute, hour and day-of-week patterns only
+  (day of month and month must be `*`); anything else is a one-off job rescheduled from its handler.
 - **The loop**: one fiber sleeps until the earliest due time among jobs whose handler is published, and is woken by
   a schedule, a cancel, a handler being published, and a clock jump. Per published handler it reads the due jobs
   through an index, so a job whose module is off or down just stays `scheduled` and is run when its handler
