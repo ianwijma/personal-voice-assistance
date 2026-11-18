@@ -1144,8 +1144,11 @@ export const notifyContract = (name: string, open: OpenNotifyStore) =>
         world.notify.reconcile("kitchen-display")
         yield* world.settle
         assert.deepStrictEqual(changes, ["kitchen-display"])
-        // The page closes: told (nothing rings there now).
-        yield* world.close(tab)
+        // The page goes away with no pass (no reconcile): the next look at what the device holds (a press) drops it
+        // and tells it (nothing rings there now).
+        world.tabs.delete(tab.id)
+        const some = (yield* world.rows)[0]!.id
+        yield* world.notify.press({ notificationId: some, actionId: "stop", deviceId: "kitchen-display" })
         assert.deepStrictEqual(changes, ["kitchen-display", "kitchen-display"])
         assert.deepStrictEqual(world.notify.ringingOn("kitchen-display"), [])
       }))
