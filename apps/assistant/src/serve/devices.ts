@@ -118,7 +118,7 @@ export interface DeviceRegistry {
   /**
    * Write the declarations that changed materially: one write at a time for all devices, each record with its latest
    * declaration read inside the write's own step. Writes are at least `DECLARE_WRITE_GAP_MS` apart, measured from the
-   * last one (also after an idle time): requests in between coalesce into the next. Never fails.
+   * end of the last one (also after an idle time): requests in between coalesce into the next. Never fails.
    */
   readonly persist: Effect.Effect<void>
   /**
@@ -217,12 +217,16 @@ export const makeDeviceRegistry = (options: DeviceRegistryOptions): DeviceRegist
   let persisting: number | undefined
   let writers = 0
   const monotonic = options.monotonic ?? (() => performance.now())
-  /** When the last write of declarations started (monotonic ms): the next one waits until `gapMs` after it. */
+  /**
+   * When the last write of declarations ended (monotonic ms): the next one waits until `gapMs` after it. Not when it
+   * was asked for: a save waits in the store (its queue, its other steps) before the file is written, so a gap counted
+   * from the request let two writes reach the disk closer together than `gapMs` after a slow one.
+   */
   let lastWriteAt = -Infinity
   const persistable = () => [...dirty].some((id) => stored()[id] !== undefined)
   /**
    * One writer for every device's declaration. Requests while it waits or writes are folded into its next round; each
-   * round starts no earlier than `gapMs` after the previous one started, whether the writer was busy or idle between.
+   * round starts no earlier than `gapMs` after the previous one ended, whether the writer was busy or idle between.
    */
   const persist: Effect.Effect<void> = Effect.suspend(() => {
     if (persisting !== undefined || !persistable()) return Effect.void
@@ -231,7 +235,6 @@ export const makeDeviceRegistry = (options: DeviceRegistryOptions): DeviceRegist
     const round = Effect.suspend(() => {
       const ids = [...dirty].filter((id) => stored()[id] !== undefined)
       if (ids.length === 0) return Effect.void
-      lastWriteAt = monotonic()
       for (const id of ids) dirty.delete(id)
       /** The declaration each record took, by its place in the order of arrival. */
       const taken = new Map<string, number | undefined>()
@@ -240,7 +243,10 @@ export const makeDeviceRegistry = (options: DeviceRegistryOptions): DeviceRegist
         return withAllLastSeen(committed)
       }).pipe(
         Effect.tap(() => Effect.sync(() => afterWrite(taken))),
-        Effect.catch((e) => Effect.logDebug(`Device capabilities not saved (kept in memory until the next write): ${e.message}`))
+        Effect.catch((e) => Effect.logDebug(`Device capabilities not saved (kept in memory until the next write): ${e.message}`)),
+        Effect.ensuring(Effect.sync(() => {
+          lastWriteAt = monotonic()
+        }))
       )
     })
     const loop: Effect.Effect<void> = Effect.suspend(() => {
