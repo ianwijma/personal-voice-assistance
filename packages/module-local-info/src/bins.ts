@@ -111,3 +111,25 @@ export const epochDay = (day: number): number => {
 
 /** The date of an entry in `zone`. */
 export const dayOfEntry = (e: Entry, zone: string): number => (e.d !== undefined ? e.d : dayIn(e.t!, zone))
+
+/** The owner's names as the task's input carries them. */
+export const rulesJsonOf = (rules: ReadonlyArray<OwnerRule>): string => JSON.stringify(rules.map((r) => ({ match: r.match, label: r.label })))
+
+/** The owner's names from the input's JSON text, or `undefined` when it is not of the allowed shape. */
+export const rulesFromJson = (json: string): ReadonlyArray<OwnerRule> | undefined => {
+  let value: unknown
+  try {
+    value = JSON.parse(json)
+  } catch {
+    return undefined
+  }
+  if (!Array.isArray(value) || value.length > 12) return undefined
+  const rules: Array<OwnerRule> = []
+  for (const item of value) {
+    if (typeof item !== "object" || item === null || Array.isArray(item)) return undefined
+    const { match, label } = item as Record<string, unknown>
+    if (typeof match !== "string" || typeof label !== "string" || match.length > 40 || label.length > 40 || Object.keys(item).length !== 2) return undefined
+    rules.push({ match, label })
+  }
+  return rules
+}

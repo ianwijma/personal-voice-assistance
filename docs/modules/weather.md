@@ -81,10 +81,12 @@ empty after a restart.
 non-commercial use, under 10,000 calls a day). The User-Agent is the product token, plus the owner's contact (Home › API
 contact) only when set.
 
-**Not checked against the live service.** The author had no network: the answers' shape (with `timeformat=unixtime`,
-`past_minutely_15` and `forecast_minutely_15`) is read from Open-Meteo's documentation and tested with fixtures of that
-shape. If the live answer differs, the tools say the service sent something they could not read, or that they have no
-rain data, rather than a wrong answer.
+**Checked once against the live service.** On 18 November 2026 the exact request (latitude 51.48, longitude 0.00,
+`timeformat=unixtime`, `past_minutely_15=2`, `forecast_minutely_15=12`, the hourly and daily fields) answered 200 in
+0.5 s: integer epoch times, `timezone` "Europe/London", 14 quarter-hours from two before now with 900 s steps, 168 hours
+and 7 days at local midnight, no nulls. That answer is kept as `packages/module-local-info/test/openMeteoLive.json` and a
+test reads it through the real client. If the live answer changes, the tools say the service sent something they could
+not read, or that they have no rain data, rather than a wrong answer.
 
 ## What was left out
 

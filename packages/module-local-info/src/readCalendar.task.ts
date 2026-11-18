@@ -2,15 +2,20 @@
 // plain data in and out, run in a fresh worker thread for each call (`offThread` in binDay.ts) with a time, memory and
 // result limit; `ical.js` is imported here only, so it is never loaded on the main thread.
 import ICAL from "ical.js"
-import { addDays, binOf, dayIn, dayNumber, type Entry, epochDay, HORIZON_DAYS, MAX_COLLECTIONS, MAX_EVENTS, MAX_WORK, type OwnerRule } from "./bins.ts"
+import { addDays, binOf, dayIn, dayNumber, type Entry, epochDay, HORIZON_DAYS, MAX_COLLECTIONS, MAX_EVENTS, MAX_WORK, rulesFromJson } from "./bins.ts"
 
+/**
+ * The input, in the one shape `offThread` takes (a flat record of strings and numbers). The owner's names are a JSON
+ * text (`rulesJson`), decoded and checked here: at most 12, each `{ match, label }` of strings of at most 40 characters,
+ * as the settings form allows.
+ */
 export interface ReadInput {
   readonly text: string
   /** Today in the household's zone (20261118): collections from the day before it on are kept. */
   readonly fromDay: number
   /** The household's zone: timed collections are ordered by their date there. */
   readonly zone: string
-  readonly rules: ReadonlyArray<OwnerRule>
+  readonly rulesJson: string
 }
 
 export type ReadResult =
@@ -20,6 +25,8 @@ export type ReadResult =
   | { readonly _tag: "unreadable" }
   /** Over `MAX_EVENTS` events or `MAX_WORK` steps: never cut short into a list that looks complete. */
   | { readonly _tag: "too-large" }
+  /** The input itself is not of the allowed shape (the owner's names): a bug of the caller, never read as a calendar. */
+  | { readonly _tag: "bad-input" }
 
 class TooLarge extends Error {}
 
@@ -124,7 +131,9 @@ const SUB_DAILY = new Set(["SECONDLY", "MINUTELY", "HOURLY"])
 const isCancelled = (c: ICAL.Component) => String(c.getFirstPropertyValue("status") ?? "").toUpperCase() === "CANCELLED"
 
 export const readCalendar = (input: ReadInput): ReadResult => {
-  const { text, fromDay, zone, rules } = input
+  const { text, fromDay, zone } = input
+  const rules = typeof input.rulesJson === "string" ? rulesFromJson(input.rulesJson) : undefined
+  if (rules === undefined || typeof text !== "string" || !Number.isInteger(fromDay) || typeof zone !== "string") return { _tag: "bad-input" }
   let calendar: ICAL.Component
   try {
     if (!/^\s*(﻿)?\s*BEGIN:VCALENDAR/i.test(text.slice(0, 200))) return { _tag: "unreadable" }

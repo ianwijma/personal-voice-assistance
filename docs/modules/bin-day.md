@@ -27,7 +27,11 @@ heap of 96 MB and an answer of at most 64 KiB. A repeating series is moved to th
 interval (a weekly round that began in 1990 costs no more than one that begins today); a series with `COUNT` is walked
 from its start. The whole calendar has a work bound (at most 2,000 events and 20,000 steps of expansion). A calendar
 over a limit, or one the reader does not finish in time, is a **failed refresh with its reason**, never an empty or a
-shortened list; a calendar with a repeat every second, minute or hour (no collection calendar has one) has that event
+shortened list. The task's input is the one flat record the helper takes (the text, today, the zone, and the owner's
+names as a JSON text that the task checks); each of the helper's reasons is a failed refresh: `timeout` is "too slow",
+`memory` and `too-large` "too large", `failed` and `exited` "unreadable", `busy` (more than 32 calls waiting) "busy",
+which is not remembered (the next refresh or question simply tries again), and `input`, `nested` and `load` "internal"
+(a bug of the module, never "not a calendar"); a calendar with a repeat every second, minute or hour (no collection calendar has one) has that event
 left out as unreadable. Measured on the development machine (`binDay.test.ts` and `readCalendar.test.ts` print it): a
 refresh of a 254 KiB calendar of 1,526 repeating events holds the main thread 2.7 to 2.9 ms at most; the reviewer's
 hostile calendars (a 163-byte rule repeating every second, 1,600 daily series of 400) hold it 1.5 and 1.6 ms and end as

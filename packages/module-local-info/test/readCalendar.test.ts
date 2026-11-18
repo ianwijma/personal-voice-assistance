@@ -6,12 +6,12 @@ import { offThreadWorkers } from "@pva/core/testing"
 import { Effect } from "effect"
 import { bound } from "../../store-sqlite/test/latencyBound.ts"
 import { calendarReader, READ_TIMEOUT_MS } from "../src/binDay.ts"
-import { addDays, classify, dayIn, type Entry, labelOf, MAX_COLLECTIONS, MAX_EVENTS, type OwnerRule } from "../src/bins.ts"
+import { addDays, classify, dayIn, type Entry, labelOf, MAX_COLLECTIONS, MAX_EVENTS, type OwnerRule, rulesFromJson, rulesJsonOf } from "../src/bins.ts"
 import { readCalendar, type ReadResult } from "../src/readCalendar.task.ts"
 import { allDay, denseCalendar, ics, impossibleCalendar, secondlyCalendar } from "./fixtures.ts"
 
 const fromDay = 20_261_118
-const read = (text: string, rules: ReadonlyArray<OwnerRule> = [], zone = "Europe/Amsterdam") => readCalendar({ text, fromDay, zone, rules })
+const read = (text: string, rules: ReadonlyArray<OwnerRule> = [], zone = "Europe/Amsterdam") => readCalendar({ text, fromDay, zone, rulesJson: rulesJsonOf(rules) })
 const ok = (r: ReadResult) => {
   assert.strictEqual(r._tag, "ok")
   return r as Extract<ReadResult, { _tag: "ok" }>
@@ -114,6 +114,15 @@ describe("reading the calendar", () => {
     assert.deepStrictEqual(read(ics([])), { _tag: "ok", entries: [], cut: false, unreadable: 0 })
   })
 
+  it("the owner's names cross as JSON and are checked in the task; a name list of another shape is the caller's bug, never a calendar", () => {
+    const rules = [{ match: "tuin", label: "Garden waste" }]
+    assert.deepStrictEqual(rulesFromJson(rulesJsonOf(rules)), rules)
+    for (const bad of ["not json", "{}", JSON.stringify([{ match: 1, label: "x" }]), JSON.stringify([{ match: "a", label: "b", extra: 1 }]), JSON.stringify(Array.from({ length: 13 }, () => ({ match: "a", label: "b" }))), JSON.stringify([{ match: "a".repeat(41), label: "b" }])]) {
+      assert.isUndefined(rulesFromJson(bad), bad.slice(0, 40))
+    }
+    assert.deepStrictEqual(readCalendar({ text: ics([]), fromDay, zone: "Europe/Amsterdam", rulesJson: "[{" }), { _tag: "bad-input" })
+  })
+
   it("dates are plain calendar arithmetic", () => {
     assert.strictEqual(addDays(20_261_231, 1), 20_270_101)
     assert.strictEqual(addDays(20_280_228, 1), 20_280_229)
@@ -167,7 +176,27 @@ const longestStop = <A, E>(effect: Effect.Effect<A, E>) =>
 
 describe("the reader runs off the main thread", () => {
   const options = { timeoutMs: READ_TIMEOUT_MS, maxMemoryMb: 96, maxResultBytes: 64 * 1024 }
-  const input = (text: string) => ({ text, fromDay, zone: "Europe/Amsterdam", rules: [] })
+  const input = (text: string, rules: ReadonlyArray<OwnerRule> = []) => ({ text, fromDay, zone: "Europe/Amsterdam", rulesJson: rulesJsonOf(rules) })
+
+  it.live("the reader's input is one flat record the helper takes, the owner's names in it as JSON; a nested one is refused as `input` (follow-up)", () =>
+    Effect.gen(function*() {
+      const text = ics([allDay("a", "20261119", "Tuinafval")])
+      const rules = [{ match: "tuin", label: "Garden waste" }]
+      assert.deepStrictEqual(yield* offThread(calendarReader, input(text, rules), options), { _tag: "ok", entries: [{ d: 20261119, k: "other", l: "Garden waste" }], cut: false, unreadable: 0 })
+      // What the module passed before the helper's rework: the names as an array of objects, refused before a worker starts.
+      const nested = yield* Effect.flip(offThread(calendarReader, { text, fromDay, zone: "Europe/Amsterdam", rules } as never, options))
+      assert.strictEqual(nested.reason, "input")
+    }), 30_000)
+
+  it.live("the largest answer the reader can give is well under the helper's 128 KiB for a structure", () =>
+    Effect.gen(function*() {
+      // 60 collections, each with a 60-character label of two-byte characters and an instant: the worst the reader returns.
+      const events = Array.from({ length: MAX_COLLECTIONS + 5 }, (_, i) =>
+        `BEGIN:VEVENT\r\nUID:w${i}\r\nDTSTART:${String(addDays(fromDay, i))}T120000Z\r\nSUMMARY:${"é".repeat(58)}${String(i).padStart(2, "0")}\r\nEND:VEVENT`)
+      const answer = yield* offThread(calendarReader, input(ics(events)), { ...options, maxResultBytes: 32 * 1024 })
+      assert.strictEqual(answer._tag === "ok" ? answer.entries.length : 0, MAX_COLLECTIONS)
+      assert.isBelow(Buffer.byteLength(JSON.stringify(answer)) * 2, 32 * 1024)
+    }), 30_000)
 
   it.live("the reviewer's hostile calendars hold the main thread under 10 ms and end as a typed answer or failure, never a list", () =>
     Effect.gen(function*() {

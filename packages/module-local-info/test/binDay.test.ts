@@ -2,11 +2,11 @@
 // reaches the network (the kit's offline network serves the calendars), and the clock is the test clock. The calendar is
 // read by real workers (`offThread`), as in the app.
 import { assert, describe, it } from "@effect/vitest"
-import { CurrentJob, type JobOrigin } from "@pva/core"
-import { checkModule, makeOfflineNet, startTestModule } from "@pva/core/testing"
+import { CurrentJob, type JobOrigin, offThread, OffThreadReason, offThreadTask } from "@pva/core"
+import { checkModule, makeOfflineNet, offThreadWorkers, startTestModule } from "@pva/core/testing"
 import { type BriefingRequest, type BriefingSection, BriefingSections } from "@pva/module-contracts"
 import { Effect, Fiber } from "effect"
-import { binDayModule, COPY_ID, copies, type Copy, explainLink, MAX_NAMES, RETRY_AFTER_MS, sourceOf, STALE_AFTER_MS, texts } from "../src/binDay.ts"
+import { binDayModule, COPY_ID, copies, type Copy, explainLink, MAX_NAMES, readReason, RETRY_AFTER_MS, sourceOf, STALE_AFTER_MS, texts } from "../src/binDay.ts"
 import { addDays, ICS_MAX_BYTES, MAX_COLLECTIONS } from "../src/bins.ts"
 import { bound } from "../../store-sqlite/test/latencyBound.ts"
 import { allDay, calendarPath, calendarUrl, householdCalendar, ics, icsHeaders } from "./fixtures.ts"
@@ -356,6 +356,59 @@ describe("bin-day: the outside service", () => {
       assert.strictEqual(yield* spoken(la), "Tomorrow: the paper bin.")
       assert.strictEqual(net.requests.length, 0)
     }))
+})
+
+describe("bin-day: the reworked off-thread helper", () => {
+  it.effect("the refresh goes through the real helper with the owner's names, and they are applied", () =>
+    Effect.gen(function*() {
+      const kit = yield* startTestModule(moduleOn(serve(ics([allDay("t", "20261119", "Tuinafval")]))), { settings: { ...settings, names: [{ match: "tuin", label: "Garden waste" }] } })
+      assert.strictEqual(yield* spoken(kit), "Tomorrow: Garden waste.")
+      assert.deepStrictEqual((yield* copyIn(kit))?.value.entries, [{ d: 20261119, k: "other", l: "Garden waste" }])
+    }))
+
+  it("every reason of the helper is a failed refresh with its own reason, never a defect", () => {
+    const expected: Record<string, string> = {
+      timeout: "too-slow", memory: "too-large", "too-large": "too-large", failed: "unreadable", exited: "unreadable", load: "internal", input: "internal", busy: "busy", nested: "internal"
+    }
+    for (const reason of OffThreadReason.literals) assert.strictEqual(readReason(reason), expected[reason], reason)
+  })
+
+  it.effect("a busy helper: the refresh fails with `busy`, the last copy stays, and the next refresh simply tries again", () =>
+    Effect.gen(function*() {
+      const { state, net } = switchable()
+      const kit = yield* startTestModule(moduleOn(net), { settings })
+      const daily = (yield* kit.jobs).find((j) => j.key === "refresh-daily")!
+      yield* runJob(kit, daily.id)
+      const good = (yield* copyIn(kit))!
+      assert.isDefined(good)
+      // Two calls running and 32 waiting fill the helper; the refresh's call is one more.
+      const wait = offThreadTask<(input: { readonly ms: number }) => Promise<string>>(new URL("./wait.task.mjs", import.meta.url))
+      const fill = Effect.gen(function*() {
+        const fibers = yield* Effect.forEach(Array.from({ length: 34 }), () => Effect.forkChild(Effect.exit(offThread(wait, { ms: 20_000 }, { timeoutMs: 30_000 }))))
+        yield* Effect.promise(() => new Promise((resolve) => setTimeout(resolve, 50)))
+        return fibers
+      })
+      const fillers = yield* fill
+      yield* runJob(kit, daily.id)
+      assert.strictEqual((yield* kit.jobs).find((j) => j.id === daily.id)!.lastError, "The calendar refresh failed: busy")
+      assert.deepStrictEqual(yield* copyIn(kit), good)
+      yield* Fiber.interruptAll(fillers)
+      // Two days on with the service down (the nightly runs fail), then up again: the copy is old.
+      state.up = false
+      yield* advance(kit, STALE_AFTER_MS + RETRY_AFTER_MS)
+      state.up = true
+      // Past the five minutes in which a question does not retry after the down service's last failure.
+      yield* advance(kit, RETRY_AFTER_MS + 60_000)
+      // A question while the helper is busy answers from the old copy and says how old it is.
+      const again = yield* fill
+      assert.match(yield* spoken(kit), / This is from my copy of the calendar from 3 days ago; I couldn't refresh it\.$/)
+      assert.deepStrictEqual(yield* copyIn(kit), good)
+      yield* Fiber.interruptAll(again)
+      assert.strictEqual(offThreadWorkers().running, 0)
+      // Busy is not remembered: the next question refreshes at once (no five-minute wait), and the copy is new.
+      assert.notInclude(yield* spoken(kit), "my copy")
+      assert.isAbove((yield* copyIn(kit))!.value.readAt, good.value.readAt)
+    }), 60_000)
 })
 
 describe("bin-day: settings and the Test button", () => {

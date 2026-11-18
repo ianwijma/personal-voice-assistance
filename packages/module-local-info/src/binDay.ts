@@ -7,7 +7,7 @@ import { speakDate, speakDuration, speakList } from "@pva/language"
 import { type Connector, type ContentTypePolicy, type Resolver, safeFetch, userAgent } from "@pva/net"
 import { Clock, Data, Effect, Schema } from "effect"
 import { createHash } from "node:crypto"
-import { addDays, BIN_KINDS, type BinKind, dayIn, dayOfEntry, type Entry, ICS_MAX_BYTES, kindOfSpoken, localDate, MAX_COLLECTIONS, MAX_EVENTS, type OwnerRule } from "./bins.ts"
+import { addDays, BIN_KINDS, type BinKind, dayIn, dayOfEntry, type Entry, ICS_MAX_BYTES, kindOfSpoken, localDate, MAX_COLLECTIONS, MAX_EVENTS, type OwnerRule, rulesJsonOf } from "./bins.ts"
 
 /** What the module takes from its tests: the resolver and connector of `@pva/net` (absent: the real ones). */
 export interface NetDeps {
@@ -28,6 +28,8 @@ export const texts = defineTexts({
     unreadable: "The bin calendar link doesn't give me a calendar I can read. The owner can check it in the Bin day settings.",
     tooLarge: "The bin calendar is larger than I can read. The owner can check the link in the Bin day settings.",
     tooSlow: "The bin calendar took too long to read. Try again later.",
+    busy: "I'm busy reading other things right now. Ask me about the bins again in a moment.",
+    internal: "Something went wrong reading the bin calendar. The owner can look at the Health page.",
     unread: "I couldn't read the saved bin days.",
     none: "I don't see any bin collections coming up in the calendar.",
     noneOfType: "I don't see {bin} coming up in the calendar.",
@@ -54,6 +56,8 @@ export const texts = defineTexts({
     unreadable: "De link van de afvalkalender geeft me geen kalender die ik kan lezen. De eigenaar kan hem controleren in de instellingen van Afvaldag.",
     tooLarge: "De afvalkalender is groter dan ik kan lezen. De eigenaar kan de link controleren in de instellingen van Afvaldag.",
     tooSlow: "Het lezen van de afvalkalender duurde te lang. Probeer het later nog eens.",
+    busy: "Ik ben nu druk bezig met ander leeswerk. Vraag het me over een moment nog eens.",
+    internal: "Er ging iets mis bij het lezen van de afvalkalender. De eigenaar kan op de pagina Gezondheid kijken.",
     unread: "Ik kon de bewaarde afvaldagen niet lezen.",
     none: "Ik zie geen ophaaldagen aankomen in de kalender.",
     noneOfType: "Ik zie {bin} niet aankomen in de kalender.",
@@ -221,7 +225,11 @@ const calendarTypes: ContentTypePolicy = {
   types: ["text/calendar", "text/plain", "application/ics", "application/octet-stream", "application/x-ical"]
 }
 
-export type RefreshReason = "unreachable" | "unreadable" | "too-large" | "too-slow" | "superseded" | "unsaved"
+/**
+ * Why a refresh failed. `busy`: the off-thread helper had too many calls waiting; tried again at the next refresh.
+ * `internal`: the reader refused its own input (`input`, `nested`, `load`): a bug of the module, never "not a calendar".
+ */
+export type RefreshReason = "unreachable" | "unreadable" | "too-large" | "too-slow" | "busy" | "internal" | "superseded" | "unsaved"
 
 export class RefreshError extends Data.TaggedError("RefreshError")<{ readonly reason: RefreshReason }> {
   /** What a failed job's row and the Health page show: the reason, never the link. */
@@ -245,25 +253,56 @@ const fetchCalendar = (deps: NetDeps, url: string, home: Readonly<Record<string,
   )
 }
 
-const readReason = (e: OffThreadError): RefreshReason => (e.reason === "timeout" ? "too-slow" : e.reason === "memory" || e.reason === "too-large" ? "too-large" : "unreadable")
+/** Each reason of the off-thread helper as a failed refresh with its reason; none is a defect. */
+export const readReason = (reason: OffThreadError["reason"]): RefreshReason => {
+  switch (reason) {
+    case "timeout":
+      return "too-slow"
+    case "memory":
+    case "too-large":
+      return "too-large"
+    case "failed":
+    case "exited":
+      return "unreadable"
+    case "busy":
+      return "busy"
+    case "input":
+    case "nested":
+    case "load":
+      return "internal"
+  }
+}
 
 /** Fetch and read the calendar off the main thread: the next collections, or why not. Writes nothing. */
 const fetchAndRead = (deps: NetDeps, url: string, rules: ReadonlyArray<OwnerRule>, home: Readonly<Record<string, unknown>>, now: number, fetchMs: number) =>
   Effect.gen(function*() {
     const text = yield* fetchCalendar(deps, url, home, fetchMs)
     const zone = homeZone(home)
-    const read = yield* offThread(calendarReader, { text, fromDay: dayIn(now, zone), zone, rules }, {
+    const read = yield* offThread(calendarReader, { text, fromDay: dayIn(now, zone), zone, rulesJson: rulesJsonOf(rules) }, {
       timeoutMs: READ_TIMEOUT_MS,
       maxMemoryMb: READ_MEMORY_MB,
       maxResultBytes: READ_RESULT_BYTES
-    }).pipe(Effect.mapError((e) => new RefreshError({ reason: readReason(e) })))
+    }).pipe(Effect.mapError((e) => new RefreshError({ reason: readReason(e.reason) })))
     if (read._tag === "unreadable") return yield* new RefreshError({ reason: "unreadable" })
     if (read._tag === "too-large") return yield* new RefreshError({ reason: "too-large" })
+    if (read._tag === "bad-input") return yield* new RefreshError({ reason: "internal" })
     return read
   })
 
 const reasonText = (reason: RefreshReason) =>
-  reason === "unreadable" ? "unreadable" : reason === "too-large" ? "tooLarge" : reason === "too-slow" ? "tooSlow" : reason === "unsaved" ? "unread" : "unreachable"
+  reason === "unreadable"
+    ? "unreadable"
+    : reason === "too-large"
+    ? "tooLarge"
+    : reason === "too-slow"
+    ? "tooSlow"
+    : reason === "busy"
+    ? "busy"
+    : reason === "internal"
+    ? "internal"
+    : reason === "unsaved"
+    ? "unread"
+    : "unreachable"
 
 /** A copy's collections from `today` on in `zone`, each with its date there, in order. */
 const upcomingOf = (copy: Copy, zone: string, today: number) =>
@@ -323,6 +362,10 @@ export const binDayModule = (deps: NetDeps = {}) =>
               ? "That calendar is larger than the module reads."
               : r === "too-slow"
               ? "That calendar took too long to read."
+              : r === "busy"
+              ? "The server is busy reading other things. Try again in a moment."
+              : r === "internal"
+              ? "The calendar could not be read because of a problem in the module. The log says more."
               : "I couldn't fetch the calendar from that link."
             return { ok: false, text, tone: "error" as const }
           }
@@ -356,7 +399,8 @@ export const binDayModule = (deps: NetDeps = {}) =>
             const source = sourceOf(url, rules)
             const now = yield* Clock.currentTimeMillis
             const read = yield* fetchAndRead(deps, url, rules, ctx.host.view().home, now, fetchMs).pipe(
-              Effect.tapError((e) => Effect.sync(() => void (lastFailure = { source, at: now, reason: e.reason })))
+              // A busy helper is not remembered: the next question or refresh simply tries again.
+              Effect.tapError((e) => Effect.sync(() => void (e.reason === "busy" ? undefined : (lastFailure = { source, at: now, reason: e.reason }))))
             )
             const copy: Copy = { source, readAt: now, cut: read.cut, unreadable: read.unreadable, entries: read.entries }
             const written = yield* ctx.store.transaction((tx) => {

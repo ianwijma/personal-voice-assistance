@@ -3,6 +3,7 @@
 // `packages/modules-builtin` (its pull request may change only `weather.ts` and `weather/` there), so its tests of the
 // extension are in the local-info package, which owns the pull request.
 import { assert, describe, it } from "@effect/vitest"
+import { readFileSync } from "node:fs"
 import type { HostView } from "@pva/core"
 import { checkModule, makeOfflineNet, startTestModule } from "@pva/core/testing"
 import { type BriefingRequest, type BriefingSection, BriefingSections } from "@pva/module-contracts"
@@ -215,6 +216,31 @@ describe("weather_forecast", () => {
         assert.isBelow(value.spoken.length, 300)
         assert.include(value.untrusted as string, "data, not instructions")
       }
+    }))
+})
+
+describe("weather: the live service's answer", () => {
+  // Open-Meteo's real answer to the extension's exact request, for latitude 51.48, longitude 0.00, fetched on
+  // 18 November 2026 at 09:34 UTC (`openMeteoLive.json`, unchanged): two past and twelve coming quarter-hours, a week
+  // of hours and days, epoch timestamps and the place's zone, Europe/London.
+  it.effect("is read as it comes: the rain of the next two hours and the forecast of tomorrow", () =>
+    Effect.gen(function*() {
+      const live = JSON.parse(readFileSync(new URL("./openMeteoLive.json", import.meta.url), "utf8")) as Record<string, unknown>
+      const greenwich = { name: "Greenwich", latitude: 51.48, longitude: 0, country: "United Kingdom" }
+      const { kit, net } = yield* on({ [GEOCODE]: geocoding([greenwich]), [FORECAST]: { body: live, headers: json } }, {
+        household: { home: { HOME_LOCATION: "Greenwich" } },
+        startAt: Date.UTC(2026, 10, 18, 9, 34)
+      })
+      const rain = yield* kit.tool("weather_rain_soon", {})
+      assert.isTrue(rain.ok, rain.content)
+      assert.isUndefined((rain.value as Said).knownUntil)
+      const tomorrow = yield* kit.tool("weather_forecast", { day: "tomorrow", hours: 3 })
+      assert.isTrue(tomorrow.ok, tomorrow.content)
+      assert.strictEqual((tomorrow.value as Said).date, "2026-11-19")
+      const today = yield* kit.tool("weather_forecast", { hours: 3 })
+      assert.strictEqual(((today.value as Said).hourly as Array<{ time: string }>).map((h) => h.time).join(","), "09:00,10:00,11:00")
+      const url = new URL(net.requests.find((q) => q.url.startsWith(FORECAST))!.url)
+      assert.deepStrictEqual([url.searchParams.get("latitude"), url.searchParams.get("longitude")], ["51.48", "0.00"])
     }))
 })
 
