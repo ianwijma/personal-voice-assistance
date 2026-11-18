@@ -48,10 +48,24 @@ export interface SectionDefinition {
   readonly spec: SettingsSpec
   readonly checks?: ReadonlyArray<SettingsCheck>
   /**
-   * P5: the section's stored values after a valid save, before it is written (Members gives a new person an id).
-   * Must keep valid values valid.
+   * P5: the section's stored values after a valid save, before it is written (Members gives a new person an id), with
+   * `committed`, every saved value before this save (as `load` gives them). Must keep valid values valid. It may set
+   * the section's `storedKeys` too.
    */
-  readonly normalize?: (values: Readonly<Record<string, SettingValue>>) => Readonly<Record<string, SettingValue>>
+  readonly normalize?: (
+    values: Readonly<Record<string, SettingValue>>,
+    committed: Readonly<Record<string, unknown>>
+  ) => Readonly<Record<string, SettingValue>>
+  /**
+   * P5 round 3: keys the server keeps for the section beside its fields (not shown, not editable, never from the
+   * environment), written by `normalize` with the section's values.
+   */
+  readonly storedKeys?: ReadonlyArray<string>
+  /**
+   * P5 round 3: the saved values as every reader sees them, made synchronously from the saved ones (Members repairs
+   * ids a hand-edited file left missing or twice). Must return the same object while nothing changed.
+   */
+  readonly load?: (stored: Readonly<Record<string, unknown>>) => Readonly<Record<string, unknown>>
 }
 
 const reload = "reload" as const

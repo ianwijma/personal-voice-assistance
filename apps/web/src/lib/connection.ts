@@ -370,12 +370,16 @@ export const makeConnection = (options: ConnectionOptions): Connection => {
         return
       }
       if (error.code === CloseCode.settingsChanged) {
-        // Not a failure: the device's session ended on purpose (P5). Back at once, with a fresh hello and session.
+        // The device's session ended on purpose (P5): what it showed goes now, not at the next welcome.
+        store.dispatch({ type: "local/session-ended" })
         settingsChanged = true
-        failures = 0
-        store.dispatch({ type: "local/connection", status: "reconnecting", attempt: 1 })
-        yield* Effect.sleep(Duration.millis(timing.backoffBaseMs))
-        continue
+        // Back at once, once, after an established session; closes before a welcome count as failures (back-off).
+        if (error.welcomed) {
+          failures = 0
+          store.dispatch({ type: "local/connection", status: "reconnecting", attempt: 1 })
+          yield* Effect.sleep(Duration.millis(timing.backoffBaseMs))
+          continue
+        }
       }
       if (error.welcomed) failures = 0
       failures++

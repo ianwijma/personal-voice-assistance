@@ -298,7 +298,7 @@ describe("Devices › a device: Place and What it can do", () => {
     const saveDevice = vi.fn<(...args: ReadonlyArray<unknown>) => Promise<Outcome>>(async () => ({ kind: "ok", rev: device.rev + 1 }))
     const client = { store, saveDevice, settings: vi.fn(), wakeTest: vi.fn(async () => ({ type: "result", requestId: "r", ok: true })) } as unknown as AssistantClient
     render(<ClientContext.Provider value={client}><DevicePage /></ClientContext.Provider>)
-    return { saveDevice }
+    return { saveDevice, store }
   }
 
   it("shows what it declared (Detected, when), picks the room, privacy and default person, takes the screen away; saved as two own sections", async () => {
@@ -377,6 +377,63 @@ describe("Devices › a device: Place and What it can do", () => {
     })
     expect(t.saveDevice).toHaveBeenCalledTimes(1)
     expect((t.saveDevice.mock.calls[0]![2] as Record<string, unknown>).capabilities).toEqual({ noDisplay: false, excludeKinds: ["card"], noSpeaker: false })
+  })
+
+  // Review round 3 (p5-r3b findings 2 and 3): a field shown invalid blocks Save.
+  const saveButton = () => screen.getByRole("button", { name: "Save" })
+
+  it("a default person removed in another tab while the draft names them: the error at the field, and Save blocked until another is picked", () => {
+    const t = setup("device")
+    const place = screen.getByTestId("section-place")
+    fireEvent.change(within(place).getByTestId("place-person"), { target: { value: "p-sam00001" } })
+    fireEvent.change(within(place).getByTestId("place-room"), { target: { value: "Den" } })
+    expect(saveButton()).toBeEnabled()
+    // Another admin page removes Sam: the Members section changes under the draft.
+    act(() => t.store.dispatch({ type: "section.changed", section: members([{ id: "p-robin001", name: "Robin" }]) }))
+    expect(within(place).getByTestId("field-error")).toHaveTextContent("That person is no longer in Members")
+    expect(within(place).getByTestId("place-person")).toHaveAttribute("aria-invalid", "true")
+    expect(saveButton()).toBeDisabled()
+    fireEvent.change(within(place).getByTestId("place-person"), { target: { value: "" } })
+    expect(within(place).queryByTestId("field-error")).toBeNull()
+    expect(saveButton()).toBeEnabled()
+  })
+
+  it("a room the wire refuses (a direction or control character) is shown at the field and blocks Save", () => {
+    setup("device")
+    const place = screen.getByTestId("section-place")
+    for (const bad of ["Kitchen\u202Edesk", "Kitchen\u0007"]) {
+      fireEvent.change(within(place).getByTestId("place-room"), { target: { value: bad } })
+      expect(within(place).getByTestId("field-error")).toHaveTextContent("A room is one line of text")
+      expect(saveButton()).toBeDisabled()
+    }
+    fireEvent.change(within(place).getByTestId("place-room"), { target: { value: "Kitchen desk" } })
+    expect(within(place).queryByTestId("field-error")).toBeNull()
+    expect(saveButton()).toBeEnabled()
+  })
+
+  it("64 kinds switched off and a newly declared one: switching it off too shows the limit and blocks Save; nothing stored is dropped", () => {
+    const stored = Array.from({ length: 64 }, (_, i) => `k${String(i).padStart(2, "0")}`)
+    const caps = { noDisplay: false, excludeKinds: stored, noSpeaker: false }
+    const kinds = Object.fromEntries([...stored, "fresh"].map((k) => [k, 1]))
+    const device: DeviceListInfo = {
+      ...declared,
+      own: { ...declared.own, capabilities: caps },
+      settings: { ...declared.settings, capabilities: caps },
+      declared: { capabilities: { ...declared.declared!.capabilities, present: { kinds } }, seenAt: Date.now() }
+    }
+    setup("device", device)
+    const section = screen.getByTestId("section-capabilities")
+    expect(section).toHaveTextContent("At most 64 kinds can be switched off (64 now).")
+    fireEvent.change(within(screen.getByTestId("section-place")).getByTestId("place-room"), { target: { value: "Den" } })
+    expect(saveButton()).toBeEnabled()
+    fireEvent.click(within(section).getByRole("switch", { name: "Show fresh" }))
+    expect(within(section).getByTestId("field-error")).toHaveTextContent("At most 64 kinds can be switched off: switch one back on to save.")
+    expect(saveButton()).toBeDisabled()
+    // What is stored stays switched off and offered.
+    for (const k of stored) expect(within(section).getByRole("switch", { name: `Show ${k}` })).toHaveAttribute("aria-checked", "false")
+    fireEvent.click(within(section).getByRole("switch", { name: "Show k07" }))
+    expect(within(section).queryByTestId("field-error")).toBeNull()
+    expect(saveButton()).toBeEnabled()
   })
 
   it("with no device that declared a kind and none the protocol knows yet: \"none yet\"", () => {

@@ -49,7 +49,14 @@ let hostRef: ModuleHostApi | undefined
 let storeRef: ModuleStore | undefined
 
 const Item = Schema.Struct({ text: Schema.String })
-const items = defineCollection({ name: "items", scope: "person", schema: Item, project: (row: Row<typeof Item.Type>) => ({ text: row.value.text }) })
+const items = defineCollection({
+  name: "items",
+  scope: "person",
+  schema: Item,
+  project: (row: Row<typeof Item.Type>) => ({ text: row.value.text }),
+  // Only with HOME_AMBIENT_FACTS on (off by default): the review round 3 member-id case reads it.
+  ambient: (rows: ReadonlyArray<Row<typeof Item.Type>>) => rows.map((r) => `Item: ${r.value.text}`)
+})
 /** Rows of one conversation: erased when it ends (P4's `endConversation`). */
 const notes = defineCollection({ name: "notes", scope: "conversation", schema: Item })
 
@@ -658,6 +665,55 @@ describe("review round 2: permission is decided where output leaves, against com
   })
 })
 
+describe("review round 3: a declaration that takes speech away stops the reply in flight", () => {
+  const stopCase = async (tts: Tts["Service"], player: { readonly speed: number }) => {
+    const dataDir = await dataDirWithAlpha()
+    const stt = controlledStt()
+    server = await startTestServer({ build: fakeBuild({ stt: stt.stt, llm: scriptedLlm(() => "A long answer.").llm, tts }), dataDir })
+    const page = await ScriptedClient.connect({ url: server.url, deviceId: `stop-tab-${player.speed * 10}`, player })
+    clients.push(page)
+    await page.hello({ device: { ...page.device, capabilities: tablet } })
+    await until("the device record", () => server!.handle.store.settings().devices[page.device.id] !== undefined)
+    await page.claim()
+    await until("the recogniser stream", () => stt.open() === 1)
+    const from = page.messages.length
+    stt.emit(endOfTurn("tell me a story"))
+    await page.waitFor("reply.start", () => true, { from, timeoutMs: 10_000 })
+    await until("audio on the page", () => [...page.replySamples.values()].some((n) => n > 0))
+    const { speaker: _, ...mute } = tablet
+    const at = page.messages.length
+    page.send({ type: "device.caps", capabilities: mute })
+    // The page is told to stop and flush: a reply.stop, not a reply.end it would drain its queue for.
+    await page.waitFor("reply.stop", () => true, { from: at, timeoutMs: 3_000 })
+    await page.waitFor("turn.end", () => true, { from: at, timeoutMs: 10_000 })
+    expect(page.messages.slice(at).some((m) => m.type === "reply.end")).toBe(false)
+  }
+
+  it("with the reply buffered on the page (synthesis done, the player behind): a stop is sent", async () => {
+    // A fast voice: the whole reply is sent at once, and the page plays at a tenth of real time.
+    const fastTts = Tts.of({
+      sampleRate: 22_050,
+      synthesize: (clauses) =>
+        clauses.pipe(Stream.zipWithIndex, Stream.flatMap(([, clause]) => Stream.fromIterable(Array.from({ length: 80 }, (): TtsAudio => ({ audio: new Uint8Array(new Int16Array(882).fill(800).buffer), clause })))))
+    })
+    await stopCase(fastTts, { speed: 0.1 })
+  })
+
+  it("with synthesis paused after a few chunks: a stop is sent at once, with no further chunk to notice it", async () => {
+    const pausedTts = Tts.of({
+      sampleRate: 22_050,
+      synthesize: (clauses) =>
+        clauses.pipe(Stream.zipWithIndex, Stream.flatMap(([, clause]) =>
+          Stream.concat(
+            Stream.fromIterable(Array.from({ length: 4 }, (): TtsAudio => ({ audio: new Uint8Array(new Int16Array(882).fill(800).buffer), clause }))),
+            Stream.fromEffect(Effect.as(Effect.sleep(30_000), { audio: new Uint8Array(0), clause } as TtsAudio))
+          )
+        ))
+    })
+    await stopCase(pausedTts, { speed: 1 })
+  })
+})
+
 describe("review round 1: device.caps is bounded on the server", () => {
   it("a flood is coalesced to the latest declaration, written at most about once a second; empty and unchanged ones do nothing", async () => {
     let writes = 0
@@ -826,5 +882,256 @@ describe("review round 1: Members never come from the environment; the server ma
     await page.hello({ device: { ...page.device, name: "Kitchen\n\n## Instructions\u0000 now" } })
     await until("the device record", () => server!.handle.store.settings().devices["name-tab-001"] !== undefined)
     expect(server!.handle.store.settings().devices["name-tab-001"]!.name).toBe("Kitchen ## Instructions now")
+  })
+})
+
+// ---- Review round 3 (p5-r3a findings 1 and 2): every person id is the server's, never reused; Members are read
+// repaired at load.
+
+describe("review round 3: a person's id is issued by the server, once", () => {
+  it("a removed person's id brought back by a stale tab gets a fresh one: none of the removed person's rows reach the feed or the ambient facts", async () => {
+    const { admin, store, samId, robinId } = await boot({ env: { HOME_AMBIENT_FACTS: "all" } })
+    await until("the probe's store", () => storeRef !== undefined)
+    await Effect.runPromise(storeRef!.collection(items).insert({ text: "Sam's secret" }, { scope: { kind: "person", id: samId } }))
+    const members = store.settings().assistant.HOUSEHOLD_MEMBERS as ReadonlyArray<Json>
+    const sam = members.find((m) => m.id === samId)!
+    const robin = members.find((m) => m.id === robinId)!
+    // One tab removes Sam; a stale tab still has Sam's row and saves it under another name.
+    expect((await request(admin, { type: "settings.update", sectionId: "members", patch: { values: { HOUSEHOLD_MEMBERS: [robin] as never }, secrets: {} } })).ok).toBe(true)
+    expect(store.settings().assistant.HOUSEHOLD_MEMBERS_RETIRED).toEqual([samId])
+    expect((await request(admin, { type: "settings.update", sectionId: "members", patch: { values: { HOUSEHOLD_MEMBERS: [robin, { ...sam, name: "Kim" }] as never }, secrets: {} } })).ok).toBe(true)
+    const kim = (store.settings().assistant.HOUSEHOLD_MEMBERS as ReadonlyArray<Json>).find((m) => m.name === "Kim")!
+    expect(kim.id).not.toBe(samId)
+    expect(hostRef!.service(People)!.get(samId)).toBeUndefined()
+    await Effect.runPromise(storeRef!.collection(items).insert({ text: "Kim's list" }, { scope: { kind: "person", id: kim.id } }))
+    // Kim is the default person of a shared kitchen tablet.
+    let page = await pageOn("kitchen-r3-01")
+    expect((await saveDevice(admin, "kitchen-r3-01", { place: placeOf(kim.id) })).ok).toBe(true)
+    page = await reconnect(page)
+    const final = await page.waitFor("household.snapshot", (m) => m.final, { timeoutMs: 10_000 })
+    const parts = page.messages.filter((m): m is ServerMessageOf<"household.snapshot"> => m.type === "household.snapshot")
+    const shown = parts.slice(0, parts.indexOf(final) + 1).flatMap((m) => m.collections.flatMap((c) => c.rows.map((r) => (r.value as { text: string }).text)))
+    expect(shown).toEqual(["Kim's list"])
+    requests.length = 0
+    await typedOn(page, "what is on my list?")
+    const context = requests.map((r) => r.context ?? "").join("\n")
+    expect(context).toContain("Item: Kim's list")
+    expect(context).not.toContain("Sam's secret")
+  })
+})
+
+describe("review round 3: Members are read repaired at load, before anything is served", () => {
+  /** A data dir whose settings file gives Ann and Bo one id, and Cy none; the kitchen tablet names the shared id. */
+  const handEdited = async () => {
+    const dataDir = await dataDirWithAlpha()
+    server = await startTestServer({ build: fakeBuild({ stt: controlledStt().stt, llm: scriptedLlm(() => "Ok.").llm }), dataDir, catalog: [greeterModule, probe] })
+    const admin = await ScriptedClient.connect({ url: server.url })
+    clients.push(admin)
+    await admin.admin(TEST_ADMIN_PASSWORD)
+    expect((await request(admin, { type: "settings.update", sectionId: "members", patch: { values: { HOUSEHOLD_MEMBERS: [{ name: "Ann" }] }, secrets: {} } })).ok).toBe(true)
+    const annId = (server.handle.store.settings().assistant.HOUSEHOLD_MEMBERS as ReadonlyArray<Json>)[0]!.id as string
+    await pageOn("kitchen-dup-01")
+    expect((await saveDevice(admin, "kitchen-dup-01", { place: placeOf(annId) })).ok).toBe(true)
+    for (const c of clients.splice(0)) c.close()
+    await server.close()
+    server = undefined
+    const path = join(dataDir, "settings.json")
+    const file = JSON.parse(readFileSync(path, "utf8")) as Json
+    file.assistant = { ...file.assistant, HOUSEHOLD_MEMBERS: [{ id: annId, name: "Ann" }, { id: annId, name: "Bo" }, { name: "Cy" }] }
+    writeFileSync(path, JSON.stringify(file))
+    return { dataDir, path, annId }
+  }
+
+  /** What every reader sees right after start: unique ids, Ann keeps hers, Bo is not Ann, the tablet names nobody. */
+  const expectRepaired = async (annId: string) => {
+    const people = hostRef!.service(People)!
+    const list = people.list()
+    expect(list.map((p) => p.name)).toEqual(["Ann", "Bo", "Cy"])
+    expect(new Set(list.map((p) => p.id)).size).toBe(3)
+    expect(list[0]!.id).toBe(annId)
+    expect(people.get(annId)?.name).toBe("Ann")
+    const bo = people.find("Bo")
+    expect(bo.kind).toBe("found")
+    const boId = bo.kind === "found" ? bo.person.id : ""
+    expect(boId).not.toBe(annId)
+    expect(people.get(boId)?.name).toBe("Bo")
+    expect(hostRef!.service(Devices)!.get("kitchen-dup-01")?.place.defaultPerson).toBeNull()
+    // What admin is served is the repaired list too.
+    const admin = await ScriptedClient.connect({ url: server!.url })
+    clients.push(admin)
+    const snapshot = await admin.admin(TEST_ADMIN_PASSWORD)
+    const section = snapshot.snapshot.sections.find((x) => x.id === "members")!
+    const served = section.form.values.HOUSEHOLD_MEMBERS as ReadonlyArray<Json>
+    expect(served.map((m) => m.id)).toEqual(list.map((p) => p.id))
+    return list.map((p) => p.id)
+  }
+
+  it("right after start: People.list, find and get, the device and admin see unique ids; the repair is written", async () => {
+    const { dataDir, path, annId } = await handEdited()
+    server = await startTestServer({ build: fakeBuild({ stt: controlledStt().stt, llm: scriptedLlm(() => "Ok.").llm }), dataDir, catalog: [greeterModule, probe] })
+    const ids = await expectRepaired(annId)
+    await until("the repair written", () => {
+      const onDisk = JSON.parse(readFileSync(path, "utf8")) as Json
+      return JSON.stringify((onDisk.assistant.HOUSEHOLD_MEMBERS as ReadonlyArray<Json>).map((m) => m.id)) === JSON.stringify(ids)
+    })
+    const onDisk = JSON.parse(readFileSync(path, "utf8")) as Json
+    expect(onDisk.devices["kitchen-dup-01"].own.place.defaultPerson).toBeNull()
+    expect(server.handle.host.issues.all().some((i) => i.id === "core.members.repair")).toBe(false)
+  })
+
+  it("with the write held: the same, and the file is still unrepaired meanwhile", async () => {
+    const { dataDir, path, annId } = await handEdited()
+    let release: (() => void) | undefined
+    let holding = true
+    server = await startTestServer({
+      build: fakeBuild({ stt: controlledStt().stt, llm: scriptedLlm(() => "Ok.").llm }),
+      dataDir,
+      catalog: [greeterModule, probe],
+      settingsBeforeStep: (step) => (step === "settings" && holding ? new Promise<void>((resolve) => { release = resolve }) : undefined)
+    })
+    await until("a write held", () => release !== undefined)
+    const ids = await expectRepaired(annId)
+    const onDisk = JSON.parse(readFileSync(path, "utf8")) as Json
+    expect(new Set((onDisk.assistant.HOUSEHOLD_MEMBERS as ReadonlyArray<Json>).map((m) => m.id)).size).toBe(2)
+    holding = false
+    release!()
+    await until("the repair written", () => {
+      const now = JSON.parse(readFileSync(path, "utf8")) as Json
+      return JSON.stringify((now.assistant.HOUSEHOLD_MEMBERS as ReadonlyArray<Json>).map((m) => m.id)) === JSON.stringify(ids)
+    })
+    expect(hostRef!.service(People)!.list().map((p) => p.id)).toEqual(ids)
+  })
+
+  it("with the write failing: a Health issue says so, and the server keeps serving the repaired list", async () => {
+    const { dataDir, path, annId } = await handEdited()
+    server = await startTestServer({
+      build: fakeBuild({ stt: controlledStt().stt, llm: scriptedLlm(() => "Ok.").llm }),
+      dataDir,
+      catalog: [greeterModule, probe],
+      settingsBeforeStep: (step) => {
+        if (step === "settings") throw new Error("disk full")
+      }
+    })
+    const ids = await expectRepaired(annId)
+    await until("the Health issue", () => server!.handle.host.issues.all().some((i) => i.id === "core.members.repair"))
+    expect(hostRef!.service(People)!.list().map((p) => p.id)).toEqual(ids)
+    expect(hostRef!.service(Devices)!.get("kitchen-dup-01")?.place.defaultPerson).toBeNull()
+    const onDisk = JSON.parse(readFileSync(path, "utf8")) as Json
+    expect(new Set((onDisk.assistant.HOUSEHOLD_MEMBERS as ReadonlyArray<Json>).map((m) => m.id)).size).toBe(2)
+  })
+})
+
+// ---- Review round 3 (p5-r3a finding 4): a room-only commit refreshes the pages in the commit's own step.
+
+describe("review round 3: a room-only change reaches a snapshot in progress at once", () => {
+  /** Every projection's room, and "COMMIT" where the room change committed. */
+  const projected: Array<string> = []
+  let projectionDelayMs = 0
+  let onFirstProjection: (() => void) | undefined
+  const Spot = Schema.Struct({ n: Schema.Number })
+  const spots = defineCollection({
+    name: "spots",
+    scope: "household",
+    schema: Spot,
+    project: (row: Row<typeof Spot.Type>, device) => {
+      const hook = onFirstProjection
+      onFirstProjection = undefined
+      hook?.()
+      // A slow projection (blocking, as a module's may be): the snapshot takes many steps, with the event loop free
+      // only between them.
+      const until = performance.now() + projectionDelayMs
+      while (performance.now() < until) {}
+      projected.push(device.room ?? "")
+      return { n: row.value.n, room: device.room ?? "" }
+    }
+  })
+  let roomyStore: ModuleStore | undefined
+  const roomy = defineModule({
+    apiVersion: 2,
+    id: "roomy",
+    name: "Roomy",
+    description: "Shows rows with the room of the page",
+    storage: { collections: [spots] },
+    shared: (ctx) =>
+      Effect.sync(() => {
+        roomyStore = ctx.store
+        return { value: undefined }
+      }),
+    start: () => Effect.succeed({})
+  })
+
+  it("a snapshot being sent when the room alone changes in a commit made outside admin: no later part has the old room", async () => {
+    const dataDir = await dataDirWithAlpha()
+    const path = join(dataDir, "settings.json")
+    const file = JSON.parse(readFileSync(path, "utf8")) as Json
+    file.assistants.byId.alpha.modules.roomy = { on: true, offTools: [] }
+    writeFileSync(path, JSON.stringify(file))
+    // The room change's write is held until the snapshot is under way (released on its first projection).
+    let armed = false
+    let release: (() => void) | undefined
+    server = await startTestServer({
+      build: fakeBuild({ stt: controlledStt().stt, llm: scriptedLlm(() => "Ok.").llm }),
+      dataDir,
+      catalog: [greeterModule, probe, roomy],
+      settingsBeforeStep: (step) => {
+        if (step !== "settings" || !armed) return
+        armed = false
+        return new Promise<void>((resolve) => {
+          release = resolve
+        })
+      }
+    })
+    const store = server.handle.store
+    await until("the module's store", () => roomyStore !== undefined)
+    // The store of the module's running part (a part made at start may be replaced once while the server settles).
+    for (let n = 0; n < 500; n++) {
+      for (let tries = 0; ; tries++) {
+        const exit = await Effect.runPromise(Effect.exit(roomyStore!.collection(spots).insert({ n })))
+        if (exit._tag === "Success") break
+        if (tries > 50) throw new Error("the module's store does not answer")
+        await sleep(20)
+      }
+    }
+    const id = "room-tab-0001"
+    const admin = await ScriptedClient.connect({ url: server.url })
+    clients.push(admin)
+    await admin.admin(TEST_ADMIN_PASSWORD)
+    let page = await pageOn(id)
+    expect((await saveDevice(admin, id, { place: { ...placeOf(null), room: "Kitchen" } })).ok).toBe(true)
+    const closed = await Promise.race([page.closed.then(() => true), sleep(500).then(() => false)])
+    if (closed) page = await reconnect(page)
+    await page.waitFor("household.snapshot", (m) => m.final, { timeoutMs: 10_000 })
+    // The next snapshot (a new page of the same device) is slow; on its first projection the room is changed by a
+    // save straight to the settings (no admin continuation runs after it).
+    projected.length = 0
+    projectionDelayMs = 1
+    let sentAtCommit = 0
+    const off = store.onCommitted((before, after) => {
+      // Only the room change (a page's hello writes the device record too).
+      if (before.devices[id]?.own.place?.room === "Bedroom" || after.devices[id]?.own.place?.room !== "Bedroom") return
+      projected.push("COMMIT")
+      sentAtCommit = second?.messages.length ?? 0
+    })
+    let second: ScriptedClient | undefined
+    const record = store.settings().devices[id]!
+    armed = true
+    const save = Effect.runPromise(store.saveDevice(id, record.rev, { own: { ...record.own, place: { ...placeOf(null), ...record.own.place, room: "Bedroom" } } }))
+    await until("the room change's write held", () => release !== undefined)
+    onFirstProjection = () => release!()
+    second = await ScriptedClient.connect({ url: server.url, deviceId: id })
+    clients.push(second)
+    await second.hello({ device: { ...second.device, capabilities: tablet } })
+    await until("the room change committed", () => projected.includes("COMMIT"))
+    await save
+    const final = await second.waitFor("household.snapshot", (m) => m.final, { from: sentAtCommit, timeoutMs: 20_000 })
+    // (What the page received after the commit is not the test: parts sent before it may still be on the way.)
+    off()
+    projectionDelayMs = 0
+    const at = projected.indexOf("COMMIT")
+    // The snapshot was still being sent when the change committed, and nothing after it was projected for the Kitchen.
+    expect(projected.slice(0, at).length).toBeGreaterThan(0)
+    expect(projected.slice(0, at).length).toBeLessThan(500)
+    expect(projected.slice(at + 1).filter((r) => r !== "Bedroom")).toEqual([])
+    expect(final.final).toBe(true)
   })
 })

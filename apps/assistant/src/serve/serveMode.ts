@@ -132,10 +132,12 @@ import {
   makeMembersGate,
   makePeopleService,
   MEMBERS_ENV_REFUSED,
+  loadedMembers,
   MEMBERS_KEY,
   MEMBERS_SECTION_ID,
-  membersNeedIds,
-  personIdsOf
+  personIdsOf,
+  referenceableIdsOf,
+  RETIRED_KEY
 } from "./people.ts"
 import { householdBackupIssues, runMaintenance } from "@pva/store-sqlite"
 import { type KdfParams, openVault, type Vault, VaultPathConfig } from "./Vault.ts"
@@ -392,7 +394,8 @@ export const startServe = (options: ServeOptions): Effect.Effect<ServeHandle, Ht
       latestOf: (id) => devices.latestOf(id),
       lastSeenOf: (id) => devices.lastSeenOf(id),
       live: (id) => hub?.deviceLive(id) ?? { connected: false, visible: false },
-      isPerson: (id) => people.get(id) !== undefined,
+      // A device's default person counts while it is a member whose id no two saved records share (`referenceableIdsOf`).
+      isPerson: (id) => referenceableIdsOf(store.settings().assistant).has(id),
       nameOfPerson: (id) => people.nameOf(id),
       peopleVersion: () => sections.value(MEMBERS_KEY)
     })
@@ -1426,7 +1429,7 @@ export const startServe = (options: ServeOptions): Effect.Effect<ServeHandle, Ht
       llmProblems,
       speechMemoryWarning,
       voiceProblem,
-      isPerson: (id) => people.get(id) !== undefined,
+      isPerson: (id) => referenceableIdsOf(store.settings().assistant).has(id),
       // P5: device and device type saves check their default person against the committed Members, inside the gate.
       membersGate,
       // P5: the setup's speaking flags follow what is sent (the override and the declaration).
@@ -1526,12 +1529,17 @@ export const startServe = (options: ServeOptions): Effect.Effect<ServeHandle, Ht
       const everyone = membersRemoved(before, after)
       const ended = hubNow.endSessions((deviceId, kind) => everyone || boundaryChanged(before, after, deviceId, kind))
       if (ended > 0) runFork(Effect.logInfo(`Settings that decide what ${ended === 1 ? "a device" : `${ended} connections`} may be sent changed: the session started again`))
+      // Review round 3: then, in the same step, every page whose device record changed (a room alone, a name) drops
+      // the snapshot it was sending and starts one of the new record, so no later part is built with the old one.
+      push.hooks.devicesChanged()
     })
     yield* Effect.addFinalizer(() => Effect.sync(stopBoundary))
     // P5: a person removed from Members is no device's default person any more (also at start, after a crash between
     // the two saves); devices and voice pages then follow the new places.
-    const clearRemovedPeople = Effect.suspend(() => store.clearDefaultPeople(personIdsOf(sections.value(MEMBERS_KEY)))).pipe(
-      Effect.flatMap((n) => (n === 0 ? Effect.void : Effect.sync(() => hubNow.entitiesChanged()))),
+    const clearDangling = Effect.suspend(() => store.clearDefaultPeople(referenceableIdsOf(store.settings().assistant))).pipe(
+      Effect.flatMap((n) => (n === 0 ? Effect.void : Effect.sync(() => hubNow.entitiesChanged())))
+    )
+    const clearRemovedPeople = clearDangling.pipe(
       Effect.catch((e) => Effect.logWarning(`A removed person is still some device's default person: ${e.message}`))
     )
     afterMembersSave = clearRemovedPeople
@@ -1546,19 +1554,32 @@ export const startServe = (options: ServeOptions): Effect.Effect<ServeHandle, Ht
         push.resync()
       }
     })
-    // At start, inside the gate: a hand-edited Members value gets its ids (written), and a removed person's references
-    // go (after a crash between the two steps of an earlier version).
+    // At start: a hand-edited Members value is already read repaired (`loadedMembers`: every reader sees unique ids,
+    // and a reference to an id two records shared counts as none). Writing that back is ordinary persistence: first
+    // the references to such an id are cleared, then the repaired list is saved through the section (so its ids are
+    // the committed ones). If either fails, a Health issue says so and the server goes on with the repaired list.
+    const repairIssue = (message: string | undefined) =>
+      host.issues.set("members", message === undefined ? [] : [{
+        id: "core.members.repair",
+        severity: "warning" as const,
+        title: "Members could not be written back with their ids",
+        detail: `The settings file gives a person no id, or an id another person has. The assistant uses repaired ids, but could not save them: ${message}`.slice(0, 1900)
+      }])
     if (store.blocked() === undefined) {
-      const raw = sections.value(MEMBERS_KEY)
       run(
-        membersNeedIds(raw)
-          // Through the section's own save (which runs in the gate and then clears removed people): validated, and
-          // the new ids made by `withPersonIds` (its `normalize`).
-          ? Effect.flatMap(
-            sections.edit(MEMBERS_SECTION_ID, () => ({ values: { [MEMBERS_KEY]: raw as SettingValue }, secrets: {} })),
-            (u) => (u.result.ok ? Effect.void : Effect.logWarning(`Members could not be given their ids: ${u.result.error.message}`))
-          )
-          : membersGate.run(clearRemovedPeople)
+        membersGate.run(clearDangling).pipe(
+          Effect.flatMap(() => {
+            if (!loadedMembers(store.settings().assistant[MEMBERS_KEY], store.settings().assistant[RETIRED_KEY]).repaired) return Effect.void
+            return Effect.flatMap(
+              sections.edit(MEMBERS_SECTION_ID, (value) => ({ values: { [MEMBERS_KEY]: value(MEMBERS_KEY) ?? [] }, secrets: {} })),
+              (u) => (u.result.ok ? Effect.void : Effect.fail(new Error(u.result.error.message)))
+            )
+          }),
+          Effect.matchEffect({
+            onFailure: (e) => Effect.andThen(Effect.sync(() => repairIssue(e.message)), Effect.logWarning(`Members could not be written back with their ids: ${e.message}`)),
+            onSuccess: () => Effect.sync(() => repairIssue(undefined))
+          })
+        )
       )
     }
     keys.subscribe((state) => {

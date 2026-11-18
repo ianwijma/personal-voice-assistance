@@ -13,7 +13,7 @@ import {
 import { boundaryKey, type DeclaredCapabilities, type DevicePlace, effectiveCapabilities, roomOf, speakerAllowedFrom } from "@pva/protocol"
 import { Effect } from "effect"
 import { deviceSettingsFrom } from "./devices.ts"
-import { MEMBERS_KEY, personIdsOf } from "./people.ts"
+import { loadedPersonIdsOf, MEMBERS_KEY, referenceableIdsOf } from "./people.ts"
 import type { SettingsFile } from "./SettingsStore.ts"
 
 /**
@@ -50,7 +50,7 @@ export const boundaryIn = (file: SettingsFile, deviceId: string | undefined, kin
   const settings = deviceSettingsFrom(file, known ? deviceId : undefined, kind)
   // Without a record, only the output overrides (its type's) apply: privacy refuses an unknown device anyway.
   if (!known) return { known: false, key: `unknown|${boundaryKey({ ...settings, place: { ...settings.place, privacy: "public", defaultPerson: null } }, () => false)}` }
-  const members = personIdsOf(file.assistant[MEMBERS_KEY])
+  const members = referenceableIdsOf(file.assistant)
   return { known: true, key: boundaryKey(settings, (id) => members.has(id)) }
 }
 
@@ -69,8 +69,8 @@ export const boundaryChanged = (before: SettingsFile, after: SettingsFile, devic
 /** A person who was in Members before the commit is not after it: every device's session ends. */
 export const membersRemoved = (before: SettingsFile, after: SettingsFile): boolean => {
   if (before.assistant[MEMBERS_KEY] === after.assistant[MEMBERS_KEY]) return false
-  const now = personIdsOf(after.assistant[MEMBERS_KEY])
-  for (const id of personIdsOf(before.assistant[MEMBERS_KEY])) if (!now.has(id)) return true
+  const now = loadedPersonIdsOf(after.assistant)
+  for (const id of loadedPersonIdsOf(before.assistant)) if (!now.has(id)) return true
   return false
 }
 

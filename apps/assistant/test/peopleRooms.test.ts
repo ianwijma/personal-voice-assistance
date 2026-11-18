@@ -20,7 +20,7 @@ import { join } from "node:path"
 import { describe, expect, it } from "vitest"
 import { makeDeviceFacts } from "../src/serve/deviceFacts.ts"
 import { makeDeviceRegistry } from "../src/serve/devices.ts"
-import { DIET_KEYS, makePeopleService, MEMBERS_KEY, peopleFrom, withPersonIds } from "../src/serve/people.ts"
+import { DIET_KEYS, loadedMembers, makePeopleService, MEMBERS_KEY, peopleFrom, RETIRED_KEY, withPersonIds } from "../src/serve/people.ts"
 import { migrateV4ToV5, readStoredSettings, type SettingsFile } from "../src/serve/SettingsStore.ts"
 import { openStore } from "./support/store.ts"
 
@@ -37,20 +37,61 @@ const tablet: DeviceCapabilities = {
 }
 
 describe("Members: ids and the People service", () => {
-  it("a new person gets an id, a valid one is kept, a copied one is replaced; other keys are left alone", () => {
+  it("a new person gets an id, a committed one is kept, a copied one is replaced; other keys are left alone", () => {
     let n = 0
     const random = () => ((n++ * 7) % 36) / 36
-    const out = withPersonIds({ [MEMBERS_KEY]: [{ name: "Sam" }, { id: "p-robin001", name: "Robin" }, { id: "p-robin001", name: "Copy" }, { id: "Bad Id", name: "Jo" }] as never, OTHER: 1 }, random)
+    const committed = { [MEMBERS_KEY]: [{ id: "p-robin001", name: "Robin" }] }
+    const out = withPersonIds({ [MEMBERS_KEY]: [{ name: "Sam" }, { id: "p-robin001", name: "Robin" }, { id: "p-robin001", name: "Copy" }, { id: "Bad Id", name: "Jo" }] as never, OTHER: 1 }, committed, random)
     const list = out[MEMBERS_KEY] as unknown as ReadonlyArray<Json>
     expect(list[1]!.id).toBe("p-robin001")
     expect(new Set(list.map((m) => m.id)).size).toBe(4)
     for (const m of list) expect(m.id).toMatch(/^[a-z0-9][a-z0-9_-]{0,39}$/)
     expect(out.OTHER).toBe(1)
     const same = { [MEMBERS_KEY]: [{ id: "p-a0000001", name: "A" }] as never }
-    expect(withPersonIds(same)).toBe(same)
+    expect(withPersonIds(same, same)[MEMBERS_KEY]).toBe(same[MEMBERS_KEY])
     expect(peopleFrom([{ id: "p-a0000001", name: " A ", aliases: ["Ay", 3] }, { name: "no id" }, { id: "p-b0000001", name: "" }, "junk"])).toEqual([
       { id: "p-a0000001", name: "A", aliases: ["Ay"], pronunciation: "", diet: { allergies: [], diets: [], dislikes: [] } }
     ])
+  })
+
+  it("review round 3: an id is kept only when it is a committed member's; a removed person's id is retired and never issued again", () => {
+    const committed = { [MEMBERS_KEY]: [{ id: "p-sam00001", name: "Sam" }, { id: "p-robin001", name: "Robin" }] }
+    // Sam is removed: Sam's id is retired.
+    const out = withPersonIds({ [MEMBERS_KEY]: [{ id: "p-robin001", name: "Robin" }] as never }, committed)
+    expect(out[RETIRED_KEY]).toEqual(["p-sam00001"])
+    // Then a stale tab's row (or a crafted one) carries Sam's id, and another one a well-formed id nobody had.
+    const stale = withPersonIds({ [MEMBERS_KEY]: [{ id: "p-robin001", name: "Robin" }, { id: "p-sam00001", name: "Kim" }, { id: "p-madeup01", name: "Jo" }] as never }, out)
+    const ids = (stale[MEMBERS_KEY] as unknown as ReadonlyArray<Json>).map((m) => m.id)
+    expect(ids[0]).toBe("p-robin001")
+    expect(ids[1]).not.toBe("p-sam00001")
+    expect(ids[2]).not.toBe("p-madeup01")
+    expect(new Set(ids).size).toBe(3)
+    expect(stale[RETIRED_KEY]).toEqual(["p-sam00001"])
+    // A later save: a random source that would give the retired id first gives another one.
+    const retiredFirst = [..."sam00001"].map((c) => "abcdefghijklmnopqrstuvwxyz0123456789".indexOf(c) / 36)
+    let i = 0
+    const random = () => (i < retiredFirst.length ? retiredFirst[i++]! + 0.001 : Math.random())
+    const again = withPersonIds({ [MEMBERS_KEY]: [{ name: "New" }] as never }, { [MEMBERS_KEY]: [], [RETIRED_KEY]: out[RETIRED_KEY] })
+    expect((again[MEMBERS_KEY] as unknown as ReadonlyArray<Json>)[0]!.id).not.toBe("p-sam00001")
+    const forced = withPersonIds({ [MEMBERS_KEY]: [{ name: "New" }] as never }, { [MEMBERS_KEY]: [], [RETIRED_KEY]: ["p-sam00001"] }, random)
+    expect(i).toBe(8)
+    expect((forced[MEMBERS_KEY] as unknown as ReadonlyArray<Json>)[0]!.id).not.toBe("p-sam00001")
+    expect(forced[RETIRED_KEY]).toEqual(["p-sam00001"])
+  })
+
+  it("review round 3: Members are read repaired at load: a second record with an id already seen gets a fresh, stable id; the shared id is ambiguous", () => {
+    const raw = [{ id: "p-same0001", name: "Ann" }, { id: "p-same0001", name: "Bo" }, { name: "Cy" }]
+    const a = loadedMembers(raw)
+    expect(a.repaired).toBe(true)
+    const ids = (a.value as ReadonlyArray<Json>).map((m) => m.id)
+    expect(ids[0]).toBe("p-same0001")
+    expect(new Set(ids).size).toBe(3)
+    expect([...a.ambiguous]).toEqual(["p-same0001"])
+    expect(loadedMembers(raw)).toBe(a)
+    // The same file read again (another start) gives the same ids.
+    expect((loadedMembers(structuredClone(raw)).value as ReadonlyArray<Json>).map((m) => m.id)).toEqual(ids)
+    const fine = [{ id: "p-a0000001", name: "A" }]
+    expect(loadedMembers(fine)).toMatchObject({ value: fine, repaired: false })
   })
 
   it("list, get, find, diets, and a diet written through the settings like an admin edit", async () => {
@@ -665,7 +706,9 @@ describe("review round 2: declarations are ordered by their number of arrival, a
   })
 
   for (const prior of [true, false]) {
-    it(`a declaration that arrives while the device is being forgotten is kept for its next record (${prior ? "with" : "without"} one before)`, async () => {
+    // Review round 3 (made blunt): forgetting deletes the record and everything the device declared, also what arrived
+    // while the forget was written; the device declares again when it reconnects.
+    it(`a declaration that arrives while the device is being forgotten goes with the record (${prior ? "with" : "without"} one before)`, async () => {
       const dir = tmp()
       let release: (() => void) | undefined
       let hold = false
@@ -685,15 +728,17 @@ describe("review round 2: declarations are ordered by their number of arrival, a
       const forgetting = run(registry.forget(id))
       for (let i = 0; i < 200 && release === undefined; i++) await wait(5)
       expect(release).toBeDefined()
-      // The device's new hello (or a device.caps) during the write.
+      // A device.caps during the write.
       expect(registry.declare(id, phone)).toBe(true)
       release!()
       expect((await forgetting).ok).toBe(true)
       expect(store.settings().devices[id]).toBeUndefined()
-      expect(registry.latestOf(id)!.capabilities).toEqual(phone)
-      // Registered again: the new record has the declaration that arrived last, not the one from before.
+      expect(registry.latestOf(id)).toBeUndefined()
+      // Registered again without declaring: a new record with nothing declared; it declares on its next connection.
       await run(registry.seen({ id, kind: WEB_VOICE_KIND, name: "Tablet" }, new Set()))
-      expect(store.settings().devices[id]!.declared!.capabilities).toEqual(phone)
+      expect(store.settings().devices[id]!.declared).toBeUndefined()
+      expect(registry.declare(id, phone)).toBe(true)
+      expect(registry.declaredOf(id)!.capabilities).toEqual(phone)
     })
   }
 

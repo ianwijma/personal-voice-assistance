@@ -22,6 +22,8 @@ import { useMediaQuery, WIDE_QUERY } from "./useMediaQuery.ts"
 export function ChatPanel() {
   const client = useClient()
   const open = useClientState((s) => s.ui.chatOpen)
+  // P5 round 3: a session the server ended takes the draft with it (the composer starts afresh).
+  const sessionSeq = useClientState((s) => s.sessionSeq)
   const ref = useRef<HTMLElement>(null)
   const close = () => client.store.dispatch({ type: "local/ui", patch: { chatOpen: false } })
   const modal = !useMediaQuery(WIDE_QUERY)
@@ -72,7 +74,7 @@ export function ChatPanel() {
         </div>
         <ConversationNote />
         <MessageList />
-        <Composer />
+        <Composer key={sessionSeq} />
       </aside>
     </>
   )

@@ -122,9 +122,9 @@ export interface DeviceRegistry {
    */
   readonly persist: Effect.Effect<void>
   /**
-   * `device.forget` (admin). The record goes in one serialized step; the device's declaration in memory goes only if
-   * nothing newer arrived during the write. A connected device's session is ended by the boundary (its connections
-   * close at the commit and say hello again as a new device).
+   * `device.forget` (admin). The record goes in one serialized step, and with it everything the device declared, also
+   * what arrived while that was written. A connected device's session is ended by the boundary (its connections close
+   * at the commit and say hello again as a new device, declaring what they can do then).
    */
   readonly forget: (id: string) => Effect.Effect<DeviceResult>
 }
@@ -160,6 +160,16 @@ export const makeDeviceRegistry = (options: DeviceRegistryOptions): DeviceRegist
   const dirty = new Set<string>()
   const stored = () => store.settings().devices
   const gapMs = options.declareGapMs ?? DECLARE_WRITE_GAP_MS
+  // Review round 3: a record that is gone (forgotten) takes everything its device declared with it, in the step that
+  // commits its removal, whatever arrived while that was being written. The device declares again when it reconnects.
+  store.onCommitted((before, after) => {
+    for (const id of Object.keys(before.devices)) {
+      if (after.devices[id] !== undefined) continue
+      declared.delete(id)
+      dirty.delete(id)
+      lastSeen.delete(id)
+    }
+  })
 
   const withLastSeen = (id: string, record: StoredDevice): StoredDevice => {
     const seen = lastSeen.get(id)
@@ -335,25 +345,14 @@ export const makeDeviceRegistry = (options: DeviceRegistryOptions): DeviceRegist
     forget: (id) =>
       Effect.suspend(() => {
         if (stored()[id] === undefined) return Effect.succeed(failure("unknown_device", "That device is not known (it may have been forgotten already)"))
-        /** The declaration the write saw (inside its serialized step): only that one goes with the record. */
-        let seen: number | undefined
+        // What the device declared goes with the record, at the commit (the listener above).
         return store.saveDeviceRecords(`forgetting device ${id}`, (committed) => {
-          seen = declared.get(id)?.seq
           const devices = withAllLastSeen(committed)
           delete devices[id]
           return devices
         }).pipe(
           Effect.as<DeviceResult>({ ok: true }),
-          Effect.catch((e) => Effect.succeed(failure("internal", e.message))),
-          Effect.tap((r) => Effect.sync(() => {
-            if (!r.ok) return
-            lastSeen.delete(id)
-            // A declaration that arrived during the write (a new hello of the device) is kept for its new record.
-            if (declared.get(id)?.seq === seen) {
-              declared.delete(id)
-              dirty.delete(id)
-            }
-          }))
+          Effect.catch((e) => Effect.succeed(failure("internal", e.message)))
         )
       })
   }
