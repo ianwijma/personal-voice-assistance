@@ -596,7 +596,7 @@ export const nagModule = defineModule({
 - The Home section's `HOME_TIME_ZONE` is empty by default, meaning this machine's zone
   (`Intl.DateTimeFormat().resolvedOptions().timeZone`); never substitute a fixed zone for it.
 - No pause and resume (cancel and schedule again), no background tasks (a fiber in your own scope), no notification
-  jobs (send a notification later with `ctx.notify.send({ inMs })`: P9's service has its own job). `cancel`, `reschedule`, `get` and `list` (your live jobs, 10 a page, `after`).
+  jobs (a notification for later is a job of yours whose handler calls `ctx.notify.send`, §16). `cancel`, `reschedule`, `get` and `list` (your live jobs, 10 a page, `after`).
 - **Cancelling, rescheduling or replacing a job does not interrupt a handler that is already running for it.**
   `cancel`, `reschedule` and scheduling the same `key` again change the job's row at once (`cancelled`, a new due
   time, the new job), and the scheduler drops what the running handler then reports, but the handler runs on to its
@@ -1306,15 +1306,19 @@ export const texts = defineTexts({
 ### Notifications and announcements (P9)
 
 What the house says or shows that nobody on that device just asked for goes through the notification service, never a
-module's own timer or socket ([NOTIFICATIONS.md](NOTIFICATIONS.md) has the calls, the bounds and the delivery table):
+module's own socket ([NOTIFICATIONS.md](NOTIFICATIONS.md) has the calls, the bounds and the delivery table):
 
 - **`ctx.notify.send`**: a card on the device that asked (`target: "origin"`, the default) or everywhere, `normal`
   (silent) or `ring` (it rings until stopped), with an optional owner (personal content: the privacy rule decides per
-  device, when it is delivered), dedupe `key`, expiry, up to two actions beside the host's `stop`, and `at` / `inMs` to
-  send it later (the service's own job: no timer of yours). One transaction and an enqueue: fine on a turn.
+  device, when it is delivered), dedupe `key`, expiry (up to a minute late), and up to two actions beside the host's
+  `stop`. It is delivered **now**: for a notification at a later time, schedule a job of your own and send from its
+  handler (below). One transaction and an enqueue: fine on a turn.
 - **Action handlers are registered in `shared`** with `ctx.notify.handle(name, { run })`, like job handlers. While your
-  module is down a press answers "I can't do that right now" and changes nothing; `stop` always works. A handler runs
-  as the press (its device is the origin of what it sends) and answers `{ say?, keepOpen? }`.
+  module is down a press answers "I can't do that right now" and changes nothing; `stop` always works and wins. A press
+  claims the notification first (one action at a time: a second gets "That is being handled already."). A handler runs
+  as the press (its device is the origin of what it sends; a job it schedules needs `origin: { deviceId }`), answers
+  `{ say?, keepOpen? }`, and **is idempotent by notification id**: after a store failure it may run again for the same
+  notification.
 - **`ctx.speech.say(target, text, { cue? })`**: one line on a device, a room's devices or everywhere, after whatever is
   being said there. Inside a turn, never wait for its `done` (it fails `in-turn`); return the spoken answer as the
   tool's result as before.
