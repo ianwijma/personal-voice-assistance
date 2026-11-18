@@ -12,6 +12,7 @@
   },
   "dependencies": {
     "@pva/core": "workspace:*",
+    "@pva/language": "workspace:*",
     "@pva/module-contracts": "workspace:*",
     "effect": "catalog:"
   },
