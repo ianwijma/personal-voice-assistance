@@ -1,15 +1,16 @@
 // Every test of the calendar module that asserts how long the main thread stops (docs/MODULES.md §15 "Latency
 // tests"): this file imports `bound` from packages/store-sqlite/test/latencyBound.ts, so it runs in the latency project,
-// alone. Refresh and turn reads are measured on the store the server runs (SQLite, here in memory) rather than the kit's
+// alone. Refresh and turn reads are measured on the store the server runs (SQLite, here a file on a real disk) rather than the kit's
 // in-memory test store, whose every list reads all of a collection's rows (fine for a test, not a latency to measure);
 // the reviewer's refresh inputs also in the kit, as the module runs there.
+import { join } from "node:path"
 import { assert, describe, it } from "@effect/vitest"
 import type { ModuleHostApi } from "@pva/core"
 import { makeOfflineNet, offThreadWorkers } from "@pva/core/testing"
 import { Effect } from "effect"
 import { TestClock } from "effect/testing"
 import { makeSqliteStore } from "../../store-sqlite/src/index.ts"
-import { bound } from "../../store-sqlite/test/latencyBound.ts"
+import { bound, latencyDir } from "../../store-sqlite/test/latencyBound.ts"
 import { ANSWER_BATCH, encodeAnswer, readAnswer } from "../src/answer.ts"
 import type { Occ } from "../src/expand.ts"
 import { calendarModule, occurrences, sources } from "../src/index.ts"
@@ -39,11 +40,11 @@ const countRows = (kit: Effect.Success<ReturnType<typeof startCalendar>>["kit"])
     }
   })
 
-/** A calendar module's store on SQLite in memory, its refresh and its tools (as `shared` and `start` make them). */
+/** A calendar module's store on SQLite in a file on a real disk, its refresh and its tools (as `shared` and `start` make them). */
 const onSqlite = (body: () => string) =>
   Effect.gen(function*() {
     yield* TestClock.setTime(Date.UTC(2026, 10, 18, 9, 0))
-    const sqlite = yield* makeSqliteStore({ filename: ":memory:" })
+    const sqlite = yield* makeSqliteStore({ filename: join(latencyDir("pva-calendar"), "household.db") })
     yield* sqlite.prepare([{ id: "calendar", storage: calendarModule.storage! }])
     const store = sqlite.forModule("calendar")
     const net = makeOfflineNet({ "https://cal.example.org/family.ics": () => served(body()) })
