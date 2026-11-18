@@ -458,6 +458,9 @@ export const startServe = (options: ServeOptions): Effect.Effect<ServeHandle, Ht
       if (parts === undefined) return undefined
       const { assistantId, connection, deviceId, person } = parts
       if (assistantId !== undefined && !assistantsNow().has(assistantId)) return `the assistant "${assistantId}" does not exist.`
+      // P5: a person is someone in Members, whether or not the call names a device (a job may name a person and no
+      // device). The person's id is not quoted: it may come from module code.
+      if (person !== undefined && !members().referenceable.has(person.id)) return "the person is not in Members."
       if (deviceId === undefined) return undefined
       if (!devices.known(deviceId) && hub?.deviceConnected(deviceId) !== true) return `the device "${deviceId}" is not known.`
       if (assistantId !== undefined) {
@@ -467,12 +470,9 @@ export const startServe = (options: ServeOptions): Effect.Effect<ServeHandle, Ht
         if (!assigned) return `the assistant "${assistantId}" is not on the device "${deviceId}".`
       }
       if (connection !== undefined && hub?.deviceOfConnection(connection) !== deviceId) return `the request did not come from the device "${deviceId}".`
-      // P5: a person is someone in Members and the device's default person (the only way a turn has a person: there is
-      // no voice identification). The person's id is not quoted: it may come from module code.
-      if (person !== undefined) {
-        if (!members().referenceable.has(person.id)) return "the person is not in Members."
-        if (deviceFacts.placeOf(deviceId)?.defaultPerson !== person.id) return `the person is not the default person of the device "${deviceId}".`
-      }
+      // P5: with a device, the person is also its default person (the only way a turn has a person: there is no voice
+      // identification).
+      if (person !== undefined && deviceFacts.placeOf(deviceId)?.defaultPerson !== person.id) return `the person is not the default person of the device "${deviceId}".`
       return undefined
     }
     const keys = makeKeys({ vault, store, host })

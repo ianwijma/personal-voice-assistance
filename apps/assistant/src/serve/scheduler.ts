@@ -8,9 +8,12 @@ import {
   makeSchedulerEngine,
   MAX_JOB_PAGE,
   type ModuleDefinition,
+  oneLine,
+  type Row,
   SCHEDULER_OWNER,
   type SchedulerEngine,
-  schedulerStorage
+  schedulerStorage,
+  type StoredJob
 } from "@pva/core"
 import type { ScheduledJob } from "@pva/protocol"
 import { householdDbPath, makeSqliteStore } from "@pva/store-sqlite"
@@ -56,7 +59,7 @@ export const scheduledJobOnWire = (view: JobView): ScheduledJob => {
   return {
     id: j.id,
     module: j.module,
-    moduleName: view.moduleName,
+    moduleName: oneLine(view.moduleName, 200),
     handler: j.handler,
     ...(j.key !== undefined ? { key: j.key } : {}),
     state: j.state,
@@ -79,9 +82,13 @@ export const scheduledJobOnWire = (view: JobView): ScheduledJob => {
   }
 }
 
+/** The failed jobs `doctor` lists at most (newest failures first); one more line says when there are more. */
+const DOCTOR_JOBS = 2 * MAX_JOB_PAGE
+
 /**
- * `pnpm start doctor`: the failed jobs (read-only from the database; the engine runs only in the server), at most two
- * pages, one line each. No database, or no scheduler data yet: nothing.
+ * `pnpm start doctor`: the failed jobs (read-only from the database; the engine runs only in the server), the newest
+ * failures first, at most `DOCTOR_JOBS` (read a page at a time), one line each. Their texts passed the page boundary
+ * when they were stored. No database, or no scheduler data yet: nothing.
  */
 export const schedulerDoctorIssues = (dataDir: string, catalog: ReadonlyArray<ModuleDefinition<any>>): Effect.Effect<ReadonlyArray<Issue>> =>
   Effect.scoped(Effect.gen(function*() {
@@ -90,14 +97,21 @@ export const schedulerDoctorIssues = (dataDir: string, catalog: ReadonlyArray<Mo
     const store = yield* makeSqliteStore({ filename: file, readOnly: true })
     yield* store.prepare(catalog.map((d) => ({ id: d.id, storage: d.storage })), [schedulerStorage])
     const c = store.forCore(SCHEDULER_OWNER).collection(jobs)
-    const first = yield* c.list({ where: { issue: true }, limit: MAX_JOB_PAGE })
+    const read: Array<Row<StoredJob>> = []
+    let after: Row<StoredJob> | undefined
+    for (;;) {
+      const page = yield* c.list({ where: { issue: true }, orderBy: { field: "failedAt", direction: "desc" }, limit: MAX_JOB_PAGE, ...(after !== undefined ? { after } : {}) })
+      read.push(...page)
+      if (page.length < MAX_JOB_PAGE || read.length > DOCTOR_JOBS) break
+      after = page[page.length - 1]
+    }
     const names = new Map(catalog.map((d) => [d.id, d.name] as const))
-    const out: Array<Issue> = first.map((row) => ({
+    const out: Array<Issue> = read.slice(0, DOCTOR_JOBS).map((row) => ({
       id: `core.scheduler.failed.${row.id}`,
       severity: "warning" as const,
       title: `A scheduled job of ${names.get(row.value.module) ?? row.value.module} failed: ${row.value.handler}${row.value.key !== undefined ? ` (${row.value.key})` : ""}`.slice(0, 200),
       detail: (row.value.lastError ?? "").replace(/\s+/g, " ").slice(0, 300)
     }))
-    if (first.length === MAX_JOB_PAGE) out.push({ id: "core.scheduler.failed.more", severity: "warning", title: `More than ${MAX_JOB_PAGE} scheduled jobs failed`, detail: "The Scheduled jobs page has them all." })
+    if (read.length > DOCTOR_JOBS) out.push({ id: "core.scheduler.failed.more", severity: "warning", title: `More than ${DOCTOR_JOBS} scheduled jobs failed`, detail: "The Scheduled jobs page has them all." })
     return out
   })).pipe(Effect.orElseSucceed(() => [] as ReadonlyArray<Issue>))

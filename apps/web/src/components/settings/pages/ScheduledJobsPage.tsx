@@ -13,6 +13,10 @@ import { Button, cx, ToneDot } from "../../ui/controls.tsx"
  * then the finished ones of the last 7 days, newest first. "Load more" reads the next page. "Cancel" stops a live
  * job (a running handler is not interrupted: what it then reports is ignored); on a failed one it dismisses it and
  * its Health issue. Payloads are never shown.
+ *
+ * Refresh (and the reload after a cancel) starts a new generation of the list: an answer to a read of an older
+ * generation (a "Load more" still on its way) is dropped, so pages of two readings are never joined. The list is not a
+ * snapshot: a job that changed between two pages can be missing or shown once in its older state; Refresh reads again.
  */
 
 const STATE: Readonly<Record<ScheduledJob["state"], { readonly label: string; readonly tone: "ok" | "warning" | "error" | "neutral" }>> = {
@@ -51,18 +55,27 @@ export function ScheduledJobsPage({ api: given }: { readonly api?: VoiceApi } = 
   const [busy, setBusy] = useState<string | undefined>(undefined)
   const [loadingMore, setLoadingMore] = useState(false)
   const [now, setNow] = useState(() => Date.now())
+  /** The generation of the list: every first-page read starts a new one; answers of older ones are dropped. */
+  const generation = useRef(0)
 
-  /** The first page again (after a cancel, on Refresh): what was loaded beyond it is read again on request. */
-  const load = async () => {
+  /**
+   * The first page again (after a cancel, on Refresh): what was loaded beyond it is read again on request. True when
+   * it was read and shown (false: it failed, and the problem says so; or a newer reading replaced it).
+   */
+  const load = async (): Promise<boolean> => {
+    const mine = ++generation.current
     try {
       const body = decode(await (await api.request("scheduler/jobs")).json())
+      if (mine !== generation.current) return false
       setJobs(body.jobs)
       setNext(body.next)
       setAvailable(body.available)
       setProblem(undefined)
       setNow(Date.now())
+      return true
     } catch (e) {
-      setProblem(e instanceof ApiError ? e.message : "The scheduled jobs could not be read.")
+      if (mine === generation.current) setProblem(e instanceof ApiError ? e.message : "The scheduled jobs could not be read.")
+      return false
     }
   }
   useEffect(() => {
@@ -71,9 +84,12 @@ export function ScheduledJobsPage({ api: given }: { readonly api?: VoiceApi } = 
 
   const loadMore = async () => {
     if (next === undefined) return
+    const mine = generation.current
     setLoadingMore(true)
     try {
       const body = decode(await (await api.request(`scheduler/jobs?cursor=${encodeURIComponent(next)}`)).json())
+      // Refresh (or a cancel) started another reading meanwhile: this page belongs to the old one.
+      if (mine !== generation.current) return
       // A job that moved between pages (it finished meanwhile) is shown once.
       setJobs((old) => {
         const seen = new Set((old ?? []).map((j) => j.id))
@@ -82,10 +98,11 @@ export function ScheduledJobsPage({ api: given }: { readonly api?: VoiceApi } = 
       setNext(body.next)
       setProblem(undefined)
     } catch (e) {
-      // The server no longer knows the page (it keeps a few hundred): start again from the top.
+      if (mine !== generation.current) return
+      // The server no longer knows the page (it keeps a few hundred, and none from before a restart): start again from
+      // the top, and say so only when that worked (a failed reload says why itself).
       if (e instanceof ApiError && e.status === 400) {
-        await load()
-        setProblem("The list changed; it was read again from the top.")
+        if (await load()) setProblem("The list changed; it was read again from the top.")
       } else setProblem(e instanceof ApiError ? e.message : "More jobs could not be read.")
     } finally {
       setLoadingMore(false)
