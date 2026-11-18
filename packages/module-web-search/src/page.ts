@@ -1,19 +1,30 @@
-// A fetched page as bounded plain text for the model. Pure: no network, no store.
-//
-// The bound (docs/MODULES.md §14, "never block the event loop"): the body is read at most `PAGE_MAX_BYTES` (by safeFetch), the
-// markup that is parsed is cut at `HTML_PARSE_CHARS`, a document with more than `MAX_ELEMENTS` elements is not run through
-// Readability (its body text is taken instead), and the text that leaves is at most `PAGE_TEXT_MAX` characters. The libraries are
-// imported where they are used, so an installation with the module off never loads them.
-import { cleanText } from "./providers.ts"
+// A fetched page as bounded plain text for the model: the bounds and the pure text steps. Free of dependencies, so the page
+// task (`page.task.ts`, which runs in a worker thread through `offThread`) and the tests can import it; the main thread only
+// uses the constants and types (docs/MODULES.md §15: nothing proportional to a page's size runs there).
 
 /** The most bytes of a page read (safeFetch's own limit; a bigger page is refused, not cut). */
 export const PAGE_MAX_BYTES = 1024 * 1024
-/** The most characters of markup that are parsed; the rest is dropped before parsing. */
+/** The most characters of markup or text that are parsed; the rest is dropped first. */
 export const HTML_PARSE_CHARS = 400_000
-/** A document with more elements than this is not run through Readability. */
+/** A document with more elements than this is not run through Readability (its body text is taken). */
 export const MAX_ELEMENTS = 6_000
 /** The most characters of text that leave. */
 export const PAGE_TEXT_MAX = 6_000
+/** The real-time limit of the page task, worker start-up included (about 0.3 s of it); past it the worker is terminated. */
+export const PAGE_TASK_TIMEOUT_MS = 3_000
+/** The worker's heap. */
+export const PAGE_TASK_MEMORY_MB = 256
+/** The largest answer the task may give (its text is at most `PAGE_TEXT_MAX` characters, a title 150). */
+export const PAGE_TASK_RESULT_BYTES = 64 * 1024
+
+/** What the page task is given: the fetched bytes as they came, their charset, and what kind of page it is. */
+export interface PageInput {
+  readonly bytes: Uint8Array
+  /** The `charset` of the Content-Type; absent or unknown: UTF-8. */
+  readonly charset?: string
+  readonly kind: "html" | "text"
+  readonly focus?: string
+}
 
 export interface PageText {
   readonly title: string
@@ -36,7 +47,7 @@ export const focusOrder = (text: string, focus: string | undefined): string => {
 }
 
 /** Cut at a paragraph or sentence end when one is near the limit. */
-const cutAt = (text: string, max: number): { readonly text: string; readonly truncated: boolean } => {
+export const cutAt = (text: string, max: number): { readonly text: string; readonly truncated: boolean } => {
   if (text.length <= max) return { text, truncated: false }
   const head = text.slice(0, max)
   const stop = Math.max(head.lastIndexOf("\n\n"), head.lastIndexOf(". "))
@@ -46,7 +57,7 @@ const cutAt = (text: string, max: number): { readonly text: string; readonly tru
 
 const UNWANTED = new RegExp("[\\u0000-\\u0008\\u000b\\u000c\\u000e-\\u001f\\u007f-\\u009f\\u2028\\u2029\\u200e\\u200f\\u202a-\\u202e\\u2066-\\u2069]", "g")
 
-const clean = (text: string): string =>
+export const clean = (text: string): string =>
   text
     .replace(UNWANTED, " ")
     .replace(/[ \t]+/g, " ")
@@ -60,38 +71,8 @@ export const plainPage = (body: string, focus: string | undefined): PageText => 
   return { title: "", text: cut.text, truncated: cut.truncated || body.length > HTML_PARSE_CHARS }
 }
 
-/**
- * HTML to Markdown text: the article Readability finds (links reduced to their text, images dropped), else the body's text. Throws
- * when the markup cannot be parsed at all; the caller says so in a sentence.
- */
-export const htmlPage = async (html: string, focus: string | undefined): Promise<PageText> => {
-  const [{ parseHTML }, { Readability }, { default: Turndown }] = await Promise.all([import("linkedom"), import("@mozilla/readability"), import("turndown")])
-  const cutHtml = html.length > HTML_PARSE_CHARS
-  const { document } = parseHTML(html.slice(0, HTML_PARSE_CHARS))
-  // Give the event loop a turn between the stages: the parse and the extraction are two separate short pieces of work.
-  await new Promise<void>((resolve) => setImmediate(resolve))
-  const title = cleanText(document.title ?? "", 150)
-  let articleHtml: string | undefined
-  let articleTitle = ""
-  if (document.querySelectorAll("*").length <= MAX_ELEMENTS) {
-    try {
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      const article = new Readability(document as any, { charThreshold: 200 }).parse()
-      if (article !== null && typeof article.content === "string" && (article.textContent ?? "").trim().length >= 200) {
-        articleHtml = article.content
-        articleTitle = cleanText(article.title ?? "", 150)
-      }
-    } catch {
-      articleHtml = undefined
-    }
-  }
-  await new Promise<void>((resolve) => setImmediate(resolve))
-  const turndown = new Turndown({ headingStyle: "atx", bulletListMarker: "-", codeBlockStyle: "fenced" })
-  // Addresses are never read out and are a way for a page to steer the model: a link is its text, an image is nothing.
-  turndown.addRule("links-as-text", { filter: "a", replacement: (content: string) => content })
-  turndown.addRule("no-images", { filter: ["img", "picture", "video", "audio", "iframe", "svg", "canvas", "script", "style", "noscript"], replacement: () => "" })
-  const source = articleHtml ?? document.body?.innerHTML ?? ""
-  const markdown = clean(turndown.turndown(source.slice(0, HTML_PARSE_CHARS)))
-  const cut = cutAt(focusOrder(markdown, focus), PAGE_TEXT_MAX)
-  return { title: articleTitle !== "" ? articleTitle : title, text: cut.text, truncated: cut.truncated || cutHtml }
+/** The `charset` parameter of a Content-Type header value (`text/html; charset="ISO-8859-1"` → `ISO-8859-1`). */
+export const charsetOf = (contentType: string | undefined): string | undefined => {
+  const m = /;\s*charset\s*=\s*"?([^";\s]{1,40})/i.exec(contentType ?? "")
+  return m?.[1]
 }

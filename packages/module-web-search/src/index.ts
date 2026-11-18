@@ -1,17 +1,25 @@
-import { ActionError, CurrentJob, defineAction, defineModule, makeTool, Setting, ToolError, type ModuleDefinition } from "@pva/core"
+import { ActionError, defineAction, defineModule, makeTool, offThread, offThreadTask, Setting, ToolError, type ModuleDefinition, type Setting as SettingOf } from "@pva/core"
+import { speakNumber } from "@pva/language"
 import { homeLanguage, isLine, say, StoredText } from "@pva/module-contracts"
-import { type ContentTypePolicy, safeFetch, userAgent } from "@pva/net"
+import { type Connector, type ContentTypePolicy, nodeConnector, nodeResolver, type Resolver, safeFetch, userAgent } from "@pva/net"
 import { Clock, Effect, Schema } from "effect"
-import { htmlPage, PAGE_MAX_BYTES, type PageText, plainPage } from "./page.ts"
-import { inDomain, makeBrave, makeSearxng, type NetDeps, type RawResult, type Recency, type SafeSearch, SearchError, type SearchProvider, siteOf } from "./providers.ts"
+import { blockEntry, canonicalHost, hostOf, isBlocked, siteOf } from "./clean.ts"
+import { charsetOf, PAGE_MAX_BYTES, PAGE_TASK_MEMORY_MB, PAGE_TASK_RESULT_BYTES, PAGE_TASK_TIMEOUT_MS } from "./page.ts"
+import { makeBrave, makeSearxng, type NetDeps, type RawResult, type Recency, type SafeSearch, SearchError, type SearchProvider } from "./providers.ts"
 import { texts } from "./texts.ts"
-import { ACTOR, asCached, bump, CACHE_TTL_MS, cacheId, dayKey, KEEP_MONTHS, reserve, searchCache, summarize, usage, zoneOf } from "./usage.ts"
+import { bump, dayKey, reserve, summarize, usage, zoneOf } from "./usage.ts"
 
+export { blockEntry, canonicalHost, hostOf } from "./clean.ts"
 export { cleanText, makeBrave, makeSearxng, MAX_RESULTS, toResults } from "./providers.ts"
 export type { NetDeps, RawResult, SearchProvider } from "./providers.ts"
-export { htmlPage, plainPage } from "./page.ts"
 export { texts } from "./texts.ts"
-export { searchCache, usage } from "./usage.ts"
+export { usage } from "./usage.ts"
+
+/**
+ * The page task, named once: its file beside this one and its default export's type. Nothing of it (linkedom, Readability,
+ * Turndown) is loaded on the main thread: `offThread` imports it in a fresh worker for each page.
+ */
+const pageTask = offThreadTask<typeof import("./page.task.ts").default>(new URL("./page.task.ts", import.meta.url))
 
 /**
  * Searches the web through SearXNG or Brave and reads a page in short (docs/modules/web-search.md).
@@ -38,7 +46,20 @@ const explainBaseUrl = (value: string): string | undefined => {
   return undefined
 }
 
-const explainDomain = (value: string): string | undefined => (/^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$/i.test(value) ? undefined : "Enter a domain such as example.com")
+/**
+ * The blocked sites: a text list whose every item must be a host name (`blockEntry`), refused as a settings error when the owner
+ * saves one that is not. A text list has no check of its own, so its decoder is wrapped.
+ */
+const blockedList = (base: SettingOf<ReadonlyArray<string>>): SettingOf<ReadonlyArray<string>> => {
+  const decode = (raw: unknown) => {
+    const decoded = base.decode(raw)
+    if (!decoded.ok) return decoded
+    const bad = decoded.value.findIndex((entry) => blockEntry(entry) === undefined)
+    // The item is named by its place, never quoted.
+    return bad === -1 ? decoded : { ok: false as const, error: `Item ${bad + 1} is not a site: enter a domain such as example.com` }
+  }
+  return { ...base, decode, fromEnv: (text) => decode(text.split(",")) }
+}
 
 const settings = {
   provider: Setting.choice({
@@ -64,12 +85,12 @@ const settings = {
     overridable: true
   }),
   resultCount: Setting.number({ label: "Results per search", default: 4, integer: true, min: 1, max: 5 }),
-  dailyCap: Setting.number({ label: "Searches per day", description: "Searches made through any provider; a repeated search within ten minutes is free.", default: 100, integer: true, min: 1, max: 10_000 }),
+  dailyCap: Setting.number({ label: "Searches per day", description: "Searches made through any provider, each one counted.", default: 100, integer: true, min: 1, max: 10_000 }),
   monthlyCapUsd: Setting.number({ label: "Monthly budget for paid searches", default: 5, min: 0, max: 1_000, step: 0.5, unit: "USD" }),
   bravePricePer1000: Setting.number({ label: "Price of 1,000 Brave searches", description: "Used to estimate the spend; correct it if your plan differs.", default: 5, min: 0, max: 100, step: 0.5, unit: "USD", advanced: true }),
   searchTimeoutMs: Setting.number({ label: "Search time limit", default: 2_500, integer: true, min: 500, max: 10_000, unit: "ms", advanced: true }),
   pageTimeoutMs: Setting.number({ label: "Page time limit", default: 6_000, integer: true, min: 1_000, max: 15_000, unit: "ms", advanced: true }),
-  blockedDomains: Setting.textList({ label: "Blocked sites", description: "Never shown in results and never opened (a domain covers its subdomains).", maxItems: 50, itemMaxLength: 100, placeholder: "example.com" }),
+  blockedDomains: blockedList(Setting.textList({ label: "Blocked sites", description: "Never shown in results and never opened, also not through a redirect (a domain covers its subdomains).", maxItems: 50, itemMaxLength: 100, placeholder: "example.com" })),
   test: Setting.action({
     label: "Check the search provider",
     description: "Sends one search to the chosen provider.",
@@ -104,7 +125,27 @@ interface Cfg {
   readonly blockedDomains: ReadonlyArray<string>
 }
 
-const blockedOf = (cfg: Pick<Cfg, "blockedDomains">): ReadonlyArray<string> => cfg.blockedDomains.map((d) => d.trim().toLowerCase().replace(/^www\./, "")).filter((d) => d !== "")
+/** The block list in canonical form (the settings refuse an entry that is not a host, so none is dropped here in practice). */
+const blockedOf = (cfg: Pick<Cfg, "blockedDomains">): ReadonlyArray<string> => cfg.blockedDomains.map(blockEntry).filter((d): d is string => d !== undefined)
+
+/**
+ * The network for one page request, with the owner's block list checked on every hop before anything is looked up or connected:
+ * `safeFetch` calls the resolver for each hop's host name and the connector for each hop's address (a literal address skips the
+ * resolver), redirects included. `blocked()` says afterwards whether a hop was refused.
+ */
+const guardedNet = (deps: NetDeps, blocked: ReadonlyArray<string>) => {
+  let refused = false
+  const resolve: Resolver = deps.resolver ?? nodeResolver
+  const connect: Connector = deps.connector ?? nodeConnector
+  const refuse = (host: string): boolean => {
+    if (!isBlocked(canonicalHost(host), blocked)) return false
+    refused = true
+    return true
+  }
+  const resolver: Resolver = (host, signal) => (refuse(host) ? Promise.reject(new Error("a blocked site")) : resolve(host, signal))
+  const connector: Connector = (request) => (refuse(request.url.hostname) ? Promise.reject(new Error("a blocked site")) : connect(request))
+  return { resolver, connector, blocked: () => refused }
+}
 
 const agentOf = (home: Readonly<Record<string, unknown>>) => {
   const contact = home.HOME_API_CONTACT
@@ -139,11 +180,10 @@ const languageTag = (home: Readonly<Record<string, unknown>>): string | undefine
   return typeof value === "string" && /^[a-z]{2,3}(-[A-Za-z]{2})?$/.test(value) ? value : undefined
 }
 
-const present = (results: ReadonlyArray<RawResult>, count: number, provider: string, cached: boolean) => ({
+const present = (results: ReadonlyArray<RawResult>, count: number, provider: string) => ({
   notice: UNTRUSTED_NOTICE,
   results: results.slice(0, count).map((r, i) => ({ n: i + 1, title: r.title, site: r.site, snippet: r.snippet, url: r.url, ...(r.published !== undefined ? { published: r.published } : {}) })),
-  provider,
-  cached
+  provider
 })
 
 // ---------------------------------------------------------------------------------------------------------------------
@@ -157,7 +197,7 @@ export const webSearchModule = (deps: NetDeps = {}) =>
     description: "Searches the web through SearXNG or Brave and reads a page in short.",
     enabledByDefault: false,
     settings,
-    storage: { version: 1, collections: [usage, searchCache] },
+    storage: { version: 1, collections: [usage] },
     requires: [{ network: "internet", why: "Searching Brave and reading web pages" }],
     health: ({ settings: s }) =>
       Effect.sync(() => {
@@ -197,51 +237,10 @@ export const webSearchModule = (deps: NetDeps = {}) =>
           return { ok: true, tone: "ok" as const, text: `${provider.id === "brave" ? "Brave" : "SearXNG"} answered with ${outcome.length} result${outcome.length === 1 ? "" : "s"}.` }
         })
     },
-    shared: (ctx) =>
-      Effect.gen(function*() {
-        const cache = ctx.store.collection(searchCache)
-        const counts = ctx.store.collection(usage)
-        // Once a day: expired answers and old monthly counters, oldest first in small batches, each its own transaction.
-        yield* ctx.scheduler.handle("purge", {
-          payload: Schema.Struct({}),
-          idempotent: true,
-          run: () =>
-            Effect.gen(function*() {
-              const job = yield* CurrentJob
-              if (job === undefined) return yield* Effect.die(new Error("purge runs only as a job"))
-              const actor = { kind: "job" as const, jobId: job.jobId }
-              const now = yield* Clock.currentTimeMillis
-              for (let batch = 0; batch < 200; batch++) {
-                const rows = yield* cache.list({ orderBy: { field: "at", direction: "asc" }, limit: 3 })
-                const old = rows.filter((r) => r.value.at < now - CACHE_TTL_MS)
-                yield* ctx.store.transaction((tx) => {
-                  for (const row of old) tx.collection(searchCache).remove(row.id, { actor })
-                })
-                if (old.length < rows.length || rows.length === 0) break
-                yield* Effect.yieldNow
-              }
-              const [y, m] = dayKey(now, zoneOf(ctx.host.view().home)).split("-").map(Number) as [number, number]
-              const total = y * 12 + (m - 1) - KEEP_MONTHS
-              const oldest = `${String(Math.floor(total / 12)).padStart(4, "0")}-${String((total % 12) + 1).padStart(2, "0")}`
-              for (let batch = 0; batch < 200; batch++) {
-                const rows = yield* counts.list({ orderBy: { field: "month", direction: "asc" }, limit: 30 })
-                const old = rows.filter((r) => r.value.month < oldest)
-                yield* ctx.store.transaction((tx) => {
-                  for (const row of old) tx.collection(usage).remove(row.id, { actor })
-                })
-                if (old.length < rows.length || rows.length === 0) break
-                yield* Effect.yieldNow
-              }
-            })
-        }).pipe(Effect.orDie)
-        yield* ctx.scheduler.schedule({ handler: "purge", key: "purge", cron: "40 4 * * *" }).pipe(Effect.orDie)
-        return { value: undefined }
-      }),
     start: (ctx) =>
       Effect.sync(() => {
         const cfg = ctx.settings as Cfg
         const paidPossible = chainOf(cfg, {}).some((p) => p.paid)
-        const cacheRows = ctx.store.collection(searchCache)
         const lang = () => homeLanguage(ctx.host.view())
         const home = () => ctx.host.view().home
         const day = (now: number) => dayKey(now, zoneOf(home()))
@@ -270,18 +269,16 @@ export const webSearchModule = (deps: NetDeps = {}) =>
                 return yield* new ToolError({ message: say(texts, language, cfg.provider === "brave" ? "noKey" : cfg.searxngUrl.trim() === "" ? "noUrl" : "noProvider") })
               }
               const wanted = count ?? cfg.resultCount
-              const now = yield* Clock.currentTimeMillis
               const sites = site?.toLowerCase()
               const q = { query: query.trim().replace(/\s+/g, " "), ...(recency !== undefined ? { recency: recency as Recency } : {}), ...(sites !== undefined ? { site: sites } : {}), ...(languageTag(home()) !== undefined ? { language: languageTag(home())! } : {}), safeSearch: cfg.safeSearch, timeoutMs: cfg.searchTimeoutMs }
-              // The same search again within ten minutes is answered from the household's cache, free. Best effort: a store that does not answer is a miss.
-              const id = cacheId([chain.map((p) => p.id).join(","), q.query.toLowerCase(), q.recency, q.site, q.language, q.safeSearch, blockedOf(cfg).join(",")])
-              const hit = yield* cacheRows.get(id).pipe(Effect.orElseSucceed(() => undefined))
-              if (hit !== undefined && hit.value.at > now - CACHE_TTL_MS && hit.value.at <= now) {
-                return hit.value.results.length === 0 ? { spoken: say(texts, language, "noResults") } : present(hit.value.results, wanted, hit.value.provider, true)
-              }
+              // Every search is answered by a provider and counted: nothing of it is kept (no cache), so nothing stored can say what
+              // anyone searched for.
               let failure: SearchError | undefined
               let capped: "daily" | "monthly" | undefined
               for (const provider of chain) {
+                // The clock is read right before each reservation: a fallback after midnight, or after the end of a month, is counted
+                // in the day and the month it is made in, against that day's and that month's caps.
+                const now = yield* Clock.currentTimeMillis
                 const verdict = yield* ctx.store
                   .transaction((tx) => reserve(tx, { day: day(now), kind: provider.id, priceMicro: Math.round(cfg.bravePricePer1000 * 1_000), dailyCap: cfg.dailyCap, monthlyCapMicro: Math.round(cfg.monthlyCapUsd * MICRO) }))
                   .pipe(Effect.mapError(() => new ToolError({ message: say(texts, language, "unreadable") })))
@@ -297,16 +294,7 @@ export const webSearchModule = (deps: NetDeps = {}) =>
                   continue
                 }
                 if (outcome.length === 0) return { spoken: say(texts, language, "noResults") }
-                const stamp = yield* Clock.currentTimeMillis
-                yield* ctx.store
-                  .transaction((tx) => {
-                    const rows = tx.collection(searchCache)
-                    const value = { at: stamp, provider: provider.id, results: asCached(outcome) }
-                    if (rows.get(id) === undefined) rows.insert(value, { id, actor: ACTOR })
-                    else rows.update(id, () => value, { actor: ACTOR })
-                  })
-                  .pipe(Effect.ignore)
-                return present(outcome, wanted, provider.id, false)
+                return present(outcome, wanted, provider.id)
               }
               if (failure !== undefined) return yield* new ToolError({ message: failureText(language, failure) })
               return yield* new ToolError({ message: say(texts, language, capped === "monthly" ? "monthlyCap" : "dailyCap") })
@@ -333,17 +321,22 @@ export const webSearchModule = (deps: NetDeps = {}) =>
               } catch {
                 return yield* new ToolError({ message: say(texts, language, "pageRefused") })
               }
-              const site = siteOf(target.href)
-              if (site === undefined) return yield* new ToolError({ message: say(texts, language, "pageRefused") })
-              if (blockedOf(cfg).some((d) => inDomain(site, d))) return yield* new ToolError({ message: say(texts, language, "pageBlocked") })
+              const host = hostOf(target)
+              if (host === undefined) return yield* new ToolError({ message: say(texts, language, "pageRefused") })
+              const blocked = blockedOf(cfg)
+              if (isBlocked(host, blocked)) return yield* new ToolError({ message: say(texts, language, "pageBlocked") })
+              // The block list is checked again on every hop, redirects included, before the hop's host is looked up or connected to.
+              const net = guardedNet(deps, blocked)
               const response = yield* safeFetch(target.href, {
                 accept: PAGE_POLICY,
                 maxBytes: PAGE_MAX_BYTES,
                 timeoutMs: cfg.pageTimeoutMs,
                 headers: { "user-agent": agentOf(home()) },
-                ...deps
+                resolver: net.resolver,
+                connector: net.connector
               }).pipe(
                 Effect.mapError((e) => {
+                  if (net.blocked()) return new ToolError({ message: say(texts, language, "pageBlocked") })
                   switch (e._tag) {
                     case "NetTimeout": return new ToolError({ message: say(texts, language, "pageSlow") })
                     case "NetTooLarge": return new ToolError({ message: say(texts, language, "pageBig") })
@@ -356,12 +349,17 @@ export const webSearchModule = (deps: NetDeps = {}) =>
                 })
               )
               if (response.status < 200 || response.status > 299) return yield* new ToolError({ message: say(texts, language, "pageFailed") })
-              const body = response.text()
-              let page: PageText
-              if (response.contentType === "text/plain") page = plainPage(body, focus)
-              else {
-                page = yield* Effect.tryPromise({ try: () => htmlPage(body, focus), catch: () => new ToolError({ message: say(texts, language, "pageUnreadable") }) })
-              }
+              // The site is the one that answered, after any redirects.
+              const site = siteOf(response.url) ?? siteOf(target)!
+              // Everything that turns the page into text runs in a worker with a real time limit: the main thread only hands
+              // the bytes over and receives at most a few KiB of text. Interrupting the turn terminates the worker.
+              const page = yield* offThread(
+                pageTask,
+                { bytes: response.body, kind: response.contentType === "text/plain" ? "text" : "html", ...(charsetOf(response.headers["content-type"]) !== undefined ? { charset: charsetOf(response.headers["content-type"])! } : {}), ...(focus !== undefined ? { focus } : {}) },
+                { timeoutMs: PAGE_TASK_TIMEOUT_MS, maxMemoryMb: PAGE_TASK_MEMORY_MB, maxResultBytes: PAGE_TASK_RESULT_BYTES }
+              ).pipe(
+                Effect.mapError((e) => new ToolError({ message: say(texts, language, e.reason === "timeout" || e.reason === "memory" ? "pageComplex" : "pageUnreadable") }))
+              )
               if (page.text.trim() === "") return yield* new ToolError({ message: say(texts, language, "pageEmpty") })
               // Counted (not capped): reading a page costs nothing but is part of the picture. A store that does not answer does not stop the answer.
               const now = yield* Clock.currentTimeMillis
@@ -383,11 +381,21 @@ export const webSearchModule = (deps: NetDeps = {}) =>
               const language = lang()
               const now = yield* Clock.currentTimeMillis
               const s = yield* ctx.store.transaction((tx) => summarize(tx, day(now))).pipe(Effect.mapError(() => new ActionError({ message: say(texts, language, "usageFailed") })))
-              // Plain digits, with the language's decimal mark: `@pva/language` is not a dependency of this package.
-              const n = (v: number) => (language === "nl" ? String(v).replace(".", ",") : String(v))
-              const values = { today: n(s.today), cap: n(cfg.dailyCap), month: n(s.month) }
+              // Every number is worded by `@pva/language`, which says up to 999,999.99: a count over that (not reachable with the
+              // caps, at most 10,000 a day) gets a sentence of its own rather than a wrong number.
+              const counts = [s.today, cfg.dailyCap, s.month].map((v) => speakNumber(v, language))
+              if (counts.some((v) => v === undefined)) return { say: say(texts, language, "usageTooLarge") }
+              const [today, cap, month] = counts as [string, string, string]
+              const values = { today, cap, month }
               if (s.microUsd === 0 && !paidPossible) return { say: say(texts, language, "usage", values) }
-              return { say: say(texts, language, "usagePaid", { ...values, spent: n(Number((s.microUsd / MICRO).toFixed(2))), budget: n(cfg.monthlyCapUsd) }) }
+              const dollars = s.microUsd / MICRO
+              const budget = speakNumber(cfg.monthlyCapUsd, language)
+              if (budget === undefined) return { say: say(texts, language, "usageTooLarge") }
+              // Under half a cent rounds to 0, which is never said for a nonzero amount: "less than 0.01".
+              if (dollars > 0 && dollars < 0.005) return { say: say(texts, language, "usagePaidUnderCent", { ...values, cent: speakNumber(0.01, language)!, budget }) }
+              const spent = speakNumber(Math.round(dollars * 100) / 100, language)
+              if (spent === undefined) return { say: say(texts, language, "usageTooLarge") }
+              return { say: say(texts, language, "usagePaid", { ...values, spent, budget }) }
             })
         })
 

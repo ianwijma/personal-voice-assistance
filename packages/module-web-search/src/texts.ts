@@ -27,9 +27,12 @@ export const texts = defineTexts({
     pageFailed: "I couldn't open that page.",
     pageEmpty: "That page has no text I can read; it may need a browser.",
     pageUnreadable: "I couldn't make sense of that page.",
+    pageComplex: "That page is too complex for me to read.",
     usage: "Today {today} of {cap} searches are used. This month {month} searches.",
     usagePaid: "Today {today} of {cap} searches are used. This month {month} searches, and the paid ones cost about {spent} of the {budget} dollars allowed.",
-    usageFailed: "I couldn't read the search counts."
+    usageFailed: "I couldn't read the search counts.",
+    usageTooLarge: "The search counts are too large for me to say.",
+    usagePaidUnderCent: "Today {today} of {cap} searches are used. This month {month} searches, and the paid ones cost less than {cent} of the {budget} dollars allowed."
   },
   nl: {
     noProvider: "Zoeken op het web is nog niet ingesteld. De eigenaar kan in de instellingen een zoekdienst kiezen.",
@@ -56,8 +59,11 @@ export const texts = defineTexts({
     pageFailed: "Ik kon die pagina niet openen.",
     pageEmpty: "Op die pagina staat geen tekst die ik kan lezen; hij heeft misschien een browser nodig.",
     pageUnreadable: "Ik kon die pagina niet begrijpen.",
+    pageComplex: "Die pagina is te ingewikkeld voor mij om te lezen.",
     usage: "Vandaag zijn {today} van {cap} zoekopdrachten gebruikt. Deze maand {month} zoekopdrachten.",
     usagePaid: "Vandaag zijn {today} van {cap} zoekopdrachten gebruikt. Deze maand {month} zoekopdrachten, en de betaalde kostten ongeveer {spent} van de {budget} dollar die mag.",
-    usageFailed: "Ik kon de zoektellingen niet lezen."
+    usageFailed: "Ik kon de zoektellingen niet lezen.",
+    usageTooLarge: "De zoektellingen zijn te groot om uit te spreken.",
+    usagePaidUnderCent: "Vandaag zijn {today} van {cap} zoekopdrachten gebruikt. Deze maand {month} zoekopdrachten, en de betaalde kostten minder dan {cent} van de {budget} dollar die mag."
   }
 })

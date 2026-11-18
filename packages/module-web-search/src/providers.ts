@@ -3,6 +3,9 @@
 // sees it.
 import { contentTypes, fetchOwnerConfiguredLan, type NetRefused, safeFetch, type SafeFetchError, type SafeFetchOptions, type SafeResponse } from "@pva/net"
 import { Data, Effect } from "effect"
+import { cleanText, HAS_UNWANTED, hostOf, isBlocked, siteOf } from "./clean.ts"
+
+export { cleanText, siteOf } from "./clean.ts"
 
 /** What a net call takes from tests: the resolver and connector (absent: the real ones). */
 export type NetDeps = Pick<SafeFetchOptions, "resolver" | "connector">
@@ -12,7 +15,7 @@ export type SafeSearch = "off" | "moderate" | "strict"
 
 /** How many results one search keeps at most. */
 export const MAX_RESULTS = 5
-/** The bounds of one stored result: they are what the `search_cache` collection's `maxChars` is computed from. */
+/** The bounds of one result. */
 export const TITLE_MAX = 100
 export const URL_MAX = 300
 export const SNIPPET_MAX = 200
@@ -56,44 +59,6 @@ export interface SearchProvider {
 // ---------------------------------------------------------------------------------------------------------------------
 // Cleaning
 
-const TAG = /<[^>]*>/g
-const ENTITY = /&(#x[0-9a-f]{1,6}|#[0-9]{1,7}|amp|lt|gt|quot|apos|nbsp);/gi
-const NAMED: Readonly<Record<string, string>> = { amp: "&", lt: "<", gt: ">", quot: '"', apos: "'", nbsp: " " }
-// Control characters, lone surrogates, line and paragraph separators and bidirectional controls: never kept.
-// eslint-disable-next-line no-control-regex
-const UNWANTED_SOURCE = "[\\u0000-\\u001f\\u007f-\\u009f\\u2028\\u2029\\u200e\\u200f\\u202a-\\u202e\\u2066-\\u2069\\ud800-\\udfff]"
-const UNWANTED = new RegExp(UNWANTED_SOURCE, "gu")
-const HAS_UNWANTED = new RegExp(UNWANTED_SOURCE, "u")
-
-const decodeEntities = (s: string): string =>
-  s.replace(ENTITY, (_, e: string) => {
-    if (e.startsWith("#")) {
-      const code = e[1]!.toLowerCase() === "x" ? Number.parseInt(e.slice(2), 16) : Number.parseInt(e.slice(1), 10)
-      return Number.isInteger(code) && code > 31 && code < 0x110000 && !(code >= 0xd800 && code <= 0xdfff) ? String.fromCodePoint(code) : " "
-    }
-    return NAMED[e.toLowerCase()] ?? " "
-  })
-
-/** Text from the web as one short plain line: markup and control characters gone, spaces collapsed, cut at `max`. */
-export const cleanText = (value: unknown, max: number): string => {
-  if (typeof value !== "string") return ""
-  // Bounded before the work: nothing here costs more than a few thousand characters.
-  const bounded = value.slice(0, max * 6 + 200)
-  const plain = decodeEntities(bounded.replace(TAG, " ")).replace(UNWANTED, " ").replace(/\s+/g, " ").trim()
-  return plain.length <= max ? plain : `${plain.slice(0, Math.max(0, max - 1)).trimEnd()}…`
-}
-
-/** The host of an http(s) address, lower case without `www.`; `undefined` for anything else. */
-export const siteOf = (url: string): string | undefined => {
-  try {
-    const u = new URL(url)
-    if (u.protocol !== "http:" && u.protocol !== "https:") return undefined
-    return u.hostname.toLowerCase().replace(/^www\./, "")
-  } catch {
-    return undefined
-  }
-}
-
 const isoDay = (value: unknown): string | undefined => {
   if (typeof value !== "string") return undefined
   const m = /^(\d{4})-(\d{2})-(\d{2})/.exec(value.trim())
@@ -103,12 +68,10 @@ const isoDay = (value: unknown): string | undefined => {
   return month >= 1 && month <= 12 && day >= 1 && day <= 31 ? `${m[1]}-${m[2]}-${m[3]}` : undefined
 }
 
-/** Whether `host` is `domain` or a subdomain of it. */
-export const inDomain = (host: string, domain: string): boolean => host === domain || host.endsWith(`.${domain}`)
-
 /**
  * Raw items to results: an address that is not a plain http(s) address of at most `URL_MAX` characters is dropped (an address
- * is never cut), so is a blocked domain, so is a second result from a host already shown; at most `MAX_RESULTS` stay.
+ * is never cut), so is a blocked domain (`blocked` holds canonical entries, `blockEntry`), so is a second result from a host
+ * already shown; at most `MAX_RESULTS` stay.
  */
 export const toResults = (items: ReadonlyArray<{ readonly title: unknown; readonly url: unknown; readonly snippet: unknown; readonly published?: unknown }>, blocked: ReadonlyArray<string>): ReadonlyArray<RawResult> => {
   const out: Array<RawResult> = []
@@ -116,8 +79,10 @@ export const toResults = (items: ReadonlyArray<{ readonly title: unknown; readon
   for (const item of items.slice(0, 50)) {
     const url = typeof item.url === "string" ? item.url.trim() : ""
     if (url === "" || url.length > URL_MAX || HAS_UNWANTED.test(url) || /\s/.test(url)) continue
+    // The block list is compared with the canonical host (lower case, IDNA, no terminal dot), as every page request is.
+    const host = hostOf(url)
     const site = siteOf(url)
-    if (site === undefined || seen.has(site) || blocked.some((d) => inDomain(site, d))) continue
+    if (host === undefined || site === undefined || seen.has(site) || isBlocked(host, blocked)) continue
     const title = cleanText(item.title, TITLE_MAX)
     const snippet = cleanText(item.snippet, SNIPPET_MAX)
     if (title === "" && snippet === "") continue
@@ -236,10 +201,12 @@ export const makeBrave = (key: string, blocked: ReadonlyArray<string>, userAgent
       if (response.status === 429) return yield* new SearchError({ reason: "rate-limited", detail: "429" })
       if (response.status < 200 || response.status > 299) return yield* new SearchError({ reason: "failed", detail: `status ${response.status}` })
       const body = objectOf(yield* parseJson(response))
-      const web = objectOf(body?.web)
-      // No `web` part at all is an answer for a query nothing matched, which Brave sends without one.
       if (body === undefined) return yield* new SearchError({ reason: "invalid", detail: "not an object" })
-      if (web === undefined) return []
+      // No `web` part at all is an answer for a query nothing matched, which Brave sends without one. A `web` part that is
+      // there with the wrong type (a list, a string, null) is a malformed answer: a failure of this provider, so the fallback runs.
+      if (!Object.hasOwn(body, "web")) return []
+      const web = objectOf(body.web)
+      if (web === undefined) return yield* new SearchError({ reason: "invalid", detail: "the web part is not an object" })
       if (!Array.isArray(web.results)) return yield* new SearchError({ reason: "invalid", detail: "no results list" })
       const items = (web.results as ReadonlyArray<unknown>).map((r) => objectOf(r)).filter((r): r is Readonly<Record<string, unknown>> => r !== undefined)
       return toResults(items.map((r) => ({ title: r.title, url: r.url, snippet: r.description, published: r.page_age })), blocked)

@@ -1,10 +1,8 @@
-// What the module stores: how many searches were made (the counter the caps read) and a ten-minute cache of search answers.
-// Nothing here is about a person: a count has no query, and the cache holds only a hash of the query with public web results.
+// What the module stores: how many searches were made, the counter the caps read, and nothing else. Nothing here is about a
+// person or a search: a row holds a month, a day, a provider's name and numbers, and its id is the month and the provider.
 import { defineCollection, type StoreTx } from "@pva/core"
 import { StoredText } from "@pva/module-contracts"
-import { createHash } from "node:crypto"
 import { Schema } from "effect"
-import { MAX_RESULTS, PUBLISHED_MAX, SITE_MAX, SNIPPET_MAX, TITLE_MAX, URL_MAX, type RawResult } from "./providers.ts"
 
 const Count = Schema.Int.check(Schema.isBetween({ minimum: 0, maximum: 1_000_000_000 }))
 
@@ -35,40 +33,8 @@ export const usage = defineCollection({
   indexes: ["month"]
 })
 
-const CachedResult = Schema.Struct({
-  title: StoredText(TITLE_MAX),
-  url: StoredText(URL_MAX),
-  snippet: StoredText(SNIPPET_MAX),
-  site: StoredText(SITE_MAX),
-  published: Schema.optionalKey(StoredText(PUBLISHED_MAX))
-})
-
-/** One cached answer; its row id is `cacheId(...)`: a hash, so the query itself is not stored. */
-export const SearchCache = Schema.Struct({
-  /** Epoch ms of the search; indexed, so expired answers are removed oldest first. */
-  at: Schema.Int.check(Schema.isBetween({ minimum: 0, maximum: 8_640_000_000_000_000 })),
-  provider: Schema.Literals(["searxng", "brave"]),
-  results: Schema.Array(CachedResult).check(Schema.isMaxLength(MAX_RESULTS))
-})
-export type SearchCache = typeof SearchCache.Type
-
-export const searchCache = defineCollection({
-  name: "search_cache",
-  scope: "household",
-  schema: SearchCache,
-  // The worst legal answer is about 7,300 characters of JSON (checkModule computes it): 7,500 lets a list read 3 rows.
-  maxChars: 7_500,
-  indexes: ["at"]
-})
-
-/** How long an answer is reused. */
-export const CACHE_TTL_MS = 10 * 60_000
 /** How long the monthly counters are kept. */
 export const KEEP_MONTHS = 14
-
-export const cacheId = (parts: ReadonlyArray<string | undefined>): string => createHash("sha256").update(JSON.stringify(parts)).digest("hex").slice(0, 40)
-
-export const asCached = (results: ReadonlyArray<RawResult>): SearchCache["results"] => results.map((r) => ({ ...r }))
 
 // ---------------------------------------------------------------------------------------------------------------------
 // Days and months
@@ -96,8 +62,8 @@ export type Kind = "searxng" | "brave" | "pages"
 export type Reservation = "ok" | "daily" | "monthly"
 
 /**
- * Every write names the module, not the turn: the store records who last wrote a row, and a shared counter or a cached answer
- * must not say which person (or which device) searched last.
+ * Every write names the module, not the turn: the store records who last wrote a row, and a shared counter must not say which
+ * person (or which device) searched last.
  */
 export const ACTOR = { kind: "module", moduleId: "web-search" } as const
 
@@ -135,6 +101,7 @@ export const bump = (tx: StoreTx, month: string, day: string, kind: Kind, microU
   const existing = rows.get(id)
   if (existing === undefined) {
     rows.insert({ month, provider: kind, queries: 1, day, dayQueries: 1, microUsd }, { id, actor: ACTOR })
+    forgetOldMonths(tx, month)
     return
   }
   rows.update(
@@ -148,6 +115,30 @@ export const bump = (tx: StoreTx, month: string, day: string, kind: Kind, microU
     }),
     { actor: ACTOR }
   )
+}
+
+/** The month `KEEP_MONTHS` before `month` (`YYYY-MM`): rows of earlier months are removed. */
+export const oldestKept = (month: string): string => {
+  const [y, m] = month.split("-").map(Number) as [number, number]
+  const total = y * 12 + (m - 1) - KEEP_MONTHS
+  return `${String(Math.floor(total / 12)).padStart(4, "0")}-${String((total % 12) + 1).padStart(2, "0")}`
+}
+
+/** The most old rows one new month's first count removes: one bounded indexed read in the same transaction. */
+export const FORGET_ROWS = 12
+
+/**
+ * Old months go when a new month starts, in the transaction that counts its first search (no job: the module schedules
+ * nothing). At most `FORGET_ROWS` rows, oldest first through the `month` index; a month writes at most three rows and each
+ * new month's first count of a kind removes up to twelve, so a backlog (the module off for years) shrinks every month.
+ */
+const forgetOldMonths = (tx: StoreTx, month: string): void => {
+  const rows = tx.collection(usage)
+  const oldest = oldestKept(month)
+  for (const row of rows.list({ orderBy: { field: "month", direction: "asc" }, limit: FORGET_ROWS })) {
+    if (row.value.month >= oldest) break
+    rows.remove(row.id, { actor: ACTOR })
+  }
 }
 
 export interface UsageSummary {
