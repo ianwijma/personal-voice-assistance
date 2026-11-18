@@ -723,10 +723,10 @@ ModuleScheduler (ctx.scheduler) = {
   cancel(id | { key }): Effect<boolean, SchedulerError>
   reschedule(id, { at } | { inMs }): Effect<JobRow | undefined, SchedulerError>
   get(id): Effect<JobRow | undefined, SchedulerError>
-  list({ key?, after?: JobRow, limit? }?): Effect<ReadonlyArray<JobRow>, SchedulerError>   // live jobs by due time, ≤ 24 a page
+  list({ key?, after?: JobRow, limit? }?): Effect<ReadonlyArray<JobRow>, SchedulerError>   // live jobs only, by due time, ≤ MAX_JOB_PAGE (10) a page
 }
 ScheduleRequest = { handler, payload?, key?, late?: "run" | { withinMs }, origin?: { assistantId?, deviceId?, person? } }
-                  & ({ at } | { inMs } | { cron, timeZone? })
+                  & ({ at } | { inMs } | { cron, timeZone? })   // cron: minute, hour, day-of-week (and seconds); day of month and month *
 JobRow  = { id, module, handler, key?, payload, state: "scheduled" | "running" | "done" | "failed" | "cancelled" | "missed",
             dueAt, cron?, timeZone?, late, origin, attempt, lastError?, failedAt?, finishedAt?, createdAt, updatedAt, rev }
 DueInfo = { jobId, key?, dueAt, lateMs, attempt }
@@ -750,19 +750,28 @@ SchedulerEngine = SchedulerHook & { forCore(owner: CoreOwner): CoreScheduler; li
   service registers with `engine.forCore("core.<name>").handle(…)` for a scope (the server's life), outside any module.
 - **The loop** is one fiber: per published handler, one indexed read of its earliest `scheduled` job (`[ready, at]`); it
   sleeps until the minimum or the maintenance pass (10 min: retention of finished rows older than 7 days in bounded
-  steps, the recovery rule, the Health issues), at most 10 s at a time with the wall-clock jump check, and is woken by
-  a schedule, reschedule, cancel, publication and a run's end. A job without a published handler is never read.
+  steps, the recovery rule, the recount of each module's live jobs, the Health issues), at most 10 s at a time with the
+  wall-clock jump check, and is woken by a schedule, reschedule, cancel, publication and a run's end. A job without a
+  published handler is never read. A pass claims in rounds of at most one job per handler, starting after the handler
+  whose job it started last (fair between handlers), until 32 run.
 - **A run**: claim (`running`, attempt + 1, the row's `rev` kept) in one transaction; the handler in a fiber of its own,
   through `PartRunner.inFlight`, with `CurrentJob` = the job's origin as its principal (the gateway admits it first),
-  within its time limit (decoding included); the outcome with `expectRev` of the claim (a conflict: rescheduled or
+  within its time limit (decoding included), forked in the engine's run scope (a core handler's in a scope of it that
+  its registration also closes); the outcome with `expectRev` of the claim (a conflict: rescheduled or
   cancelled meanwhile, dropped; a busy store: tried again, then left `running`). Interrupted because its module stopped
   or the server is stopping: left `running`. **Recovery rule**: a `running` row with no run alive here failed without
   telling (idempotent: run again within its retries; otherwise one-off `failed`, repeating moves on), applied when its
   handler is published and by the maintenance pass.
 - **Inside a module's transaction**: `prepare` (an Effect, outside) then `job.writeIn(tx)` (synchronous, inside): it
-  joins the running transaction (the store's flat transactions) and wakes the engine after the commit.
-- **Admin and doctor**: `GET /api/scheduler/jobs?cursor=&limit=` (pages: live by due time, then finished newest first;
-  the cursor is a token for the last row of a page, kept by the engine for its newest 256 pages),
+  joins the running transaction (the store's flat transactions) and wakes the engine after the commit. Every refusal
+  comes before its first write; a store failure after it must not be caught (the store cannot make a joined
+  transaction fail whatever its caller catches).
+- **Rows**: `jobs` has `maxChars` 2,500 (the worst legal row, built by the contract), so one list reads
+  `maxListRows(jobs)` = 10 rows (`MAX_JOB_PAGE`); every sweep pages with `after`. A failure text passes its module's
+  page boundary in full, then is stored well-formed and at most 200 characters as JSON.
+- **Admin and doctor**: `GET /api/scheduler/jobs?cursor=&limit=` (pages of at most 20, two reads: live by due time, then
+  finished newest first; not a snapshot; the cursor is a random token of this engine for the last row of a page, kept
+  for its newest 256 pages, since the store continues a list only after a row object a list returned),
   `POST /api/scheduler/jobs/<id>/cancel` (`serve/schedulerApi.ts`, `@pva/protocol` `scheduledJobs.ts`, no protocol
   bump), shown under Diagnostics › Scheduled jobs; issues under the source `scheduler`; `doctor` reads the failed jobs
   read-only.
