@@ -419,6 +419,44 @@ system crash can lose the last transactions committed before it (those whose log
 not treat a committed write as surviving a power cut (an alarm set a second before one may be gone). The daily backup
 is the recovery point for a damaged file.
 
+## The write-ahead log
+
+The main connection writes the log; the checkpointer (a worker thread with a connection of its own) copies it into the
+file: a truncating checkpoint after every removal and at start, a passive one when the log grew. When a checkpoint has
+copied everything, the log starts again from its beginning, and **the connection that writes next starts it and syncs
+its new header** (SQLite does so with `synchronous = NORMAL` too; it is what keeps a reused log consistent after a power
+loss). That sync takes 19 to 26 ms on the development machine's NVMe disk, far more on an SD card or a busy disk.
+
+So the worker starts the new log itself: in the same synchronous step as the checkpoint, it commits one tiny write on
+its own connection (the file header's user version, set to the value it has: a write that changes nothing, but writes
+page 1 as the new log's first frame) and pays the sync on its thread. The main thread's next commit appends to a log
+that has started and syncs nothing. No sync is skipped and no connection's `synchronous` is lowered.
+
+- **When.** After a truncating checkpoint that emptied the log, after one that copied everything but found a reader
+  at the newest snapshot (the truncation is still not done and is retried: starting a log acknowledges no removal),
+  and after a passive checkpoint that copied everything. The worker's connection makes no automatic checkpoint of its
+  own (`wal_autocheckpoint = 0`, as the main one): one would copy the frame it just wrote, and the next main-thread
+  commit would start a new log after all.
+- **The window.** A commit by another connection (in the app, the main thread) between the checkpoint and the worker's
+  write starts the log itself and syncs. The two are consecutive statements in the worker, so the window is the time
+  between them. Which connection started the log is read from the log's header (its checkpoint sequence and salts
+  change whenever a log starts again). When the worker finds the write lock taken, it tries again with the store's own
+  pauses (1 ms doubling to 100 ms, 1 s in all): the transaction holding it may write nothing or roll back, and then the
+  worker still starts the log. In `schedulerLatency.test.ts`, whose retention pass removes 400 rows in 40 transactions
+  back to back, 8 runs (5 on the real disk, 3 with two busy loops on its two cores) started 26 new logs, **all by the
+  worker; the window was not hit**. 7 times the worker's write went into the log as it was (a reader still held its
+  newest snapshot, so it could not start again; nobody synced a new header), and the lock was never taken for the whole
+  wait.
+- **A write behind the worker.** While the worker holds the write lock for its write (one or two syncs), a main-thread
+  write finds the store busy and tries again on a timer, like any busy store: the event loop is not held
+  (`logStart.test.ts`: a write behind a lock held 300 ms waited 328 to 430 ms, with a longest stop of at most 1.8 ms).
+- **Closing.** Before the main connection closes, the worker makes the last truncating checkpoint (no new log after
+  it) and closes its connection, so the main connection's close finds an empty log: nothing to copy, nothing to sync.
+- **What it changed**, on the real disk: the retention pass's longest stop went from 19.8–24.5 ms to 2.7–9.7 ms, a
+  one-row commit right after a removal's checkpoint from 13 ms (median; worst 25 ms) to 0.2 ms (worst 1.5 ms), and 40
+  removal steps of a conversation at the legal maximum, each right after a completed checkpoint, from 26–35 ms to
+  2.3 ms (`latency.test.ts`). On tmpfs nothing changed (a sync costs nothing there).
+
 ## Backups
 
 - **Only the serving process makes backups** (it holds the data directory's writer lock, and inside it backups run
@@ -468,7 +506,12 @@ removal, the removed item is in no file the store manages, as long as the server
 ## Latency
 
 Measured on the development machine (a 16-thread AMD Ryzen 9 7945HX laptop with 32 GB of memory and an NVMe disk,
-shared with other agents), behind a lock so no other test ran at the same time. The bounds below are the ones the
+shared with other agents), behind a lock so no other test ran at the same time. **The latency tests put their
+databases on a real disk** (`latencyDir()` in `packages/store-sqlite/test/latencyBound.ts`: the system temporary
+directory when it is on one, as on CI, else a directory under `node_modules/.cache/pva-latency/`): on tmpfs, which
+`/tmp` is on the development machine, a sync costs nothing, so a stop that a sync on the main thread causes could not
+show ("The write-ahead log" is the one found that way). The tables below were measured with `/tmp` on tmpfs, before
+that, except where they say "real disk". The bounds below are the ones the
 tests assert there; on CI (`process.env.CI`) the tests allow three times each bound, since shared runners are several
 times slower and noisy (`packages/store-sqlite/test/latencyBound.ts`: a CI run measured 19.6 ms for a list bounded by
 10 ms here).
@@ -512,7 +555,7 @@ The longest stop of the event loop (a 1 ms timer) while the work ran, with a tur
 | a backup (own connection, one step on SQLite's worker thread) | 2.7 ms |
 | a removal and the truncating checkpoint after it (worker thread), after a reader let the log grow | 1.6 ms |
 | ending a conversation of 3,000 rows of about 1 KB (steps of 10) | 1.8 ms |
-| ending a conversation at the legal maximum: values of 16,000 characters, eight indexed fields of 500 characters (sixteen indexes), secure deletion (steps of 10; 100 rows a step took 48 ms) | 3.4 ms |
+| ending a conversation at the legal maximum: values of 16,000 characters, eight indexed fields of 500 characters (sixteen indexes), secure deletion (steps of 10; 100 rows a step took 48 ms) | 3.4 ms (real disk: 3.6–7.7 ms) |
 | ambient facts for two modules of 64 collections, each 12 rows of 2,000 characters (`ambientLatency.test.ts`; it yields between collections, and stops at its 50 ms budget) | 2.3 ms |
 | migrating 20,000 rows of about 1 KB at start (one transaction; before the server serves) | 700 ms |
 
