@@ -44,17 +44,24 @@ describe("home-assistant: the module", () => {
       assert.deepStrictEqual(old.toolNames(), ["home_state", "home-assistant_lights_on", "home-assistant_lights_off", "home-assistant_set_brightness", "home-assistant_lights_status"])
     }))
 
-  it.effect("starts with one config request and one template; its status line and form say what it read", () =>
+  it.effect("starts with one config request and the house in pages; its status line and form say what it read", () =>
     Effect.gen(function*() {
       const ha = makeFakeHa()
       const kit = yield* startTestModule(homeAssistantModule({ fetch: ha.fetch }), configured({ aliases: "scene.movie_time: movie time" }))
       assert.strictEqual(kit.info()?.state, "running")
-      assert.deepStrictEqual(ha.requests.map((r) => `${r.method} ${r.path}`).slice(0, 2), ["GET /api/config", "POST /api/template"])
+      // The config, then one page each: the people (with the areas), the kinds the service exposes, the named scene.
+      assert.deepStrictEqual(ha.requests.map((r) => `${r.method} ${r.path}`), ["GET /api/config", "POST /api/template", "POST /api/template", "POST /api/template"])
+      assert.deepStrictEqual(ha.pages().map((p) => [p.domains, p.with_areas, p.ids]), [
+        [["person"], true, null],
+        [["light", "switch", "fan", "input_boolean", "climate", "cover", "media_player", "sensor", "binary_sensor", "lock", "alarm_control_panel"], false, null],
+        [["scene"], false, ["scene.movie_time"]]
+      ])
       assert.isTrue(ha.requests.every((r) => r.authorization === `Bearer ${TOKEN}`))
       assert.strictEqual(kit.info()?.status?.text, "5 areas · 4 lights · 12 others · HA 2026.11.1")
       assert.strictEqual(valueOf(kit, "server"), `Home 2026.11.1 at ${URL_BASE}`)
-      assert.include(valueOf(kit, "lists"), "5 areas; 4 lights, 2 switches, 1 thermostats, 3 covers, 1 media players, 2 sensors, 2 locks and alarms")
-      assert.include(valueOf(kit, "lists"), "scenes and scripts you named: Movie time")
+      assert.include(valueOf(kit, "lists"), "5 areas; 4 lights, 2 switches, 1 thermostats, 2 blinds, 1 media players, 2 sensors, 2 locks and alarms")
+      assert.include(valueOf(kit, "lists"), "1 other cover (garage doors, gates, doors and the like) only read")
+      assert.include(valueOf(kit, "lists"), "scenes that can be started: Movie time")
       // Every kind the house has, and the scene the owner named.
       assert.deepStrictEqual(kit.toolNames(), [
         "home_state",
@@ -117,10 +124,11 @@ describe("home-assistant: the module", () => {
       const kit = yield* startTestModule(homeAssistantModule({ fetch: ha.fetch }), configured())
       const before = kit.toolNames()
       const templates = () => ha.requests.filter((r) => r.path === "/api/template").length
+      // Everything so far is the start's one read.
       const read = templates()
       yield* kit.restart
       assert.strictEqual(kit.info()?.state, "running")
-      assert.strictEqual(templates(), read + 1)
+      assert.strictEqual(templates(), 2 * read)
       assert.deepStrictEqual(kit.toolNames(), before)
       const r = yield* kit.action("lights_on", { target: "kitchen" })
       assert.deepStrictEqual(r, { ok: true, say: "I've turned on the lights in Kitchen." })
@@ -169,12 +177,16 @@ describe("home-assistant: settings that are invalid", () => {
 })
 
 describe("home-assistant: health and the Test button", () => {
-  it.effect("health: nothing while it is not set up and off; the address, the token and the server when it is", () =>
+  it.effect("health: nothing and no request while it is off, set up or not; the address, the token and the server while it runs", () =>
     Effect.gen(function*() {
       const ha = makeFakeHa()
       const health = homeAssistantModule({ fetch: ha.fetch }).health!
       const base = { baseUrl: "", token: undefined, domains: ["light"] as const, aliases: "", timeoutMs: 2000, server: "", lists: "" } as never
       assert.deepStrictEqual(yield* health({ settings: base, running: false }), [])
+      // Configured, and off: Home Assistant is not contacted at all.
+      assert.deepStrictEqual(yield* health({ settings: { ...(base as object), baseUrl: URL_BASE, token: TOKEN } as never, running: false }), [])
+      assert.deepStrictEqual(yield* health({ settings: { ...(base as object), token: TOKEN } as never, running: false }), [])
+      assert.deepStrictEqual(ha.requests, [])
       assert.deepStrictEqual(yield* health({ settings: undefined, running: true }), [])
       const ids = (issues: ReadonlyArray<{ readonly id: string }>) => issues.map((i) => i.id)
       assert.deepStrictEqual(ids(yield* health({ settings: { ...(base as object), token: TOKEN } as never, running: true })), ["home-assistant.no-address"])
@@ -186,6 +198,20 @@ describe("home-assistant: health and the Test button", () => {
       ha.ok()
       const wrong = makeFakeHa({ token: "another-token" })
       assert.deepStrictEqual(ids(yield* homeAssistantModule({ fetch: wrong.fetch }).health!({ settings: good, running: true })), ["home-assistant.token-refused"])
+    }))
+
+  it.effect("configured but switched off: no request at the start, on Check again or from the host's own health run; the Test button is the owner's to press", () =>
+    Effect.gen(function*() {
+      const ha = makeFakeHa()
+      const kit = yield* startTestModule(homeAssistantModule({ fetch: ha.fetch }), { ...configured(), started: false })
+      assert.notStrictEqual(kit.info()?.state, "running")
+      assert.deepStrictEqual(yield* kit.checkHealth, [])
+      yield* kit.advance(5 * 60_000)
+      assert.deepStrictEqual(ha.requests, [])
+      const test = homeAssistantModule({ fetch: ha.fetch }).fieldActions!.test!
+      const pressed = yield* test({ settings: { baseUrl: URL_BASE, token: TOKEN, domains: ["light"], aliases: "", timeoutMs: 2000, server: "", lists: "" } as never, draft: false })
+      assert.isTrue(pressed.ok)
+      assert.isAbove(ha.requests.length, 0)
     }))
 
   it.effect("health through the host: Check again reports an unreachable Home Assistant, and clears when it answers", () =>
@@ -206,7 +232,7 @@ describe("home-assistant: health and the Test button", () => {
       const settings = { baseUrl: URL_BASE, token: TOKEN, domains: ["light"], aliases: "", timeoutMs: 2000, server: "", lists: "" } as never
       const ok = yield* test({ settings, draft: true })
       assert.isTrue(ok.ok)
-      assert.match(ok.text, /^Connected to Home \(HA 2026\.11\.1\) in \d+ ms: 5 areas, 17 devices\.$/)
+      assert.match(ok.text, /^Connected to Home \(HA 2026\.11\.1\) in \d+ ms: 5 areas, 15 devices\.$/)
       const noAddress = yield* test({ settings: { ...(settings as object), baseUrl: "" } as never, draft: true })
       assert.isFalse(noAddress.ok)
       ha.down()

@@ -1,5 +1,6 @@
 import { createServer, type IncomingMessage, type Server } from "node:http"
 import type { AddressInfo } from "node:net"
+import { PAGE_TEMPLATE, type PageVariables } from "../src/house.ts"
 
 /**
  * A fake Home Assistant HTTP server on 127.0.0.1 (random port), speaking the
@@ -60,7 +61,7 @@ export const startFakeHomeAssistant = async (options: FakeHomeAssistantOptions =
   let delayMs = options.delayMs ?? 0
   let failNext: number | undefined
 
-  // The answer of the module's inventory template (`INVENTORY_TEMPLATE` in `src/house.ts`): areas, and each light with its area.
+  // The house the module's page template reads: areas, and each light with its area.
   const areaOf = (id: string) => Object.entries(areas).find(([, a]) => a.lights.includes(id))?.[0] ?? null
   const render = () => ({
     areas: Object.entries(areas).map(([id, a]) => ({ id, name: a.name })),
@@ -90,13 +91,24 @@ export const startFakeHomeAssistant = async (options: FakeHomeAssistantOptions =
     }
     if (req.headers.authorization !== `Bearer ${token}`) return send(401, "401: Unauthorized", "text/plain")
     if (req.method === "GET" && path === "/api/config") {
-      return send(200, { location_name: "Home", version: "2026.11.1", time_zone: "Europe/Amsterdam", state: "RUNNING" })
+      return send(200, { location_name: "Home", version: "2026.11.1", time_zone: "Europe/Amsterdam", state: "RUNNING", unit_system: { temperature: "°C" } })
     }
     if (req.method === "POST" && path === "/api/template") {
       if (options.nonAdmin === true) return send(401, "401: Unauthorized", "text/plain")
-      const template = (body as { template?: string } | undefined)?.template ?? ""
-      if (!template.includes("areas()") || !template.includes("area_id(")) return send(400, { message: "unexpected template" })
-      return send(200, JSON.stringify(render()), "text/plain; charset=utf-8")
+      // The module's page template (`PAGE_TEMPLATE`), rendered from its variables: the lights of the page's domains
+      // after its cursor, at most its size, with the areas on the page that asks for them.
+      const t = body as { template?: string; variables?: PageVariables } | undefined
+      if (t?.template !== PAGE_TEMPLATE || t.variables === undefined) return send(400, { message: "unexpected template" })
+      const v = t.variables
+      const all = render()
+      const ids = all.entities.map((e) => e.id).sort().filter((id) => (v.ids !== null ? v.ids.includes(id) : v.domains.includes(id.slice(0, id.indexOf("."))) && id > v.after))
+      const shown = ids.slice(0, v.size)
+      return send(200, JSON.stringify({
+        areas: v.with_areas ? all.areas : null,
+        entities: all.entities.filter((e) => shown.includes(e.id)).sort((x, y) => (x.id < y.id ? -1 : 1)),
+        last: shown.at(-1) ?? null,
+        more: ids.length > v.size
+      }), "text/plain; charset=utf-8")
     }
     const service = /^\/api\/services\/light\/(turn_on|turn_off)$/.exec(path)
     if (req.method === "POST" && service !== null) {

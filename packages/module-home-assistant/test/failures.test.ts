@@ -3,7 +3,7 @@
 import { assert, describe, it } from "@effect/vitest"
 import { startTestModule } from "@pva/core/testing"
 import { Effect, Fiber } from "effect"
-import { HOUSE_LIMITS, homeAssistantModule } from "../src/index.ts"
+import { HOUSE_LIMITS, homeAssistantModule, OUTSIDE_NOTE } from "../src/index.ts"
 import { configured, makeFakeHa } from "./fakeHa.ts"
 
 const respond = (status: number, body: string, type = "application/json") => () => new Response(body, { status, headers: { "content-type": type } })
@@ -49,19 +49,20 @@ describe("home-assistant: unreachable", () => {
       const ha = makeFakeHa()
       const kit = yield* startTestModule(homeAssistantModule({ fetch: ha.fetch }), { ...configured(), household: { home: { HOME_LANGUAGE: "nl-NL" } } })
       ha.down("service")
-      assert.deepStrictEqual(yield* kit.action("lights_off", { target: "kitchen" }), { ok: false, code: "failed", message: "Ik kon Home Assistant niet bereiken." })
+      assert.deepStrictEqual(yield* kit.action("lights_off", { target: "kitchen" }), { ok: false, code: "failed", message: "Ik heb het naar Home Assistant gestuurd, maar kon niet nagaan of het gebeurd is; misschien wel, misschien niet." })
     }))
 })
 
 describe("home-assistant: slow", () => {
-  it.effect("a command that gets no answer stops after 3 s, within the action's 5 s, and says it may have happened", () =>
+  it.effect("a command that gets no answer stops after 3 s, within the action's 5 s, says it may or may not have happened, and is not sent again", () =>
     Effect.gen(function*() {
       const ha = makeFakeHa()
       const kit = yield* startTestModule(homeAssistantModule({ fetch: ha.fetch }), configured({ timeoutMs: 10_000 }))
       ha.hang("service")
       const fiber = yield* Effect.forkChild(kit.action("lights_off", { target: "kitchen" }))
       yield* kit.advance(3_000)
-      assert.deepStrictEqual(yield* Fiber.join(fiber), { ok: false, code: "failed", message: "Home Assistant didn't answer in time, so I don't know whether it happened." })
+      assert.deepStrictEqual(yield* Fiber.join(fiber), { ok: false, code: "failed", message: "I sent it to Home Assistant but couldn't confirm that it happened; it may or may not have." })
+      assert.strictEqual(ha.calls().length, 1)
       // A question that gets no answer says only that.
       ha.hang("template")
       const q = yield* Effect.forkChild(kit.action("lights_status"))
@@ -115,7 +116,10 @@ describe("home-assistant: rubbish", () => {
     Effect.gen(function*() {
       const ha = makeFakeHa()
       const long = "a".repeat(HOUSE_LIMITS.idChars)
+      // Every page answers the same rows: what is not of the page's kinds, or came already, is left out too.
       ha.answer("template", respond(200, JSON.stringify({
+        last: null,
+        more: false,
         areas: [{ id: "kitchen", name: "Kitchen" }, { id: "Bad Id", name: "Bad" }, { id: 5 }, "x"],
         entities: [
           { id: "light.kitchen", name: "Kitchen\nlight‮", state: "on", area: "kitchen", brightness: 9999 },
@@ -129,7 +133,7 @@ describe("home-assistant: rubbish", () => {
       }), "text/plain"))
       const kit = yield* startTestModule(homeAssistantModule({ fetch: ha.fetch }), configured())
       const r = yield* kit.tool("home_state", {})
-      assert.deepStrictEqual(r.value, { rooms: [{ room: "Kitchen", things: ["Kitchen light: on, 100%"] }, { room: "Without a room", things: ["Nameless: unknown"] }] })
+      assert.deepStrictEqual(r.value, { note: OUTSIDE_NOTE, rooms: [{ room: "Kitchen", things: ["Kitchen light: on, 100%"] }, { room: "Without a room", things: ["Nameless: unknown"] }] })
     }))
 
   it.effect("an answer larger than the limit is not read past it", () =>
@@ -143,7 +147,7 @@ describe("home-assistant: rubbish", () => {
           pull: (controller) => {
             sent += chunk.byteLength
             controller.enqueue(chunk)
-            if (sent > 64 * HOUSE_LIMITS.answerBytes) controller.close()
+            if (sent > 64 * HOUSE_LIMITS.pageBytes) controller.close()
           },
           cancel: () => void (cancelled = true)
         })
@@ -154,7 +158,7 @@ describe("home-assistant: rubbish", () => {
       assert.include(kit.info()?.status?.text ?? "", "too large")
       // A declared length over the limit is refused before the body is read.
       const declared = makeFakeHa()
-      declared.answer("template", () => new Response("{}", { status: 200, headers: { "content-length": String(HOUSE_LIMITS.answerBytes + 1) } }))
+      declared.answer("template", () => new Response("{}", { status: 200, headers: { "content-length": String(HOUSE_LIMITS.pageBytes + 1) } }))
       const other = yield* startTestModule(homeAssistantModule({ fetch: declared.fetch }), configured())
       assert.include(other.info()?.status?.text ?? "", "too large")
     }))

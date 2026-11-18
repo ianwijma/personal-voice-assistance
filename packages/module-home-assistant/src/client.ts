@@ -62,22 +62,32 @@ export interface CallLimits {
 /** The largest answer read by default (`config`, a service call): 64 KiB. */
 export const DEFAULT_MAX_BYTES = 64 * 1024
 
+/** What `GET /api/config` says: the version, the place's name, and the installation's temperature unit. */
+export interface HomeAssistantConfig {
+  readonly version: string | undefined
+  readonly locationName: string | undefined
+  /** `unit_system.temperature`: "°C" → `C`, "°F" → `F`; anything else is `undefined` (not known). */
+  readonly temperatureUnit: "C" | "F" | undefined
+}
+
 export interface HomeAssistantClient {
   readonly baseUrl: string
-  /** `GET /api/config`: the version, or a failure. */
-  readonly config: (limits?: CallLimits) => Effect.Effect<{ readonly version: string | undefined; readonly locationName: string | undefined }, HomeAssistantError>
-  /** `POST /api/template`: the rendered text. */
-  readonly renderTemplate: (template: string, limits?: CallLimits) => Effect.Effect<string, HomeAssistantError>
+  /** `GET /api/config`, or a failure. */
+  readonly config: (limits?: CallLimits) => Effect.Effect<HomeAssistantConfig, HomeAssistantError>
+  /** `POST /api/template` with the template and its `variables`: the rendered text. */
+  readonly renderTemplate: (template: string, variables: Readonly<Record<string, unknown>>, limits?: CallLimits) => Effect.Effect<string, HomeAssistantError>
   /**
    * `POST /api/services/<domain>/<service>` with `data` as the body (`?return_response` when `returnResponse`): the
-   * answer's text (the changed states, or with `returnResponse` `{ changed_states, service_response }`).
+   * answer's text (the changed states, or with `returnResponse` `{ changed_states, service_response }`), or
+   * `undefined` when Home Assistant answered with success but more than `maxBytes` (the call happened; its answer is
+   * not read).
    */
   readonly callService: (
     domain: string,
     service: string,
     data: Readonly<Record<string, unknown>>,
     limits?: CallLimits & { readonly returnResponse?: boolean | undefined }
-  ) => Effect.Effect<string, HomeAssistantError>
+  ) => Effect.Effect<string | undefined, HomeAssistantError>
 }
 
 /** Read a body as text up to `maxBytes`, stopping (and cancelling the rest) as soon as it is longer. */
@@ -136,7 +146,8 @@ export const checkAddressSetting = (text: string): string | undefined => {
 
 const ConfigResponse = Schema.Struct({
   version: Schema.optional(Schema.String),
-  location_name: Schema.optional(Schema.String)
+  location_name: Schema.optional(Schema.String),
+  unit_system: Schema.optional(Schema.Struct({ temperature: Schema.optional(Schema.String) }))
 })
 
 /** A thrown error as text: its message and its cause's code (or message), all upstream text, redacted as it enters. */
@@ -170,7 +181,7 @@ export const makeHomeAssistantClient = (options: HomeAssistantClientOptions): Ho
   // Only the credential-free form is ever shown; a refused address is shown as nothing at all.
   const shownUrl = typeof setup === "string" ? "" : setup.baseUrl
 
-  const send = (method: "GET" | "POST", path: string, body: unknown | undefined, adminOnly: boolean, limits: CallLimits) =>
+  const send = (method: "GET" | "POST", path: string, body: unknown | undefined, adminOnly: boolean, limits: CallLimits, oversizedOk = false) =>
     Effect.suspend(() => {
       if (typeof setup === "string") {
         return Effect.fail(haError({ message: "I couldn't reach Home Assistant.", kind: "unreachable", detail: `${method} ${path}: ${setup}` }))
@@ -217,7 +228,12 @@ export const makeHomeAssistantClient = (options: HomeAssistantClientOptions): Ho
             })
           )
       }),
-      Effect.flatMap(({ status, text }) => {
+      Effect.flatMap(({ status, text: body }): Effect.Effect<string | undefined, HomeAssistantError> => {
+        let text = body
+        // A successful answer too large to read: the call happened (a service call's caller says so, `responseCut`).
+        if (text === undefined && oversizedOk && status >= 200 && status < 300) return Effect.succeed(undefined)
+        // An error answer too large to read is still that error (its body is not needed to say so).
+        if (text === undefined && (status < 200 || status >= 300)) text = ""
         if (text === undefined) {
           return Effect.fail(haError({ message: "Home Assistant sent an answer that is too large.", kind: "invalid", status, detail: `${method} ${path}: more than ${maxBytes} bytes` }))
         }
@@ -252,8 +268,8 @@ export const makeHomeAssistantClient = (options: HomeAssistantClientOptions): Ho
     })
 
   // The last resort: anything unexpected (a defect) leaves as a sanitised `HomeAssistantError`.
-  const request = (method: "GET" | "POST", path: string, body: unknown | undefined, adminOnly: boolean, limits: CallLimits = {}) =>
-    send(method, path, body, adminOnly, limits).pipe(
+  const request = (method: "GET" | "POST", path: string, body: unknown | undefined, adminOnly: boolean, limits: CallLimits = {}, oversizedOk = false) =>
+    send(method, path, body, adminOnly, limits, oversizedOk).pipe(
       Effect.catchDefect((defect) =>
         Effect.fail(haError({ message: "Something went wrong talking to Home Assistant.", kind: "invalid", detail: `${method} ${path}: ${describeCause(defect, secrets)}` }))
       ),
@@ -263,7 +279,7 @@ export const makeHomeAssistantClient = (options: HomeAssistantClientOptions): Ho
   const config = (limits?: CallLimits) => request("GET", "/api/config", undefined, false, limits).pipe(
     Effect.flatMap((text) =>
       Effect.try({
-        try: () => JSON.parse(text) as unknown,
+        try: () => JSON.parse(text ?? "") as unknown,
         catch: () => haError({ message: "Home Assistant sent an unexpected answer.", kind: "invalid", detail: "GET /api/config: not JSON" })
       })
     ),
@@ -274,15 +290,18 @@ export const makeHomeAssistantClient = (options: HomeAssistantClientOptions): Ho
         )
       )
     ),
-    Effect.map((c) => ({ version: c.version, locationName: c.location_name }))
+    Effect.map((c): HomeAssistantConfig => {
+      const unit = c.unit_system?.temperature
+      return { version: c.version, locationName: c.location_name, temperatureUnit: unit === "°C" ? "C" : unit === "°F" ? "F" : undefined }
+    })
   )
 
   return {
     baseUrl: shownUrl,
     config,
     // The template endpoint is admin only: a 401 there with a token that passed /api/config means "not an admin".
-    renderTemplate: (template, limits) => request("POST", "/api/template", { template }, true, limits),
+    renderTemplate: (template, variables, limits) => Effect.map(request("POST", "/api/template", { template, variables }, true, limits), (t) => t ?? ""),
     callService: (domain, service, data, limits) =>
-      request("POST", `/api/services/${domain}/${service}${limits?.returnResponse === true ? "?return_response" : ""}`, data, false, limits)
+      request("POST", `/api/services/${domain}/${service}${limits?.returnResponse === true ? "?return_response" : ""}`, data, false, limits, true)
   }
 }

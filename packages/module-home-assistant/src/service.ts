@@ -15,9 +15,9 @@ import {
   REFUSED_DOMAINS,
   TARGET_DATA_KEYS
 } from "@pva/module-contracts"
-import { Effect, Latch, Queue, Stream } from "effect"
+import { Cause, Effect, Latch, Stream } from "effect"
 import type { CallLimits, HomeAssistantError as ClientError } from "./client.ts"
-import type { Entity, House, Kind } from "./house.ts"
+import type { Entity, House } from "./house.ts"
 import { fromUpstream, type Secrets } from "./redact.ts"
 
 /**
@@ -25,23 +25,20 @@ import { fromUpstream, type Secrets } from "./redact.ts"
  * and the one checked path every service call takes, the module's own actions' included.
  *
  * **Polling** ("In this version the provider polls"): the shared part reads the house every 60 s (and when a question
- * asks for it now). Each kept read is a poll: `polled(house)` after a good one, `failed()` after a bad one.
+ * asks for it now). Each kept read is a poll: `polled(read)` after a good one, `failed()` after a bad one.
  *
- * - **Exposed** = the entities of the kinds chosen in the module's shared `domains` setting (read at each poll with
- *   `settingsFor(undefined)`), plus every `person` entity. Scenes and scripts are not exposed: they are not a kind of
- *   `domains`, and a script is refused to every consumer anyway. The module's own tools never read a person.
+ * - **Exposed** = people, and the entities of the kinds chosen in the module's shared `domains` setting (read first,
+ *   so the module's other kinds never use the provider's room). Scenes and scripts are never exposed.
  * - **`connection()`**: `unknown` until the first good poll; `connected` while polls succeed; `reconnecting` after one
  *   fails, with the cache as it was.
  * - **Changes**: after a good poll that follows a good poll, one `changed` or `removed` per entity that differs, in
  *   entity id order; after a good poll that follows `unknown` or `reconnecting`, a `connection` and one `snapshot`
  *   (`reconnected`), never changes. After a failed poll that follows a good one, a `connection` (`reconnecting`).
- *   Areas come only in snapshots (`areas()` always answers the newest).
- * - **A subscriber** has its own list of what it has not taken. When it holds more than `HA_LIMITS.queue` changes, the
- *   list is dropped and the next thing it takes is a `snapshot` (`overflow`) of the cache at that moment; nothing is
- *   added to the list until it has taken that snapshot (the snapshot covers it). Its stream ends when the consumer's
- *   scope closes or the part closes.
- * - **After the part closed**: every method throws `ModuleStopped` (`callService` dies with it; a stream already given
- *   ends).
+ * - **A subscriber** pulls: nothing is made for it before it asks for the next item, so nothing is buffered outside its
+ *   own list of what it has not taken. When that list holds more than `HA_LIMITS.queue` changes it is dropped, and
+ *   the next item the subscriber takes is a `snapshot` (`overflow`) of the cache at that moment; nothing is added to
+ *   the list until it has taken it. Its stream ends when the consumer's scope closes or the part closes.
+ * - **After the part closed**: every method throws `ModuleStopped` (`callService` dies with it; a stream ends).
  */
 
 /** What a checked call may not do, or what went wrong: the contract's reason, a line for the log, the client's error. */
@@ -50,18 +47,12 @@ export interface CallProblem {
   readonly detail: string
   /** The client's error when Home Assistant was asked: the module's own actions word it more closely. */
   readonly cause?: ClientError
+  /** The request was sent (or may have been): whether it happened is not known. */
+  readonly unconfirmed?: boolean
 }
 
-/** Who calls: a consumer of the transport, or the module's own actions (which may run the scenes and scripts the owner named). */
+/** Who calls: a consumer of the transport, or the module's own actions (which may run the scenes the owner named). */
 export type Caller = "consumer" | "own"
-
-/** The kinds the transport exposes for a `domains` value (scenes and scripts never; people always). */
-export const exposedKinds = (domains: ReadonlyArray<string> | undefined): ReadonlySet<Kind> => {
-  const chosen = domains ?? ["light", "switch", "climate", "cover", "media_player", "sensor", "lock"]
-  const kinds = new Set<Kind>(["person"])
-  for (const d of chosen) if (d !== "scene" && d !== "person") kinds.add(d as Kind)
-  return kinds
-}
 
 const ID_PART = /^[a-z0-9_]+$/
 const ENTITY_ID = /^([a-z0-9_]+)\.[a-z0-9_]+$/
@@ -109,26 +100,31 @@ export const toHaEntity = (e: Entity): HaEntity => {
 interface Subscriber {
   pending: Array<HaChange>
   overflowed: boolean
+  ended: boolean
   readonly latch: Latch.Latch
-  readonly end: () => void
 }
 
 export interface TransportDeps {
-  /** The kinds exposed now (the shared `domains`, read at each poll). */
-  readonly kinds: () => ReadonlySet<Kind>
   /** The client's service call. */
-  readonly call: (domain: string, service: string, data: Readonly<Record<string, unknown>>, limits: CallLimits & { readonly returnResponse?: boolean }) => Effect.Effect<string, ClientError>
+  readonly call: (domain: string, service: string, data: Readonly<Record<string, unknown>>, limits: CallLimits & { readonly returnResponse?: boolean }) => Effect.Effect<string | undefined, ClientError>
   /** The longest one request to Home Assistant may take (the module's `timeoutMs`). */
   readonly timeoutMs: number
   readonly secrets: Secrets
 }
 
+/** A poll as the transport takes it: the house, and what of it is exposed, each entity with its JSON. */
+export interface Polled {
+  readonly house: House
+  readonly exposed: ReadonlyArray<{ readonly entity: HaEntity; readonly json: string }>
+}
+
 export const makeTransport = (deps: TransportDeps) => {
+  const secrets = deps.secrets.filter((s): s is string => typeof s === "string" && s.length > 0)
   let connection: HaConnection = "unknown"
   let entities: ReadonlyArray<HaEntity> = []
   let byId = new Map<string, { readonly entity: HaEntity; readonly json: string }>()
   let areas: ReadonlyArray<HaArea> = []
-  /** The house of the last good poll, for the module's own calls (which may act on what the assistant chose). */
+  /** The house of the last good poll, for the checks of a call and the module's own calls. */
   let house: House | undefined
   let closed = false
   const subscribers = new Set<Subscriber>()
@@ -145,7 +141,7 @@ export const makeTransport = (deps: TransportDeps) => {
     for (const sub of subscribers) {
       // Behind already: the snapshot it will take covers these.
       if (sub.overflowed) continue
-      sub.pending.push(...changes)
+      for (const c of changes) sub.pending.push(c)
       if (sub.pending.length > HA_LIMITS.queue) {
         sub.pending = []
         sub.overflowed = true
@@ -154,30 +150,42 @@ export const makeTransport = (deps: TransportDeps) => {
     }
   }
 
-  /** A good poll: the cache follows it, and the subscribers learn what changed (or get a snapshot, see above). */
-  const polled = (next: House) => {
+  /** A good poll: the cache follows it in one step, and the subscribers learn what changed (or get a snapshot). */
+  const polled = (next: Polled) => {
     if (closed) return
-    house = next
-    const kinds = deps.kinds()
-    const exposed = next.entities.filter((e) => kinds.has(e.kind)).map(toHaEntity)
-    const nextById = new Map(exposed.map((e) => [e.entityId, { entity: e, json: JSON.stringify(e) }] as const))
+    house = next.house
+    const nextById = new Map(next.exposed.map((x) => [x.entity.entityId, x] as const))
     const before = byId
     const wasLive = connection === "connected"
-    entities = exposed
+    entities = next.exposed.map((x) => x.entity)
     byId = nextById
-    areas = next.areas.map((a) => ({ id: a.id, name: a.name, aliases: a.aliases }))
+    areas = next.house.areas.map((a) => ({ id: a.id, name: a.name, aliases: a.aliases }))
     connection = "connected"
     if (!wasLive) {
       push([{ _tag: "connection", connection: "connected" }, snapshot("reconnected")])
       return
     }
-    const ids = [...new Set([...before.keys(), ...nextById.keys()])].sort()
+    // Both lists are in id order: one merge.
     const changes: Array<HaChange> = []
-    for (const id of ids) {
-      const was = before.get(id)
-      const now = nextById.get(id)
-      if (now === undefined) changes.push({ _tag: "removed", entityId: id })
-      else if (was === undefined || was.json !== now.json) changes.push({ _tag: "changed", entity: now.entity, previous: was?.entity })
+    const was = [...before.keys()]
+    const now = next.exposed
+    let i = 0
+    let j = 0
+    while (i < was.length || j < now.length) {
+      const a = was[i]
+      const b = now[j]?.entity.entityId
+      if (b === undefined || (a !== undefined && a < b)) {
+        changes.push({ _tag: "removed", entityId: a! })
+        i++
+      } else if (a === undefined || b < a) {
+        changes.push({ _tag: "changed", entity: now[j]!.entity, previous: undefined })
+        j++
+      } else {
+        const old = before.get(a)!
+        if (old.json !== now[j]!.json) changes.push({ _tag: "changed", entity: now[j]!.entity, previous: old.entity })
+        i++
+        j++
+      }
     }
     push(changes)
   }
@@ -189,40 +197,43 @@ export const makeTransport = (deps: TransportDeps) => {
     push([{ _tag: "connection", connection: "reconnecting" }])
   }
 
+  /** The next item a subscriber takes, made when it asks: the overflow snapshot of the cache now, or its oldest change. */
+  const next = (sub: Subscriber): Effect.Effect<readonly [HaChange], Cause.Done> =>
+    Effect.gen(function*() {
+      while (true) {
+        if (sub.ended || closed) return yield* Cause.done()
+        if (sub.overflowed) {
+          sub.overflowed = false
+          sub.pending = []
+          return [snapshot("overflow")] as const
+        }
+        const head = sub.pending.shift()
+        if (head !== undefined) return [head] as const
+        yield* sub.latch.close
+        if (sub.pending.length === 0 && !sub.overflowed && !sub.ended && !closed) yield* sub.latch.await
+      }
+    })
+
   const changes = (): Stream.Stream<HaChange> => {
     live()
-    return Stream.callback<HaChange>((queue) =>
-      Effect.gen(function*() {
-        const latch = yield* Latch.make(false)
-        const sub: Subscriber = { pending: [snapshot("subscribed")], overflowed: false, latch, end: () => void Queue.endUnsafe(queue) }
-        if (closed) return yield* Queue.end(queue)
-        subscribers.add(sub)
-        yield* Effect.addFinalizer(() => Effect.sync(() => void subscribers.delete(sub)))
-        // One item at a time into a buffer of one: what the consumer has not taken stays in `pending`, where an
-        // overflow can replace it with a snapshot.
-        while (true) {
-          yield* latch.close
-          if (sub.pending.length === 0 && !sub.overflowed) yield* latch.await
-          let next: HaChange
-          if (sub.overflowed) {
-            sub.overflowed = false
-            sub.pending = []
-            next = snapshot("overflow")
-          } else {
-            const head = sub.pending.shift()
-            if (head === undefined) continue
-            next = head
-          }
-          if (!(yield* Queue.offer(queue, next))) return
-        }
-      }), { bufferSize: 1, strategy: "suspend" })
+    return Stream.unwrap(Effect.gen(function*() {
+      const sub: Subscriber = { pending: [], overflowed: false, ended: false, latch: yield* Latch.make(false) }
+      if (closed) return Stream.empty
+      sub.pending.push(snapshot("subscribed"))
+      subscribers.add(sub)
+      yield* Effect.addFinalizer(() => Effect.sync(() => void subscribers.delete(sub)))
+      return Stream.fromPull(Effect.succeed(next(sub)))
+    }))
   }
+
+  /** Whether any text of `json` holds a configured secret. */
+  const holdsSecret = (json: string) => secrets.some((s) => json.includes(s))
 
   /**
    * The one checked path of every service call (the contract's "How a call names what it acts on"), before anything
-   * reaches Home Assistant: the form, the bounds, the target keys in `data`, the refused domains (a script the owner
-   * named is the module's own exception), the security covers, the connection, the exposure. Then one request within
-   * `limitMs` (at most the contract's `callTimeoutMs`).
+   * reaches Home Assistant: the form, the bounds, the target keys in `data`, the refused domains, covers that are not
+   * of a blind class, the connection, the exposure (the module's own: a runnable scene). Then one request within
+   * `limitMs` (at most the contract's `callTimeoutMs`), never retried.
    */
   const checked = (call: HaServiceCall, caller: Caller, limitMs: number): Effect.Effect<HaServiceResult, CallProblem> =>
     Effect.suspend((): Effect.Effect<HaServiceResult, CallProblem> => {
@@ -249,28 +260,45 @@ export const makeTransport = (deps: TransportDeps) => {
         data = JSON.parse(text) as JsonObject
         if (namesTarget(data)) return refuse("refused", "data names a target itself")
       }
-      const ownScene = (id: string) => caller === "own" && service === "turn_on" && (domain === "scene" || domain === "script") && house?.byId.get(id)?.runnable === true
-      if (REFUSED_DOMAINS.includes(domain) && !ids.every(ownScene)) return refuse("refused", `the ${domain} domain is refused`)
+      if (REFUSED_DOMAINS.includes(domain)) return refuse("refused", `the ${domain} domain is refused`)
       for (const id of ids) {
         const match = id.length <= HA_LIMITS.idChars ? ENTITY_ID.exec(id) : null
         if (match === null) return refuse("unknown_entity", "an entity id that is not Home Assistant's form")
-        if (REFUSED_DOMAINS.includes(match[1]!) && !ownScene(id)) return refuse("refused", `an entity of the refused ${match[1]} domain`)
-        if (house?.byId.get(id)?.security === true) return refuse("refused", "a garage door, a gate or a door")
+        if (REFUSED_DOMAINS.includes(match[1]!)) return refuse("refused", `an entity of the refused ${match[1]} domain`)
+        // A cover is moved only when it is known to be a blind, curtain, shade, shutter or awning: a garage door, a gate,
+        // a door, a cover of a class this module does not know and a cover without a class are all refused.
+        if (match[1] === "cover") {
+          const e = house?.byId.get(id)
+          if (e !== undefined && !e.blind) return refuse("refused", "a cover that is not of a blind class (a garage door, a gate, a door, or no class)")
+        }
+        // A scene runs only for the module's own action, when every entity it sets is one this module changes itself.
+        if (match[1] === "scene" && caller === "own" && house?.byId.get(id)?.runnable !== true) return refuse("refused", "a scene that sets something this module does not change")
       }
       if (connection !== "connected") return refuse("not_connected", `the last poll of Home Assistant ${connection === "unknown" ? "has not succeeded yet" : "failed"}`)
       for (const id of ids) {
-        const known = caller === "consumer" ? byId.has(id) : house?.byId.has(id) === true && (house.byId.get(id)!.kind !== "person")
+        const own = house?.byId.get(id)
+        const known = caller === "consumer"
+          ? byId.has(id) && (!id.startsWith("cover.") || own?.blind === true)
+          : own !== undefined && own.kind !== "person" && (own.kind !== "cover" || own.blind)
         if (!known) return refuse("unknown_entity", "an entity that is not exposed")
       }
       const returnResponse = call.returnResponse === true
       return deps.call(domain, service, { ...data, entity_id: [...ids] }, { timeoutMs: Math.min(limitMs, HA_LIMITS.callTimeoutMs), maxBytes: 256 * 1024, returnResponse }).pipe(
-        Effect.mapError((e): CallProblem => ({
-          reason: e.kind === "timeout" ? "timeout" : e.kind === "unreachable" ? "not_connected" : "failed",
-          detail: fromUpstream(`${domain}.${service}: ${e.detail}`, deps.secrets),
-          cause: e
-        })),
+        Effect.mapError((e): CallProblem => {
+          // Home Assistant answered with an error: it says so. Anything else (no answer, a broken connection, an answer
+          // that could not be read) after the request was sent: it may or may not have happened, and is never retried.
+          const answered = e.kind === "http" || e.kind === "unauthorized" || e.kind === "forbidden"
+          return {
+            reason: answered ? "failed" : "timeout",
+            detail: fromUpstream(`${domain}.${service}: ${answered ? "" : "no confirmed answer (it may or may not have happened): "}${e.detail}`, deps.secrets),
+            cause: e,
+            ...(answered ? {} : { unconfirmed: true })
+          }
+        }),
         Effect.map((text): HaServiceResult => {
           if (!returnResponse) return {}
+          // Home Assistant said it was done, with an answer too large to read: the call happened, its answer is cut.
+          if (text === undefined) return { responseCut: true }
           let response: unknown
           try {
             response = (JSON.parse(text) as { readonly service_response?: unknown } | null)?.service_response
@@ -279,7 +307,8 @@ export const makeTransport = (deps: TransportDeps) => {
           }
           if (response === undefined) return {}
           const json = JSON.stringify(response)
-          return json === undefined || json.length > HA_LIMITS.responseChars ? { responseCut: true } : { response: JSON.parse(json) as Json }
+          // An answer that holds a configured secret is never handed on, nor rewritten: it is cut.
+          return json === undefined || json.length > HA_LIMITS.responseChars || holdsSecret(json) ? { responseCut: true } : { response: JSON.parse(json) as Json }
         })
       )
     })
@@ -324,7 +353,10 @@ export const makeTransport = (deps: TransportDeps) => {
     /** The part closed: every stream ends, every method answers `ModuleStopped`. */
     close: () => {
       closed = true
-      for (const sub of subscribers) sub.end()
+      for (const sub of subscribers) {
+        sub.ended = true
+        sub.latch.openUnsafe()
+      }
       subscribers.clear()
     },
     subscriberCount: () => subscribers.size

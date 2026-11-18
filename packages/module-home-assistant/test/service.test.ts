@@ -11,6 +11,8 @@ import { homeAssistantModule } from "../src/index.ts"
 import { CHANGED_AT, configured, type FakeEntity, makeFakeHa } from "./fakeHa.ts"
 
 const POLL = 60_000
+/** Let a background read of a house of several pages finish (each page is a real yield). */
+const settle = Effect.repeat(Effect.yieldNow, { times: 200 })
 
 const start = (options: { readonly entities?: Record<string, FakeEntity>; readonly down?: boolean; readonly settings?: Readonly<Record<string, unknown>> } = {}) =>
   Effect.gen(function*() {
@@ -90,7 +92,7 @@ describe("HomeAssistant service: state", () => {
       assert.deepStrictEqual(service.entities().map((e) => e.entityId), ["media_player.kitchen", "person.robin"])
     }))
 
-  it.effect("bounds: an entity whose id breaks the bound is left out, never cut; at most the contract's number of entities", () =>
+  it.effect("bounds: an entity whose id breaks the bound or Home Assistant's form is left out, never cut (the number of entities: house.test.ts)", () =>
     Effect.gen(function*() {
       const entities: Record<string, FakeEntity> = { [`light.${"a".repeat(HA_LIMITS.idChars)}`]: { state: "on" }, "light.Upper": { state: "on" }, "person.sam": { name: "Sam", state: "home" } }
       const { service } = yield* start({ entities })
@@ -207,10 +209,12 @@ describe("HomeAssistant service: changes", () => {
       yield* Effect.yieldNow
       for (const e of Object.values(entities)) e.state = "on"
       yield* kit.advance(POLL)
+      yield* settle
       yield* Deferred.succeed(release, undefined)
       yield* kit.advance(0)
       entities["light.l0000"]!.state = "off"
       yield* kit.advance(POLL)
+      yield* settle
       assert.deepStrictEqual(got.map(tag), ["snapshot:subscribed", "snapshot:overflow", "changed:light.l0000"])
       const overflow = got[1] as Extract<HaChange, { _tag: "snapshot" }>
       assert.isTrue(overflow.entities.every((e) => e.state === "on"))
@@ -310,14 +314,22 @@ describe("HomeAssistant service: callService", () => {
       assert.strictEqual(ha.requests.length, before)
     }))
 
-  it.effect("the module's own actions take the same checked path: a script the owner named runs, the transport's consumers may not", () =>
+  it.effect("scripts are cut: a script named under Other names is ignored (the setting stays valid), no action runs one, and no consumer may", () =>
     Effect.gen(function*() {
-      const { ha, kit, service } = yield* start({ settings: { aliases: "script.goodnight: goodnight" } })
-      assert.deepStrictEqual(yield* kit.action("scene_activate", { scene: "goodnight" }), { ok: true, say: "I've started Goodnight." })
-      assert.deepStrictEqual(ha.calls(), [{ service: "script.turn_on", body: { entity_id: ["script.goodnight"] } }])
+      const { ha, kit, service } = yield* start({ settings: { aliases: "script.goodnight: goodnight\nscene.movie_time: movie time" } })
+      assert.strictEqual(kit.info()?.state, "running")
+      assert.include(String(kit.info()?.settings.values.lists), "1 script named under Other names: scripts are not run in this version")
+      const r = yield* kit.action("scene_activate", { scene: "goodnight" })
+      assert.isFalse(r.ok)
+      const tool = yield* kit.tool("home-assistant_scene_activate", { scene: "script.goodnight" })
+      assert.isFalse(tool.ok)
       const consumer = yield* Effect.flip(service.callService({ domain: "script", service: "turn_on", target: { entityIds: ["script.goodnight"] } }))
       assert.strictEqual(consumer.reason, "refused")
-      assert.strictEqual(ha.calls().length, 1)
+      const through = yield* Effect.flip(service.callService({ domain: "homeassistant", service: "turn_on", target: { entityIds: ["script.goodnight"] } }))
+      assert.strictEqual(through.reason, "refused")
+      assert.deepStrictEqual(ha.calls(), [])
+      // Not even read: no script is in the house the module knows.
+      assert.isFalse(ha.pages().some((p) => p.domains.includes("script") || (p.ids ?? []).includes("script.goodnight")))
     }))
 })
 

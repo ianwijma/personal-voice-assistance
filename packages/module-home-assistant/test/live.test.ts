@@ -1,6 +1,7 @@
 import { describe, expect, it } from "@effect/vitest"
 import { Effect } from "effect"
-import { decodeHouse, INVENTORY_TEMPLATE, makeHomeAssistantClient, targetOptions } from "../src/index.ts"
+import { CHOICE_KINDS, makeHomeAssistantClient, targetIndex } from "../src/index.ts"
+import { readHouse } from "../src/inventory.ts"
 
 /**
  * Opt-in test against a real Home Assistant. Skipped unless both are set:
@@ -8,8 +9,8 @@ import { decodeHouse, INVENTORY_TEMPLATE, makeHomeAssistantClient, targetOptions
  *   HOME_ASSISTANT_URL=http://homeassistant.local:8123 HOME_ASSISTANT_TOKEN=... \
  *     pnpm --filter @pva/module-home-assistant exec vitest run test/live.test.ts --silent=false
  *
- * Read-only by default: it renders the module's inventory template, decodes it and prints the rooms and the targets of
- * each kind, with the time each request took. It switches something only when HOME_ASSISTANT_LIVE_TOGGLE names one
+ * Read-only by default: it reads the house page by page with the module's template and prints the rooms and the names
+ * of each kind's target, with the time the reads took. It switches something only when HOME_ASSISTANT_LIVE_TOGGLE names one
  * light entity (e.g. light.desk_lamp): that light is toggled and then put back. It runs the client and the decoder
  * directly (real time), not the test kit (whose clock is a test clock).
  */
@@ -24,17 +25,12 @@ describe.skipIf(url === undefined || url === "" || token === undefined || token 
       const t0 = performance.now()
       const config = yield* client.config()
       const t1 = performance.now()
-      const text = yield* client.renderTemplate(INVENTORY_TEMPLATE, { maxBytes: 1024 * 1024 })
+      const { house } = yield* readHouse({ client, secrets: [token!], aliases: "", exposed: new Set(CHOICE_KINDS), limitMs: 10_000, now: Date.now(), temperatureUnit: config.temperatureUnit })
       const t2 = performance.now()
-      const decoded = decodeHouse(text, "", Date.now())
-      const t3 = performance.now()
-      expect(decoded.ok).toBe(true)
-      if (!decoded.ok) return
-      const house = decoded.house
-      console.log(`HA ${config.version}: config ${(t1 - t0).toFixed(0)} ms, template ${(t2 - t1).toFixed(0)} ms (${text.length} chars), decode ${(t3 - t2).toFixed(1)} ms`)
-      console.log(`${house.areas.length} areas, ${house.entities.length} entities, ${house.leftOut} left out`)
+      console.log(`HA ${config.version} (${config.temperatureUnit ?? "unit not read"}): config ${(t1 - t0).toFixed(0)} ms, the house in pages ${(t2 - t1).toFixed(0)} ms`)
+      console.log(`${house.areas.length} areas, ${house.entities.length} entities, ${house.leftOut} left out, incomplete: ${[...house.incomplete].join(", ") || "no"}`)
       for (const kind of ["light", "switch", "climate", "cover"] as const) {
-        console.log(`${kind}:\n` + targetOptions(house, kind).map((t) => `  ${t.value}  "${t.label}"  ${(t.aliases ?? []).join(", ")}`).join("\n"))
+        console.log(`${kind}:\n` + targetIndex(house, kind).options.map((t) => `  ${t.value}  "${t.label}"  ${(t.aliases ?? []).join(", ")}`).join("\n"))
       }
       if (toggle !== undefined && toggle !== "") {
         expect(toggle.startsWith("light.")).toBe(true)

@@ -1,8 +1,12 @@
 /**
  * An in-process fake of the three Home Assistant endpoints the module uses, as a `fetch` function: no socket, no
- * network. It records every request, keeps a small house whose state follows service calls, and can be told to be
- * down, to hang until the call is aborted, or to answer anything for one path.
+ * network. It records every request, keeps a small house whose state follows service calls, renders the module's page
+ * template from its `variables` as Home Assistant would (`PAGE_TEMPLATE` in `src/house.ts`: the domains, the cursor,
+ * the page size, the cut at `keep` characters, a scene's members), and can be told to be down, to hang until the call
+ * is aborted, or to answer anything for one path.
  */
+import { PAGE_TEMPLATE, type PageVariables } from "../src/house.ts"
+
 export type Fetch = typeof globalThis.fetch
 
 export interface FakeEntity {
@@ -20,8 +24,12 @@ export interface FakeEntity {
   title?: string | null
   artist?: string | null
   volume?: number | null
+  /** A scene's `entity_id` attribute: the entities it sets (absent: Home Assistant lists none). */
+  members?: Array<string> | null
   /** Home Assistant's `last_changed`, epoch seconds (default: a fixed time). */
   changed?: number | null
+  /** Anything else Home Assistant's answer carries for it (a proxy's extras, a person's area): the decoder drops it. */
+  extra?: Record<string, unknown>
 }
 
 /** The default `last_changed` of the fake's entities: 2026-11-18 08:00 UTC, in seconds. */
@@ -50,19 +58,19 @@ export const defaultEntities = (): Record<string, FakeEntity> => ({
   "switch.coffee": { name: "Coffee machine", state: "off", area: "kitchen" },
   "fan.bedroom": { name: "Bedroom fan", state: "off", area: "bedroom" },
   "climate.living_room": { name: "Living room thermostat", state: "heat", area: "living_room", current: 18.5, target: 20, modes: ["off", "heat", "auto"] },
-  "cover.living_room_blinds": { name: "Living room blinds", state: "open", area: "living_room", position: 100, features: 15 },
-  "cover.bedroom_blinds": { name: "Bedroom blinds", state: "closed", area: "bedroom", features: 3 },
+  "cover.living_room_blinds": { name: "Living room blinds", state: "open", area: "living_room", class: "blind", position: 100, features: 15 },
+  "cover.bedroom_blinds": { name: "Bedroom blinds", state: "closed", area: "bedroom", class: "shade", features: 3 },
   "cover.garage_door": { name: "Garage door", state: "closed", area: "garage", class: "garage", features: 3 },
   "sensor.kitchen_temperature": { name: "Kitchen temperature", state: "21.3", area: "kitchen", class: "temperature", unit: "°C" },
   "binary_sensor.back_door": { name: "Back door", state: "off", area: "hall", class: "door" },
   // A sensor without a class (Home Assistant's companion app makes these): never read.
   "sensor.robins_phone_geocoded_location": { name: "Robin's phone location", state: "Dorpsstraat 1, Utrecht" },
-  // A person: never read by this module.
+  // A person: read for the HomeAssistant service only.
   "person.robin": { name: "Robin", state: "not_home" },
   "lock.front_door": { name: "Front door", state: "locked", area: "hall" },
   "alarm_control_panel.home": { name: "Alarm", state: "disarmed" },
   "media_player.kitchen": { name: "Kitchen speaker", state: "playing", area: "kitchen", title: "So What", artist: "Miles Davis" },
-  "scene.movie_time": { name: "Movie time", state: "2026-11-17T20:00:00+00:00", area: "living_room" },
+  "scene.movie_time": { name: "Movie time", state: "2026-11-17T20:00:00+00:00", area: "living_room", members: ["light.ceiling", "cover.living_room_blinds", "media_player.kitchen"] },
   "script.goodnight": { name: "Goodnight", state: "off" }
 })
 
@@ -81,34 +89,73 @@ const hang = (init?: RequestInit) =>
     signal?.addEventListener("abort", () => reject(new DOMException("This operation was aborted", "AbortError")))
   })
 
-export const makeFakeHa = (options: { readonly token?: string; readonly areas?: Record<string, string>; readonly entities?: Record<string, FakeEntity>; readonly nonAdmin?: boolean } = {}) => {
+const SENSOR_DOMAINS = ["sensor", "binary_sensor"]
+const domainOf = (id: string) => id.slice(0, id.indexOf("."))
+/** Python's `s[:n]` on a string, as the template does it (code units are close enough for the fake's texts). */
+const cut = (v: unknown, n: number) => (typeof v === "string" ? v.slice(0, n) : null)
+
+export interface FakeHaOptions {
+  readonly token?: string
+  readonly areas?: Record<string, string>
+  readonly entities?: Record<string, FakeEntity>
+  readonly nonAdmin?: boolean
+  /** `unit_system.temperature` of `/api/config` (default "°C"). */
+  readonly unit?: string
+  readonly locationName?: string
+}
+
+export const makeFakeHa = (options: FakeHaOptions = {}) => {
   const token = options.token ?? TOKEN
   const areas = options.areas ?? defaultAreas()
   const entities = options.entities ?? defaultEntities()
   const requests: Array<FakeRequest> = []
   const behaviour = new Map<Route, Behaviour>()
+  const config = { location_name: options.locationName ?? "Home", version: "2026.11.1", unit_system: { temperature: options.unit ?? "°C" } }
 
-  const render = () => ({
-    areas: Object.entries(areas).map(([id, name]) => ({ id, name })),
-    entities: Object.entries(entities).map(([id, e]) => ({
-      id,
-      name: e.name ?? null,
-      state: e.state,
-      area: e.area ?? null,
-      class: e.class ?? null,
-      brightness: e.brightness ?? null,
-      current: e.current ?? null,
-      target: e.target ?? null,
-      modes: e.modes ?? null,
-      position: e.position ?? null,
-      features: e.features ?? null,
-      unit: e.unit ?? null,
-      title: e.title ?? null,
-      artist: e.artist ?? null,
-      volume: e.volume ?? null,
-      changed: e.changed === undefined ? CHANGED_AT : e.changed
-    }))
-  })
+  /** The page template rendered as Home Assistant would, from its variables. */
+  const page = (v: PageVariables) => {
+    const ids = Object.keys(entities).sort()
+    const picked = v.ids !== null ? ids.filter((id) => v.ids!.includes(id)) : ids.filter((id) => v.domains.includes(domainOf(id)) && id > v.after)
+    const shown = picked.slice(0, v.size)
+    const rows: Array<unknown> = []
+    for (const id of shown) {
+      const e = entities[id]!
+      const d = domainOf(id)
+      if (d === "person") {
+        rows.push({ id, name: cut(e.name ?? id, v.keep), state: cut(e.state, v.keep), changed: e.changed === undefined ? CHANGED_AT : e.changed, ...e.extra })
+        continue
+      }
+      if (SENSOR_DOMAINS.includes(d) && !v.classes.includes(e.class ?? "")) continue
+      const members = d === "scene" && Array.isArray(e.members) ? e.members.slice(0, v.max_members).map((m) => ({ id: cut(m, v.keep), class: entities[m]?.class ?? null })) : null
+      rows.push({
+        id,
+        name: cut(e.name ?? id, v.keep),
+        state: cut(e.state, v.keep),
+        changed: e.changed === undefined ? CHANGED_AT : e.changed,
+        area: e.area ?? null,
+        class: cut(e.class, v.keep),
+        brightness: e.brightness ?? null,
+        current: e.current ?? null,
+        target: e.target ?? null,
+        modes: e.modes ?? null,
+        position: e.position ?? null,
+        features: e.features ?? null,
+        unit: cut(e.unit, v.keep),
+        title: cut(e.title, v.keep),
+        artist: cut(e.artist, v.keep),
+        volume: e.volume ?? null,
+        members,
+        member_count: d === "scene" && Array.isArray(e.members) ? e.members.length : null,
+        ...e.extra
+      })
+    }
+    return {
+      areas: v.with_areas ? Object.entries(areas).slice(0, v.max_areas).map(([id, name]) => ({ id, name: cut(name, v.keep) })) : null,
+      entities: rows,
+      last: shown.at(-1) ?? null,
+      more: picked.length > v.size
+    }
+  }
 
   const json = (status: number, payload: unknown, type = "application/json") =>
     new Response(typeof payload === "string" ? payload : JSON.stringify(payload), { status, headers: { "content-type": type } })
@@ -156,12 +203,12 @@ export const makeFakeHa = (options: { readonly token?: string; readonly areas?: 
     if (b?.kind === "hang") return hang(init)
     if (b?.kind === "answer") return b.answer(init)
     if (headers.get("authorization") !== `Bearer ${token}`) return json(401, "401: Unauthorized", "text/plain")
-    if (init?.method === "GET" && path === "/api/config") return json(200, { location_name: "Home", version: "2026.11.1" })
+    if (init?.method === "GET" && path === "/api/config") return json(200, config)
     if (init?.method === "POST" && path === "/api/template") {
       if (options.nonAdmin === true) return json(401, "401: Unauthorized", "text/plain")
-      const template = (body as { template?: string } | undefined)?.template ?? ""
-      if (!template.includes("areas()") || !template.includes("area_id(")) return json(400, { message: "unexpected template" })
-      return json(200, JSON.stringify(render()), "text/plain; charset=utf-8")
+      const t = body as { template?: string; variables?: PageVariables } | undefined
+      if (t?.template !== PAGE_TEMPLATE || t.variables === undefined) return json(400, { message: "unexpected template" })
+      return json(200, JSON.stringify(page(t.variables)), "text/plain; charset=utf-8")
     }
     const match = /^\/api\/services\/([a-z_]+)\/([a-z_]+)$/.exec(path)
     if (init?.method === "POST" && match !== null) return service(match[1]!, match[2]!, (body ?? {}) as Record<string, unknown>, url.searchParams.has("return_response"))
@@ -174,12 +221,17 @@ export const makeFakeHa = (options: { readonly token?: string; readonly areas?: 
     requests,
     areas,
     entities,
+    config,
+    /** The template pages asked for. */
+    pages: () => requests.filter((r) => r.path === "/api/template").map((r) => (r.body as { variables: PageVariables }).variables),
     /** The service calls made, as `domain.service` with their body. */
     calls: () => requests.filter((r) => r.path.startsWith("/api/services/")).map((r) => ({ service: r.path.slice("/api/services/".length).replace("/", "."), body: r.body })),
     /** Make one route (or all) unreachable, hang, or answer as given; `ok()` undoes it. */
     down: (route?: Route) => void (route === undefined ? ["config", "template", "service"] : [route]).forEach((r) => behaviour.set(r as Route, { kind: "down" })),
     hang: (route?: Route) => void (route === undefined ? ["config", "template", "service"] : [route]).forEach((r) => behaviour.set(r as Route, { kind: "hang" })),
     answer: (route: Route, answer: (init?: RequestInit) => Response | Promise<Response>) => void behaviour.set(route, { kind: "answer", answer }),
+    /** The page Home Assistant would render for a request (for an answer that wraps it). */
+    render: (init?: RequestInit) => page((JSON.parse(String(init?.body)) as { variables: PageVariables }).variables),
     /** What a service call with `returnResponse` answers. */
     respondWith: (response: unknown) => void (serviceResponse = response),
     ok: () => behaviour.clear()

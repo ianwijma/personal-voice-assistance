@@ -4,7 +4,7 @@
 import { assert, describe, it } from "@effect/vitest"
 import { startTestModule } from "@pva/core/testing"
 import { Effect } from "effect"
-import { homeAssistantModule } from "../src/index.ts"
+import { HOME_STATE_ITEMS, homeAssistantModule, OUTSIDE_NOTE } from "../src/index.ts"
 import { configured, makeFakeHa } from "./fakeHa.ts"
 
 const start = (options: { readonly aliases?: string; readonly dutch?: boolean; readonly devices?: ReadonlyArray<{ readonly id: string; readonly name: string; readonly room?: string }> } = {}) =>
@@ -21,6 +21,7 @@ const start = (options: { readonly aliases?: string; readonly dutch?: boolean; r
   })
 
 const kitchen = { device: "kitchen-display" }
+const kitchen_ = kitchen
 const hall = { device: "hall-screen" }
 
 describe("home-assistant: lights", () => {
@@ -94,7 +95,7 @@ describe("home-assistant: switches, heating, scenes", () => {
       assert.deepStrictEqual(yield* kit.action("climate_set", { target: "living room", temperature: 21 }), { ok: true, say: "I've set the heating in Living room to 21 degrees; it's 18.5 degrees now." })
       assert.deepStrictEqual(ha.calls(), [{ service: "climate.set_temperature", body: { temperature: 21, entity_id: ["climate.living_room"] } }])
       assert.deepStrictEqual(yield* kit.action("climate_mode", { target: "living room", mode: "off" }), { ok: true, say: "I've set the heating in Living room to off." })
-      assert.deepStrictEqual(yield* kit.action("climate_mode", { target: "living room", mode: "cool" }), { ok: true, say: "Living room thermostat can't be set to cooling." })
+      assert.deepStrictEqual(yield* kit.action("climate_mode", { target: "living room", mode: "cool" }), { ok: true, say: "Living room thermostat can't be set to cooling, so I haven't changed anything." })
       assert.strictEqual(ha.calls().length, 2)
       const outOfRange = yield* kit.action("climate_set", { target: "living room", temperature: 80 })
       assert.isFalse(outOfRange.ok)
@@ -128,35 +129,29 @@ describe("home-assistant: blinds, garage doors, locks", () => {
       assert.deepStrictEqual(yield* kit.action("covers_open", {}, { device: "robins-phone" }), { ok: true, say: "I'm opening the blinds in Bedroom." })
       assert.deepStrictEqual(yield* kit.action("covers_stop", { target: "bedroom blinds" }), { ok: true, say: "I've stopped Bedroom blinds." })
       assert.deepStrictEqual(yield* kit.action("cover_position", { target: "living room blinds", position: 30 }), { ok: true, say: "I'm setting Living room blinds to 30 percent open." })
-      assert.deepStrictEqual(yield* kit.action("cover_position", { target: "bedroom blinds", position: 30 }), { ok: true, say: "Bedroom blinds can't be set to a position; say open or close." })
+      assert.deepStrictEqual(yield* kit.action("cover_position", { target: "bedroom blinds", position: 30 }), { ok: true, say: "Bedroom blinds can't be set to a position, so I haven't changed anything; say open or close." })
       assert.deepStrictEqual(ha.calls().map((c) => c.service), ["cover.close_cover", "cover.open_cover", "cover.stop_cover", "cover.set_cover_position"])
       // "All blinds" are the blinds and shades only: never the garage door.
       assert.deepStrictEqual(yield* kit.action("covers_close", { target: "all blinds" }), { ok: true, say: "I'm closing all the blinds." })
       assert.deepStrictEqual(ha.calls().at(-1)?.body, { entity_id: ["cover.bedroom_blinds", "cover.living_room_blinds"] })
     }))
 
-  it.effect("a garage door, or the room it is in, is security: the gateway refuses it on every path and nothing reaches Home Assistant", () =>
-    Effect.gen(function*() {
-      const { ha, kit } = yield* start()
-      for (const [id, params] of [["covers_open", { target: "garage door" }], ["covers_close", { target: "garage" }], ["cover_position", { target: "garage door", position: 50 }], ["covers_stop", { target: "garage door" }]] as const) {
-        const r = yield* kit.action(id, params)
-        assert.isFalse(r.ok, id)
-        if (!r.ok) {
-          assert.strictEqual(r.code, "refused", id)
-          assert.match(r.message, /^Not run/, id)
-        }
-        const tool = yield* kit.tool(`home-assistant_${id}`, params)
-        assert.isFalse(tool.ok, id)
-        assert.match(tool.content, /^Not run/, id)
-      }
-      assert.deepStrictEqual(ha.calls(), [])
-    }))
-
-  it.effect("here in the garage reaches the garage door through the device's room: the module refuses it itself", () =>
+  it.effect("a garage door is no name a cover action takes, the garage is no room of blinds, and here in the garage has no blinds; nothing reaches Home Assistant", () =>
     Effect.gen(function*() {
       const { ha, kit } = yield* start({ devices: [{ id: "garage-speaker", name: "Garage speaker", room: "Garage" }] })
-      const r = yield* kit.action("covers_open", {}, { device: "garage-speaker" })
-      assert.deepStrictEqual(r, { ok: false, code: "failed", message: "I don't open or close garage doors, gates or doors by voice." })
+      for (const [id, params] of [["covers_open", { target: "garage door" }], ["covers_close", { target: "garage" }], ["cover_position", { target: "cover.garage_door", position: 50 }], ["covers_stop", { target: "garage door" }]] as const) {
+        const r = yield* kit.action(id, params)
+        assert.isFalse(r.ok, id)
+        if (!r.ok) assert.strictEqual(r.code, "invalid_params", id)
+        const tool = yield* kit.tool(`home-assistant_${id}`, params)
+        assert.isFalse(tool.ok, id)
+        assert.include(tool.content, "Unknown room or blind", id)
+      }
+      for (const id of ["covers_open", "covers_close", "covers_stop"]) {
+        assert.deepStrictEqual(yield* kit.action(id, {}, { device: "garage-speaker" }), { ok: true, say: "There are no blinds in Garage that I may use." }, id)
+        assert.deepStrictEqual((yield* kit.tool(`home-assistant_${id}`, {}, { device: "garage-speaker" })).value, "There are no blinds in Garage that I may use.", id)
+      }
+      assert.deepStrictEqual(yield* kit.action("cover_position", { position: 50 }, { device: "garage-speaker" }), { ok: true, say: "There are no blinds in Garage that I may use." })
       assert.deepStrictEqual(ha.calls(), [])
     }))
 
@@ -178,42 +173,48 @@ describe("home-assistant: blinds, garage doors, locks", () => {
 })
 
 describe("home-assistant: home_state", () => {
-  it.effect("rooms and their devices with their state now, by room and by kind; no person and no classless sensor", () =>
+  it.effect("a few devices with their state now, marked as outside content, narrowed by room and kind; no person and no classless sensor", () =>
     Effect.gen(function*() {
       const { kit } = yield* start()
       const all = yield* kit.tool("home_state", {})
       assert.isTrue(all.ok)
-      const value = all.value as { readonly rooms: ReadonlyArray<{ readonly room: string; readonly things: ReadonlyArray<string> }> }
-      assert.deepStrictEqual(value.rooms.map((r) => r.room), ["Bedroom", "Garage", "Hall", "Kitchen", "Living room", "Without a room"])
-      assert.deepStrictEqual(value.rooms.find((r) => r.room === "Living room")?.things, [
-        "Living room thermostat: heat, 18.5° now, set to 20°",
-        "Living room blinds: open, 100% open",
-        "Ceiling: on, 50%",
-        "Reading lamp: off",
-        "Movie time: scene"
-      ])
-      assert.include(all.content, "Garage door: closed (only read)")
-      assert.include(all.content, "Kitchen speaker: playing, Miles Davis – So What")
+      const value = all.value as { readonly note: string; readonly rooms: ReadonlyArray<{ readonly room: string; readonly things: ReadonlyArray<string> }>; readonly more: number }
+      assert.strictEqual(value.note, OUTSIDE_NOTE)
+      // A handful of items and how many more (docs/MODULES.md §16), never the whole house.
+      assert.strictEqual(value.rooms.flatMap((r) => r.things).length, HOME_STATE_ITEMS)
+      assert.strictEqual(value.more, 16 - HOME_STATE_ITEMS)
       assert.notInclude(all.content, "Robin")
       assert.notInclude(all.content, "Dorpsstraat")
-      const here = yield* kit.tool("home_state", { area: "here", kind: "light" }, kitchen)
-      assert.deepStrictEqual(here.value, { rooms: [{ room: "Kitchen", things: ["Kitchen light: off"] }] })
+      const living = yield* kit.tool("home_state", { area: "lounge" })
+      assert.deepStrictEqual((living.value as typeof value).rooms, [{
+        room: "Living room",
+        things: ["Living room thermostat: heat, 18.5° now, set to 20°", "Living room blinds: open, 100% open", "Ceiling: on, 50%", "Reading lamp: off", "Movie time: scene"]
+      }])
+      const garage = yield* kit.tool("home_state", { area: "garage" })
+      assert.include(garage.content, "Garage door: closed (only read)")
+      const kitchen = yield* kit.tool("home_state", { area: "kitchen", kind: "media_player" })
+      assert.include(kitchen.content, "Kitchen speaker: playing, Miles Davis – So What")
+      const here = yield* kit.tool("home_state", { area: "here", kind: "light" }, kitchen_)
+      assert.deepStrictEqual(here.value, { note: OUTSIDE_NOTE, rooms: [{ room: "Kitchen", things: ["Kitchen light: off"] }] })
       const lounge = yield* kit.tool("home_state", { area: "lounge", kind: "climate" })
-      assert.deepStrictEqual(lounge.value, { rooms: [{ room: "Living room", things: ["Living room thermostat: heat, 18.5° now, set to 20°"] }] })
+      assert.deepStrictEqual(lounge.value, { note: OUTSIDE_NOTE, rooms: [{ room: "Living room", things: ["Living room thermostat: heat, 18.5° now, set to 20°"] }] })
       const nowhere = yield* kit.tool("home_state", { area: "the attic" })
       assert.deepStrictEqual(nowhere.value, { spoken: "I don't know a room called the attic in Home Assistant. Which room do you mean?" })
     }))
 
-  it.effect("a long house: at most 60 lines, and how many more", () =>
+  it.effect("a long house: a handful of items and how many more, also in one room", () =>
     Effect.gen(function*() {
       const entities: Record<string, { name: string; state: string; area: string }> = {}
       for (let i = 0; i < 75; i++) entities[`light.lamp_${String(i).padStart(2, "0")}`] = { name: `Lamp ${i}`, state: "off", area: "kitchen" }
       const ha = makeFakeHa({ entities })
       const kit = yield* startTestModule(homeAssistantModule({ fetch: ha.fetch }), configured())
-      const r = yield* kit.tool("home_state", {})
-      const value = r.value as { readonly rooms: ReadonlyArray<{ readonly things: ReadonlyArray<string> }>; readonly more: number }
-      assert.strictEqual(value.rooms[0]!.things.length, 60)
-      assert.strictEqual(value.more, 15)
+      for (const input of [{}, { area: "kitchen" }, { kind: "light" as const }]) {
+        const r = yield* kit.tool("home_state", input)
+        const value = r.value as { readonly rooms: ReadonlyArray<{ readonly things: ReadonlyArray<string> }>; readonly more: number }
+        assert.strictEqual(value.rooms.flatMap((x) => x.things).length, HOME_STATE_ITEMS)
+        assert.strictEqual(value.more, 75 - HOME_STATE_ITEMS)
+        assert.isBelow(r.content.length, 1_000)
+      }
     }))
 })
 
