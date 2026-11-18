@@ -3,7 +3,7 @@
 import { describe, it } from "@effect/vitest"
 import { checkModule, expectOffByDefault } from "@pva/core/testing"
 import { Effect } from "effect"
-import { catalog } from "../src/index.ts"
+import { catalog, kitchenModule, texts } from "../src/index.ts"
 
 describe("@pva/module-kitchen", () => {
   it.effect("kitchen: accepted by the host, off by default, conformant", () =>
@@ -11,4 +11,6 @@ describe("@pva/module-kitchen", () => {
       yield* expectOffByDefault(catalog)
       for (const definition of catalog) yield* checkModule(definition)
     }))
+
+  it.effect("kitchen: conformant with its texts in both languages, and with the lists module beside it", () => checkModule(kitchenModule, { texts }))
 })
