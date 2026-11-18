@@ -4,7 +4,8 @@ import { ServiceKey } from "./ModuleApi.ts"
 /**
  * `Playback`: pausing what plays in a room, and changing its volume (docs/MODULES-PLAN.md §5.2; §4 P7;
  * docs/research/modules/music.md §12). Provided by `music` (`packages/module-music`, wave B), used by the host's
- * essential controls (P7: "stop" pauses media playing in the room, "louder" and "quieter" change its volume).
+ * essential controls (P7: "stop" pauses media playing in the room; "louder" and "quieter" changing its volume is
+ * later: the first version changes the reply volume only, since this contract cannot say whether anything plays).
  *
  * **Two operations only**, the ones that first consumer needs. Reading what plays, resuming, and choosing what to play
  * are music's own tools; they join this contract when a consumer needs them.

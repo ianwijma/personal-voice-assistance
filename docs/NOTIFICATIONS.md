@@ -200,7 +200,7 @@ speaker and no display gets the cue and no card.
 
 ## What P7 and P10 build on
 
-- P7 (`ringing` window, the spoken "stop"): `engine.ringingOn(deviceId)` (what rings there, with its actions),
+- P7 (`ringing` window, the spoken "stop"; built: [PHRASES.md](PHRASES.md)): `engine.ringingOn(deviceId)` (what rings there, with its actions),
   `engine.onRingingChanged(listener)` (open and close the window), `engine.stopRinging(deviceId)` (each ring held there
   stopped through the same admission as a press), `engine.stopSpeech(deviceId)`, and `engine.press(…)` for a ringing
   phrase of an action.

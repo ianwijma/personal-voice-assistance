@@ -5,11 +5,12 @@ for their module and their module's research document (`docs/research/modules/<n
 what a module is, the rules the preparation stack (P1 to P6) settled, and how to test a module so that it keeps them.
 Where this page and a research document disagree, the plan and this page win.
 
-> **Wave A: what does not exist yet.** You are writing on the scaffold (P11), before P7 and P10. **Phrase commands and
-> presentations (a checklist, a card, the timer view, `ctx.present`) do not exist.** Notifications, ringing and a
-> module's own speech (`ctx.notify`, `ctx.speech`) exist in a first version since P9 (§16, [NOTIFICATIONS.md](NOTIFICATIONS.md)).
-> Where your row in the plan's §5.1 names a phrase command or a presentation, that part waits for wave B: build the
-> rest, and list the part under "Left out" on your page and in your pull request. Also later, for everyone: connections
+> **Wave A: what does not exist yet.** You are writing on the scaffold (P11), before P10. **Presentations (a
+> checklist, a card, the timer view, `ctx.present`) do not exist.** Notifications, ringing and a module's own speech
+> (`ctx.notify`, `ctx.speech`) exist in a first version since P9 (§16, [NOTIFICATIONS.md](NOTIFICATIONS.md)); phrase
+> commands after the wake phrase, the host's essential controls and the ringing window since P7 (§16 "Phrase commands",
+> [PHRASES.md](PHRASES.md)). Where your row in the plan's §5.1 names a presentation, that part waits for wave B: build
+> the rest, and list the part under "Left out" on your page and in your pull request. Also later, for everyone: connections
 > and OAuth, CalDAV, an MCP client, and any outgoing HTTP but `GET` and `HEAD` (§12). The plan's "Order from here" (§4)
 > has the waves.
 
@@ -943,7 +944,7 @@ rely on, with every bound and id.
 | `Lists` | service: the household's shopping list | lists | kitchen | `lists.ts` |
 | `Timers` | service: start a timer | timers (wave B) | routines; kitchen later | `timers.ts` |
 | `HomeAssistant` | service (a transport) | home-assistant (smart-home) | music (wave B), presence | `homeAssistant.ts` |
-| `Playback` | service: pause, volume | music (wave B) | the host's "stop" and volume (P7) | `playback.ts` |
+| `Playback` | service: pause, volume | music (wave B) | the host's "stop" (P7; volume later) | `playback.ts` (defined in `@pva/core` since P7, re-exported) |
 | `BriefingSections` | contribution | weather, bin-day, calendar, news; reminders later | briefing | `briefing.ts` |
 
 The core's own are `People`, `Privacy`, `Devices` in `@pva/core` (later `SessionControl`, `DeviceControl`). The
@@ -1423,6 +1424,79 @@ route's field), check that separately: `isLine(text, n)` from `@pva/module-contr
 (`NOT_ONE_LINE`: no control character, C0, DEL or C1, no line or paragraph separator, no bidirectional control) with a
 bound and no lone surrogates, as a filter on the schema (the reference module's `pinboard_pin` text) or in code.
 
+### Phrase commands (P7)
+
+An action can be said **without the language model**: give it `phrases` per language, words and `{param}` slots
+([PHRASES.md](PHRASES.md) has the rules, the bounds and what is left out). After the wake phrase (or in a follow-up
+window, or on a device whose assistant answers without a phrase), an utterance that is one of the phrases of the
+household's language runs the action through the gateway as a `phrase` turn of that device, and its `say` is spoken as
+a canned reply: the utterance never becomes a turn and nothing of it enters the history. Words are matched exactly (case
+and punctuation aside); each slot is read by its parameter's own parser, and one that does not read means no match. The
+longest phrase wins. The host's essential controls ("stop", "never mind", "repeat", "louder", "quieter", with their
+variants, in both languages) are reserved: a phrase of yours that is one of them refuses your module's start, like any
+phrase outside the bounds (8 a language, 8 words, 2 slots with a word between them, every required parameter a slot).
+Two modules with the same phrase for one assistant are both left out for it and named on the Health page.
+
+<!-- region: packages/module-contracts/test/kit/phraseExample.test.ts#phrase-module -->
+```ts
+const lampTexts = defineTexts({
+  en: { on: "The {room} lamp is on.", off: "The {room} lamp is off." },
+  nl: { on: "De lamp in de {room} is aan.", off: "De lamp in de {room} is uit." }
+})
+const rooms = [{ value: "kitchen", label: "kitchen", aliases: ["keuken"] }, { value: "hall", label: "hall", aliases: ["gang"] }]
+
+export const lampModule = defineModule({
+  apiVersion: 2,
+  id: "lamp",
+  name: "Lamp",
+  description: "Switches a room's lamp.",
+  enabledByDefault: false,
+  start: (ctx) =>
+    Effect.succeed({
+      actions: [defineAction({
+        id: "switch",
+        label: "Switch a lamp",
+        description: "Switch the lamp in a room on or off.",
+        examples: ["kitchen lamp on", "lamp uit in de keuken"],
+        params: {
+          room: Param.dynamic({ label: "Room", options: () => rooms }),
+          to: Param.choice({ label: "On or off", options: [{ value: "on", label: "on", aliases: ["aan"] }, { value: "off", label: "off", aliases: ["uit"] }] })
+        },
+        // Said after the wake phrase (or in a follow-up window), these run the action with no model call. Words are
+        // matched exactly; each slot is read by its parameter's parser (a room by name or alias, on/off by label).
+        phrases: { en: ["{room} lamp {to}", "turn the {room} lamp {to}"], nl: ["lamp {to} in de {room}"] },
+        risk: "change",
+        run: ({ room, to }) =>
+          Effect.succeed({ say: say(lampTexts, homeLanguage(ctx.host.view()), to, { room: rooms.find((r) => r.value === room)?.label ?? room }) })
+      })]
+    })
+})
+```
+
+Its test, through the kit's `phrases` handle (the real decision, matcher and gateway):
+
+<!-- region: packages/module-contracts/test/kit/phraseExample.test.ts#phrase-test -->
+```ts
+const kit = yield* startTestModule(lampModule)
+// As the recogniser's final after "hey Jeff": the kit decides as serve mode does, and runs it through the gateway.
+const said = yield* kit.phrases.say("Turn the kitchen lamp on.", { device: "kitchen-display" })
+assert.isTrue(said.taken)
+assert.deepStrictEqual(kit.phrases.spoken.map((s) => s.text), ["The kitchen lamp is on."])
+// Words that are not one of its phrases are not taken: they go on to the assistant as a turn.
+assert.deepStrictEqual(yield* kit.phrases.say("is the kitchen lamp on?"), { taken: false })
+// The host's controls are there for every assistant, whatever modules it has.
+const louder = yield* kit.phrases.say("louder")
+assert.isTrue(louder.taken && louder.by === "control")
+```
+
+- **Keep the answer short** (300 characters at most are spoken) and return within 5 s; start anything longer in `shared`.
+- **Over a reply**: a phrase said while a reply plays cuts it off; after your answer the reply is said again, unless the
+  action is declared `endsReply: true`.
+- **Ringing**: while one of your notifications rings, its buttons' labels are accepted without the wake phrase (the
+  ringing window): label a button with what people will say ("Snooze").
+- **While your module is down** its phrases are in nobody's set: they go on to the assistant as before. Withdrawn
+  between the decision and the run: "I can't do that right now.", and nothing ran.
+
 ## 17. Testing: the kit and checkModule
 
 Tests never reach the network and leave nothing on disk. The kit is `@pva/core/testing`; run tests inside `it.effect`
@@ -1450,6 +1524,7 @@ values), `startAt`, `started`. It returns handles:
 | `stop`, `start`, `restart`, `configure(values, secrets?)` | switched off for every assistant, on again; one real restart of the module with its demand kept (the same host and store: not a restart of the server); a settings change as the owner saves it |
 | `info()`, `issues()`, `checkHealth`, `toolNames(as?)` | the admin page's view of it, its Health issues (health run now), the tools the turn's model is sent: as serve mode offers them, without the tools and action tools the assistant switched off and those the risk policy refuses |
 | `expectNoSecrets(...values)` | fails when the value of a secret given to the kit is in any string of the `values` you pass (tool results, action outcomes, spoken lines, **the rows your test read**), decoded: every key and string, and a string that is JSON parsed and walked too, so an escaped secret is found; it also looks at every event and the admin page. It reads no collection itself: pass it the rows your module wrote |
+| `phrases` | P7: `say(text, { device, wake?, interrupting? })` as the recogniser's final after the wake phrase (or without it, where only the ringing window can take it), `decide` / `run`, `spoken`, `answered`, `replied`, `volume`, `commandsFor` ([PHRASES.md](PHRASES.md) "Testing") |
 | `notify` | P9: the real notification service: `all`, `messages` (what each page was sent), `decisions` (where it would go, and why not), `press(id, action, { device })`, `announced`, `replying(device, on)`, `connect` / `disconnect`, `dnd()`, `settle`, `engine` ([NOTIFICATIONS.md](NOTIFICATIONS.md) "Testing") |
 | `moduleStore()`, `store`, `events`, `people`, `schedulerUses` | the module's store, the household store, every event on the bus, the household's core services, what the kit saw of the scheduler |
 
