@@ -20,7 +20,10 @@ const TEXTS = {
     notSent: "The notification could not be sent.",
     inTurn: "An announcement can't be waited for during a reply.",
     noDevice: "There is no device there to say it on.",
-    notSaid: "That can't be announced here."
+    notSaid: "That can't be announced here.",
+    handling: "That is being handled already.",
+    region: "Notifications",
+    startAudio: "Start audio to hear it."
   },
   nl: {
     stop: "Stop",
@@ -34,7 +37,10 @@ const TEXTS = {
     notSent: "De melding kon niet worden verstuurd.",
     inTurn: "Op een omroep kan niet worden gewacht tijdens een antwoord.",
     noDevice: "Daar is geen apparaat om het op te zeggen.",
-    notSaid: "Dat kan hier niet worden omgeroepen."
+    notSaid: "Dat kan hier niet worden omgeroepen.",
+    handling: "Daar wordt al aan gewerkt.",
+    region: "Meldingen",
+    startAudio: "Zet het geluid aan om het te horen."
   }
 } as const
 

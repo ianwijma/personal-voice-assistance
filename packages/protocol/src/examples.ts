@@ -779,9 +779,11 @@ export const serverExamples: { readonly [T in ServerMessageType]: Extract<Server
       title: "Pasta timer",
       text: "Ten minutes are up.",
       priority: "ring",
-      silent: false,
+      show: true,
+      sound: true,
       actions: [{ id: "stop", label: "Stop" }, { id: "snooze", label: "Snooze" }],
-      sentAt: 1_763_100_600_000
+      sentAt: 1_763_100_600_000,
+      texts: { region: "Notifications", startAudio: "Start audio to hear it." }
     }
   },
   "notification.resolved": { type: "notification.resolved", id: "n-4f2a", outcome: "stop" },

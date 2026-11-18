@@ -50,6 +50,7 @@ import { makeSchedulerEngine } from "./SchedulerEngine.ts"
 import { schedulerStorage } from "./SchedulerJobs.ts"
 import { type DndState, type Notification, notifications as notificationRows, NOTIFY_OWNER, notifyStorage, type PressAnswer, type StoredNotification } from "./Notify.ts"
 import { type DecisionRecord, makeNotifyEngine, notificationView, type NotifyMessage, type SpeechPort } from "./NotifyEngine.ts"
+import { deviceOutputsFrom } from "./Notify.ts"
 import { notifyLanguageOf } from "./NotifyTexts.ts"
 
 // ---------------------------------------------------------------------------------------------------------------------
@@ -147,7 +148,7 @@ export const testConnectionOf = (deviceId: string): ConnectionRef => makeConnect
  * over the devices' places and Members) and `Devices` (`makeDevices`). Throws when the household is not one serve
  * mode could have (a default person who is not a member, a diet the server would have cleaned).
  */
-export const makeTestPeople = (input: TestHouseholdInput = {}) => {
+export const makeTestPeople = (input: TestHouseholdInput = {}, live?: { readonly connected: (deviceId: string) => boolean }) => {
   const people = new Map<string, Person>(
     (input.people ?? DEFAULT_TEST_HOUSEHOLD.people).map((p) => [p.id, { id: p.id, name: p.name, aliases: [...(p.aliases ?? [])], pronunciation: "", diet: cleanDiet(p.diet, p.name) }])
   )
@@ -184,7 +185,14 @@ export const makeTestPeople = (input: TestHouseholdInput = {}) => {
     setDiet: () => Effect.fail(peopleError("not_saved", "The test kit's household is fixed for a test; give the diets to startTestModule."))
   }
   const privacy = makePrivacy((id) => devices.get(id)?.place, (id) => people.has(id))
-  const devicesService = makeDevices(() => [...devices.values()])
+  // A device's connection is live state, not household data: with `live`, the Devices service reads it there (the kit's
+  // notification service reads the same), so a test that disconnects a device sees it disconnected everywhere.
+  const devicesService = makeDevices(() =>
+    live === undefined ? [...devices.values()] : [...devices.values()].map((d) => {
+      const on = live.connected(d.id)
+      return on === d.connected ? d : { ...d, connected: on, visible: on }
+    })
+  )
   const connections = new Map([...devices.keys()].map((id) => [testConnectionOf(id).id, id] as const))
   return {
     people: peopleService,
@@ -500,7 +508,10 @@ export const startTestModule = (definition: ModuleDefinition<any>, options: Star
     const catalog: ReadonlyArray<ModuleDefinition<any>> = [...standIns, ...(options.others ?? []), observed]
     const input = options.household ?? {}
     const home = { ...DEFAULT_TEST_HOUSEHOLD.home, ...input.home }
-    const people = makeTestPeople(input)
+    // P9: which devices have a page connected now (live state: the kit's Devices and notification service read this one).
+    const deviceInputs = input.devices ?? DEFAULT_TEST_HOUSEHOLD.devices
+    const connectedNow = new Set(deviceInputs.filter((d) => d.connected !== false).map((d) => d.id))
+    const people = makeTestPeople(input, { connected: (id) => connectedNow.has(id) })
     const assistants = input.assistants ?? DEFAULT_TEST_HOUSEHOLD.assistants
     const deviceList = input.devices ?? DEFAULT_TEST_HOUSEHOLD.devices
 
@@ -529,46 +540,63 @@ export const startTestModule = (definition: ModuleDefinition<any>, options: Star
     const schedulerUses: Array<SchedulerUse> = []
 
     // P9: the real notification service on the same store, clock and gateway; pages and voices are recorders.
-    const connectedNow = new Set(deviceList.filter((d) => d.connected !== false).map((d) => d.id))
     const declaredOf = new Map(deviceList.map((d) => [d.id, d.capabilities] as const))
     const pageMessages: Array<{ readonly deviceId: string; readonly message: NotifyMessage }> = []
     const decisions: Array<DecisionRecord> = []
     const announced: Array<KitAnnouncement> = []
+    /** A reply is being spoken on the device: announcements wait for it, and one that is playing is cut (as serve mode's lease does). */
     const replying = new Map<string, Deferred.Deferred<void>>()
+    const playing = new Map<string, Deferred.Deferred<void>>()
     const speechMs = options.speechMs ?? 2_000
     const speech: SpeechPort = {
-      quiet: (deviceId) => Effect.suspend(() => {
-        const d = replying.get(deviceId)
-        return d === undefined ? Effect.void : Deferred.await(d)
-      }),
-      play: (deviceId, text, o) =>
+      speak: (deviceId, text, o) =>
         Effect.gen(function*() {
-          const record: { -readonly [K in keyof KitAnnouncement]: KitAnnouncement[K] } = { deviceId, text, cue: o.cue, startedAt: yield* Clock.currentTimeMillis }
-          announced.push(record)
-          yield* Effect.sleep(speechMs).pipe(Effect.onInterrupt(() => Effect.sync(() => void (record.outcome = "stopped"))))
-          record.outcome = "spoken"
+          for (;;) {
+            const reply = replying.get(deviceId)
+            if (reply !== undefined) {
+              yield* Deferred.await(reply)
+              continue
+            }
+            const gate = o.gate()
+            if (gate === "wait") {
+              yield* Effect.yieldNow
+              continue
+            }
+            if (gate !== "go") return { skipped: gate } as const
+            const record: { -readonly [K in keyof KitAnnouncement]: KitAnnouncement[K] } = { deviceId, text, cue: o.cue, startedAt: yield* Clock.currentTimeMillis }
+            announced.push(record)
+            const cut = Deferred.makeUnsafe<void>()
+            playing.set(deviceId, cut)
+            const how = yield* Effect.raceFirst(Effect.as(Effect.sleep(speechMs), "played" as const), Effect.as(Deferred.await(cut), "cut" as const)).pipe(
+              Effect.onInterrupt(() => Effect.sync(() => void (record.outcome = "stopped"))),
+              Effect.ensuring(Effect.sync(() => void (playing.get(deviceId) === cut && playing.delete(deviceId))))
+            )
+            if (how === "cut") {
+              record.outcome = "stopped"
+              return yield* Effect.fail(new Error("superseded"))
+            }
+            record.outcome = "spoken"
+            return "spoken" as const
+          }
         })
     }
     const notify = yield* makeNotifyEngine({
       store,
       scheduler: engine,
       devices: () => people.devices.list(),
-      connected: (deviceId) => connectedNow.has(deviceId),
-      // A kit device judged by the capabilities it was given; one given none is a page that never declared (it can do both).
-      canSpeak: (d) => {
-        const c = declaredOf.get(d.id)
-        return c === undefined || c.speaker?.media.includes("speech") === true
-      },
-      canShow: (d) => {
-        const c = declaredOf.get(d.id)
-        return c === undefined || c.display !== undefined
-      },
+      // A kit device's outputs as serve mode computes them, from what it was given as its declaration (none: a page that
+      // never declared, which speaks and shows); the kit has no owner overrides.
+      outputs: (d) => deviceOutputsFrom({ capabilities: { noDisplay: false, noSpeaker: false, excludeKinds: [] } }, declaredOf.get(d.id)),
       privacy: people.privacy,
-      outlet: () => ({ send: (deviceId, message) => void pageMessages.push({ deviceId, message }) }),
+      // One page per connected device, as a tab of it.
+      outlet: () => ({
+        connections: (deviceId) => (connectedNow.has(deviceId) ? [{ id: testConnectionOf(deviceId).id, send: (message) => void pageMessages.push({ deviceId, message }) }] : [])
+      }),
       speech: () => speech,
       gateway: () => hostRef?.gateway,
       pageText: (moduleId, text, max) => hostRef?.pageText(moduleId, text, max) ?? String(text).slice(0, max),
       language: () => notifyLanguageOf(home.HOME_LANGUAGE),
+      issues,
       onDecision: (record) => void decisions.push(record)
     }).pipe(Scope.provide(lifetime))
 
@@ -823,7 +851,7 @@ export const startTestModule = (definition: ModuleDefinition<any>, options: Star
           const out: Array<Notification> = []
           let after: Row<StoredNotification> | undefined
           for (;;) {
-            const page = yield* store.forCore(NOTIFY_OWNER).collection(notificationRows).list({ orderBy: { field: "createdAt" }, limit: 12, ...(after !== undefined ? { after } : {}) }).pipe(Effect.orDie)
+            const page = yield* store.forCore(NOTIFY_OWNER).collection(notificationRows).list({ orderBy: { field: "createdAt", direction: "asc" }, limit: 12, ...(after !== undefined ? { after } : {}) }).pipe(Effect.orDie)
             for (const row of page) if (row.value.module === id) out.push(notificationView(row))
             if (page.length < 12) return out as ReadonlyArray<Notification>
             after = page[page.length - 1]
@@ -835,40 +863,53 @@ export const startTestModule = (definition: ModuleDefinition<any>, options: Star
         decisions: decisions as ReadonlyArray<DecisionRecord>,
         /** What was announced where, with when it started and how it ended. */
         announced: announced as ReadonlyArray<KitAnnouncement>,
-        /** Press an action of a notification on a device (default the first), as a page's button does; the clock is driven. */
-        press: (notificationId: string, actionId: string, as: { readonly device?: string } = {}): Effect.Effect<PressAnswer> =>
-          checked(
+        /**
+         * Press an action of a notification on a device (default the first), as that device's page's button does (its
+         * connection must hold the card); the test clock is driven while the module's handler runs.
+         */
+        press: (notificationId: string, actionId: string, as: { readonly device?: string } = {}): Effect.Effect<PressAnswer> => {
+          const deviceId = as.device ?? deviceList[0]?.id ?? "kitchen-display"
+          return checked(
             `after pressing ${actionId}`,
             Effect.andThen(
-              notify.press({ notificationId, actionId, deviceId: as.device ?? deviceList[0]?.id ?? "kitchen-display", connection: testConnectionOf(as.device ?? deviceList[0]?.id ?? "kitchen-display") }),
+              Effect.andThen(settle, driven(`the press of ${actionId}`, notify.press({ notificationId, actionId, deviceId, connection: testConnectionOf(deviceId) }))),
               (a) => Effect.as(settle, a)
             )
-          ),
-        /** A reply is being spoken on the device (`true`) or has ended: announcements there wait for it. */
+          )
+        },
+        /**
+         * A reply starts on the device (`true`) or has ended: announcements there wait for it, and one being spoken is
+         * cut (`stopped`, why "a reply"), as serve mode's output lease does.
+         */
         replying: (deviceId: string, on: boolean) =>
           Effect.suspend(() => {
             const d = replying.get(deviceId)
             if (on && d === undefined) replying.set(deviceId, Deferred.makeUnsafe<void>())
+            if (on) {
+              const cut = playing.get(deviceId)
+              if (cut !== undefined) Deferred.doneUnsafe(cut, Effect.void)
+            }
             if (!on && d !== undefined) {
               replying.delete(deviceId)
               Deferred.doneUnsafe(d, Effect.void)
             }
             return settle
           }),
-        /** A page of the device says hello (it gets what is open for it) or its last one goes. */
+        /** A page of the device says hello (it is given what is open for it), or its page goes; `Devices` sees the same. */
         connect: (deviceId: string) =>
           Effect.suspend(() => {
             connectedNow.add(deviceId)
-            notify.connected(deviceId)
+            notify.reconcile(deviceId)
             return settle
           }),
         disconnect: (deviceId: string) =>
-          Effect.sync(() => {
+          Effect.suspend(() => {
             connectedNow.delete(deviceId)
-            notify.disconnected(deviceId)
+            notify.reconcile(deviceId)
+            return settle
           }),
-        /** Do not disturb now. */
-        dnd: (): DndState => notify.dnd(),
+        /** Do not disturb now (`known: false` until it was read: it counts as on). */
+        dnd: (): DndState & { readonly known: boolean } => notify.dnd(),
         /** Let deliveries and the scheduler finish what is due now. */
         settle: settle
       },
