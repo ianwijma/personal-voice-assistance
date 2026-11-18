@@ -513,3 +513,11 @@ export const makeTestScheduler = (
     const advance = (ms: number) => Effect.andThen(Effect.andThen(scheduler.settled, TestClock.adjust(ms)), scheduler.settled)
     return { scheduler, store, issues, advance, household: made?.household }
   })
+
+// ---------------------------------------------------------------------------------------------------------------------
+// The module test kit (docs/MODULES.md "Testing"): a module in the real host, its conformance check, a network
+// without a network.
+
+export * from "./ModuleTestKit.ts"
+export * from "./ModuleCheck.ts"
+export * from "./OfflineNet.ts"
