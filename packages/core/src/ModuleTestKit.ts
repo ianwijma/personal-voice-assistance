@@ -970,6 +970,22 @@ export const startTestModule = (definition: ModuleDefinition<any>, options: Star
               }
             )
           }))),
+        /**
+         * The decision alone, as serve mode takes it at the final (nothing runs): what would take `text`, if anything. With
+         * `run`, a test can change something between the decision and the run (serve mode runs it a moment later).
+         */
+        decide: (text: string, as: KitPhraseInput = {}): Taken | undefined => decidePhrase(text, as).taken,
+        /** Run what took an utterance (from `decide`) on the device, as serve mode does. */
+        run: (taken: Taken, as: KitPhraseInput = {}): Effect.Effect<PhraseOutcome> => {
+          const deviceId = as.device ?? deviceList[0]?.id ?? "kitchen-display"
+          return checked(
+            "after running a phrase",
+            Effect.andThen(Effect.andThen(settle, driven("a phrase's run", runTaken(taken, phrasePorts(deviceId, as)))), (outcome) => {
+              outcomes.push({ deviceId, text: taken.by === "phrase" ? taken.text : taken.match.kind === "stop" ? taken.match.phrase : taken.match.label, outcome })
+              return Effect.as(settle, outcome)
+            })
+          )
+        },
         /** What every taken phrase came to, in order. */
         answered: outcomes as ReadonlyArray<{ readonly deviceId: string; readonly text: string; readonly outcome: PhraseOutcome }>,
         /** Every line the kit's devices said for phrases, in order (canned replies in serve mode). */

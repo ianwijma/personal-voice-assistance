@@ -50,7 +50,13 @@ export const PHRASE_LIMITS = {
   /** An utterance longer than this (in characters) is never matched. */
   utteranceChars: 300,
   /** Words one slot may take (a text slot: its `maxWords`, at most this). */
-  slotWords: 8
+  slotWords: 8,
+  /**
+   * Slot readings one utterance may cost over every phrase of the set (a reading runs a slot's parser on words whose
+   * alignment already covers the whole utterance). Ordinary sentences need a few; once spent, no further phrase can
+   * match that utterance (it goes on as not taken), so a sentence built to make many alignments costs a bounded time.
+   */
+  slotReads: 64
 } as const
 
 /** The longest spoken answer of a phrase command, in UTF-16 units, cut at the module's page boundary. */
@@ -113,7 +119,7 @@ const parsePhrase = (text: string, params: ActionParams | undefined): { readonly
   if (text.trim().length === 0) return { problem: "a phrase is empty" }
   if (text.length > PHRASE_LIMITS.charsPerPhrase) return { problem: `a phrase has at most ${PHRASE_LIMITS.charsPerPhrase} characters` }
   // eslint-disable-next-line no-control-regex
-  if (/[\u0000-\u001f\u007f-\u009f  ]/.test(text)) return { problem: "a phrase is one line, without control characters" }
+  if (/[\u0000-\u001f\u007f-\u009f\u2028\u2029]/.test(text)) return { problem: "a phrase is one line, without control characters" }
   const parts: Array<PhrasePart> = []
   for (const token of text.trim().split(/\s+/)) {
     const slot = SLOT.exec(token)
@@ -332,27 +338,50 @@ const readSlot = (param: ActionParam, text: string, count: number): unknown => {
   }
 }
 
-/** The values of `phrase`'s slots if it matches the whole utterance, else `undefined`. Leftmost reading first. */
-const align = (phrase: CompiledPhrase, text: string, ws: ReadonlyArray<Word>): Record<string, unknown> | undefined => {
+/** How many slot readings one utterance may cost in all (see `matchCommand`); one read is one parser call. */
+interface Budget {
+  reads: number
+}
+
+/**
+ * The values of `phrase`'s slots if it matches the whole utterance, else `undefined`. The words are aligned first
+ * (string comparisons only); the slots are read only for an alignment that covers every word, leftmost first, each
+ * read counted against `budget` (none is made once it is spent).
+ */
+const align = (phrase: CompiledPhrase, text: string, ws: ReadonlyArray<Word>, budget: Budget): Record<string, unknown> | undefined => {
   const parts = phrase.parts
-  const values: Record<string, unknown> = {}
+  const spans: Array<readonly [number, number]> = []
+  let found: Record<string, unknown> | undefined
+  const readAll = (): boolean => {
+    const values: Record<string, unknown> = {}
+    let s = 0
+    for (const part of parts) {
+      if (typeof part === "string") continue
+      const [from, to] = spans[s++]!
+      if (budget.reads <= 0) return false
+      budget.reads--
+      const value = readSlot(part.param, text.slice(ws[from]!.start, ws[to - 1]!.end), to - from)
+      if (value === undefined) return false
+      values[part.slot] = value
+    }
+    found = values
+    return true
+  }
   const step = (pi: number, wi: number): boolean => {
-    if (pi === parts.length) return wi === ws.length
+    if (pi === parts.length) return wi === ws.length && readAll()
     const part = parts[pi]!
     if (typeof part === "string") return wi < ws.length && ws[wi]!.norm === part && step(pi + 1, wi + 1)
     const next = parts[pi + 1]
     const last = Math.min(ws.length, wi + PHRASE_LIMITS.slotWords)
     for (let k = wi + 1; k <= last; k++) {
       if (next === undefined ? k !== ws.length : k >= ws.length || ws[k]!.norm !== next) continue
-      const value = readSlot(part.param, text.slice(ws[wi]!.start, ws[k - 1]!.end), k - wi)
-      if (value === undefined) continue
-      values[part.slot] = value
+      spans.push([wi, k])
       if (step(pi + 1, k)) return true
-      delete values[part.slot]
+      spans.pop()
     }
     return false
   }
-  return step(0, 0) ? values : undefined
+  return step(0, 0) ? found : undefined
 }
 
 const ownerKey = (o: PhraseOwner) => (o.kind === "control" ? `control:${o.control}` : `action:${o.action.id}`)
@@ -361,7 +390,8 @@ const ownerKey = (o: PhraseOwner) => (o.kind === "control" ? `control:${o.contro
  * What the whole utterance matches in `set`: the phrase with the most literal words. Ties between phrases of one
  * owner take the first; a host control beats a module's phrase of the same length; a tie between two modules' commands
  * matches nothing (the utterance goes on as if no phrase had matched). An utterance over `utteranceWords` or
- * `utteranceChars` matches nothing. A slot's values: the leftmost reading that parses.
+ * `utteranceChars` matches nothing. A slot's values: the leftmost reading that parses. At most `slotReads` slot readings
+ * are made for one utterance over every phrase; past them nothing more can match it.
  */
 export const matchCommand = (set: CommandSet, text: string): PhraseMatch | undefined => {
   if (text.length > PHRASE_LIMITS.utteranceChars) return undefined
@@ -369,12 +399,13 @@ export const matchCommand = (set: CommandSet, text: string): PhraseMatch | undef
   if (ws.length === 0 || ws.length > PHRASE_LIMITS.utteranceWords) return undefined
   let best: Array<{ readonly phrase: CompiledPhrase; readonly values: Readonly<Record<string, unknown>> }> = []
   let bestLiterals = 0
+  const budget: Budget = { reads: PHRASE_LIMITS.slotReads }
   for (const phrase of set.phrases) {
     // Cheap rejections first: a phrase longer than the utterance, or whose first word cannot be where it must be.
     if (phrase.parts.length > ws.length || phrase.literals < bestLiterals) continue
     const first = phrase.parts[0]
     if (typeof first === "string" && ws[0]!.norm !== first) continue
-    const values = align(phrase, text, ws)
+    const values = align(phrase, text, ws, budget)
     if (values === undefined) continue
     if (phrase.literals > bestLiterals) {
       best = [{ phrase, values }]
