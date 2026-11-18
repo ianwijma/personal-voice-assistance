@@ -1,5 +1,11 @@
 import { ActionError, type AssistantModule, defineAction, defineModule, makeTool, Param, Setting, ToolError } from "@pva/core"
+import { BriefingSections } from "@pva/module-contracts"
 import { Effect, Schema } from "effect"
+import { makeWeatherClient, type WeatherClient, type WeatherNet } from "./weather/client.ts"
+import { makeWeatherExtras, type WeatherSettingsView } from "./weather/extras.ts"
+import { conditionsEn } from "./weather/words.ts"
+
+export { type WeatherNet } from "./weather/client.ts"
 
 export interface WeatherOptions {
   /** Place used when the user does not name one, e.g. "Amsterdam". */
@@ -43,19 +49,9 @@ const ForecastResponse = Schema.Struct({
   })
 })
 
-/** WMO weather interpretation codes, as documented by Open-Meteo. */
-const conditions: Record<number, string> = {
-  0: "clear sky", 1: "mainly clear", 2: "partly cloudy", 3: "overcast",
-  45: "fog", 48: "freezing fog",
-  51: "light drizzle", 53: "drizzle", 55: "heavy drizzle", 56: "freezing drizzle", 57: "heavy freezing drizzle",
-  61: "light rain", 63: "rain", 65: "heavy rain", 66: "freezing rain", 67: "heavy freezing rain",
-  71: "light snow", 73: "snow", 75: "heavy snow", 77: "snow grains",
-  80: "light rain showers", 81: "rain showers", 82: "violent rain showers",
-  85: "snow showers", 86: "heavy snow showers",
-  95: "thunderstorm", 96: "thunderstorm with hail", 99: "thunderstorm with heavy hail"
-}
+/** WMO weather interpretation codes, as documented by Open-Meteo: the English names are in `weather/words.ts`. */
 export const describeCode = (code: number | undefined): string =>
-  code === undefined ? "unknown conditions" : conditions[code] ?? "unknown conditions"
+  code === undefined ? "unknown conditions" : conditionsEn[code] ?? "unknown conditions"
 
 /** "Amsterdam, North Holland, Netherlands" (parts that repeat or are missing are left out). */
 const placeName = (p: Place) =>
@@ -215,14 +211,18 @@ export const makeWeatherParts = (options: WeatherOptions = {}) => {
 }
 
 /**
- * The weather lookup as a module. The geocode cache lives in the instance, so
- * changed settings start with a fresh cache. `fetch` is injected in tests.
+ * The weather module: the `weather` tool and `today` action below (Open-Meteo, one request each), and the extension of the
+ * local-info pull request in `weather/` (rain in the next hours, a forecast of a day this week, weather warnings, and a
+ * briefing section for each), which fetch through `@pva/net`. The geocode cache of the first two lives in the instance, so
+ * changed settings start with a fresh cache; the extension's cache lives in the module's shared part. `fetch` is injected in
+ * tests of the first two, `resolver` and `connector` in tests of the extension.
  */
-export const weatherModule = (deps: { readonly fetch?: typeof globalThis.fetch } = {}) =>
+export const weatherModule = (deps: { readonly fetch?: typeof globalThis.fetch } & WeatherNet = {}) =>
   defineModule({
+    apiVersion: 2,
     id: "weather",
     name: "Weather",
-    description: "Current weather and today's forecast from Open-Meteo (no account needed).",
+    description: "Current weather, rain in the next hours, forecasts and warnings from Open-Meteo and MeteoAlarm (no account needed).",
     settings: {
       defaultPlace: Setting.text({
         label: "Home location",
@@ -251,11 +251,26 @@ export const weatherModule = (deps: { readonly fetch?: typeof globalThis.fetch }
         advanced: true
       })
     },
-    start: ({ setStatus, settings }) =>
+    requires: [{ network: "internet", why: "Fetches forecasts from Open-Meteo and warnings from MeteoAlarm." }],
+    // Nothing to check without the network, and no setting is required: the place can be said in each question.
+    health: () => Effect.succeed([]),
+    shared: (ctx) =>
+      Effect.sync(() => {
+        const client = makeWeatherClient({ ...(deps.resolver !== undefined ? { resolver: deps.resolver } : {}), ...(deps.connector !== undefined ? { connector: deps.connector } : {}) })
+        const extras = makeWeatherExtras({ client: () => client, view: () => ctx.host.view(), settings: (turn) => ctx.settingsFor(turn?.assistantId) as WeatherSettingsView | undefined })
+        return { value: { client }, contributions: extras.sections.map((s) => BriefingSections.of(s)) }
+      }),
+    start: ({ setStatus, settings, shared, host }) =>
       Effect.sync(() => {
         const home = settings.defaultPlace.trim()
         setStatus(home === "" ? undefined : { text: `Home: ${home}`.slice(0, 120), tone: "neutral" })
         const { today, tool } = makeWeatherParts({ ...settings, ...(deps.fetch !== undefined ? { fetch: deps.fetch } : {}) })
-        return { tools: [tool], actions: [today] }
+        // Looked up when a call runs, never at start: what the host gave this instance is used only while it runs.
+        const extras = makeWeatherExtras({
+          client: () => (shared as { readonly client: WeatherClient }).client,
+          view: () => host.view(),
+          settings: () => settings
+        })
+        return { tools: [tool, ...extras.tools], actions: [today, ...extras.actions] }
       })
   })
