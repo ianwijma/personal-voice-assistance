@@ -29,11 +29,10 @@ import {
   withIndexes
 } from "@pva/core"
 import { Cron, Effect, Result, Schema } from "effect"
-import { mkdtempSync } from "node:fs"
-import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { makeSqliteStore } from "../src/index.ts"
-import { bound } from "./latencyBound.ts"
+import { logStarts } from "../src/testing.ts"
+import { bound, latencyDir } from "./latencyBound.ts"
 
 /** The longest gap between ticks of a 1 ms timer while `effect` runs (what audio framing would see). */
 const longestStop = <A, E>(effect: Effect.Effect<A, E>) =>
@@ -75,7 +74,7 @@ const FROMS = ["2026-11-18T12:00:00Z", "2026-03-29T00:59:59Z", "2026-10-25T00:59
 describe("scheduler latency on SQLite at the limits", () => {
   it.live("schedule is one short transaction; a loop pass over 50 handlers and 1,000 jobs and a retention step hold the main thread briefly", () =>
     Effect.scoped(Effect.gen(function*() {
-      const store = yield* makeSqliteStore({ filename: join(mkdtempSync(join(tmpdir(), "pva-scheduler-latency-")), "household.db") })
+      const store = yield* makeSqliteStore({ filename: join(latencyDir("pva-scheduler-latency"), "household.db") })
       yield* store.prepare([], [schedulerStorage])
       const passes: Array<{ ms: number; claimed: number; handlers: number }> = []
       const steps: Array<{ ms: number; removed: number }> = []
@@ -213,6 +212,7 @@ describe("scheduler latency on SQLite at the limits", () => {
         for (let i = 0; i < 400; i++) c.insert({ ...fixture, key: key100(`old${i}`) }, { actor: { kind: "admin" } })
       })
       steps.length = 0
+      const startsBefore = logStarts(store)
       const retention = yield* longestStop(Effect.gen(function*() {
         engine.maintainSoon()
         yield* engine.settled
@@ -220,6 +220,12 @@ describe("scheduler latency on SQLite at the limits", () => {
         yield* engine.settled
       }))
       const removing = steps.filter((s) => s.removed > 0)
+      // Each removal step asks for a truncating checkpoint; after one, the worker starts the new log, unless a
+      // main-thread commit lands between the two (the window: that commit then syncs the log). Counted once every
+      // checkpoint asked for has answered.
+      yield* store.scrubbed
+      const startsAfter = logStarts(store)
+      const counted = Object.fromEntries((Object.keys(startsAfter) as Array<keyof typeof startsAfter>).map((k) => [k, startsAfter[k] - startsBefore[k]]))
       const stepWorst = Math.max(...removing.map((s) => s.ms))
       const lines = [
         `schedule (payload of ${MAX_PAYLOAD_CHARS} JSON characters of escapes, key of 100, ids of 64), ${warm.length} calls after ${WARM_UP} to warm up: longest stop ${scheduling.worst.toFixed(2)} ms; wall per call median ${scheduleMedian.toFixed(2)} ms, worst ${scheduleWorst.toFixed(2)} ms`,
@@ -227,7 +233,7 @@ describe("scheduler latency on SQLite at the limits", () => {
         `cron planning (Cron.next and Cron.prev, ${CRONS.length} expressions x ${ZONES.length} zones x ${FROMS.length} dates), synchronous: worst ${planWorst.toFixed(3)} ms; schedule with a cron, ${cronSchedule.length} calls: wall worst ${cronWorst.toFixed(2)} ms; a refused date ${refusedMs.toFixed(2)} ms`,
         `loop pass, 50 handlers, 1,000 jobs, nothing due, ${idlePasses.length} passes: worst ${idleWorst.toFixed(2)} ms wall (yielding between handlers); longest stop ${idle.worst.toFixed(2)} ms`,
         `loop pass claiming ${claiming.map((p) => p.claimed).join(" + ")} of 40 due jobs: worst ${Math.max(...claiming.map((p) => p.ms)).toFixed(2)} ms wall; longest stop ${busy.worst.toFixed(2)} ms`,
-        `retention, ${removing.reduce((n, s) => n + s.removed, 0)} failed rows of ${fixtureChars} characters (every text field at its longest) in ${removing.length} transactions of ${RETENTION_STEP_ROWS}: longest stop over the passes (with the recovery rule, the recount and the issues) ${retention.worst.toFixed(2)} ms; wall per transaction worst ${stepWorst.toFixed(2)} ms`
+        `retention, ${removing.reduce((n, s) => n + s.removed, 0)} failed rows of ${fixtureChars} characters (every text field at its longest) in ${removing.length} transactions of ${RETENTION_STEP_ROWS}: longest stop over the passes (with the recovery rule, the recount and the issues) ${retention.worst.toFixed(2)} ms; wall per transaction worst ${stepWorst.toFixed(2)} ms; log starts after its checkpoints ${JSON.stringify(counted)}`
       ]
       console.log(`Scheduler latency:\n  ${lines.join("\n  ")}`)
       assert.isAtLeast(fixtureChars, 2_100)

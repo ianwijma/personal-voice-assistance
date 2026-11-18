@@ -557,8 +557,11 @@ export type EngineStore = Omit<HouseholdStore, "info" | "backup"> & {
  */
 const BUSY_BUDGET_MS = 1_000
 const BUSY_MAX_PAUSE_MS = 100
-/** The pause before try `n + 1` after `n + 1` busy beginnings (`n` from 0), or `undefined` when the budget is spent. */
-const busyPauseMs = (n: number): number | undefined => {
+/**
+ * The pause before try `n + 1` after `n + 1` busy beginnings (`n` from 0), or `undefined` when the budget is spent.
+ * Exported for the SQLite store's checkpoint worker, which waits for the lock the same way (`@pva/store-sqlite`).
+ */
+export const busyPauseMs = (n: number): number | undefined => {
   let spent = 0
   for (let i = 0; i < n; i++) spent += Math.min(BUSY_MAX_PAUSE_MS, 2 ** i)
   return spent >= BUSY_BUDGET_MS ? undefined : Math.min(BUSY_MAX_PAUSE_MS, 2 ** n)
