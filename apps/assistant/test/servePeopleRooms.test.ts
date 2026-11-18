@@ -1135,3 +1135,260 @@ describe("review round 3: a room-only change reaches a snapshot in progress at o
     expect(final.final).toBe(true)
   })
 })
+
+// ---- Review round 4 (p5-r4a findings 1 and 2): one authority on who is a member (`effectiveMembersOf`). A settings
+// file edited by hand can neither bring back a removed person's id nor make someone a member whom Members validation
+// refuses: People, the device facts and Privacy, the gateway, a device's default person, the feed and the ambient
+// facts all answer from the same effective Members.
+
+/** The rows of a page's snapshot, from part 0 to the final part (merged P4: a snapshot comes in parts). */
+const snapshotRows = async (client: ScriptedClient, from = 0): Promise<ReadonlyArray<string>> => {
+  const final = await client.waitFor("household.snapshot", (m) => m.final, { from, timeoutMs: 10_000 })
+  const parts = client.messages.slice(from).filter((m): m is ServerMessageOf<"household.snapshot"> => m.type === "household.snapshot")
+  const upTo = parts.slice(0, parts.indexOf(final) + 1)
+  return upTo.slice(upTo.map((p) => p.part).lastIndexOf(0)).flatMap((m) => m.collections.flatMap((c) => c.rows.map((r) => (r.value as { text: string }).text))).sort()
+}
+
+/** The tool call of a typed turn on `page` (what the probe saw) and the per-turn context the model got. */
+const probedTurn = async (page: ScriptedClient, text: string) => {
+  const before = seen.length
+  requests.length = 0
+  await typedOn(page, text)
+  await until("the tool call", () => seen.length > before)
+  return { seen: seen.at(-1)!, context: requests.map((r) => r.context ?? "").join("\n") }
+}
+
+/** The gateway's answer for a turn of `person` on `deviceId` (`principalProblem`). */
+const gatewayFor = async (deviceId: string, person: string) => {
+  const host = server!.handle.host
+  const where = (host.snapshot().assistantParts.get("alpha") ?? []).find((p) => p.moduleId === "probe")!.module.tools!.find((t) => t.name === "where")!
+  const principal = { _tag: "turn", turn: { turnId: 98, conversationId: "c", source: "text", assistantId: "alpha", deviceId, person: { id: person, how: "device-default" } } } as const
+  const exit = await Effect.runPromise(Effect.exit(host.gateway.tool("probe", where, {}, { principal })))
+  return exit._tag === "Success" ? "ran" : String((exit.cause as { readonly reasons?: ReadonlyArray<{ readonly error?: { readonly message?: string } }> }).reasons?.[0]?.error?.message ?? "failed")
+}
+
+const AMBIENT = { HOME_AMBIENT_FACTS: "all" }
+
+/**
+ * Sam and Robin in Members, a shared kitchen tablet whose default person is Sam, a personal row of each; then (`before`)
+ * more saves, the server stopped, the settings file edited by hand (`edit`) and the server started again from it.
+ */
+const startFromEditedFile = async (
+  edit: (file: Json, ids: { readonly samId: string; readonly robinId: string }) => void,
+  before?: (admin: ScriptedClient, ids: { readonly samId: string; readonly robinId: string }) => Promise<void>
+) => {
+  const { admin, samId, robinId } = await boot({ env: AMBIENT })
+  await until("the probe's store", () => storeRef !== undefined)
+  await Effect.runPromise(storeRef!.collection(items).insert({ text: "Sam's appointment" }, { scope: { kind: "person", id: samId } }))
+  await Effect.runPromise(storeRef!.collection(items).insert({ text: "Robin's note" }, { scope: { kind: "person", id: robinId } }))
+  await pageOn("kitchen-r4-01")
+  expect((await saveDevice(admin, "kitchen-r4-01", { place: placeOf(samId) })).ok).toBe(true)
+  await before?.(admin, { samId, robinId })
+  for (const c of clients.splice(0)) c.close()
+  const dataDir = server!.dataDir
+  const path = join(dataDir, "settings.json")
+  await server!.close()
+  server = undefined
+  const file = JSON.parse(readFileSync(path, "utf8")) as Json
+  edit(file, { samId, robinId })
+  writeFileSync(path, JSON.stringify(file))
+  hostRef = undefined
+  storeRef = undefined
+  server = await startTestServer({
+    build: fakeBuild({ stt: controlledStt().stt, llm: scriptedLlm(() => "").llm }),
+    buildLlm: toolThenText,
+    dataDir,
+    catalog: [greeterModule, probe],
+    env: AMBIENT
+  })
+  await until("the probe", () => hostRef !== undefined && storeRef !== undefined)
+  const admin2 = await ScriptedClient.connect({ url: server.url })
+  clients.push(admin2)
+  await admin2.admin(TEST_ADMIN_PASSWORD)
+  return { admin: admin2, path, samId, robinId }
+}
+
+describe("review round 4: a retired id pasted back into the settings file", () => {
+  it("is nobody's: People gives that person a fresh id, no reference may name the retired one, none of the removed member's rows reach the feed or the ambient facts, and no save brings it back", async () => {
+    const { admin, path, samId, robinId } = await startFromEditedFile(
+      (file, { samId, robinId }) => {
+        // The retired list is intact; an old row of Sam's is pasted back under another name, and the tablet names Sam.
+        expect(file.assistant.HOUSEHOLD_MEMBERS_RETIRED).toEqual([samId])
+        file.assistant.HOUSEHOLD_MEMBERS = [{ id: robinId, name: "Robin" }, { id: samId, name: "Kim" }]
+        file.devices["kitchen-r4-01"].own.place = placeOf(samId)
+      },
+      async (admin, { robinId }) => {
+        // Sam is removed: Sam's id is retired (Sam's rows stay in the database).
+        const robin = (server!.handle.store.settings().assistant.HOUSEHOLD_MEMBERS as ReadonlyArray<Json>).find((m) => m.id === robinId)!
+        expect((await request(admin, { type: "settings.update", sectionId: "members", patch: { values: { HOUSEHOLD_MEMBERS: [robin] as never }, secrets: {} } })).ok).toBe(true)
+      }
+    )
+    const store = server!.handle.store
+    const people = hostRef!.service(People)!
+    const privacy = hostRef!.service(Privacy)!
+    expect(people.list().map((p) => p.name)).toEqual(["Robin", "Kim"])
+    const kimId = people.list()[1]!.id
+    expect(kimId).not.toBe(samId)
+    expect(people.get(samId)).toBeUndefined()
+    expect(people.find("Kim")).toMatchObject({ kind: "found", person: { id: kimId } })
+    expect(hostRef!.service(Devices)!.get("kitchen-r4-01")?.place.defaultPerson).toBeNull()
+    expect(privacy.mayReveal(samId, "kitchen-r4-01")).toBe(false)
+    expect(await gatewayFor("kitchen-r4-01", samId)).toBe("Not run: the person is not in Members.")
+    // The repair is written (Kim's id is the committed one), and the tablet's reference to the retired id is cleared.
+    await until("the repair written", () => {
+      const onDisk = JSON.parse(readFileSync(path, "utf8")) as Json
+      return JSON.stringify((onDisk.assistant.HOUSEHOLD_MEMBERS as ReadonlyArray<Json>).map((m) => m.id)) === JSON.stringify([robinId, kimId]) &&
+        onDisk.devices["kitchen-r4-01"].own.place.defaultPerson === null
+    })
+    expect(store.settings().assistant.HOUSEHOLD_MEMBERS_RETIRED).toEqual([samId])
+    // A shared device cannot take the retired id as its default person; Kim's own id it can.
+    expect((await saveDevice(admin, "kitchen-r4-01", { place: placeOf(samId) })).ok).toBe(false)
+    expect((await saveDevice(admin, "kitchen-r4-01", { place: placeOf(kimId) })).ok).toBe(true)
+    await Effect.runPromise(storeRef!.collection(items).insert({ text: "Kim's list" }, { scope: { kind: "person", id: kimId } }))
+    const page = await pageOn("kitchen-r4-01")
+    expect(await snapshotRows(page)).toEqual(["Kim's list"])
+    const turn = await probedTurn(page, "what is on my list?")
+    expect(turn.seen.turn?.person).toEqual({ id: kimId, how: "device-default" })
+    expect(turn.context).toContain("Item: Kim's list")
+    expect(turn.context).not.toContain("Sam's appointment")
+    expect(privacy.mayReveal(samId, turn.seen.turn)).toBe(false)
+    // A later save, from a stale tab still holding the old row: the retired id does not come back.
+    const stale = [{ id: robinId, name: "Robin" }, { id: kimId, name: "Kim" }, { id: samId, name: "Jo" }]
+    expect((await request(admin, { type: "settings.update", sectionId: "members", patch: { values: { HOUSEHOLD_MEMBERS: stale as never }, secrets: {} } })).ok).toBe(true)
+    const ids = (store.settings().assistant.HOUSEHOLD_MEMBERS as ReadonlyArray<Json>).map((m) => m.id as string)
+    expect(ids.slice(0, 2)).toEqual([robinId, kimId])
+    expect(ids).not.toContain(samId)
+    expect(store.settings().assistant.HOUSEHOLD_MEMBERS_RETIRED).toEqual([samId])
+    expect(people.get(samId)).toBeUndefined()
+  })
+})
+
+describe("review round 4: Members that do not pass validation as a whole are nobody", () => {
+  it.each([
+    ["a field of the wrong type", (samId: string, robinId: string) => [{ id: samId, name: "Sam", aliases: 17 }, { id: robinId, name: "Robin" }]],
+    ["two people with the same name", (samId: string, robinId: string) => [{ id: samId, name: "Sam" }, { id: robinId, name: "sam" }]]
+  ])("%s: People is empty, the tablet has no default person, the turn no person, Privacy says no, no personal row or fact", async (_what, members) => {
+    let saved: unknown
+    const { path, samId } = await startFromEditedFile((file, { samId, robinId }) => {
+      file.assistant.HOUSEHOLD_MEMBERS = members(samId, robinId)
+      saved = file.assistant.HOUSEHOLD_MEMBERS
+      // The tablet still names Sam.
+      expect(file.devices["kitchen-r4-01"].own.place.defaultPerson).toBe(samId)
+    })
+    const people = hostRef!.service(People)!
+    const privacy = hostRef!.service(Privacy)!
+    expect(people.list()).toEqual([])
+    expect(people.get(samId)).toBeUndefined()
+    expect(people.find("Sam").kind).not.toBe("found")
+    expect(hostRef!.service(Devices)!.get("kitchen-r4-01")?.place.defaultPerson).toBeNull()
+    expect(privacy.mayReveal(samId, "kitchen-r4-01")).toBe(false)
+    expect(await gatewayFor("kitchen-r4-01", samId)).toBe("Not run: the person is not in Members.")
+    const page = await pageOn("kitchen-r4-01")
+    expect(await snapshotRows(page)).toEqual([])
+    const turn = await probedTurn(page, "what is on my list?")
+    expect(turn.seen.turn?.deviceId).toBe("kitchen-r4-01")
+    expect(turn.seen.turn?.person).toBeUndefined()
+    expect(privacy.mayReveal(samId, turn.seen.turn)).toBe(false)
+    expect(turn.context).not.toContain("Sam's appointment")
+    expect(turn.context).not.toContain("Robin's note")
+    // The owner's list is left in the file for admin to correct (no write of an empty list over it).
+    const onDisk = JSON.parse(readFileSync(path, "utf8")) as Json
+    expect(onDisk.assistant.HOUSEHOLD_MEMBERS).toEqual(saved)
+  })
+})
+
+describe("review round 4: every membership predicate in the server agrees with People", () => {
+  it("for generated Members values (valid, invalid fields, repeated ids, retired ids, repeated names), stored as a hand edit would", async () => {
+    const POOL = Array.from({ length: 5 }, (_, i) => `p-pool000${i + 1}`)
+    const NAMES = ["Ann", "Bo", "Cy", "Di", "Ed", "Flo"]
+    const { admin, store } = await boot({ env: AMBIENT })
+    // Every pool id a member once, with a personal row each (rows of a person outside Members cannot be written).
+    await Effect.runPromise(store.saveAssistant(["HOUSEHOLD_MEMBERS"], { HOUSEHOLD_MEMBERS: POOL.map((id, i) => ({ id, name: NAMES[i]! })) as never }, {}))
+    await until("the probe's store", () => storeRef !== undefined)
+    for (const id of POOL) await Effect.runPromise(storeRef!.collection(items).insert({ text: `row of ${id}` }, { scope: { kind: "person", id } }))
+    const SHARED = POOL.map((_, i) => `shared-r4-0${i}`)
+    for (const id of [...SHARED, "private-r4-0"]) {
+      const page = await pageOn(id)
+      page.close()
+    }
+    // A small seeded generator (the same values at every run).
+    let state = 42
+    const rand = () => {
+      state = (state * 1103515245 + 12345) % 2147483648
+      return state / 2147483648
+    }
+    const pick = <T>(xs: ReadonlyArray<T>): T => xs[Math.floor(rand() * xs.length)]!
+    const generate = (i: number) => {
+      const n = 1 + Math.floor(rand() * 4)
+      const names = [...NAMES].sort(() => rand() - 0.5).slice(0, n)
+      const list: Array<Json> = names.map((name) => {
+        const r = rand()
+        return r < 0.6 ? { id: pick(POOL), name } : r < 0.75 ? { name } : r < 0.85 ? { id: "Bad Id", name } : { id: pick(POOL), name, aliases: [name.toLowerCase()] }
+      })
+      const mode = i % 5
+      if (mode === 1) list[Math.floor(rand() * list.length)]!.aliases = 17 // an invalid field
+      if (mode === 2 && list.length > 1) list[1]!.name = list[0]!.name.toUpperCase() // a repeated name
+      if (mode === 3) list.push({ id: (list.find((m) => typeof m.id === "string" && m.id.startsWith("p-"))?.id as string | undefined) ?? POOL[0]!, name: "Gus" }) // a repeated id
+      const retired = POOL.filter(() => rand() < (mode === 4 ? 0.6 : 0.2))
+      return { list, retired }
+    }
+    const privacy = hostRef!.service(Privacy)!
+    const people = hostRef!.service(People)!
+    const devicesService = hostRef!.service(Devices)!
+    const { boundaryIn, membersRemoved } = await import("../src/serve/deviceFacts.ts")
+    const { referenceableIdsOf } = await import("../src/serve/people.ts")
+    let invalid = 0
+    let checked = 0
+    for (let i = 0; i < 30; i++) {
+      const { list, retired } = generate(i)
+      await Effect.runPromise(store.saveAssistant(["HOUSEHOLD_MEMBERS", "HOUSEHOLD_MEMBERS_RETIRED"], { HOUSEHOLD_MEMBERS: list as never, HOUSEHOLD_MEMBERS_RETIRED: retired }, {}))
+      const listed = people.list()
+      const listedIds = listed.map((p) => p.id)
+      // People's own invariants: distinct, well-formed ids, none retired; an invalid value is nobody.
+      expect(new Set(listedIds).size).toBe(listedIds.length)
+      for (const id of listedIds) {
+        expect(id).toMatch(/^[a-z0-9][a-z0-9_-]{0,39}$/)
+        expect(retired).not.toContain(id)
+      }
+      if (listed.length === 0) invalid++
+      // An id two saved records carried is in People (its first record keeps it) but no reference may name it.
+      const counts = new Map<string, number>()
+      for (const m of list) if (typeof m.id === "string") counts.set(m.id, (counts.get(m.id) ?? 0) + 1)
+      const member = (id: string) => listedIds.includes(id) && (counts.get(id) ?? 0) < 2
+      const candidates = [...new Set([...POOL, ...listedIds])]
+      // Each shared tablet names one candidate (a hand edit too); the private one names the first pool id.
+      const sharedOf = new Map(candidates.slice(0, SHARED.length).map((c, k) => [c, SHARED[k]!]))
+      await Effect.runPromise(store.saveDeviceRecords("test", (committed) => {
+        const out = { ...committed }
+        for (const [c, id] of sharedOf) out[id] = { ...out[id]!, own: { ...out[id]!.own, place: placeOf(c, "shared") }, rev: out[id]!.rev + 1 }
+        out["private-r4-0"] = { ...out["private-r4-0"]!, own: { ...out["private-r4-0"]!.own, place: placeOf(POOL[0]!, "private") }, rev: out["private-r4-0"]!.rev + 1 }
+        return out
+      }))
+      const file = store.settings()
+      expect([...referenceableIdsOf(file.assistant)].sort()).toEqual(candidates.filter(member).sort())
+      expect(membersRemoved(file, { ...file, assistant: { ...file.assistant, HOUSEHOLD_MEMBERS: [] } })).toBe(candidates.some(member))
+      for (const c of candidates) {
+        expect(privacy.mayReveal(c, "private-r4-0")).toBe(member(c))
+        const shared = sharedOf.get(c)
+        if (shared === undefined) continue
+        checked++
+        expect(devicesService.get(shared)?.place.defaultPerson ?? null).toBe(member(c) ? c : null)
+        expect(privacy.mayReveal(c, shared)).toBe(member(c))
+        expect(boundaryIn(file, shared).key.includes(c)).toBe(member(c))
+        expect(await gatewayFor(shared, c)).toBe(member(c) ? "ran" : "Not run: the person is not in Members.")
+        // A device save naming the person: accepted only for a member.
+        expect((await saveDevice(admin, shared, { place: placeOf(c) })).ok).toBe(member(c))
+      }
+      // The feed's person rule and the ambient facts, on the private tablet (it may see every member's rows).
+      const page = await pageOn("private-r4-0")
+      expect(await snapshotRows(page)).toEqual(POOL.filter(member).map((id) => `row of ${id}`).sort())
+      const turn = await probedTurn(page, "what is on my list?")
+      expect(turn.seen.turn?.person?.id).toBe(member(POOL[0]!) ? POOL[0] : undefined)
+      for (const id of POOL) expect(turn.context.includes(`Item: row of ${id}`)).toBe(id === POOL[0] && member(id))
+      page.close()
+    }
+    // The generated values covered every kind.
+    expect(invalid).toBeGreaterThan(4)
+    expect(checked).toBeGreaterThan(50)
+  }, 240_000)
+})

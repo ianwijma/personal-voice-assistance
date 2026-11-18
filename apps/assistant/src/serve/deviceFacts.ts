@@ -13,7 +13,7 @@ import {
 import { boundaryKey, type DeclaredCapabilities, type DevicePlace, effectiveCapabilities, roomOf, speakerAllowedFrom } from "@pva/protocol"
 import { Effect } from "effect"
 import { deviceSettingsFrom } from "./devices.ts"
-import { loadedPersonIdsOf, MEMBERS_KEY, referenceableIdsOf } from "./people.ts"
+import { type EffectiveMembers, effectiveMembersOf } from "./people.ts"
 import type { SettingsFile } from "./SettingsStore.ts"
 
 /**
@@ -50,7 +50,7 @@ export const boundaryIn = (file: SettingsFile, deviceId: string | undefined, kin
   const settings = deviceSettingsFrom(file, known ? deviceId : undefined, kind)
   // Without a record, only the output overrides (its type's) apply: privacy refuses an unknown device anyway.
   if (!known) return { known: false, key: `unknown|${boundaryKey({ ...settings, place: { ...settings.place, privacy: "public", defaultPerson: null } }, () => false)}` }
-  const members = referenceableIdsOf(file.assistant)
+  const members = effectiveMembersOf(file.assistant).referenceable
   return { known: true, key: boundaryKey(settings, (id) => members.has(id)) }
 }
 
@@ -66,11 +66,15 @@ export const boundaryChanged = (before: SettingsFile, after: SettingsFile, devic
   return !(!b.known && a.known)
 }
 
-/** A person who was in Members before the commit is not after it: every device's session ends. */
+/**
+ * A person who was a member before the commit (`effectiveMembersOf`, an id a reference may name) is not after it: every
+ * device's session ends.
+ */
 export const membersRemoved = (before: SettingsFile, after: SettingsFile): boolean => {
-  if (before.assistant[MEMBERS_KEY] === after.assistant[MEMBERS_KEY]) return false
-  const now = loadedPersonIdsOf(after.assistant)
-  for (const id of loadedPersonIdsOf(before.assistant)) if (!now.has(id)) return true
+  const b = effectiveMembersOf(before.assistant)
+  const a = effectiveMembersOf(after.assistant)
+  if (a === b) return false
+  for (const id of b.referenceable) if (!a.referenceable.has(id)) return true
   return false
 }
 
@@ -94,11 +98,6 @@ export interface DeviceFactsOptions {
   readonly lastSeenOf?: (id: string) => number | undefined
   /** Live state per device (the hub's connections); absent: nothing is connected. */
   readonly live: (id: string) => DeviceLiveFacts
-  /** Whether a person id is one of the household's (Members). */
-  readonly isPerson: (id: string) => boolean
-  readonly nameOfPerson: (id: string) => string | undefined
-  /** Identity of the people value (`Sections.value(HOUSEHOLD_MEMBERS)`): a new one rebuilds the cache. */
-  readonly peopleVersion: () => unknown
 }
 
 export interface DeviceFacts {
@@ -128,7 +127,8 @@ export const makeDeviceFacts = (options: DeviceFactsOptions): DeviceFacts => {
   let version = 0
   type Cache = {
     readonly file: SettingsFile
-    readonly people: unknown
+    /** Members in `file` (`effectiveMembersOf`): the only answer to "is this id a member" here. */
+    readonly members: EffectiveMembers
     readonly version: number
     readonly list: ReadonlyArray<KnownDevice>
     readonly byId: ReadonlyMap<string, KnownDevice>
@@ -138,19 +138,19 @@ export const makeDeviceFacts = (options: DeviceFactsOptions): DeviceFacts => {
   }
   let cache: Cache | undefined
 
-  const placeIn = (file: SettingsFile, deviceId: string): DevicePlace => {
+  const placeIn = (file: SettingsFile, members: EffectiveMembers, deviceId: string): DevicePlace => {
     const place = deviceSettingsFrom(file, deviceId).place
-    return place.defaultPerson !== null && !options.isPerson(place.defaultPerson) ? { ...place, defaultPerson: null } : place
+    return place.defaultPerson !== null && !members.referenceable.has(place.defaultPerson) ? { ...place, defaultPerson: null } : place
   }
 
   const current = (): Cache => {
     const file = options.file()
-    const people = options.peopleVersion()
-    if (cache !== undefined && cache.file === file && cache.people === people && cache.version === version) return cache
+    const members = effectiveMembersOf(file.assistant)
+    if (cache !== undefined && cache.file === file && cache.members === members && cache.version === version) return cache
     const list = Object.entries(file.devices)
       .map(([id, record]): KnownDevice => {
         const settings = deviceSettingsFrom(file, id)
-        const place = placeIn(file, id)
+        const place = placeIn(file, members, id)
         const declared = options.declaredOf(id) ?? record.declared
         const live = options.live(id)
         return {
@@ -169,7 +169,7 @@ export const makeDeviceFacts = (options: DeviceFactsOptions): DeviceFacts => {
       })
       .sort((a, b) => b.lastSeen - a.lastSeen)
     const speaks = new Map(Object.keys(file.devices).map((id) => [id, speaksIn(file, id, undefined)]))
-    cache = { file, people, version, list, byId: new Map(list.map((d) => [d.id, d])), lines: new Map(), speaks }
+    cache = { file, members, version, list, byId: new Map(list.map((d) => [d.id, d])), lines: new Map(), speaks }
     return cache
   }
 
@@ -184,14 +184,16 @@ export const makeDeviceFacts = (options: DeviceFactsOptions): DeviceFacts => {
   const known = (deviceId: string | undefined): KnownDevice | undefined => (deviceId === undefined ? undefined : current().byId.get(deviceId))
   const placeOf = (deviceId: string | undefined): DevicePlace | undefined => known(deviceId)?.place
 
-  const isMember = (id: string) => options.isPerson(id)
+  // A person is a member while the committed settings' effective Members can name them (fails closed otherwise).
+  const isMember = (id: string) => current().members.referenceable.has(id)
+  const nameOfPerson = (id: string) => current().members.byId.get(id)?.name
 
   const contextLine = (deviceId: string | undefined): string => {
     const c = current()
     const key = deviceId ?? ""
     const cached = c.lines.get(key)
     if (cached !== undefined) return cached
-    const line = deviceContextLine(c.list, deviceId, options.nameOfPerson, isMember)
+    const line = deviceContextLine(c.list, deviceId, nameOfPerson, isMember)
     c.lines.set(key, line)
     return line
   }

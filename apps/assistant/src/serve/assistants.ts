@@ -81,7 +81,10 @@ export interface AssistantsOptions {
    * without a key (warning, "Save anyway"). Without it every voice is accepted.
    */
   readonly voiceProblem?: (voice: VoiceRefJson) => { readonly level: "error" | "warning"; readonly message: string } | undefined
-  /** P5: whether a person id is one of the household's Members (a `place.defaultPerson` must be). Absent: any id. */
+  /**
+   * P5: whether a person id is one of the household's Members a reference may name (`EffectiveMembers.referenceable`;
+   * a `place.defaultPerson` must be). Absent: none is (fails closed).
+   */
   readonly isPerson?: (id: string) => boolean
   /**
    * P5: the one serialized operation over people and the references to them (`people.ts`): every save here (devices,
@@ -297,7 +300,7 @@ export const makeAssistants = (options: AssistantsOptions): Assistants => {
   /** P5: a `place` whose default person is not one of the Members is refused. */
   const placeRefusal = (patch: DeviceSettingsPatch): AssistantResult | undefined => {
     const person = patch.place?.defaultPerson
-    if (person === undefined || person === null || options.isPerson === undefined || options.isPerson(person)) return undefined
+    if (person === undefined || person === null || options.isPerson?.(person) === true) return undefined
     return refusal([{ code: "invalid", path: "place.defaultPerson", message: "That person is not in Members (any more): pick another, or nobody." }])
   }
 

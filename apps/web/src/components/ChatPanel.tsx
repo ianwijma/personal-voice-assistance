@@ -22,7 +22,8 @@ import { useMediaQuery, WIDE_QUERY } from "./useMediaQuery.ts"
 export function ChatPanel() {
   const client = useClient()
   const open = useClientState((s) => s.ui.chatOpen)
-  // P5 round 3: a session the server ended takes the draft with it (the composer starts afresh).
+  // P5 round 3: a session the server ended takes the draft with it (the composer starts afresh); round 4: the message
+  // list's scroll state too (it starts at the bottom of the new session).
   const sessionSeq = useClientState((s) => s.sessionSeq)
   const ref = useRef<HTMLElement>(null)
   const close = () => client.store.dispatch({ type: "local/ui", patch: { chatOpen: false } })
@@ -73,8 +74,8 @@ export function ChatPanel() {
           </div>
         </div>
         <ConversationNote />
-        <MessageList />
-        <Composer key={sessionSeq} />
+        <MessageList key={`list-${sessionSeq}`} />
+        <Composer key={`composer-${sessionSeq}`} />
       </aside>
     </>
   )

@@ -128,17 +128,7 @@ import { makeHouseholdPush } from "./HouseholdPush.ts"
 import { Devices, hostEvent, makeIssueRegistry, oneLine, People, Privacy, withContextProvider } from "@pva/core"
 import { openServeScheduler } from "./scheduler.ts"
 import { boundaryChanged, makeDeviceFacts, membersRemoved } from "./deviceFacts.ts"
-import {
-  makeMembersGate,
-  makePeopleService,
-  MEMBERS_ENV_REFUSED,
-  loadedMembers,
-  MEMBERS_KEY,
-  MEMBERS_SECTION_ID,
-  personIdsOf,
-  referenceableIdsOf,
-  RETIRED_KEY
-} from "./people.ts"
+import { effectiveMembersOf, makeMembersGate, makePeopleService, MEMBERS_ENV_REFUSED, MEMBERS_KEY, MEMBERS_SECTION_ID } from "./people.ts"
 import { householdBackupIssues, runMaintenance } from "@pva/store-sqlite"
 import { type KdfParams, openVault, type Vault, VaultPathConfig } from "./Vault.ts"
 import * as SherpaStt from "@pva/stt-sherpa"
@@ -357,8 +347,13 @@ export const startServe = (options: ServeOptions): Effect.Effect<ServeHandle, Ht
     const logContext = yield* Effect.context<never>()
     const logInfo = (line: string) => void Effect.runForkWith(logContext)(Effect.logInfo(line))
     // P5: the household's people (shared settings › Members); a diet a module records is saved like an admin edit.
+    // Review round 4: `effectiveMembersOf` of the committed settings is the one answer to "who is a member" (People,
+    // device facts and Privacy, the feed and ambient facts, the gateway, default-person saves and clean-up, the
+    // boundary). Nothing reads the saved Members list any other way.
+    const members = () => effectiveMembersOf(store.settings().assistant)
     const people = makePeopleService({
       value: (key) => sections.value(key),
+      members,
       edit: (build) => {
         let code: "unknown_person" | undefined
         return Effect.map(
@@ -379,7 +374,7 @@ export const startServe = (options: ServeOptions): Effect.Effect<ServeHandle, Ht
       catalog,
       backupCopyDir: env.HOUSEHOLD_BACKUP_COPY_DIR,
       log: logInfo,
-      people: () => people.list().map((p) => p.id),
+      people: () => [...members().referenceable],
       guard: lock.guard,
       report: (problem) => {
         feedProblems.set(problem.module, { what: problem.what, message: problem.message })
@@ -393,11 +388,7 @@ export const startServe = (options: ServeOptions): Effect.Effect<ServeHandle, Ht
       declaredOf: (id) => devices.declaredOf(id),
       latestOf: (id) => devices.latestOf(id),
       lastSeenOf: (id) => devices.lastSeenOf(id),
-      live: (id) => hub?.deviceLive(id) ?? { connected: false, visible: false },
-      // A device's default person counts while it is a member whose id no two saved records share (`referenceableIdsOf`).
-      isPerson: (id) => referenceableIdsOf(store.settings().assistant).has(id),
-      nameOfPerson: (id) => people.nameOf(id),
-      peopleVersion: () => sections.value(MEMBERS_KEY)
+      live: (id) => hub?.deviceLive(id) ?? { connected: false, visible: false }
     })
     // P6: the scheduler (docs/SCHEDULING.md) on the household store, made before the module host it gives
     // `ctx.scheduler` to; its Health issues go to the registry the host keeps. The gateway that admits a job's
@@ -479,7 +470,7 @@ export const startServe = (options: ServeOptions): Effect.Effect<ServeHandle, Ht
       // P5: a person is someone in Members and the device's default person (the only way a turn has a person: there is
       // no voice identification). The person's id is not quoted: it may come from module code.
       if (person !== undefined) {
-        if (people.get(person.id) === undefined) return "the person is not in Members."
+        if (!members().referenceable.has(person.id)) return "the person is not in Members."
         if (deviceFacts.placeOf(deviceId)?.defaultPerson !== person.id) return `the person is not the default person of the device "${deviceId}".`
       }
       return undefined
@@ -1429,7 +1420,7 @@ export const startServe = (options: ServeOptions): Effect.Effect<ServeHandle, Ht
       llmProblems,
       speechMemoryWarning,
       voiceProblem,
-      isPerson: (id) => referenceableIdsOf(store.settings().assistant).has(id),
+      isPerson: (id) => members().referenceable.has(id),
       // P5: device and device type saves check their default person against the committed Members, inside the gate.
       membersGate,
       // P5: the setup's speaking flags follow what is sent (the override and the declaration).
@@ -1536,7 +1527,7 @@ export const startServe = (options: ServeOptions): Effect.Effect<ServeHandle, Ht
     yield* Effect.addFinalizer(() => Effect.sync(stopBoundary))
     // P5: a person removed from Members is no device's default person any more (also at start, after a crash between
     // the two saves); devices and voice pages then follow the new places.
-    const clearDangling = Effect.suspend(() => store.clearDefaultPeople(referenceableIdsOf(store.settings().assistant))).pipe(
+    const clearDangling = Effect.suspend(() => store.clearDefaultPeople(members().referenceable)).pipe(
       Effect.flatMap((n) => (n === 0 ? Effect.void : Effect.sync(() => hubNow.entitiesChanged())))
     )
     const clearRemovedPeople = clearDangling.pipe(
@@ -1544,18 +1535,19 @@ export const startServe = (options: ServeOptions): Effect.Effect<ServeHandle, Ht
     )
     afterMembersSave = clearRemovedPeople
     /** Who was in Members at the last look: a change of it gives every page a fresh snapshot (a removed person's rows go). */
-    let memberIds = [...personIdsOf(sections.value(MEMBERS_KEY))].sort().join(",")
+    let memberIds = [...members().referenceable].sort().join(",")
     sections.subscribe((section) => {
       if (section.id !== MEMBERS_SECTION_ID) return
       hubNow.refreshDevices()
-      const ids = [...personIdsOf(sections.value(MEMBERS_KEY))].sort().join(",")
+      const ids = [...members().referenceable].sort().join(",")
       if (ids !== memberIds) {
         memberIds = ids
         push.resync()
       }
     })
-    // At start: a hand-edited Members value is already read repaired (`loadedMembers`: every reader sees unique ids,
-    // and a reference to an id two records shared counts as none). Writing that back is ordinary persistence: first
+    // At start: a hand-edited Members value is already read repaired (`effectiveMembersOf`: every reader sees unique,
+    // unretired ids, and a reference to an id two records shared counts as none; a value that is not valid as a whole
+    // is no members, and is left for admin to correct). Writing that back is ordinary persistence: first
     // the references to such an id are cleared, then the repaired list is saved through the section (so its ids are
     // the committed ones). If either fails, a Health issue says so and the server goes on with the repaired list.
     const repairIssue = (message: string | undefined) =>
@@ -1563,13 +1555,13 @@ export const startServe = (options: ServeOptions): Effect.Effect<ServeHandle, Ht
         id: "core.members.repair",
         severity: "warning" as const,
         title: "Members could not be written back with their ids",
-        detail: `The settings file gives a person no id, or an id another person has. The assistant uses repaired ids, but could not save them: ${message}`.slice(0, 1900)
+        detail: `The settings file gives a person no id, an id another person has, or the id of someone removed. The assistant uses repaired ids, but could not save them: ${message}`.slice(0, 1900)
       }])
     if (store.blocked() === undefined) {
       run(
         membersGate.run(clearDangling).pipe(
           Effect.flatMap(() => {
-            if (!loadedMembers(store.settings().assistant[MEMBERS_KEY], store.settings().assistant[RETIRED_KEY]).repaired) return Effect.void
+            if (!members().repaired) return Effect.void
             return Effect.flatMap(
               sections.edit(MEMBERS_SECTION_ID, (value) => ({ values: { [MEMBERS_KEY]: value(MEMBERS_KEY) ?? [] }, secrets: {} })),
               (u) => (u.result.ok ? Effect.void : Effect.fail(new Error(u.result.error.message)))

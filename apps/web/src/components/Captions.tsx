@@ -28,9 +28,13 @@ export function Captions() {
     }
     return null
   }, shallowEqual)
-  const last = useRef<Caption | null>(null)
-  if (caption !== null) last.current = caption
-  const shown = caption ?? last.current
+  // The last caption stays while it fades, but only within the session it belongs to: once the server ended the
+  // session (`local/session-ended`, `sessionSeq`), the old text is nowhere in the page (review round 4).
+  const seq = useClientState((s) => s.sessionSeq)
+  const last = useRef<{ readonly seq: number; readonly caption: Caption } | null>(null)
+  if (caption !== null) last.current = { seq, caption }
+  else if (last.current !== null && last.current.seq !== seq) last.current = null
+  const shown = caption ?? last.current?.caption ?? null
   if (!enabled || (!reserve && caption === null)) return null
   return (
     <div

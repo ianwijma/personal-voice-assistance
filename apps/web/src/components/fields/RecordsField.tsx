@@ -1,6 +1,6 @@
 "use client"
 import { type ComponentType, useEffect, useRef, useState } from "react"
-import type { RecordItemField, RecordValue, SettingField, SettingValue } from "@pva/protocol"
+import { MAX_LIST_JSON, type RecordItemField, type RecordValue, type SettingField, type SettingValue } from "@pva/protocol"
 import { Icon } from "../ui/Icon.tsx"
 import { Button, cx, IconButton } from "../ui/controls.tsx"
 import { BooleanField } from "./BooleanField.tsx"
@@ -109,11 +109,19 @@ export function RecordsField({ field, id, describedBy, value, onChange, disabled
       return message === undefined || !live.has(rowId) ? [] : [`${Noun} ${index + 1}, ${f.label}: ${message}`]
     })
   )[0]
+  // Review round 4: the whole value against the wire's bound (`RecordsValue`: at most `MAX_LIST_JSON` characters as
+  // JSON), so a list every field accepts but the server cannot take blocks Save here, with the data kept (the form
+  // shows it under the field, as every local error).
+  const size = JSON.stringify(list).length
+  const tooLarge = size > MAX_LIST_JSON
+    ? `The ${noun}s are too long all together: ${size.toLocaleString("en-GB")} characters, at most ${MAX_LIST_JSON.toLocaleString("en-GB")}. Shorten or remove something.`
+    : undefined
+  const problem = first ?? tooLarge
   const report = useRef(onLocalError)
   report.current = onLocalError
   useEffect(() => {
-    report.current(first)
-  }, [first])
+    report.current(problem)
+  }, [problem])
   useEffect(() => () => {
     report.current(undefined)
   }, [])

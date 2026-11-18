@@ -258,4 +258,42 @@ describe("the mock, through its handlers, as the server", { timeout: 30_000 }, (
     page.ws.close()
     a.ws.close()
   })
+
+  // Review round 4 (p5-r4b finding 3): the mock issues person ids as the server does.
+  it("Members: an id is kept only when it is a committed member's and not retired; the retired ids go with a reset", async () => {
+    const http = url.replace(/^ws/, "http").replace(/\/ws$/, "")
+    await fetch(`${http}/mock/reset`, { method: "POST", body: "{}" })
+    let a = await admin()
+    const membersNow = () =>
+      (a.messages.filter((m) => m.type === "section.changed" && m.section.id === "members").map((m) => (m as ServerMessageOf<"section.changed">).section.form.values.HOUSEHOLD_MEMBERS).at(-1) ??
+        (a.messages.find((m) => m.type === "admin.snapshot") as ServerMessageOf<"admin.snapshot">).snapshot.sections.find((x) => x.id === "members")!.form.values.HOUSEHOLD_MEMBERS) as unknown as ReadonlyArray<Record<string, unknown>>
+    const save = async (list: ReadonlyArray<Record<string, unknown>>) => {
+      const from = a.messages.length
+      expect((await a.request({ type: "settings.update", sectionId: "members", patch: { values: { HOUSEHOLD_MEMBERS: list }, secrets: {} } })).ok).toBe(true)
+      await a.waitFor("section.changed", (m) => m.section.id === "members", from)
+      return membersNow()
+    }
+    const seeded = membersNow()
+    const sam = seeded.find((m) => m.name === "Sam")!
+    const robin = seeded.find((m) => m.name === "Robin")!
+    expect(typeof sam.id).toBe("string")
+    // Sam is removed; then a stale tab saves Sam's row under another name, and a row with an id nobody had.
+    await save([robin])
+    const stale = await save([robin, { ...sam, name: "Kim" }, { name: "Jo", id: "p-madeup01" }])
+    expect(stale.map((m) => m.name)).toEqual(["Robin", "Kim", "Jo"])
+    expect(stale[0]!.id).toBe(robin.id)
+    expect(stale[1]!.id).not.toBe(sam.id)
+    expect(stale[2]!.id).not.toBe("p-madeup01")
+    expect(new Set(stale.map((m) => m.id)).size).toBe(3)
+    for (const m of stale) expect(m.id).toMatch(/^p-/)
+    // A save of what is shown keeps every id.
+    expect((await save(stale)).map((m) => m.id)).toEqual(stale.map((m) => m.id))
+    // A reset starts the scenario again: Sam is a member with the seeded id, which a save keeps.
+    a.ws.close()
+    await fetch(`${http}/mock/reset`, { method: "POST", body: "{}" })
+    a = await admin()
+    const again = await save(membersNow())
+    expect(again.find((m) => m.name === "Sam")!.id).toBe(sam.id)
+    a.ws.close()
+  })
 })
