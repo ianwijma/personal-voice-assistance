@@ -805,16 +805,19 @@ stream), a WebSocket or a `POST` to a URL a model or a page chose is not in this
   Assistant, Grocy): it also allows private addresses, local names and other ports. **Never pass it a URL a model chose.**
   - **`method: "POST", body: { json }`** when the API takes a JSON request (Home Assistant's `/api/services/…`,
     `/api/template`). The helper serialises `json`, sets `Content-Type: application/json` and the length (yours are
-    refused) and refuses a body over `maxRequestBytes` (64 KiB; you may set up to 1 MiB) before connecting; a value
-    `JSON.stringify` cannot write is `NetRefused` (`body`). **A POST is sent once, to one server**: a redirect answer is
-    refused (`post-redirect`), it is never retried, and it moves to the host's next address only after a refused or
+    refused) and refuses a body over `maxRequestBytes` (64 KiB; you may set up to 128 KiB, whose serialisation stops the
+    main thread under 5 ms: a heartbeat's longest gap 4.5–5.0 ms for the worst shape) before connecting; a value
+    `JSON.stringify` cannot write is `NetRefused` (`body`). The one `timeoutMs` includes serialising. **A POST is sent once,
+    to one server**: every 3xx answer is refused (`post-redirect`), it is never retried, and it moves to the host's next address only after a refused or
     timed-out connect, when nothing was sent. So **a POST that failed may or may not have been carried out**: say so
     ("I could not confirm the kitchen light is on"), and do not repeat it by yourself. Every other rule (addresses, headers,
     the response type, `maxBytes`, the one `timeoutMs`, interruption) applies to the POST and its answer.
   - **`typedLoopback: true`** when the owner's server may run on the assistant's own machine (`http://localhost:8123`):
-    loopback is then allowed only when the host written in the URL is itself `localhost` (exactly) or a loopback literal
-    (`127.0.0.1`, `[::1]`). A name that resolves to loopback and a redirect to loopback stay refused. Without it, every
-    loopback address is refused.
+    loopback is then allowed only when the URL is text whose host, as written, is exactly `localhost` (ASCII, any case),
+    `[::1]` or a plain dotted quad `127.a.b.c`. Every other spelling (`2130706433`, `0x7f000001`, `127.1`, `127.0.0.1.`,
+    `localhost.`, `x.localhost`, `%6cocalhost`, `[::ffff:127.0.0.1]`, a `URL` object), a name that resolves to loopback and a
+    redirect to loopback stay refused. Without the option, every loopback address is refused. The kit's offline network
+    resolves `localhost` names to loopback, so your test passes only where serve mode would.
 - **`makeCachedJson`** for JSON with a time to live, `ETag` and stale-if-error.
 - **`userAgent(contact)`**: put the owner's contact (Home › API contact, `HOME_API_CONTACT`) in the User-Agent **only
   when the owner set one**.
@@ -1083,11 +1086,22 @@ loop or allocate. What a worker thread cannot guarantee is said below.
   checked before anything is copied. Bytes are copied onto a buffer of their own before they cross: the task never
   sees the bytes beside them in a pooled `Buffer`, and what it writes stays in the worker. Pass a fetched body as it
   is (cap the fetch first: `safeFetch`'s `maxBytes`), and the settings the task needs as a few plain fields.
-- **The answer** is anything the structured clone carries. The worker serialises it once, into one buffer that is
-  checked against `maxResultBytes` (default 1 MiB, at most 4 MiB), transferred, checked again and read on the main
-  thread; the task's value itself never crosses. Reading it is the main thread's work, and it costs by the object, not
-  by the byte: answer a string or a small result, and set `maxResultBytes` to what the task needs (an answer of
-  objects at most 128 KiB; the numbers are below).
+- **The answer: return text or a small structure; a big structure is refused.** The worker serialises the answer
+  once, into one buffer that is checked, transferred, checked again and read on the main thread (the task's value
+  itself never crosses). Reading text or bytes costs the main thread by the byte, reading a structure by the object.
+  So `maxResultBytes` (default 128 KiB) may be raised to 4 MiB, but only an answer that is one string or one
+  `Uint8Array` may use more than 128 KiB. A structured answer (an object, an array, anything else) over 128 KiB fails
+  with `too-large` whatever the limit says, and its buffer is never read. The longest stop of the main thread while
+  receiving the largest allowed answers, and what larger structures cost (development machine, worst of 5 calls):
+
+  | Answer | Allowed | Longest stop |
+  |---|---|---|
+  | a 4 MiB string | with `maxResultBytes` raised | 3.6 to 4.6 ms |
+  | 4 MiB of bytes | with `maxResultBytes` raised | 3.1 to 8.0 ms |
+  | 128 KiB of small objects (13,931 of them) | yes, the largest structure | 2.4 to 2.5 ms |
+  | 1 MiB of small objects | no | 19 to 21 ms |
+  | 4 MiB of small objects | no | 107 to 120 ms |
+
 - **The call**: `offThread(task, input, { timeoutMs, maxMemoryMb, maxResultBytes, maxInputBytes })`. It is an Effect:
   call it from a tool, a job or a part's start; only from the main thread (a task that calls it is refused with
   `nested`: tasks do not nest).
@@ -1118,7 +1132,7 @@ loop or allocate. What a worker thread cannot guarantee is said below.
   |---|---|---|
   | `timeout` | the time limit passed (waiting included); the worker was terminated | it took too long to read |
   | `memory` | the worker ran out of `maxMemoryMb` | it could not be read |
-  | `too-large` | the answer was over `maxResultBytes` | it could not be read (or: it is too long) |
+  | `too-large` | the answer was over `maxResultBytes`, or is a structure over 128 KiB | it could not be read (or: it is too long) |
   | `failed` | the task threw or rejected (a stack overflow too), or its answer cannot be serialised | it could not be read |
   | `exited` | the worker ended without answering, or could not start | it could not be read |
   | `load` | the task module is missing, has no default function, or is not a `.ts`, `.mts` or `.mjs` file: a bug of the module | it could not be read |
@@ -1140,8 +1154,6 @@ loop or allocate. What a worker thread cannot guarantee is said below.
   - The main thread's own share, the longest stop of a 1 ms timer over 5 calls: 1 MiB in and 100 KiB out 1.8 ms; the
     largest legal input (4 MiB as counted) 3.6 to 4.0 ms as a string of two-byte characters, 1.8 to 1.9 ms as bytes,
     1.5 to 1.9 ms as an object of 30 strings; a task writing 80 MB to console and the streams 1.2 to 1.5 ms.
-  - Answers: a 4 MiB string 3.2 ms; small objects 5.3 to 6.3 ms for 128 KiB of them, 19 to 21 ms for 1 MiB, 107 to
-    120 ms for 4 MiB (over the audio budget: keep answers of objects small).
   - A task that loops forever ends 4 ms after its time limit; an interrupted one is gone 3 to 4 ms after the
     interruption.
   - A rare stop of 6 to 8 ms on the main thread is its own garbage collection, not the helper's work (a GC observer

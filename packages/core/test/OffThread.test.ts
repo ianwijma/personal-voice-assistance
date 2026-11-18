@@ -4,6 +4,7 @@
 import { assert, describe, it } from "@effect/vitest"
 import {
   OFF_THREAD_CONCURRENCY,
+  OFF_THREAD_DEFAULT_RESULT_BYTES,
   OFF_THREAD_MAX_INPUT_BYTES,
   OFF_THREAD_MAX_RESULT_BYTES,
   OFF_THREAD_MAX_WAITING,
@@ -20,7 +21,8 @@ import { join } from "node:path"
 import type { MessagePort, Worker } from "node:worker_threads"
 import { vi } from "vitest"
 import { bound } from "../../store-sqlite/test/latencyBound.ts"
-import { describeThrown, offThreadYoungGenerationMb } from "../src/OffThread.ts"
+import * as v8 from "node:v8"
+import { describeThrown, markersOf, offThreadYoungGenerationMb, wireShape } from "../src/OffThread.ts"
 
 // Every call here starts a real worker (about a quarter of a second each on a fast machine): the tests that make
 // twenty of them need more than the default five seconds on a slow CI runner.
@@ -504,7 +506,45 @@ describe("offThread", () => {
       for (const worst of [usual, ...Object.values(largest)]) assert.isBelow(worst, bound(10))
     }))
 
-  it.live("the main thread's cost of the largest legal answers: a 4 MiB string, and 1 MiB and 4 MiB of small objects", () =>
+  it.live("a structured answer is small: over 128 KiB it is refused whatever the limit says; only text or bytes may be larger", () =>
+    Effect.gen(function*() {
+      // 14,100 small objects serialise to 129.6 KiB: refused with a limit of 4 MiB, and over the default limit.
+      const raised = failure(yield* Effect.exit(offThread(probe, { kind: "objects", count: 14_100 }, { timeoutMs: 10_000, maxResultBytes: OFF_THREAD_MAX_RESULT_BYTES })))
+      assert.strictEqual(raised.reason, "too-large")
+      assert.strictEqual(raised.message, "probe.task.mjs: answered 129.6 KiB of structured data, over its limit of 128.0 KiB (only a string or bytes may be larger)")
+      const usual = failure(yield* Effect.exit(offThread(probe, { kind: "objects", count: 14_100 }, { timeoutMs: 10_000 })))
+      assert.strictEqual(usual.reason, "too-large")
+      assert.strictEqual(usual.message, "probe.task.mjs: answered 129.6 KiB, over its limit of 128.0 KiB")
+      // A string or bytes of 4 MiB pass with a limit of 4 MiB.
+      const text = yield* offThread(probe, { kind: "string", chars: OFF_THREAD_MAX_RESULT_BYTES - 16 }, { timeoutMs: 10_000, maxResultBytes: OFF_THREAD_MAX_RESULT_BYTES })
+      assert.strictEqual(text.length, OFF_THREAD_MAX_RESULT_BYTES - 16)
+      const bytes = yield* offThread(probe, { kind: "bytes", length: OFF_THREAD_MAX_RESULT_BYTES - 16 }, { timeoutMs: 10_000, maxResultBytes: OFF_THREAD_MAX_RESULT_BYTES })
+      assert.instanceOf(bytes, Uint8Array)
+      assert.strictEqual(bytes.byteLength, OFF_THREAD_MAX_RESULT_BYTES - 16)
+      assert.strictEqual(bytes[OFF_THREAD_MAX_RESULT_BYTES - 17], 7)
+      // The default limit is 128 KiB, for text too.
+      assert.strictEqual(OFF_THREAD_DEFAULT_RESULT_BYTES, 128 * 1024)
+      assert.strictEqual(failure(yield* Effect.exit(offThread(big, { chars: 128 * 1024 + 1 }, { timeoutMs: 10_000 }))).reason, "too-large")
+    }))
+
+  it("the main thread tells text and bytes from a structure by the serialised tag, before it reads the buffer", () => {
+    const markers = markersOf(v8)
+    const shape = (value: unknown) => wireShape(v8.serialize(value), markers)
+    assert.strictEqual(shape("abc"), "text")
+    assert.strictEqual(shape("жж"), "text")
+    assert.strictEqual(shape("a\u{1F600}"), "text")
+    assert.strictEqual(shape(""), "text")
+    assert.strictEqual(shape(new Uint8Array([1, 2])), "bytes")
+    assert.strictEqual(shape(Buffer.from("ab")), "bytes")
+    assert.strictEqual(shape(new Uint8Array(new ArrayBuffer(8), 3, 2)), "bytes")
+    for (const value of [{ a: "x" }, ["x"], [new Uint8Array(1)], new Float32Array(1), new Uint8ClampedArray(1), new DataView(new ArrayBuffer(1)), 1, null, true, new Map()]) {
+      assert.strictEqual(shape(value), "structured", String(value))
+    }
+    assert.strictEqual(wireShape(new Uint8Array([0x22, 0, 0]), markers), "structured")
+    assert.strictEqual(wireShape(new Uint8Array([]), markers), "structured")
+  })
+
+  it.live("the main thread's cost of the largest legal answers: a 4 MiB string, 4 MiB of bytes, 128 KiB of small objects", () =>
     Effect.gen(function*() {
       const worstOf = <O>(make: () => Effect.Effect<O, OffThreadError>, n: number) =>
         Effect.gen(function*() {
@@ -512,16 +552,17 @@ describe("offThread", () => {
           for (let i = 0; i < n; i++) worst = Math.max(worst, (yield* longestStop(make())).worst)
           return worst
         })
-      const string = yield* worstOf(() => offThread(probe, { kind: "string", chars: OFF_THREAD_MAX_RESULT_BYTES - 16 }, { timeoutMs: 10_000, maxResultBytes: OFF_THREAD_MAX_RESULT_BYTES }), 5)
-      const objects128 = yield* worstOf(() => offThread(probe, { kind: "objects", count: 12_000 }, { timeoutMs: 10_000, maxResultBytes: 128 * 1024 }), 5)
-      const objects1 = yield* worstOf(() => offThread(probe, { kind: "objects", count: 95_000 }, { timeoutMs: 10_000 }), 3)
-      const objects4 = yield* worstOf(() => offThread(probe, { kind: "objects", count: 380_000 }, { timeoutMs: 20_000, maxResultBytes: OFF_THREAD_MAX_RESULT_BYTES }), 3)
+      const big4 = { timeoutMs: 10_000, maxResultBytes: OFF_THREAD_MAX_RESULT_BYTES }
+      const string = yield* worstOf(() => offThread(probe, { kind: "string", chars: OFF_THREAD_MAX_RESULT_BYTES - 16 }, big4), 5)
+      const bytes = yield* worstOf(() => offThread(probe, { kind: "bytes", length: OFF_THREAD_MAX_RESULT_BYTES - 16 }, big4), 5)
+      // 13,931 small objects: 131,063 bytes serialised, the largest structured answer allowed.
+      const objects = yield* worstOf(() => offThread(probe, { kind: "objects", count: 13_931 }, { timeoutMs: 10_000 }), 5)
       results.push(`main thread, a 4 MiB string answer: longest stop ${ms(string)} over 5 calls`)
-      results.push(`main thread, an answer of 12,000 small objects (128 KiB): longest stop ${ms(objects128)} over 5 calls`)
-      results.push(`main thread, an answer of 95,000 small objects (1 MiB): longest stop ${ms(objects1)} over 3 calls`)
-      results.push(`main thread, an answer of 380,000 small objects (4 MiB): longest stop ${ms(objects4)} over 3 calls`)
-      // A string is cheap to receive; a graph of objects costs by the object (the guide says to keep answers small).
+      results.push(`main thread, a 4 MiB bytes answer: longest stop ${ms(bytes)} over 5 calls`)
+      results.push(`main thread, the largest structured answer (13,931 small objects, 128 KiB): longest stop ${ms(objects)} over 5 calls`)
       assert.isBelow(string, bound(15))
+      assert.isBelow(bytes, bound(15))
+      assert.isBelow(objects, bound(10))
     }))
 
   it.live("start-up cost per call: a bare thread, tsx's loader, linkedom, feedsmith", () =>

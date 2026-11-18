@@ -113,6 +113,37 @@ describe("the network in a module's test", () => {
     }))
   // #endregion net-post-test
 
+  it.effect("loopback in the test network is refused exactly where serve mode refuses it: only a typed localhost with typedLoopback", () =>
+    Effect.gen(function*() {
+      const net = makeOfflineNet({
+        "http://localhost:8123/api/services/light/turn_on": { body: [] },
+        "http://localhost.:8123/api/services/light/turn_on": { body: [] },
+        "http://x.localhost:8123/api/services/light/turn_on": { body: [] },
+        "http://127.0.0.1:8123/api/services/light/turn_on": { body: [] },
+        "http://ha.lan:8123/api/services/light/turn_on": { body: [] }
+      }, { lan: { "ha.lan": "127.0.0.1", localhost: "192.168.1.5" } })
+      const call = (base: string, option: { readonly typedLoopback?: boolean }) =>
+        Effect.exit(fetchOwnerConfiguredLan(`${base}/api/services/light/turn_on`, {
+          accept: contentTypes.json, method: "POST", body: { json: {} }, resolver: net.resolver, connector: net.connector, ...option
+        }))
+      const outcomes: Array<string> = []
+      for (const base of ["http://localhost:8123", "http://127.0.0.1:8123", "http://localhost.:8123", "http://x.localhost:8123", "http://ha.lan:8123"]) {
+        for (const option of [{}, { typedLoopback: false }, { typedLoopback: true }]) {
+          const exit = yield* call(base, option)
+          outcomes.push(`${base} ${JSON.stringify(option)} ${exit._tag === "Success" ? "answered" : exit.cause.reasons.map((r) => (r._tag === "Fail" ? (r.error as { rule?: string }).rule : r._tag)).join()}`)
+        }
+      }
+      assert.deepStrictEqual(outcomes, [
+        'http://localhost:8123 {} address', 'http://localhost:8123 {"typedLoopback":false} address', 'http://localhost:8123 {"typedLoopback":true} answered',
+        'http://127.0.0.1:8123 {} address', 'http://127.0.0.1:8123 {"typedLoopback":false} address', 'http://127.0.0.1:8123 {"typedLoopback":true} answered',
+        'http://localhost.:8123 {} address', 'http://localhost.:8123 {"typedLoopback":false} address', 'http://localhost.:8123 {"typedLoopback":true} address',
+        'http://x.localhost:8123 {} address', 'http://x.localhost:8123 {"typedLoopback":false} address', 'http://x.localhost:8123 {"typedLoopback":true} address',
+        'http://ha.lan:8123 {} address', 'http://ha.lan:8123 {"typedLoopback":false} address', 'http://ha.lan:8123 {"typedLoopback":true} address'
+      ])
+      // Only the two typed hosts with the option reached the connector.
+      assert.deepStrictEqual(net.requests.map((r) => r.url), ["http://localhost:8123/api/services/light/turn_on", "http://127.0.0.1:8123/api/services/light/turn_on"])
+    }))
+
   it.effect("a POST to a host the test network does not have is a refused connect, and nothing is answered", () =>
     Effect.gen(function*() {
       const net = makeOfflineNet({}, { lan: { "ha.lan": "192.168.1.20" } })

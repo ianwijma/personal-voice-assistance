@@ -968,9 +968,9 @@ packages/
                     refuses non-public addresses on every hop by the IANA registries, connects to the checked address, checked request
                     headers, size limit after decompression, time limit; `makeNodeConnector({ ca })` for an owner's own CA),
                     `fetchOwnerConfiguredLan` for an address the owner typed (LAN addresses, local names, any port; GET, HEAD and a
-                    JSON `POST` the helper serialises and bounds, sent once: no redirect followed, no retry, another address only
-                    after a refused or timed-out connect; loopback only with `typedLoopback` and a typed `localhost` or loopback
-                    literal), a cached JSON GET
+                    JSON `POST` the helper serialises and bounds (at most 128 KiB, inside the one deadline), sent once: every 3xx
+                    refused, no retry, another address only after a refused or timed-out connect; loopback only with `typedLoopback`
+                    and a host written exactly `localhost`, `[::1]` or `127.a.b.c`; no received header value in an error), a cached JSON GET
                     (key with the request headers, shared in-flight requests, refreshes ordered by the cache's sequence, TTL, ETag,
                     stale-if-error) and the outgoing `User-Agent` from the household API contact
                     (`HOME_API_CONTACT`); README in the package
