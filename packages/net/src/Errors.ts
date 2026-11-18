@@ -12,7 +12,9 @@ export type RefusedRule =
   | "header" // a request header that may not be sent (Host, hop-by-hop, Accept-Encoding) or cannot be sent (a character a header cannot hold)
   | "content-type" // the response's type is missing or not one the caller's policy accepts (checked before the body is read)
   | "content-encoding" // the response is compressed in a way other than gzip, deflate or br
-  | "options" // a limit that is not a positive number, a method other than GET or HEAD, or an empty content-type policy
+  | "options" // a limit that is not a positive number, a method the function does not send, an option it does not take, or an empty content-type policy
+  | "body" // a POST body that is missing, not `{ json }`, cannot be serialised as JSON, or is larger than `maxRequestBytes`
+  | "post-redirect" // a redirect answer to a POST (fetchOwnerConfiguredLan): the body is never sent again, nor to another place
 
 /** A rule refused the URL, before or during the request. `detail` is for people; never contains response data. */
 export class NetRefused extends Data.TaggedError("NetRefused")<{

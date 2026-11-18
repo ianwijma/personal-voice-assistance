@@ -60,7 +60,8 @@ its headings (§18).
 
 The contracts you provide or consume are in `@pva/module-contracts` (§13); your tests give a consumer a **stub** of a
 contract (`stubService` in `@pva/core/testing`), never an imitation of the provider. Spoken numbers, times, dates,
-durations, quantities and recurrences are `@pva/language`; outgoing HTTP is `@pva/net`, `GET` and `HEAD` only (§12).
+durations, quantities and recurrences are `@pva/language`; outgoing HTTP is `@pva/net`: `GET` and `HEAD`, and a JSON `POST`
+to an address the owner typed (§12).
 
 ## 2. The shape of a module
 
@@ -791,16 +792,29 @@ serve tests (`apps/assistant/test/moduleRoutes*.test.ts` show how).
 
 ## 12. The network
 
-Outgoing HTTP is `@pva/net`, never `fetch`, and **in this wave it is `GET` and `HEAD` only**: a module whose first
-version needs another method (a `POST`, a WebDAV verb, a streamed request) or a library that makes its own requests is
-not in this wave.
+Outgoing HTTP is `@pva/net`; **a module never calls `fetch` itself** (nor `node:http`, nor a library that makes its own
+requests). In this wave that is `GET` and `HEAD` to any URL, and a `POST` with a JSON body only to an address the owner
+typed: a module whose first version needs another method (a `PUT`, a WebDAV verb), another body (a form, a file, a
+stream), a WebSocket or a `POST` to a URL a model or a page chose is not in this wave.
 
 - **`safeFetch(url, { accept, … })`** for public APIs and any URL a model chose: `accept` (the response types you take:
   `contentTypes.json`, `webPage`, `feed`, `image`, or your own) is required; only `http`/`https`, ports 80 and 443, no
   credentials in the URL, every non-public address refused (checked on the address it connects to, and on every
   redirect), limits on size (`maxBytes`, 2 MiB) and time (`timeoutMs`, 6 s; an action's call takes less, §10).
-- **`fetchOwnerConfiguredLan(url, …)`** only for an address the owner typed into your settings (a LAN SearXNG): it also
-  allows private addresses and other ports. **Never pass it a URL a model chose.**
+- **`fetchOwnerConfiguredLan(url, …)`** only for an address the owner typed into your settings (a LAN SearXNG, Home
+  Assistant, Grocy): it also allows private addresses, local names and other ports. **Never pass it a URL a model chose.**
+  - **`method: "POST", body: { json }`** when the API takes a JSON request (Home Assistant's `/api/services/…`,
+    `/api/template`). The helper serialises `json`, sets `Content-Type: application/json` and the length (yours are
+    refused) and refuses a body over `maxRequestBytes` (64 KiB; you may set up to 1 MiB) before connecting; a value
+    `JSON.stringify` cannot write is `NetRefused` (`body`). **A POST is sent once, to one server**: a redirect answer is
+    refused (`post-redirect`), it is never retried, and it moves to the host's next address only after a refused or
+    timed-out connect, when nothing was sent. So **a POST that failed may or may not have been carried out**: say so
+    ("I could not confirm the kitchen light is on"), and do not repeat it by yourself. Every other rule (addresses, headers,
+    the response type, `maxBytes`, the one `timeoutMs`, interruption) applies to the POST and its answer.
+  - **`typedLoopback: true`** when the owner's server may run on the assistant's own machine (`http://localhost:8123`):
+    loopback is then allowed only when the host written in the URL is itself `localhost` (exactly) or a loopback literal
+    (`127.0.0.1`, `[::1]`). A name that resolves to loopback and a redirect to loopback stay refused. Without it, every
+    loopback address is refused.
 - **`makeCachedJson`** for JSON with a time to live, `ETag` and stale-if-error.
 - **`userAgent(contact)`**: put the owner's contact (Home › API contact, `HOME_API_CONTACT`) in the User-Agent **only
   when the owner set one**.
@@ -859,6 +873,53 @@ it.effect("serves fixtures, fails every other host, and keeps the owner's LAN fo
     assert.strictEqual(refused._tag, "NetRefused")
     const own = yield* searchOwnServer(deps, "http://searx.lan", "bins")
     assert.strictEqual(own.status, 200)
+  }))
+```
+
+A POST in a module and in its test: the test reads the method and the body that was sent from `net.requests` (`body` is
+the text as sent), and a fixture function sees the request with its `method` and `body`.
+
+<!-- region: packages/module-contracts/test/kit/network.test.ts#net-post-module -->
+```ts
+/**
+ * The owner's Home Assistant (its address from the module's settings, `http://localhost:8123` included): a POST with a JSON body.
+ * Sent once: no redirect is followed and it is never retried, so a failure may or may not have switched the light.
+ */
+export const callService = (deps: NetDeps, baseUrl: string, token: string, domain: string, service: string, data: Readonly<Record<string, unknown>>) =>
+  fetchOwnerConfiguredLan(`${baseUrl}/api/services/${encodeURIComponent(domain)}/${encodeURIComponent(service)}`, {
+    accept: contentTypes.json,
+    method: "POST",
+    body: { json: data },
+    typedLoopback: true,
+    timeoutMs: 3_000,
+    headers: { authorization: `Bearer ${token}` },
+    ...deps
+  })
+```
+
+<!-- region: packages/module-contracts/test/kit/network.test.ts#net-post-test -->
+```ts
+it.effect("a POST to the owner's server: the test reads the method and the body that was sent", () =>
+  Effect.gen(function*() {
+    const net = makeOfflineNet(
+      {
+        "http://ha.lan:8123/api/services/light/turn_on": (request) =>
+          request.method === "POST" ? { body: [{ entity_id: "light.kitchen" }] } : { status: 405, body: "POST only" }
+      },
+      { lan: { "ha.lan": "192.168.1.20" } }
+    )
+    const deps = { resolver: net.resolver, connector: net.connector }
+    const answer = yield* callService(deps, "http://ha.lan:8123", "t0ken", "light", "turn_on", { entity_id: "light.kitchen", brightness_pct: 40 })
+    assert.deepStrictEqual(JSON.parse(answer.text()), [{ entity_id: "light.kitchen" }])
+    const [sent] = net.requests
+    assert.strictEqual(sent?.method, "POST")
+    assert.deepStrictEqual(JSON.parse(sent?.body ?? ""), { entity_id: "light.kitchen", brightness_pct: 40 })
+    assert.strictEqual(sent?.headers["content-type"], "application/json")
+    assert.strictEqual(sent?.headers["authorization"], "Bearer t0ken")
+    // A GET to the same fixture: no body recorded, the fixture sees the method.
+    const get = yield* fetchOwnerConfiguredLan("http://ha.lan:8123/api/services/light/turn_on", { accept: contentTypes.json, ...deps })
+    assert.strictEqual(get.status, 405)
+    assert.deepStrictEqual([net.requests[1]?.method, net.requests[1]?.body], ["GET", undefined])
   }))
 ```
 
@@ -1267,7 +1328,7 @@ Also: `makeTestTurn` (a synthetic turn from its input alone: no person, room or 
 `kit.turn()` for a turn of the household, and give each turn of a multi-turn test its own `turnId` and
 `conversationId`), `makeTestPeople`, `testConnectionOf`, `dietProblem`, `provide(moduleId, { services, contributions
 })`, `stubService(name, answers)` with `succeeds`, `fails`, `stops` and `returns`, `makeOfflineNet(fixtures, { lan })`
-(§12), `expectOffByDefault(catalog)`.
+(§12; its `requests` record each request's method and a POST's body), `expectOffByDefault(catalog)`.
 
 <!-- region: packages/module-contracts/test/kit/pinboard.test.ts#turns -->
 ```ts
