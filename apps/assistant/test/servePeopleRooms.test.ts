@@ -1167,6 +1167,15 @@ const gatewayFor = async (deviceId: string, person: string) => {
   return exit._tag === "Success" ? "ran" : String((exit.cause as { readonly reasons?: ReadonlyArray<{ readonly error?: { readonly message?: string } }> }).reasons?.[0]?.error?.message ?? "failed")
 }
 
+/** The gateway's answer for a job of `person` that names no device and no assistant (`principalProblem`). */
+const jobGatewayFor = async (person: string) => {
+  const host = server!.handle.host
+  const where = (host.snapshot().assistantParts.get("alpha") ?? []).find((p) => p.moduleId === "probe")!.module.tools!.find((t) => t.name === "where")!
+  const principal = { _tag: "job", job: { jobId: "j-r4", moduleId: "probe", person: { id: person, how: "chosen" } } } as const
+  const exit = await Effect.runPromise(Effect.exit(host.gateway.tool("probe", where, {}, { principal })))
+  return exit._tag === "Success" ? "ran" : String((exit.cause as { readonly reasons?: ReadonlyArray<{ readonly error?: { readonly message?: string } }> }).reasons?.[0]?.error?.message ?? "failed")
+}
+
 const AMBIENT = { HOME_AMBIENT_FACTS: "all" }
 
 /**
@@ -1234,6 +1243,9 @@ describe("review round 4: a retired id pasted back into the settings file", () =
     expect(hostRef!.service(Devices)!.get("kitchen-r4-01")?.place.defaultPerson).toBeNull()
     expect(privacy.mayReveal(samId, "kitchen-r4-01")).toBe(false)
     expect(await gatewayFor("kitchen-r4-01", samId)).toBe("Not run: the person is not in Members.")
+    // Merged final P1: a job that names only a person (no device) is checked too, against the effective Members.
+    expect(await jobGatewayFor(samId)).toBe("Not run: the person is not in Members.")
+    expect(await jobGatewayFor(robinId)).toBe("ran")
     // The repair is written (Kim's id is the committed one), and the tablet's reference to the retired id is cleared.
     await until("the repair written", () => {
       const onDisk = JSON.parse(readFileSync(path, "utf8")) as Json

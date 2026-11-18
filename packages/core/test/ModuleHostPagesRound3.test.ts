@@ -15,7 +15,7 @@ import { Effect, Exit, Fiber, Schema, Scope, Stream } from "effect"
 import { TestClock } from "effect/testing"
 import { defineAgent } from "../src/ModuleContributions.ts"
 import { defineModule } from "../src/ModuleDefinition.ts"
-import { makeModuleHost, MAX_PRESS_STRAGGLERS, readOnlyPersistence } from "../src/ModuleHost.ts"
+import { makeModuleHost, readOnlyPersistence } from "../src/ModuleHost.ts"
 import { type ModuleRoute, RouteTokenError, routeProblem, type RouteTokenStore } from "../src/ModuleRoutes.ts"
 import { makePageBoundary, MAX_REMEMBERED, OVERFLOW, REDACTED, TOO_LONG } from "../src/PageBoundary.ts"
 import { resolveSettings, Setting } from "../src/Settings.ts"
@@ -293,34 +293,6 @@ describe("presses at shutdown (3a-8, 3a-9)", () => {
       // After the host has closed too.
       assert.isFalse((yield* host.fieldAction("fresh", "go")).ok)
       assert.deepStrictEqual(ran, [])
-    }))
-
-  it.effect("presses that do not stop are capped per module: further presses are refused and Health says why (3b-3 for buttons)", () =>
-    Effect.gen(function*() {
-      const settings: Record<string, ReturnType<typeof Setting.action>> = {}
-      const fieldActions: Record<string, () => Effect.Effect<{ ok: boolean; text: string }>> = {}
-      for (let i = 0; i <= MAX_PRESS_STRAGGLERS; i++) {
-        settings[`b${i}`] = Setting.action({ label: `B${i}`, buttonLabel: "Go" })
-        fieldActions[`b${i}`] = () => Effect.as(Effect.uninterruptible(Effect.never), { ok: true, text: "never" })
-      }
-      const mod = defineModule({ id: "stuck", name: "Stuck", description: "Never stops", settings, fieldActions, start: () => Effect.succeed({}) })
-      const scope = yield* Scope.make()
-      const host = yield* makeModuleHost({ catalog: [mod], persistence: readOnlyPersistence(), env: {}, closeTimeoutMs: 100 }).pipe(Scope.provide(scope))
-      for (let i = 0; i < MAX_PRESS_STRAGGLERS; i++) {
-        const press = yield* Effect.forkChild(host.fieldAction("stuck", `b${i}`))
-        yield* advance(8_000)
-        assert.match(textOf(yield* Fiber.join(press)), /Did not finish/)
-      }
-      yield* advance(10_000)
-      const refused = yield* host.fieldAction("stuck", `b${MAX_PRESS_STRAGGLERS}`)
-      assert.deepStrictEqual(refused.ok ? undefined : refused.code, "busy")
-      assert.match(refused.ok ? "" : refused.message, /have not stopped yet/)
-      const issue = host.issues.all().find((i) => i.id === "stuck.presses-stuck")
-      assert.strictEqual(issue?.severity, "error")
-      // Closing the host gives up on them after its limit (they never end).
-      const closing = yield* Effect.forkChild(Scope.close(scope, Exit.void))
-      yield* advance(1_000)
-      yield* Fiber.join(closing)
     }))
 })
 

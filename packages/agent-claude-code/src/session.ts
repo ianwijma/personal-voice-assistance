@@ -119,6 +119,8 @@ interface TurnBinding {
 /** A tool use the stream announced (an `assistant` message's `tool_use` block), waiting for its MCP call. */
 interface ToolClaim {
   readonly binding: TurnBinding | undefined
+  /** The block's `tool_use` id: what a call that carries one is matched by. */
+  readonly id: string | undefined
   readonly name: string
   readonly input: unknown
   taken: boolean
@@ -207,7 +209,7 @@ export class ClaudeSession {
     this.toolKey = toolKey(config.tools)
     this.lastUsedAt = now()
     // The MCP server always exists when tools exist; its handler forwards to the turn in progress.
-    this.mcp = config.tools.length > 0 ? sdk.mcpServer(config.tools, (name, args) => this.callTool(name, args)) : undefined
+    this.mcp = config.tools.length > 0 ? sdk.mcpServer(config.tools, (name, args, toolUseId) => this.callTool(name, args, toolUseId)) : undefined
     const self = this
     async function* input(): AsyncGenerator<SDKUserMessage> {
       for (;;) {
@@ -282,7 +284,7 @@ export class ClaudeSession {
    */
   async bind(system: string, tools: ReadonlyArray<SessionTool>, timeoutMs: number): Promise<void> {
     if (tools.length > 0) {
-      this.mcp = this.sdk.mcpServer(tools, (name, args) => this.callTool(name, args))
+      this.mcp = this.sdk.mcpServer(tools, (name, args, toolUseId) => this.callTool(name, args, toolUseId))
       await withTimeout(this.query.setMcpServers({ [MCP_SERVER_NAME]: this.mcp }), timeoutMs, "Registering the assistant's tools timed out")
     }
     this.toolKey = toolKey(tools)
@@ -413,23 +415,29 @@ export class ClaudeSession {
     const content = (message.message as { readonly content?: unknown } | undefined)?.content
     if (!Array.isArray(content)) return
     const prefix = `mcp__${MCP_SERVER_NAME}__`
-    for (const block of content as ReadonlyArray<{ readonly type?: unknown; readonly name?: unknown; readonly input?: unknown }>) {
+    for (const block of content as ReadonlyArray<{ readonly type?: unknown; readonly id?: unknown; readonly name?: unknown; readonly input?: unknown }>) {
       if (block?.type !== "tool_use" || typeof block.name !== "string") continue
       const name = block.name.startsWith(prefix) ? block.name.slice(prefix.length) : block.name
-      this.claims.push({ binding: this.binding, name, input: block.input, taken: false })
+      this.claims.push({ binding: this.binding, id: typeof block.id === "string" ? block.id : undefined, name, input: block.input, taken: false })
     }
     if (this.claims.length > MAX_CLAIMS) this.claims.splice(0, this.claims.length - MAX_CLAIMS)
   }
 
   /**
-   * An MCP tool call from Claude Code: run by the turn whose stream announced it (the oldest unanswered tool use with
-   * this name and input). A call whose turn ended or was interrupted is refused; so is one no turn announced within
-   * `CLAIM_WAIT_MS`. It is never given to whatever turn happens to be in progress.
+   * An MCP tool call from Claude Code: run by the turn whose stream announced it. Claude Code sends the model's
+   * `tool_use` id with the request (`_meta["claudecode/toolUseId"]`): the call is matched to the announcement with that
+   * id, and to nothing else. Only a call without one (an older Claude Code) is matched by name and input to the oldest
+   * unanswered announcement. There, an identical call of a turn that ended or was cancelled, arriving after its
+   * announcements were purged, can take a later turn's matching claim and run with that later turn's handler and
+   * context; the later turn's own call is then refused. For a call that carries an id (what Claude Code sends): a call
+   * whose turn ended or was interrupted is refused, so is one no turn announced within `CLAIM_WAIT_MS`, and it is
+   * never given to whatever turn happens to be in progress.
    */
-  private async callTool(name: string, args: Record<string, unknown>): Promise<{ readonly content: string; readonly isError: boolean }> {
+  private async callTool(name: string, args: Record<string, unknown>, toolUseId?: string): Promise<{ readonly content: string; readonly isError: boolean }> {
     const deadline = this.now() + CLAIM_WAIT_MS
+    const matches = (c: ToolClaim) => !c.taken && c.name === name && (toolUseId !== undefined ? c.id === toolUseId : sameInput(c.input, args))
     for (;;) {
-      const claim = this.claims.find((c) => !c.taken && c.name === name && sameInput(c.input, args))
+      const claim = this.claims.find(matches)
       if (claim !== undefined) {
         claim.taken = true
         const binding = claim.binding

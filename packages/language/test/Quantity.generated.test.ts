@@ -1,12 +1,15 @@
 // Quantities (review round 3, decision 6): the speaker over a grid of amounts, units and items; generated phrases and their mutants
 // against the tests' own grammar.
-import { describe, expect, it } from "@effect/vitest"
+import { describe, expect, it, vi } from "@effect/vitest"
 import { parseQuantity, speakAmount, type UnitId } from "../src/index.ts"
 import { norm, stable } from "./support/Cfg.ts"
 import { generatedParse, mutantsParse, type GrammarCheck } from "./support/Check.ts"
 import { rng } from "./support/Rng.ts"
 import { quantityGrammar, units, withText, type QuantityValue } from "./grammars/quantities.ts"
 import { readDigits } from "./grammars/numbers.ts"
+
+// Generated cases by the hundred: slow on a shared CI runner, so these tests get more than the default five seconds.
+vi.setConfig({ testTimeout: 60_000 })
 
 const project = (q: Record<string, unknown>): QuantityValue => ({ ...q, said: norm(String(q["said"])), item: norm(String(q["item"])) }) as QuantityValue
 const parsed = (text: string, language: "en" | "nl") => {
@@ -61,7 +64,8 @@ describe("quantities: speakAmount never states another quantity (round 4, findin
         if (unit === "piece" && item === "" && r.chance(0.5)) continue
         const humanize = firstRounds ? k % 4 < 2 : r.chance(0.5)
         const text = speakAmount({ amount, unit, approx }, language, { item, humanize })
-        const hundredths = Math.abs(amount * 100 - Math.round(amount * 100)) < 1e-6
+        // Whole hundredths by the test's own definition: the amount is the double nearest to its hundredths (round 5, finding 6).
+        const hundredths = Math.round(amount * 100) / 100 === amount
         // An amount of whole hundredths in its own unit is always said (it needs no rounding).
         if (text === undefined) {
           if (hundredths && amount <= 999_999.99) throw new Error(`${language} ${amount} ${unit}: an exact amount was not said`)

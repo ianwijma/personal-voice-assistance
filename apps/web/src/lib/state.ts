@@ -508,7 +508,15 @@ const server: ServerHandlers = {
   "admin.snapshot": (s, m) => ({
     ...s,
     engine: m.snapshot.engine,
-    modules: { order: m.snapshot.modules.map((x) => x.id), byId: Object.fromEntries(m.snapshot.modules.map((x) => [x.id, x])) },
+    modules: {
+      order: m.snapshot.modules.map((x) => x.id),
+      // A light entry (`details: "follow"`: its complete entry follows at once in `module.changed`) never replaces a
+      // complete one the page already has (a reconnect while a form is being edited keeps its fields).
+      byId: Object.fromEntries(m.snapshot.modules.map((x) => {
+        const known = s.modules.byId[x.id]
+        return [x.id, x.details === "follow" && known !== undefined && known.details === undefined ? known : x]
+      }))
+    },
     sections: m.snapshot.sections,
     vault: m.snapshot.vault,
     env: m.snapshot.env,

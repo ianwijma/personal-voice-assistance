@@ -81,7 +81,10 @@ export interface ModuleTarget {
    * counter. Equal fingerprints: what runs is left alone (only who uses which instance may change).
    */
   readonly fingerprint: string
-  /** The fingerprint plus what else a failed start depends on: the vault, the requirement probes, the retry counter. */
+  /**
+   * The fingerprint plus what else a failed start depends on: whether the settings are valid, the vault, the
+   * requirement probes, the retry counter.
+   */
   readonly attempt: string
 }
 
@@ -109,13 +112,16 @@ export interface ModulePlan {
  * What to do for one module, pure:
  *
  * - It should not run: stop what runs, forget a failure.
+ * - Its settings are not valid: stop what runs (even with the same fingerprint: settings that cannot be read may
+ *   leave it unchanged), start nothing; the module is down with its error.
  * - What runs has the target's fingerprint: keep it.
- * - Otherwise stop what runs (if anything), then start the target, unless its settings are not valid or that very
- *   attempt failed before (the module stays down with its error until something in its attempt key changes).
+ * - Otherwise stop what runs (if anything), then start the target, unless that very attempt failed before (the
+ *   module stays down with its error until something in its attempt key changes).
  */
 export const planModule = (target: ModuleTarget, current: ModuleCurrent): ModulePlan => {
   const none = { id: target.id, stop: false, start: false, keep: false, forget: false }
   if (!target.runs) return { ...none, stop: current.running !== undefined, forget: true }
+  if (target.invalid !== undefined) return { ...none, stop: current.running !== undefined }
   if (current.running === target.fingerprint) return { ...none, keep: true }
   return { ...none, stop: current.running !== undefined, start: target.invalid === undefined && current.failed !== target.attempt }
 }

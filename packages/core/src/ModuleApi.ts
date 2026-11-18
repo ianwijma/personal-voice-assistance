@@ -157,6 +157,10 @@ export interface DeclaredAction {
  * `export const Lists = ServiceKey<ListsService>("lists")`, provided with `services: [Lists.of(impl)]`. Keys are
  * compared by `id`; one module may provide a key (a second provider is a start error for the second). The shared keys
  * live in `@pva/module-contracts` (P11).
+ *
+ * The grace period of a stop covers the calls admitted to the stopping module itself (its tools, actions, context
+ * providers). A call another module makes into its service while it stops (or restarts) may fail: the consumer
+ * handles that failure like any other (and finds the service absent at its next lookup).
  */
 export interface ServiceKey<T> {
   readonly _tag: "ServiceKey"
@@ -355,7 +359,9 @@ export interface ModuleHostApi {
   readonly view: () => HostView
   /**
    * The service under `key` from a demanded module's `shared` part, or `undefined` while none is published (a
-   * provider starts and stops on its own; look it up at each use, never keep it).
+   * provider starts and stops on its own; look it up at each use, never keep it). A call into it may fail while its
+   * provider stops: the provider's grace period covers only calls admitted to the provider itself, so handle that
+   * failure.
    */
   readonly service: <T>(key: ServiceKey<T>) => T | undefined
   /**
@@ -380,9 +386,12 @@ export interface ModuleHostApi {
   /**
    * Ask the host to stop this module and start it again (a tool list that changed at run time, an MCP server's, then
    * applies from the next turn). Returns at once; the module's worker stops it (its tools are withdrawn, calls in
-   * flight get the grace period) and starts it again, at most once every 5 s: requests in between are merged into
-   * the next restart, and one made after the last restart began always leads to another. From `shared` or `start`,
-   * it applies once the module is published; from a part that was stopped since, it is ignored. The new start runs
+   * flight get the grace period) and starts it again. Requests are taken up at most once every 5 s, the ones in
+   * between merged into the next: a module cannot restart itself in a tight loop (this is not a minimum distance
+   * between two restarts). One made after the last one was taken up always leads to another. The request is
+   * recorded in one step: a caller interrupted right after it has made it whole or not at all. Only a live part asks:
+   * from `shared` or `start` while it starts, from a start that failed, or from a part being stopped (a finalizer),
+   * it is ignored (logged at debug); from a part whose scope has closed it dies with `ModuleStopped`. The new start runs
    * outside any turn: it never sees the caller's `CurrentTurn`. Settings are the module's current ones; a vault
    * locked since does not stop it (it starts with the secrets it ran with).
    */
@@ -435,12 +444,17 @@ export interface ModuleServicesV2 {
 export interface SharedContext<A> extends ModuleServicesV2 {
   readonly settings: Partial<A>
   /**
-   * The module's effective settings for an assistant, from the desired state this module was started with: the
-   * assistant's own values of `overridable` fields over the shared ones; with no assistant (or one that does not have
-   * the module on), the shared ones. A change of either restarts the module, so the answer is always that of the
-   * settings it runs with. Shared code that acts for a caller asks with the caller's assistant (`CurrentTurn`), so a
-   * weather briefing uses the asking assistant's place. `undefined` when those values are not valid (a required field
-   * with no value for that assistant). Throws `ModuleStopped` once the module has stopped.
+   * The module's effective settings for an assistant: the assistant's own values of `overridable` fields over the
+   * shared ones; with no assistant (or one that does not have the module on), the shared ones. It answers from the
+   * latest accepted state of the run: who has the module on, their own values, the saved values and the defaults as
+   * of the last change that kept the run, with the secrets the run started with. Changes that keep the run do not
+   * restart the module: an assistant that joins or leaves an existing instance, assistants that swap between equal
+   * instances, a changed default or saved value of an `overridable` field that no running instance uses (the module
+   * runs only for `uses`, or every assistant that has it on has its own value). So ask
+   * each time; do not cache what it answers on the assumption that every relevant change restarts the module.
+   * Shared code that acts for a caller asks with the caller's assistant (`CurrentTurn`), so a weather briefing uses
+   * the asking assistant's place. `undefined` when those values are not valid (a required field with no value for
+   * that assistant). Throws `ModuleStopped` once the module has stopped.
    */
   readonly settingsFor: (assistantId: string | undefined) => A | undefined
 }

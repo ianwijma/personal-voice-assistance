@@ -2,7 +2,7 @@
 // serving process, the checkpoint after a removal, retention of every archive, upgrades after a backup (also copied
 // to the second directory), index names, and the index every list shape uses.
 import { assert, describe, it } from "@effect/vitest"
-import { defineCollection, type StoreError } from "@pva/core"
+import { defineCollection, maxListRows, type StoreError } from "@pva/core"
 import { checkQuery, cursorColumns, layoutOf } from "@pva/core/store-backend"
 import { Effect, Exit, Fiber, Schema } from "effect"
 import { createHash } from "node:crypto"
@@ -360,7 +360,7 @@ describe("SQLite store: names and indexes", () => {
       ]
       const raw = new DatabaseSync(file, { readOnly: true })
       for (const shape of shapes) {
-        const checked = checkQuery(timers, { ...shape, limit: 20 })
+        const checked = checkQuery(timers, { ...shape, limit: maxListRows(timers) })
         // Also continued after a place (`after`): a key present, and a key missing (NULL), which takes two ranges.
         const width = cursorColumns(checked.index).length
         const places: Array<ReadonlyArray<string | number | null> | undefined> = [undefined, Array.from({ length: width }, (_, i) => (i === width - 1 ? "x" : 5))]
@@ -370,14 +370,14 @@ describe("SQLite store: names and indexes", () => {
         for (const after of places) {
           const parts = listSql("timers", "timers", { kind: "household" }, after === undefined ? checked : { ...checked, after })
           for (const { sql, params } of parts) {
-            const plan = (raw.prepare(`EXPLAIN QUERY PLAN ${sql}`).all(...params, 20) as Array<{ detail: string }>).map((r) => r.detail).join(" | ")
+            const plan = (raw.prepare(`EXPLAIN QUERY PLAN ${sql}`).all(...params, maxListRows(timers)) as Array<{ detail: string }>).map((r) => r.detail).join(" | ")
             assert.notMatch(plan, /TEMP B-TREE|SCAN pva_docs(?! USING)/, `${JSON.stringify(shape)} after ${JSON.stringify(after)}: ${plan}`)
             assert.match(plan, /SEARCH pva_docs USING (COVERING )?INDEX/, `${JSON.stringify(shape)} after ${JSON.stringify(after)}: ${plan}`)
             // A range after the place (a row-value comparison), or the missing keys (`k… IS NULL` shows as `k…=?`).
             if (after !== undefined) assert.match(plan, /[<>]|k\d=\?\)/, `${JSON.stringify(shape)} after ${JSON.stringify(after)}: a range, not the whole scope: ${plan}`)
           }
         }
-        assert.isTrue((yield* c.list({ ...shape, limit: 20 })).length <= 20)
+        assert.isTrue((yield* c.list({ ...shape, limit: maxListRows(timers) })).length <= maxListRows(timers))
       }
       // The snapshot's pages and the steps of a bulk removal: an index range each, continued by its cursor.
       const cursor = { updatedAt: 5, createdAt: 5, id: "x" }

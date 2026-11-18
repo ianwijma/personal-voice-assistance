@@ -1,5 +1,6 @@
 // SessionHub request limits: requests that do work (settings, modules, reload) are bounded per connection and overall.
-import { encodeClientMessage, PROTOCOL_VERSION, type ServerMessage } from "@pva/protocol"
+import { decodeServerMessage, encodeClientMessage, MAX_TEXT_FRAME_BYTES, type ModuleInfo, PROTOCOL_VERSION, type ServerMessage } from "@pva/protocol"
+import { exampleWeatherModule } from "@pva/protocol/examples"
 import { Deferred, Effect } from "effect"
 import { describe, expect, it } from "vitest"
 import { makeAccessPolicy } from "../src/serve/access.ts"
@@ -70,7 +71,7 @@ const fakeSessions = (send: (input: unknown) => string = () => "accepted") => {
   } as never
 }
 
-const setup = () => {
+const setup = (modules: () => ReadonlyArray<ModuleInfo> = () => []) => {
   const gate = Effect.runSync(Deferred.make<void>())
   let started = 0
   let finished = 0
@@ -84,7 +85,7 @@ const setup = () => {
       status: () => ({ state: "ready", problems: [], reloadPending: false, reloadPendingFor: [], engines: [], voices: [] }),
       reload: work({ ok: true })
     } as never,
-    host: { modules: () => [], enable: () => work({ ok: true }), disable: () => work({ ok: true }), configure: () => work({ ok: true }) } as never,
+    host: { modules, enable: () => work({ ok: true }), disable: () => work({ ok: true }), configure: () => work({ ok: true }) } as never,
     sections: { list: () => [], update: () => work({ result: { ok: true }, reload: false }) } as never,
     sessions: fakeSessions(),
     run: (effect) => void Effect.runFork(effect),
@@ -92,21 +93,29 @@ const setup = () => {
     server: { name: "test", version: "0" },
     ...noVault()
   })
-  const connect = (id: string) => {
+  /** `buffered`: a page whose socket never drains (everything sent stays buffered), to check the send limit. */
+  const connect = (id: string, buffered = false) => {
     const received: Array<ServerMessage> = []
+    const texts: Array<string> = []
+    let pending = 0
+    let closed = false
     const connection: HubConnection = {
       id,
-      sendText: (t) => received.push(JSON.parse(t)),
+      sendText: (t) => {
+        texts.push(t)
+        received.push(JSON.parse(t))
+        if (buffered) pending += new TextEncoder().encode(t).length
+      },
       sendBinary: () => {},
-      close: () => {},
-      bufferedAmount: () => 0
+      close: () => void (closed = true),
+      bufferedAmount: () => pending
     }
     const handlers = hub.accept(connection)!
     handlers.onText(encodeClientMessage({ type: "hello", protocol: PROTOCOL_VERSION, clientId: `client-${id}-0000`, resumeOwner: false, frontend: "admin" }))
     handlers.onText(encodeClientMessage({ type: "admin.login", requestId: `login-${id}`, password: ADMIN_PASSWORD }))
     // Only the results of the requests under test.
     const results = () => received.filter((m): m is Extract<ServerMessage, { type: "result" }> => m.type === "result" && !m.requestId.startsWith("login-"))
-    return { handlers, results }
+    return { handlers, results, texts, closed: () => closed }
   }
   return { hub, connect, release: () => Effect.runSync(Deferred.succeed(gate, undefined)), started: () => started, finished: () => finished }
 }
@@ -189,6 +198,82 @@ describe("SessionHub: typed input", () => {
     t.say(1)
     expect(t.results()[0]?.error?.code).toBe("engine_failed")
     expect(t.sent).toEqual([])
+  })
+})
+
+// Review rounds 5 and 6 of PR 90 (5A-2, 6A-2): the modules together have a share of the admin snapshot's frame; a
+// module that does not fit is a light entry there, and its complete projection follows at once in its own frame.
+describe("SessionHub: the admin snapshot fits its frame", () => {
+  /** After the login: the snapshot, then the frames that follow it, each decoded. */
+  const adminSend = (texts: ReadonlyArray<string>) => {
+    const at = texts.findLastIndex((x) => x.includes('"admin.snapshot"'))
+    const decoded = texts.slice(at).map((text) => {
+      expect(text.length).toBeLessThanOrEqual(MAX_TEXT_FRAME_BYTES)
+      const result = decodeServerMessage(text)
+      expect(result._tag).toBe("Ok")
+      return result._tag === "Ok" ? result.message : undefined
+    })
+    const snapshot = decoded[0] as Extract<ServerMessage, { type: "admin.snapshot" }>
+    const after = decoded.slice(1) as Array<ServerMessage>
+    const light = snapshot.snapshot.modules.filter((m) => m.details === "follow")
+    // Every light entry's complete projection follows at once, in order, before anything else.
+    const follow = after.slice(0, light.length)
+    expect(follow.map((m) => m.type)).toEqual(light.map(() => "module.changed"))
+    expect(follow.map((m) => (m as Extract<ServerMessage, { type: "module.changed" }>).module.id)).toEqual(light.map((m) => m.id))
+    const page = new Map(snapshot.snapshot.modules.map((m) => [m.id, m]))
+    for (const m of follow) page.set((m as Extract<ServerMessage, { type: "module.changed" }>).module.id, (m as Extract<ServerMessage, { type: "module.changed" }>).module)
+    return { light, page }
+  }
+  const big = (m: number): ModuleInfo => ({
+    ...exampleWeatherModule,
+    id: `m${m}`,
+    name: `Module ${m}`,
+    tools: [],
+    settings: {
+      fields: [{ type: "textList", key: "list", label: "List", apply: "live", default: [], maxItems: 200, itemMaxLength: 500, source: "saved" }],
+      values: { list: Array.from({ length: 120 }, (_, i) => `${i} `.padEnd(380 - m, "x")) },
+      secrets: {},
+      errors: []
+    }
+  })
+
+  it("forty modules with forms just under their limit: the snapshot decodes, those it has no room for follow it in their own frames, and none is withheld", () => {
+    const modules = Array.from({ length: 40 }, (_, m) => big(m))
+    const t = setup(() => modules)
+    const a = t.connect("a")
+    const { light, page } = adminSend(a.texts)
+    expect(light.length).toBeGreaterThan(0)
+    for (const m of light) expect([m.settings.fields, m.tools]).toEqual([[], []])
+    // The page ends with every module's complete form.
+    for (const m of modules) expect(page.get(m.id)?.settings).toEqual(m.settings)
+  })
+
+  it("Sol's forty modules with 32 long routes each: the snapshot and every frame after it decode, and the page ends with every module's routes", () => {
+    const route = (i: number) => ({
+      method: "GET" as const,
+      path: `/api/modules/web/r${String(i).padStart(2, "0")}-${"p".repeat(60)}/${"q".repeat(64)}/${"r".repeat(64)}`,
+      guards: ["admin" as const],
+      public: false,
+      bodyLimitBytes: 0,
+      ratePerMinute: { perAddress: 60, total: 600 },
+      description: "d".repeat(500)
+    })
+    const modules = Array.from({ length: 40 }, (_, m): ModuleInfo => ({ ...exampleWeatherModule, id: `web${m}`, name: `Web ${m}`, tools: [], routes: Array.from({ length: 32 }, (_, i) => route(i)) }))
+    const t = setup(() => modules)
+    const a = t.connect("a")
+    const { light, page } = adminSend(a.texts)
+    expect(light.length).toBeGreaterThan(0)
+    for (const m of modules) expect(page.get(m.id)?.routes).toEqual(m.routes)
+  })
+
+  it("a page whose socket does not drain gets the snapshot and every frame that follows it: they are one answer to the send limit", () => {
+    const modules = Array.from({ length: 40 }, (_, m) => big(m))
+    const t = setup(() => modules)
+    const a = t.connect("a", true)
+    const { light, page } = adminSend(a.texts)
+    expect(light.length).toBeGreaterThan(0)
+    expect(a.closed()).toBe(false)
+    for (const m of modules) expect(page.get(m.id)?.settings).toEqual(m.settings)
   })
 })
 

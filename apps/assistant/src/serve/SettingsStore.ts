@@ -1498,6 +1498,9 @@ export const loadSettingsStore = (directory: string, options: LoadOptions = {}):
                 // Inside the serialized save too: a token change queued behind another save never reaches the files
                 // of a blocked store.
                 if (blockedProblem !== undefined) throw new KeysUnavailable(`The route tokens were not saved: ${blockedProblem}`)
+                // And the vault's: locked since the change was asked for, the committed tokens cannot be read, so
+                // "no change" would be a lie (a revocation acknowledged while the token stays).
+                if (vaultInUse() && vault!.secrets() === undefined) throw new KeysUnavailable(KEYS_LOCKED_MESSAGE)
                 return {
                   settings: committed.settings,
                   secrets: {

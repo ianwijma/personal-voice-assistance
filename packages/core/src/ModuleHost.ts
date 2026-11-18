@@ -4,22 +4,25 @@ import {
   type ErrorInfo,
   type FieldError,
   MAX_COMBO_OPTIONS,
+  MAX_FIELD_LABEL,
   MAX_MODULE_TEMPLATES,
   MAX_OPTIONS_JSON,
   MAX_ROUTE_DESCRIPTION,
+  MAX_ROUTE_PATH,
   MODULE_ROUTES_PREFIX,
   type ModuleInfo,
   type ModuleInstanceInfo,
   type ModuleRouteInfo,
   type ModuleState,
   ModuleUnavailable,
-  type SettingField,
+  SettingField,
   type SettingsForm,
   type SettingsPatch,
   type SettingValue,
-  type StatusLine
+  type StatusLine,
+  type ToolInfo
 } from "@pva/protocol"
-import { Cause, Clock, Deferred, Effect, Exit, Fiber, Option, Schema, Scope, Stream } from "effect"
+import { Cause, Clock, Deferred, Effect, Exit, Fiber, Option, Result, Schema, Scope, Stream } from "effect"
 import {
   ACTION_TIMEOUT_MS,
   ActionError,
@@ -38,7 +41,7 @@ import { buildDecisionPlan, type DecisionProvider } from "./Decision.ts"
 import { ToolError } from "./Errors.ts"
 import { type ExecutionGateway, type GatewayAccess, type GatewayOptions, isGatewayRefusal, makeExecutionGateway } from "./Gateway.ts"
 import { sealAction, sealTool } from "./GatewayPrivate.ts"
-import { boundIssues, makeIssueRegistry, type IssueRegistry, wireSafeIssue } from "./Issues.ts"
+import { makeIssueRegistry, type IssueRegistry, wireSafeIssue } from "./Issues.ts"
 import { type EventBus, hostEvent, makeEventBus, type ModuleEvents, type SubscriptionGate } from "./EventBus.ts"
 import { type Collection, type CollectionHandle, type HouseholdStore, makeClosedStore, type ModuleStore } from "./HouseholdStore.ts"
 import { type AssistantModule, type ContextProvider, metadataProblem, type Tool, toolMetadata } from "./Module.ts"
@@ -67,8 +70,9 @@ import {
 import type { FieldActionHandler, FieldActionResult } from "./ModuleContributions.ts"
 import { type FieldActionOwner, makeFieldActionOwner } from "./FieldActionOwner.ts"
 import { type ModuleRoute, type PublishedRoute, RouteTokenError, routeInfo, routeProblem, type RouteTokens, type RouteTokenStore } from "./ModuleRoutes.ts"
+import { clipText as clip, jsonBytes, largestField, wholeCodePoints } from "./ModuleFrames.ts"
 import { makePageBoundary } from "./PageBoundary.ts"
-import { makeStragglers, stragglerIssues } from "./Stragglers.ts"
+import { makeModuleSlots, MAX_PRESS_SLOTS, slotIssues } from "./ModuleSlots.ts"
 import { type ModuleDefinition, type ModuleInstance, ModuleStartError } from "./ModuleDefinition.ts"
 import { type InstanceTarget, type ModuleTarget, planModule, reachedBy, usesOrder } from "./ModulePlanner.ts"
 import type { PartHandle, PartState, Registrar, Registration } from "./ModuleRegistrations.ts"
@@ -76,6 +80,7 @@ import {
   applicableOwnValues,
   applySettingsPatch,
   checkOwnValues,
+  type Contain,
   isEditableSetting,
   overridableKeys,
   type ResolvedSettings,
@@ -200,14 +205,34 @@ export type { PublishedRoute } from "./ModuleRoutes.ts"
 
 /** Time a field action's handler has (`ModuleHostOptions.fieldActionTimeoutMs`). Below the page's 10 s request limit. */
 export const FIELD_ACTION_TIMEOUT_MS = 8_000
+
 /**
- * Time a stopped field action's interruption (its finalizers) may take in the background before the host logs it
- * (`ModuleHostOptions.fieldActionCleanupMs`). The press was answered at its deadline already; its button stays busy
- * until it has really ended (`FieldActionOwner`).
+ * What one module's settings form may take on the wire (UTF-8 bytes of its fields as JSON, with what the running
+ * instance adds: `combo` suggestions and `info` values). Every module's form travels in the one `admin.snapshot`
+ * frame (1 MiB, `MAX_TEXT_FRAME_BYTES`) beside the Health issues (256 KiB) and the templates (128 KiB): 40 modules at
+ * this budget take 320 KiB, leaving about 300 KiB for everything else. A module whose described form does not encode
+ * or is larger does not start (its error names the field); what the instance adds is trimmed to what is left, with
+ * "and N more" shown.
  */
-export const FIELD_ACTION_CLEANUP_MS = 10_000
-/** Presses of one module that did not stop within the cleanup limit before its buttons are refused (`Stragglers`). */
-export const MAX_PRESS_STRAGGLERS = 4
+export const MODULE_FORM_BUDGET_BYTES = 8 * 1024
+
+/**
+ * What one module's complete settings form may take as it is sent (UTF-8 bytes of the form as JSON, envelope
+ * included: its fields with the generated Test button, the effective values, the errors and warnings after the page
+ * boundary, the room its run-time notes need, and what the running instance adds), together with the module's listed
+ * tools. One function builds that form (`sentForm` in the host) and the load check, the save check and `info()` all
+ * measure its output. A save that would make it larger is refused, naming the largest field; settings already larger
+ * (a hand-edited file) are not valid: the module gets no form on the page, only an error naming the largest field,
+ * and does not start. When only the messages make it larger (a secret the boundary replaced inside an error), the
+ * messages are cut shorter, never the values. What the instance adds, and then the listed tools, get what is left.
+ * One module's whole projection is bounded once more by `MODULE_FRAME_MAX_BYTES` (`ModuleFrames.ts`).
+ */
+export const MODULE_FORM_MAX_BYTES = 48 * 1024
+
+/** At most this many of a module's tools are listed on the admin page (`ModuleInfo.toolsLeft` counts the rest). */
+export const MAX_LISTED_TOOLS = 100
+/** A tool's description as the admin page shows it, after secret matching (the model's catalogue is unchanged). */
+export const MAX_LISTED_TOOL_DESCRIPTION = 300
 
 export type HostResult = { readonly ok: true } | { readonly ok: false; readonly error: ErrorInfo }
 
@@ -403,8 +428,6 @@ export interface ModuleHostOptions {
   readonly routeTokens?: RouteTokenStore
   /** P3: time a field action may take. Default `FIELD_ACTION_TIMEOUT_MS`. */
   readonly fieldActionTimeoutMs?: number
-  /** P3: time a stopped field action's cleanup may take before it is logged (it is still waited for). Default `FIELD_ACTION_CLEANUP_MS`. */
-  readonly fieldActionCleanupMs?: number
   /**
    * P5: services the core itself provides to modules (`People`, `Privacy`, `Devices`). `host.service` finds them
    * before any module's; a module whose shared part provides one of these keys does not start. A part is given its own
@@ -426,6 +449,11 @@ interface Desired {
   readonly enabled: boolean
   /** The owner has chosen on or off (saved); before that, `enabledByDefault` / `enabledWhenSet` decide. */
   readonly chosen: boolean
+  /**
+   * On by its `enabledWhenSet` key (before the owner chose): set once the key is seen set, kept while the vault is
+   * locked and across a stop and start, given up only when the owner changes the module's secrets and the key is unset.
+   */
+  readonly keyed: boolean
   readonly stored: Readonly<Record<string, unknown>>
   /** The secrets the vault reports (and configure changes). */
   readonly secrets: Readonly<Record<string, string>>
@@ -452,10 +480,10 @@ interface Part {
   readonly kind: "shared" | "instance"
   readonly scope: Scope.Closeable
   state: PartState
+  /** Its own `shared` / `start` has not returned yet: `PartHandle.register` is open only until then. */
+  registering: boolean
   /** Registrations it made during its start (`PartHandle.register`): published with the module. */
   readonly staged: Array<Registration>
-  /** `requestRestart` called during its own start: applied once it is published, dropped if it is not. */
-  stagedRestart: string | undefined
   readonly handle: PartHandle
   /**
    * P4: completed by the first finalizer added to its scope (so it runs last, after the module's own): a subscription
@@ -487,6 +515,11 @@ interface Run {
   readonly id: number
   readonly entry: Entry
   readonly target: HostTarget
+  /**
+   * The desired state it runs for now: its start's, then that of every later pass that kept it (assistants moving
+   * between equal instances, a changed default of an overridable field). `settingsFor` answers from it.
+   */
+  accepted: Desired
   state: "starting" | "live" | "withdrawn" | "closed"
   shared: { readonly part: Part; readonly value: SharedPart<unknown> } | undefined
   readonly instances: Map<string, InstanceRun>
@@ -568,7 +601,6 @@ export const unavailableLine = (name: string, reason: string): string => `${name
 export const outsideTurns = <A, E, R>(effect: Effect.Effect<A, E, R>): Effect.Effect<A, E, R> =>
   effect.pipe(Effect.provideService(CurrentTurn, undefined), Effect.provideService(CurrentJob, undefined), Effect.provideService(CurrentPrincipal, undefined))
 
-const clip = (text: string, max: number) => (text.length <= max ? text : `${text.slice(0, max - 1)}…`)
 
 /** An unavailable reason made safe for the wire's `ModuleUnavailable` (reason ≤ 500, the fix's label ≤ 200, value ≤ 1000). */
 const wireUnavailable = (u: ModuleUnavailable): ModuleUnavailable => {
@@ -619,7 +651,10 @@ const usesCycles = (catalog: ReadonlyArray<ModuleDefinition<any>>): Map<string, 
   return out
 }
 
-/** Restarts of one module are at least this far apart; requests in between are merged into the next one. */
+/**
+ * A module's restart requests are taken up at most once per this interval (the requests in between are merged into
+ * the next one): a module cannot restart itself in a tight loop. Not a minimum distance between two restarts.
+ */
 const RESTART_INTERVAL_MS = 5_000
 
 /** The template text all modules together may send (UTF-8 bytes), so the admin snapshot stays under the frame limit. */
@@ -630,7 +665,6 @@ const sameRecord = (a: Readonly<Record<string, string>>, b: Readonly<Record<stri
   return ka.length === Object.keys(b).length && ka.every((k) => Object.hasOwn(b, k) && a[k] === b[k])
 }
 
-const firstLine = (cause: Cause.Cause<unknown>) => Cause.pretty(cause).split("\n")[0] ?? "unknown"
 const describe = (error: unknown) => (error instanceof Error ? error.message : String(error))
 
 /** What a bounded call into module code came to. */
@@ -658,6 +692,19 @@ export const makeModuleHost = Effect.fnUntraced(function*(options: ModuleHostOpt
 
   // -- The catalogue --------------------------------------------------------------------------------------------------
 
+  /**
+   * Whether the module's `enabledWhenSet` key is set in the environment or in these secrets, as `resolveSettings`
+   * judges a secret (a non-empty value). Read directly, without decoding any other setting: a decoder that throws on
+   * another field leaves the module wanted and down with its settings error, never off.
+   */
+  const keySet = (def: ModuleDefinition<any>, secrets: Readonly<Record<string, string>>): boolean => {
+    const key = def.enabledWhenSet
+    const setting = key === undefined ? undefined : (def.settings as SettingsSpec | undefined)?.[key]
+    if (key === undefined || setting === undefined || !setting.secret) return false
+    const fromEnv = setting.env === undefined ? undefined : options.env[setting.env]
+    return (fromEnv !== undefined && fromEnv.length > 0) || (secrets[key] ?? "").length > 0
+  }
+
   const ids = new Set<string>()
   const cycles = usesCycles(options.catalog)
   const entries: Array<Entry> = options.catalog.map((def) => {
@@ -668,6 +715,7 @@ export const makeModuleHost = Effect.fnUntraced(function*(options: ModuleHostOpt
     const want: Desired = {
       enabled: record?.enabled ?? def.enabledByDefault,
       chosen: record?.enabled !== undefined,
+      keyed: keySet(def, options.persistence.initial.secrets[def.id] ?? {}),
       stored: record?.settings ?? {},
       secrets: options.persistence.initial.secrets[def.id] ?? {},
       secretEpoch: 0,
@@ -682,7 +730,9 @@ export const makeModuleHost = Effect.fnUntraced(function*(options: ModuleHostOpt
     return {
       def,
       rank: 0,
-      catalogError: cycle === undefined ? undefined : `Its "uses" form a cycle (${[...cycle, cycle[0]].join(" → ")}), so it cannot start. Fix the module catalogue.`,
+      catalogError: cycle === undefined
+        ? formProblem(def, (def.kind === "agent" || def.kind === "decider") && !Object.hasOwn(def.settings, "test"))
+        : `Its "uses" form a cycle (${[...cycle, cycle[0]].join(" → ")}), so it cannot start. Fix the module catalogue.`,
       want,
       shown: want,
       run: undefined,
@@ -712,26 +762,6 @@ export const makeModuleHost = Effect.fnUntraced(function*(options: ModuleHostOpt
     ...(options.envLocation !== undefined ? { envLocation: options.envLocation } : {})
   }
 
-  /** The module's settings from these sources. */
-  const resolveFrom = (
-    entry: Entry,
-    src: { readonly stored: Readonly<Record<string, unknown>>; readonly secrets: Readonly<Record<string, string>> },
-    own: Readonly<Record<string, unknown>> | undefined,
-    defaults: Readonly<Record<string, unknown>> | undefined
-  ) =>
-    resolveSettings(entry.def.settings, {
-      stored: src.stored,
-      secrets: src.secrets,
-      env: options.env,
-      ...envOrigin,
-      ...(defaults !== undefined ? { defaults } : {}),
-      ...(own !== undefined ? { own } : {})
-    })
-  /** The settings as saved now (what the form shows). */
-  const resolve = (entry: Entry) => resolveFrom(entry, entry.want, undefined, entry.want.defaults)
-
-  const invalidMessage = (errors: ReadonlyArray<FieldError>) => `The settings are not valid: ${errors.map((e) => e.message).join("; ")}`
-
   // -- P3: what reaches the admin page; field-action presses ----------------------------------------------------------
 
   /** The secret fields of a module. */
@@ -758,6 +788,118 @@ export const makeModuleHost = Effect.fnUntraced(function*(options: ModuleHostOpt
     }
   })
   /**
+   * A plain function the module supplies (a field's `check` or decoder) run where the host calls it: one that throws
+   * becomes that module's error (`fallback` with a bounded message), never the host's (docs/MODULES-PLAN.md §3.5).
+   */
+  const moduleCode = <A>(entry: Entry, f: () => A, fallback: (message: string) => A): A => {
+    try {
+      return f()
+    } catch (error) {
+      // What it threw passes the page boundary (matched whole) before it is shortened.
+      return fallback(`${entry.def.name}: its settings could not be read (${clip(boundary.redact(entry.def.id, describe(error)).replace(/\s+/g, " "), 200)})`)
+    }
+  }
+
+  /**
+   * The module's settings from these sources (a check or decoder that throws: not valid, with that error), as
+   * resolved: before the form's size is judged (`resolveFrom` judges it).
+   */
+  /** P1's containment (`moduleCode`) for each field's decoder and checks: one that throws is that field's error. */
+  const containFor = (entry: Entry): Contain => (f, fallback) => moduleCode(entry, f, fallback)
+  const resolveRaw = (
+    entry: Entry,
+    src: { readonly stored: Readonly<Record<string, unknown>>; readonly secrets: Readonly<Record<string, string>> },
+    own: Readonly<Record<string, unknown>> | undefined,
+    defaults: Readonly<Record<string, unknown>> | undefined
+  ): ResolvedSettings<any> => {
+    // The messages of field code that threw (`faults`; a field's error wraps one): a fault, not an invalid value, so
+    // it stops the shared part even on an assistant-owned field (`sharedOf`), as a whole resolution that throws does.
+    const thrown = new Set<string>()
+    const contain: Contain = (f, fallback) => moduleCode(entry, f, (message) => (thrown.add(message), fallback(message)))
+    const resolved = moduleCode(
+      entry,
+      (): ResolvedSettings<any> =>
+        resolveSettings(entry.def.settings, {
+          stored: src.stored,
+          secrets: src.secrets,
+          env: options.env,
+          contain,
+          ...envOrigin,
+          ...(defaults !== undefined ? { defaults } : {}),
+          ...(own !== undefined ? { own } : {})
+        }),
+      (message) => ({ value: undefined, form: { fields: [], values: {}, secrets: {}, errors: [{ key: null, message }] } })
+    )
+    if (thrown.size > 0) faults.set(resolved.form, thrown)
+    return resolved
+  }
+  /** Per resolved form, the messages of the field code that threw while it was resolved (`resolveRaw`). */
+  const faults = new WeakMap<SettingsForm, ReadonlySet<string>>()
+  /** An agent or decision provider without a `test` field of its own gets the generated Test button. */
+  const generatesTest = (entry: Entry) => (entry.def.kind === "agent" || entry.def.kind === "decider") && !Object.hasOwn(entry.def.settings, "test")
+
+  /**
+   * The form as it is sent, before what the running instance adds (`decorateForm`): the one measure of
+   * `MODULE_FORM_MAX_BYTES`, used by the load check (`resolveFrom`), the save check (`configureEntry`) and `info()`.
+   * Its messages (errors, warnings) pass the page boundary first, the generated Test button is in it, and it is
+   * measured as the UTF-8 JSON of the whole form (its envelope included), with the room each combo or info field's
+   * run-time note needs (`NOTE_RESERVE_BYTES`). Over the limit, its messages are cut shorter, step by step
+   * (`MESSAGE_CAPS`); the editable values never are. `over` says it does not fit even with the shortest messages:
+   * then its values are too large (the largest field is named).
+   */
+  const sentForm = (entry: Entry, form: SettingsForm): {
+    readonly form: SettingsForm
+    readonly bytes: number
+    readonly over?: { readonly bytes: number; readonly key: string | null; readonly label: string }
+  } => {
+    const fields = generatesTest(entry) ? [...form.fields, GENERATED_TEST_FIELD] : form.fields
+    const reserve = notesReserve(fields)
+    // Through the boundary in full, then cut: a secret is matched before anything shortens it.
+    const through = (list: ReadonlyArray<FieldError>) => list.map((e) => ({ ...e, message: boundary.text(entry.def.id, e.message, 2000) }))
+    const errors = through(form.errors)
+    const warnings = form.warnings === undefined ? undefined : through(form.warnings)
+    let first: { readonly form: SettingsForm; readonly bytes: number } | undefined
+    for (const cap of MESSAGE_CAPS) {
+      const cut = (list: ReadonlyArray<FieldError>) => list.map((e) => ({ ...e, message: clip(e.message, cap) }))
+      const candidate: SettingsForm = { ...form, fields, errors: cut(errors), ...(warnings !== undefined ? { warnings: cut(warnings) } : {}) }
+      const bytes = jsonBytes(candidate) + reserve
+      if (bytes <= MODULE_FORM_MAX_BYTES) return { form: candidate, bytes }
+      first ??= { form: candidate, bytes }
+    }
+    return { ...first!, over: { bytes: first!.bytes, ...largestField(form) } }
+  }
+  /** The form sent for settings too large for the admin page: one error naming the largest field. */
+  const tooLargeForm = (entry: Entry, over: { readonly bytes: number; readonly label: string }): SettingsForm => ({
+    fields: [],
+    values: {},
+    secrets: {},
+    errors: [{
+      key: null,
+      message: `${entry.def.name}'s settings are too large for the admin page (${kib(over.bytes)} KiB; at most ${kib(MODULE_FORM_MAX_BYTES)} KiB). The largest is "${over.label}": reduce it in the settings file.`
+    }]
+  })
+
+  /**
+   * The module's settings from these sources. Settings whose form as it is sent (`sentForm`) is larger than
+   * `MODULE_FORM_MAX_BYTES` even with its messages cut short are not valid, like any settings a field refuses: no
+   * form, one error naming the largest field (its values are kept as they are; nothing is cut).
+   */
+  const resolveFrom = (
+    entry: Entry,
+    src: { readonly stored: Readonly<Record<string, unknown>>; readonly secrets: Readonly<Record<string, string>> },
+    own: Readonly<Record<string, unknown>> | undefined,
+    defaults: Readonly<Record<string, unknown>> | undefined
+  ): ResolvedSettings<any> => {
+    const resolved = resolveRaw(entry, src, own, defaults)
+    const { over } = sentForm(entry, resolved.form)
+    return over === undefined ? resolved : { value: undefined, form: tooLargeForm(entry, over) }
+  }
+  /** The settings as saved now (what the form shows). */
+  const resolve = (entry: Entry) => resolveFrom(entry, entry.want, undefined, entry.want.defaults)
+
+  const invalidMessage = (errors: ReadonlyArray<FieldError>) => `The settings are not valid: ${errors.map((e) => e.message).join("; ")}`
+
+  /**
    * Module code is about to get `settings`: the boundary keeps their secret values for as long as `holders` live (the
    * part that receives them, a press until it has ended and been answered, a health check), whatever the vault does
    * meanwhile.
@@ -770,29 +912,32 @@ export const makeModuleHost = Effect.fnUntraced(function*(options: ModuleHostOpt
     }
     return settings
   }
-  const fieldActionTimeoutMs = options.fieldActionTimeoutMs ?? FIELD_ACTION_TIMEOUT_MS
-  const fieldActionCleanupMs = options.fieldActionCleanupMs ?? FIELD_ACTION_CLEANUP_MS
   /**
-   * Presses of each module that did not stop when asked (across all its owners, so restarts cannot pile them up): at
-   * `MAX_PRESS_STRAGGLERS` its buttons are refused until some end, and Health says so.
+   * The first line of a cause as the page may show it: the whole text is matched by the boundary first, then cut, so
+   * a secret that spans lines (or that the cut would split) is replaced whole. Every place the host shortens a
+   * module's text goes through the boundary before it is shortened.
    */
-  const pressStragglers = makeStragglers({
-    cap: MAX_PRESS_STRAGGLERS,
-    cleanupMs: fieldActionCleanupMs,
-    changed: (moduleId, count) => {
+  const firstLine = (moduleId: string, cause: Cause.Cause<unknown>) => boundary.redact(moduleId, Cause.pretty(cause)).split("\n")[0] || "unknown"
+  const fieldActionTimeoutMs = options.fieldActionTimeoutMs ?? FIELD_ACTION_TIMEOUT_MS
+  /**
+   * The press slots of each module (`ModuleSlots`), across all its owners, so restarts cannot pile presses up: at
+   * `MAX_PRESS_SLOTS` a further press is refused `busy`, and Health says so (`presses:<id>`) until a slot is free.
+   */
+  const pressSlots = makeModuleSlots({
+    cap: MAX_PRESS_SLOTS,
+    report: (moduleId, full) => {
       const entry = byId.get(moduleId)
-      if (entry !== undefined) issues.set(`presses:${moduleId}`, stragglerIssues(moduleId, entry.def.name, "presses", count, MAX_PRESS_STRAGGLERS))
+      if (entry !== undefined) issues.set(`presses:${moduleId}`, full ? slotIssues(moduleId, entry.def.name, "presses", MAX_PRESS_SLOTS) : [])
     }
   })
   /** An owner of field-action presses (`FieldActionOwner`): an instance part's (keys are field keys), or the host's (`<module>/<key>`). */
-  const pressOwner = (label: (key: string) => string, released: (key: string) => void, moduleOf: (key: string) => string) =>
-    makeFieldActionOwner({ label, cleanupMs: fieldActionCleanupMs, released, stragglers: pressStragglers, moduleOf })
+  const pressOwner = (released: (key: string) => void, moduleOf: (key: string) => string) => makeFieldActionOwner({ released, slots: pressSlots, moduleOf })
   /**
    * The host's own presses (a definition's `fieldActions`, which run without an instance), keyed `<module>/<key>`:
    * made once with the host, stopped first when it closes (before anything else stops), refusing presses from then on.
    */
   const moduleOfKey = (key: string) => key.slice(0, key.indexOf("/"))
-  const hostPresses = pressOwner((key) => `field action ${key.replace("/", ".")}`, (key) => {
+  const hostPresses = pressOwner((key) => {
     const entry = byId.get(moduleOfKey(key))
     // `info` values may have changed with the press.
     if (entry !== undefined) announce(entry)
@@ -858,15 +1003,14 @@ export const makeModuleHost = Effect.fnUntraced(function*(options: ModuleHostOpt
   // -- Desired state: who wants what ----------------------------------------------------------------------------------
 
   /**
-   * Its own switch: the owner's choice; before one, on by default, or on while the `enabledWhenSet` key is set
-   * (environment, saved or the vault). A module switched on by its key that runs keeps running when the vault locks.
+   * Its own switch: the owner's choice; before one, on by default, or on by its `enabledWhenSet` key (`Desired.keyed`:
+   * the key set in the environment, the saved secrets or the vault, and kept on when the vault locks). Read from the
+   * desired state alone, never from whether a run exists at the moment.
    */
   const switchOn = (entry: Entry, d: Desired): boolean => {
     if (d.chosen) return d.enabled
-    const key = entry.def.enabledWhenSet
-    if (entry.def.enabledByDefault || key === undefined) return entry.def.enabledByDefault
-    if (resolveFrom(entry, d, undefined, d.defaults).form.secrets[key]?.set === true) return true
-    return entry.run !== undefined
+    if (entry.def.enabledByDefault || entry.def.enabledWhenSet === undefined) return entry.def.enabledByDefault
+    return d.keyed || keySet(entry.def, d.secrets)
   }
 
   /** Someone wants the module (its switch, or an assistant has it on). */
@@ -893,7 +1037,10 @@ export const makeModuleHost = Effect.fnUntraced(function*(options: ModuleHostOpt
     const without = (record: Readonly<Record<string, unknown>>) => Object.fromEntries(Object.entries(record).filter(([k]) => !owned.has(k)))
     // Only the fields the shared part receives are judged here: an assistant-owned field's invalid shared default
     // does not stop it (each instance validates its own effective settings in full).
-    const errors = resolved.form.errors.filter((e) => e.key === null || !owned.has(e.key))
+    // Field code that threw is a fault of the module, never only an assistant's value: it stops the shared part too.
+    const thrown = faults.get(resolved.form)
+    const fault = (message: string) => thrown !== undefined && [...thrown].some((m) => message.includes(m))
+    const errors = resolved.form.errors.filter((e) => e.key === null || !owned.has(e.key) || fault(e.message))
     const raw: Record<string, unknown> = { ...resolved.form.values }
     for (const [key, setting] of Object.entries(entry.def.settings as SettingsSpec)) {
       if (!setting.secret) continue
@@ -950,7 +1097,8 @@ export const makeModuleHost = Effect.fnUntraced(function*(options: ModuleHostOpt
       invalid: why,
       instances: [...valid, ...invalid],
       fingerprint,
-      attempt: JSON.stringify([fingerprint, d.vaultEpoch, d.statuses.map((st) => [st.state, st.detail]), d.retry]),
+      // Valid or not is part of it: settings that become valid again at an unchanged fingerprint are a new attempt.
+      attempt: JSON.stringify([fingerprint, why === undefined, d.vaultEpoch, d.statuses.map((st) => [st.state, st.detail]), d.retry]),
       shared,
       fieldErrors,
       secrets,
@@ -1048,6 +1196,10 @@ export const makeModuleHost = Effect.fnUntraced(function*(options: ModuleHostOpt
       for (const t of r.tools) if (!tools.has(t.name)) tools.set(t.name, t)
     }
     const templates = templateBudget.get(entry)?.list ?? []
+    // Every module with a catalogue error (a form that cannot be sent, a cycle, …) gets the empty form: no form that
+    // was never checked is sent.
+    const settings = entry.catalogError !== undefined ? EMPTY_FORM : decorateForm(entry, resolve(entry).form)
+    const listed = listedTools(id, [...tools.values()], MODULE_FORM_MAX_BYTES - jsonBytes(settings))
     return {
       id: entry.def.id,
       name: entry.def.name,
@@ -1056,18 +1208,9 @@ export const makeModuleHost = Effect.fnUntraced(function*(options: ModuleHostOpt
       state,
       ...(error !== undefined ? { error: boundary.text(id, error, 2000) } : {}),
       ...(status !== undefined ? { status } : {}),
-      tools: [...tools.values()].map((t) => {
-        const { risk, ...meta } = toolMetadata(t)
-        return {
-          name: boundary.redact(id, t.name),
-          description: boundary.redact(id, t.description),
-          speculative: t.speculative === true,
-          ...(risk !== undefined ? { risk } : {}),
-          ...meta,
-          risks: [...meta.risks]
-        }
-      }),
-      settings: decorateForm(entry, resolve(entry).form),
+      tools: listed.tools,
+      ...(listed.left > 0 ? { toolsLeft: listed.left } : {}),
+      settings,
       revision: entry.revision,
       ...(entry.def.kind !== undefined ? { kind: entry.def.kind } : {}),
       ...(entry.want.demand !== undefined ? { instances: instanceInfos(entry) } : {}),
@@ -1080,6 +1223,32 @@ export const makeModuleHost = Effect.fnUntraced(function*(options: ModuleHostOpt
   }
 
   /**
+   * The admin page's list of a module's tools (not the model's catalogue): names and descriptions through the
+   * boundary, a description then shortened to `MAX_LISTED_TOOL_DESCRIPTION`, at most `MAX_LISTED_TOOLS`, and only as
+   * many as fit in `room` (what the form leaves of `MODULE_FORM_MAX_BYTES`); `left` counts the others.
+   */
+  const listedTools = (id: string, all: ReadonlyArray<Tool>, room: number): { readonly tools: Array<ToolInfo>; readonly left: number } => {
+    const tools: Array<ToolInfo> = []
+    let left = room - 2
+    for (const t of all.slice(0, MAX_LISTED_TOOLS)) {
+      const { risk, ...meta } = toolMetadata(t)
+      const view: ToolInfo = {
+        name: boundary.redact(id, t.name),
+        description: boundary.text(id, t.description, MAX_LISTED_TOOL_DESCRIPTION),
+        speculative: t.speculative === true,
+        ...(risk !== undefined ? { risk } : {}),
+        ...meta,
+        risks: [...meta.risks]
+      }
+      const cost = jsonBytes(view) + 1
+      if (cost > left) break
+      left -= cost
+      tools.push(view)
+    }
+    return { tools, left: all.length - tools.length }
+  }
+
+  /**
    * A live route as the page sees it: what the module declared (its path, token name, description) through the
    * boundary. The live routing identity is unchanged; only the view is: a path that holds a secret is shown redacted,
    * a token name that does is left out.
@@ -1089,7 +1258,8 @@ export const makeModuleHost = Effect.fnUntraced(function*(options: ModuleHostOpt
     const prefix = `${MODULE_ROUTES_PREFIX}${moduleId}`
     return {
       ...view,
-      path: route.path === "" ? prefix : `${prefix}/${boundary.redact(moduleId, route.path)}`,
+      // Matched whole, then bounded to the wire's length (a short secret repeated in a long path expands it).
+      path: route.path === "" ? prefix : clip(`${prefix}/${boundary.redact(moduleId, route.path)}`, MAX_ROUTE_PATH + 100),
       ...(token !== undefined && !boundary.holds(moduleId, token) ? { token } : {}),
       ...(description !== undefined ? { description: boundary.text(moduleId, description, MAX_ROUTE_DESCRIPTION) } : {})
     }
@@ -1101,6 +1271,11 @@ export const makeModuleHost = Effect.fnUntraced(function*(options: ModuleHostOpt
    * decision provider. Never part of an instance's settings key.
    */
   const decorateForm = (entry: Entry, form: SettingsForm): SettingsForm => {
+    // The form as it is sent (`sentForm`: messages through the boundary and cut to fit, the generated Test): measured
+    // here as on load and save, never skipped.
+    const sent = sentForm(entry, form)
+    if (sent.over !== undefined) return tooLargeForm(entry, sent.over)
+    const checked = sent.form
     const instance = mainOf(entry)?.instance
     // Called on the instance (a method may use `this`); a throwing one gives nothing.
     const read = <T>(f: () => T): T | undefined => {
@@ -1114,17 +1289,21 @@ export const makeModuleHost = Effect.fnUntraced(function*(options: ModuleHostOpt
     const options = instance?.settingOptions === undefined ? undefined : read(() => instance.settingOptions!())
     const own = <T>(dict: Readonly<Record<string, T>> | undefined, key: string): T | undefined =>
       typeof dict === "object" && dict !== null && Object.hasOwn(dict, key) ? dict[key] : undefined
-    const generated = generatesTest(entry)
-    // Messages may come from a field's own check (module code): through the boundary, like everything it writes.
-    const errors = form.errors.map((e) => ({ ...e, message: boundary.text(entry.def.id, e.message, 2000) }))
-    const warnings = form.warnings?.map((e) => ({ ...e, message: boundary.text(entry.def.id, e.message, 2000) }))
-    const checked = { ...form, errors, ...(warnings !== undefined ? { warnings } : {}) }
-    if (infos === undefined && options === undefined && !generated && !form.fields.some((f) => f.type === "combo")) return checked
-    const values: Record<string, SettingValue> = { ...form.values }
-    const fields = form.fields.map((field): SettingField => {
+    if (infos === undefined && options === undefined && !checked.fields.some((f) => f.type === "combo")) return checked
+    const values: Record<string, SettingValue> = { ...checked.values }
+    const base = checked.fields
+    // What the instance adds fits in what the described form leaves of the module's budget (`MODULE_FORM_BUDGET_BYTES`)
+    // and in what the form as it is sent (with its notes' room) leaves of `MODULE_FORM_MAX_BYTES`; the listed tools
+    // get what is left after that.
+    let room = Math.min(MODULE_FORM_BUDGET_BYTES - formBytes(base), MODULE_FORM_MAX_BYTES - sent.bytes)
+    const fields = base.map((field): SettingField => {
       const info = own(infos, field.key)
       // Through the boundary: an info value never carries one of the module's secrets to the page.
-      if (field.type === "info" && typeof info === "string") values[field.key] = boundary.text(entry.def.id, info, 1000)
+      if (field.type === "info" && typeof info === "string") {
+        const shown = withinBytes(boundary.text(entry.def.id, info, 1000), room)
+        values[field.key] = shown
+        room -= jsonBytes(shown)
+      }
       if (field.type !== "combo") return field
       // A closed combo accepts only its static options (`Setting.combo`), so only an open one shows the instance's.
       if (!field.allowCustom) return field
@@ -1132,28 +1311,27 @@ export const makeModuleHost = Effect.fnUntraced(function*(options: ModuleHostOpt
       const list = boundary.options(entry.def.id, own(options, field.key))
       const known = new Set(field.options.map((o) => o.value))
       const added = (list ?? []).filter((o) => !known.has(o.value) && (known.add(o.value), true))
-      // Within the wire's bounds: at most MAX_COMBO_OPTIONS in all and MAX_OPTIONS_JSON as JSON (the last go).
-      const all = withinOptionBounds([...field.options, ...added], field.options.length)
-      const note = instance === undefined ? "Not running: type a name" : list !== undefined ? `${all.length} suggestions from ${entry.def.name}` : undefined
-      return { ...field, options: all, ...(note !== undefined && field.optionsNote === undefined ? { optionsNote: note } : {}) }
+      // Within the wire's bounds: at most MAX_COMBO_OPTIONS in all and MAX_OPTIONS_JSON as JSON (the last go), and
+      // within the module's budget.
+      const bounded = withinOptionBounds([...field.options, ...added], field.options.length)
+      const all = [...field.options]
+      for (const option of bounded.slice(field.options.length)) {
+        const cost = jsonBytes(option) + 1
+        if (cost > room) break
+        room -= cost
+        all.push(option)
+      }
+      const more = field.options.length + added.length - all.length
+      const counted = more > 0 ? `${all.length} suggestions from ${entry.def.name} and ${more} more` : `${all.length} suggestions from ${entry.def.name}`
+      const note = instance === undefined ? "Not running: type a name" : list !== undefined ? counted : undefined
+      // "and N more" is always visible, also beside the field's own note.
+      const shownNote = more > 0 && field.optionsNote !== undefined ? `${field.optionsNote} (and ${more} more)` : field.optionsNote ?? note
+      return { ...field, options: all, ...(shownNote !== undefined ? { optionsNote: clip(shownNote, MAX_FIELD_LABEL) } : {}) }
     })
-    if (generated) {
-      fields.push({
-        type: "action",
-        key: "test",
-        label: "Test",
-        description: "Sends one short message and reports the first answer and how long it took.",
-        apply: "live",
-        buttonLabel: "Test",
-        requiresSaved: true,
-        source: "default"
-      })
-    }
-    return { ...checked, fields, values }
+    const decorated = { ...checked, fields, values }
+    // Measured once more as it goes: what the instance added stays within the limit, or is not sent.
+    return jsonBytes(decorated) <= MODULE_FORM_MAX_BYTES ? decorated : checked
   }
-
-  /** An agent or decision provider without a `test` field of its own gets the generated Test button. */
-  const generatesTest = (entry: Entry) => (entry.def.kind === "agent" || entry.def.kind === "decider") && !Object.hasOwn(entry.def.settings, "test")
 
   /** The module's own issues (source `module:<id>`): requirements, unavailable, a failed start, what hung. */
   const moduleIssues = (entry: Entry, demandedNow: ReadonlySet<Entry>): ReadonlyArray<Issue> => {
@@ -1166,7 +1344,7 @@ export const makeModuleHost = Effect.fnUntraced(function*(options: ModuleHostOpt
     const unused = severity === "warning" && entry.want.demand !== undefined ? " (No assistant has it on.)" : ""
     const page = { kind: "link", label: `Open ${name}`, value: `#settings/shared/modules/${id}` } as const
     if (entry.catalogError !== undefined) {
-      out.push({ id: `${id}.uses`, module: id, severity: "error", title: `${name} cannot start`, detail: entry.catalogError })
+      out.push({ id: cycles.has(id) ? `${id}.uses` : `${id}.form`, module: id, severity: "error", title: `${name} cannot start`, detail: entry.catalogError })
     }
     for (const st of entry.want.statuses) {
       if (st.state !== "missing") continue
@@ -1210,7 +1388,7 @@ export const makeModuleHost = Effect.fnUntraced(function*(options: ModuleHostOpt
       })
     }
     // Host-made issues: the module's words in them (a start error, a problem's detail) passed the boundary above.
-    return normaliseIssues(entry.def.id, entry.def.name, out, (value, max) => boundary.text(entry.def.id, value, max), true)
+    return normaliseIssues(entry.def.id, out, (value, max) => boundary.text(entry.def.id, value, max), true)
   }
 
   /** Every module's issues again (a change of demand changes the severity of the modules it reaches too). */
@@ -1386,7 +1564,9 @@ export const makeModuleHost = Effect.fnUntraced(function*(options: ModuleHostOpt
     JSON.stringify(entries.map((e) => [
       e.shown.unavailable === undefined ? null : [e.shown.unavailable.reason, e.shown.demand === undefined ? switchOn(e, e.shown) : e.shown.demand.map((d) => d.assistantId)],
       e.run?.id ?? null,
-      [...(e.run?.instances.values() ?? [])].map((r) => [r.key, r.users, r.ownKeys.length])
+      [...(e.run?.instances.values() ?? [])].map((r) => [r.key, r.users, r.ownKeys.length]),
+      // Who wants it, running or not: `assistantParts` has an entry per assistant named anywhere.
+      e.shown.demand?.map((d) => d.assistantId) ?? null
     ]))
   /** The snapshot of what is published, from the runs and the picture each module was published with. */
   const buildSnapshot = (): ModuleSnapshot => {
@@ -1464,7 +1644,7 @@ export const makeModuleHost = Effect.fnUntraced(function*(options: ModuleHostOpt
   /** Instances by part id, while they are open (the tool registrar reads their names). */
   const instanceByPart = new Map<number, InstanceRun>()
   /** P3: published module routes by module id: the published shared part's (`host.routes()`, `ModuleInfo.routes`). */
-  const routeTable = new Map<string, { readonly routes: ReadonlyArray<ModuleRoute>; readonly scope: Scope.Scope }>()
+  const routeTable = new Map<string, { readonly routes: ReadonlyArray<ModuleRoute>; readonly scope: Scope.Scope; readonly stopped: Effect.Effect<void> }>()
 
   /**
    * The kinds declared by what a part returns (`ModuleRegistrations.ts`). A later PR adds its kind here, one entry
@@ -1539,12 +1719,18 @@ export const makeModuleHost = Effect.fnUntraced(function*(options: ModuleHostOpt
           }
           : route
       )
+      // The host's stop signal for this part's handlers: its run's grace period is over (`run.killed`); at once when
+      // the part is no longer the published one (its handler is refused then too).
+      const stopped = Effect.suspend(() => {
+        const run = byId.get(handle.moduleId)?.run
+        return run !== undefined && run.shared?.part.id === handle.id ? Deferred.await(run.killed) : Effect.void
+      })
       return [{
         kind: "route",
         // The full paths: unique across modules by construction (each module has its own prefix).
         claims: routes.map((r) => `${r.method} ${routeInfo(handle.moduleId, r).path}`),
         validate: () => routeProblem(routes),
-        publish: () => void routeTable.set(handle.moduleId, { routes: live, scope: handle.scope }),
+        publish: () => void routeTable.set(handle.moduleId, { routes: live, scope: handle.scope, stopped }),
         withdraw: () => void routeTable.delete(handle.moduleId)
       }]
     },
@@ -1623,6 +1809,8 @@ export const makeModuleHost = Effect.fnUntraced(function*(options: ModuleHostOpt
   let closing = false
   /** P3: shutdown has begun: no field action is admitted from now on. */
   let pressesClosed = false
+  /** The host's own presses have ended at shutdown (or the bounded wait for them is over). */
+  const hostPressesEnded = Deferred.makeUnsafe<void>()
   const closingSignal = Deferred.makeUnsafe<void>()
 
   /**
@@ -1643,11 +1831,11 @@ export const makeModuleHost = Effect.fnUntraced(function*(options: ModuleHostOpt
       return { _tag: "hung" } as const
     })
 
-  const describeStartFailure = (cause: Cause.Cause<unknown>): string => {
+  const describeStartFailure = (moduleId: string, cause: Cause.Cause<unknown>): string => {
     const error = Cause.findErrorOption(cause)
     if (error._tag === "Some" && error.value instanceof ModuleStartError) return error.value.message
     if (Cause.hasInterruptsOnly(cause)) return "It was interrupted while starting"
-    return `The module crashed while starting: ${firstLine(cause)}`
+    return `The module crashed while starting: ${firstLine(moduleId, cause)}`
   }
 
   let nextId = 0
@@ -1666,8 +1854,8 @@ export const makeModuleHost = Effect.fnUntraced(function*(options: ModuleHostOpt
         kind,
         scope,
         state: "starting",
+        registering: true,
         staged,
-        stagedRestart: undefined,
         closed,
         handle: {
           moduleId: entry.def.id,
@@ -1677,13 +1865,13 @@ export const makeModuleHost = Effect.fnUntraced(function*(options: ModuleHostOpt
           state: () => part.state,
           scope,
           register: (registration) => {
-            if (part.state !== "starting") return { ok: false, reason: `${entry.def.name}: registrations are made while the module starts` }
+            if (part.state !== "starting" || !part.registering) return { ok: false, reason: `${entry.def.name}: registrations are made while the part itself starts` }
             staged.push(registration)
             return { ok: true }
           }
         },
         // P3: an instance's presses; `info` values may have changed with one: announced when it ends.
-        presses: kind === "instance" ? pressOwner((key) => `field action ${entry.def.id}.${key}`, () => announce(entry), () => entry.def.id) : undefined
+        presses: kind === "instance" ? pressOwner(() => announce(entry), () => entry.def.id) : undefined
       }
       openParts.add(part)
       return part
@@ -1721,8 +1909,10 @@ export const makeModuleHost = Effect.fnUntraced(function*(options: ModuleHostOpt
     Effect.map(
       bounded(Effect.suspend(start).pipe(Scope.provide(part.scope)), startTimeoutMs, true),
       (outcome): { readonly ok: true; readonly value: A } | { readonly ok: false; readonly message: string } => {
+        // Its start has returned (or was abandoned): what it did not register by now it never will.
+        part.registering = false
         if (outcome._tag === "hung") return { ok: false, message: closing ? "The assistant is stopping" : `${label} within ${Math.round(startTimeoutMs / 1000)} s` }
-        return Exit.isSuccess(outcome.exit) ? { ok: true, value: outcome.exit.value } : { ok: false, message: describeStartFailure(outcome.exit.cause) }
+        return Exit.isSuccess(outcome.exit) ? { ok: true, value: outcome.exit.value } : { ok: false, message: describeStartFailure(part.entry.def.id, outcome.exit.cause) }
       }
     )
 
@@ -1768,6 +1958,7 @@ export const makeModuleHost = Effect.fnUntraced(function*(options: ModuleHostOpt
         id: ++nextId,
         entry,
         target,
+        accepted: target.desired,
         state: "starting",
         shared: undefined,
         instances: new Map(),
@@ -1791,7 +1982,7 @@ export const makeModuleHost = Effect.fnUntraced(function*(options: ModuleHostOpt
         // resolves with the start's secrets too.
         given(entry, [part], target.shared!.settings)
         boundary.remember(entry.def.id, part, Object.values(target.secrets))
-        const context = { settings: target.shared!.settings as never, settingsFor: settingsForOf(entry, part, target) as never, ...servicesFor(entry, part) }
+        const context = { settings: target.shared!.settings as never, settingsFor: settingsForOf(entry, part, run) as never, ...servicesFor(entry, part) }
         const started = yield* runCode(part, "Its shared part did not start", () => entry.def.shared!(context))
         if (!started.ok) return yield* giveUp(started.message)
         const keys = (started.value.services ?? []).map((p) => p.key.id)
@@ -1852,6 +2043,8 @@ export const makeModuleHost = Effect.fnUntraced(function*(options: ModuleHostOpt
       } catch (error) {
         return yield* giveUp(`Its registrations could not be read: ${describe(error)}`)
       }
+      // Nothing is published once the host has begun to close (it withdrew everything in one step).
+      if (closing) return yield* giveUp("The assistant is stopping")
       const refused = refusalOf(entry, regs)
       if (refused !== undefined) return yield* giveUp(refused)
       // Published in one synchronous step: no other fiber sees part of it.
@@ -1866,11 +2059,6 @@ export const makeModuleHost = Effect.fnUntraced(function*(options: ModuleHostOpt
       entry.starting = undefined
       rebuildSnapshot()
       announceAll()
-      for (const part of opened) {
-        const reason = part.stagedRestart
-        part.stagedRestart = undefined
-        if (reason !== undefined) yield* requestRestart(entry, reason)
-      }
     }).pipe(Effect.ensuring(Effect.sync(() => {
       entry.phase = "idle"
       entry.starting = undefined
@@ -1885,13 +2073,26 @@ export const makeModuleHost = Effect.fnUntraced(function*(options: ModuleHostOpt
       const run = entry.run
       if (run === undefined) return
       entry.phase = "stopping"
-      run.state = "withdrawn"
-      entry.run = undefined
-      for (const inst of run.instances.values()) inst.part.state = "withdrawn"
-      if (run.shared !== undefined) run.shared.part.state = "withdrawn"
-      withdrawAll(entry, run.registrations)
+      withdrawRun(entry, run)
       rebuildSnapshot()
       announceAll()
+      yield* closeRun(run, grace)
+    }).pipe(Effect.ensuring(Effect.sync(() => {
+      entry.phase = "idle"
+    })))
+
+  /** Take a published run out (synchronous): its calls are refused from now on, its registrations are withdrawn. */
+  const withdrawRun = (entry: Entry, run: Run) => {
+    run.state = "withdrawn"
+    if (entry.run === run) entry.run = undefined
+    for (const inst of run.instances.values()) inst.part.state = "withdrawn"
+    if (run.shared !== undefined) run.shared.part.state = "withdrawn"
+    withdrawAll(entry, run.registrations)
+  }
+
+  /** Close a withdrawn run: the grace period for its calls in flight (none while the host closes), then its parts. */
+  const closeRun = (run: Run, grace: number): Effect.Effect<void> =>
+    Effect.gen(function*() {
       // P3: field-action presses of its instances get the same grace period as its calls (no new one reaches a
       // withdrawn module); `closePart` interrupts what remains.
       const presses = [...run.instances.values()].flatMap((inst) => (inst.part.presses === undefined ? [] : [inst.part.presses]))
@@ -1903,20 +2104,41 @@ export const makeModuleHost = Effect.fnUntraced(function*(options: ModuleHostOpt
         const ended = Effect.forEach(presses, (owner) => owner.settled, { concurrency: "unbounded", discard: true })
         yield* Effect.raceFirst(Effect.all([calls, ended], { concurrency: "unbounded", discard: true }), Deferred.await(closingSignal)).pipe(Effect.timeoutOption(grace))
       }
+      // The grace period is over: every press of every instance is answered `stopped` and asked to stop in this one
+      // step, before any part's cleanup is awaited (no press's answer waits for another instance's finalizers).
+      for (const owner of presses) owner.signal()
       Deferred.doneUnsafe(run.killed, Effect.void)
       for (const inst of run.instances.values()) yield* closePart(inst.part)
       if (run.shared !== undefined) yield* closePart(run.shared.part)
       run.state = "closed"
-    }).pipe(Effect.ensuring(Effect.sync(() => {
-      entry.phase = "idle"
-    })))
+    })
+
+  /** Runs the host withdrew when it began to close (`revokeAll`), consumers first: the shutdown walk closes them. */
+  const revoked: Array<Run> = []
+
+  /**
+   * The host begins to close: every published run is withdrawn in one synchronous step, before any part is closed, so
+   * nothing of any module stays callable or published however long (or not at all) the closing then takes. Its calls
+   * in flight are interrupted at once.
+   */
+  const revokeAll = () => {
+    for (const entry of [...ordered].reverse()) {
+      const run = entry.run
+      if (run === undefined) continue
+      withdrawRun(entry, run)
+      Deferred.doneUnsafe(run.killed, Effect.void)
+      for (const inst of run.instances.values()) inst.part.presses?.signal()
+      revoked.push(run)
+    }
+    rebuildSnapshot()
+  }
 
   /** One module's step in a pass: whatever goes wrong in the host's own handling marks it down and the walk goes on. */
   const contained = (entry: Entry, attempt: string, step: Effect.Effect<void>): Effect.Effect<void> =>
     step.pipe(Effect.catchCause((cause) =>
       Effect.gen(function*() {
         yield* Effect.logError(`Module ${entry.def.id}: the module host could not handle it`, cause)
-        entry.failure = { attempt, message: `The module host could not handle it: ${firstLine(cause)}`, instances: [] }
+        entry.failure = { attempt, message: `The module host could not handle it: ${firstLine(entry.def.id, cause)}`, instances: [] }
       })
     ))
 
@@ -1937,21 +2159,35 @@ export const makeModuleHost = Effect.fnUntraced(function*(options: ModuleHostOpt
     const picture = new Map(entries.map((e) => [e, e.want] as const))
     const demanded = demandedIn((e) => picture.get(e)!)
     const items = ordered.map((entry) => {
-      const target = targetOf(entry, picture.get(entry)!, demanded)
-      return { entry, target, plan: planModule(target, { running: entry.run?.target.fingerprint, failed: entry.failure?.attempt }) }
+      const d = picture.get(entry)!
+      try {
+        const target = targetOf(entry, d, demanded)
+        return { entry, target, plan: planModule(target, { running: entry.run?.target.fingerprint, failed: entry.failure?.attempt }), unplanned: undefined }
+      } catch (error) {
+        // It could not be planned (something of the module's threw): stopped and down with that error, never taken
+        // as converged; the next pass plans it again.
+        const message = `${entry.def.name} could not be planned: ${clip(describe(error).replace(/\s+/g, " "), 200)}`
+        const target: HostTarget = { id: entry.def.id, runs: false, invalid: message, instances: [], fingerprint: "", attempt: `unplanned:${desiredVersion}`, shared: undefined, fieldErrors: undefined, secrets: {}, desired: d }
+        return { entry, target, plan: { id: entry.def.id, stop: entry.run !== undefined, start: false, keep: false, forget: false }, unplanned: message }
+      }
     })
     for (const { entry, plan, target } of [...items].reverse()) {
       if (plan.stop) yield* contained(entry, target.attempt, stopModule(entry, graceMs))
     }
-    for (const { entry, plan, target } of items) {
+    for (const { entry, plan, target, unplanned } of items) {
       if (closing) break
       entry.shown = target.desired
       entry.invalid = target.instances.filter((i) => i.invalid !== undefined)
-      if (plan.forget) entry.failure = undefined
+      if (unplanned !== undefined) entry.failure = { attempt: target.attempt, message: unplanned, instances: [] }
+      else if (plan.forget) entry.failure = undefined
       else if (target.invalid !== undefined) {
         entry.failure = { attempt: target.attempt, message: target.invalid, ...(target.fieldErrors !== undefined ? { fieldErrors: target.fieldErrors } : {}), instances: [] }
+      } else if (!plan.start && entry.run === undefined && entry.failure !== undefined && entry.failure.attempt === target.attempt) {
+        // Down for the same attempt: its error is shown for the assistants that want it now.
+        entry.failure = { ...entry.failure, instances: target.instances.filter((i) => i.invalid === undefined) }
       }
       if (plan.keep && entry.run !== undefined) {
+        entry.run.accepted = target.desired
         for (const t of target.instances) {
           const inst = entry.run.instances.get(t.key)
           if (inst === undefined) continue
@@ -1965,8 +2201,13 @@ export const makeModuleHost = Effect.fnUntraced(function*(options: ModuleHostOpt
     announceAll()
   })
 
-  /** Closing the host: the same walk with nothing wanted, consumers first, without grace. */
+  /**
+   * Closing the host: close what `revokeAll` withdrew (and anything published since), consumers first, without grace;
+   * first the host's own presses have ended (or their bounded wait is over), so none outlives what it may use.
+   */
   const shutdownWalk = Effect.gen(function*() {
+    yield* Deferred.await(hostPressesEnded)
+    for (const run of revoked.splice(0)) yield* contained(run.entry, "", closeRun(run, 0))
     for (const entry of [...ordered].reverse()) {
       if (entry.run !== undefined) yield* contained(entry, "", stopModule(entry, 0))
     }
@@ -2004,15 +2245,20 @@ export const makeModuleHost = Effect.fnUntraced(function*(options: ModuleHostOpt
 
   // -- Saving ---------------------------------------------------------------------------------------------------------
 
-  /** Modules whose desired state changed since their last save; one saver saves them one at a time, the latest state. */
-  const saveQueue = new Set<Entry>()
+  /**
+   * Modules whose desired state changed since their last save, with the switch to save (decided when the save was
+   * asked for, never from what happens to run when the saver gets to it); one saver saves them one at a time, the
+   * latest state.
+   */
+  const saveQueue = new Map<Entry, boolean>()
   let saveWake = Deferred.makeUnsafe<void>()
   let saveDone = Deferred.makeUnsafe<void>()
   let saving = false
   /** Ask for a save of `entry` (synchronously, inside the write): returns the number its caller waits for. */
   const requestSave = (entry: Entry): number => {
     entry.saveRequested++
-    saveQueue.add(entry)
+    // An owner who never chose: what its default makes it (on by default, or on by its key: `Desired.keyed`).
+    saveQueue.set(entry, switchOn(entry, entry.want))
     Deferred.doneUnsafe(saveWake, Effect.void)
     return entry.saveRequested
   }
@@ -2024,15 +2270,14 @@ export const makeModuleHost = Effect.fnUntraced(function*(options: ModuleHostOpt
         if (signal === saveWake) saveWake = Deferred.makeUnsafe<void>()
         continue
       }
-      const entry = [...saveQueue][0]!
+      const [entry, enabled] = [...saveQueue][0]!
       saveQueue.delete(entry)
       const seq = entry.saveRequested
       const d = entry.want
       saving = true
       yield* Effect.suspend(() =>
         options.persistence.save(entry.def.id, {
-          // An owner who never chose: what its default makes it (on while its key is set), as before.
-          enabled: d.chosen ? d.enabled : switchOn(entry, d),
+          enabled,
           settings: d.stored as Record<string, SettingValue>,
           secrets: d.secrets
         })
@@ -2054,12 +2299,18 @@ export const makeModuleHost = Effect.fnUntraced(function*(options: ModuleHostOpt
   // `closeTimeoutMs` in all. Registered after the forks, so it runs before they are interrupted.
   yield* Effect.addFinalizer(() =>
     Effect.gen(function*() {
-      // P3: the host's own presses stop first (refused from now on; each in flight has ended), before anything closes.
+      // P3: in one synchronous step, nothing is admitted any more (presses, calls, routes), the host's own presses
+      // are asked to stop, every run is withdrawn with its presses and calls signalled, and the worker is woken. Only
+      // then is the definition presses' cleanup awaited (bounded); the worker's shutdown walk waits for it before it
+      // releases any module's resources.
       pressesClosed = true
-      yield* Effect.timeoutOption(hostPresses.stop, closeTimeoutMs)
       closing = true
+      hostPresses.signal()
+      revokeAll()
       Deferred.doneUnsafe(closingSignal, Effect.void)
       Deferred.doneUnsafe(wake, Effect.void)
+      yield* Effect.timeoutOption(hostPresses.stop, closeTimeoutMs)
+      Deferred.doneUnsafe(hostPressesEnded, Effect.void)
       const deadline = (yield* Clock.currentTimeMillis) + closeTimeoutMs
       const finished = yield* Effect.timeoutOption(Fiber.await(worker), closeTimeoutMs)
       if (Option.isNone(finished)) {
@@ -2177,13 +2428,24 @@ export const makeModuleHost = Effect.fnUntraced(function*(options: ModuleHostOpt
       const id = entry.def.id
       readDefaults()
       const base = entry.want
-      const patched = applySettingsPatch(
-        entry.def.settings,
-        { stored: base.stored, secrets: base.secrets, env: options.env, ...envOrigin, ...(base.defaults !== undefined ? { defaults: base.defaults } : {}) },
-        patch,
-        configureOptions
+      const patched = moduleCode(
+        entry,
+        () =>
+          applySettingsPatch(
+            entry.def.settings,
+            { stored: base.stored, secrets: base.secrets, env: options.env, contain: containFor(entry), ...envOrigin, ...(base.defaults !== undefined ? { defaults: base.defaults } : {}) },
+            patch,
+            configureOptions
+          ),
+        (message): ReturnType<typeof applySettingsPatch> => ({ ok: false, errors: [{ key: null, message }] })
       )
       if (!patched.ok) return Effect.succeed(failure("invalid_settings", "Some settings are not valid", { moduleId: id, fieldErrors: patched.errors }))
+      // Settings the admin page could not show again are not saved (`MODULE_FORM_MAX_BYTES`).
+      const { over } = sentForm(entry, resolveRaw(entry, { stored: patched.stored, secrets: patched.secrets }, undefined, base.defaults).form)
+      if (over !== undefined) {
+        const message = `Too large to save: these settings would take ${kib(over.bytes)} KiB on the admin page, more than the ${kib(MODULE_FORM_MAX_BYTES)} KiB a module's settings may take. The largest is "${over.label}"; make it smaller.`
+        return Effect.succeed(failure("invalid_settings", "Some settings are not valid", { moduleId: id, fieldErrors: [{ key: over.key, message }] }))
+      }
       // While it runs, settings it could not start with are refused at once (what runs keeps running).
       if (entry.run !== undefined) {
         const src = { stored: patched.stored, secrets: patched.secrets }
@@ -2195,13 +2457,16 @@ export const makeModuleHost = Effect.fnUntraced(function*(options: ModuleHostOpt
         if (errors.length > 0) return Effect.succeed(failure("invalid_settings", "Some settings are not valid", { moduleId: id, fieldErrors: errors }))
       }
       let seq = 0
+      const secretsChanged = !sameRecord(patched.secrets, base.secrets)
       const version = write(() => {
         entry.want = {
           ...entry.want,
           stored: patched.stored,
           secrets: patched.secrets,
           // Only a real change of a secret starts it again (the same token saved again changes nothing).
-          secretEpoch: entry.want.secretEpoch + (sameRecord(patched.secrets, base.secrets) ? 0 : 1),
+          secretEpoch: entry.want.secretEpoch + (secretsChanged ? 1 : 0),
+          // The owner's change of its secrets decides `keyed` anew; any other save keeps it (the vault may be locked).
+          keyed: secretsChanged ? keySet(entry.def, patched.secrets) : entry.want.keyed || keySet(entry.def, patched.secrets),
           retry: entry.want.retry + 1
         }
         seq = requestSave(entry)
@@ -2218,7 +2483,8 @@ export const makeModuleHost = Effect.fnUntraced(function*(options: ModuleHostOpt
       settled(write(() => {
         for (const entry of entries) {
           const next = all[entry.def.id] ?? {}
-          if (!sameRecord(next, entry.want.secrets)) entry.want = { ...entry.want, secrets: next, vaultEpoch: entry.want.vaultEpoch + 1 }
+          // A lock takes the secrets away but not `keyed`: a module on by its key stays on.
+          if (!sameRecord(next, entry.want.secrets)) entry.want = { ...entry.want, secrets: next, vaultEpoch: entry.want.vaultEpoch + 1, keyed: entry.want.keyed || keySet(entry.def, next) }
         }
       }))
     )
@@ -2243,10 +2509,11 @@ export const makeModuleHost = Effect.fnUntraced(function*(options: ModuleHostOpt
   const recheck = Effect.suspend(() =>
     settled(write(() => {
       judgeAll()
-      // Check again tries every module that is down after a failed start again, whatever the probes say now, and
-      // clears what was reported of code that hung (it is reported again if it hangs again).
+      // Check again starts a fresh attempt for every module that is not live (down after a failed start, or with a
+      // start under way whose failure is not recorded yet), whatever the probes say now, and clears what was reported
+      // of code that hung (it is reported again if it hangs again).
       for (const entry of entries) {
-        if (entry.failure !== undefined) entry.want = { ...entry.want, retry: entry.want.retry + 1 }
+        if (entry.run === undefined) entry.want = { ...entry.want, retry: entry.want.retry + 1 }
         entry.problems = []
       }
     }))
@@ -2258,41 +2525,63 @@ export const makeModuleHost = Effect.fnUntraced(function*(options: ModuleHostOpt
   const checkOwn = (id: string, own: Readonly<Record<string, unknown>>): ReadonlyArray<FieldError> => {
     const entry = byId.get(id)
     if (entry === undefined) return [{ key: null, message: `There is no module "${id}"` }]
-    // A field's own check is module code: its messages pass the boundary.
-    return checkOwnValues(entry.def.settings, own).map((e) => ({ ...e, message: boundary.text(id, e.message, 2000) }))
+    // A field's own check is module code: one that throws is that module's error; its messages pass the boundary.
+    return moduleCode(entry, () => checkOwnValues(entry.def.settings, own, containFor(entry)), (message) => [{ key: null, message }])
+      .map((e) => ({ ...e, message: boundary.text(id, e.message, 2000) }))
   }
 
   // -- Restarts -------------------------------------------------------------------------------------------------------
 
+  /** A module's recorded restart requests become desired state (the worker restarts it in a later pass). */
+  const applyRestart = (entry: Entry, at: number) => {
+    entry.lastRestartAt = at
+    write(() => {
+      entry.want = { ...entry.want, restarts: entry.restartRequests }
+    })
+  }
+
+  /** Wakes the restart timer: a module's request was held back by the interval. */
+  let restartWake = Deferred.makeUnsafe<void>()
+
   /**
-   * A restart of the module: counted at once; applied (written to the desired state) at most once every
-   * `RESTART_INTERVAL_MS`, every request since the last one merged into the next. A request made after the last
-   * restart was applied always leads to another.
+   * A restart of the module, recorded in one synchronous step (an interrupted caller either made it whole or not at
+   * all): counted, then either written to the desired state at once or, within `RESTART_INTERVAL_MS` of the last one
+   * taken up, held for the restart timer, which takes up every held request when the interval is over (all of a
+   * module's requests in between merged into one). A request made after the last one was taken up always leads to
+   * another restart. The interval only keeps a module from restarting itself in a tight loop: it is not a minimum
+   * distance between two restarts (a pass that is busy elsewhere can bring two closer together).
    */
   const requestRestart = (entry: Entry, reason: string): Effect.Effect<void> =>
-    Effect.gen(function*() {
-      entry.restartRequests++
-      yield* Effect.logInfo(`Module ${entry.def.id} is to be started again: ${reason}`)
-      if (entry.restartTimer) return
+    Clock.clockWith((clock) =>
+      Effect.sync(() => {
+        entry.restartRequests++
+        if (entry.restartTimer) return
+        const now = clock.currentTimeMillisUnsafe()
+        if (now - entry.lastRestartAt >= RESTART_INTERVAL_MS) return applyRestart(entry, now)
+        entry.restartTimer = true
+        Deferred.doneUnsafe(restartWake, Effect.void)
+      })
+    ).pipe(Effect.andThen(Effect.logInfo(`Module ${entry.def.id} is to be started again: ${reason}`)))
+
+  /** The restart timer: one fiber of the host's, which takes up the held requests once their interval is over. */
+  const restartTimer = Effect.gen(function*() {
+    for (;;) {
       const now = yield* Clock.currentTimeMillis
-      const apply = (at: number) => {
-        entry.lastRestartAt = at
-        write(() => {
-          entry.want = { ...entry.want, restarts: entry.restartRequests }
-        })
-      }
-      const wait = entry.lastRestartAt + RESTART_INTERVAL_MS - now
-      if (wait <= 0) return apply(now)
-      entry.restartTimer = true
-      yield* Effect.forkIn(
-        outsideTurns(Effect.gen(function*() {
-          yield* Effect.sleep(wait)
+      let next = Infinity
+      for (const entry of entries) {
+        if (!entry.restartTimer) continue
+        const due = entry.lastRestartAt + RESTART_INTERVAL_MS
+        if (due <= now) {
           entry.restartTimer = false
-          apply(yield* Clock.currentTimeMillis)
-        })),
-        hostScope
-      )
-    })
+          applyRestart(entry, now)
+        } else next = Math.min(next, due - now)
+      }
+      const signal = restartWake
+      yield* next === Infinity ? Deferred.await(signal) : Effect.raceFirst(Deferred.await(signal), Effect.sleep(next))
+      if (signal === restartWake && Deferred.isDoneUnsafe(signal)) restartWake = Deferred.makeUnsafe<void>()
+    }
+  })
+  yield* Effect.forkIn(outsideTurns(restartTimer), hostScope)
 
   /** `reportMissingProgram`: a required program failed to start; the app marks it missing, then every module is judged again. */
   const reportMissingProgram = (entry: Entry, tool: string): Effect.Effect<void> =>
@@ -2316,27 +2605,44 @@ export const makeModuleHost = Effect.fnUntraced(function*(options: ModuleHostOpt
           issues.set(source, [])
           return Effect.void
         }
-        // The check holds what it is given until its issues are published.
+        // The check holds what it is given until both its fiber has really ended (its observer: a check left at its
+        // time limit may still be cleaning up with those secrets) and its issues have passed the boundary and been
+        // published (the first of the two releases nothing). The answer never waits for the cleanup.
         const holder = {}
+        let holds = 1
+        const releaseHold = () => {
+          if (--holds === 0) boundary.release(holder)
+        }
         const settings = given(entry, [holder], resolve(entry).value)
         const own = (title: string, detail: string): ReadonlyArray<Issue> => [{ id: `${entry.def.id}.health`, module: entry.def.id, severity: "warning", title, detail }]
-        // Suspended: a health check that throws is reported like one that fails.
-        return Effect.suspend(() => health({ settings, running: entry.run !== undefined })).pipe(
-          Effect.timeoutOrElse({
-            duration: healthTimeoutMs,
-            orElse: () => Effect.succeed(own(`${entry.def.name}'s health check did not finish`, `It took longer than ${Math.round(healthTimeoutMs / 1000)} s.`))
-          }),
-          Effect.catchCause((cause) =>
-            Cause.hasInterruptsOnly(cause)
-              ? Effect.interrupt
-              : Effect.succeed(own(`${entry.def.name}'s health check failed`, firstLine(cause)))
-          ),
+        // In a fiber of its own, awaited as its Exit: one that throws, fails or interrupts itself is that module's
+        // issue, never the whole check's; one that does not finish in time is left (interrupted, not waited for).
+        return Effect.gen(function*() {
+          // Forked (in the host's scope, so no caller waits for its cleanup) and observed in one uninterruptible step,
+          // so a check interrupted while it is admitted is still held until its fiber ends; the fiber itself is
+          // interruptible, and asked to stop when its caller is interrupted or its time is up (never waited for).
+          const fiber = yield* Effect.uninterruptible(Effect.map(Effect.forkIn(Effect.suspend(() => health({ settings, running: entry.run !== undefined })), hostScope), (f) => {
+            holds++
+            f.addObserver(releaseHold)
+            return f
+          }))
+          const exit = yield* Effect.timeoutOption(Fiber.await(fiber), healthTimeoutMs).pipe(Effect.onInterrupt(() => Effect.sync(() => fiber.interruptUnsafe())))
+          if (Option.isNone(exit)) {
+            fiber.interruptUnsafe()
+            return own(`${entry.def.name}'s health check did not finish`, `It took longer than ${Math.round(healthTimeoutMs / 1000)} s.`)
+          }
+          if (Exit.isFailure(exit.value)) {
+            const cause = exit.value.cause
+            return own(`${entry.def.name}'s health check failed`, Cause.hasInterruptsOnly(cause) ? "It was interrupted." : firstLine(entry.def.id, cause))
+          }
+          return exit.value.value
+        }).pipe(
           Effect.flatMap((list) =>
             Effect.sync(() =>
-              issues.set(source, normaliseIssues(entry.def.id, entry.def.name, Array.isArray(list) ? list : [], (value, max) => boundary.text(entry.def.id, value, max)))
+              issues.set(source, normaliseIssues(entry.def.id, Array.isArray(list) ? list : [], (value, max) => boundary.text(entry.def.id, value, max)))
             )
           ),
-          Effect.ensuring(Effect.sync(() => boundary.release(holder)))
+          Effect.ensuring(Effect.sync(releaseHold))
         )
       }),
     { concurrency: "unbounded", discard: true }
@@ -2350,9 +2656,15 @@ export const makeModuleHost = Effect.fnUntraced(function*(options: ModuleHostOpt
     return assistantId !== undefined && entry.shown.demand !== undefined ? instanceFor(entry, assistantId) : mainOf(entry)
   }
 
-  /** The assistant may use this module (the gateway's own first check, so the catalogue lists what would run). */
+  /**
+   * The assistant may use this module (the gateway's own first check, so the catalogue lists what would run). Without
+   * `access`: the assistant wants it directly (`demand`; a module without demand is everyone's).
+   */
   const moduleOnFor = (assistantId: string | undefined, entry: Entry) =>
-    assistantId === undefined || options.access === undefined || options.access.moduleOn(assistantId, entry.def.id)
+    assistantId === undefined ||
+    (options.access === undefined
+      ? entry.shown.demand === undefined || entry.shown.demand.some((d) => d.assistantId === assistantId)
+      : options.access.moduleOn(assistantId, entry.def.id))
 
   /** The assistant may use this action (the gateway's first two checks). */
   const offered = (assistantId: string | undefined, entry: Entry, actionId: string) =>
@@ -2499,12 +2811,15 @@ export const makeModuleHost = Effect.fnUntraced(function*(options: ModuleHostOpt
       // Serve mode: a caller with no complete principal gets none (deliberately all: `contributionsFor(key, undefined)`).
       "refused" in principal ? (options.access === undefined ? contributionsFor(key, undefined) : []) : contributionsFor(key, assistantOf(principal)))
 
-  /** `ctx.settingsFor` of a shared part: from the desired state its module was started with. */
-  const settingsForOf = (entry: Entry, part: Part, target: HostTarget) => (assistantId: string | undefined): unknown => {
-    if (part.state === "closed" || part.state === "abandoned") throw stoppedError(entry)
-    const d = target.desired
+  /**
+   * `ctx.settingsFor` of a shared part: from the desired state its run runs for now (`Run.accepted`: who has it on,
+   * the saved values and defaults), with the secrets it was started with.
+   */
+  const settingsForOf = (entry: Entry, part: Part, run: Run) => (assistantId: string | undefined): unknown => {
+    if (closing || part.state === "closed" || part.state === "abandoned") throw stoppedError(entry)
+    const d = run.accepted
     const own = assistantId === undefined ? undefined : d.demand?.find((x) => x.assistantId === assistantId)?.own
-    return resolveFrom(entry, { stored: d.stored, secrets: target.secrets }, own === undefined ? undefined : applicableOwnValues(entry.def.settings, own), d.defaults).value
+    return resolveFrom(entry, { stored: d.stored, secrets: run.target.secrets }, own === undefined ? undefined : applicableOwnValues(entry.def.settings, own), d.defaults).value
   }
 
   /**
@@ -2540,7 +2855,8 @@ export const makeModuleHost = Effect.fnUntraced(function*(options: ModuleHostOpt
    * closed, every member answers with `ModuleStopped`.
    */
   function servicesFor(entry: Entry, part: Part): ModuleServicesV2 {
-    const isStopped = () => part.state === "closed" || part.state === "abandoned"
+    // Once the host has begun to close, every module's context answers with ModuleStopped (`revokeAll`).
+    const isStopped = () => closing || part.state === "closed" || part.state === "abandoned"
     const now = <A>(f: () => A): A => {
       if (isStopped()) throw stoppedError(entry)
       return f()
@@ -2555,6 +2871,7 @@ export const makeModuleHost = Effect.fnUntraced(function*(options: ModuleHostOpt
       if (!coreViews.has(key.id)) coreViews.set(key.id, coreServiceView(core, now, effect))
       return coreViews.get(key.id) as T
     }
+    let refusedRestart = false
     return {
       host: {
         routeTokens: {
@@ -2569,11 +2886,12 @@ export const makeModuleHost = Effect.fnUntraced(function*(options: ModuleHostOpt
         actions: { list: effect(() => actions.list), run: (request) => effect(() => actions.run(request)) },
         requestRestart: (reason) =>
           effect(() => {
-            // During its own start: applied once it is published (dropped if it is not). While it runs or is being
-            // stopped (only ever before its module's next start): counted, so the next start comes after it.
-            if (part.state === "starting") {
-              part.stagedRestart = reason
-              return Effect.void
+            // Only a live part asks: one that is starting, was never published or is being closed (a "restart on
+            // disconnect" finalizer) is refused, so a failed start cannot restart itself.
+            if (part.state !== "live") {
+              if (refusedRestart) return Effect.void
+              refusedRestart = true
+              return Effect.logDebug(`Module ${entry.def.id}: a restart asked for by its ${part.kind} part while it is ${part.state} is ignored: ${reason}`)
             }
             return requestRestart(entry, reason)
           }),
@@ -2689,28 +3007,30 @@ export const makeModuleHost = Effect.fnUntraced(function*(options: ModuleHostOpt
       const prepared = useDraft ? draftSettings(entry, values) : savedSettings(entry)
       if (!prepared.ok) return Effect.succeed(answer({ ok: false, text: prepared.message, tone: "error" }))
       const label = `field action ${id}.${key}`
-      // The secrets the press is given are kept by the boundary until the press has ended AND been answered (the
-      // first of the two releases nothing); an instance's press gives them to its instance, which keeps them as long
-      // as it lives.
+      // The secrets the press is given are kept by the boundary until the press's fiber has ended (its observer, so
+      // also when it is interrupted before it began) AND it has been answered (the first of the two releases
+      // nothing); an instance's press gives them to its instance, which keeps them as long as it lives.
       const holder = {}
-      let holds = 2
-      const releaseOne = Effect.sync(() => {
+      let holds = 1
+      const releaseHold = () => {
         if (--holds === 0) boundary.release(holder)
-      })
+      }
+      const releaseOne = Effect.sync(releaseHold)
       const holders = definition !== undefined || running === undefined ? [holder] : [holder, running.part]
       // Suspended: a handler that throws is reported like one that fails. Outside any turn.
-      const press = outsideTurns(Effect.suspend(() => handler({ settings: given(entry, holders, prepared.settings), draft: useDraft }))).pipe(Effect.ensuring(releaseOne))
+      const press = outsideTurns(Effect.suspend(() => handler({ settings: given(entry, holders, prepared.settings), draft: useDraft })))
+      const started = (fiber: Fiber.Fiber<FieldActionResult, unknown>) => {
+        holds++
+        fiber.addObserver(releaseHold)
+      }
       return Effect.gen(function*() {
-        const outcome = yield* owner.start(ownerKey, press, fieldActionTimeoutMs)
+        const outcome = yield* owner.start(ownerKey, press, fieldActionTimeoutMs, started)
         switch (outcome._tag) {
           case "busy":
-            boundary.release(holder)
             return { ok: false, code: "busy", message: "That button is still running" } as const
-          case "stuck":
-            boundary.release(holder)
-            return { ok: false, code: "busy", message: `Earlier presses of ${entry.def.name}'s buttons have not stopped yet; try again later (Health has more)` } as const
+          case "full":
+            return { ok: false, code: "busy", message: `${entry.def.name} has ${MAX_PRESS_SLOTS} button presses running already; try again when one has ended (Health has more)` } as const
           case "stopped":
-            boundary.release(holder)
             return { ok: false, code: "not_running", message: `${entry.def.name} is not running` } as const
           case "timeout":
             return answer({ ok: false, text: `Did not finish within ${Math.round(fieldActionTimeoutMs / 1000)} s`, tone: "error" })
@@ -2747,10 +3067,15 @@ export const makeModuleHost = Effect.fnUntraced(function*(options: ModuleHostOpt
     }
     // The saved state (the desired state: a configure's settings are saved even when the module could not start).
     const base = entry.want
-    const patched = applySettingsPatch(
-      spec,
-      { stored: base.stored, secrets: base.secrets, env: options.env, ...envOrigin, ...(base.defaults !== undefined ? { defaults: base.defaults } : {}) },
-      { values: patchValues, secrets: {} }
+    const patched = moduleCode(
+      entry,
+      () =>
+        applySettingsPatch(
+          spec,
+          { stored: base.stored, secrets: base.secrets, env: options.env, contain: containFor(entry), ...envOrigin, ...(base.defaults !== undefined ? { defaults: base.defaults } : {}) },
+          { values: patchValues, secrets: {} }
+        ),
+      (message): ReturnType<typeof applySettingsPatch> => ({ ok: false, errors: [{ key: null, message }] })
     )
     if (!patched.ok) return { ok: false, message: `Not run: ${problemsText(entry, patched.errors)}` }
     // Secrets are always the saved ones (a draft cannot name one: it is skipped above).
@@ -2798,7 +3123,7 @@ export const makeModuleHost = Effect.fnUntraced(function*(options: ModuleHostOpt
 
   /** P3: the live routes, from the route table publication fills. */
   const routes = (): ReadonlyArray<PublishedRoute> =>
-    [...routeTable].flatMap(([moduleId, live]) => live.routes.map((route) => ({ moduleId, route, scope: live.scope })))
+    [...routeTable].flatMap(([moduleId, live]) => live.routes.map((route) => ({ moduleId, route, scope: live.scope, stopped: live.stopped })))
 
   /** The boundary for the app's own views of module-produced text (the route call log and token labels). */
   const pageText = (moduleId: string, text: unknown, max: number): string => boundary.text(moduleId, text, max)
@@ -2844,21 +3169,22 @@ export const makeModuleHost = Effect.fnUntraced(function*(options: ModuleHostOpt
 })
 
 /**
- * Module issues made safe for the wire and a terminal (`wireSafeIssue`), with the module's id as prefix and `module`;
- * at most 20 per module, the rest said in one more ("and 12 more"). P3: every text in them passes the page boundary
- * first (`page`), before anything is clipped, so a start error or a `health()` result never carries a secret the
- * module was given; host-made issues (`hostMade`: the module's words in them redacted already) are only made safe.
+/**
+ * Module issues made safe for the wire and a terminal (`wireSafeIssue`), with the module's id as prefix and `module`.
+ * Not counted here: the issue registry sorts each source's list by severity, bounds it and counts what it left out.
+ * P3: every text in them passes the page boundary first (`page`), before anything is clipped, so a start error or a
+ * `health()` result never carries a secret the module was given; host-made issues (`hostMade`: the module's words in
+ * them redacted already) are only made safe.
  */
 function normaliseIssues(
   id: string,
-  name: string,
   list: ReadonlyArray<Issue>,
   page: (value: unknown, max: number) => string,
   hostMade = false
 ): ReadonlyArray<Issue> {
   // Redacted in full; `wireSafeIssue` clips afterwards.
   const own = (value: unknown) => (hostMade || value === undefined ? value : page(value, Number.MAX_SAFE_INTEGER))
-  const redacted = list.map((issue, i): Issue => {
+  return list.map((issue, i): Issue => {
     const rawId = String(issue.id ?? "")
     const fullId = rawId.startsWith(`${id}.`) ? rawId : `${id}.${rawId}`
     const fix = issue.fix
@@ -2875,7 +3201,6 @@ function normaliseIssues(
         : {})
     }
   })
-  return boundIssues(redacted, 20, (more) => ({ id: `${id}.more`, module: id, severity: "warning", title: `${name} reported ${more} more issues`, detail: "Only the first ones are shown." }))
     .map((issue, i) => {
       const safe = wireSafeIssue(issue, id, i)
       return safe.module === undefined ? { ...safe, module: id } : safe
@@ -2883,11 +3208,84 @@ function normaliseIssues(
 }
 
 // ---------------------------------------------------------------------------
+// The form's budget (`MODULE_FORM_BUDGET_BYTES`)
+
+/** Room kept per field for what the host adds at run time beside the instance's values: a combo's note, a cut marker. */
+const NOTE_RESERVE_BYTES = 256
+/** The room the run-time notes of these fields need (a combo's "and N more", an info value's cut marker). */
+const notesReserve = (fields: ReadonlyArray<SettingField>): number => fields.filter((f) => f.type === "combo" || f.type === "info").length * NOTE_RESERVE_BYTES
+/** The described fields' size (the complete array as JSON, brackets and commas included), with their notes' room. */
+const formBytes = (fields: ReadonlyArray<SettingField>): number => jsonBytes(fields) + notesReserve(fields)
+/**
+ * The lengths a sent form's messages are cut to, in turn, until the form fits `MODULE_FORM_MAX_BYTES` (`sentForm`):
+ * first as the page gets them (2,000 characters), at last 100.
+ */
+const MESSAGE_CAPS = [2000, 1000, 500, 200, 100] as const
+
+const kib = (bytes: number) => Math.ceil(bytes / 1024)
+
+/** `text` cut to `room` bytes as JSON, saying how much was left out. */
+const withinBytes = (text: string, room: number): string => {
+  if (jsonBytes(text) <= room) return text
+  let keep = Math.max(0, Math.min(text.length, room - 64))
+  while (keep > 0 && jsonBytes(text.slice(0, keep)) > room - 64) keep = Math.floor(keep * 0.9)
+  keep = wholeCodePoints(text, keep)
+  return `${text.slice(0, keep)}… (and ${text.length - keep} more characters)`
+}
+
+const encodeField = Schema.encodeUnknownResult(SettingField)
+
+/** The generated Test button of an agent or decision provider without a `test` field of its own. */
+const GENERATED_TEST_FIELD: SettingField = {
+  type: "action",
+  key: "test",
+  label: "Test",
+  description: "Sends one short message and reports the first answer and how long it took.",
+  apply: "live",
+  buttonLabel: "Test",
+  requiresSaved: true,
+  source: "default"
+}
+
+/** The form sent for a module whose own form cannot be sent. */
+const EMPTY_FORM: SettingsForm = { fields: [], values: {}, secrets: {}, errors: [] }
+
+/**
+ * Why a module's described form cannot be sent, naming the field, or `undefined`: checked once, when the host is made,
+ * against the wire's own schema (`SettingField`, every nested record item and option included) and the module's budget
+ * (`MODULE_FORM_BUDGET_BYTES`). Such a module does not start.
+ */
+const formProblem = (def: ModuleDefinition<any>, generatedTest = false): string | undefined => {
+  let fields: ReadonlyArray<SettingField>
+  try {
+    fields = resolveSettings(def.settings, { stored: {}, secrets: {}, env: {} }).form.fields
+  } catch (error) {
+    return `Its settings form could not be described: ${describe(error)}`
+  }
+  const all = generatedTest ? [...fields, GENERATED_TEST_FIELD] : fields
+  // The complete encoded array (its brackets and commas), with the same note reserves as the run-time measure; added
+  // up field by field so that the error names the field from which on it is too large.
+  const encodedFields: Array<SettingField> = []
+  for (const field of all) {
+    const encoded = encodeField(field)
+    if (Result.isFailure(encoded)) {
+      return `Its settings field "${field.key}" cannot be sent to the admin page: ${clip(encoded.failure.message.replace(/\s+/g, " "), 300)}. Fix the module.`
+    }
+    encodedFields.push(encoded.success as SettingField)
+    if (formBytes(encodedFields) > MODULE_FORM_BUDGET_BYTES) {
+      return `Its settings form is larger than the ${MODULE_FORM_BUDGET_BYTES} bytes a module's form may take, from the field "${field.key}" on. Fix the module.`
+    }
+  }
+  return undefined
+}
+
+// ---------------------------------------------------------------------------
 // Generated "Test" buttons
 
 const TEST_TIMEOUT_MS = 30_000
 
-const quote = (s: string) => (s.length > 120 ? `${s.slice(0, 117)}...` : s)
+/** At most 120 characters, cut at a whole character. */
+const quote = (s: string) => (s.length > 120 ? `${s.slice(0, wholeCodePoints(s, 117))}...` : s)
 
 /** Options within the wire's bounds (`MAX_COMBO_OPTIONS`, `MAX_OPTIONS_JSON`): the last go first, the first `keep` stay. */
 const withinOptionBounds = (options: ReadonlyArray<ChoiceOption>, keep: number): Array<ChoiceOption> => {

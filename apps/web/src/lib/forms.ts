@@ -138,13 +138,17 @@ export interface FormSync {
  * every other field takes the new server value, the new values become the base
  * (so a save sends only the edits), and the form is marked stale ("Changed in
  * another tab"). A field changed on both sides keeps the user's edit.
+ *
+ * `invalid`: the fields that show a local error (text a renderer could not take yet). The same rule as Save and Test:
+ * such a field is edited, so it keeps its draft value (and its renderer, with the text being typed) and the form is
+ * marked stale, never silently replaced under its error.
  */
-export const reconcile = (sync: FormSync, previous: SettingsForm, next: SettingsForm, revision: number): FormSync => {
+export const reconcile = (sync: FormSync, previous: SettingsForm, next: SettingsForm, revision: number, invalid: ReadonlyArray<string> = []): FormSync => {
   if (revision <= sync.baseRevision) return sync
-  if (!isDirty(previous, sync.draft)) return { draft: initialDraft(next), baseRevision: revision, stale: false }
+  if (!isDirty(previous, sync.draft) && invalid.length === 0) return { draft: initialDraft(next), baseRevision: revision, stale: false }
   const values: Record<string, SettingValue> = { ...next.values }
   for (const key of Object.keys(sync.draft.values)) {
-    if (edited(sync.draft, key)) values[key] = sync.draft.values[key]!
+    if (edited(sync.draft, key) || invalid.includes(key)) values[key] = sync.draft.values[key]!
   }
   return {
     draft: {

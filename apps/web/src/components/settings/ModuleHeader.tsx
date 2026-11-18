@@ -98,7 +98,8 @@ const RISK_LABEL: Partial<Record<NonNullable<ModuleInfo["tools"][number]["risk"]
 
 /** The module's tools, under its form. */
 export function ModuleTools({ module: m }: { readonly module: ModuleInfo }) {
-  if (m.tools.length === 0) return null
+  const left = m.toolsLeft ?? 0
+  if (m.tools.length === 0 && left === 0) return null
   return (
     <div>
       <h3 className="label mb-2 text-ink-faint">Tools</h3>
@@ -113,6 +114,7 @@ export function ModuleTools({ module: m }: { readonly module: ModuleInfo }) {
           </li>
         ))}
       </ul>
+      {left > 0 && <p className="mt-2 text-[13px] text-ink-muted" data-testid="tools-left">{m.tools.length === 0 ? `${left} tools` : `and ${left} more`}</p>}
     </div>
   )
 }
@@ -132,6 +134,7 @@ export function ModuleInstances({ module: m }: { readonly module: ModuleInfo }) 
   const nameOf = (id: string) => names[id] ?? id
   return (
     <div className="flex flex-col gap-2" data-testid={`module-${m.id}`} data-state={m.state}>
+      {m.version !== undefined && <span className="text-[12px] text-ink-faint" data-testid="module-version">version {m.version}</span>}
       {m.state === "unavailable" ? (
         <ModuleUnavailableNote module={m} />
       ) : instances.length === 0 && runsForOthers(m) ? (

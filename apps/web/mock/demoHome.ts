@@ -150,6 +150,12 @@ export const demoHomeModule = (): ModuleInfo => ({
 const asRecords = (v: SettingValue | undefined): ReadonlyArray<RecordValue> =>
   Array.isArray(v) && v.every((x) => typeof x === "object" && x !== null) ? (v as ReadonlyArray<RecordValue>) : []
 
+/**
+ * Buttons whose handler is the module definition's (`<module>/<key>`): they run while the module is stopped too. Every
+ * other button is its running instance's, answered `not_running` while it does not run (as on the host).
+ */
+export const DEMO_DEFINITION_ACTIONS: ReadonlySet<string> = new Set(["demo-home/check"])
+
 /** What the demo home's buttons answer: `check` judges the given (draft or saved) values. */
 export const demoHomeAction = (key: string, values: Readonly<Record<string, SettingValue>>): FieldActionResult | undefined => {
   if (key === "allOff") return { ok: true, text: "Every light was already off.", tone: "ok" }
