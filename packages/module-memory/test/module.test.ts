@@ -6,6 +6,7 @@ import { assert, describe, it } from "@effect/vitest"
 import { type ActionDefinition, askFor, type Collection, CurrentTurn, extractText, makeToolRegistry, maxListRows, type ModuleHostApi, type Row, StoreError, type TextParam } from "@pva/core"
 import { checkModule, expectOffByDefault, type ModuleHarness, startTestModule } from "@pva/core/testing"
 import { Effect } from "effect"
+import { bound } from "../../store-sqlite/test/latencyBound.ts"
 import { catalog, DUPLICATE_ROWS, type Memory, memories, memoryModule, MAX_PINNED, type Note, notes, SCAN_ROWS, texts } from "../src/index.ts"
 import { looksSecret, MAX_QUERY_WORDS } from "../src/words.ts"
 
@@ -89,8 +90,6 @@ const longestStop = <A, E, R>(effect: Effect.Effect<A, E, R>) =>
     active = false
     return { value, longest }
   })
-/** The bound a latency test asserts: as the store's latency tests do (`packages/store-sqlite/test/latencyBound.ts`), three times it on CI. */
-const bound = (ms: number) => (process.env.CI ? ms * 3 : ms)
 
 describe("memory: the definition", () => {
   it.effect("is accepted by the host, off by default, and passes the conformance check with its texts in both languages", () =>
@@ -939,7 +938,7 @@ describe("memory: the pinned context", () => {
         assert.strictEqual(text, expected)
       }
       times.sort((a, b) => a - b)
-      assert.isBelow(times[5]!, 10, `median ${times[5]!.toFixed(1)} ms`)
+      assert.isBelow(times[5]!, bound(10), `median ${times[5]!.toFixed(1)} ms`)
     }))
 })
 
