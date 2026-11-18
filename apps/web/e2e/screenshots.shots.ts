@@ -242,7 +242,7 @@ test.describe("voice, phone, dark", () => {
     await settle(page, 400)
     await shot(page, "voice-phone-10-dock-more")
     await page.getByTestId("dock-new-conversation").tap()
-    await expect(page.getByTestId("toasts")).toContainText("Started a new conversation.")
+    await expect(page.getByTestId("toasts")).toContainText("New conversation with Jeff. T3 keeps its own.")
     await settle(page, 300)
     await shot(page, "voice-phone-11-new-conversation-toast")
     await page.getByTestId("chat-toggle").tap()
@@ -550,6 +550,32 @@ test.describe("admin, desktop, dark", () => {
     const top = (await place.boundingBox())!
     const bottom = (await page.getByTestId("section-capabilities").boundingBox())!
     await page.screenshot({ path: join(dir, "admin-desktop-79-device-place-and-capabilities.png"), clip: { x: 0, y: Math.max(0, top.y - 24), width: 1280, height: bottom.y + bottom.height - top.y + 48 } })
+  })
+
+  test("module routes and tokens (protocol 10): the addresses, a minted token shown once", async ({ page, baseURL }) => {
+    await loginAdmin(page, baseURL, "#settings/shared/modules")
+    const routes = page.getByTestId("module-block-demo-home").getByTestId("module-routes")
+    await expect(routes).toBeVisible()
+    await routes.getByLabel("Who the new token is for").fill("Home Assistant")
+    await routes.getByRole("button", { name: "New token" }).click()
+    await expect(routes.getByTestId("minted-token")).toBeVisible()
+    await expect(routes.getByTestId("route-token")).toHaveCount(2) // the mock seeds one; the new one is the second
+    await page.setViewportSize({ width: 1280, height: 1600 })
+    await routes.scrollIntoViewIfNeeded()
+    await page.mouse.move(2, 2)
+    await settle(page)
+    const box = (await routes.boundingBox())!
+    await page.screenshot({ path: join(dir, "admin-desktop-80-module-routes-and-tokens.png"), clip: { x: 0, y: Math.max(0, box.y - 24), width: 1280, height: Math.min(1600 - Math.max(0, box.y - 24), box.height + 48) } })
+  })
+
+  test("diagnostics: scheduled jobs (protocol 12)", async ({ page, baseURL }) => {
+    await mock.scenario("health")
+    await gotoAdmin(page, baseURL, "#settings/diagnostics/scheduled")
+    await expect(page.getByTestId("scheduled-jobs")).toBeVisible()
+    await expect(page.getByTestId("scheduled-job").first()).toBeVisible()
+    await page.mouse.move(2, 2)
+    await settle(page)
+    await shot(page, "admin-desktop-81-diagnostics-scheduled-jobs")
   })
 
   test("shared settings: the navigation, the accounts, a module in error", async ({ page, baseURL }) => {
