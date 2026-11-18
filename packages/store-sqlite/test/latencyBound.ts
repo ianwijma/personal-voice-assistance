@@ -19,18 +19,55 @@ const MEMORY_FILE_SYSTEMS = new Set([0x01021994, 0x858458f6])
 /** Whether `dir` is on a file system held in memory (tmpfs, ramfs). */
 export const inMemoryFileSystem = (dir: string): boolean => MEMORY_FILE_SYSTEMS.has(Number(statfsSync(dir).type))
 
+/** What `latencyDir` uses of the system (tests give their own: `latencyDirWith`). */
+export interface LatencyDirSystem {
+  readonly tmpdir: () => string
+  /** The `statfs` type of the file system `dir` is on. */
+  readonly fileSystemType: (dir: string) => number
+  readonly mkdirp: (dir: string) => void
+  readonly mkdtemp: (prefix: string) => string
+  readonly remove: (dir: string) => void
+  /** Run `f` when the test ends, also when it fails. */
+  readonly onTestFinished: (f: () => void) => void
+}
+
+/** The directory `latencyDir` falls back to when the system temporary directory is in memory. */
+export const LATENCY_CACHE_DIR = fileURLToPath(new URL("../../../node_modules/.cache/pva-latency", import.meta.url))
+
+/** `latencyDir` on a given system and fallback directory. */
+export const latencyDirWith = (system: LatencyDirSystem, cacheDir: string, prefix: string): string => {
+  const inMemory = (dir: string) => MEMORY_FILE_SYSTEMS.has(system.fileSystemType(dir))
+  const temp = system.tmpdir()
+  const base = inMemory(temp) ? cacheDir : temp
+  system.mkdirp(base)
+  const dir = system.mkdtemp(join(base, `${prefix}-`))
+  system.onTestFinished(() => system.remove(dir))
+  // The directory returned is checked itself, the fallback too: a test measured in memory would show no sync.
+  if (inMemory(dir)) {
+    system.remove(dir)
+    throw new Error(
+      `latencyDir: ${dir} is on a file system held in memory (tmpfs or ramfs), like ${temp}; a latency test there would `
+        + "measure no disk sync. Set TMPDIR to a directory on a real disk."
+    )
+  }
+  return dir
+}
+
+const SYSTEM: LatencyDirSystem = {
+  tmpdir,
+  fileSystemType: (dir) => Number(statfsSync(dir).type),
+  mkdirp: (dir) => void mkdirSync(dir, { recursive: true }),
+  mkdtemp: (prefix) => mkdtempSync(prefix),
+  remove: (dir) => rmSync(dir, { recursive: true, force: true }),
+  onTestFinished: (f) => onTestFinished(f)
+}
+
 /**
  * A new directory for a latency test's database, on a real disk: the system temporary directory when it is on one
  * (as on CI), otherwise (`/tmp` on tmpfs, as on the development machine) one under the repository's
  * `node_modules/.cache/pva-latency/`. A store measured on tmpfs never waits for a disk: its syncs cost nothing, so a
  * stop that a sync on the main thread causes (tens of milliseconds on a slow disk or an SD card) would never show.
- * Removed when the test ends, also when it fails. Call it inside a test.
+ * The directory returned is checked, and it fails when that is in memory too. Removed when the test ends, also when
+ * it fails. Call it inside a test.
  */
-export const latencyDir = (prefix: string): string => {
-  const system = tmpdir()
-  const base = inMemoryFileSystem(system) ? fileURLToPath(new URL("../../../node_modules/.cache/pva-latency", import.meta.url)) : system
-  mkdirSync(base, { recursive: true })
-  const dir = mkdtempSync(join(base, `${prefix}-`))
-  onTestFinished(() => rmSync(dir, { recursive: true, force: true }))
-  return dir
-}
+export const latencyDir = (prefix: string): string => latencyDirWith(SYSTEM, LATENCY_CACHE_DIR, prefix)
