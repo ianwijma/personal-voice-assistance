@@ -197,7 +197,9 @@ SQLite (`test/latency.test.ts`), a refresh writing 2,900 rows and removing 2,900
 thread at most 2.8 to 5.2 ms, and one of the largest answer a calendar may give (2,898 occurrences of the longest
 two-byte titles and places, about 2 MiB as counted) 2.4 to 3.0 ms; reading 3,000 lines of the longest kind (2.16 MiB
 as counted) 1.2 to 2.2 ms; in the test kit, the reviewer's 1 MiB file of 6,000 events 3.8 to 4.2 ms, a file of 5,001
-events 2.3 to 2.9 ms, the impossible rule 2.2 to 2.6 ms; the tests fail above 10 ms (30 ms on CI). The worker's own start-up
+events 2.3 to 2.9 ms, the impossible rule 2.2 to 2.6 ms; on a turn, over 2,900 half-hour events (200 a day) on SQLite, the agenda over 14 days 1.9 to 4.6 ms, "next" with words
+that are never found 1.2 to 2.4 ms, a search 1.7 to 4.0 ms, free time 1.0 to 1.7 ms (29.8 ms for the agenda without the
+yields between pages); the tests fail above 10 ms (30 ms on CI). The worker's own start-up
 (docs/MODULES.md §15) is paid on its thread, once per calendar per refresh.
 
 ## What it needs
