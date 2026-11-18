@@ -894,7 +894,7 @@ SchedulerEngine = SchedulerHook & { forCore(owner: CoreOwner): CoreScheduler; li
 - **Testing**: `makeTestScheduler` (`@pva/core/testing`) is the same engine on the in-memory store and the test clock;
   `@pva/core/scheduler-contract` runs the same suite on it and on SQLite.
 
-Adding a feature = one new file exporting `defineModule({...})` + one line in `moduleCatalog` in `apps/assistant/src/modules.ts`. Adding a provider = one new package implementing a core interface + one line in `apps/assistant/src/providers.ts`. Adding a voice provider = an adapter with `layerConfig` (`Tts`) and `makeVoices` (`TtsVoices`), and one entry in `ttsProviders`, `ttsProviderInfo` and (hosted) `hostedTtsVoices` in `providers.ts`. A voice needs no code: it is chosen by its key.
+Adding a feature = one new file exporting `defineModule({...})` + one line in `moduleCatalog` in `apps/assistant/src/modules.ts` (the module packages of docs/MODULES-PLAN.md §5.1 are already listed there, each by its package's `catalog`: their PRs touch only their package and `docs/modules/<id>.md`; docs/MODULES.md). Adding a provider = one new package implementing a core interface + one line in `apps/assistant/src/providers.ts`. Adding a voice provider = an adapter with `layerConfig` (`Tts`) and `makeVoices` (`TtsVoices`), and one entry in `ttsProviders`, `ttsProviderInfo` and (hosted) `hostedTtsVoices` in `providers.ts`. A voice needs no code: it is chosen by its key.
 
 ## Serve mode (web UI)
 
@@ -963,8 +963,19 @@ packages/
                     (key with the request headers, shared in-flight requests, refreshes ordered by the cache's sequence, TTL, ETag,
                     stale-if-error) and the outgoing `User-Agent` from the household API contact
                     (`HOME_API_CONTACT`); README in the package
-  modules-builtin/  first modules (defineModule): clock (context + tool), weather (Open-Meteo HTTP lookup, speculative-safe)
+  modules-builtin/  first modules (defineModule): clock (context + tool), weather (Open-Meteo HTTP lookup, speculative-safe);
+                    `index.ts` re-exports all of `clock.ts` and `weather.ts`, so their two extending module PRs never meet (P11)
   module-home-assistant/ lights by room through the owner's Home Assistant (REST, actions); in the app's catalog since WP-12c
+  module-contracts/ `@pva/module-contracts` (P11): the service and contribution keys modules share (`Lists`, `Timers`,
+                    `HomeAssistant`, `Playback`, `Mcp`, `CalendarProviders`, `BriefingSections`), each interface documented in its
+                    file; `useService` (a missing or stopping provider as `ProviderOff`); `defineTexts` / `say` / `homeLanguage`
+                    (spoken texts in English and Dutch); `StoredText` (bounded stored text); `/fakes`: an in-memory fake of each
+                    contract; `test/kit/`: the reference module of docs/MODULES.md
+  module-<id>/      one package per module of docs/MODULES-PLAN.md §5.1 waves A and B (P11 scaffold: off by default, no tools
+                    yet): assistant-controls, timers (timers, alarms), core-tools (calculator, knowledge, system-status),
+                    web-search, lists, notifications, kitchen, music, reminders, images, calendar, memory, broadcast, briefing,
+                    local-info (bin-day), presence, news, routines, mcp; each exports `catalog`, which `apps/assistant/src/modules.ts`
+                    lists once; how to write one: docs/MODULES.md, each module's page: docs/modules/<id>.md
 models/             downloaded model files (git-ignored; `pnpm download-models`, or Settings › Models in the web UI)
 apps/
   assistant/        config (env view with origins, `.env`; cliSettings.ts: CLI modes on the saved settings), providers.ts (one map per stage, chosen by `LLM_PROVIDER` / `STT_PROVIDER` /
@@ -983,4 +994,10 @@ apps/
 - `core` is tested entirely with the in-memory fakes from `@pva/core/testing` (scripted `Stt` events, scripted `Llm` events, a `Tts` that reads clauses eagerly, records when each arrived, and turns each into a marker chunk tagged with its clause index, a tone `Tts` at a chosen sample rate, a recording `AudioOutput`, a reporting `AudioOutput` that behaves like the browser, a scripted `AudioInput`) and `TestClock`.
 - Serve mode is tested with a scripted client (`apps/assistant/test/support/scriptedClient.ts`: a Node `ws` client that speaks the protocol and simulates the browser's player) against the real server with injected providers, plus one live test with the local models. Gotcha: `TestClock.adjust` waits only one scheduler hop before advancing, so let freshly forked fibers run first (see `advance` in `Conversation.test.ts`). The Conversation table above — speculation, promotion, discard, barge-in, tool loop — each has a test.
 - Adapters have unit tests for their protocol mapping against recorded/mock messages (a local mock WebSocket server), and an opt-in live test that runs only when the provider's API key is set.
+- Modules are tested with the module test kit (`@pva/core/testing`, P11; docs/MODULES.md §16): `startTestModule` runs one
+  definition in the real module host with serve mode's gateway checks, the real scheduler engine on the in-memory store,
+  the core's `People` / `Privacy` / `Devices` rules over a test household, stand-ins for the modules it uses (`provide`,
+  with the fakes of `@pva/module-contracts/fakes`) and in-memory route tokens, and runs its tools, actions, jobs and
+  routes as a given turn; `makeOfflineNet` gives `@pva/net` a resolver and connector that serve fixtures; `checkModule`
+  is the conformance check every module's test calls (`ModuleCheck.ts` lists its rules).
 - `pnpm check` (typecheck all), `pnpm test` (all unit tests) must pass before any change is considered done.

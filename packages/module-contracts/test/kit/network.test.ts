@@ -1,0 +1,76 @@
+// The network in a module and in its test (docs/MODULES.md, "The network"): `@pva/net` with the test kit's network that
+// has no network, so no test reaches the internet. The `#region` blocks are quoted in docs/MODULES.md.
+import { assert, describe, it } from "@effect/vitest"
+import type { HostView } from "@pva/core"
+import { makeOfflineNet } from "@pva/core/testing"
+import { type Connector, contentTypes, fetchOwnerConfiguredLan, makeCachedJson, type Resolver, safeFetch, userAgent } from "@pva/net"
+import { Effect } from "effect"
+
+// #region net-module
+/** What a module that fetches takes from its tests: the resolver and connector (absent: the real ones). */
+export interface NetDeps {
+  readonly resolver?: Resolver
+  readonly connector?: Connector
+}
+
+/** The User-Agent: the product token, and the owner's contact only when the owner set one (Home › API contact). */
+const agentOf = (view: Pick<HostView, "home">) => {
+  const contact = view.home.HOME_API_CONTACT
+  return userAgent(typeof contact === "string" && contact.trim() !== "" ? contact : undefined)
+}
+
+/** A public API: `safeFetch` with the response type it accepts, a size and a time limit. */
+export const fetchForecast = (deps: NetDeps, view: Pick<HostView, "home">, place: string) =>
+  safeFetch(`https://api.example.org/forecast?place=${encodeURIComponent(place)}`, {
+    accept: contentTypes.json,
+    maxBytes: 64 * 1024,
+    timeoutMs: 3_000,
+    headers: { "user-agent": agentOf(view) },
+    ...deps
+  }).pipe(Effect.map((response) => JSON.parse(response.text()) as { readonly rain: boolean }))
+
+/** An address the owner typed into the module's settings (a LAN SearXNG): the separate, explicit function. */
+export const searchOwnServer = (deps: NetDeps, baseUrl: string, query: string) =>
+  fetchOwnerConfiguredLan(`${baseUrl}/search?format=json&q=${encodeURIComponent(query)}`, { accept: contentTypes.json, timeoutMs: 3_000, ...deps })
+// #endregion net-module
+
+describe("the network in a module's test", () => {
+  // #region net-test
+  it.effect("serves fixtures, fails every other host, and keeps the owner's LAN for the LAN function", () =>
+    Effect.gen(function*() {
+      const net = makeOfflineNet(
+        { "https://api.example.org/forecast": { body: { rain: true } }, "http://searx.lan/search": { body: { results: [] } } },
+        { lan: { "searx.lan": "192.168.1.5" } }
+      )
+      const deps = { resolver: net.resolver, connector: net.connector }
+      assert.deepStrictEqual(yield* fetchForecast(deps, { home: {} }, "Utrecht"), { rain: true })
+      assert.strictEqual(net.requests[0]?.headers["user-agent"], "personal-voice-assistance/1")
+      // Any other host is a lookup failure, as when the internet is not there.
+      const elsewhere = yield* Effect.flip(safeFetch("https://elsewhere.example.com/", { accept: contentTypes.json, ...deps }))
+      assert.strictEqual(elsewhere._tag, "NetFailure")
+      // A LAN address: refused to safeFetch (a model's URL), allowed for the owner's own server.
+      const refused = yield* Effect.flip(safeFetch("http://searx.lan/search", { accept: contentTypes.json, ...deps }))
+      assert.strictEqual(refused._tag, "NetRefused")
+      const own = yield* searchOwnServer(deps, "http://searx.lan", "bins")
+      assert.strictEqual(own.status, 200)
+    }))
+  // #endregion net-test
+
+  it.effect("the contact goes into the User-Agent only when the owner set one", () =>
+    Effect.gen(function*() {
+      const net = makeOfflineNet({ "https://api.example.org/forecast": { body: { rain: false } } })
+      yield* fetchForecast(net, { home: { HOME_API_CONTACT: "owner@example.org" } }, "Utrecht")
+      assert.strictEqual(net.requests[0]?.headers["user-agent"], "personal-voice-assistance/1 (owner@example.org)")
+    }))
+
+  it.effect("the cached JSON helper asks once within its time to live", () =>
+    Effect.gen(function*() {
+      const net = makeOfflineNet({ "https://api.example.org/forecast": { body: { rain: true }, headers: { etag: '"v1"' } } })
+      let now = 0
+      const cached = makeCachedJson({ now: () => now, fetch: (url, options) => safeFetch(url, { ...options, resolver: net.resolver, connector: net.connector }) })
+      const first = yield* cached.getJson("https://api.example.org/forecast", { ttlMs: 60_000 })
+      now += 1_000
+      const second = yield* cached.getJson("https://api.example.org/forecast", { ttlMs: 60_000 })
+      assert.deepStrictEqual([first.source, second.source, net.requests.length], ["network", "cache", 1])
+    }))
+})
