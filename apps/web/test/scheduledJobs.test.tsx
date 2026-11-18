@@ -1,6 +1,6 @@
 import { act, fireEvent, render, screen, within } from "@testing-library/react"
 import { describe, expect, it, vi } from "vitest"
-import { MAX_SCHEDULED_JOBS_PAGE } from "@pva/protocol"
+import { MAX_SCHEDULED_JOBS_PAGE, type ScheduledJob } from "@pva/protocol"
 import { ScheduledJobsPage } from "@/components/settings/pages/ScheduledJobsPage.tsx"
 import type { VoiceApi } from "@/lib/voiceCatalog.ts"
 import { ApiError } from "@/lib/voiceCatalog.ts"
@@ -42,6 +42,42 @@ const heldApi = (inner: VoiceApi) => {
 }
 
 const clock = () => Date.parse("2026-11-18T12:00:00Z")
+
+/** A job of the fixed pages below, live or finished. */
+const jobOf = (id: string, state: ScheduledJob["state"] = "scheduled"): ScheduledJob => ({
+  id,
+  module: "timers",
+  moduleName: "Timers",
+  handler: "ring",
+  key: id,
+  state,
+  dueAt: clock() + 60_000,
+  late: "run",
+  origin: {},
+  attempt: state === "scheduled" ? 0 : 1,
+  orphaned: false,
+  createdAt: clock() - 60_000,
+  updatedAt: clock() - 60_000,
+  ...(state === "scheduled" || state === "running" ? {} : { finishedAt: clock() - 30_000 })
+})
+
+/**
+ * An API over fixed pages: the first page without a cursor, page k for the cursor `page<k>` (each page but the last
+ * gives the next one's); a cancel succeeds and changes nothing. The requests are recorded.
+ */
+const pagesApi = (pages: ReadonlyArray<ReadonlyArray<ScheduledJob>>, calls: Array<string> = []): VoiceApi => ({
+  request: async (path) => {
+    calls.push(path)
+    if (path.endsWith("/cancel")) return new Response(JSON.stringify({ cancelled: true }), { status: 200 })
+    const k = path === "scheduler/jobs" ? 0 : Number(/cursor=page(\d+)$/.exec(path)?.[1] ?? NaN)
+    const jobs = pages[k]
+    if (jobs === undefined) throw new ApiError(400, "invalid", "That page of the list is no longer known")
+    return new Response(JSON.stringify({ jobs, available: true, ...(k + 1 < pages.length ? { next: `page${k + 1}` } : {}) }), { status: 200 })
+  }
+})
+/** Four pages of distinct jobs: `p<page>-<n>`, five each. */
+const fourPages = Array.from({ length: 4 }, (_, p) => Array.from({ length: 5 }, (_, n) => jobOf(`p${p}-${n}`)))
+const shownIds = () => screen.getAllByTestId("scheduled-job").map((r) => r.querySelector("span.font-medium")?.textContent)
 const flush = () => act(async () => void (await new Promise((r) => setTimeout(r, 0))))
 
 describe("the scheduled jobs page", () => {
@@ -147,6 +183,66 @@ describe("the scheduled jobs page", () => {
     })
   }
 
+  for (const how of ["Refresh", "the reload after a cancel"] as const) {
+    it(`a Load more pressed while ${how} reads the first page is refused (from three loaded pages, answers in reverse order)`, async () => {
+      vi.spyOn(window, "confirm").mockReturnValue(true)
+      const calls: Array<string> = []
+      const { api, held } = heldApi(pagesApi(fourPages, calls))
+      await act(async () => void render(<ScheduledJobsPage api={api} />))
+      held.shift()!.release()
+      await flush()
+      for (let i = 0; i < 2; i++) {
+        await act(async () => fireEvent.click(screen.getByTestId("scheduled-more")))
+        held.shift()!.release()
+        await flush()
+      }
+      expect(shownIds()).toEqual(fourPages.slice(0, 3).flat().map((j) => j.id))
+      if (how === "Refresh") {
+        // Refresh and Load more in one go, before React renders again: the old reading's cursor is already unusable.
+        await act(async () => {
+          fireEvent.click(screen.getByText("Refresh"))
+          fireEvent.click(screen.getByTestId("scheduled-more"))
+        })
+      } else {
+        const first = screen.getAllByTestId("scheduled-job")[0]!
+        await act(async () => fireEvent.click(within(first).getByTestId("scheduled-cancel")))
+        held.shift()!.release()
+        await flush()
+        // The reload is on its way: Load more is pressed now.
+        await act(async () => fireEvent.click(screen.getByTestId("scheduled-more")))
+      }
+      // Only the reload was asked for; no continuation of the old reading.
+      expect(held.map((h) => h.path)).toEqual(["scheduler/jobs"])
+      // Answers in reverse order: the reload's first; anything after it would be the old reading's.
+      held.shift()!.release()
+      await flush()
+      for (const h of held.splice(0)) h.release()
+      await flush()
+      expect(shownIds()).toEqual(fourPages[0]!.map((j) => j.id))
+      expect(calls.filter((c) => c.includes("cursor=page3"))).toEqual([])
+      // Load more now goes on from the new first page.
+      await act(async () => fireEvent.click(screen.getByTestId("scheduled-more")))
+      expect(held.map((h) => h.path)).toEqual(["scheduler/jobs?cursor=page1"])
+      held.shift()!.release()
+      await flush()
+      expect(shownIds()).toEqual(fourPages.slice(0, 2).flat().map((j) => j.id))
+    })
+  }
+
+  it("a job that comes twice within one answer is shown once, as it came first: on the first page and on a continuation", async () => {
+    // A job read live, then (it finished meanwhile) again among the finished ones of the same answer.
+    const pages = [
+      [jobOf("a"), jobOf("twice"), jobOf("b"), jobOf("twice", "cancelled")],
+      [jobOf("c"), jobOf("again"), jobOf("again", "done"), jobOf("twice", "done"), jobOf("d")]
+    ]
+    await act(async () => void render(<ScheduledJobsPage api={pagesApi(pages)} />))
+    expect(shownIds()).toEqual(["a", "twice", "b"])
+    expect(screen.getAllByTestId("scheduled-job")[1]).toHaveAttribute("data-state", "scheduled")
+    await act(async () => fireEvent.click(screen.getByTestId("scheduled-more")))
+    expect(shownIds()).toEqual(["a", "twice", "b", "c", "again", "d"])
+    expect(screen.getAllByTestId("scheduled-job")[4]).toHaveAttribute("data-state", "scheduled")
+  })
+
   it("the mock answers like the server: pages with next, 400 for an unknown cursor or limit, and cancel only for a live or failed job", () => {
     const mock = createScheduledJobsMock(() => 0)
     const first = mock.list()
@@ -164,6 +260,8 @@ describe("the scheduled jobs page", () => {
       return ["no error"]
     }
     expect(refused(() => mock.list("live.zz"))).toEqual([400, "invalid"])
+    // An explicitly empty cursor (`?cursor=`) is not the first page: 400, as the server's route answers.
+    expect(refused(() => mock.list(""))).toEqual([400, "invalid"])
     expect(refused(() => mock.list(undefined, MAX_SCHEDULED_JOBS_PAGE + 1))).toEqual([400, "invalid"])
     expect(refused(() => mock.list(undefined, 0))).toEqual([400, "invalid"])
     // A token of another mock (a restart) is unknown here.

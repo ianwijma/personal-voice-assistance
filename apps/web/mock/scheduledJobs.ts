@@ -60,7 +60,9 @@ export const createScheduledJobsMock = (now: () => number = Date.now) => {
       if (!Number.isInteger(limit) || limit < 1 || limit > MAX_SCHEDULED_JOBS_PAGE) throw new MockSchedulerError(400, "invalid", `limit must be 1 to ${MAX_SCHEDULED_JOBS_PAGE}`)
       let phase: "live" | "finished" = "live"
       let after: { readonly at: number; readonly id: string } | undefined
-      if (cursor !== undefined && cursor !== "") {
+      // As the server's route: an explicitly empty cursor (`?cursor=`) is not a page of the list.
+      if (cursor === "") throw new MockSchedulerError(400, "invalid", "That is not a page of the list")
+      if (cursor !== undefined) {
         if (cursor === "finished") phase = "finished"
         else {
           const known = cursors.get(cursor)

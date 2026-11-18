@@ -14,9 +14,11 @@ import { Button, cx, ToneDot } from "../../ui/controls.tsx"
  * job (a running handler is not interrupted: what it then reports is ignored); on a failed one it dismisses it and
  * its Health issue. Payloads are never shown.
  *
- * Refresh (and the reload after a cancel) starts a new generation of the list: an answer to a read of an older
- * generation (a "Load more" still on its way) is dropped, so pages of two readings are never joined. The list is not a
- * snapshot: a job that changed between two pages can be missing or shown once in its older state; Refresh reads again.
+ * Refresh (and the reload after a cancel) starts a new reading of the list at once (in refs, before React renders): the
+ * old reading's cursor is unusable from then on, "Load more" does nothing until the new first page has arrived, and an
+ * answer to a read of an older reading (a "Load more" still on its way) is dropped, so pages of two readings are never
+ * joined. The list is not a snapshot: a job that changed between two reads can be missing, or come twice (even within
+ * one answer); every answer is checked against the jobs of its reading, and the first occurrence is kept.
  */
 
 const STATE: Readonly<Record<ScheduledJob["state"], { readonly label: string; readonly tone: "ok" | "warning" | "error" | "neutral" }>> = {
@@ -55,8 +57,19 @@ export function ScheduledJobsPage({ api: given }: { readonly api?: VoiceApi } = 
   const [busy, setBusy] = useState<string | undefined>(undefined)
   const [loadingMore, setLoadingMore] = useState(false)
   const [now, setNow] = useState(() => Date.now())
-  /** The generation of the list: every first-page read starts a new one; answers of older ones are dropped. */
+  /** The reading of the list: every first-page read starts a new one; answers of older ones are dropped. */
   const generation = useRef(0)
+  /** The cursor "Load more" may use, with the reading that produced it (none while a first page or a page is read). */
+  const cursor = useRef<{ readonly generation: number; readonly next: string } | undefined>(undefined)
+  /** The ids of the jobs shown for the current reading: a job that comes again is left out. */
+  const seen = useRef(new Set<string>())
+  /** `jobs` without those already in `ids` (and without a second occurrence within it); `ids` takes the ones kept. */
+  const fresh = (jobs: ReadonlyArray<ScheduledJob>, ids: Set<string>) =>
+    jobs.filter((j) => {
+      if (ids.has(j.id)) return false
+      ids.add(j.id)
+      return true
+    })
 
   /**
    * The first page again (after a cancel, on Refresh): what was loaded beyond it is read again on request. True when
@@ -64,10 +77,14 @@ export function ScheduledJobsPage({ api: given }: { readonly api?: VoiceApi } = 
    */
   const load = async (): Promise<boolean> => {
     const mine = ++generation.current
+    cursor.current = undefined
     try {
       const body = decode(await (await api.request("scheduler/jobs")).json())
       if (mine !== generation.current) return false
-      setJobs(body.jobs)
+      const ids = new Set<string>()
+      seen.current = ids
+      setJobs(fresh(body.jobs, ids))
+      cursor.current = body.next === undefined ? undefined : { generation: mine, next: body.next }
       setNext(body.next)
       setAvailable(body.available)
       setProblem(undefined)
@@ -83,22 +100,26 @@ export function ScheduledJobsPage({ api: given }: { readonly api?: VoiceApi } = 
   }, [])
 
   const loadMore = async () => {
-    if (next === undefined) return
-    const mine = generation.current
+    // Only the current reading's cursor, once: none while its first page (or another page) is being read.
+    const from = cursor.current
+    if (from === undefined || from.generation !== generation.current) return
+    cursor.current = undefined
+    const mine = from.generation
     setLoadingMore(true)
     try {
-      const body = decode(await (await api.request(`scheduler/jobs?cursor=${encodeURIComponent(next)}`)).json())
+      const body = decode(await (await api.request(`scheduler/jobs?cursor=${encodeURIComponent(from.next)}`)).json())
       // Refresh (or a cancel) started another reading meanwhile: this page belongs to the old one.
       if (mine !== generation.current) return
-      // A job that moved between pages (it finished meanwhile) is shown once.
-      setJobs((old) => {
-        const seen = new Set((old ?? []).map((j) => j.id))
-        return [...(old ?? []), ...body.jobs.filter((j) => !seen.has(j.id))]
-      })
+      // A job that moved between reads (it finished meanwhile) is shown once, where it came first.
+      const added = fresh(body.jobs, seen.current)
+      setJobs((old) => [...(old ?? []), ...added])
+      cursor.current = body.next === undefined ? undefined : { generation: mine, next: body.next }
       setNext(body.next)
       setProblem(undefined)
     } catch (e) {
       if (mine !== generation.current) return
+      // The same page may be asked for again (unless the server forgot it: then the list is read from the top).
+      cursor.current = from
       // The server no longer knows the page (it keeps a few hundred, and none from before a restart): start again from
       // the top, and say so only when that worked (a failed reload says why itself).
       if (e instanceof ApiError && e.status === 400) {
