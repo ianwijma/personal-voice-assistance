@@ -179,6 +179,35 @@ describe("the mock, through its handlers, as the server", { timeout: 30_000 }, (
   })
 
   // Review round 3 (p5-r3b finding 6): a dropped session's delayed work never reaches its successor on the device.
+  it("P9 notifications as the server: a ring reaches its device and again after a hello; stop resolves it everywhere; an action whose handler is down answers I can't do that right now", async () => {
+    const http = url.replace(/^ws/, "http").replace(/\/ws$/, "")
+    const one = await Peer.open({ device: { id: "d-mock-notify01", kind: "web-voice", name: "One" } })
+    const two = await Peer.open({ device: { id: "d-mock-notify02", kind: "web-voice", name: "Two" } })
+    const post = (path: string, body: unknown) => fetch(`${http}${path}`, { method: "POST", body: JSON.stringify(body) }).then((r) => r.json() as Promise<{ id?: string }>)
+    const mine = await post("/mock/notify", { title: "Pasta", ring: true, deviceId: "d-mock-notify01", actions: [{ id: "snooze", label: "Snooze" }], handlerDown: true })
+    const all = await post("/mock/notify", { title: "Everyone", ring: true })
+    await one.waitFor("notification.ring", (m) => m.notification.id === mine.id)
+    await two.waitFor("notification.ring", (m) => m.notification.id === all.id)
+    expect(two.messages.some((m) => m.type === "notification.ring" && m.notification.id === mine.id)).toBe(false)
+    // A page that says hello while they are open gets them again.
+    const again = await Peer.open({ device: { id: "d-mock-notify01", kind: "web-voice", name: "One" } })
+    await again.waitFor("notification.ring", (m) => m.notification.id === mine.id)
+    await again.waitFor("notification.ring", (m) => m.notification.id === all.id)
+    // The handler is down: changed nothing; from another device: refused; stop always works, everywhere it rang.
+    const down = await one.request({ type: "notification.action", id: mine.id, actionId: "snooze" })
+    expect([down.ok, down.error?.code, down.say]).toEqual([false, "not_running", "I can't do that right now."])
+    expect((await two.request({ type: "notification.action", id: mine.id, actionId: "stop" })).ok).toBe(false)
+    const from = two.messages.length
+    const stop = await one.request({ type: "notification.action", id: all.id, actionId: "stop" })
+    expect([stop.ok, stop.say]).toEqual([true, "Done."])
+    await two.waitFor("notification.resolved", (m) => m.id === all.id, from)
+    await again.waitFor("notification.resolved", (m) => m.id === all.id)
+    // An admin page cannot press.
+    const a = await admin()
+    expect((await a.request({ type: "notification.action", id: mine.id, actionId: "stop" })).error?.code).toBe("bad_message")
+    for (const p of [one, two, again, a]) p.ws.close()
+  })
+
   it("a privacy change while the scripted turn is being heard: the reconnected page gets nothing of the old session", async () => {
     const a = await admin()
     const id = "d-mock-pending01"

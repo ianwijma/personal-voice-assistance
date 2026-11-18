@@ -292,7 +292,8 @@ defineModule({
 })
 SharedContext<A>      = { settings: Partial<A> /* no overridable fields */; settingsFor(assistantId?): A | undefined } & ModuleServicesV2
 ModuleContextV2<A, X> = ModuleContext<A> & ModuleServicesV2 & { shared: X }
-ModuleServicesV2      = { host: ModuleHostApi; store: ModuleStore; events: ModuleEvents; scheduler: ModuleScheduler }   // later PRs add speech, notify, present, connections
+ModuleServicesV2      = { host: ModuleHostApi; store: ModuleStore; events: ModuleEvents; scheduler: ModuleScheduler;
+                          notify: ModuleNotify; speech: ModuleSpeech }   // P9; later PRs add present, connections
 SharedPart<X>         = { value: X; services?: [ServiceKey<T>.of(impl)]; contributions?: [ContributionKey<T>.of(value)];
                           routes?: ReadonlyArray<ModuleRoute> }   // P3: HTTP routes under /api/modules/<id>/ (ModuleRoutes.ts)
 ModuleHostApi = {
@@ -322,7 +323,8 @@ CurrentPrincipal: Context.Reference<Principal | undefined>       // the admitted
   (`apps/assistant/src/modules.ts`, `CliModules`).
 - **The execution gateway** (`packages/core/src/Gateway.ts`) is the one way to `Tool.execute` and `ActionDefinition.run`:
   `ToolRegistry.run` (core's tool loop, the Claude Code bridge), `ToolRegistry.runAction` (the intent agent) and
-  `host.actions.run`; later phrase commands, taps, routine steps and notification actions. Every tool and action the
+  `host.actions.run`; later phrase commands, taps and routine steps (a notification's action handler, P9, is admitted
+  by `ExecutionGateway.principal` with the notification principal, as a job's handler is). Every tool and action the
   host publishes is **sealed**: its own `execute`/`run` only refuses, and the real one (inside the host's in-flight
   tracking) is reachable only from the gateway (`GatewayPrivate.ts`, not exported from the package); a generated
   action tool's `execute` refuses too. Sealing stops **accidental** direct calls; it is not a security boundary against
@@ -900,6 +902,69 @@ SchedulerEngine = SchedulerHook & { forCore(owner: CoreOwner): CoreScheduler; li
   of at most a few single-row writes (measured in docs/SCHEDULING.md "Latency").
 - **Testing**: `makeTestScheduler` (`@pva/core/testing`) is the same engine on the in-memory store and the test clock;
   `@pva/core/scheduler-contract` runs the same suite on it and on SQLite.
+
+### Notifications, speech outside a reply, ringing (docs/MODULES-PLAN.md §4 P9, first version; how to use it: [docs/NOTIFICATIONS.md](NOTIFICATIONS.md))
+
+```ts
+ModuleNotify (ctx.notify) = {
+  send(NotifyRequest): Effect<{ notification: Notification; deduped: boolean }, NotifyError>
+  resolve(id | { key }, outcome? = "resolved"): Effect<boolean, NotifyError>
+  list({ after?, limit? ≤ MAX_NOTIFY_PAGE (12) }?): Effect<ReadonlyArray<Notification>, NotifyError>   // the module's live ones
+  handle(name, { run(ActionPress): Effect<ActionAnswer | void, unknown> }): Effect<void, NotifyError>    // in shared: a registration
+  dnd: { get: Effect<DndState, NotifyError>; set({ until? }?): Effect<DndState, NotifyError>; clear: Effect<DndState, NotifyError> }
+}
+NotifyRequest = { title (one line ≤ 60); text? (≤ 200); priority?: "normal" | "ring"; owner?: PersonId; target?: "origin" | "everywhere";
+                  key? ([A-Za-z0-9_.:@/-]{1,64}); expiresInMs?; actions?: [{ id, label }] (≤ 2, beside stop); handler?; at? | inMs? (≤ 7 days) }
+Notification  = { id, module, state: "scheduled" | "open" | "resolved", key?, title, text?, priority, owner?, target, deviceId?, actions,
+                  handler?, sentAt, expiresAt, outcome?, resolvedAt?, resolvedBy? }
+ActionPress   = { notificationId, actionId, key?, deviceId }        ActionAnswer = { say? (≤ 300 at the page boundary); keepOpen? }
+DndState      = { on: boolean; until? }
+NotifyError   = { reason: "unavailable" | "invalid" | "limit" | "busy" | "failed", message }
+ModuleSpeech (ctx.speech) = { say(SpeechTarget, text (≤ 300), { cue?, owner? }?): Effect<SpeechHandle, SpeechError> }
+SpeechTarget  = { device } | { room } | "everywhere"
+SpeechHandle  = { id; deliveries: [{ deviceId, queued, why? }]; done: Effect<[{ deviceId, outcome: "spoken" | "stopped" | "skipped" | "failed", why? }], SpeechError>; stop: Effect<void> }
+SpeechError   = { reason: "unavailable" | "invalid" | "no-device" | "in-turn", message }
+decideDelivery(DeliveryInput): Delivery     // THE decision: { kind, priority, personal, mayReveal, dnd, device: { connected, canSpeak, canShow } }
+Delivery      = { deliver: false; why: "offline" | "private" | "cannot-show" | "cannot-speak" | "dnd" } | { deliver: true; show; sound }
+NotifyHook (ModuleHostOptions.notify) = { forPart(part: PartHandle, runner: PartRunner): { notify; speech } }
+NotifyEngine  = NotifyHook & { connected(deviceId, send?); disconnected(deviceId); press(PressRequest): Effect<PressAnswer>;
+                               ringingOn(deviceId): RingingNotification[]; stopRinging(deviceId): Effect<number>; stopSpeech(deviceId): Effect<boolean>;
+                               onRingingChanged(listener): () => void; dnd(): DndState; settled }
+makeNotifyEngine({ store, scheduler, devices, connected, canSpeak, canShow, privacy, outlet: () => NotifyOutlet?, speech: () => SpeechPort?,
+                   gateway, pageText, language, log?, newId?, onDecision?, observe? }): Effect<NotifyEngine, never, Scope>
+NotifyOutlet  = { send(deviceId, NotifyMessage) }                   // serve mode: every voice connection of the device
+SpeechPort    = { quiet(deviceId): Effect<void>; play(deviceId, text, { cue }): Effect<void, unknown> }   // serve mode: VoiceSession.announce
+// protocol (additive within 11): notification.ring { notification: NotificationCard } and notification.resolved { id, outcome? } (server → a
+// device's voice pages), notification.action { requestId, id, actionId } (page → server), answered by result { say? }
+```
+
+- **Where**: `Notify.ts` (the contract, the bounds, the collections, `decideDelivery`), `NotifyEngine.ts` (the engine),
+  `NotifyTexts.ts` (what the service says and shows itself, English and Dutch; the announcement chime),
+  `notifyContract.ts` (`@pva/core/notify-contract`, the contract suite). The collections `notifications` (`maxChars`
+  2,000: 12 rows a list; indexes `dedupe`, `[liveModule, sentAt]`, `[state, sentAt]`, `[state, finishedAt]`),
+  `notify_counts` (the live counters, `total` and `m:<module>`) and `notify_dnd` belong to the core owner `core.notify`
+  (`notifyStorage`), prepared with the scheduler's in serve mode, the CLI modes, `makeTestHousehold` and the test kit.
+- **Serve mode** makes the engine after the scheduler and before the module host (`serveMode.ts`), on the household
+  store, with the device facts (`Devices.list`, `speakerAllowed`, the privacy rule), and binds the hub (pages), the
+  voice sessions (speech), the gateway and the page boundary once they exist. The hub calls `connected` after a voice
+  connection's welcome (that connection gets what is open for its device), `disconnected` when a device's last
+  connection closes, and answers `notification.action` with `press`. The CLI modes have none: `notify.handle` succeeds,
+  every other call fails `unavailable` (`closedModuleNotify`).
+- **Turn path**: only `send` (one synchronous transaction: the dedupe read, two counter rows, the row, its expiry job;
+  and an enqueue), `resolve` and `say` (decisions and an enqueue). Delivery to pages runs in the engine's one fiber, a
+  page of 12 rows at a time with a yield between; announcements in one fiber per device. Measured: docs/NOTIFICATIONS.md
+  "Latency".
+- **Jobs**: the core handlers `deliver`, `expire`, `dnd-end` and `retention` of `core.notify` (`SchedulerEngine.forCore`),
+  each job with no origin; a job's principal is admitted like a module's.
+- **Actions**: `notify.handle` stages a `notify-action-handler` registration through `part.register`, published and
+  withdrawn with the module; a press runs the handler through `PartRunner.inFlight` with the notification principal
+  (`asPrincipal`), admitted by `ExecutionGateway.principal` first (serve mode's `principalProblem`: the device is known,
+  the connection is the device's), within 5 s. `stop` is the host's (`STOP_ACTION`) and resolves without module code.
+- **Speech**: `VoiceSession.announce` waits until no play holds the session's output lease, no turn is in flight and the
+  state is not hearing, then synthesises the line with the answering assistant's `TurnSetup.tts` (the clause chunker,
+  the reply's synthesis) and plays it through `lease.output("@announcement")`; a reply that starts supersedes it.
+- **P7 seams**: `ringingOn`, `onRingingChanged`, `stopRinging`, `stopSpeech`, `press`. **P10**: the card is drawn by
+  `apps/web/src/components/NotificationCards.tsx`, outside the character; the ring cue loop is `apps/web/src/lib/audio/ringLoop.ts`.
 
 Adding a feature = one new file exporting `defineModule({...})` + one line in `moduleCatalog` in `apps/assistant/src/modules.ts` (the module packages of docs/MODULES-PLAN.md §5.1 are already listed there, each by its package's `catalog`: their PRs touch only their package and `docs/modules/<id>.md`; docs/MODULES.md). Adding a provider = one new package implementing a core interface + one line in `apps/assistant/src/providers.ts`. Adding a voice provider = an adapter with `layerConfig` (`Tts`) and `makeVoices` (`TtsVoices`), and one entry in `ttsProviders`, `ttsProviderInfo` and (hosted) `hostedTtsVoices` in `providers.ts`. A voice needs no code: it is chosen by its key.
 

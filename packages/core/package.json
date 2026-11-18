@@ -9,7 +9,8 @@
     "./download": "./src/download.ts",
     "./store-backend": "./src/StoreEngine.ts",
     "./store-contract": "./src/storeContract.ts",
-    "./scheduler-contract": "./src/schedulerContract.ts"
+    "./scheduler-contract": "./src/schedulerContract.ts",
+    "./notify-contract": "./src/notifyContract.ts"
   },
   "scripts": {
     "check": "tsc -p tsconfig.json",

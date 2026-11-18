@@ -5,12 +5,13 @@ for their module and their module's research document (`docs/research/modules/<n
 what a module is, the rules the preparation stack (P1 to P6) settled, and how to test a module so that it keeps them.
 Where this page and a research document disagree, the plan and this page win.
 
-> **Wave A: what does not exist yet.** You are writing on the scaffold (P11), before P7 to P10. **Phrase commands,
-> presentations (a checklist, a card, the timer view), notifications (ringing, delivery, notification actions) and a
-> module's own speech (`ctx.speech`, `ctx.present`) do not exist.** Where your row in the plan's §5.1 names one of them,
-> that part waits for wave B: build the rest, and list the part under "Left out" on your page and in your pull request.
-> Also later, for everyone: connections and OAuth, CalDAV, an MCP client, and any outgoing HTTP but `GET` and `HEAD`
-> (§12). The plan's "Order from here" (§4) has the waves.
+> **Wave A: what does not exist yet.** You are writing on the scaffold (P11), before P7 and P10. **Phrase commands and
+> presentations (a checklist, a card, the timer view, `ctx.present`) do not exist.** Notifications, ringing and a
+> module's own speech (`ctx.notify`, `ctx.speech`) exist in a first version since P9 (§16, [NOTIFICATIONS.md](NOTIFICATIONS.md)).
+> Where your row in the plan's §5.1 names a phrase command or a presentation, that part waits for wave B: build the
+> rest, and list the part under "Left out" on your page and in your pull request. Also later, for everyone: connections
+> and OAuth, CalDAV, an MCP client, and any outgoing HTTP but `GET` and `HEAD` (§12). The plan's "Order from here" (§4)
+> has the waves.
 
 The deeper references, only when this page is not enough: [ARCHITECTURE.md](ARCHITECTURE.md) (the host, the gateway,
 the store, the scheduler, people), [UI-AND-MODULES.md](UI-AND-MODULES.md) §1.10–§1.11 (API v2, settings fields,
@@ -595,7 +596,7 @@ export const nagModule = defineModule({
 - The Home section's `HOME_TIME_ZONE` is empty by default, meaning this machine's zone
   (`Intl.DateTimeFormat().resolvedOptions().timeZone`); never substitute a fixed zone for it.
 - No pause and resume (cancel and schedule again), no background tasks (a fiber in your own scope), no notification
-  jobs (P9's service has its own). `cancel`, `reschedule`, `get` and `list` (your live jobs, 10 a page, `after`).
+  jobs (send a notification later with `ctx.notify.send({ inMs })`: P9's service has its own job). `cancel`, `reschedule`, `get` and `list` (your live jobs, 10 a page, `after`).
 - **Cancelling, rescheduling or replacing a job does not interrupt a handler that is already running for it.**
   `cancel`, `reschedule` and scheduling the same `key` again change the job's row at once (`cancelled`, a new due
   time, the new job), and the scheduler drops what the running handler then reports, but the handler runs on to its
@@ -1302,6 +1303,114 @@ export const texts = defineTexts({
 })
 ```
 
+### Notifications and announcements (P9)
+
+What the house says or shows that nobody on that device just asked for goes through the notification service, never a
+module's own timer or socket ([NOTIFICATIONS.md](NOTIFICATIONS.md) has the calls, the bounds and the delivery table):
+
+- **`ctx.notify.send`**: a card on the device that asked (`target: "origin"`, the default) or everywhere, `normal`
+  (silent) or `ring` (it rings until stopped), with an optional owner (personal content: the privacy rule decides per
+  device, when it is delivered), dedupe `key`, expiry, up to two actions beside the host's `stop`, and `at` / `inMs` to
+  send it later (the service's own job: no timer of yours). One transaction and an enqueue: fine on a turn.
+- **Action handlers are registered in `shared`** with `ctx.notify.handle(name, { run })`, like job handlers. While your
+  module is down a press answers "I can't do that right now" and changes nothing; `stop` always works. A handler runs
+  as the press (its device is the origin of what it sends) and answers `{ say?, keepOpen? }`.
+- **`ctx.speech.say(target, text, { cue? })`**: one line on a device, a room's devices or everywhere, after whatever is
+  being said there. Inside a turn, never wait for its `done` (it fails `in-turn`); return the spoken answer as the
+  tool's result as before.
+- `ctx.notify.dnd` reads and sets do not disturb for the house. Nothing may send above `ring`.
+
+<!-- region: packages/module-contracts/test/kit/notifyExample.test.ts#notify-module -->
+```ts
+const kettleTexts = defineTexts({
+  en: { done: "The kettle has boiled", snooze: "Snooze", snoozed: "I'll remind you in five minutes.", started: "I'll tell you when it has boiled.", failed: "I couldn't set that reminder." },
+  nl: { done: "Het water kookt", snooze: "Later", snoozed: "Over vijf minuten zeg ik het nog eens.", started: "Ik zeg het als het water kookt.", failed: "Die herinnering kon ik niet zetten." }
+})
+
+export const kettleModule = defineModule({
+  apiVersion: 2,
+  id: "kettle",
+  name: "Kettle",
+  description: "Rings when the kettle has boiled.",
+  enabledByDefault: false,
+  shared: (ctx) =>
+    Effect.gen(function*() {
+      // An action handler is registered in `shared`, like a job handler: published and withdrawn with the module.
+      // While the module is down, its actions answer "I can't do that right now"; `stop` always works.
+      yield* ctx.notify.handle("kettle", {
+        run: (press) =>
+          Effect.gen(function*() {
+            const lang = homeLanguage(ctx.host.view())
+            // Runs as the press (its device is the origin). This one ends now, so its key is free for the next.
+            yield* ctx.notify.resolve(press.notificationId, "snooze")
+            yield* ctx.notify.send({
+              title: say(kettleTexts, lang, "done"),
+              priority: "ring",
+              key: "kettle",
+              inMs: 5 * 60_000,
+              actions: [{ id: "snooze", label: say(kettleTexts, lang, "snooze") }],
+              handler: "kettle"
+            })
+            return { say: say(kettleTexts, lang, "snoozed") }
+          }).pipe(Effect.orElseSucceed(() => ({ say: say(kettleTexts, homeLanguage(ctx.host.view()), "failed"), keepOpen: true })))
+      }).pipe(Effect.orDie)
+      return { value: undefined }
+    }),
+  start: (ctx) =>
+    Effect.succeed({
+      tools: [makeTool({
+        name: "kettle_watch",
+        description: "Ring on this device when the kettle has boiled (in about three minutes).",
+        parameters: Schema.Struct({}),
+        risk: "change",
+        execute: () =>
+          Effect.gen(function*() {
+            const lang = homeLanguage(ctx.host.view())
+            // One transaction and an enqueue: fine on a turn. Sent later by the service's own scheduler job.
+            yield* ctx.notify.send({
+              title: say(kettleTexts, lang, "done"),
+              priority: "ring",
+              key: "kettle",
+              inMs: 3 * 60_000,
+              actions: [{ id: "snooze", label: say(kettleTexts, lang, "snooze") }],
+              handler: "kettle"
+            })
+            // An announcement in the room, after whatever is being said there. Inside a turn, never wait for `done`.
+            yield* ctx.speech.say({ room: "Kitchen" }, say(kettleTexts, lang, "started"), { cue: true })
+            return { spoken: say(kettleTexts, lang, "started") }
+          }).pipe(
+            Effect.catchTag("NotifyError", () => Effect.succeed({ spoken: say(kettleTexts, homeLanguage(ctx.host.view()), "failed") })),
+            // No device in the kitchen, or none that may speak: the ring still comes.
+            Effect.catchTag("SpeechError", () => Effect.succeed({ spoken: say(kettleTexts, homeLanguage(ctx.host.view()), "started") }))
+          )
+      })]
+    })
+})
+```
+
+Its test, through the kit's `notify` handles (what was sent, where it would go and why not, pressing, what was announced):
+
+<!-- region: packages/module-contracts/test/kit/notifyExample.test.ts#notify-test -->
+```ts
+const kit = yield* startTestModule(kettleModule)
+yield* kit.tool("kettle_watch", {}, { device: "kitchen-display" })
+// The announcement went to the kitchen's device; nothing rings yet.
+yield* kit.advance(2_000)
+assert.deepStrictEqual(kit.notify.announced.map((a) => [a.deviceId, a.text]), [["kitchen-display", "I'll tell you when it has boiled."]])
+assert.deepStrictEqual(kit.notify.engine.ringingOn("kitchen-display"), [])
+// Three minutes later it rings there, with stop and snooze.
+yield* kit.advance(3 * 60_000)
+const [ringing] = kit.notify.engine.ringingOn("kitchen-display")
+assert.deepStrictEqual(ringing?.actions.map((a) => a.id), ["snooze"])
+// Snooze, as a press on the card: the module's handler answers, and it rings again five minutes later.
+assert.deepStrictEqual(yield* kit.notify.press(ringing!.id, "snooze", { device: "kitchen-display" }), { ok: true, say: "I'll remind you in five minutes." })
+assert.deepStrictEqual(kit.notify.engine.ringingOn("kitchen-display"), [])
+yield* kit.advance(5 * 60_000)
+assert.strictEqual(kit.notify.engine.ringingOn("kitchen-display").length, 1)
+// Why it went where it went: every decision is recorded.
+assert.isTrue(kit.notify.decisions.every((d) => d.deviceId === "kitchen-display" && d.decision.deliver))
+```
+
 **One line or stored text.** `StoredText(n)` bounds a stored text and keeps its JSON cost at 2 a character; it allows
 tab, line feed, carriage return, backspace and form feed. Where a value must be **one line** (a name, a list item, a
 route's field), check that separately: `isLine(text, n)` from `@pva/module-contracts`, the core's own one-line rule
@@ -1335,6 +1444,7 @@ values), `startAt`, `started`. It returns handles:
 | `stop`, `start`, `restart`, `configure(values, secrets?)` | switched off for every assistant, on again; one real restart of the module with its demand kept (the same host and store: not a restart of the server); a settings change as the owner saves it |
 | `info()`, `issues()`, `checkHealth`, `toolNames(as?)` | the admin page's view of it, its Health issues (health run now), the tools the turn's model is sent: as serve mode offers them, without the tools and action tools the assistant switched off and those the risk policy refuses |
 | `expectNoSecrets(...values)` | fails when the value of a secret given to the kit is in any string of the `values` you pass (tool results, action outcomes, spoken lines, **the rows your test read**), decoded: every key and string, and a string that is JSON parsed and walked too, so an escaped secret is found; it also looks at every event and the admin page. It reads no collection itself: pass it the rows your module wrote |
+| `notify` | P9: the real notification service: `all`, `messages` (what each page was sent), `decisions` (where it would go, and why not), `press(id, action, { device })`, `announced`, `replying(device, on)`, `connect` / `disconnect`, `dnd()`, `settle`, `engine` ([NOTIFICATIONS.md](NOTIFICATIONS.md) "Testing") |
 | `moduleStore()`, `store`, `events`, `people`, `schedulerUses` | the module's store, the household store, every event on the bus, the household's core services, what the kit saw of the scheduler |
 
 **Where the kit waits on your module's code** (the start, with every module of `others`; `stop`, `start`, `restart`,
@@ -1516,8 +1626,8 @@ check` behind the shared lock (`flock /workspace/build-cache/ian/pva-heavy.lock 
 - Its own package (§19) under `packages/module-<pkg>/` (source, tests, `package.json`).
 - **Its own pages, `docs/modules/<id>.md`** (one per module id), filled in under the stub's headings: what it does, its
   tools, settings, what it stores, what it needs, and what was left out. **In wave A, "Left out" lists every part of
-  the plan's row that needs a phrase command, a presentation, a notification or a module's speech (P7, P9, P10): they
-  do not exist yet, and come with wave B.** This replaces the plan's "own section in `docs/MODULES.md`", so twenty pull
+  the plan's row that needs a phrase command or a presentation (P7, P10): they do not exist yet, and come with wave
+  B.** Notifications and a module's speech exist since P9 (§16). This replaces the plan's "own section in `docs/MODULES.md`", so twenty pull
   requests never edit the same file.
 - `pnpm-lock.yaml`, only when it adds a dependency the scaffold did not foresee; the description names it.
 - **Nothing else.** The scaffold has created the package, registered it in the catalogue, added the dependencies of
