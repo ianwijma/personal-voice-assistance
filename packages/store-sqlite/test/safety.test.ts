@@ -290,7 +290,14 @@ describe("SQLite store: a removal reaches the files", () => {
       for (const name of readdirSync(dir).filter((n) => n.startsWith("household.db"))) {
         assert.isFalse(readFileSync(join(dir, name)).includes("quetzalcoatlsecret"), `${name} still holds the removed text`)
       }
-      assert.isTrue(!existsSync(`${file}-wal`) || statSync(`${file}-wal`).size === 0)
+      // The log was emptied; what it may hold now is the new log the checkpoint worker started (docs/STORING-DATA.md
+      // "The write-ahead log"): its header and one frame, of page 1 (the file header and the schema, no row).
+      if (existsSync(`${file}-wal`) && statSync(`${file}-wal`).size > 0) {
+        const log = readFileSync(`${file}-wal`)
+        const pageSize = log.readUInt32BE(8)
+        assert.strictEqual(log.length, 32 + 24 + pageSize, "the header and one frame")
+        assert.strictEqual(log.readUInt32BE(32), 1, "the frame is page 1")
+      }
     }).pipe(Effect.scoped))
 })
 
