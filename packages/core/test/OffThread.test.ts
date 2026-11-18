@@ -7,7 +7,12 @@ import { Effect, Exit, Fiber } from "effect"
 import { mkdtempSync, readdirSync, rmSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
+import { vi } from "vitest"
 import { bound } from "../../store-sqlite/test/latencyBound.ts"
+
+// Every call here starts a real worker (about a quarter of a second each on a fast machine): the tests that make
+// twenty of them need more than the default five seconds on a slow CI runner.
+vi.setConfig({ testTimeout: 60_000 })
 
 const task = <F extends (input: never) => unknown>(file: string) => offThreadTask<F>(new URL(`./offThread/${file}`, import.meta.url))
 
