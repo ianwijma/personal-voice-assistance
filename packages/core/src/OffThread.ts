@@ -12,7 +12,9 @@
  * - the input has one narrow, bounded shape (`OffThreadInput`), checked and measured before anything is cloned, and
  *   every byte view is copied onto a buffer of its own before it crosses (nothing shared, no neighbouring bytes);
  * - the answer is serialised once, in the worker, into one exactly sized buffer that is checked against
- *   `maxResultBytes`, transferred, checked again and deserialised here; the task's value itself is never posted;
+ *   `maxResultBytes`, transferred, checked again and deserialised here; the task's value itself is never posted. A
+ *   structured answer (anything but one string or one `Uint8Array`) is at most `OFF_THREAD_MAX_STRUCTURED_RESULT_BYTES`
+ *   whatever the limit says, because reading it costs by the object; its buffer is never deserialised when larger;
  * - the answer comes back on a private channel of the worker's bootstrap: what a task or a library posts on the
  *   worker's public port is not read, and nothing a thrown value carries reaches the error or the log except a name
  *   or a code from a fixed list;
@@ -45,7 +47,12 @@ export const OFF_THREAD_DEFAULT_MEMORY_MB = 128
 /** The largest memory limit a call may ask for. */
 export const OFF_THREAD_MAX_MEMORY_MB = 1_024
 /** The result limit when the call names none (`maxResultBytes`): the answer's size as it is serialised. */
-export const OFF_THREAD_DEFAULT_RESULT_BYTES = 1024 * 1024
+export const OFF_THREAD_DEFAULT_RESULT_BYTES = 128 * 1024
+/**
+ * The largest structured answer (anything but one string or one `Uint8Array`), whatever `maxResultBytes` says: reading
+ * one costs the main thread by the object (128 KiB of small objects about 5 ms, 1 MiB about 20 ms).
+ */
+export const OFF_THREAD_MAX_STRUCTURED_RESULT_BYTES = 128 * 1024
 /** The largest result limit a call may ask for. */
 export const OFF_THREAD_MAX_RESULT_BYTES = 4 * 1024 * 1024
 /** The input limit, the default and the most a call may ask for (`maxInputBytes`): string code units × 2 + bytes. */
@@ -63,7 +70,7 @@ const TERMINATE_WAIT_MS = 2_000
  * Why a call failed:
  * - `timeout`: the time limit passed (waiting for a slot included); the worker, if it had started, was terminated;
  * - `memory`: the worker ran out of its heap (`maxMemoryMb`);
- * - `too-large`: the answer was over `maxResultBytes`;
+ * - `too-large`: the answer was over `maxResultBytes`, or is structured and over `OFF_THREAD_MAX_STRUCTURED_RESULT_BYTES`;
  * - `failed`: the task threw or rejected (a stack overflow too), or its answer cannot be serialised;
  * - `exited`: the worker ended without answering (the task called `process.exit`, or the thread could not start);
  * - `load`: the task module could not be loaded, has no default-exported function, or is not a supported form;
@@ -118,7 +125,10 @@ export interface OffThreadOptions {
   readonly timeoutMs: number
   /** The worker's heap limit in MB (`resourceLimits.maxOldGenerationSizeMb`); default 128, 16 to 1,024. */
   readonly maxMemoryMb?: number
-  /** The largest answer in bytes, as serialised; default 1 MiB, at most 4 MiB. */
+  /**
+   * The largest answer in bytes, as serialised; default 128 KiB, at most 4 MiB. Over 128 KiB only for an answer that
+   * is one string or one `Uint8Array`: a structured answer is refused over 128 KiB whatever this says.
+   */
   readonly maxResultBytes?: number
   /** The largest input (string code units × 2 + bytes); default and at most 4 MiB. */
   readonly maxInputBytes?: number
@@ -320,16 +330,64 @@ export const offThreadWorkers = (): {
 
 // ---- One call
 
+// ---- What a serialised answer is, from its first tag (before it is read)
+
+/**
+ * The tags that mark a serialised answer as text (V8's string tags) or bytes (the view indices Node's serializer writes
+ * after its host-object tag for a `Uint8Array` and a `Buffer`), taken from this Node's own serializer.
+ */
+export interface WireMarkers {
+  readonly text: ReadonlyArray<number>
+  readonly bytes: ReadonlyArray<number>
+}
+
+const HOST_OBJECT = 0x5c
+
+/** The position of the value's tag: after the header (0xFF and a varint version) and any padding. */
+const tagAt = (wire: Uint8Array): number => {
+  if (wire[0] !== 0xff) return -1
+  let i = 1
+  while (i < wire.length && (wire[i]! & 0x80) !== 0) i++
+  i++
+  while (i < wire.length && wire[i] === 0x00) i++
+  return i < wire.length ? i : -1
+}
+
+/** A serialised answer is `text` (one string), `bytes` (one `Uint8Array` or `Buffer`) or `structured` (anything else). */
+export const wireShape = (wire: Uint8Array, markers: WireMarkers): "text" | "bytes" | "structured" => {
+  const at = tagAt(wire)
+  if (at < 0) return "structured"
+  const tag = wire[at]!
+  if (markers.text.includes(tag)) return "text"
+  if (tag === HOST_OBJECT && at + 1 < wire.length && markers.bytes.includes(wire[at + 1]!)) return "bytes"
+  return "structured"
+}
+
+export const markersOf = (v8: typeof import("node:v8")): WireMarkers => {
+  const tag = (value: unknown) => {
+    const wire = v8.serialize(value)
+    return wire[tagAt(wire)]!
+  }
+  const view = (value: Uint8Array) => {
+    const wire = v8.serialize(value)
+    const at = tagAt(wire)
+    if (wire[at] !== HOST_OBJECT) throw new Error("offThread: this Node does not serialise a Uint8Array as a host object")
+    return wire[at + 1]!
+  }
+  return { text: [...new Set([tag("a"), tag("\u0436")])], bytes: [...new Set([view(new Uint8Array(0)), view(Buffer.alloc(0))])] }
+}
+
 interface Runtime {
   readonly threads: typeof import("node:worker_threads")
   readonly v8: typeof import("node:v8")
+  readonly markers: WireMarkers
 }
 let runtime: Runtime | undefined
 const loadRuntime = Effect.suspend(() =>
   runtime !== undefined
     ? Effect.succeed(runtime)
     : Effect.promise(() => Promise.all([import("node:worker_threads"), import("node:v8")])).pipe(
-      Effect.map(([threads, v8]) => (runtime = { threads, v8 }))
+      Effect.map(([threads, v8]) => (runtime = { threads, v8, markers: markersOf(v8) }))
     )
 )
 
@@ -399,6 +457,8 @@ type Fail = (reason: OffThreadReason, what: string) => OffThreadError
 const run = <O>(rt: Runtime, url: URL, crossing: Crossing, limits: Limits, deadline: number, fail: Fail): Effect.Effect<O, OffThreadError> =>
   Effect.callback<O, OffThreadError>((resume) => {
     const timedOut = () => fail("timeout", `took longer than ${limits.timeoutMs} ms`)
+    const structuredTooLarge = (size: number | undefined) =>
+      fail("too-large", `${size !== undefined ? `answered ${sized(size)}` : "answered too much"} of structured data, over its limit of ${sized(OFF_THREAD_MAX_STRUCTURED_RESULT_BYTES)} (only a string or bytes may be larger)`)
     let worker: Worker | undefined
     let answers: MessagePort | undefined
     let queued = true
@@ -438,6 +498,8 @@ const run = <O>(rt: Runtime, url: URL, crossing: Crossing, limits: Limits, deadl
         const wire: unknown = (m as { wire?: unknown }).wire
         if (!(wire instanceof ArrayBuffer)) return decide(Effect.fail(fail("failed", "answered something unreadable")))
         if (wire.byteLength > limits.resultBytes) return decide(Effect.fail(fail("too-large", `answered ${sized(wire.byteLength)}, over its limit of ${sized(limits.resultBytes)}`)))
+        // A structured buffer over the structured limit is never read (the worker refuses it too).
+        if (wire.byteLength > OFF_THREAD_MAX_STRUCTURED_RESULT_BYTES && wireShape(new Uint8Array(wire), rt.markers) === "structured") return decide(Effect.fail(structuredTooLarge(wire.byteLength)))
         let value: O
         try {
           value = rt.v8.deserialize(new Uint8Array(wire)) as O
@@ -448,6 +510,7 @@ const run = <O>(rt: Runtime, url: URL, crossing: Crossing, limits: Limits, deadl
       }
       if (kind === "too-large") {
         const size: unknown = (m as { size?: unknown }).size
+        if ((m as { structured?: unknown }).structured === true) return decide(Effect.fail(structuredTooLarge(typeof size === "number" && Number.isSafeInteger(size) && size > OFF_THREAD_MAX_STRUCTURED_RESULT_BYTES ? size : undefined)))
         const shown = typeof size === "number" && Number.isSafeInteger(size) && size > limits.resultBytes ? `answered ${sized(size)}` : "answered too much"
         return decide(Effect.fail(fail("too-large", `${shown}, over its limit of ${sized(limits.resultBytes)}`)))
       }
@@ -465,7 +528,15 @@ const run = <O>(rt: Runtime, url: URL, crossing: Crossing, limits: Limits, deadl
         queued = false
         state.started++
         const workerOptions: WorkerOptions = {
-          workerData: { task: url.href, input: crossing.value, maxResultBytes: limits.resultBytes, names: OFF_THREAD_ERROR_NAMES, codes: OFF_THREAD_ERROR_CODES },
+          workerData: {
+            task: url.href,
+            input: crossing.value,
+            maxResultBytes: limits.resultBytes,
+            maxStructuredBytes: OFF_THREAD_MAX_STRUCTURED_RESULT_BYTES,
+            markers: rt.markers,
+            names: OFF_THREAD_ERROR_NAMES,
+            codes: OFF_THREAD_ERROR_CODES
+          },
           transferList: crossing.transfer,
           resourceLimits: {
             maxOldGenerationSizeMb: limits.memoryMb,

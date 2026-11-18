@@ -59,6 +59,8 @@ export default async (input) => {
       return "real answer"
     case "string":
       return "a".repeat(input.chars)
+    case "bytes":
+      return new Uint8Array(input.length).fill(7)
     case "objects":
       return Array.from({ length: input.count }, (_, i) => ({ i }))
     default:
