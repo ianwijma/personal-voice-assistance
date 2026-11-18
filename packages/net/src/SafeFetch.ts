@@ -599,11 +599,12 @@ const positive = (v: number | undefined, fallback: number): number | undefined =
  * finding 7). The attempt's signal follows the request's, so cancelling the request (the total deadline, the caller) still stops a
  * connection that has answered and whose body is being read.
  */
-const attempt = async (connector: Connector, request: Omit<ConnectRequest, "signal">, signal: AbortSignal, budgetMs: number): Promise<ConnectResponse> => {
+const attempt = async (connector: Connector, request: Omit<ConnectRequest, "signal">, signal: AbortSignal, budgetMs: number | undefined): Promise<ConnectResponse> => {
   const own = new AbortController()
   const follow = () => own.abort(signal.reason)
   signal.addEventListener("abort", follow, { once: true })
-  const timer = setTimeout(() => own.abort(new Error(`No answer from ${request.address} within ${Math.round(budgetMs)} ms`)), budgetMs)
+  // Without a budget of its own (the last address) only the request's deadline ends the attempt, so the caller gets a NetTimeout.
+  const timer = budgetMs === undefined ? undefined : setTimeout(() => own.abort(new Error(`No answer from ${request.address} within ${Math.round(budgetMs)} ms`)), budgetMs)
   try {
     const response = await raceAbort(Promise.resolve().then(() => connector({ ...request, signal: own.signal })), own.signal)
     clearTimeout(timer)
@@ -639,14 +640,15 @@ const run = async (input: string | URL, options: SafeFetchOptions, allowLan: boo
     if (signal.aborted) throw signal.reason
     const resolved = await resolveHop(url, allowLan, resolver, signal)
     if (resolved instanceof NetRefused || resolved instanceof NetFailure) throw resolved
-    // Connect to the addresses we checked, in order: each attempt gets an equal share of the time left (the last one all of it), and
-    // the next address is tried when an attempt fails or runs out of its share.
+    // Connect to the addresses we checked, in order: each attempt gets an equal share of the time left, and the next address is tried
+    // when an attempt fails or runs out of its share. The last address has no share of its own: it has all the time left, and a timer
+    // of its own would race the request's deadline, turning a timeout into a connect failure whenever it fired first.
     let response: ConnectResponse | undefined
     let lastError = "no address"
     for (let k = 0; k < resolved.addresses.length; k++) {
       if (signal.aborted) throw signal.reason
       const left = resolved.addresses.length - k
-      const budget = Math.max(1, (deadline - Date.now()) / left)
+      const budget = left === 1 ? undefined : Math.max(1, (deadline - Date.now()) / left)
       try {
         response = await attempt(connector, { url, address: resolved.addresses[k]!, method, headers }, signal, budget)
         break
