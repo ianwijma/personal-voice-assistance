@@ -49,12 +49,13 @@ describe("home-assistant: the module", () => {
       const ha = makeFakeHa()
       const kit = yield* startTestModule(homeAssistantModule({ net: ha.net }), configured({ aliases: "scene.movie_time: movie time" }))
       assert.strictEqual(kit.info()?.state, "running")
-      // The config, then one page each: the people (with the areas), the kinds the service exposes, the named scene.
-      assert.deepStrictEqual(ha.requests.map((r) => `${r.method} ${r.path}`), ["GET /api/config", "POST /api/template", "POST /api/template", "POST /api/template"])
-      assert.deepStrictEqual(ha.pages().map((p) => [p.domains, p.with_areas, p.ids]), [
-        [["person"], true, null],
-        [["light", "switch", "fan", "input_boolean", "climate", "cover", "media_player", "sensor", "binary_sensor", "lock", "alarm_control_panel"], false, null],
-        [["scene"], false, ["scene.movie_time"]]
+      // The config, then one page each: the areas, the people, the kinds the service exposes, the named scene.
+      assert.deepStrictEqual(ha.requests.map((r) => `${r.method} ${r.path}`), ["GET /api/config", "POST /api/template", "POST /api/template", "POST /api/template", "POST /api/template"])
+      assert.deepStrictEqual(ha.pages().map((p) => [p.mode, p.domains, p.ids]), [
+        ["areas", [], null],
+        ["entities", ["person"], null],
+        ["entities", ["light", "switch", "fan", "input_boolean", "climate", "cover", "media_player", "sensor", "binary_sensor", "lock", "alarm_control_panel"], null],
+        ["entities", ["scene"], ["scene.movie_time"]]
       ])
       assert.isTrue(ha.requests.every((r) => r.authorization === `Bearer ${TOKEN}`))
       assert.strictEqual(kit.info()?.status?.text, "5 areas · 4 lights · 12 others · HA 2026.11.1")

@@ -95,17 +95,21 @@ export const startFakeHomeAssistant = async (options: FakeHomeAssistantOptions =
     }
     if (req.method === "POST" && path === "/api/template") {
       if (options.nonAdmin === true) return send(401, "401: Unauthorized", "text/plain")
-      // The module's page template (`PAGE_TEMPLATE`), rendered from its variables: the lights of the page's domains
-      // after its cursor, at most its size, with the areas on the page that asks for them.
+      // The module's page template (`PAGE_TEMPLATE`), rendered from its variables: a page of areas, or the lights of
+      // the page's domains after its cursor, at most its size (each light dimmable).
       const t = body as { template?: string; variables?: PageVariables } | undefined
       if (t?.template !== PAGE_TEMPLATE || t.variables === undefined) return send(400, { message: "unexpected template" })
       const v = t.variables
       const all = render()
-      const ids = all.entities.map((e) => e.id).sort().filter((id) => (v.ids !== null ? v.ids.includes(id) : v.domains.includes(id.slice(0, id.indexOf("."))) && id > v.after))
+      if (v.mode === "areas") {
+        const picked = all.areas.map((a) => a.id).sort().filter((id) => id > v.after)
+        const shown = picked.slice(0, v.size)
+        return send(200, JSON.stringify({ rows: all.areas.filter((a) => shown.includes(a.id)), last: shown.at(-1) ?? null, more: picked.length > v.size }), "text/plain; charset=utf-8")
+      }
+      const ids = all.entities.map((e) => e.id).sort().filter((id) => (v.ids !== null ? v.ids.includes(id) : v.domains.includes(id.slice(0, id.indexOf(".")))) && id > v.after)
       const shown = ids.slice(0, v.size)
       return send(200, JSON.stringify({
-        areas: v.with_areas ? all.areas : null,
-        entities: all.entities.filter((e) => shown.includes(e.id)).sort((x, y) => (x.id < y.id ? -1 : 1)),
+        rows: all.entities.filter((e) => shown.includes(e.id)).sort((x, y) => (x.id < y.id ? -1 : 1)).map((e) => ({ ...e, dim: true })),
         last: shown.at(-1) ?? null,
         more: ids.length > v.size
       }), "text/plain; charset=utf-8")

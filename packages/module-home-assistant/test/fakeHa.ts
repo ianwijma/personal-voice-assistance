@@ -35,6 +35,8 @@ export interface FakeEntity {
   title?: string | null
   artist?: string | null
   volume?: number | null
+  /** A light's `supported_color_modes` (default `["brightness"]`; `["onoff"]` is a relay that cannot be dimmed). */
+  colorModes?: Array<string> | null
   /** A scene's `entity_id` attribute: the entities it sets (absent: Home Assistant lists none). */
   members?: Array<string> | null
   /** Home Assistant's `last_changed`, epoch seconds (default: a fixed time). */
@@ -129,48 +131,72 @@ export const makeFakeHa = (options: FakeHaOptions = {}) => {
   const config = { location_name: options.locationName ?? "Home", version: "2026.11.1", unit_system: { temperature: options.unit ?? "°C" } }
 
   /** The page template rendered as Home Assistant would, from its variables. */
+  /** As the template's `regex_replace(ctl, " ")`: control characters become spaces. */
+  const plain = (v: unknown) => (typeof v === "string" ? v.replace(/[\x00-\x1f\x7f]/g, " ") : v)
+  /** As the template's `[:n]` after `regex_replace`: Python cuts on code points. */
+  const cutText = (v: unknown, n: number) => (typeof v === "string" ? [...(plain(v) as string)].slice(0, n).join("") : null)
+  const num = (v: unknown) => (typeof v === "number" && Math.abs(v) < 1e15 ? v : null)
+  const short = (v: unknown, n: number) => (typeof v === "string" && [...v].length <= n ? plain(v) : null)
+  const colorModesOf = (id: string, e: FakeEntity) => (e.colorModes !== undefined ? e.colorModes : domainOf(id) === "light" ? ["brightness"] : null)
+
+  /** The page template rendered as Home Assistant would, from its variables (`PAGE_TEMPLATE`). */
   const page = (v: PageVariables) => {
+    if (v.mode === "areas") {
+      const picked = Object.keys(areas).sort().filter((id) => id > v.after)
+      const shown = picked.slice(0, v.size)
+      return { rows: shown.map((id) => ({ id, name: cutText(areas[id] ?? "", v.keep) })), last: shown.at(-1) ?? null, more: picked.length > v.size }
+    }
     const ids = Object.keys(entities).sort()
-    const picked = v.ids !== null ? ids.filter((id) => v.ids!.includes(id)) : ids.filter((id) => v.domains.includes(domainOf(id)) && id > v.after)
+    const picked = v.ids !== null ? ids.filter((id) => v.ids!.includes(id) && id > v.after) : ids.filter((id) => v.domains.includes(domainOf(id)) && id > v.after)
     const shown = picked.slice(0, v.size)
     const rows: Array<unknown> = []
     for (const id of shown) {
       const e = entities[id]!
       const d = domainOf(id)
       if (d === "person") {
-        rows.push({ id, name: cut(e.name ?? id, v.keep), state: cut(e.state, v.keep), changed: e.changed === undefined ? CHANGED_AT : e.changed, ...e.extra })
+        rows.push({ id, name: cutText(e.name ?? id, v.keep), state: cutText(e.state, 256), changed: e.changed === undefined ? CHANGED_AT : e.changed, ...e.extra })
         continue
       }
       if (SENSOR_DOMAINS.includes(d) && !v.classes.includes(e.class ?? "")) continue
-      const members = d === "scene" && Array.isArray(e.members) ? e.members.slice(0, v.max_members).map((m) => ({ id: cut(m, v.keep), class: entities[m]?.class ?? null })) : null
+      const members = d === "scene" && Array.isArray(e.members)
+        ? e.members.slice(0, v.max_members).map((m) => ({ id: cutText(m, 256), class: short(entities[m]?.class ?? null, 32) }))
+        : null
+      const modes = colorModesOf(id, e)
       rows.push({
         id,
-        name: cut(e.name ?? id, v.keep),
-        state: cut(e.state, v.keep),
+        name: cutText(e.name ?? id, v.keep),
+        state: cutText(e.state, 256),
         changed: e.changed === undefined ? CHANGED_AT : e.changed,
         area: e.area ?? null,
-        class: cut(e.class, v.keep),
-        brightness: e.brightness ?? null,
-        current: e.current ?? null,
-        target: e.target ?? null,
-        modes: e.modes ?? null,
-        position: e.position ?? null,
-        features: e.features ?? null,
-        unit: cut(e.unit, v.keep),
-        title: cut(e.title, v.keep),
-        artist: cut(e.artist, v.keep),
-        volume: e.volume ?? null,
+        class: short(e.class, 32),
+        brightness: num(e.brightness),
+        current: num(e.current),
+        target: num(e.target),
+        modes: Array.isArray(e.modes) ? [...new Set(e.modes.filter((m) => v.hvac.includes(m)))] : null,
+        dim: Array.isArray(modes) ? modes.some((m) => v.dim_modes.includes(m)) : null,
+        position: num(e.position),
+        features: num(e.features),
+        unit: short(e.unit, 16),
+        title: cutText(e.title, v.keep),
+        artist: cutText(e.artist, v.keep),
+        volume: num(e.volume),
         members,
         member_count: d === "scene" && Array.isArray(e.members) ? e.members.length : null,
         ...e.extra
       })
     }
-    return {
-      areas: v.with_areas ? Object.entries(areas).slice(0, v.max_areas).map(([id, name]) => ({ id, name: cut(name, v.keep) })) : null,
-      entities: rows,
-      last: shown.at(-1) ?? null,
-      more: picked.length > v.size
-    }
+    return { rows, last: shown.at(-1) ?? null, more: picked.length > v.size }
+  }
+
+  /** Home Assistant's own limit on a rendered template (`MAX_TEMPLATE_OUTPUT`), in characters (code points). */
+  const TEMPLATE_LIMIT = 262_144
+  /** The page as Home Assistant answers it: the rendered text, or its HTTP 400 when the text is over the limit. */
+  const rendered = (v: PageVariables): OfflineResponse => {
+    const text = JSON.stringify(page(v))
+    let chars = 0
+    for (const _ of text) chars++
+    if (chars > TEMPLATE_LIMIT) return json(400, { message: `Error rendering template: Template output exceeded maximum size of ${TEMPLATE_LIMIT} characters` })
+    return json(200, text, "text/plain; charset=utf-8")
   }
 
   const json = (status: number, payload: unknown, type = "application/json"): OfflineResponse =>
@@ -187,7 +213,11 @@ export const makeFakeHa = (options: FakeHaOptions = {}) => {
       if (!id.startsWith(`${domain}.`)) continue
       if (name === "turn_on") e.state = domain === "scene" ? "2026-11-18T09:00:00+00:00" : "on"
       if (name === "turn_off") e.state = "off"
-      if (typeof data.brightness_pct === "number") {
+      // Home Assistant's light filter: a brightness for a light without one is dropped, and the light turns on fully.
+      const dims = colorModesOf(id, e)?.some((m) => m !== "onoff" && m !== "unknown") === true
+      if (typeof data.brightness_pct === "number" && domain === "light" && !dims) {
+        if (name === "turn_on") e.brightness = null
+      } else if (typeof data.brightness_pct === "number") {
         e.brightness = Math.round((data.brightness_pct / 100) * 255)
         if (data.brightness_pct === 0) e.state = "off"
       }
@@ -210,7 +240,7 @@ export const makeFakeHa = (options: FakeHaOptions = {}) => {
       if (options.nonAdmin === true) return json(401, "401: Unauthorized", "text/plain")
       const t = body as { template?: string; variables?: PageVariables } | undefined
       if (t?.template !== PAGE_TEMPLATE || t.variables === undefined) return json(400, { message: "unexpected template" })
-      return json(200, JSON.stringify(page(t.variables)), "text/plain; charset=utf-8")
+      return rendered(t.variables)
     }
     const match = /^\/api\/services\/([a-z_]+)\/([a-z_]+)$/.exec(path)
     if (method === "POST" && match !== null) return service(match[1]!, match[2]!, (body ?? {}) as Record<string, unknown>, url.searchParams.has("return_response"))

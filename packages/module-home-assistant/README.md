@@ -17,6 +17,8 @@ What it does, its actions and tools, settings, what it stores (nothing; people a
 - `src/inventory.ts`: the house read in pages, people first, at most the supported size, incomplete beyond it.
 - `src/module.ts`: the definition: the `shared` part (client, cache, background read), the instance (actions, the
   `home_state` tool, status line, form values), health, the Test button.
+- `src/services.ts`: the allow-list of the services a call may name, with each one's target domain and data fields.
+- `src/secrets.ts`: the configured secrets in every form an answer could carry them in, and the check of decoded text.
 - `src/service.ts`: the `HomeAssistant` transport of `@pva/module-contracts` over the polled cache (state, the pulled
   change stream with its snapshots, `callService`), and the one checked path every service call takes, the module's own too.
 - `src/texts.ts`: every spoken sentence in English and Dutch; numbers and lists by `@pva/language`.
@@ -37,8 +39,8 @@ What it does, its actions and tools, settings, what it stores (nothing; people a
   ```
 
 **Not verified against a real Home Assistant** (none was available): the page template on the owner's version (the
-`variables` of `POST /api/template`, `selectattr` with `"gt"` and `"in"`, `area_id(entity)`, a scene's `entity_id`
-attribute), and the latency of a command.
+`variables` of `POST /api/template`, `selectattr` and `select` with `"gt"` and `"in"`, `regex_replace`, `unique`,
+`area_id(entity)`, a scene's `entity_id` attribute, `supported_color_modes`), and the latency of a command.
 
 ## Sources
 

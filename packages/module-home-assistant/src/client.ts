@@ -59,6 +59,9 @@ export interface NetDeps {
   readonly connector?: Connector | undefined
 }
 
+/** The `@pva/net` refusals made on the answer, after the request was sent. */
+const POST_RESPONSE_RULES: ReadonlyArray<string> = ["content-type", "content-encoding", "redirect-limit", "redirect-target", "post-redirect"]
+
 /** What Home Assistant answers: JSON (config, services, errors) or text (a rendered template, some errors). */
 const HA_ANSWER: ContentTypePolicy = { name: "Home Assistant answer", types: ["application/json", "text/plain"] }
 
@@ -110,7 +113,12 @@ export const normalizeBaseUrl = (text: string): string | undefined => {
   if (text.trim() === "") return undefined
   const address = checkAddress(text, ADDRESS_RULES)
   if (!address.ok) return undefined
-  return address.display.replace(/\/api$/, "")
+  // The owner's own spelling, tidied only as text (spaces, trailing slashes, a trailing "/api"): the network helper
+  // decides on loopback from the host as the owner wrote it, so a parsed and re-written host would launder "127.1"
+  // or "2130706433" into "127.0.0.1".
+  const tidy = (t: string) => t.replace(/\/+$/, "")
+  const typed = tidy(text.trim())
+  return tidy(/\/api$/i.test(typed) ? typed.slice(0, -4) : typed)
 }
 
 /** The settings form's check of the address: why it is refused, in words that never repeat it (it may hold a password). */
@@ -195,10 +203,19 @@ export const makeHomeAssistantClient = (options: HomeAssistantClientOptions): Ho
               return { tooLarge: true }
             case "NetTimeout":
               return haError({ message: "Home Assistant didn't answer in time.", kind: "timeout", detail: `${at}: no answer within ${timeoutMs} ms` })
-            case "NetRefused":
-              return haError({ message: "I couldn't reach Home Assistant.", kind: "unreachable", detail: `${at}: refused (${e.rule}): ${fromUpstream(e.detail, secrets)}` })
+            case "NetRefused": {
+              // Refused before a byte left (the address, a header, the body), or on the answer (its type or encoding, a
+              // redirect): for a POST the second may have been carried out.
+              const answered = POST_RESPONSE_RULES.includes(e.rule)
+              const maybe = method === "POST" && answered
+              return haError({
+                message: maybe ? "Home Assistant may or may not have done it: its answer could not be read." : "I couldn't reach Home Assistant.",
+                kind: maybe ? "unconfirmed" : answered ? "invalid" : "unreachable",
+                detail: `${at}: refused (${e.rule}): ${fromUpstream(e.detail, secrets)}`
+              })
+            }
             case "NetAborted":
-              return haError({ message: "I couldn't reach Home Assistant.", kind: "unreachable", detail: `${at}: aborted` })
+              return haError({ message: "I couldn't reach Home Assistant.", kind: method === "POST" ? "unconfirmed" : "unreachable", detail: `${at}: aborted` })
             case "NetFailure": {
               // A POST that failed after it may have been written: it may or may not have been carried out.
               const maybe = method === "POST" && (e.stage === "response" || e.detail.includes("may or may not"))

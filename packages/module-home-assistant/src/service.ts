@@ -19,6 +19,8 @@ import { Cause, Effect, Latch, Stream } from "effect"
 import type { CallLimits, HomeAssistantError as ClientError } from "./client.ts"
 import type { Entity, House } from "./house.ts"
 import { fromUpstream, type Secrets } from "./redact.ts"
+import { holdsForm, secretForms } from "./secrets.ts"
+import { checkData, SERVICES } from "./services.ts"
 
 /**
  * The `HomeAssistant` transport (`packages/module-contracts/src/homeAssistant.ts`), over the module's polled cache,
@@ -226,8 +228,8 @@ export const makeTransport = (deps: TransportDeps) => {
     }))
   }
 
-  /** Whether any text of `json` holds a configured secret. */
-  const holdsSecret = (json: string) => secrets.some((s) => json.includes(s))
+  /** The configured secrets in every form an answer could carry (`secrets.ts`), compared with decoded text. */
+  const forms = secretForms(secrets)
 
   /**
    * The one checked path of every service call (the contract's "How a call names what it acts on"), before anything
@@ -260,37 +262,46 @@ export const makeTransport = (deps: TransportDeps) => {
         data = JSON.parse(text) as JsonObject
         if (namesTarget(data)) return refuse("refused", "data names a target itself")
       }
-      if (REFUSED_DOMAINS.includes(domain)) return refuse("refused", `the ${domain} domain is refused`)
+      // The allow-list (`services.ts`): the service, the fields of its data, the domain and kind of every target.
+      const rule = Object.hasOwn(SERVICES, `${domain}.${service}`) ? SERVICES[`${domain}.${service}`]! : undefined
+      if (rule === undefined || REFUSED_DOMAINS.includes(domain)) return refuse("refused", `${domain}.${service} is not a service this provider calls`)
+      const bad = checkData(rule, data)
+      if (bad !== undefined) return refuse(bad.reason, bad.detail)
+      if (call.returnResponse === true && rule.response !== true) return refuse("invalid", `${domain}.${service} gives no response`)
       for (const id of ids) {
         const match = id.length <= HA_LIMITS.idChars ? ENTITY_ID.exec(id) : null
         if (match === null) return refuse("unknown_entity", "an entity id that is not Home Assistant's form")
-        if (REFUSED_DOMAINS.includes(match[1]!)) return refuse("refused", `an entity of the refused ${match[1]} domain`)
-        // A cover is moved only when it is known to be a blind, curtain, shade, shutter or awning: a garage door, a gate,
-        // a door, a cover of a class this module does not know and a cover without a class are all refused.
-        if (match[1] === "cover") {
-          const e = house?.byId.get(id)
-          if (e !== undefined && !e.blind) return refuse("refused", "a cover that is not of a blind class (a garage door, a gate, a door, or no class)")
-        }
-        // A scene runs only for the module's own action, when every entity it sets is one this module changes itself.
-        if (match[1] === "scene" && caller === "own" && house?.byId.get(id)?.runnable !== true) return refuse("refused", "a scene that sets something this module does not change")
+        // Every target is of the service's own domain: an integration's service cannot be aimed through a sensor.
+        if (match[1] !== rule.domain) return refuse("refused", `${domain}.${service} acts on ${rule.domain} entities only`)
+        const e = house?.byId.get(id)
+        // A cover is moved only when it is known to be a blind, curtain, shade, shutter or awning.
+        if (rule.targets === "blind" && e !== undefined && !e.blind) return refuse("refused", "a cover that is not of a blind class (a garage door, a gate, a door, or no class)")
+        // A scene runs only when every entity it sets is one this module changes itself.
+        if (rule.targets === "runnable-scene" && e?.runnable !== true) return refuse("refused", "a scene that sets something this module does not change, or that the owner did not name")
+        // Home Assistant drops a brightness for a light without one and turns it on fully: refused instead.
+        if ("brightness_pct" in data && e !== undefined && e.dimmable !== true) return refuse("refused", "a brightness for a light that cannot be dimmed")
       }
       if (connection !== "connected") return refuse("not_connected", `the last poll of Home Assistant ${connection === "unknown" ? "has not succeeded yet" : "failed"}`)
       for (const id of ids) {
         const own = house?.byId.get(id)
+        // A consumer's targets are exposed (a scene: one that passed the rule above); the module's own, in its house.
         const known = caller === "consumer"
-          ? byId.has(id) && (!id.startsWith("cover.") || own?.blind === true)
-          : own !== undefined && own.kind !== "person" && (own.kind !== "cover" || own.blind)
+          ? (rule.targets === "runnable-scene" ? own?.runnable === true : byId.has(id)) && (rule.targets !== "blind" || own?.blind === true)
+          : own !== undefined && own.kind !== "person" && (rule.targets !== "blind" || own.blind)
         if (!known) return refuse("unknown_entity", "an entity that is not exposed")
       }
       const returnResponse = call.returnResponse === true
       return deps.call(domain, service, { ...data, entity_id: [...ids] }, { timeoutMs: Math.min(limitMs, HA_LIMITS.callTimeoutMs), maxBytes: 256 * 1024, returnResponse }).pipe(
         Effect.mapError((e): CallProblem => {
-          // Home Assistant answered with an error: it says so. Not reached at all (the connection refused, a redirect
-          // answer, which is never followed): nothing happened. Anything else after the request may have reached it (no
-          // answer in time, a connection broken mid-way, an answer that could not be read): it may or may not have
-          // happened, and is never sent again.
-          if (e.kind === "http" || e.kind === "unauthorized" || e.kind === "forbidden") return { reason: "failed", detail: fromUpstream(`${domain}.${service}: ${e.detail}`, deps.secrets), cause: e }
+          // Nothing was sent only when the connection failed before a byte left (`unreachable`). Home Assistant refuses these before it acts (a malformed call, the token, a service or entity it does not
+          // have): a definite failure. Any other status (500 after one entity changed and another failed, a 503 from a
+          // proxy) may have come after part of the call was carried out.
+          if (e.kind === "unauthorized" || e.kind === "forbidden" || (e.kind === "http" && (e.status === 400 || e.status === 404))) {
+            return { reason: "failed", detail: fromUpstream(`${domain}.${service}: ${e.detail}`, deps.secrets), cause: e }
+          }
           if (e.kind === "unreachable") return { reason: "not_connected", detail: fromUpstream(`${domain}.${service}: not sent: ${e.detail}`, deps.secrets), cause: e }
+          // Anything else after the request left (another status, an answer of the wrong type or encoding, one cut off,
+          // a time limit): it may or may not have happened, and it is never sent again.
           return {
             reason: "timeout",
             detail: fromUpstream(`${domain}.${service}: no confirmed answer (it may or may not have happened): ${e.detail}`, deps.secrets),
@@ -309,9 +320,11 @@ export const makeTransport = (deps: TransportDeps) => {
             return { responseCut: true }
           }
           if (response === undefined) return {}
+          // An answer any of whose decoded keys or strings holds a configured secret form is never handed on, nor
+          // rewritten: it is cut. Checked before it is serialised, so an escaped quote is no disguise.
+          if (holdsForm(forms, response)) return { responseCut: true }
           const json = JSON.stringify(response)
-          // An answer that holds a configured secret is never handed on, nor rewritten: it is cut.
-          return json === undefined || json.length > HA_LIMITS.responseChars || holdsSecret(json) ? { responseCut: true } : { response: JSON.parse(json) as Json }
+          return json === undefined || json.length > HA_LIMITS.responseChars ? { responseCut: true } : { response: JSON.parse(json) as Json }
         })
       )
     })

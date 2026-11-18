@@ -120,8 +120,12 @@ describe("home-assistant: rubbish", () => {
       ha.answer("template", respond(200, JSON.stringify({
         last: null,
         more: false,
-        areas: [{ id: "kitchen", name: "Kitchen" }, { id: "Bad Id", name: "Bad" }, { id: 5 }, "x"],
-        entities: [
+        // The same rows for the page of areas and for each page of entities: what is not of the page's kind is left out.
+        rows: [
+          { id: "kitchen", name: "Kitchen" },
+          { id: "Bad Id", name: "Bad" },
+          { id: 5 },
+          "x",
           { id: "light.kitchen", name: "Kitchen\nlight‮", state: "on", area: "kitchen", brightness: 9999 },
           { id: `light.${long}`, name: "Too long", state: "on" },
           { id: "light.UPPER", name: "Upper", state: "on" },
@@ -145,14 +149,19 @@ describe("home-assistant: rubbish", () => {
       assert.deepStrictEqual(ha.pages().map((p) => p.size), [HOUSE_LIMITS.pageRows, HOUSE_LIMITS.pageRows / 8, 3, 1])
     }))
 
-  it.effect("errors from Home Assistant: 503 restarting, 500, a token refused later", () =>
+  it.effect("errors from Home Assistant: 400 and 404 are definite, 503 and 500 may have come after part of it, a token refused later", () =>
     Effect.gen(function*() {
       const ha = makeFakeHa()
       const kit = yield* startTestModule(homeAssistantModule({ net: ha.net }), configured())
+      const unconfirmed = { ok: false, code: "failed", message: "I sent it to Home Assistant but couldn't confirm that it happened; it may or may not have." } as const
       ha.answer("service", respond(503, "{\"message\": \"starting\"}"))
-      assert.deepStrictEqual(yield* kit.action("lights_on", { target: "kitchen" }), { ok: false, code: "failed", message: "Home Assistant is restarting. Try again in a minute." })
+      assert.deepStrictEqual(yield* kit.action("lights_on", { target: "kitchen" }), unconfirmed)
       ha.answer("service", respond(500, "{\"message\": \"boom\"}"))
-      assert.deepStrictEqual(yield* kit.action("lights_on", { target: "kitchen" }), { ok: false, code: "failed", message: "Home Assistant reported an error." })
+      assert.deepStrictEqual(yield* kit.action("lights_on", { target: "kitchen" }), unconfirmed)
+      for (const status of [400, 404]) {
+        ha.answer("service", respond(status, "{\"message\": \"no such service\"}"))
+        assert.deepStrictEqual(yield* kit.action("lights_on", { target: "kitchen" }), { ok: false, code: "failed", message: "Home Assistant reported an error." }, String(status))
+      }
       ha.answer("service", respond(401, "401: Unauthorized", "text/plain"))
       assert.deepStrictEqual(yield* kit.action("lights_on", { target: "kitchen" }), { ok: false, code: "failed", message: "Home Assistant refused my access token; a new one can be set on the module's page." })
     }))

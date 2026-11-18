@@ -255,11 +255,11 @@ describe("HomeAssistant service: callService", () => {
       assert.deepStrictEqual(yield* service.callService({ domain: "media_player", service: "media_pause", target: { entityIds: ["media_player.kitchen"] } }), {})
       assert.deepStrictEqual(ha.calls(), [{ service: "media_player.media_pause", body: { entity_id: ["media_player.kitchen"] } }])
       ha.respondWith({ "media_player.kitchen": { volume: 0.4 } })
-      const answered = yield* service.callService({ domain: "music_assistant", service: "get_queue", target: { entityIds: ["media_player.kitchen"] }, data: { limit: 5 }, returnResponse: true })
+      const answered = yield* service.callService({ domain: "media_player", service: "browse_media", target: { entityIds: ["media_player.kitchen"] }, data: { media_content_type: "music" }, returnResponse: true })
       assert.deepStrictEqual(answered, { response: { "media_player.kitchen": { volume: 0.4 } } })
-      assert.include(ha.requests.at(-1)!.path, "/api/services/music_assistant/get_queue")
+      assert.include(ha.requests.at(-1)!.path, "/api/services/media_player/browse_media")
       ha.respondWith({ big: "x".repeat(HA_LIMITS.responseChars) })
-      assert.deepStrictEqual(yield* service.callService({ domain: "music_assistant", service: "get_queue", target: { entityIds: ["media_player.kitchen"] }, returnResponse: true }), { responseCut: true })
+      assert.deepStrictEqual(yield* service.callService({ domain: "media_player", service: "browse_media", target: { entityIds: ["media_player.kitchen"] }, returnResponse: true }), { responseCut: true })
     }))
 
   it.effect("every refusal of the contract, before anything reaches Home Assistant", () =>
@@ -282,8 +282,9 @@ describe("HomeAssistant service: callService", () => {
         ["a garage door", { domain: "cover", service: "open_cover", target: { entityIds: ["cover.garage_door"] } }, "refused"],
         ["a garage door among blinds", { domain: "cover", service: "close_cover", target: { entityIds: ["cover.living_room_blinds", "cover.garage_door"] } }, "refused"],
         ["not in Home Assistant", { domain: "light", service: "turn_on", target: { entityIds: ["light.nope"] } }, "unknown_entity"],
-        ["not exposed (a scene)", { domain: "scene", service: "turn_on", target: { entityIds: ["scene.movie_time"] } }, "unknown_entity"],
-        ["not exposed (a classless sensor)", { domain: "sensor", service: "reload", target: { entityIds: ["sensor.robins_phone_geocoded_location"] } }, "unknown_entity"],
+        ["a scene the owner did not name", { domain: "scene", service: "turn_on", target: { entityIds: ["scene.elsewhere"] } }, "refused"],
+        ["a service not in the table (a classless sensor)", { domain: "sensor", service: "reload", target: { entityIds: ["sensor.robins_phone_geocoded_location"] } }, "refused"],
+        ["not exposed (a classless sensor)", { domain: "switch", service: "turn_on", target: { entityIds: ["switch.robins_phone"] } }, "unknown_entity"],
         ["not an entity id", { domain: "light", service: "turn_on", target: { entityIds: ["Kitchen"] } }, "unknown_entity"],
         ["a domain that is not a-z0-9_", { domain: "Light", service: "turn_on", target: { entityIds: ["light.kitchen"] } }, "invalid"],
         ["a service that is not a-z0-9_", { domain: "light", service: "turn on", target: { entityIds: ["light.kitchen"] } }, "invalid"],
@@ -302,7 +303,11 @@ describe("HomeAssistant service: callService", () => {
       const slow = yield* Effect.forkChild(Effect.flip(service.callService(pause)))
       yield* kit.advance(HA_LIMITS.callTimeoutMs)
       assert.strictEqual((yield* Fiber.join(slow)).reason, "timeout")
-      ha.answer("service", () => new Response("{\"message\": \"boom\"}", { status: 500 }))
+      // A 500 may come after part of the call was carried out: it may or may not have happened.
+      ha.answer("service", () => new Response("{\"message\": \"boom\"}", { status: 500, headers: { "content-type": "application/json" } }))
+      assert.strictEqual((yield* Effect.flip(service.callService(pause))).reason, "timeout")
+      // A 400 is refused before Home Assistant acts: failed.
+      ha.answer("service", () => new Response("{\"message\": \"bad\"}", { status: 400, headers: { "content-type": "application/json" } }))
       const failed = yield* Effect.flip(service.callService(pause))
       assert.strictEqual(failed.reason, "failed")
       assert.notInclude(failed.detail, configured().secrets.token)

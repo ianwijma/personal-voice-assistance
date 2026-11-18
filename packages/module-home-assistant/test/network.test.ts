@@ -15,7 +15,9 @@ describe("home-assistant: the network, through @pva/net", () => {
       const ha = makeFakeHa()
       const kit = yield* startTestModule(homeAssistantModule({ net: ha.net }), configured())
       assert.deepStrictEqual(yield* kit.action("lights_on", { target: "kitchen" }), { ok: true, say: "I've turned on the lights in Kitchen." })
-      const [config, firstPage] = ha.sent
+      const [config, areasPage, firstPage] = ha.sent
+      // The areas come in pages of their own, first.
+      assert.strictEqual((JSON.parse(areasPage!.body!) as { variables: { mode: string } }).variables.mode, "areas")
       assert.deepStrictEqual([config!.method, config!.url, config!.body], ["GET", `${URL_BASE}/api/config`, undefined])
       assert.strictEqual(firstPage!.method, "POST")
       assert.strictEqual(firstPage!.headers["content-type"], "application/json")
@@ -45,10 +47,10 @@ describe("home-assistant: the network, through @pva/net", () => {
       yield* kit.advance(10_000)
       assert.strictEqual(kit.info()?.status?.tone, "ok")
       ha.answer("service", redirect)
-      // A redirect to a POST: refused by its own rule, so nothing happened and the module says it could not reach it.
-      assert.deepStrictEqual(yield* kit.action("lights_on", { target: "kitchen" }), { ok: false, code: "failed", message: "I couldn't reach Home Assistant." })
+      // A redirect answer to a POST: never followed, and it came after the request left, so it may or may not have happened.
+      assert.deepStrictEqual(yield* kit.action("lights_on", { target: "kitchen" }), { ok: false, code: "failed", message: "I sent it to Home Assistant but couldn't confirm that it happened; it may or may not have." })
       const e = yield* Effect.flip(kit.service(HomeAssistant)!.callService({ domain: "media_player", service: "media_pause", target: { entityIds: ["media_player.kitchen"] } }))
-      assert.strictEqual(e.reason, "not_connected")
+      assert.strictEqual(e.reason, "timeout")
       assert.include(e.detail, "post-redirect")
       assert.isFalse(ha.sent.some((r) => r.url.endsWith("/unexpected")))
       assert.strictEqual(ha.calls().length, 2)
@@ -87,4 +89,48 @@ describe("home-assistant: the network, through @pva/net", () => {
       assert.strictEqual(kit.info()?.status?.tone, "warning")
       assert.deepStrictEqual(yield* kit.action("lights_on", {}), { ok: false, code: "failed", message: "I couldn't reach Home Assistant." })
     }))
+
+  it.effect("after the request left: Home Assistant changed the light and answered a web page, or 500 after one entity changed; both may or may not have happened, never sent twice", () =>
+    Effect.gen(function*() {
+      const ha = makeFakeHa()
+      const kit = yield* startTestModule(homeAssistantModule({ net: ha.net }), configured())
+      const service = kit.service(HomeAssistant)!
+      const unconfirmed = { ok: false, code: "failed", message: "I sent it to Home Assistant but couldn't confirm that it happened; it may or may not have." } as const
+      // It switches the light on, then a proxy answers with HTML (refused on its type, after the request left).
+      ha.answer("service", () => {
+        ha.entities["light.kitchen"]!.state = "on"
+        return { status: 200, headers: { "content-type": "text/html" }, body: "<html>ok</html>" }
+      })
+      assert.deepStrictEqual(yield* kit.action("lights_on", { target: "kitchen" }), unconfirmed)
+      const html = yield* Effect.flip(service.callService({ domain: "light", service: "turn_on", target: { entityIds: ["light.kitchen"] } }))
+      assert.strictEqual(html.reason, "timeout")
+      assert.notInclude(html.detail, "not sent")
+      // Home Assistant's collector: one light changed, the other failed, HTTP 500.
+      ha.answer("service", () => {
+        ha.entities["light.ceiling"]!.state = "off"
+        return { status: 500, headers: { "content-type": "application/json" }, body: { message: "one entity failed after another changed" } }
+      })
+      assert.deepStrictEqual(yield* kit.action("lights_off", { target: "living room" }), unconfirmed)
+      const partial = yield* Effect.flip(service.callService({ domain: "light", service: "turn_off", target: { entityIds: ["light.ceiling", "light.reading_lamp"] } }))
+      assert.strictEqual(partial.reason, "timeout")
+      assert.strictEqual(ha.calls().length, 4)
+    }))
+
+  for (const address of ["http://127.1:8123", "http://2130706433:8123", "http://0x7f000001:8123"]) {
+    it.effect(`an owner's ${address} keeps its spelling, so the network helper refuses it: the start, the Test button and health reach nothing`, () =>
+      Effect.gen(function*() {
+        const ha = makeFakeHa({ base: address })
+        const kit = yield* startTestModule(homeAssistantModule({ net: ha.net }), { settings: { baseUrl: address }, secrets: { token: TOKEN } })
+        assert.include(kit.info()?.status?.text ?? "", "Can't read Home Assistant yet")
+        const test = homeAssistantModule({ net: ha.net }).fieldActions!.test!
+        const pressed = yield* test({ settings: { baseUrl: address, token: TOKEN, domains: ["light"], aliases: "", timeoutMs: 2000, server: "", lists: "" } as never, draft: true })
+        assert.isFalse(pressed.ok)
+        const health = homeAssistantModule({ net: ha.net }).health!
+        const issues = yield* health({ settings: { baseUrl: address, token: TOKEN, domains: ["light"], aliases: "", timeoutMs: 2000, server: "", lists: "" } as never, running: true })
+        assert.deepStrictEqual(issues.map((i) => i.id), ["home-assistant.unreachable"])
+        // Nothing was connected to: not 127.0.0.1, not anything.
+        assert.deepStrictEqual(ha.requests, [])
+        assert.deepStrictEqual(ha.sent, [])
+      }))
+  }
 })

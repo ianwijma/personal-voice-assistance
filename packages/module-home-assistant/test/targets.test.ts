@@ -225,3 +225,80 @@ describe("home-assistant: numbers as they were sent and read", () => {
 })
 
 
+
+describe("home-assistant: a named room wins over all and here", () => {
+  /** 300 lights, 150 in Kitchen and 150 in Bedroom: more names than a choice list, so the target is free text. */
+  const split = () => {
+    const entities: Record<string, FakeEntity> = {}
+    for (let i = 0; i < 300; i++) entities[`light.l${String(i).padStart(3, "0")}`] = { name: `Lamp ${i}`, state: "off", area: i < 150 ? "kitchen" : "bedroom" }
+    return { areas: { kitchen: "Kitchen", bedroom: "Bedroom" }, entities, devices: [{ id: "bedroom-speaker", name: "Bedroom speaker", room: "Bedroom" }] }
+  }
+  const sentIds = (ha: { readonly calls: () => ReadonlyArray<{ readonly body: unknown }> }) => ha.calls().flatMap((c) => (c.body as { entity_id: Array<string> }).entity_id)
+
+  it.effect("\"all lights in kitchen\", by the tool and the action: only the kitchen's lights are sent", () =>
+    Effect.gen(function*() {
+      const { ha, kit } = yield* start(split())
+      assert.strictEqual((yield* kit.tool("home-assistant_lights_on", { target: "turn on all lights in kitchen" })).value, "I've turned on the lights in Kitchen.")
+      assert.deepStrictEqual(yield* kit.action("lights_off", { target: "all the lights in the kitchen please" }, { device: "bedroom-speaker" }), { ok: true, say: "I've turned off the lights in Kitchen." })
+      assert.deepStrictEqual(yield* kit.action("lights_on", { target: "turn on the kitchen lights here" }, { device: "bedroom-speaker" }), { ok: true, say: "I've turned on the lights in Kitchen." })
+      const ids = sentIds(ha)
+      assert.strictEqual(ids.length, 450)
+      assert.isTrue(ids.every((id) => Number(id.slice(7)) < 150), "no Bedroom light was sent")
+    }))
+
+  it.effect("two named rooms in one request: a question, nothing sent", () =>
+    Effect.gen(function*() {
+      const { ha, kit } = yield* start(split())
+      assert.deepStrictEqual(yield* kit.action("lights_on", { target: "turn on the kitchen and the bedroom" }), { ok: true, say: "turn on the kitchen and the bedroom is more than one thing in Home Assistant: Kitchen and Bedroom. Which one do you mean?" })
+      assert.deepStrictEqual(ha.calls(), [])
+    }))
+})
+
+describe("home-assistant: brightness only for lights that have one", () => {
+  it.effect("a room with a dimmable light and an on/off relay: refused before anything is sent, naming the relay", () =>
+    Effect.gen(function*() {
+      const entities: Record<string, FakeEntity> = {
+        "light.dimmable": { name: "Ceiling", state: "off", area: "kitchen", colorModes: ["brightness"] },
+        "light.relay": { name: "Relay", state: "off", area: "kitchen", colorModes: ["onoff"] }
+      }
+      const { ha, kit } = yield* start({ entities, areas: { kitchen: "Kitchen" } })
+      assert.deepStrictEqual(yield* kit.action("set_brightness", { target: "kitchen", level: 40 }), { ok: true, say: "Relay can't be dimmed, so I haven't changed anything." })
+      assert.strictEqual((yield* kit.tool("home-assistant_set_brightness", { target: "relay", level: 40 })).value, "Relay can't be dimmed, so I haven't changed anything.")
+      assert.deepStrictEqual(ha.calls(), [])
+      // The dimmable one alone is set; the relay is still switched on and off.
+      assert.deepStrictEqual(yield* kit.action("set_brightness", { target: "ceiling", level: 40 }), { ok: true, say: "I've set Ceiling to 40 percent." })
+      assert.deepStrictEqual(yield* kit.action("lights_on", { target: "kitchen" }), { ok: true, say: "I've turned on the lights in Kitchen." })
+      assert.strictEqual(ha.entities["light.dimmable"]!.brightness, 102)
+      // The fake is Home Assistant's light filter: a brightness for the relay would be dropped and the relay turned on fully.
+      ha.entities["light.relay"]!.state = "off"
+      ha.entities["light.relay"]!.brightness = null
+    }))
+})
+
+describe("home-assistant: a house read in part never says there are none", () => {
+  it.effect("a thermostat beyond the supported size in Kitchen: the question and a command say they could not read everything, and Kitchen stays Kitchen", () =>
+    Effect.gen(function*() {
+      // 2,001 thermostats: the first 2,000 in Bedroom, the one left out in Kitchen.
+      const entities: Record<string, FakeEntity> = {}
+      for (let i = 0; i <= 2_000; i++) entities[`climate.c${String(i).padStart(4, "0")}`] = { name: `Thermostat ${i}`, state: "heat", current: 20, area: i < 2_000 ? "bedroom" : "kitchen" }
+      const { ha, kit } = yield* start({ entities, areas: { kitchen: "Kitchen", bedroom: "Bedroom" } })
+      assert.deepStrictEqual(yield* kit.action("climate_status", { room: "kitchen" }), { ok: true, say: "I couldn't read every device in your house, so I can't tell whether there are thermostats or temperature sensors in Kitchen." })
+      assert.deepStrictEqual(yield* kit.action("climate_mode", { target: "kitchen", mode: "off" }), { ok: true, say: "I couldn't read every device in your house, so I can't tell whether there are thermostats in Kitchen." })
+      assert.deepStrictEqual(ha.calls(), [])
+      // Something found in a room read in part: said, and that the list may be longer.
+      const bedroom = yield* kit.action("climate_status", { room: "bedroom" })
+      assert.isTrue(bedroom.ok && (bedroom as { say: string }).say.endsWith("Your house has more than I can read, so there may be more."))
+    }), 60_000)
+
+  it.effect("a light beyond the supported size in Kitchen: no light there is not said, nothing is sent; the whole house neither", () =>
+    Effect.gen(function*() {
+      const entities: Record<string, FakeEntity> = {}
+      for (let i = 0; i <= 2_000; i++) entities[`light.l${String(i).padStart(4, "0")}`] = { name: `Lamp ${i}`, state: "off", area: i < 2_000 ? "bedroom" : "kitchen" }
+      const { ha, kit } = yield* start({ entities, areas: { kitchen: "Kitchen", bedroom: "Bedroom" }, devices: [{ id: "kitchen-speaker", name: "Kitchen speaker", room: "Kitchen" }] })
+      const said = { ok: true, say: "I couldn't read every device in your house, so I can't tell whether there are lights in Kitchen." } as const
+      assert.deepStrictEqual(yield* kit.action("lights_on", { target: "kitchen" }), said)
+      assert.deepStrictEqual(yield* kit.action("lights_on", {}, { device: "kitchen-speaker" }), said)
+      assert.strictEqual((yield* kit.tool("home-assistant_lights_on", { target: "kitchen" })).value, said.say)
+      assert.deepStrictEqual(ha.calls(), [])
+    }), 60_000)
+})

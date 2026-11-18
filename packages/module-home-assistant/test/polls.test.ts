@@ -219,13 +219,54 @@ describe("HomeAssistant: answers too large to read", () => {
       const ha = makeFakeHa()
       const kit = yield* startTestModule(homeAssistantModule({ net: ha.net }), configured())
       const service = kit.service(HomeAssistant)!
-      const call = { domain: "music_assistant", service: "get_queue", target: { entityIds: ["media_player.kitchen"] }, returnResponse: true } as const
+      const call = { domain: "media_player", service: "browse_media", target: { entityIds: ["media_player.kitchen"] }, returnResponse: true } as const
       ha.respondWith({ big: "x".repeat(HA_LIMITS.responseChars + 10) })
       assert.deepStrictEqual(yield* service.callService(call), { responseCut: true })
       ha.respondWith({ huge: "x".repeat(300_000) })
       assert.deepStrictEqual(yield* service.callService(call), { responseCut: true })
-      ha.answer("service", () => new Response(JSON.stringify({ message: "boom" }), { status: 500, headers: { "content-type": "application/json" } }))
+      ha.answer("service", () => new Response(JSON.stringify({ message: "boom" }), { status: 400, headers: { "content-type": "application/json" } }))
       assert.strictEqual((yield* Effect.flip(service.callService(call))).reason, "failed")
       assert.strictEqual(ha.calls().length, 3)
+    }))
+})
+
+describe("HomeAssistant: one read, one result", () => {
+  /** What home_state says of the thermostat now. */
+  const thermostat = (value: unknown) => (value as { rooms: Array<{ things: Array<string> }> }).rooms.flatMap((r) => r.things).find((t) => t.startsWith("Living room thermostat"))
+
+  it.effect("an older read whose config said Fahrenheit, overtaken by a newer one: its config is not kept, and the next read converts nothing", () =>
+    Effect.gen(function*() {
+      const ha = makeFakeHa()
+      let release: (() => void) | undefined
+      const kit = yield* startTestModule(homeAssistantModule({ net: ha.net }), configured())
+      // The next /api/config (the background read's) is held, and then says Fahrenheit.
+      let held = true
+      ha.answer("config", () => (held ? new Promise((resolve) => {
+        release = () => resolve({ status: 200, headers: { "content-type": "application/json" }, body: { ...ha.config, unit_system: { temperature: "°F" } } })
+      }) : { status: 200, headers: { "content-type": "application/json" }, body: ha.config }))
+      yield* kit.advance(POLL)
+      yield* settle
+      assert.isDefined(release)
+      // A newer read, on a turn, with the accepted Celsius config: kept.
+      held = false
+      assert.strictEqual(thermostat((yield* kit.tool("home_state", { area: "living room", kind: "climate" })).value), "Living room thermostat: heat, 18.5° now, set to 20°")
+      // The older read goes on with Fahrenheit, and is overtaken: nothing of it is kept.
+      release!()
+      yield* settle
+      assert.strictEqual(thermostat((yield* kit.tool("home_state", { area: "living room", kind: "climate" })).value), "Living room thermostat: heat, 18.5° now, set to 20°")
+      assert.deepStrictEqual(yield* kit.action("climate_set", { target: "living room", temperature: 21 }), { ok: true, say: "I've set the heating in Living room to 21 degrees; it's 18.5 degrees now." })
+      assert.deepStrictEqual(ha.calls().at(-1)?.body, { temperature: 21, entity_id: ["climate.living_room"] })
+    }))
+
+  it.effect("a read whose config came but whose house failed changes nothing: not the config, not the house", () =>
+    Effect.gen(function*() {
+      const ha = makeFakeHa()
+      const kit = yield* startTestModule(homeAssistantModule({ net: ha.net }), configured())
+      ha.answer("config", () => ({ status: 200, headers: { "content-type": "application/json" }, body: { ...ha.config, unit_system: { temperature: "°F" } } }))
+      ha.answer("template", () => ({ status: 500, headers: { "content-type": "application/json" }, body: { message: "boom" } }))
+      yield* kit.advance(POLL)
+      yield* settle
+      ha.ok()
+      assert.strictEqual(thermostat((yield* kit.tool("home_state", { area: "living room", kind: "climate" })).value), "Living room thermostat: heat, 18.5° now, set to 20°")
     }))
 })

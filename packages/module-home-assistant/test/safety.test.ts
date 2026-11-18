@@ -47,7 +47,7 @@ describe("home-assistant: covers that are not blinds are never moved", () => {
         assert.isFalse((yield* kit.action("cover_position", { target: id, position: 40 })).ok, id)
         // The service refuses it by id, as it refuses a garage door.
         for (const call of ["open_cover", "close_cover", "stop_cover", "set_cover_position"]) {
-          const e = yield* Effect.flip(service.callService({ domain: "cover", service: call, target: { entityIds: [id] } }))
+          const e = yield* Effect.flip(service.callService({ domain: "cover", service: call, target: { entityIds: [id] }, ...(call === "set_cover_position" ? { data: { position: 40 } } : {}) }))
           assert.strictEqual(e.reason, "refused", `${call} ${id}`)
         }
         // Read, like a garage door: the state is there for presence and the locks question.
@@ -117,14 +117,16 @@ describe("home-assistant: scenes run only when everything they set is something 
       assert.include(String(kit.info()?.settings.values.lists), "scenes that can be started: Evening")
     }))
 
-  it.effect("a consumer of the service reaches no scene; a house with only unsafe scenes offers no scene action", () =>
+  it.effect("a consumer of the service reaches only a scene that passes the rule; a house with only unsafe scenes offers no scene action", () =>
     Effect.gen(function*() {
       const { ha, kit, service } = yield* start(entities(), aliases)
-      for (const id of [...Object.keys(scenes), "scene.movie_time"]) {
+      for (const id of [...Object.keys(scenes).filter((id) => id !== "scene.evening"), "scene.movie_time"]) {
         const e = yield* Effect.flip(service.callService({ domain: "scene", service: "turn_on", target: { entityIds: [id] } }))
-        assert.include(["refused", "unknown_entity"], e.reason, id)
+        assert.strictEqual(e.reason, "refused", id)
       }
       assert.deepStrictEqual(ha.calls(), [])
+      assert.deepStrictEqual(yield* service.callService({ domain: "scene", service: "turn_on", target: { entityIds: ["scene.evening"] } }), {})
+      assert.deepStrictEqual(ha.calls(), [{ service: "scene.turn_on", body: { entity_id: ["scene.evening"] } }])
       const only = yield* start({ ...defaultEntities(), "scene.unlock_house": scenes["scene.unlock_house"]! }, "scene.unlock_house: unlock house")
       assert.notInclude(only.kit.toolNames(), "home-assistant_scene_activate")
     }))

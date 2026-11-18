@@ -29,13 +29,17 @@ How it works:
   `@pva/net`'s `fetchOwnerConfiguredLan` (docs/MODULES.md §12): `GET /api/config` (the token, the version, the
   installation's temperature unit), and a JSON `POST` for each page of the house (`/api/template`, admin only) and for
   each service call. No redirect is followed (a redirect answer is a failure), loopback is reached only as the owner
-  typed it (`http://localhost:8123` works), the answer must be JSON or text, and each call has its own byte limit and
-  time limit.
+  typed it (`http://localhost:8123` and `http://127.0.0.1:8123` work; the address reaches the helper as the owner wrote
+  it, tidied only as text, so `http://127.1:8123`, `http://2130706433:8123` and `http://0x7f000001:8123` are refused,
+  at the start, by the Test button and by health alike), the answer must be JSON or text, and each call has its own
+  byte limit and time limit.
 - **The house is read in pages** (see "How large a house"): at the start, then every minute in the background, off the
   turn path. Commands resolve their target from the cache; questions (`lights_status`, `climate_status`,
   `locks_status`, `home_state`) read the house again at once, at most 3 s. Reads do not wait for each other; a read
   that a newer one overtook answers with what was kept (the newer house, or the newer failure), never with its own
-  older outcome.
+  older outcome. **One read, one result**: the configuration a read fetched (the temperature unit) stays that read's,
+  and is kept together with its house and names under the one order check; a read that was overtaken, or whose house
+  failed, changes nothing.
 - **A refused token or a user who is not an administrator** is a start error (only the owner can fix it). An
   **unreachable, slow or garbled** Home Assistant is not: the module runs, its status line says so, every command
   answers "I couldn't reach Home Assistant.", and the next background read picks it up again.
@@ -45,30 +49,56 @@ How it works:
 - **Every service call names its entities by id** (never an area), at most 50 per call, all in parallel, each within
   3 s, so an action keeps within its 5 s. The module's own actions and the `HomeAssistant` service's consumers take
   **one checked path** (`src/service.ts`).
-- **A POST is sent once.** When a service call fails after it may have reached Home Assistant (no answer in time, a
-  connection lost mid-way), the module says "I sent it to Home Assistant but couldn't confirm that it happened; it may
-  or may not have." and never sends it again; a refused connect or a redirect answer sent nothing, and it says it could
-  not reach Home Assistant.
+- **A POST is sent once.** "Nothing was sent" only when the network helper says the connection failed before a byte
+  left: then "I couldn't reach Home Assistant." An answer of 400, 401, 403 or 404 is a definite failure (Home Assistant
+  refuses these before it acts). **Everything else after the request left** (any other status, such as a 500 after
+  one entity changed and another failed; an answer of the wrong type or encoding, a redirect, one cut off or too large
+  to read on a command; a time limit) is "I sent it to Home Assistant but couldn't confirm that it happened; it may or
+  may not have.", and it is never sent again.
 - **How fresh things are.** This version polls: the cache is what Home Assistant said at the last read, at most about
   a minute old. A change in the house reaches a subscriber of the service at the next poll.
 
 ## How large a house
 
 The supported house is **2,000 entities** (people, devices and sensors of the kinds the module reads; scenes apart).
-It is read in pages of at most 200 entities and at most 256 KiB of answer, in this order: the people (with the
-areas), the kinds the service exposes (the shared `domains`), the module's other kinds, then the scenes the owner
-named. A page whose answer is larger is asked again in eighths. Each page is decoded on its own and the names of each
-target are indexed a hundred at a time, with a real yield between steps, and the new house is published in one step.
+It is read in pages, in this order: the areas (pages of their own, at most 200 a page), the people, the kinds the
+service exposes (the shared `domains`), the module's other kinds, then every scene the owner named (pages after the
+last one seen, until each was examined, none twice). Each text is cut by Home Assistant in the template itself: a name
+or media title at 80 characters plus the longest configured secret form (so a secret that starts inside the 80 is seen
+whole; the module then cuts to 80), a state at 256; a device class over 32 characters or a unit over 16 is left out,
+HVAC and colour modes are filtered to Home Assistant's own, a number is kept only when it is plain, and control
+characters become spaces.
 
-Measured on the development machine (Node 22): one page of 256 KiB of escape-heavy JSON parses in under 0.5 ms; a poll
-of the largest supported house (2,000 entities, two polls in a row, the second changing every one) holds the main
-thread **2.8 ms at most** (`test/house.test.ts`, a 1 ms heartbeat; the test fails above 10 ms, 30 ms on CI). Before the
-names were indexed in steps the same poll held it 16.2 ms.
+**Page sizes, from Home Assistant's own limit.** Home Assistant renders at most 262,144 characters of template output
+(more is HTTP 400 "Template output exceeded maximum size"). The worst legal row, every text at its cut and every
+character of it escaped to two, every number at Python's longest, counted as Python's `json.dumps` writes it (an upper
+bound of Home Assistant's `to_json`), is **1,754 + 6 × keep** characters for an entity (`keep` = 80 + the longest
+secret form + 1), **281 + 2 × keep** for an area, and an entity row plus **101 × 607** for a scene (its members, each
+an id of 256 and a class of 32). A page asks for (262,144 − 1,024) ÷ the worst row rows, at most 200: with a token of 24
+characters (keep 113) that is 107 entities, 4 scenes and 200 areas a page; with no secret, 116 entities. The
+arithmetic is in `src/house.ts` (`worstRow`) and `test/house.test.ts` renders the worst legal page and checks it.
+Home Assistant's exact "exceeded maximum size" answer is still recognised and the page asked again in eighths; no other
+400 is. The reader takes at most 1 MiB + 64 KiB of one answer (the limit at four bytes a character); the worst such
+page parses in at most 1.0 ms. The names of each target are indexed fifty at a time, with a real yield between steps,
+together with every key a request is looked up by (exact, sound-alike, one edit away, each run of words), and the new
+house, its names and its configuration are published in one step.
+
+Measured on the development machine (Node 22), with the shared bound of the latency tests (`test/latency.test.ts`;
+10 ms, three times that on CI):
+
+- a poll of the largest supported house (2,000 entities, two polls in a row, the second changing every one) holds the
+  main thread **3.5–4.0 ms at most** (16.2 ms before the names were indexed in steps);
+- resolving the five-word request "turn on the kitchen lights" among 2,000 lights with names of 80 characters holds it
+  **0.8–0.9 ms** through the action and **1.4–1.5 ms** through the tool, the whole call included; the lookup itself
+  takes at most 0.09 ms (it was 91–100 ms when every request passed over all the names).
 
 **A house with more is incomplete**, and every answer that depends on the whole list says so: "all the lights" is
 refused with a question for a room ("Your house has more devices than I can read, so I can't reach all the lights.
 Which room do you mean?"), a room's lights are "the lights I know of in Kitchen", `lights_status`, `locks_status` and
 `home_state` say there may be more, the status line says "incomplete", and nothing states a total it did not count.
+**It never says "none"** for a room or the whole house where the kind was read in part: "I couldn't read every device
+in your house, so I can't tell whether there are lights in Kitchen.", for the status questions and the commands alike;
+a room asked for by name still stays that room.
 
 ## Tools
 
@@ -109,13 +139,17 @@ what a script does cannot be seen from outside it (see "What was left out").
 carry: a known id or a unique name always works. A name (a room, an other name, a device) that is more than one thing
 is a question ("Shared is more than one thing in Home Assistant: Shared (alpha) and Shared (beta). Which one do you
 mean?"), also for "here" in a room whose name two areas share; ids always work. When every name of a target fits one
-choice list (254 options) the parameter is that list; in a larger house it is free text, resolved here (by the name, or
-the longest name a request contains; a request of only the action's own words means here). The owner's whole-house
-other names (`all: …`, `all lights: …`) still name every light.
+choice list (254 options) the parameter is that list; in a larger house it is free text, resolved here: by the name,
+else by the names the request contains, where **a named room or device wins over "all" and "here"** ("turn on all
+lights in kitchen" is the kitchen, and no other light is sent), two named rooms are a question, and a request of only
+the action's own words means here. The owner's whole-house other names (`all: …`, `all lights: …`) still name every
+light.
 
 **Exactly what happened.** Before anything is sent the whole target is checked: a request that only part of it can
 carry out is refused, naming what cannot ("Cool only can't be set to heating, so I haven't changed anything."), and so
-is a target with a light that is unavailable. A light whose state is `unknown` or `unavailable` is never called off. A
+is a target with a light that is unavailable, and **a brightness for a target that holds a light without one** (its
+`supported_color_modes` has none but `onoff`; Home Assistant would drop the brightness and turn it on fully): "Relay
+can't be dimmed, so I haven't changed anything." A light whose state is `unknown` or `unavailable` is never called off. A
 room asked for by name stays that room when it has nothing to report. Temperatures are in the household's unit
 (`HOME_UNITS`: imperial is Fahrenheit, else Celsius); a request is converted to the installation's unit (read from
 `/api/config`) before it is sent and every reading back is converted the other way; when the installation's unit is not
@@ -150,16 +184,48 @@ polls": the polled cache above is its state.
   `reconnecting`, a `connection` and one `snapshot` (`reconnected`). A subscriber more than 1,000 changes behind loses
   every change it has not read and next reads a `snapshot` (`overflow`) of the cache at that moment. A stream ends when
   the consumer's scope or the module's part closes (the provider forgets it at once).
-- **`callService`**: entity ids only (`target.entityIds`, 1 to 50). Refused before anything reaches Home Assistant: any
-  other target key, a target key anywhere in `data`, the contract's `REFUSED_DOMAINS` (locks, alarm panels, scripts,
-  `homeassistant`, …) and any entity of those domains, **any cover that is not of a blind class**, and scenes;
-  `unknown_entity` for an id that is not exposed; `invalid` outside the bounds. `not_connected` at once while the last
-  poll failed, and when the request was not sent (a refused connect, a redirect answer); `timeout` when it may have
-  happened (no answer in time, a connection lost after the request was written; never sent again); `failed` when Home
-  Assistant answers with an error. With `returnResponse`: at most 16,000 characters of JSON, else `responseCut`; a
-  successful answer too large to read at all is `responseCut` too, and so is one that holds the configured token.
+- **`callService`**: entity ids only (`target.entityIds`, 1 to 50), and **only the services of the table below**
+  ("The services a call may name"), on entities of the service's own domain that are exposed (a scene: one that passes
+  the scene rule), with only that service's data fields, each a plain value in its range. Anything else is `refused`
+  before anything is sent: every integration's own services (`zwave_js.invoke_cc_api`, `mqtt.publish`,
+  `homeassistant.*`, `script.*`, `automation.*`, `shell_command.*`, `rest_command.*`, `notify.*`, …), a field not in
+  the table (an entity, device, area, floor or label id among them), a nested value, a target of another domain, any
+  cover that is not of a blind class, a brightness for a light without one. `unknown_entity` for an id that is not
+  exposed; `invalid` for a value out of its range or a required field missing. `not_connected` at once while the last
+  poll failed, and when the request was not sent (the connection failed before a byte left); `failed` for an answer of
+  400, 401, 403 or 404; `timeout` for everything else after the request left (it may or may not have happened; never
+  sent again). With `returnResponse` (only `media_player.browse_media`): at most 16,000 characters of JSON, else
+  `responseCut`; a successful answer too large to read at all is `responseCut` too, and so is one any of whose decoded
+  keys or strings holds a configured secret in any of its forms.
 - **When the module stops**: the service is gone, every stream ends, and the old object's methods throw
   `ModuleStopped`. After a start it is a new object.
+
+### The services a call may name
+
+The one table (`src/services.ts`), for a consumer's calls and the module's own actions alike. The target entities must
+be of the domain given; data may hold only the fields listed, each a plain value.
+
+| Service | Targets | Data fields |
+|---|---|---|
+| `light.turn_on` | lights | `brightness_pct` 0–100 (only lights that can be dimmed) |
+| `light.turn_off`, `light.toggle` | lights | – |
+| `switch.turn_on`, `switch.turn_off`, `switch.toggle` | switches | – |
+| `fan.turn_on`, `fan.turn_off`, `fan.toggle` | fans | – |
+| `input_boolean.turn_on`, `input_boolean.turn_off`, `input_boolean.toggle` | on/off helpers | – |
+| `cover.open_cover`, `cover.close_cover`, `cover.stop_cover` | covers of a blind class | – |
+| `cover.set_cover_position` | covers of a blind class | `position` 0–100, whole, required |
+| `climate.set_temperature` | thermostats | `temperature` −100–1,000 (the installation's unit), required |
+| `climate.set_hvac_mode` | thermostats | `hvac_mode` one of `off`, `heat`, `cool`, `heat_cool`, `auto`, `dry`, `fan_only`, required |
+| `media_player.media_play`, `media_pause`, `media_play_pause`, `media_stop`, `media_next_track`, `media_previous_track`, `volume_up`, `volume_down` | media players | – |
+| `media_player.media_seek` | media players | `seek_position` 0–86,400 s, required |
+| `media_player.volume_set` | media players | `volume_level` 0–1, required |
+| `media_player.volume_mute` | media players | `is_volume_muted` true or false, required |
+| `media_player.select_source` | media players | `source` text of at most 200, required |
+| `media_player.shuffle_set` | media players | `shuffle` true or false, required |
+| `media_player.repeat_set` | media players | `repeat` `off`, `all` or `one`, required |
+| `media_player.play_media` | media players | `media_content_id` text of at most 2,000 and `media_content_type` text of at most 100, required; `enqueue` `play`, `next`, `add` or `replace`; `announce` true or false |
+| `media_player.browse_media` (with `returnResponse`) | media players | `media_content_id` text of at most 2,000; `media_content_type` text of at most 100 |
+| `scene.turn_on` | scenes that pass the scene rule | – |
 
 ## Settings
 
@@ -182,11 +248,14 @@ start. The template reads only the kinds above, no script, `device_tracker`, `zo
 named class. A sensor without a class is never read, because Home Assistant's companion app makes classless sensors
 that say where a phone is.
 
-**Nothing that holds a configured secret is kept.** After a successful read, an entity or an area any of whose texts
-(name, state, attributes, a media title) holds the configured token or the secret part of the address is left out
-whole and counted in the form; nothing is rewritten in place and no generic pattern is applied to names ("Basic
-Bedroom" stays). Home Assistant cuts each text at the longest bound plus the longest secret, so a secret that starts
-inside what is kept is always seen whole. A service answer that holds one is cut (`responseCut`).
+**Nothing that holds a configured secret is kept.** The configured token and the secret parts of the address are
+looked for in every form a successful answer could carry them in: as written, percent-encoded, base64 and base64url
+(padded or not). They are compared with decoded text (every key and string, after the JSON is read, so an escaped
+quote in the answer is no disguise). After a successful read, an entity or an area any of whose texts (name, state,
+attributes, a media title) holds one is left out whole and counted in the form, and a configuration whose location
+name or version holds one is not shown; nothing is rewritten in place and no generic pattern is applied to names
+("Basic Bedroom" stays). Home Assistant cuts each name at 80 plus the longest form, so a form that starts inside what
+is kept is always seen whole. A service answer any of whose decoded keys or strings holds one is cut (`responseCut`).
 
 **People are read for other modules only.** Each `person` entity is read with its id, name, state and last change,
 nothing else, kept in memory, and handed to the `HomeAssistant` service's consumers as the contract says. The module's
