@@ -6,7 +6,11 @@
 // starts once the audio runs. Review round 1: b8, b9, b10, b12 (and note b15) each have a case here.
 import { act, cleanup, fireEvent, render, screen } from "@testing-library/react"
 import { afterEach, describe, expect, it, vi } from "vitest"
+import { notifyStorage, schedulerStorage } from "@pva/core"
+import { notifyWorld } from "@pva/core/notify-contract"
+import { makeMemoryHouseholdStore } from "@pva/core/testing"
 import { MAX_NOTIFICATION_CARDS, type NotificationCard, type ServerMessage } from "@pva/protocol"
+import { Effect } from "effect"
 import { serverExamples } from "@pva/protocol/examples"
 import { type AssistantClient, createAssistantClient } from "@/lib/client.ts"
 import { makeRingLoop, RING_EVERY_MS, ringCue } from "@/lib/audio/ringLoop.ts"
@@ -67,6 +71,45 @@ describe("cards in the page's state", () => {
     expect(s.notifications.length).toBe(MAX_NOTIFICATION_CARDS)
     expect(s.notifications.some((n) => n.id === "only-ring")).toBe(true)
     expect(wanted(s)).toBe(true)
+  })
+
+  it("b3 (round 2): churn at the bound, from the service to this reducer: a resolve and a new send in one go never cost a live ring, and the page never holds more than the bound", async () => {
+    const store = makeMemoryHouseholdStore()
+    await Effect.runPromise(store.prepare([], [schedulerStorage, notifyStorage]))
+    let s: ClientState = initialState
+    let most = 0
+    const modules = Array.from({ length: 7 }, (_, i) => `bell${i}`)
+    await Effect.runPromise(Effect.scoped(Effect.gen(function*() {
+      const world = yield* notifyWorld(store, {
+        modules,
+        connected: ["kitchen-display"],
+        outlet: (_d, m) => {
+          s = reducer(s, m as Action)
+          most = Math.max(most, s.notifications.length)
+        }
+      })
+      yield* world.settle
+      const ids: Array<string> = []
+      for (let i = 0; i < MAX_NOTIFICATION_CARDS; i++) {
+        const n = yield* world.bell(modules[Math.floor(i / 10)]!).send({ title: `Card ${i}`, priority: i === 0 ? "ring" : "normal", target: "everywhere" })
+        ids.push(n.notification.id)
+      }
+      yield* world.settle
+      expect(s.notifications.length).toBe(MAX_NOTIFICATION_CARDS)
+      expect(wanted(s)).toBe(true)
+      // The newest resolved and a replacement sent at once: one reconciliation pass sees both.
+      for (let round = 0; round < 3; round++) {
+        const m = world.bell(modules[6]!)
+        yield* m.resolve(ids.pop()!)
+        ids.push((yield* m.send({ title: `Replacement ${round}`, target: "everywhere" })).notification.id)
+        yield* world.settle
+        expect(s.notifications.length).toBe(MAX_NOTIFICATION_CARDS)
+        expect(s.notifications.some((n) => n.id === ids[0])).toBe(true)
+        expect(wanted(s)).toBe(true)
+      }
+      expect(most).toBe(MAX_NOTIFICATION_CARDS)
+      expect(world.notify.ringingOn("kitchen-display").map((r) => r.id)).toEqual([ids[0]])
+    })))
   })
 })
 

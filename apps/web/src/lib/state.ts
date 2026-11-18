@@ -270,7 +270,7 @@ export interface ClientState {
   readonly sessionSeq: number
   /**
    * P9: the notification cards on this device (`notification.ring` until `notification.resolved`), oldest first: every
-   * one the server may have open (`MAX_CARDS`, its total bound), so none is lost. Emptied at every welcome and when the
+   * one the server sent, never cut here (the server holds a page to `MAX_CARDS`, its total bound). Emptied at every welcome and when the
    * session ends: the server sends what is open again after a welcome. `quiet`: a button was
    * pressed here, so the page's ring cue stops for it at once (the server's `resolved` takes the card down).
    */
@@ -300,7 +300,7 @@ export interface ClientState {
 export const MAX_TURNS = 300
 export const MAX_TRACES = 50
 export const MAX_TOASTS = 3
-/** The most notification cards a page keeps: every one the server may have open (`MAX_NOTIFICATION_CARDS`, 64). */
+/** The most notification cards the server lets a page hold (`MAX_NOTIFICATION_CARDS`, 64); the page keeps all it is sent. */
 export const MAX_CARDS = MAX_NOTIFICATION_CARDS
 
 export const emptyEngine: EngineStatus = { state: "starting", problems: [], reloadPending: false, reloadPendingFor: [], engines: [], voices: [] }
@@ -691,7 +691,9 @@ const server: ServerHandlers = {
     const before = s.notifications.find((n) => n.id === m.notification.id)
     const card = before?.quiet === true ? { ...m.notification, quiet: true } : m.notification
     const rest = s.notifications.filter((n) => n.id !== m.notification.id)
-    return { ...s, notifications: [...rest, card].sort((a, b) => a.sentAt - b.sentAt).slice(-MAX_CARDS) }
+    // Never cut: the server enforces the bound (it withdraws before it adds at the bound), and a card dropped here
+    // would be a live ring lost without a word.
+    return { ...s, notifications: [...rest, card].sort((a, b) => a.sentAt - b.sentAt) }
   },
   "notification.resolved": (s, m) => (s.notifications.some((n) => n.id === m.id) ? { ...s, notifications: s.notifications.filter((n) => n.id !== m.id) } : s)
 }

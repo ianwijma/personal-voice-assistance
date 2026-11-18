@@ -1,4 +1,4 @@
-import { sameRoom, type ServerMessageOf } from "@pva/protocol"
+import { MAX_NOTIFICATION_CARDS, sameRoom, type ServerMessageOf } from "@pva/protocol"
 import { Cause, Clock, Deferred, Effect, Exit, Fiber, Queue, Schema, Scope } from "effect"
 import type { KnownDevice } from "./Devices.ts"
 import { asPrincipal, type ExecutionGateway } from "./Gateway.ts"
@@ -447,6 +447,19 @@ export const makeNotifyEngine = (options: NotifyEngineOptions): Effect.Effect<No
     }
 
     /** What the device's connections should hold of the row now, and make them hold it. Synchronous. */
+    /** Withdraw from one connection the cards it holds (other than `adding`) that are no longer open or allowed, read now. */
+    const makeRoom = (deviceId: string, by: HeldBy, adding: string, device: KnownDevice | undefined, connected: boolean) => {
+      for (const hid of [...by.cards.keys()]) {
+        if (hid === adding) continue
+        const row = readRow(hid)
+        const v = row?.value
+        const allowed = v !== undefined && v.state === "open" && device !== undefined && targets(v, deviceId) && decideNotification(hid, v, device, connected).deliver
+        if (allowed) continue
+        by.cards.delete(hid)
+        send(by, { type: "notification.resolved", id: hid, outcome: v?.state === "resolved" ? v.outcome ?? "resolved" : "withdrawn" })
+      }
+    }
+
     const syncRow = (deviceId: string, bys: ReadonlyArray<HeldBy>, id: string, row: Row<StoredNotification> | undefined, device: KnownDevice | undefined) => {
       const v = row?.value
       const decision = v === undefined || v.state !== "open" || device === undefined || !targets(v, deviceId) ? undefined : decideNotification(id, v, device, bys.length > 0)
@@ -456,6 +469,10 @@ export const makeNotifyEngine = (options: NotifyEngineOptions): Effect.Effect<No
           const message = cardOf(id, v, decision)
           const fp = JSON.stringify(message)
           if (before?.fp === fp) continue
+          // At the page's bound, what it holds that has ended (or is no longer allowed) is withdrawn first, read now:
+          // the page never holds more than the bound, so it never has to drop a live card to make room.
+          if (before === undefined && by.cards.size >= MAX_NOTIFICATION_CARDS) makeRoom(deviceId, by, id, device, bys.length > 0)
+          if (before === undefined && by.cards.size >= MAX_NOTIFICATION_CARDS) continue
           send(by, message)
           by.cards.set(id, { fp, module: v.module, title: v.title, actions: v.actions, ring: v.priority === "ring", sound: decision.sound, sentAt: v.sentAt })
         } else if (before !== undefined) {
