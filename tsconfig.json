@@ -5,7 +5,8 @@
     "packages/*/test",
     "apps/*/src",
     "apps/*/test",
-    "vitest.config.ts"
+    "vitest.config.ts",
+    "vitest.latency.ts"
   ],
   "exclude": [
     "apps/web"

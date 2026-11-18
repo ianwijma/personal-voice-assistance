@@ -1243,6 +1243,13 @@ assert.strictEqual((yield* on.tool("reader_read_page", { url: "https://example.o
 assert.strictEqual(offThreadWorkers().running, 0)
 ```
 
+### Latency tests
+
+A test file that asserts how long the main thread stops (the longest gap of a 1 ms heartbeat) or how long real work
+takes imports `packages/store-sqlite/test/latencyBound.ts` and writes its bounds as `bound(ms)`, and **that import is
+what makes it a latency test**: CI runs those files alone, one at a time after the rest (`vitest.latency.ts`), so other
+tests' busy threads do not lengthen what they measure, while `pnpm test` still runs everything together.
+
 ## 16. Speaking
 
 What a tool returns goes to the model, which words the reply. Return **a `spoken` line** (one or two sentences, ready to
