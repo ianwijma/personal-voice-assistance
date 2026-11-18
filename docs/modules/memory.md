@@ -30,34 +30,55 @@ The model gets five tools. Every sentence the module speaks itself is in English
 
 | Tool | Parameters | Risk | What it answers |
 |---|---|---|---|
-| `memory_remember` | `text` (one line, up to 500 characters), `kind?` (`fact`, `preference`), `forMe?`, `pinned?` | change | "Got it: Sam is allergic to nuts." A memory the household already has is not kept twice ("I already know that."). Saying a known memory again with `pinned` pins it. Where a personal text may not be revealed: "Got it, only for you." Pinned memories are limited to 15 per scope; past that it is kept unpinned and says so. |
-| `memory_recall` | `query` (words, up to 100 characters), `in?` (`memories`, `notes`) | read (speculative) | `{ items, more, cut?, withheld? }` newest first, at most 8 items, each text cut to 400 characters; or "I found nothing about that." |
-| `memory_forget` | `query?` or `id?` | change | One match: it is deleted ("Forgotten: …. Backups keep it for up to 14 days."). Several: none is deleted; they come back as `candidates` with ids and the person chooses; then the tool is called again with the `id`. |
+| `memory_remember` | `text` (one line, up to 500 characters), `kind?` (`fact`, `preference`), `forMe?`, `pinned?` | change | "Got it: Sam is allergic to nuts." A memory the household already has is not kept twice ("I already know that."): it is looked for in the **newest 200 memories of the same scope**, so an identical text older than that is kept again. Two remembers never look and write at the same time (one at a time for the module), so two at once keep it once. Saying a known memory again with `pinned` pins it. Where a personal text may not be revealed: "Got it, only for you." Pinned memories are limited to 15 per scope; past that it is kept unpinned and says so. |
+| `memory_recall` | `query` (words, up to 100 characters), `in?` (`memories`, `notes`) | read (speculative) | `{ items, more, cut?, withheld? }` newest first, at most 8 items, each text cut to 400 characters (`more`: how many other matches the search found); spoken "I found 2: a and b." or "I found 5; the newest: a, b and c."; or "I found nothing about that." |
+| `memory_forget` | `query?` or `id?` | change | Deleted by words only when the search covered everything and exactly one thing matches ("Forgotten: …. Backups keep it for up to 14 days."). Several, or a search that was cut short (even with one match): none is deleted; they come back as `candidates` with ids, the answer says why ("There may be more, so I have not forgotten anything"), and the person chooses; then the tool is called again with the `id`. |
 | `memory_note` | `text` (up to 1,000 characters), `notebook?` (up to 30 characters), `forMe?` | change | "Noted in journal." |
-| `memory_read_notes` | `notebook?`, `limit?` (1 to 8, default 5) | read (speculative) | The newest notes, one notebook or all, newest first, with `more`. |
+| `memory_read_notes` | `notebook?`, `limit?` (1 to 8, default 5) | read (speculative) | The newest notes, one notebook or all, newest first; `more` is `true` when there are older ones (it reads one more than it shows, so it never says how many): "The newest notes: a, b and three more. There are older notes too." |
 
 `forMe` means "about me or only for me". With no known person asking (a public screen, a shared device without a default
 person) it asks "Whose is it?" and **writes nothing**; it never stores a personal item as the household's.
 
 **Typed actions** (they run without the language model; each has English and Dutch `examples`, none is also offered as
-a tool): `memory.remember` ("remember that …", `Only for me` as a yes/no), `memory.note` ("note …"), `memory.recall`
-("what do you remember about …"), `memory.read_notes` ("read my notes", "read my journal"), `memory.forget` ("forget what
-I said about …"; it deletes only when exactly one thing matches, otherwise it names them and deletes none). They say the
-same sentences as the tools.
+a tool): `memory.remember` ("remember that …", `Only for me` as a yes/no), `memory.note` ("note …"; a leading "that" or
+"dat" is not part of the note), `memory.recall` ("what do you remember about …"), `memory.read_notes` ("read my notes",
+"read my journal", "lees mijn notities voor"), `memory.forget` ("forget what I said about …"; it deletes only when the
+search covered everything and exactly one thing matches, otherwise it names them and deletes none). They say the same
+sentences as the tools, and go through the same checks (an empty text is a question, a text that is too long is
+refused). In `read_notes`, "notes", "notities" and the other names of the default notebook mean every notebook, a trailing
+command word ("voor", "out", "please") is not part of the name, and any other name is kept whole ("read my work notes"
+reads the notebook "work notes"). A phrase as long as core's extraction takes (100 words for remember, 200 for note, 20
+for a query) may have been cut there, so it is refused rather than kept or searched shortened.
 
-**What it refuses.** Text that looks like a code or a password is not kept, in a memory or a note: password, passcode,
+The actions' questions for a missing value ("What should I remember?", "Wat moet ik onthouden?") are in the household's
+language. They are fixed when the actions are registered, so when the language changes, the first thing the module does
+afterwards (a tool, an action, a turn's context) asks the host to start it again, and from then on the questions follow.
+
+**What it refuses.** Text that looks like a code or a password is not kept, in a memory, a note or a notebook's name
+(each is checked before anything is written, and the refusal repeats none of it): password, passcode,
 PIN, alarm, door and security codes, "code" followed by digits, API keys and tokens, a run of 13 to 19 digits (a card
 number), and the Dutch forms (wachtwoord, pincode, alarmcode, toegangscode …). The answer is "I don't keep codes or
 passwords. A password manager is the place for those." This is a guard rail for the usual ways of saying one, not a
 guarantee: a code said in an unusual way is kept.
 
-**Words, not a search engine.** `memory_recall` (and `memory_forget` by words) matches in code: every word of the query
-(without filler such as "what did the … say about") must start a word of the text, ignoring case and accents ("plumb"
-finds "plumber", "cafe" finds "café"). It reads the **newest 500 entries of each collection in each scope it may read**
-(memories and notes, the household's and the asker's own: at most 2,000 entries, in list pages of 17 and 9, with a pause
-between pages) and **says so when there are more** ("I looked through the newest 500 entries; there may be more."). A
-word in another language is not found (no translation, no synonyms). Reading 2,000 entries of the longest legal size
-takes about 50 ms where it was measured, and the test fails above one second.
+**Notebook names** are one line, single-spaced, composed (Unicode NFC, so a name never grows by decomposing), lower case,
+with their accents ("café" is its own notebook), and at most 30 characters, cut between whole characters: a character
+is never split in two. A name that is still not valid after that is refused ("I can't use that as a notebook name.").
+
+**Words, not a search engine.** `memory_recall` (and `memory_forget` by words) matches in code: **every** word of the
+query (without filler such as "what did the … say about") must start a word of the text, ignoring case and accents
+("plumb" finds "plumber", "cafe" finds "café"). A query has at most 8 such words; one with more is refused with "Say it
+in fewer words: I look for at most 8 words at a time." (never shortened: a weaker query could find, and forget, the
+wrong thing). It reads the **newest 500 entries of each collection in each scope it may read** (memories and notes, the
+household's and the asker's own: at most 2,000 entries, in list pages of 17 and 9, each page tested before a pause) and
+**says so when there are more**, in the spoken answer of the tools and the actions alike ("I looked through the newest
+500 entries only; there may be more."). Matches are counted as they are found, only the 8 newest are kept, and only
+those are formatted for the answer. A word in another language is not found (no translation, no synonyms).
+
+The longest the event loop is held during one search, with all 2,000 entries matching at nearly the longest legal size
+(the test measures it with a `setImmediate` heartbeat, through the kit's real host and in-memory store): **0.7 to 0.8 ms
+for a recall and 1.0 to 1.8 ms for a forget** over two runs where it was measured (before this was fixed: 103.5 ms and 88.5 ms). The test fails
+above 10 ms (30 ms on CI, the store's latency tests' allowance). These are test numbers, not a `TurnTrace` of a turn.
 
 ## Settings
 
@@ -69,6 +90,10 @@ takes about 50 ms where it was measured, and the test fails above one second.
 Both are shared by all assistants. There are no secrets. The pinned block is a context provider, and a provider has 50 ms
 a turn (the host's limit): it is two bounded indexed reads (at most 15 rows each) and takes about 0.3 ms where it was
 measured, with 30 pinned memories of the longest legal size; the test fails above 10 ms.
+
+When a turn's pinned block leaves memories out, the module's **status line** on the admin page says so ("Some pinned
+memories did not fit the room for pinned memories; the oldest were left out."), without any of their text; the next turn
+whose block holds them all clears it. Raise "Room for pinned memories", or forget some.
 
 ## What it stores
 
@@ -94,7 +119,8 @@ keep it for up to 14 days**, which the answer says. Nothing is scheduled: there 
 
 Nothing outside the process: no network, no outside service, no program on the server, no secret, no service or
 contribution from or to another module. The household's language and time zone come from the Home section (the
-`savedOn` date of an item is in the household's zone). `requires` and `health` are therefore not declared.
+`savedOn` date of an item is in the household's zone). Spoken counts and lists are worded by `@pva/language`
+(`speakNumber`, `speakList`). `requires` and `health` are therefore not declared.
 
 Its instructions tell the model: remember lasting facts and say what was saved; use notes for things to find again;
 recall before saying it does not know; lists belong on the lists, diets and allergies with the person; never save
@@ -117,11 +143,10 @@ Left out because the plan's row excludes it, or it is not part of a first versio
 - Audio of voice notes.
 - Expiry of a memory ("until Friday") and the daily clean-up and stale-memory review: nothing is scheduled.
 - "Replace, do not duplicate" for the same subject: only an identical text (ignoring case and spacing) is recognised.
-- A warning in the admin when pinned memories are cut: the block itself says how many were left out; `health()` has no
-  store to read, so the admin page cannot show it.
+- A Health issue when pinned memories are cut: `health()` has no store to read. The status line says it instead (above).
 - An admin Memory page (read, edit, pin, delete), automatic saving of facts that were not asked for, and a "keep
   forgotten items out of backups" option.
 - Events (`memory.saved`, `memory.forgotten`).
 - A tool to unpin a memory: forget it and say it again.
 - A cap on how many rows there are: recall reads the newest 500 of a kind in a scope, so older ones are not found by
-  words (and cannot be forgotten by words), though they are kept; the answer says so.
+  words (and cannot be forgotten by words), though they are kept; the answer says so, and forget then deletes only by id.
