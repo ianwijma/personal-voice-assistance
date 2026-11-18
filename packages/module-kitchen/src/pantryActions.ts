@@ -7,11 +7,14 @@ import { homeLanguage, isLine, say } from "@pva/module-contracts"
 import { Clock, Effect, Schema } from "effect"
 import { type BaseUnit, bookings, MAX_AMOUNT, names, type Product, products, scan } from "./data.ts"
 import {
-  amountText, book, createProduct, lastUndoable, lowOf, type Pantry, type PantrySettings, PRODUCT_PAGE, PRODUCT_SCAN, removeProduct, round, saidText, stockText,
-  storeFailureText
+  amountText, book, createProduct, drainForgotten, fits, FORGET_NOW, lastKnownText, listText, lowOf, overviewText, type Pantry, type PantrySettings, PRODUCT_PAGE,
+  PRODUCT_SCAN, removeProduct, round, saidText, stockSentence, stockText, storeFailureText, undoable
 } from "./pantry.ts"
 import { texts, type TextKey, unitWords } from "./texts.ts"
 import { cleanPhrase, KEY_CHARS, keyOf, readPhrase } from "./words.ts"
+
+/** The most low products one answer reads: four pages of 25. */
+export const LOW_SCAN = 100
 
 /** What the pantry's actions read of the module's settings (all shared fields: a change restarts the module). */
 export interface KitchenSettings extends PantrySettings {
@@ -29,7 +32,7 @@ export interface PantryDeps {
 type Outcome =
   | { readonly kind: "say"; readonly key: TextKey; readonly values?: Readonly<Record<string, string | number>> }
   | { readonly kind: "unknown"; readonly item: string }
-  | { readonly kind: "booked"; readonly id: string; readonly before: Product; readonly after: Product; readonly created: boolean; readonly said: string; readonly text: TextKey }
+  | { readonly kind: "booked"; readonly id: string; readonly before: Product; readonly after: Product; readonly created: boolean; readonly main: string }
 
 const sayOf = (key: TextKey, values?: Readonly<Record<string, string | number>>): Outcome => ({ kind: "say", key, ...(values !== undefined ? { values } : {}) })
 
@@ -51,25 +54,33 @@ export const readAmount = (text: string, lang: Language, cupMl: number): Quantit
   return undefined
 }
 
-/** How much a quantity is in base units for this product, or the question to ask. */
+/** How much a quantity is in base units for this product, or why it is not an amount, or the question to ask. */
 type Base =
   | { readonly kind: "ok"; readonly amount: number; readonly unit: BaseUnit }
   | { readonly kind: "rest" }
   | { readonly kind: "some" }
+  /** In packages of a product whose package size is not known: no amount can be booked. */
+  | { readonly kind: "packUnknown" }
   | { readonly kind: "ask"; readonly key: TextKey; readonly values: Readonly<Record<string, string>> }
 
 const baseOf = (q: Quantity, product: Product | undefined, item: string, lang: Language): Base => {
   if (q.rest) return { kind: "rest" }
   if (q.dimension === "none" || q.dimension === "vague") return { kind: "some" }
   if (q.dimension === "pack") {
-    if (product?.pack === undefined || q.amount === undefined) return { kind: "ask", key: "packSize", values: { item } }
-    return { kind: "ok", amount: round(q.amount * product.pack), unit: product.unit }
+    if (product === undefined || q.amount === undefined) return { kind: "ask", key: "packSize", values: { item } }
+    if (product.pack === undefined) return { kind: "packUnknown" }
+    const amount = round(q.amount * product.pack)
+    if (amount > MAX_AMOUNT) return { kind: "ask", key: "tooMuch", values: { item } }
+    return { kind: "ok", amount, unit: product.unit }
   }
   if (q.base === undefined) return { kind: "ask", key: "unclear", values: {} }
   if (product !== undefined && product.unit !== q.base.unit) return { kind: "ask", key: "mismatch", values: { item, unit: unitWords[lang][product.unit] } }
-  if (q.base.amount > MAX_AMOUNT) return { kind: "ask", key: "unclear", values: {} }
+  if (q.base.amount > MAX_AMOUNT) return { kind: "ask", key: "tooMuch", values: { item } }
   return { kind: "ok", amount: q.base.amount, unit: q.base.unit }
 }
+
+/** A name at the start of a sentence. */
+const capital = (name: string) => name.charAt(0).toUpperCase() + name.slice(1)
 
 /** A name a person said, as a product's name: one line, at most `KEY_CHARS`, with a key. */
 const nameOk = (name: string) => isLine(name, KEY_CHARS) && keyOf(name) !== ""
@@ -83,7 +94,7 @@ export const pantryActions = (deps: PantryDeps) => {
   const lang = () => homeLanguage(deps.host.view())
   const deviceOf = Effect.map(CurrentTurn, (t) => t?.deviceId)
 
-  /** Run a booking transaction, then follow the shopping list, and say the outcome. */
+  /** Say the outcome of a booking transaction, after it committed, and bring the shopping list into line. */
   const finish = (outcome: Outcome, l: Language) =>
     Effect.gen(function*() {
       if (outcome.kind === "say") return { say: say(texts, l, outcome.key, outcome.values) }
@@ -91,11 +102,9 @@ export const pantryActions = (deps: PantryDeps) => {
         const suggestion = yield* pantry.suggest(outcome.item)
         return { say: suggestion !== undefined ? say(texts, l, "unknownMaybe", { item: outcome.item, suggestion }) : say(texts, l, "unknown", { item: outcome.item }) }
       }
-      const { after, before } = outcome
-      const main = say(texts, l, outcome.text, { item: after.name, total: stockText(after, l), added: outcome.said, had: stockText(before, l), min: after.min !== undefined ? amountText(after.min, after.unit, false, l, after.name) : "" })
       // A product made by this call was not on the list before it.
-      const list = yield* pantry.followList(outcome.id, outcome.created ? undefined : before, after, settings, l)
-      return { say: list === undefined ? main : `${main} ${list}` }
+      const list = yield* pantry.followList(outcome.id, outcome.created ? undefined : outcome.before, outcome.after.name, settings, l)
+      return { say: list === undefined ? outcome.main : `${outcome.main} ${list}` }
     })
 
   const transact = (l: Language, f: (tx: StoreTx, now: number) => Outcome) =>
@@ -103,6 +112,9 @@ export const pantryActions = (deps: PantryDeps) => {
       const now = yield* Clock.currentTimeMillis
       return yield* store.transaction((tx) => f(tx, now)).pipe(Effect.mapError((e) => new ActionError({ message: storeFailureText(e, l, "unsaved") })))
     })
+
+  /** "Okay." and what there is now, for a change that left the stock unknown. */
+  const okayUnsure = (after: Product, l: Language) => `${say(texts, l, "okay")} ${stockSentence(after, l)}`
 
   const add = defineAction({
     id: "stock_add",
@@ -120,9 +132,10 @@ export const pantryActions = (deps: PantryDeps) => {
         if (r.kind === "several") return { say: say(texts, l, "several") }
         if (r.kind === "unclear") return { say: say(texts, l, "unclear") }
         if (!nameOk(r.item)) return { say: say(texts, l, "badName") }
-        const outcome = yield* transact(l, (tx, now) => {
+        const outcome = yield* transact(l, (tx, now): Outcome => {
           const row = lookup(tx, r.item)
           const item = row?.value.name ?? r.item
+          const common = { ...(device !== undefined ? { device } : {}) }
           let base: Base
           let said: string
           if (r.kind === "item") {
@@ -134,11 +147,22 @@ export const pantryActions = (deps: PantryDeps) => {
             said = base.kind === "ok" ? saidText(r.quantity, base.amount, base.unit, l, item) : ""
           }
           if (base.kind === "ask") return sayOf(base.key, base.values)
-          if (base.kind !== "ok") return sayOf("howMuchAdd", { item })
+          if (base.kind === "rest") return sayOf("howMuchAdd", { item })
+          // "Some" or packages of an unknown size: something was added, but not how much. Booked, and the stock is unknown.
+          if (base.kind === "some" || base.kind === "packUnknown") {
+            if (row === undefined) return sayOf("howMuchAdd", { item })
+            const b = book(tx, row, { kind: "add", delta: 0, approx: true, said: r.kind === "amount" ? r.quantity.said : "", ...common }, now)
+            const main = base.kind === "packUnknown" ? say(texts, l, "packUnknownBooked", { item }) : say(texts, l, "addedSome", { item })
+            return { kind: "booked", id: row.id, ...b, created: false, main }
+          }
           const target = row ?? createProduct(tx, r.item, base.unit)
+          if (!fits(target.value, base.amount)) return sayOf("tooMuch", { item })
           const approx = r.kind === "amount" && r.quantity.approx
-          const b = book(tx, target, { kind: "add", delta: base.amount, approx, said: r.kind === "amount" ? r.quantity.said : said, ...(device !== undefined ? { device } : {}) }, now)
-          return { kind: "booked", id: target.id, before: b.before, after: b.after, created: row === undefined, said, text: row === undefined ? "addedNew" : "added" }
+          const b = book(tx, target, { kind: "add", delta: base.amount, approx, said: r.kind === "amount" ? r.quantity.said : said, ...common }, now)
+          const main = row === undefined
+            ? `${say(texts, l, "addedNew", { added: said, item: b.after.name })}${b.after.unknown ? ` ${stockSentence(b.after, l)}` : ""}`
+            : `${say(texts, l, "added", { added: said })} ${stockSentence(b.after, l)}`
+          return { kind: "booked", id: target.id, ...b, created: row === undefined, main }
         })
         return yield* finish(outcome, l)
       })
@@ -166,18 +190,28 @@ export const pantryActions = (deps: PantryDeps) => {
           const base = baseOf(r.quantity, p, p.name, l)
           if (base.kind === "ask") return sayOf(base.key, base.values)
           const common = { said: r.quantity.said, ...(device !== undefined ? { device } : {}) }
-          if (base.kind === "some") {
-            const b = book(tx, row, { kind: "use", delta: 0, approx: true, uncertain: true, ...common }, now)
-            return { kind: "booked", id: row.id, ...b, created: false, said: "", text: "uncertain" }
+          const booked = (b: ReturnType<typeof book>, main: string): Outcome => ({ kind: "booked", id: row.id, ...b, created: false, main })
+          if (base.kind === "some" || base.kind === "packUnknown") {
+            const b = book(tx, row, { kind: "use", delta: 0, approx: true, ...common }, now)
+            return booked(b, base.kind === "packUnknown" ? say(texts, l, "packUnknownUsed", { item: p.name }) : say(texts, l, "uncertain", { item: p.name }))
           }
-          if (base.kind === "rest" || base.amount > p.stock) {
-            const b = book(tx, row, { kind: "use", delta: -p.stock, approx: false, flags: { approx: false, uncertain: false }, ...common }, now)
-            return { kind: "booked", id: row.id, ...b, created: false, said: "", text: base.kind === "rest" || p.stock === 0 ? "none" : "overspent" }
+          if (base.kind === "rest") {
+            const b = book(tx, row, { kind: "use", delta: -p.stock, approx: false, unknown: false, ...common }, now)
+            return booked(b, say(texts, l, "none", { item: p.name }))
+          }
+          if (base.amount > p.stock) {
+            // More than is on record. Known: the record was wrong, and it is none now, said so. Unknown: it was only a
+            // last known amount, so it stays unknown.
+            if (p.unknown) return booked(book(tx, row, { kind: "use", delta: -p.stock, approx: r.quantity.approx, ...common }, now), "")
+            const b = book(tx, row, { kind: "use", delta: -p.stock, approx: false, unknown: false, ...common }, now)
+            return booked(b, p.stock === 0 ? say(texts, l, "none", { item: p.name }) : say(texts, l, "overspent", { item: p.name, had: stockText(p, l) }))
           }
           const b = book(tx, row, { kind: "use", delta: -base.amount, approx: r.quantity.approx, ...common }, now)
-          return { kind: "booked", id: row.id, ...b, created: false, said: "", text: b.after.stock <= 0 ? "none" : "left" }
+          if (b.after.unknown) return booked(b, okayUnsure(b.after, l))
+          return booked(b, b.after.stock <= 0 ? say(texts, l, "none", { item: p.name }) : say(texts, l, "left", { total: stockText(b.after, l) }))
         })
-        return yield* finish(outcome, l)
+        const fixed = outcome.kind === "booked" && outcome.main === "" ? { ...outcome, main: okayUnsure(outcome.after, l) } : outcome
+        return yield* finish(fixed, l)
       })
   })
 
@@ -198,8 +232,8 @@ export const pantryActions = (deps: PantryDeps) => {
         const outcome = yield* transact(l, (tx, now): Outcome => {
           const row = lookup(tx, r.item)
           if (row === undefined) return { kind: "unknown", item: r.item }
-          const b = book(tx, row, { kind: "set", delta: -row.value.stock, approx: false, flags: { approx: false, uncertain: false }, said: cleanPhrase(what).slice(0, 80), ...(device !== undefined ? { device } : {}) }, now)
-          return { kind: "booked", id: row.id, ...b, created: false, said: "", text: "none" }
+          const b = book(tx, row, { kind: "set", delta: -row.value.stock, approx: false, unknown: false, said: cleanPhrase(what).slice(0, 80), ...(device !== undefined ? { device } : {}) }, now)
+          return { kind: "booked", id: row.id, ...b, created: false, main: say(texts, l, "none", { item: row.value.name }) }
         })
         return yield* finish(outcome, l)
       })
@@ -208,7 +242,8 @@ export const pantryActions = (deps: PantryDeps) => {
   const set = defineAction({
     id: "stock_set",
     label: "Correct the stock",
-    description: "Say how much of a product there is now, replacing what was on record (\"there's about a kilo of rice left\"). Also for something not yet in the pantry.",
+    description:
+      "Say how much of a product there is now, replacing what was on record (\"there's a kilo of rice left\"). An exact amount makes the stock known again; \"about\" keeps it approximate. Also for something not yet in the pantry.",
     examples: ["there is about a kilo of rice left", "we have two litres of milk left", "er is nog ongeveer een kilo rijst", "we hebben nog twee liter melk"],
     params: { what: whatParam("How much of what", ["is", "are", "have", "nog"]) },
     risk: "change",
@@ -226,17 +261,17 @@ export const pantryActions = (deps: PantryDeps) => {
           if (r.kind === "item") return sayOf("howMuchSet", { item })
           const base = baseOf(r.quantity, row?.value, item, l)
           if (base.kind === "ask") return sayOf(base.key, base.values)
+          if (base.kind === "packUnknown") return sayOf("packSize", { item })
           if (base.kind !== "ok") return sayOf("howMuchSet", { item })
           const target = row ?? createProduct(tx, r.item, base.unit)
-          const b = book(tx, target, {
-            kind: "set",
-            delta: base.amount - target.value.stock,
-            approx: r.quantity.approx,
-            flags: { approx: r.quantity.approx, uncertain: false },
-            said: r.quantity.said,
-            ...(device !== undefined ? { device } : {})
-          }, now)
-          return { kind: "booked", id: target.id, ...b, created: row === undefined, said: "", text: b.after.stock <= 0 ? "none" : "setTo" }
+          const approx = r.quantity.approx
+          const b = book(tx, target, { kind: "set", delta: round(base.amount - target.value.stock), approx, unknown: approx, said: r.quantity.said, ...(device !== undefined ? { device } : {}) }, now)
+          const main = approx
+            ? say(texts, l, "setApprox", { total: lastKnownText(b.after, l) })
+            : b.after.stock <= 0
+            ? say(texts, l, "none", { item: b.after.name })
+            : say(texts, l, "setTo", { total: stockText(b.after, l) })
+          return { kind: "booked", id: target.id, ...b, created: row === undefined, main }
         })
         return yield* finish(outcome, l)
       })
@@ -256,15 +291,16 @@ export const pantryActions = (deps: PantryDeps) => {
         const name = item === undefined ? "" : cleanPhrase(item)
         if (name === "" || keyOf(name) === "") {
           const { rows, cut } = yield* pantry.all().pipe(Effect.mapError(unreadable))
-          const stocked = rows.filter((r) => r.value.stock > 0)
-          if (stocked.length === 0) return { say: say(texts, l, "empty") }
-          const list = speakList(stocked.map((r) => stockText(r.value, l)), l, { max: 6 }) ?? ""
-          return { say: `${say(texts, l, "overview", { list })}${cut ? ` ${say(texts, l, "pantryCut", { count: PRODUCT_SCAN })}` : ""}` }
+          // A product of unknown stock is named too, with what was last known: it may be there.
+          const shown = rows.filter((r) => r.value.stock > 0 || r.value.unknown)
+          const cutNote = cut ? ` ${say(texts, l, "pantryCut", { count: PRODUCT_SCAN })}` : ""
+          if (shown.length === 0) return { say: cut ? say(texts, l, "emptyCut", { count: PRODUCT_SCAN }) : say(texts, l, "empty") }
+          return { say: `${say(texts, l, "overview", { list: listText(shown.map((r) => overviewText(r.value, l)), l, cut) })}${cutNote}` }
         }
         const row = yield* pantry.find(name).pipe(Effect.mapError(unreadable))
         if (row === undefined) return yield* finish({ kind: "unknown", item: name }, l)
         const p = row.value
-        if (p.uncertain) return { say: p.stock > 0 ? say(texts, l, "haveUnsure", { item: p.name, total: stockText(p, l) }) : say(texts, l, "haveUnsureNone", { item: p.name }) }
+        if (p.unknown) return { say: p.stock > 0 ? say(texts, l, "haveUnsure", { item: p.name, total: lastKnownText(p, l) }) : say(texts, l, "haveUnsureNone", { item: p.name }) }
         return { say: p.stock > 0 ? say(texts, l, "have", { total: stockText(p, l) }) : say(texts, l, "haveNone", { item: p.name }) }
       })
   })
@@ -279,18 +315,20 @@ export const pantryActions = (deps: PantryDeps) => {
     run: () =>
       Effect.gen(function*() {
         const l = lang()
-        const { rows } = yield* scan(pantry.productStore, { where: { low: true }, orderBy: { field: "key", direction: "asc" } }, PRODUCT_PAGE, 100).pipe(
+        const { rows, cut } = yield* scan(pantry.productStore, { where: { low: true }, orderBy: { field: "key", direction: "asc" } }, PRODUCT_PAGE, LOW_SCAN).pipe(
           Effect.mapError(() => new ActionError({ message: say(texts, l, "unreadable") }))
         )
         if (rows.length === 0) return { say: say(texts, l, "lowNone") }
-        return { say: say(texts, l, "low", { list: speakList(rows.map((r) => r.value.name), l, { max: 6 }) ?? "" }) }
+        const main = say(texts, l, "low", { list: listText(rows.map((r) => r.value.name), l, cut) })
+        return { say: cut ? `${main} ${say(texts, l, "lowCut", { count: LOW_SCAN })}` : main }
       })
   })
 
   const undo = defineAction({
     id: "undo",
     label: "Undo the last pantry change",
-    description: "Reverse the last pantry booking made on this device in the last day, with a reversing booking. Saying it again undoes the one before.",
+    description:
+      "Reverse the last pantry booking made on this device, when it was made in the last ten minutes and nothing else was booked for that product since. One step only: after an undo there is nothing more to undo; otherwise set the amount instead.",
     examples: ["undo that", "undo the last pantry change", "that was wrong, undo it", "maak dat ongedaan", "draai dat terug"],
     params: {},
     risk: "change",
@@ -300,35 +338,23 @@ export const pantryActions = (deps: PantryDeps) => {
         const device = yield* deviceOf
         if (device === undefined) return { say: say(texts, l, "undoNoDevice") }
         const outcome = yield* transact(l, (tx, now): Outcome => {
-          const last = lastUndoable(tx, device, now)
-          const row = last === undefined ? undefined : tx.collection(products).get(last.value.product)
-          if (last === undefined || row === undefined) return sayOf("nothingToUndo")
-          // The product's flags after the undo: as they were before the undone booking, plus what the bookings after it
-          // (not undone themselves) made approximate or uncertain. A correction after it, or more than one page of
-          // bookings after it, keeps the flags as they are now (the cautious reading).
-          const recent = tx.collection(bookings).list({ where: { product: row.id }, orderBy: { field: "at", direction: "desc" }, limit: 30 })
-          const at = recent.findIndex((r) => r.id === last.id)
-          const newer = at < 0 ? undefined : recent.slice(0, at)
-          const cancelled = new Set((newer ?? []).flatMap((r) => (r.value.undoes !== undefined ? [r.value.undoes] : [])))
-          const standing = (newer ?? []).filter((r) => r.value.kind !== "undo" && !cancelled.has(r.id))
-          const flags = newer === undefined || standing.some((r) => r.value.kind === "set")
-            ? { approx: row.value.approx || last.value.approxBefore, uncertain: row.value.uncertain }
-            : {
-              approx: last.value.approxBefore || standing.some((r) => r.value.approx),
-              uncertain: last.value.uncertainBefore || standing.some((r) => r.value.uncertain === true)
-            }
-          const wasOnly = newer !== undefined && newer.length === 0 && recent.length === 1
-          const b = book(tx, row, { kind: "undo", delta: -last.value.delta, approx: false, flags, undoes: last.id, device }, now)
+          const u = undoable(tx, device, now)
+          if (u.kind === "nothing") return sayOf("nothingToUndo")
+          if (u.kind === "tooOld") return sayOf("undoTooOld", { item: u.product.value.name })
+          if (u.kind === "changedSince") return sayOf("undoChanged", { item: u.product.value.name, Item: capital(u.product.value.name) })
+          const row = u.product
+          const wasOnly = tx.collection(bookings).list({ where: { product: row.id }, orderBy: { field: "at", direction: "asc" }, limit: 2 }).length === 1
+          // Nothing was booked for the product since: the reversal is exact, and the stock is known or unknown as it was.
+          const b = book(tx, row, { kind: "undo", delta: -u.booking.value.delta, approx: false, unknown: u.booking.value.unknownBefore, device }, now)
+          const p = row.value
           // The booking that made the product was its only one, and nothing was set for it: the product goes with it
           // (a misheard "a kilo of ice" leaves nothing behind).
-          const p = row.value
-          if (wasOnly && b.after.stock === 0 && p.min === undefined && p.pack === undefined && p.aliases.length === 0) {
+          if (wasOnly && b.after.stock === 0 && !b.after.unknown && p.min === undefined && p.pack === undefined && p.aliases.length === 0) {
             removeProduct(tx, row.id)
-            return { kind: "booked", id: row.id, ...b, created: false, said: "", text: "undoneGone" }
+            return sayOf("undoneGone", { item: p.name })
           }
-          return { kind: "booked", id: row.id, ...b, created: false, said: "", text: b.after.stock > 0 ? "undone" : "undoneNone" }
+          return { kind: "booked", id: row.id, ...b, created: false, main: `${say(texts, l, "undone")} ${stockSentence(b.after, l)}` }
         })
-        if (outcome.kind === "booked" && outcome.text === "undoneGone") return { say: say(texts, l, "undoneGone", { item: outcome.after.name }) }
         return yield* finish(outcome, l)
       })
   })
@@ -353,11 +379,12 @@ export const pantryActions = (deps: PantryDeps) => {
           if (r.kind === "item") return sayOf("howMuchMin", { item })
           const base = baseOf(r.quantity, row?.value, item, l)
           if (base.kind === "ask") return sayOf(base.key, base.values)
+          if (base.kind === "packUnknown") return sayOf("packSize", { item })
           if (base.kind !== "ok") return sayOf("howMuchMin", { item })
           const target = row ?? createProduct(tx, r.item, base.unit)
           const after: Product = { ...target.value, min: base.amount, low: lowOf(target.value.stock, base.amount) }
           tx.collection(products).update(target.id, () => after)
-          return { kind: "booked", id: target.id, before: target.value, after, created: row === undefined, said: "", text: "minimumSet" }
+          return { kind: "booked", id: target.id, before: target.value, after, created: row === undefined, main: say(texts, l, "minimumSet", { min: amountText(base.amount, after.unit, false, l, after.name) }) }
         })
         return yield* finish(outcome, l)
       })
@@ -397,17 +424,20 @@ export const productTools = (deps: PantryDeps) => {
           const p = row.value
           const shown: { min?: string; pack?: string; alias?: string } = {}
           let next: Product = p
-          const asBase = (text: string, allowPack: boolean): number | { readonly spoken: string } => {
+          const asBase = (text: string, allowPack: boolean, exact: boolean): number | { readonly spoken: string } => {
             const q = readAmount(text, l, cupMl)
             if (q === undefined) return { spoken: say(texts, l, "unclear") }
+            // A package size is exact or it is not kept: "about 900 grams" would turn two bags into an exact amount.
+            if (exact && q.approx) return { spoken: say(texts, l, "packApprox", { item: p.name }) }
             const { pack: _pack, ...noPack } = next
             const b = baseOf(q, allowPack ? next : noPack, p.name, l)
             if (b.kind === "ask") return { spoken: say(texts, l, b.key, b.values) }
+            if (b.kind === "packUnknown") return { spoken: say(texts, l, "packSize", { item: p.name }) }
             if (b.kind !== "ok" || b.amount <= 0) return { spoken: say(texts, l, "unclear") }
             return b.amount
           }
           if (input.package !== undefined) {
-            const pack = asBase(input.package, false)
+            const pack = asBase(input.package, false, true)
             if (typeof pack !== "number") return pack
             next = { ...next, pack }
             shown.pack = say(texts, l, "detailPack", { pack: amountText(pack, p.unit, false, l) })
@@ -417,7 +447,7 @@ export const productTools = (deps: PantryDeps) => {
             next = { ...rest, low: lowOf(next.stock, undefined) }
             shown.min = say(texts, l, "detailNoMin")
           } else if (input.minimum !== undefined) {
-            const min = asBase(input.minimum, true)
+            const min = asBase(input.minimum, true, false)
             if (typeof min !== "number") return min
             next = { ...next, min, low: lowOf(next.stock, min) }
             shown.min = say(texts, l, "detailMin", { min: amountText(min, p.unit, false, l) })
@@ -447,7 +477,7 @@ export const productTools = (deps: PantryDeps) => {
         }
         const { id, before, after, details } = result.booked
         const main = say(texts, l, "productSaved", { item: after.name.charAt(0).toUpperCase() + after.name.slice(1), details: speakList(details, l, { max: 4 }) ?? "" })
-        const list = yield* pantry.followList(id, before, after, settings, l)
+        const list = yield* pantry.followList(id, before, after.name, settings, l)
         return { spoken: list === undefined ? main : `${main} ${list}` }
       })
   })
@@ -460,17 +490,20 @@ export const productTools = (deps: PantryDeps) => {
     execute: ({ item }) =>
       Effect.gen(function*() {
         const l = lang()
+        const failed = (e: unknown) => new ToolError({ message: storeFailureText(e, l, "unsaved") })
+        // The product and its names go at once, with its first bookings; the rest of its history goes in steps of
+        // their own, and whatever a restart leaves is finished by the nightly job (its `forgotten` row says so).
         const gone = yield* store.transaction((tx) => {
           const row = lookup(tx, item)
           if (row === undefined) return undefined
-          removeProduct(tx, row.id)
-          return row.value.name
-        }).pipe(Effect.mapError((e) => new ToolError({ message: storeFailureText(e, l, "unsaved") })))
+          return { id: row.id, name: row.value.name, left: removeProduct(tx, row.id) }
+        }).pipe(Effect.mapError(failed))
         if (gone === undefined) {
           const suggestion = yield* pantry.suggest(item)
           return { spoken: suggestion !== undefined ? say(texts, l, "unknownMaybe", { item, suggestion }) : say(texts, l, "unknown", { item }) }
         }
-        return { spoken: say(texts, l, "forgotten", { item: gone.charAt(0).toUpperCase() + gone.slice(1) }) }
+        if (gone.left) yield* drainForgotten(store, gone.id, FORGET_NOW).pipe(Effect.orElseSucceed(() => ({ removed: 0, done: false })))
+        return { spoken: say(texts, l, "forgotten", { item: gone.name.charAt(0).toUpperCase() + gone.name.slice(1) }) }
       })
   })
 

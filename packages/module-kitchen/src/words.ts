@@ -1,24 +1,83 @@
 // What the kitchen does with words: the key a product or ingredient is found by, the phrase a person says cleaned of
-// what is not the quantity, and the conservative matching of allergies and diets. Pure functions, each bounded by the
-// length of its (already bounded) input; no state.
+// what is not the quantity, and diets and dislikes. Pure functions, each bounded by the length of its (already
+// bounded) input; no state. Allergies are not matched here: they go by the fixed vocabulary (`allergens.ts`).
 import { normalizePhrase, stem } from "@pva/core"
 import { type Language, parseQuantity, type Quantity } from "@pva/language"
 
-/** The longest key: product names and ingredient keys are cut to this. */
+/** The longest key: product names and ingredient keys are cut to this (pantry matching only; never an allergy check). */
 export const KEY_CHARS = 40
 
 const LEADING = new Set(["the", "a", "an", "my", "our", "de", "het", "een", "mijn", "onze", "ons"])
 
-/** One word in its singular form, for the plurals that matter in a kitchen ("tomatoes", "berries", "eggs"). */
-const singular = (w: string): string => {
-  if (w.length > 4 && w.endsWith("ies")) return `${w.slice(0, -3)}y`
-  if (w.length > 4 && w.endsWith("oes")) return w.slice(0, -2)
-  return stem(w)
+/** Dutch plurals the endings below do not reach, and the diminutives a kitchen uses. */
+const IRREGULAR: Readonly<Record<string, string>> = {
+  eieren: "ei",
+  eitjes: "ei",
+  eitje: "ei",
+  uien: "ui",
+  uitjes: "ui",
+  uitje: "ui",
+  groenten: "groente",
+  linzen: "linze",
+  kalveren: "kalf",
+  lammeren: "lam",
+  runderen: "rund",
+  kinderen: "kind",
+  bladeren: "blad",
+  kruidjes: "kruid",
+  tomaatjes: "tomaat",
+  worteltjes: "wortel",
+  aardappeltjes: "aardappel"
+}
+
+const VOWEL = /[aeiouy]/u
+const isVowel = (c: string | undefined) => c !== undefined && VOWEL.test(c)
+
+/**
+ * The Dutch "-en" plural taken off ("tomaten" → "tomaat", "bonen" → "boon", "kazen" → "kaas", "druiven" → "druif",
+ * "kippen" → "kip", "aardappelen" → "aardappel"), for a word of five letters or more that does not end in "-een".
+ * The open syllable gets its long vowel back where a single a, o or u (or the e of a one-syllable word) stood.
+ */
+const dutchEn = (w: string): string => {
+  if (w.length < 5 || !w.endsWith("en") || w.endsWith("een")) return w
+  let s = w.slice(0, -2)
+  if (s.endsWith("z")) s = `${s.slice(0, -1)}s`
+  else if (s.endsWith("v")) s = `${s.slice(0, -1)}f`
+  const last = s.at(-1)
+  const vowel = s.at(-2)
+  const before = s.at(-3)
+  if (last !== undefined && !isVowel(last) && s.at(-2) === last) return s.slice(0, -1)
+  const syllables = s.match(/[aeiouy]+/gu)?.length ?? 0
+  if (last !== undefined && !isVowel(last) && vowel !== undefined && "aou".includes(vowel) && !isVowel(before)) return `${s.slice(0, -1)}${vowel}${last}`
+  if (last !== undefined && !isVowel(last) && vowel === "e" && !isVowel(before) && syllables === 1) return `${s.slice(0, -1)}e${last}`
+  return s
+}
+
+/**
+ * One word in its singular form, English and Dutch alike ("tomatoes", "berries", "eggs", "eieren", "tomaten"), so a
+ * product said in the singular and in the plural is one product, in either language. The rules are applied until the
+ * word stays the same, so a word and its plural meet in one key ("kazen" and "kaas", "chickens" and "chicken").
+ */
+export const singular = (word: string): string => {
+  let w = word
+  for (let i = 0; i < 4; i++) {
+    const irregular = IRREGULAR[w]
+    let next = irregular ?? w
+    if (irregular === undefined) {
+      if (next.length > 4 && next.endsWith("ies")) next = `${next.slice(0, -3)}y`
+      else if (next.length > 4 && next.endsWith("oes")) next = next.slice(0, -2)
+      else next = stem(next)
+      if (next === w) next = dutchEn(next)
+    }
+    if (next === w) return w
+    w = next
+  }
+  return w
 }
 
 /**
  * The key a name is found by: lower case, accents and punctuation dropped, a leading article dropped, each word in its
- * singular form, at most `KEY_CHARS` characters. "The Tomatoes" and "tomato" have one key; "rijst" is "rijst".
+ * singular form, at most `KEY_CHARS` characters. "The Tomatoes" and "tomato" have one key; so do "eieren" and "ei".
  */
 export const keyOf = (name: string): string => {
   const ws = normalizePhrase(name.slice(0, 200)).split(" ").filter((w) => w !== "")
@@ -27,11 +86,13 @@ export const keyOf = (name: string): string => {
 }
 
 /** Words that say how an ingredient is prepared: "cooked rice" is rice from the pantry (matching tries without them). */
-const PREPARED = new Set([
-  "cooked", "boiled", "chopped", "diced", "sliced", "fresh", "dried", "grated", "minced", "tinned", "canned", "frozen", "large", "small",
-  "medium", "ripe", "crushed", "ground", "whole", "raw", "peeled", "gekookte", "gekookt", "gehakte", "gehakt", "verse", "vers", "gedroogde",
-  "geraspte", "gesneden", "grote", "kleine", "rijpe", "bevroren", "diepvries", "gepelde", "gemalen", "hele"
-])
+const PREPARED = new Set(
+  [
+    "cooked", "boiled", "chopped", "diced", "sliced", "fresh", "dried", "grated", "minced", "tinned", "canned", "frozen", "large", "small",
+    "medium", "ripe", "crushed", "ground", "whole", "raw", "peeled", "gekookte", "gekookt", "gehakte", "gehakt", "verse", "vers", "gedroogde",
+    "geraspte", "gesneden", "grote", "kleine", "rijpe", "bevroren", "diepvries", "gepelde", "gemalen", "hele"
+  ].map(singular)
+)
 
 /** The keys an ingredient may be found under, most specific first: "cooked rice", then "rice". */
 export const ingredientKeys = (key: string): ReadonlyArray<string> => {
@@ -47,16 +108,20 @@ export const ingredientKeys = (key: string): ReadonlyArray<string> => {
 // ---------------------------------------------------------------------------------------------------------------------
 // The phrase a person says
 
-/** Trailing words that name where it goes or that it is left, not what it is ("to the pantry", "left", "gekocht"). */
+/**
+ * Trailing words that name where it goes, that it is left or gone, not what it is ("to the pantry", "left", "is op",
+ * "zijn", "gekocht"). Longer phrases first: "is op" before "op".
+ */
 const TRAILING = [
   /\s+(?:to|in|into|on|from)\s+(?:the\s+)?(?:pantry|cupboard|fridge|freezer|stock|larder|kitchen|house)$/iu,
-  /\s+(?:is|are)\s+left$/iu,
-  /\s+(?:left|please|today|now|at home|in the house|do we have|have we got|we have|have i got|i have)$/iu,
+  /\s+(?:is|are|was|were)\s+(?:left|gone|finished|empty|out|all gone)$/iu,
+  /\s+(?:left|please|today|now|at home|in the house|in stock|do we have|have we got|we have|have i got|i have)$/iu,
   /\s+(?:aan|in|uit)\s+(?:de\s+|het\s+)?(?:voorraad|voorraadkast|koelkast|vriezer|keuken|kast|huis)$/iu,
-  /\s+(?:gekocht|gebruikt|toegevoegd|toe|op|over|meer|nog|gehaald|gegeten|opgemaakt|alsjeblieft|graag|vandaag|hebben we nog|hebben we|is er nog|zijn er nog)$/iu
+  /\s+(?:is|zijn|was|waren)\s+(?:op|leeg|weg|over|er nog|opgemaakt)$/iu,
+  /\s+(?:gekocht|gebruikt|toegevoegd|toe|op|over|meer|nog|gehaald|gegeten|opgemaakt|alsjeblieft|graag|vandaag|hebben we nog|hebben we|is er nog|zijn er nog|in huis zijn|zijn|is|hebben|heb|hebt|heeft|in huis)$/iu
 ]
-/** Leading words that are not the quantity ("I", "we", "out of", "ik", "er"). */
-const LEADING_WORDS = /^(?:i|we|we've|ive|i've|just|also|out of|of|ik|we|er|nog|ook|net|van)\s+/iu
+/** Leading words that are not the quantity ("I", "we", "out of", "at least", "ik", "er", "altijd"). */
+const LEADING_WORDS = /^(?:i|we|we've|ive|i've|just|also|out of|of|at least|always|ik|er|nog|ook|net|van|altijd|minstens|ten minste|tenminste|dat er|dat)\s+/iu
 
 /** "some of the cheese" is "some cheese", "wat van de kaas" is "wat kaas": the quantity grammar takes no "of the" there. */
 const SOME_OF: ReadonlyArray<readonly [RegExp, string]> = [
@@ -109,67 +174,11 @@ export const readPhrase = (text: string, language: Language, cupMl: number): Rea
 }
 
 // ---------------------------------------------------------------------------------------------------------------------
-// Allergies and diets (conservative: when in doubt, a recipe is left out)
-
-/**
- * What an allergy also covers, by key, in both languages: a safety net beside the allergens a recipe declares. Matching
- * is by substring of keys, so "nut" also leaves out nutmeg and coconut: a recipe left out by mistake is the safe error.
- */
-const ALLERGY_TERMS: Readonly<Record<string, ReadonlyArray<string>>> = (() => {
-  const nuts = ["nut", "almond", "cashew", "pecan", "pistachio", "hazelnut", "walnut", "macadamia", "peanut", "praline", "marzipan", "pesto", "noot", "noten", "amandel", "pinda", "hazelnoot", "walnoot", "marsepein", "satay", "sate"]
-  const peanut = ["peanut", "pinda", "satay", "sate"]
-  const gluten = ["gluten", "wheat", "flour", "bread", "pasta", "spaghetti", "noodle", "couscous", "barley", "rye", "spelt", "semolina", "breadcrumb", "cracker", "biscuit", "soy sauce", "beer", "tarwe", "bloem", "brood", "gerst", "rogge", "griesmeel", "paneermeel", "beschuit", "bier", "sojasaus"]
-  const dairy = ["milk", "cheese", "butter", "cream", "yoghurt", "yogurt", "lactose", "whey", "ghee", "parmesan", "mozzarella", "feta", "melk", "kaas", "boter", "room", "zuivel", "kwark", "wei"]
-  const egg = ["egg", "mayonnaise", "mayo", "meringue", "ei", "eieren", "mayonaise"]
-  const fish = ["fish", "salmon", "tuna", "cod", "anchovy", "sardine", "mackerel", "haddock", "vis", "zalm", "tonijn", "kabeljauw", "ansjovis", "makreel"]
-  const shellfish = ["shellfish", "shrimp", "prawn", "crab", "lobster", "mussel", "oyster", "clam", "scallop", "garnaal", "garnalen", "krab", "kreeft", "mossel", "oester", "schaaldier"]
-  const soy = ["soy", "soya", "tofu", "tempeh", "edamame", "miso", "soja", "sojasaus"]
-  const sesame = ["sesame", "tahini", "sesam"]
-  const celery = ["celery", "celeriac", "selderij", "knolselderij"]
-  const mustard = ["mustard", "mosterd"]
-  const out: Record<string, ReadonlyArray<string>> = {}
-  const add = (names: ReadonlyArray<string>, terms: ReadonlyArray<string>) => {
-    for (const n of names) out[keyOf(n)] = [...(out[keyOf(n)] ?? []), ...terms.map(keyOf)]
-  }
-  add(["nuts", "nut", "tree nuts", "noten", "noot", "notenallergie"], nuts)
-  add(["peanuts", "peanut", "pinda", "pindas", "pinda's"], peanut)
-  add(["gluten", "wheat", "coeliac", "celiac", "tarwe", "coeliakie"], gluten)
-  add(["dairy", "milk", "lactose", "zuivel", "melk", "lactose-intolerant", "lactose intolerance"], dairy)
-  add(["egg", "eggs", "ei", "eieren"], egg)
-  add(["fish", "vis"], fish)
-  add(["shellfish", "crustaceans", "schaaldieren", "schelpdieren"], shellfish)
-  add(["soy", "soya", "soja"], soy)
-  add(["sesame", "sesam"], sesame)
-  add(["celery", "selderij"], celery)
-  add(["mustard", "mosterd"], mustard)
-  return out
-})()
-
-/** Whether `term` is found in `key`: a whole word for terms under four letters ("ei"), otherwise anywhere ("nut" in "peanut"). */
-const found = (term: string, key: string): boolean => {
-  if (term === "") return false
-  if (term.length < 4) return (` ${key} `).includes(` ${term} `)
-  return key.includes(term)
-}
-
-/**
- * A test of whether an allergy (as people write it: "nuts", "pinda's") is in any of some keys (a recipe's ingredients,
- * its declared allergens, its title). Its words are worked out once; each test is at most (words × keys) substring
- * checks, with at most about 30 words per allergy.
- */
-export const allergyTest = (allergy: string): ((keys: ReadonlyArray<string>) => boolean) => {
-  const k = keyOf(allergy)
-  if (k === "") return () => false
-  const terms = [...new Set([k, ...(ALLERGY_TERMS[k] ?? []), ...k.split(" ").flatMap((w) => ALLERGY_TERMS[w] ?? [])])]
-  return (keys) => keys.some((key) => terms.some((term) => found(term, key)))
-}
-
-/** Whether an allergy is in any of these keys (`allergyTest`, once). */
-export const allergyIn = (allergy: string, keys: ReadonlyArray<string>): boolean => allergyTest(allergy)(keys)
+// Diets and dislikes (a diet is met only when a recipe declares it; a dislike only lowers a recipe)
 
 /** A diet as one canonical word, both languages: "Vegetarisch" and "veggie" are "vegetarian". */
 export const dietKey = (diet: string): string => {
-  const k = keyOf(diet).replace(/-/gu, " ")
+  const k = normalizePhrase(diet.slice(0, 200)).replace(/-/gu, " ")
   const table: Readonly<Record<string, string>> = {
     vegetarian: "vegetarian", veggie: "vegetarian", vegetarisch: "vegetarian", vegetarier: "vegetarian",
     vegan: "vegan", veganistisch: "vegan", veganist: "vegan", plantaardig: "vegan",
@@ -194,3 +203,9 @@ export const dietFits = (diet: string, declared: ReadonlyArray<string>): boolean
   if (d === "") return true
   return (SATISFIES[d] ?? [d]).some((x) => declared.includes(x))
 }
+
+/** The longest dislike compared (a dislike only orders the answer, so a longer one is cut, never matched in part). */
+const DISLIKE_CHARS = 60
+
+/** A dislike as it is looked for in a recipe's title and lines: `normalizePhrase`, cut to a bound. */
+export const dislikeText = (dislike: string): string => normalizePhrase(dislike.slice(0, DISLIKE_CHARS))

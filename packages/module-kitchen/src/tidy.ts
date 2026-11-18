@@ -1,28 +1,65 @@
-// The nightly job: it keeps the ledger bounded and checks it. For each product, bookings older than `keepDays` are
-// folded into one `carry` booking with their sum (so the sum, and so the stock, is unchanged); the product's running
-// sum is compared with its ledger and, should they ever differ, set to the ledger's (the ledger is the truth);
-// bookings of a product that no longer exists are removed; and every low product is put on the shopping list again
-// (same key: one item), which catches what a booking could not put there while the Lists module was off.
-// Each product is one small transaction; the job yields between them.
+// The nightly job: it keeps the ledger bounded and checked, finishes forgetting products, and brings the shopping list
+// into line with every product. Each part is bounded per night and carries on the next night where it stopped: the
+// products are taken in order of when the job last saw them (`tidiedAt`, `listedAt`), oldest first, so nothing is
+// starved by a prefix it keeps reading. Each step is one small transaction; the job yields between them. Running it
+// twice does no harm (the scheduler retries it after a restart in the middle).
+//
+// - Folding: for each product, bookings older than `keepDays` are folded into one `carry` booking with their sum, so
+//   the sum, and so the stock, is unchanged; the product's running sum is compared with its ledger and, should they
+//   ever differ, set to the ledger's (the ledger is the truth).
+// - Forgotten products: their bookings are removed in steps until none are left.
+// - The shopping list: a low product gets its open item (one key per product, so one item); a product that is not
+//   low has the item kitchen put there ticked off. When the list is off, failing or slow, the night stops asking it
+//   and those products are first the next night.
 import { type Actor, type ModuleHostApi, type ModuleStore, type Row } from "@pva/core"
-import { Lists, useService } from "@pva/module-contracts"
-import { Effect } from "effect"
-import { type Booking, bookings, type Product, products, scan } from "./data.ts"
-import { listKey, LISTS_TIMEOUT_MS, lowOf, round, type PantrySettings } from "./pantry.ts"
+import { Lists, ListsError, useService } from "@pva/module-contracts"
+import { Effect, Option } from "effect"
+import { type Booking, bookings, forgotten, type Product, products } from "./data.ts"
+import { drainForgotten, listKey, LISTS_TIMEOUT_MS, lowOf, type PantrySettings, round, wanted } from "./pantry.ts"
 
-/** The most products and bookings one night looks at, and the most bookings read or folded in one transaction. */
-export const TIDY_PRODUCTS = 5_000
+/** The most products folded and checked per night, and the most whose list item is brought into line. */
+export const TIDY_PRODUCTS = 2_000
+export const LIST_PRODUCTS = 500
+/** The most bookings of forgotten products removed per night. */
+export const FORGET_PER_NIGHT = 20_000
+/** The list part stops after this much real time in one night: the rest is first the next night. */
+const LIST_BUDGET_MS = 60_000
 const BOOKINGS_PER_PRODUCT = 400
 const FOLD_PER_TX = 100
 const BOOKING_PAGE = 16
-const ORPHAN_SCAN = 400
+const PAGE = 25
 
 export interface TidyReport {
   readonly folded: number
   readonly repaired: number
-  readonly orphans: number
+  readonly forgotten: number
   readonly listed: number
+  readonly ticked: number
+  /** The list part stopped early (the list was off, failing or slow). */
+  readonly listStopped: boolean
 }
+
+/**
+ * Products in order of a "last seen" field, oldest first, at most `max`, page by page, until one seen at `now` (this
+ * night) comes up: each product handled moves to the end of that order.
+ */
+const oldestFirst = (store: ModuleStore, field: "tidiedAt" | "listedAt", now: number, max: number, each: (row: Row<Product>) => Effect.Effect<boolean, unknown>) =>
+  Effect.gen(function*() {
+    let after: Row<Product> | undefined
+    let seen = 0
+    while (seen < max) {
+      const got: ReadonlyArray<Row<Product>> = yield* store.collection(products).list({ orderBy: { field, direction: "asc" }, limit: PAGE, ...(after !== undefined ? { after } : {}) })
+      for (const row of got) {
+        if (row.value[field] >= now) return
+        seen++
+        if (!(yield* each(row))) return
+        yield* Effect.yieldNow
+        if (seen >= max) return
+      }
+      if (got.length < PAGE) return
+      after = got.at(-1)
+    }
+  })
 
 export const tidy = (deps: {
   readonly store: ModuleStore
@@ -30,21 +67,28 @@ export const tidy = (deps: {
   readonly settings: PantrySettings & { readonly keepDays: number }
   readonly now: number
   readonly actor: Actor
+  /** Smaller per-night bounds, for tests that show a bounded night carrying on (the defaults otherwise). */
+  readonly bounds?: { readonly products?: number; readonly list?: number; readonly forget?: number }
 }) =>
   Effect.gen(function*() {
-    const { store, settings, actor } = deps
-    const cutoff = deps.now - settings.keepDays * 86_400_000
+    const { store, settings, actor, now } = deps
+    const cutoff = now - settings.keepDays * 86_400_000
+    const maxProducts = deps.bounds?.products ?? TIDY_PRODUCTS
+    const maxList = deps.bounds?.list ?? LIST_PRODUCTS
+    const maxForget = deps.bounds?.forget ?? FORGET_PER_NIGHT
     let folded = 0
     let repaired = 0
-    let orphans = 0
+    let forgottenRemoved = 0
     let listed = 0
-    let after: Row<Product> | undefined
-    const exists = new Set<string>()
-    for (let page = 0; page < TIDY_PRODUCTS / 25; page++) {
-      const got: ReadonlyArray<Row<Product>> = yield* store.collection(products).list({ orderBy: { field: "key", direction: "asc" }, limit: 25, ...(after !== undefined ? { after } : {}) })
-      for (const product of got) {
-        exists.add(product.id)
+    let ticked = 0
+    let listStopped = false
+
+    // 1. Fold and check, the products seen longest ago first.
+    yield* oldestFirst(store, "tidiedAt", now, maxProducts, (product) =>
+      Effect.gen(function*() {
         const outcome = yield* store.transaction((tx) => {
+          const current = tx.collection(products).get(product.id)
+          if (current === undefined) return { didFold: 0, didRepair: false }
           const rows: Array<Row<Booking>> = []
           let last: Row<Booking> | undefined
           while (rows.length < BOOKINGS_PER_PRODUCT) {
@@ -65,58 +109,75 @@ export const tidy = (deps: {
               kind: "carry",
               delta: sum,
               approx: old.some((r) => r.value.approx),
-              approxBefore: old[0]!.value.approxBefore,
-              uncertainBefore: old[0]!.value.uncertainBefore,
+              unknownBefore: old[0]!.value.unknownBefore,
               at: old.at(-1)!.value.at
             }, { actor })
             didFold = old.length
           }
           let didRepair = false
+          let next: Product = { ...current.value, tidiedAt: now }
           if (complete) {
             const sum = Math.max(0, round(rows.reduce((s, r) => s + r.value.delta, 0)))
-            const current = tx.collection(products).get(product.id)
-            if (current !== undefined && Math.abs(current.value.stock - sum) > 0.0005) {
-              tx.collection(products).update(product.id, (p) => ({ ...p, stock: sum, low: lowOf(sum, p.min) }), { actor })
+            if (Math.abs(current.value.stock - sum) > 0.0005) {
+              next = { ...next, stock: sum, low: lowOf(sum, next.min) }
               didRepair = true
             }
           }
+          tx.collection(products).update(product.id, () => next, { actor, expectRev: current.rev })
           return { didFold, didRepair }
         })
         folded += outcome.didFold
         if (outcome.didRepair) repaired++
-        yield* Effect.yieldNow
+        return true
+      }))
+
+    // 2. Forgotten products: remove their bookings in steps until none are left (bounded per night; the next night
+    // goes on with what is left).
+    for (let page = 0; page < 40 && forgottenRemoved < maxForget; page++) {
+      const rows = yield* store.collection(forgotten).list({ limit: PAGE })
+      if (rows.length === 0) break
+      let finished = 0
+      for (const row of rows) {
+        const step = yield* drainForgotten(store, row.id, maxForget - forgottenRemoved, actor)
+        forgottenRemoved += step.removed
+        if (step.done) finished++
+        if (forgottenRemoved >= maxForget) break
       }
-      if (got.length < 25) break
-      after = got.at(-1)
+      if (finished === 0) break
     }
 
-    // Bookings of products that are gone (a product forgotten with more history than one transaction removes).
-    const oldest = yield* scan(store.collection(bookings), { orderBy: { field: "at", direction: "asc" } }, BOOKING_PAGE, ORPHAN_SCAN)
-    const stray = oldest.rows.filter((r) => !exists.has(r.value.product))
-    for (let i = 0; i < stray.length; i += FOLD_PER_TX) {
-      const batch = stray.slice(i, i + FOLD_PER_TX)
-      yield* store.transaction((tx) => {
-        for (const r of batch) if (tx.collection(products).get(r.value.product) === undefined) tx.collection(bookings).remove(r.id, { actor })
-      })
-      orphans += batch.length
-      yield* Effect.yieldNow
-    }
-
-    // Low products on the shopping list again: the same key keeps one item. Stops at the first refusal or absence.
+    // 3. The shopping list, brought into line with every product in turn, the products seen longest ago first.
     if (settings.lowStockToList) {
-      const low = yield* scan(store.collection(products), { where: { low: true }, orderBy: { field: "key", direction: "asc" } }, 25, 500)
-      for (const row of low.rows) {
-        const p = row.value
-        if (!((p.min !== undefined && p.stock < p.min) || (settings.listWhenOut && p.stock <= 0))) continue
-        const ok = yield* useService(deps.host, Lists, (lists) => lists.addItem({ text: p.name, dedupeKey: listKey(row.id) })).pipe(
-          Effect.timeoutOption(LISTS_TIMEOUT_MS),
-          Effect.map((o) => o._tag === "Some"),
-          Effect.catchTag("ProviderOff", () => Effect.succeed(false)),
-          Effect.catchTag("ListsError", () => Effect.succeed(false))
-        )
-        if (!ok) break
-        listed++
-      }
+      const startedReal = performance.now()
+      yield* oldestFirst(store, "listedAt", now, maxList, (row) =>
+        Effect.gen(function*() {
+          if (performance.now() - startedReal > LIST_BUDGET_MS) {
+            listStopped = true
+            return false
+          }
+          const current = yield* store.collection(products).get(row.id)
+          if (current === undefined) return true
+          const p = current.value
+          const call = wanted(p, settings)
+            ? useService(deps.host, Lists, (lists) => lists.addItem({ text: p.name, dedupeKey: listKey(row.id) })).pipe(Effect.map(() => "listed" as const))
+            : useService(deps.host, Lists, (lists) => lists.completeByKey(listKey(row.id))).pipe(Effect.map((item) => (item === undefined ? "clear" as const : "ticked" as const)))
+          const result = yield* call.pipe(
+            Effect.timeoutOption(LISTS_TIMEOUT_MS),
+            Effect.map((o) => (Option.isNone(o) ? "stop" as const : o.value)),
+            Effect.catchTag("ProviderOff", () => Effect.succeed("stop" as const)),
+            // A refusal of this one item (the list is full, the request does not fit) is its answer for tonight; a
+            // busy or failing list stops the night, and this product is first the next one.
+            Effect.catchTag("ListsError", (e: ListsError) => Effect.succeed(e.reason === "limit" || e.reason === "invalid" ? "refused" as const : "stop" as const))
+          )
+          if (result === "stop") {
+            listStopped = true
+            return false
+          }
+          if (result === "listed") listed++
+          if (result === "ticked") ticked++
+          yield* store.collection(products).update(row.id, (v) => ({ ...v, listedAt: now }), { actor }).pipe(Effect.ignore)
+          return true
+        }))
     }
-    return { folded, repaired, orphans, listed } satisfies TidyReport
+    return { folded, repaired, forgotten: forgottenRemoved, listed, ticked, listStopped } satisfies TidyReport
   })

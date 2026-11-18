@@ -1,19 +1,20 @@
 import { CurrentJob, defineModule, type ModuleDefinition, Setting } from "@pva/core"
 import { Clock, Effect, Schema } from "effect"
-import { collections } from "./data.ts"
+import { collections, DATA_VERSION } from "./data.ts"
 import { makePantry } from "./pantry.ts"
 import { type KitchenSettings, pantryActions, productTools } from "./pantryActions.ts"
 import { recipeTools } from "./recipes.ts"
 import { tidy } from "./tidy.ts"
 
-export { bookings, names, products, recipes, recipeTexts } from "./data.ts"
+export { bookings, forgotten, names, products, recipes, recipeTexts } from "./data.ts"
 export { texts } from "./texts.ts"
 
 /**
  * The kitchen (docs/modules/kitchen.md; docs/MODULES-PLAN.md §5.1 row 7, wave A): a pantry ledger whose bookings sum
- * to each product's stock, with approximate amounts and undo by a reversing booking; product settings; low stock onto
- * the household's shopping list through the `Lists` service; stored recipes entered by voice; and
- * `kitchen_what_can_i_make`, within a time limit and the diets of the people it is for. Off by default.
+ * to each product's stock, which is either known or unknown, with a one-step undo; product settings; low stock onto
+ * the household's shopping list through the `Lists` service; stored recipes entered by voice, with their allergens
+ * declared; and `kitchen_what_can_i_make`, within a time limit and the diets and allergies of the people it is for.
+ * Off by default.
  */
 
 export const settings = {
@@ -66,14 +67,15 @@ export const kitchenModule = defineModule({
   description: "A pantry ledger, stored recipes, and what you can make with what is in the house.",
   enabledByDefault: false,
   settings,
-  storage: { version: 1, collections },
+  storage: { version: DATA_VERSION, collections },
   events: [],
   shared: (ctx) =>
     Effect.gen(function*() {
       yield* ctx.scheduler.handle("tidy", {
         payload: Schema.Struct({}),
-        // Folding is a sum kept as one booking, checking is a comparison, listing uses one key per product: running it
-        // twice does no harm, so a run cut short is run again.
+        // Folding is a sum kept as one booking, checking is a comparison, forgetting removes what is left, listing uses
+        // one key per product, and each product's progress is on its row: running it twice does no harm, so a run cut
+        // short is run again and carries on.
         idempotent: true,
         timeoutMs: 120_000,
         run: () =>
@@ -105,7 +107,7 @@ export const kitchenModule = defineModule({
         tools: [...productTools(deps), ...recipe.tools],
         actions: [...pantryActions(deps), ...recipe.actions],
         instructions:
-          "The kitchen tools keep the household's pantry and recipes. Use kitchen_stock_add only when someone bought or put away food (a bare \"add milk\" is the shopping list), kitchen_stock_use when they used some, and kitchen_undo to take the last change back; never guess what is in the pantry, ask the tools. Say amounts with their units. When you suggest a dish that is not a saved recipe, say it is your own idea, and keep strictly to the allergies and diets the tools give."
+          "The kitchen tools keep the household's pantry and recipes. Use kitchen_stock_add only when someone bought or put away food (a bare \"add milk\" is the shopping list), kitchen_stock_use when they used some, and kitchen_undo to take the last change back; never guess what is in the pantry, ask the tools. Say amounts with their units, and when the tools say an amount is not known, say so. Never fill in a recipe's allergens yourself: ask. When you suggest a dish that is not a saved recipe, or a saved recipe whose source is the assistant, say it is your own idea, and keep strictly to the allergies and diets the tools give."
       }
     })
 })
