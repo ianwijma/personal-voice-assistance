@@ -3,7 +3,9 @@ import type { AddressInfo } from "node:net"
 
 /**
  * A fake Home Assistant HTTP server on 127.0.0.1 (random port), speaking the
- * three endpoints the module uses. It records every request, and its state
+ * three endpoints the module uses, with lights only. The app's serve tests use it
+ * (`apps/assistant/test/serveModules.test.ts`); this package's own tests use the
+ * in-process fake of `fakeHa.ts`, which opens no socket. It records every request, and its state
  * changes on service calls, so a test can switch a light and read it back.
  */
 export interface FakeLight {
@@ -58,9 +60,11 @@ export const startFakeHomeAssistant = async (options: FakeHomeAssistantOptions =
   let delayMs = options.delayMs ?? 0
   let failNext: number | undefined
 
+  // The answer of the module's inventory template (`INVENTORY_TEMPLATE` in `src/house.ts`): areas, and each light with its area.
+  const areaOf = (id: string) => Object.entries(areas).find(([, a]) => a.lights.includes(id))?.[0] ?? null
   const render = () => ({
-    areas: Object.entries(areas).map(([id, a]) => ({ id, name: a.name, lights: a.lights })),
-    lights: Object.entries(lights).map(([id, l]) => ({ id, name: l.name, state: l.state, brightness: l.brightness ?? null }))
+    areas: Object.entries(areas).map(([id, a]) => ({ id, name: a.name })),
+    entities: Object.entries(lights).map(([id, l]) => ({ id, name: l.name, state: l.state, area: areaOf(id), brightness: l.brightness ?? null }))
   })
 
   const server: Server = createServer(async (req, res) => {
@@ -91,7 +95,7 @@ export const startFakeHomeAssistant = async (options: FakeHomeAssistantOptions =
     if (req.method === "POST" && path === "/api/template") {
       if (options.nonAdmin === true) return send(401, "401: Unauthorized", "text/plain")
       const template = (body as { template?: string } | undefined)?.template ?? ""
-      if (!template.includes("areas()") || !template.includes("states.light")) return send(400, { message: "unexpected template" })
+      if (!template.includes("areas()") || !template.includes("area_id(")) return send(400, { message: "unexpected template" })
       return send(200, JSON.stringify(render()), "text/plain; charset=utf-8")
     }
     const service = /^\/api\/services\/light\/(turn_on|turn_off)$/.exec(path)
