@@ -966,7 +966,11 @@ packages/
                     backups, the maintenance fiber and the doctor check (docs/STORING-DATA.md)
   net/              `@pva/net`: `safeFetch` for URLs a model or user chose (a required content-type policy, resolves the host itself,
                     refuses non-public addresses on every hop by the IANA registries, connects to the checked address, checked request
-                    headers, size limit after decompression, time limit; `makeNodeConnector({ ca })` for an owner's own CA), a cached JSON GET
+                    headers, size limit after decompression, time limit; `makeNodeConnector({ ca })` for an owner's own CA),
+                    `fetchOwnerConfiguredLan` for an address the owner typed (LAN addresses, local names, any port; GET, HEAD and a
+                    JSON `POST` the helper serialises and bounds (at most 128 KiB, inside the one deadline), sent once: every 3xx
+                    refused, no retry, another address only after a refused or timed-out connect; loopback only with `typedLoopback`
+                    and a host written exactly `localhost`, `[::1]` or `127.a.b.c`; no received header value in an error), a cached JSON GET
                     (key with the request headers, shared in-flight requests, refreshes ordered by the cache's sequence, TTL, ETag,
                     stale-if-error) and the outgoing `User-Agent` from the household API contact
                     (`HOME_API_CONTACT`); README in the package
@@ -1006,6 +1010,6 @@ apps/
   in-memory store, the core's `Privacy` rule over a test household fixed for the test, and stand-ins for the modules it
   uses (`provide`, with stubs of their services: `stubService` records calls and answers what the test programs), and
   runs its tools, actions and jobs as a given turn; it does not imitate the HTTP router. `makeOfflineNet` gives
-  `@pva/net` a resolver and connector that serve fixtures; `checkModule` is the conformance check every module's test
+  `@pva/net` a resolver and connector that serve fixtures and record each request (its method, a POST's body); `checkModule` is the conformance check every module's test
   calls (`ModuleCheck.ts` lists its rules).
 - `pnpm check` (typecheck all), `pnpm test` (all unit tests) must pass before any change is considered done.

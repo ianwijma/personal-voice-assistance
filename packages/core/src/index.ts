@@ -42,15 +42,25 @@ export {
   OFF_THREAD_CONCURRENCY,
   OFF_THREAD_DEFAULT_MEMORY_MB,
   OFF_THREAD_DEFAULT_RESULT_BYTES,
+  OFF_THREAD_ERROR_CODES,
+  OFF_THREAD_ERROR_NAMES,
+  OFF_THREAD_MAX_ANSWER_NODES,
+  OFF_THREAD_MAX_INPUT_BYTES,
+  OFF_THREAD_MAX_INPUT_ENTRIES,
   OFF_THREAD_MAX_MEMORY_MB,
   OFF_THREAD_MAX_RESULT_BYTES,
+  OFF_THREAD_MAX_STRUCTURED_RESULT_BYTES,
   OFF_THREAD_MAX_TIMEOUT_MS,
+  OFF_THREAD_MAX_WAITING,
+  OFF_THREAD_STACK_MB,
   offThread,
   OffThreadError,
+  type OffThreadInput,
   type OffThreadOptions,
   OffThreadReason,
   type OffThreadTask,
-  offThreadTask
+  offThreadTask,
+  type OffThreadValue
 } from "./OffThread.ts"
 export * from "./Resample.ts"
 export * from "./Routing.ts"

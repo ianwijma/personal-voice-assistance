@@ -666,7 +666,8 @@ describe("review round 2: permission is decided where output leaves, against com
 })
 
 describe("review round 3: a declaration that takes speech away stops the reply in flight", () => {
-  const stopCase = async (tts: Tts["Service"], player: { readonly speed: number }) => {
+  /** `synthesisDone`: the declaration comes after the whole reply was sent (its `reply.end`), else during it. */
+  const stopCase = async (tts: Tts["Service"], player: { readonly speed: number }, synthesisDone: boolean) => {
     const dataDir = await dataDirWithAlpha()
     const stt = controlledStt()
     server = await startTestServer({ build: fakeBuild({ stt: stt.stt, llm: scriptedLlm(() => "A long answer.").llm, tts }), dataDir })
@@ -680,6 +681,9 @@ describe("review round 3: a declaration that takes speech away stops the reply i
     stt.emit(endOfTurn("tell me a story"))
     await page.waitFor("reply.start", () => true, { from, timeoutMs: 10_000 })
     await until("audio on the page", () => [...page.replySamples.values()].some((n) => n > 0))
+    // The first audio does not mean the rest was sent: on a busy machine the reply's end can still be on its way,
+    // and would then land after `at` though it was sent before the declaration was handled.
+    if (synthesisDone) await page.waitFor("reply.end", () => true, { from, timeoutMs: 10_000 })
     const { speaker: _, ...mute } = tablet
     const at = page.messages.length
     page.send({ type: "device.caps", capabilities: mute })
@@ -696,7 +700,7 @@ describe("review round 3: a declaration that takes speech away stops the reply i
       synthesize: (clauses) =>
         clauses.pipe(Stream.zipWithIndex, Stream.flatMap(([, clause]) => Stream.fromIterable(Array.from({ length: 80 }, (): TtsAudio => ({ audio: new Uint8Array(new Int16Array(882).fill(800).buffer), clause })))))
     })
-    await stopCase(fastTts, { speed: 0.1 })
+    await stopCase(fastTts, { speed: 0.1 }, true)
   })
 
   it("with synthesis paused after a few chunks: a stop is sent at once, with no further chunk to notice it", async () => {
@@ -710,7 +714,7 @@ describe("review round 3: a declaration that takes speech away stops the reply i
           )
         ))
     })
-    await stopCase(pausedTts, { speed: 1 })
+    await stopCase(pausedTts, { speed: 1 }, false)
   })
 })
 
