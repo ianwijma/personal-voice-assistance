@@ -232,6 +232,8 @@ export const notifyWorld = (
     readonly speech?: Parameters<typeof makeNotifyEngine>[0]["speech"]
     /** The wall clock's offset from the test clock (ms), shared with the case: a correction moves it alone. */
     readonly wall?: { offset: number }
+    /** A wait before the service's next `schedule` call (a slow store under the scheduler), taken by that call. */
+    readonly scheduleGate?: { wait: Deferred.Deferred<void> | undefined }
   } = {}
 ) =>
   Effect.gen(function*() {
@@ -253,7 +255,22 @@ export const notifyWorld = (
       const scheduler = yield* makeSchedulerEngine({ store, issues, retryBaseMs: SECOND, outcomeRetryMs: [100, 200], gateway: () => hostRef?.gateway })
       const notify = yield* makeNotifyEngine({
         store,
-        scheduler,
+        scheduler: o.scheduleGate === undefined ? scheduler : {
+          ...scheduler,
+          forCore: (owner) => {
+            const calls = scheduler.forCore(owner)
+            const gate = o.scheduleGate!
+            return {
+              ...calls,
+              schedule: (request) =>
+                Effect.suspend(() => {
+                  const wait = gate.wait
+                  gate.wait = undefined
+                  return wait === undefined ? calls.schedule(request) : Effect.andThen(Deferred.await(wait), calls.schedule(request))
+                })
+            }
+          }
+        },
         devices: () => devices,
         outputs: o.outputs ?? (() => ({ speak: true, show: true })),
         privacy: makePrivacy((id) => places.get(id), (id) => MEMBERS.has(id)),
@@ -625,6 +642,14 @@ export const notifyContract = (name: string, open: OpenNotifyStore) =>
         // Nothing is due: the hourly job alone.
         assert.deepStrictEqual((yield* notifyJobs(world)).map((j) => [j.handler, j.key, j.cron]), [[HOURLY_HANDLER, HOURLY_HANDLER, HOURLY_CRON]])
         assert.isUndefined(world.notify.plannedAt())
+        // Something due that goes away before it is due: the due job goes with it.
+        yield* world.bell().dnd.set({ until: t0 + 5 * MINUTE })
+        yield* world.settle
+        assert.strictEqual(yield* dueJobAt(world), t0 + 5 * MINUTE)
+        yield* world.bell().dnd.clear
+        yield* world.settle
+        assert.isUndefined(yield* dueJobAt(world))
+        assert.isUndefined(world.notify.plannedAt())
         const ring = yield* world.sendOn("kitchen-display", { title: "A", priority: "ring" })
         assert.strictEqual(world.notify.plannedAt(), ring.notification.expiresAt)
         yield* world.bell().dnd.set({ until: t0 + 5 * MINUTE })
@@ -737,6 +762,24 @@ export const notifyContract = (name: string, open: OpenNotifyStore) =>
         assert.strictEqual((yield* notifyJobs(world)).length, 2)
       }))
 
+    it.effect("D2b: plans never interleave: a change while a plan is being written plans again after it, so the newest wins", () =>
+      Effect.gen(function*() {
+        const scheduleGate: { wait: Deferred.Deferred<void> | undefined } = { wait: undefined }
+        const { world } = yield* start({ scheduleGate })
+        const t0 = yield* Clock.currentTimeMillis
+        const slow = yield* Deferred.make<void>()
+        scheduleGate.wait = slow
+        yield* world.bell().send({ title: "Later", target: "everywhere", expiresInMs: 3 * HOUR })
+        for (let i = 0; i < 20 && scheduleGate.wait !== undefined; i++) yield* Effect.yieldNow
+        assert.isUndefined(scheduleGate.wait, "the first plan is writing its job")
+        yield* world.bell().send({ title: "Sooner", target: "everywhere", expiresInMs: HOUR })
+        for (let i = 0; i < 20; i++) yield* Effect.yieldNow
+        yield* Deferred.succeed(slow, undefined)
+        yield* world.settle
+        assert.strictEqual(yield* dueJobAt(world), t0 + HOUR)
+        assert.strictEqual(world.notify.plannedAt(), t0 + HOUR)
+      }))
+
     it.effect("D2b: a lost plan (the due job could not be written) is a Health issue; the hourly job does the work within the hour and plans again", () =>
       Effect.gen(function*() {
         const { world, faults } = yield* startFaulty()
@@ -824,6 +867,8 @@ export const notifyContract = (name: string, open: OpenNotifyStore) =>
     it.effect("retention on time: the due job removes a resolved row exactly a day after it was resolved", () =>
       Effect.gen(function*() {
         const { world } = yield* start()
+        // Off the hour, so that the hourly job cannot be what removes it.
+        yield* world.advance(17 * MINUTE)
         const n = yield* world.sendOn("kitchen-display", { title: "Gone soon" })
         yield* world.bell().resolve(n.notification.id)
         yield* world.advance(KEEP_RESOLVED_MS - 1)
@@ -1131,6 +1176,7 @@ export const notifyContract = (name: string, open: OpenNotifyStore) =>
         const modules = ["m0", "m1"]
         const { world, faults } = yield* startFaulty({ modules, connected: [] })
         for (let i = 0; i < 12; i++) yield* world.bell(modules[i % 2]).send({ title: `R${i}`, priority: "ring", target: "everywhere" })
+        yield* world.settle
         const changes: Array<string> = []
         world.notify.onRingingChanged((d) => changes.push(d))
         // The first page (12 rows) is read and sent; the next read fails.
@@ -1139,6 +1185,10 @@ export const notifyContract = (name: string, open: OpenNotifyStore) =>
         const tab = yield* world.open("kitchen-display")
         assert.strictEqual(world.holds(tab).size, 12)
         assert.strictEqual(faults.reads, 0)
+        assert.deepStrictEqual(world.notify.ringingOn("kitchen-display").length, 12)
+        // The pass failed (it is planned again in a minute) ...
+        assert.strictEqual(world.notify.plannedAt(), (yield* Clock.currentTimeMillis) + MINUTE)
+        // ... and what it delivered was told.
         assert.deepStrictEqual(changes, ["kitchen-display"])
         // The retry changes nothing: nothing more is told.
         world.notify.reconcile("kitchen-display")
