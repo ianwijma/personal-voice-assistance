@@ -12,9 +12,13 @@ import { ROUTE_TOKENS_ENTRY, type SettingsStore } from "./SettingsStore.ts"
  * constant time (`timingSafeEqual`). While the vault is locked nothing can be checked, listed or minted: token routes
  * answer 503. Revoking a token removes it at once. When it was last used is kept in memory only.
  *
- * A stored record counts only if its id and metadata are what the wire allows (`RouteTokenInfo`) and its module holds
- * no more than `MAX_ROUTE_TOKENS_PER_MODULE` before it; any other (a hand-edited file) is ignored for authentication
- * and listing alike, and `report` is told how many were ignored (a Health issue).
+ * One canonical list (`keptTokens`) of the stored records decides everything: a record counts only if its id and
+ * metadata are what the wire allows (`RouteTokenInfo`), its secret's hash is not one an earlier record has, and its
+ * module holds no more than `MAX_ROUTE_TOKENS_PER_MODULE` before it, in a fixed order (by when it was made, then by
+ * id). Authentication, listing, the limit, mint and revoke all work on that list; mint and revoke derive it from the
+ * committed map inside the store's serialized change and persist exactly the list after the change, so a record that
+ * was not admitted is dropped from the file then, and never revived. Any other record (a hand-edited file) is ignored
+ * until then, and `report` is told how many are ignored (a Health issue).
  */
 
 interface Stored {
@@ -42,6 +46,34 @@ const parse = (text: string): Stored | undefined => {
 
 const isTokenInfo = Schema.is(RouteTokenInfo)
 
+/** A stored record the canonical list keeps: its id, what it says, and its text exactly as stored. */
+type Kept = readonly [id: string, stored: Stored, text: string]
+
+/**
+ * The records of a committed map that count, in their fixed order (when made, then id): valid by the wire schema,
+ * the first with a given hash, at most `MAX_ROUTE_TOKENS_PER_MODULE` per module; `ignored` counts the others.
+ */
+export const keptTokens = (committed: Readonly<Record<string, unknown>>): { readonly kept: ReadonlyArray<Kept>; readonly ignored: number } => {
+  const entries = Object.entries(committed)
+  const valid = entries.flatMap(([id, text]): Array<Kept> => {
+    const stored = typeof text === "string" ? parse(text) : undefined
+    if (stored === undefined || typeof text !== "string") return []
+    return isTokenInfo({ id, moduleId: stored.moduleId, name: stored.name, label: stored.label, createdAt: stored.createdAt }) ? [[id, stored, text]] : []
+  }).sort(([a, x], [b, y]) => x.createdAt - y.createdAt || (a < b ? -1 : a > b ? 1 : 0))
+  const held = new Map<string, number>()
+  const hashes = new Set<string>()
+  const kept = valid.filter(([, stored]) => {
+    const n = held.get(stored.moduleId) ?? 0
+    if (n >= MAX_ROUTE_TOKENS_PER_MODULE || hashes.has(stored.hash)) return false
+    held.set(stored.moduleId, n + 1)
+    hashes.add(stored.hash)
+    return true
+  })
+  return { kept, ignored: entries.length - kept.length }
+}
+/** The kept records as a map to persist (their texts as stored). */
+const asMap = (kept: ReadonlyArray<Kept>): Record<string, string> => Object.fromEntries(kept.map(([id, , text]) => [id, text]))
+
 const sha256 = (text: string): Buffer => createHash("sha256").update(text, "utf8").digest()
 
 export type TokenCheck =
@@ -68,25 +100,14 @@ export const makeRouteTokens = (options: {
   const now = options.now ?? Date.now
   const lastUsed = new Map<string, number>()
   let reported = 0
-  /** The stored tokens that count: valid as the wire says, at most the bound per module (the first ones). */
-  const all = (): ReadonlyArray<readonly [string, Stored]> => {
-    const held = new Map<string, number>()
-    const entries = Object.entries(options.store.secrets().modules[ROUTE_TOKENS_ENTRY] ?? {})
-    const admitted = entries.flatMap(([id, text]) => {
-      const stored = typeof text === "string" ? parse(text) : undefined
-      if (stored === undefined) return []
-      if (!isTokenInfo({ id, moduleId: stored.moduleId, name: stored.name, label: stored.label, createdAt: stored.createdAt })) return []
-      const n = held.get(stored.moduleId) ?? 0
-      if (n >= MAX_ROUTE_TOKENS_PER_MODULE) return []
-      held.set(stored.moduleId, n + 1)
-      return [[id, stored] as const]
-    })
-    const ignored = entries.length - admitted.length
+  /** The stored tokens that count now (`keptTokens` of what the store holds); `report` hears how many do not. */
+  const all = (): ReadonlyArray<Kept> => {
+    const { kept, ignored } = keptTokens(options.store.secrets().modules[ROUTE_TOKENS_ENTRY] ?? {})
     if (ignored !== reported) {
       reported = ignored
       options.report?.(ignored)
     }
-    return admitted
+    return kept
   }
   const infoOf = (id: string, t: Stored): RouteTokenInfo => ({
     id,
@@ -119,14 +140,15 @@ export const makeRouteTokens = (options: {
         const secret = randomBytes(32).toString("base64url")
         const id = randomBytes(6).toString("hex")
         const stored: Stored = { moduleId, name, label: text, hash: sha256(secret).toString("hex"), createdAt: now() }
-        // The limit is judged on the committed tokens inside the store's serialized save, so two mints at once cannot
-        // both take the last place.
+        // The limit is judged on the canonical list of the committed tokens inside the store's serialized save (two
+        // mints at once cannot both take the last place), and that list with the new token is what is saved.
         let full = false
         return options.store.saveRouteTokens((committed) => {
-          const held = Object.values(committed).filter((t) => parse(t)?.moduleId === moduleId).length
-          full = held >= MAX_ROUTE_TOKENS_PER_MODULE
-          return full ? committed : { ...committed, [id]: JSON.stringify(stored) }
+          const { kept } = keptTokens(committed)
+          full = kept.filter(([, t]) => t.moduleId === moduleId).length >= MAX_ROUTE_TOKENS_PER_MODULE
+          return full ? committed : { ...asMap(kept), [id]: JSON.stringify(stored) }
         }).pipe(
+          Effect.tap(() => Effect.sync(all)),
           Effect.mapError(saveFailed),
           Effect.flatMap(() =>
             full
@@ -137,13 +159,21 @@ export const makeRouteTokens = (options: {
       }),
     revoke: (id) =>
       whenWritable(() => {
-        const found = all().some(([tid, t]) => tid === id && t.moduleId === moduleId)
-        if (!found) return Effect.succeed(false)
-        lastUsed.delete(id)
+        // Judged on the canonical list of the committed tokens inside the serialized save; what is saved is that list
+        // without the token (a record that was not admitted is dropped with it, so none can take its place).
+        let found = false
         return options.store.saveRouteTokens((committed) => {
-          const { [id]: _gone, ...rest } = committed
-          return rest
-        }).pipe(Effect.mapError(saveFailed), Effect.as(true))
+          const { kept } = keptTokens(committed)
+          found = kept.some(([tid, t]) => tid === id && t.moduleId === moduleId)
+          return found ? asMap(kept.filter(([tid]) => tid !== id)) : committed
+        }).pipe(
+          Effect.tap(() => Effect.sync(() => {
+            if (found) lastUsed.delete(id)
+            all()
+          })),
+          Effect.mapError(saveFailed),
+          Effect.map(() => found)
+        )
       })
   })
 

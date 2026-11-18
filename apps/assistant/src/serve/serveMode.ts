@@ -19,7 +19,8 @@ import {
   type TurnSetup,
   type TurnTrace,
   type VoiceRef,
-  voiceKey
+  voiceKey,
+  withinModuleFrame
 } from "@pva/core"
 import {
   type Assistant,
@@ -1340,7 +1341,8 @@ export const startServe = (options: ServeOptions): Effect.Effect<ServeHandle, Ht
     const hubNow = hub
     health.subscribe((info) => hubNow.broadcast({ type: "health", health: info }))
     host.subscribe((module) => {
-      hubNow.broadcast({ type: "module.changed", module: access.module(module) })
+      // One module's projection, within one frame (`withinModuleFrame`, the guard the snapshot's entries pass too).
+      hubNow.broadcast({ type: "module.changed", module: withinModuleFrame(access.module(module)) })
       if (module.id === SUBSCRIPTION_AGENT_ID && theEngine.status().engines.some((e) => e.provider === SUBSCRIPTION_PROVIDER)) theEngine.refreshStatus()
     })
     sections.subscribe((section) => hubNow.broadcast({ type: "section.changed", section: access.section(section) }))
