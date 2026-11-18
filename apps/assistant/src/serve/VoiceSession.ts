@@ -262,14 +262,18 @@ export interface VoiceSession {
   /** A `device.pick` was accepted: the open windows close, so the picked assistant answers the next sentence (§5.3). */
   readonly pickAccepted: () => void
   /**
-   * P9: announcements on this device (docs/NOTIFICATIONS.md "Speech"): `quiet` completes once nothing is spoken or
-   * heard here (no reply plays, no turn is in flight, the person is not speaking); `play` speaks a line with the
-   * answering assistant's voice (`TurnSetup.tts`, the reply's synthesis) through the session's one output lease, so a
-   * reply that starts takes the speaker from it (the announcement fails `superseded`) and two never sound at once.
+   * P9: announcements on this device (docs/NOTIFICATIONS.md "Speech"). `speak` makes the answering assistant's voice
+   * ready first (`TurnSetup.tts` and its `ttsReady`: the reply's synthesis), then waits until nothing is spoken or heard
+   * here (no play holds the lease, no turn is in flight, no utterance is open in the recogniser, addressed or not, and
+   * the state is not hearing, thinking or speaking) and, in the same step as it takes the output lease
+   * (`playIfFree`), asks `gate` (the service's delivery decision) last: a reply that took the speaker meanwhile, or a
+   * gate that says "wait", sends it back to waiting; another answer skips it. A reply that starts while it plays takes
+   * the speaker (it fails `superseded`).
    */
   readonly announce: {
-    readonly quiet: Effect.Effect<void>
-    readonly play: (text: string, options: { readonly cue: boolean }) => Effect.Effect<void, unknown>
+    readonly speak: (text: string, options: { readonly cue: boolean; readonly gate: () => string }) => Effect.Effect<"spoken" | { readonly skipped: string }, unknown>
+    /** The reply id of the announcement playing now (the page's Stop names it), if one plays. */
+    readonly playing: () => number | undefined
   }
 }
 
@@ -1079,27 +1083,35 @@ export const makeVoiceSession = (options: VoiceSessionOptions): Effect.Effect<Vo
       dispatcher
     }
 
-    /** Nothing is spoken or heard here: no play holds the lease and the state is not hearing, thinking or speaking. */
+    /**
+     * Nothing is spoken or heard here: no play holds the lease, no turn is in flight, no utterance is open in the
+     * recogniser (routed to an assistant or not), and the state is not hearing, thinking or speaking.
+     */
     const isQuiet = () => {
       const state = tracker.current().state
-      return lease.holder() === undefined && inFlight === undefined && (state === "idle" || state === "listening" || state === "asleep")
+      return lease.holder() === undefined && inFlight === undefined && !utteranceOpen && (state === "idle" || state === "listening" || state === "asleep")
     }
     const announce: VoiceSession["announce"] = {
-      quiet: Effect.gen(function*() {
-        while (!isQuiet()) yield* Effect.sleep(QUIET_POLL_MS)
-      }),
-      play: (text, o) =>
+      speak: (text, o) =>
         Effect.gen(function*() {
+          // The voice first: everything after this is a wait for quiet, then the last checks as the output is taken.
           const assistant = answering()
           const setup = assistant === undefined ? undefined : yield* options.conversationSetup(assistant, options.deviceId).setup
           const tts = setup?.tts ?? options.engine.built()?.providers.tts
           if (tts === undefined) return yield* new AudioError({ message: "no voice on this device" })
           if (setup?.ttsReady !== undefined) yield* setup.ttsReady
-          // The reply's synthesis: the line cut into clauses, synthesised as it plays.
-          const voice = tts.synthesize(Stream.make(text).pipe(chunkClauses())).pipe(Stream.map((chunk) => chunk.audio))
-          const audio = o.cue ? Stream.concat(Stream.make(announcementChime(tts.sampleRate)), voice) : voice
-          yield* lease.output(ANNOUNCE_HOLDER).play(audio, tts.sampleRate)
-        })
+          for (;;) {
+            while (!isQuiet()) yield* Effect.sleep(QUIET_POLL_MS)
+            // The reply's synthesis: the line cut into clauses, synthesised as it plays.
+            const voice = tts.synthesize(Stream.make(text).pipe(chunkClauses())).pipe(Stream.map((chunk) => chunk.audio))
+            const audio = o.cue ? Stream.concat(Stream.make(announcementChime(tts.sampleRate)), voice) : voice
+            const how = yield* lease.playIfFree(ANNOUNCE_HOLDER, audio, tts.sampleRate, () => (isQuiet() ? o.gate() : "wait"))
+            if (how === "played") return "spoken" as const
+            if (how.notStarted === "busy" || how.notStarted === "wait") continue
+            return { skipped: how.notStarted }
+          }
+        }),
+      playing: () => (lease.holder() === ANNOUNCE_HOLDER ? web.playingTurn() : undefined)
     }
 
     return {

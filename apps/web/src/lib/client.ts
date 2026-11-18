@@ -14,7 +14,7 @@ import { ADMIN_TOKEN_KEY } from "./adminToken.ts"
 import { createPrefsStore, type Prefs, type PrefsStore } from "./prefs.ts"
 import { sessionsFullText } from "./sessions.ts"
 import { navigateSettings, type SettingsPath } from "./settingsTree.ts"
-import { type ClientState, profileOf } from "./state.ts"
+import { type ClientState, profileOf, ringingCard } from "./state.ts"
 import { type ClientStore, createClientStore } from "./store.ts"
 
 /**
@@ -551,15 +551,22 @@ export const createAssistantClient = (options: { readonly frontend?: FrontendRol
   }
 
   /**
-   * P9: the ring cue while a card that is not silent (and not pressed here) is shown (`audio/ringLoop.ts`). Only the tab
-   * that owns the device's audio plays it, once the audio was started (the Start gesture gave the page its audio
-   * permission) and runs, never over a reply or the echo test. Before that the card shows without sound, with a note.
+   * P9: the ring cue while a card that rings is shown (`audio/ringLoop.ts`, `ringingCard` over every card). Its life is
+   * the page's and the connection's: it is made once, followed while connected (`connect` subscribes and its clean-up
+   * stops it), stops when the connection is lost or the page is left, and plays only on the tab that owns the device's
+   * audio, while connected and while the audio runs (the Start gesture gave the page its permission), never over a
+   * reply or the echo test. Before that a ringing card shows without sound, with the server's note.
    */
+  /** The page was left (`pagehide`; back from the back-forward cache, `pageshow`, clears it): no cue meanwhile. */
+  let pageLeft = false
   const ringLoop = makeRingLoop({
-    wanted: () => store.get().notifications.some((n) => n.priority === "ring" && !n.silent && n.quiet !== true),
+    wanted: () => {
+      const s = store.get()
+      return !pageLeft && s.connection.status === "open" && s.notifications.some(ringingCard)
+    },
     canPlay: () => {
       const s = store.get()
-      if (frontend !== "voice" || !owner() || !audio.running || audio.contextState !== "running") return false
+      if (frontend !== "voice" || s.connection.status !== "open" || !owner() || !audio.running || audio.contextState !== "running") return false
       if (s.audio.playing !== undefined || echoRun !== undefined) return false
       const open = audio.openReply()
       return open === undefined || open >= LOCAL_REPLY_ID
@@ -569,8 +576,6 @@ export const createAssistantClient = (options: { readonly frontend?: FrontendRol
       if (audio.running && audio.openReply() === RING_REPLY_ID) audio.replyStop(RING_REPLY_ID, false)
     }
   })
-  // continuation(state): runs synchronously on every store change; the loop reads the present state.
-  store.subscribe(() => ringLoop.update())
 
   // ---- Screen wake lock while this tab owns the audio ----
   let wakeLock: { release: () => Promise<void> } | undefined
@@ -600,6 +605,8 @@ export const createAssistantClient = (options: { readonly frontend?: FrontendRol
     prefs.load()
     const stop = connection.start()
     if (frontend === "voice" && typeof window !== "undefined") capsWatch = watchCapabilities({ send: (m) => connection.send(m) })
+    // continuation(state): the ring loop reads the present state on every change while connected.
+    const stopRinging = store.subscribe(() => ringLoop.update())
     // continuation(none): acts on the present state when the page becomes visible.
     const onVisible = () => {
       if (document.visibilityState !== "visible" || !audio.running) return
@@ -612,14 +619,25 @@ export const createAssistantClient = (options: { readonly frontend?: FrontendRol
     // sent now with the best count the page has (it cannot wait for the worklet).
     // continuation(none): acts on the present state, synchronously.
     const onPageHide = () => {
+      pageLeft = true
+      ringLoop.stop()
       if (audio.running && owner()) audio.unload()
     }
     window.addEventListener("pagehide", onPageHide) // continuation(none): see `onPageHide`
+    // continuation(none): back from the back-forward cache: the cue may sound again (the present state decides).
+    const onPageShow = () => {
+      pageLeft = false
+      ringLoop.update()
+    }
+    window.addEventListener("pageshow", onPageShow) // continuation(none): see `onPageShow`
     return () => {
       document.removeEventListener("visibilitychange", onVisible)
       window.removeEventListener("pagehide", onPageHide)
+      window.removeEventListener("pageshow", onPageShow)
       capsWatch?.stop()
       capsWatch = undefined
+      stopRinging()
+      ringLoop.stop()
       stop()
     }
   }

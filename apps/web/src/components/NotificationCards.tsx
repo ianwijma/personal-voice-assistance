@@ -1,27 +1,30 @@
 "use client"
-import { useState } from "react"
-import type { ClientState } from "@/lib/state.ts"
+import { useEffect, useRef, useState } from "react"
+import { type ClientState, ringingCard } from "@/lib/state.ts"
 import { useClient, useClientState } from "./context.tsx"
 import { cx } from "./ui/controls.tsx"
 
 /**
- * P9: the notification cards of this device (docs/NOTIFICATIONS.md "The voice page"): a plain card per notification
- * with its title, its text and its buttons (`stop` first, in the household's language, as the server sent them).
- * Outside the character's stage, above the dock, so every character keeps drawing exactly as before
- * (docs/CHARACTERS.md); P10 moves it into its presentation stage. A press goes to the server (`notification.action`)
- * and its answer is shown on the card until the server takes it down.
+ * P9: the notification cards of this device (docs/NOTIFICATIONS.md "The voice page"): a plain card per notification the
+ * server says to show, with its title, its text and its buttons (`stop` first). Every word on it comes from the server,
+ * in the household's language (the card's `texts` and labels). Outside the character's stage, in a region that scrolls
+ * within the viewport (every Stop reachable, long text wrapped), so every character keeps drawing exactly as before
+ * (docs/CHARACTERS.md); P10 moves it into its presentation stage. A press goes to the server (`notification.action`):
+ * Stop is always usable, a module action disables only its own button while it is pending, and an answer that comes
+ * after the card is gone is ignored.
  */
 export function NotificationCards() {
   const cards = useClientState((s) => s.notifications)
   const audioOn = useClientState((s) => s.audio.phase === "running")
-  if (cards.length === 0) return null
+  const shown = cards.filter((c) => c.show)
+  if (shown.length === 0) return null
   return (
     <section
-      aria-label="Notifications"
+      aria-label={shown[0]!.texts.region}
       data-testid="notification-cards"
-      className="pointer-events-none fixed inset-x-0 top-[calc(64px+env(safe-area-inset-top))] z-[60] flex flex-col items-center gap-2 px-4"
+      className="pointer-events-none fixed inset-x-0 top-[calc(64px+env(safe-area-inset-top))] z-[60] flex max-h-[calc(100dvh-200px-env(safe-area-inset-top)-env(safe-area-inset-bottom))] flex-col items-center gap-2 overflow-y-auto overscroll-contain px-4 pb-2"
     >
-      {cards.map((card) => <Card key={card.id} card={card} audioOn={audioOn} />)}
+      {shown.map((card) => <Card key={card.id} card={card} audioOn={audioOn} />)}
     </section>
   )
 }
@@ -29,31 +32,48 @@ export function NotificationCards() {
 function Card({ card, audioOn }: { readonly card: ClientState["notifications"][number]; readonly audioOn: boolean }) {
   const client = useClient()
   const [said, setSaid] = useState<string | undefined>(undefined)
-  const [busy, setBusy] = useState(false)
+  const [pending, setPending] = useState<ReadonlySet<string>>(new Set())
+  const mounted = useRef(true)
+  useEffect(() => {
+    mounted.current = true
+    return () => {
+      mounted.current = false
+    }
+  }, [])
   const press = (actionId: string) => {
-    setBusy(true)
+    if (actionId !== "stop") setPending((p) => new Set(p).add(actionId))
     client.store.dispatch({ type: "local/notification-pressed", id: card.id })
-    // continuation(identity): shows this card's own answer; the card goes when the server resolves it.
+    /** The answer applies only while this card is still shown (an answer after the server took it down is ignored). */
+    const current = () => mounted.current && client.store.get().notifications.some((n) => n.id === card.id)
+    const done = () => {
+      if (!mounted.current) return
+      setPending((p) => {
+        const next = new Set(p)
+        next.delete(actionId)
+        return next
+      })
+    }
+    // continuation(identity): shows this card's own answer, only while the card is still there.
     void client.request({ type: "notification.action", id: card.id, actionId }).then((r) => {
-      setBusy(false)
-      setSaid(r.say ?? (r.ok ? undefined : r.error?.message))
-    }, () => setBusy(false))
+      done()
+      if (current()) setSaid(r.say ?? (r.ok ? undefined : r.error?.message))
+    }, done)
   }
-  const ringing = card.priority === "ring" && !card.silent && card.quiet !== true
+  const ringing = ringingCard(card)
   return (
     <article
       role={ringing ? "alert" : "status"}
       data-testid="notification-card"
       data-ringing={ringing || undefined}
-      className="pointer-events-auto w-full max-w-[420px] rounded-lg border border-line bg-surface px-4 py-3 text-ink shadow-panel animate-[pva-rise_200ms_var(--ease-out)]"
+      className="pointer-events-auto w-full max-w-[420px] shrink-0 rounded-lg border border-line bg-surface px-4 py-3 text-ink shadow-panel animate-[pva-rise_200ms_var(--ease-out)]"
     >
       <div className="flex items-start gap-2">
         <span aria-hidden="true" className={cx("mt-[7px] size-2 shrink-0 rounded-full", ringing ? "bg-voice animate-pulse" : "bg-ink-faint")} />
         <div className="min-w-0 flex-1">
-          <h2 className="truncate text-[15px] font-medium">{card.title}</h2>
-          {card.text !== undefined ? <p className="mt-0.5 text-[14px] text-ink-muted">{card.text}</p> : null}
-          {ringing && !audioOn ? <p className="mt-1 text-[12px] text-ink-faint" data-testid="notification-silent-note">Start audio to hear it.</p> : null}
-          {said !== undefined ? <p className="mt-1 text-[13px] text-ink-muted" role="status">{said}</p> : null}
+          <h2 className="text-[15px] font-medium [overflow-wrap:anywhere]">{card.title}</h2>
+          {card.text !== undefined ? <p className="mt-0.5 text-[14px] text-ink-muted [overflow-wrap:anywhere]">{card.text}</p> : null}
+          {ringing && !audioOn ? <p className="mt-1 text-[12px] text-ink-faint" data-testid="notification-silent-note">{card.texts.startAudio}</p> : null}
+          {said !== undefined ? <p className="mt-1 text-[13px] text-ink-muted [overflow-wrap:anywhere]" role="status">{said}</p> : null}
         </div>
       </div>
       <div className="mt-2 flex flex-wrap justify-end gap-2">
@@ -61,7 +81,7 @@ function Card({ card, audioOn }: { readonly card: ClientState["notifications"][n
           <button
             key={a.id}
             type="button"
-            disabled={busy}
+            disabled={a.id !== "stop" && pending.has(a.id)}
             data-action={a.id}
             onClick={() => press(a.id)}
             className={cx(

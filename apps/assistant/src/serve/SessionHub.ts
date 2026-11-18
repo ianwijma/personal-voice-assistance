@@ -1,5 +1,5 @@
 import type { AudioClientLink } from "@pva/audio-web"
-import { adminModules, type ConnectionRef, type HostDeviceView, type HostResult, makeConnectionRef, type ModuleHost, type NotifyEngine, withinModuleFrame } from "@pva/core"
+import { adminModules, type ConnectionRef, type HostDeviceView, type HostResult, makeConnectionRef, type ModuleHost, type NotifyEngine, STOP_ACTION, withinModuleFrame } from "@pva/core"
 import {
   type AdminSnapshot,
   type AdminState,
@@ -202,11 +202,13 @@ export interface HubOptions {
   /** Household data for voice pages and device events (P4). Absent: none sent. */
   readonly household?: HouseholdHooks
   /**
-   * P9: the notification service (docs/NOTIFICATIONS.md). A voice connection of a device gets what is open for it after
-   * its welcome (`connected`, that connection only); the device's last connection going ends its ringing
-   * (`disconnected`); a card's button is `notification.action`, answered with `result` (`say`). Absent: none of it.
+   * P9: the notification service (docs/NOTIFICATIONS.md). The device is reconciled (`reconcile`: what each of its
+   * voice connections holds made equal to what is open and allowed now) when a connection of it says hello (once its
+   * record is written), when one closes and when its declaration changes; a card's button is `notification.action`
+   * (a module action through the bounded admission, `stop` outside it), answered with `result` (`say`); the page's
+   * Stop reaches the announcement being spoken (`stopSpeech`). Absent: none of it.
    */
-  readonly notify?: Pick<NotifyEngine, "connected" | "disconnected" | "press">
+  readonly notify?: Pick<NotifyEngine, "reconcile" | "press" | "stopSpeech">
   /** P5: a device's connections, declaration or live state changed (the device facts rebuild their list). */
   readonly onDeviceChange?: () => void
   /**
@@ -459,9 +461,10 @@ export const makeSessionHub = (options: HubOptions): SessionHub => {
           ok: true,
           ...("assistantId" in outcome && outcome.assistantId !== undefined ? { assistantId: outcome.assistantId } : {}),
           ...("rev" in outcome && outcome.rev !== undefined ? { rev: outcome.rev } : {}),
-          ...("action" in outcome ? { action: outcome.action } : {})
+          ...("action" in outcome ? { action: outcome.action } : {}),
+          ...("say" in outcome && typeof outcome.say === "string" ? { say: outcome.say } : {})
         }
-        : { type: "result", requestId, ok: false, error: outcome.error }
+        : { type: "result", requestId, ok: false, error: outcome.error, ...("say" in outcome && typeof outcome.say === "string" ? { say: outcome.say } : {}) }
     )
 
   const failure = (code: ErrorInfo["code"], message: string): HostResult => ({ ok: false, error: { code, message } })
@@ -630,7 +633,7 @@ export const makeSessionHub = (options: HubOptions): SessionHub => {
   const startNotify = (client: Client) => {
     if (client.role !== "voice" || client.device === undefined || client.notifyStarted === true || client.closed || options.notify === undefined) return
     client.notifyStarted = true
-    options.notify.connected(client.device.id, (m) => send(client, m))
+    options.notify.reconcile(client.device.id)
   }
 
   const registerDevice = (device: DeviceHello) =>
@@ -658,6 +661,8 @@ export const makeSessionHub = (options: HubOptions): SessionHub => {
     // page's Stop (the page is told to stop and flush what it holds), also while synthesis is paused; the send-time
     // gate (`linkFor`) stays.
     deviceChanged()
+    // P9: what the device's pages hold follows its new outputs (a ring silenced, a card withdrawn or given back).
+    options.notify?.reconcile(deviceId)
     if (spoke && !(options.speakerAllowed?.(deviceId, kind) ?? true)) {
       const session = sessions.get(deviceId)
       if (session !== undefined && session.publisher.committedTurn() !== undefined) session.conversation.stop()
@@ -806,7 +811,8 @@ export const makeSessionHub = (options: HubOptions): SessionHub => {
       deviceChanged()
       devicesChanged(true)
       if (last) options.household?.deviceDisconnected(id)
-      if (last) options.notify?.disconnected(id)
+      // P9: what this connection held is dropped, and the device's other pages are reconciled.
+      options.notify?.reconcile(id)
     }
     const key = client.sessionKey
     if (key === undefined) return
@@ -1064,6 +1070,13 @@ export const makeSessionHub = (options: HubOptions): SessionHub => {
         const session = sessionOf(client)
         if (session === undefined) return
         const running = session.publisher.committedTurn()
+        // P9: the page's Stop while an announcement plays (it names the announcement's reply id, or none): the
+        // announcement stops at once; the next reply and the next announcement are left as they are.
+        const announcing = session.announce.playing()
+        if (announcing !== undefined && client.device !== undefined && (message.turnId === undefined || message.turnId === announcing)) {
+          options.run(Effect.asVoid(options.notify?.stopSpeech(client.device.id) ?? Effect.void))
+          if (message.turnId !== undefined) return
+        }
         if (message.turnId !== undefined && message.turnId !== running) return
         session.conversation.stop()
         return
@@ -1287,18 +1300,19 @@ export const makeSessionHub = (options: HubOptions): SessionHub => {
         }
         const notify = options.notify
         const deviceId = client.device.id
-        return options.run(Effect.map(
+        const pressed = Effect.map(
           notify.press({ notificationId: message.id, actionId: message.actionId, deviceId, connection: client.ref }),
-          (answer) => {
-            if (client.closed) return
-            send(
-              client,
-              answer.ok
-                ? { type: "result", requestId: message.requestId, ok: true, say: answer.say }
-                : { type: "result", requestId: message.requestId, ok: false, error: { code: answer.code === "not_running" ? "not_running" : "bad_message", message: answer.say }, say: answer.say }
-            )
-          }
-        ))
+          (answer): HostResult & { readonly say: string } =>
+            answer.ok
+              ? { ok: true, say: answer.say }
+              : { ok: false, error: { code: answer.code === "not_running" ? "not_running" : answer.code === "busy" ? "busy" : "bad_message", message: answer.say }, say: answer.say }
+        )
+        // `stop` is always admitted; a module action goes through the hub's bounded admission (per connection and in all).
+        if (message.actionId !== STOP_ACTION) return limited(client, message.requestId, pressed)
+        const requestId = message.requestId
+        return options.run(Effect.map(pressed, (r) => {
+          if (!client.closed) result(client, requestId, r)
+        }))
       }
       case "device.caps": {
         // P5: only a voice connection with a device declares (admin pages and pages without a device are ignored).

@@ -10,7 +10,7 @@ import {
   type TargetDevice,
   type TurnPerson
 } from "@pva/core"
-import { boundaryKey, type DeclaredCapabilities, type DevicePlace, effectiveCapabilities, roomOf, speakerAllowedFrom } from "@pva/protocol"
+import { boundaryKey, type DeclaredCapabilities, type DeviceOutputs, deviceOutputsFrom, type DevicePlace, effectiveCapabilities, roomOf, speakerAllowedFrom } from "@pva/protocol"
 import { Effect } from "effect"
 import { deviceSettingsFrom } from "./devices.ts"
 import { type EffectiveMembers, effectiveMembersOf } from "./people.ts"
@@ -114,6 +114,12 @@ export interface DeviceFacts {
    * declared anything (a page of an older build) may. Read where audio leaves (every frame), so a cache read.
    */
   readonly speakerAllowed: (deviceId: string | undefined, kind?: string) => boolean
+  /**
+   * P9: what a device can do with a notification or an announcement now, from one place (`deviceOutputsFrom`): the
+   * owner's overrides (its own, else its type's) first, then its latest declaration; a page that never declared speaks
+   * and shows unless an override says not.
+   */
+  readonly outputsOf: (deviceId: string, kind?: string) => DeviceOutputs
   /** Something live changed (a connection, a declaration, visibility): the next read rebuilds the list. */
   readonly changed: () => void
   readonly devices: DevicesService
@@ -225,6 +231,13 @@ export const makeDeviceFacts = (options: DeviceFactsOptions): DeviceFacts => {
       const c = current()
       const cached = deviceId === undefined ? undefined : c.speaks.get(deviceId)
       return cached ?? speaksIn(c.file, deviceId, kind)
+    },
+    outputsOf: (deviceId, kind) => {
+      const file = current().file
+      const known = file.devices[deviceId] !== undefined
+      const settings = deviceSettingsFrom(file, known ? deviceId : undefined, kind)
+      const declared = (options.latestOf ?? options.declaredOf)(deviceId) ?? file.devices[deviceId]?.declared
+      return deviceOutputsFrom(settings, declared?.capabilities)
     },
     changed: () => {
       version++

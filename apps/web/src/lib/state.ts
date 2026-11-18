@@ -15,6 +15,7 @@ import {
   type JobInfo,
   type ModelSet,
   type ModuleInfo,
+  MAX_NOTIFICATION_CARDS,
   type NotificationCard,
   type Role,
   type ServerMessage,
@@ -268,8 +269,9 @@ export interface ClientState {
   /** Counts the sessions the server ended on this page (`local/session-ended`): views keyed by it start afresh. */
   readonly sessionSeq: number
   /**
-   * P9: the notification cards on this device (`notification.ring` until `notification.resolved`), oldest first, at
-   * most `MAX_CARDS`. Emptied at every welcome: the server sends what is open again after it. `quiet`: a button was
+   * P9: the notification cards on this device (`notification.ring` until `notification.resolved`), oldest first: every
+   * one the server may have open (`MAX_CARDS`, its total bound), so none is lost. Emptied at every welcome and when the
+   * session ends: the server sends what is open again after a welcome. `quiet`: a button was
    * pressed here, so the page's ring cue stops for it at once (the server's `resolved` takes the card down).
    */
   readonly notifications: ReadonlyArray<NotificationCard & { readonly quiet?: boolean }>
@@ -298,8 +300,8 @@ export interface ClientState {
 export const MAX_TURNS = 300
 export const MAX_TRACES = 50
 export const MAX_TOASTS = 3
-/** The most notification cards a page keeps (the newest; the server keeps at most 64 open). */
-export const MAX_CARDS = 16
+/** The most notification cards a page keeps: every one the server may have open (`MAX_NOTIFICATION_CARDS`, 64). */
+export const MAX_CARDS = MAX_NOTIFICATION_CARDS
 
 export const emptyEngine: EngineStatus = { state: "starting", problems: [], reloadPending: false, reloadPendingFor: [], engines: [], voices: [] }
 /** Before the admin snapshot: no vault known, and this page is not admin. */
@@ -390,6 +392,9 @@ export type LocalAction =
   | { readonly type: "local/notification-pressed"; readonly id: string }
 
 export type Action = ServerMessage | LocalAction
+
+/** P9: a card that wants the ring cue: a ring the server says to sound, not pressed here. Derived from every card. */
+export const ringingCard = (n: ClientState["notifications"][number]): boolean => n.priority === "ring" && n.sound && n.quiet !== true
 
 let toastSeq = 0
 

@@ -5,6 +5,7 @@ import {
   LlmError,
   makeModuleHost,
   makeNotifyEngine,
+  type NotDelivered,
   notifyLanguageOf,
   defaultRiskPolicy,
   makeToolRegistry,
@@ -414,26 +415,27 @@ export const startServe = (options: ServeOptions): Effect.Effect<ServeHandle, Ht
       store: household.store,
       scheduler,
       devices: () => deviceFacts.devices.list(),
-      connected: (deviceId) => hub?.deviceConnected(deviceId) === true,
-      canSpeak: (d) => deviceFacts.speakerAllowed(d.id, d.kind),
-      // A page that never declared what it can do draws cards (the voice page does); one that declared no display does not.
-      canShow: (d) => d.declared === undefined || d.capabilities.display !== undefined,
+      // One place for a device's effective outputs: its overrides first, then its declaration (`deviceOutputsFrom`).
+      outputs: (d) => deviceFacts.outputsOf(d.id, d.kind),
       privacy: deviceFacts.privacy,
+      // The voice connections of the device that said hello (each its own bookkeeping in the service).
       outlet: () =>
         hub === undefined ? undefined : {
-          send: (deviceId, message) => {
-            for (const c of hub!.voiceConnections()) if (c.deviceId === deviceId) c.send(message)
-          }
+          connections: (deviceId) => hub!.voiceConnections().filter((c) => c.deviceId === deviceId).map((c) => ({ id: c.id, send: c.send }))
         },
+      // The device's voice session speaks (its `announce`); a device whose audio nobody started cannot.
       speech: () =>
         sessionsRef === undefined ? undefined : {
-          quiet: (deviceId) => Effect.suspend(() => sessionsRef?.get(deviceId)?.announce.quiet ?? Effect.void),
-          play: (deviceId, text, o) =>
+          speak: (deviceId, text, o) =>
             Effect.suspend(() => {
               const session = sessionsRef?.get(deviceId)
-              return session === undefined ? Effect.fail(new Error("nobody has started audio on that device")) : session.announce.play(text, o)
+              // The gate answers only "go", "wait" or a `NotDelivered` reason, so what comes back as skipped is one.
+              return session === undefined
+                ? Effect.fail(new Error("nobody has started audio on that device"))
+                : Effect.map(session.announce.speak(text, o), (r) => (r === "spoken" ? r : { skipped: r.skipped as NotDelivered }))
             })
         },
+      issues,
       gateway: () => hostRef?.gateway,
       pageText: (moduleId, text, max) => hostRef?.pageText(moduleId, text, max) ?? oneLine(text, max),
       language: () => notifyLanguageOf(sections.value("HOME_LANGUAGE")),

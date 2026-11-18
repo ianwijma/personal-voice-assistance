@@ -208,6 +208,33 @@ describe("the mock, through its handlers, as the server", { timeout: 30_000 }, (
     for (const p of [one, two, again, a]) p.ws.close()
   })
 
+  it("b13/b14: the mock decides delivery per device with the real decision function (also on hello), and never reuses an id", async () => {
+    const http = url.replace(/^ws/, "http").replace(/\/ws$/, "")
+    const post = (path: string, body: unknown) => fetch(`${http}${path}`, { method: "POST", body: JSON.stringify(body) })
+    const display = { v: 1 as const, display: { class: "standard" as const, widthPx: 800, heightPx: 600, dpr: 1, touch: "coarse" as const, colour: true } }
+    const nothing = await Peer.open({ device: { id: "d-mock-notify10", kind: "web-voice", name: "Nothing", capabilities: { v: 1 } } })
+    const screenOnly = await Peer.open({ device: { id: "d-mock-notify11", kind: "web-voice", name: "Screen", capabilities: display } })
+    const first = (await (await post("/mock/notify", { title: "First", ring: true })).json()) as { id: string }
+    await screenOnly.waitFor("notification.ring", (m) => m.notification.id === first.id)
+    // A display without a speaker: the card, silent. No outputs at all: nothing (as `decideDelivery` says).
+    expect(screenOnly.messages.find((m) => m.type === "notification.ring")).toMatchObject({ notification: { show: true, sound: false } })
+    await new Promise((r) => setTimeout(r, 150))
+    expect(nothing.messages.some((m) => m.type === "notification.ring")).toBe(false)
+    // The same on a hello.
+    const again = await Peer.open({ device: { id: "d-mock-notify10", kind: "web-voice", name: "Nothing", capabilities: { v: 1 } } })
+    await new Promise((r) => setTimeout(r, 150))
+    expect(again.messages.some((m) => m.type === "notification.ring")).toBe(false)
+    // Ids: create, create, resolve the first, create: three different ids; an explicit id in use is refused.
+    const second = (await (await post("/mock/notify", { title: "Second" })).json()) as { id: string }
+    await post("/mock/notify/resolve", { id: first.id })
+    const third = (await (await post("/mock/notify", { title: "Third" })).json()) as { id: string }
+    expect(new Set([first.id, second.id, third.id]).size).toBe(3)
+    expect((await post("/mock/notify", { id: second.id, title: "Clash" })).status).toBe(409)
+    await post("/mock/notify/resolve", { id: second.id })
+    await post("/mock/notify/resolve", { id: third.id })
+    for (const p of [nothing, screenOnly, again]) p.ws.close()
+  })
+
   it("a privacy change while the scripted turn is being heard: the reconnected page gets nothing of the old session", async () => {
     const a = await admin()
     const id = "d-mock-pending01"
