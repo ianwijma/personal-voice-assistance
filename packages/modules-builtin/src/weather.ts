@@ -212,8 +212,8 @@ export const makeWeatherParts = (options: WeatherOptions = {}) => {
 
 /**
  * The weather module: the `weather` tool and `today` action below (Open-Meteo, one request each), and the extension of the
- * local-info pull request in `weather/` (rain in the next hours, a forecast of a day this week, weather warnings, and a
- * briefing section for each), which fetch through `@pva/net`. The geocode cache of the first two lives in the instance, so
+ * local-info pull request in `weather/` (rain in the next hours, a forecast of a day this week, and a briefing section),
+ * which fetch through `@pva/net`. The geocode cache of the first two lives in the instance, so
  * changed settings start with a fresh cache; the extension's cache lives in the module's shared part. `fetch` is injected in
  * tests of the first two, `resolver` and `connector` in tests of the extension.
  */
@@ -222,7 +222,7 @@ export const weatherModule = (deps: { readonly fetch?: typeof globalThis.fetch }
     apiVersion: 2,
     id: "weather",
     name: "Weather",
-    description: "Current weather, rain in the next hours, forecasts and warnings from Open-Meteo and MeteoAlarm (no account needed).",
+    description: "Current weather, rain in the next hours and forecasts from Open-Meteo (no account needed).",
     settings: {
       defaultPlace: Setting.text({
         label: "Home location",
@@ -251,7 +251,7 @@ export const weatherModule = (deps: { readonly fetch?: typeof globalThis.fetch }
         advanced: true
       })
     },
-    requires: [{ network: "internet", why: "Fetches forecasts from Open-Meteo and warnings from MeteoAlarm." }],
+    requires: [{ network: "internet", why: "Fetches forecasts from Open-Meteo." }],
     // Nothing to check without the network, and no setting is required: the place can be said in each question.
     health: () => Effect.succeed([]),
     shared: (ctx) =>

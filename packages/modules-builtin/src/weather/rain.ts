@@ -1,54 +1,66 @@
 /**
- * The next hours of rain from Open-Meteo's 15-minute precipitation (mm in each quarter of an hour), as periods. A pure
- * function: the tool words them. Native 15-minute data exists in central Europe and North America; elsewhere Open-Meteo
- * interpolates from hourly data, so the quarter-hours are less exact there (the doc page says so).
+ * The next hours of rain from Open-Meteo's 15-minute precipitation (mm in each quarter of an hour), as periods. Pure
+ * functions over instants (the service is asked for epoch timestamps): the tool words them in the place's own zone. Native
+ * 15-minute data exists in central Europe and North America; elsewhere Open-Meteo interpolates from hourly data, so the
+ * quarter-hours are less exact there (the doc page says so).
  */
 export type Intensity = "dry" | "light" | "moderate" | "heavy"
 
 /** One quarter-hour of rain as a word: under 0.1 mm is dry, to 0.5 mm light (about 2 mm/h), to 1.9 mm moderate, then heavy. */
 export const intensityOf = (mm: number): Intensity => (mm < 0.1 ? "dry" : mm < 0.5 ? "light" : mm < 1.9 ? "moderate" : "heavy")
 
+export const QUARTER_MS = 15 * 60_000
+
 export interface Slot {
-  /** Local time of the place as written by the service, "2026-11-18T10:15". */
-  readonly time: string
   /** Epoch ms of the start of the quarter-hour. */
   readonly startMs: number
-  readonly mm: number
+  /** Precipitation in it; `null` when the service does not know. */
+  readonly mm: number | null
 }
 
 export interface Period {
   readonly kind: Intensity
-  readonly from: string
-  readonly to: string
-  readonly minutes: number
   readonly startMs: number
   readonly endMs: number
 }
 
-const QUARTER = 15 * 60_000
+/**
+ * The quarter-hours that really cover the time from `nowMs`: the one `nowMs` falls in, then each that follows it
+ * exactly (no gap, no overlap, no unknown value), until `untilMs` is covered. Returns the time they cover to, which is
+ * before `untilMs` when the service did not cover all of it; `undefined` when not even the present quarter is known.
+ */
+export const coverage = (slots: ReadonlyArray<Slot>, nowMs: number, untilMs: number): { readonly slots: ReadonlyArray<Slot & { readonly mm: number }>; readonly toMs: number } | undefined => {
+  const first = slots.findIndex((s) => s.startMs <= nowMs && nowMs < s.startMs + QUARTER_MS)
+  if (first < 0) return undefined
+  const covered: Array<Slot & { readonly mm: number }> = []
+  for (let i = first; i < slots.length; i++) {
+    const s = slots[i]!
+    if (s.mm === null || !Number.isFinite(s.mm)) break
+    if (covered.length > 0 && s.startMs !== covered.at(-1)!.startMs + QUARTER_MS) break
+    covered.push({ startMs: s.startMs, mm: s.mm })
+    if (s.startMs + QUARTER_MS >= untilMs) break
+  }
+  if (covered.length === 0) return undefined
+  return { slots: covered, toMs: Math.min(untilMs, covered.at(-1)!.startMs + QUARTER_MS) }
+}
 
 /**
- * The slots still to come (or in progress) within `windowMs` of `nowMs`, merged into runs of dry and wet. A wet run keeps
- * its strongest intensity. `to` is the end of the last quarter-hour of the run.
+ * The covered quarter-hours from `nowMs` to `endMs`, merged into runs of dry and wet, each clipped to that interval. A wet
+ * run keeps its strongest intensity.
  */
-export const periodsOf = (slots: ReadonlyArray<Slot>, nowMs: number, windowMs: number): ReadonlyArray<Period> => {
-  const seen = slots.filter((s) => s.startMs + QUARTER > nowMs && s.startMs < nowMs + windowMs)
-  const out: Array<{ kind: Intensity; slots: Array<Slot> }> = []
+export const periodsOf = (slots: ReadonlyArray<Slot & { readonly mm: number }>, nowMs: number, endMs: number): ReadonlyArray<Period> => {
   const rank: Record<Intensity, number> = { dry: 0, light: 1, moderate: 2, heavy: 3 }
-  for (const slot of seen) {
+  const out: Array<{ kind: Intensity; startMs: number; endMs: number }> = []
+  for (const slot of slots) {
+    const from = Math.max(slot.startMs, nowMs)
+    const to = Math.min(slot.startMs + QUARTER_MS, endMs)
+    if (to <= from) continue
     const kind = intensityOf(slot.mm)
     const last = out.at(-1)
     if (last !== undefined && (last.kind === "dry") === (kind === "dry")) {
-      last.slots.push(slot)
+      last.endMs = to
       if (rank[kind] > rank[last.kind]) last.kind = kind
-    } else out.push({ kind, slots: [slot] })
+    } else out.push({ kind, startMs: from, endMs: to })
   }
-  return out.map((run) => {
-    const first = run.slots[0]!
-    const last = run.slots.at(-1)!
-    const endMs = last.startMs + QUARTER
-    // The service writes the place's own clock; adding a quarter to that written time (read as UTC) gives the written end.
-    const end = new Date(Date.parse(`${last.time}:00Z`) + QUARTER).toISOString().slice(0, 16)
-    return { kind: run.kind, from: first.time, to: end, minutes: Math.round((endMs - Math.max(first.startMs, nowMs)) / 60_000), startMs: first.startMs, endMs }
-  })
+  return out
 }

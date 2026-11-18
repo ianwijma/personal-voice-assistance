@@ -23,19 +23,12 @@ export const texts = defineTexts({
     degreesF: "degrees Fahrenheit",
     rainChance: ", {n} percent chance of rain",
     windUpTo: ", wind up to {n} {unit}",
-    hours: " In the next {n} hours: {min} to {max} {degrees}, up to {p} percent chance of rain.",
-    warnNone: "No weather warnings for {place}.",
-    warnYes: "Code {level} for {what} in {place}{until}.",
-    warnUntil: " until {when}",
-    warnMore: " And {count} more.",
-    warnUnavailable: "I can't check weather warnings at the moment.",
-    levelYellow: "yellow",
-    levelOrange: "orange",
-    levelRed: "red",
-    at: "{day} at {time}",
-    typeWind: "wind", typeSnow: "snow and ice", typeThunder: "thunderstorms", typeFog: "fog", typeHeat: "high temperatures",
-    typeCold: "low temperatures", typeCoast: "coastal conditions", typeFire: "forest fire risk", typeAvalanche: "avalanches",
-    typeRain: "rain", typeFlood: "flooding", typeRainFlood: "rain and flooding", typeOther: "dangerous weather"
+    dayMissing: "I don't have the forecast for that day.",
+    hours: " In the next {span}: {min} to {max} {degrees}, up to {p} percent chance of rain.",
+    hoursUnknownRain: " In the next {span}: {min} to {max} {degrees}; the chance of rain is not known.",
+    hoursNone: " I don't have the forecast for the coming hours.",
+    onlyUntil: " I only know until {time}.",
+    rainOnlyUntil: "I only know until {time}."
   },
   nl: {
     noPlace: "Ik weet nog niet waar thuis is. De eigenaar kan het instellen onder Thuis, of noem een plaats.",
@@ -58,19 +51,12 @@ export const texts = defineTexts({
     degreesF: "graden Fahrenheit",
     rainChance: ", {n} procent kans op regen",
     windUpTo: ", wind tot {n} {unit}",
-    hours: " In de komende {n} uur: {min} tot {max} {degrees}, tot {p} procent kans op regen.",
-    warnNone: "Geen weerwaarschuwingen voor {place}.",
-    warnYes: "Code {level} voor {what} in {place}{until}.",
-    warnUntil: " tot {when}",
-    warnMore: " En nog {count}.",
-    warnUnavailable: "Ik kan de weerwaarschuwingen op dit moment niet controleren.",
-    levelYellow: "geel",
-    levelOrange: "oranje",
-    levelRed: "rood",
-    at: "{day} om {time}",
-    typeWind: "wind", typeSnow: "sneeuw en ijzel", typeThunder: "onweer", typeFog: "mist", typeHeat: "hoge temperaturen",
-    typeCold: "lage temperaturen", typeCoast: "kustomstandigheden", typeFire: "kans op bosbrand", typeAvalanche: "lawines",
-    typeRain: "regen", typeFlood: "overstroming", typeRainFlood: "regen en overstroming", typeOther: "gevaarlijk weer"
+    dayMissing: "Ik heb de verwachting voor die dag niet.",
+    hours: " In de komende {span}: {min} tot {max} {degrees}, tot {p} procent kans op regen.",
+    hoursUnknownRain: " In de komende {span}: {min} tot {max} {degrees}; de kans op regen is niet bekend.",
+    hoursNone: " Ik heb de verwachting voor de komende uren niet.",
+    onlyUntil: " Ik weet het maar tot {time}.",
+    rainOnlyUntil: "Ik weet het maar tot {time}."
   }
 })
 
@@ -95,9 +81,3 @@ export const conditionsNl: Record<number, string> = {
   80: "lichte buien", 81: "buien", 82: "zware buien", 85: "sneeuwbuien", 86: "zware sneeuwbuien",
   95: "onweer", 96: "onweer met hagel", 99: "onweer met zware hagel"
 }
-
-/** The names of MeteoAlarm's awareness types (1 to 13), as text keys. */
-export const awarenessTypeKeys = {
-  1: "typeWind", 2: "typeSnow", 3: "typeThunder", 4: "typeFog", 5: "typeHeat", 6: "typeCold", 7: "typeCoast", 8: "typeFire",
-  9: "typeAvalanche", 10: "typeRain", 11: "typeFlood", 12: "typeRainFlood"
-} as const satisfies Record<number, keyof typeof texts.en>

@@ -178,8 +178,8 @@ describe("weather.today", () => {
     Effect.scoped(Effect.gen(function*() {
       const host = yield* makeModuleHost({ catalog: [weatherModule({ fetch })], persistence: readOnlyPersistence(), env: {} })
       yield* host.startEnabled
-      // `weather` and the three tools of the local-info extension; the four actions are not also tools.
-      assert.deepStrictEqual(host.snapshot().registry.specs.map((s) => s.name), ["weather", "weather_rain_soon", "weather_forecast", "weather_warnings"])
-      assert.deepStrictEqual(host.snapshot().actions.map((a) => a.id), ["weather.today", "weather.rain_soon", "weather.tomorrow", "weather.warnings"])
+      // `weather` and the two tools of the local-info extension; the three actions are not also tools.
+      assert.deepStrictEqual(host.snapshot().registry.specs.map((s) => s.name), ["weather", "weather_rain_soon", "weather_forecast"])
+      assert.deepStrictEqual(host.snapshot().actions.map((a) => a.id), ["weather.today", "weather.rain_soon", "weather.tomorrow"])
     })))
 })
