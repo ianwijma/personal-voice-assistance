@@ -517,10 +517,15 @@ module's shared settings only: the `overridable` fields, which an assistant may 
 stop it; each instance validates its own effective settings in full). Shared code acting for a caller asks
 `ctx.settingsFor(assistantId)`: the shared (not overridable) values and that assistant's own value of each overridable
 field over the shared default; the
-current shared defaults with no assistant, `undefined` when they are not valid. It answers from the desired state the
-module was started with: a changed default of an overridable field (Amsterdam to London) changes an instance, so the
-module starts again and its `settingsFor` gives London from then on. Sockets, caches, handlers, services and
-contributions belong there. What it returns as `value`, every instance receives as `ctx.shared`.
+current shared defaults with no assistant, `undefined` when they are not valid. It answers from the latest accepted
+state of the run (who has the module on, their own values, the saved values and the defaults as of the last change that
+kept the run), with the secrets the run started with. Not every change that alters its answer restarts the module: an
+assistant joining or leaving an existing instance, assistants swapping between equal instances, and a changed default
+or saved value of an overridable field that no running instance uses (Amsterdam to London while the module runs only
+for `uses`) keep the run, and the same `settingsFor` answers London from then on. A change that does alter an instance
+restarts the module as below. So a module must not cache what `settingsFor` answers (or other shared state derived
+from it) on the assumption that every relevant change restarts it: ask when acting. Sockets, caches, handlers,
+services and contributions belong there. What it returns as `value`, every instance receives as `ctx.shared`.
 
 The shared part and the instances it serves start, run, stop and close **together** (docs/ARCHITECTURE.md "Module
 host"):
@@ -606,8 +611,10 @@ requirements, why it is unavailable, a failed start (kept current), module code 
 again), and the last `health()` result. Every issue is normalised where it enters, whoever reported it: id, module,
 device, title and the fix's label and value are one line each, a detail keeps its line breaks, no other control
 character survives (no terminal escape reaches doctor's output or the page), every text is clipped to the wire's
-limits; one that still does not fit is replaced by a warning that says so. At most 20 issues per module, and
-`MAX_HEALTH_ISSUES` (100) and 256 KB in all, the rest said in one last issue ("And 12 more issues"); every list the
+limits; one that still does not fit is replaced by a warning that says so. Only the registry bounds them: a module's
+whole list is sorted by severity (so an error after many warnings is kept), and at most `MAX_HEALTH_ISSUES` (100) and
+256 KB in all are kept, the most severe first, the true number left out said in one last issue ("And 12 more
+issues"); every list the
 protocol gained for this (issues, templates per module, a template's modules and phrases, a tool's risks) has a
 maximum, so no message exceeds the frame limit.
 
@@ -635,8 +642,11 @@ opaque reference to the connection the request came in on (a voice turn: the tab
 turn starts; a typed turn: the tab that typed it, `TextInput.connection`). The Claude Code bridge captures it at the
 turn's start and gives it to every tool call the SDK makes **for that turn**: Claude Code announces each tool use in
 the turn's stream before it calls the tool, and the bridge routes a call only to the turn whose stream announced it
-(same name and input), never to "the turn in progress now"; a call of a turn that ended or was interrupted is refused,
-and one waiting inside the bridge when its turn is cancelled does not start. It is `undefined` in the CLI modes; a job
+(the same `tool_use` id, which Claude Code sends with the call), never to "the turn in progress now"; a call of a turn
+that ended or was interrupted is refused, and one waiting inside the bridge when its turn is cancelled does not start.
+A call that arrives without an id (an older Claude Code) is matched by name and input instead; then a late identical
+call of an ended turn can take a later turn's matching claim and run with that later turn's handler and context, and
+the later turn's own call is refused. The guarantee above holds for calls that carry an id. It is `undefined` in the CLI modes; a job
 carries its own origin (`CurrentJob`, P6).
 
 Every tool call and action run goes through one **execution gateway** (`Gateway.ts`): `ToolRegistry.run` (the model's

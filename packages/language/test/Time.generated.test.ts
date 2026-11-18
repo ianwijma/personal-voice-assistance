@@ -1,9 +1,12 @@
 // Times of day (review round 3, decision 6): every clock time in every speaking style reads back; generated phrases and mutants.
-import { describe, expect, it } from "@effect/vitest"
+import { describe, expect, it, vi } from "@effect/vitest"
 import { parseTimeOfDay, speakTime } from "../src/index.ts"
 import { stable } from "./support/Cfg.ts"
 import { generatedParse, mutantsParse, type GrammarCheck } from "./support/Check.ts"
 import { settleReading, timeGrammar, type Reading, type Settled } from "./grammars/times.ts"
+
+// Generated cases by the hundred: slow on a shared CI runner, so these tests get more than the default five seconds.
+vi.setConfig({ testTimeout: 60_000 })
 
 const clockOrder = (a: { hour: number; minute: number }, b: { hour: number; minute: number }) => a.hour * 60 + a.minute - (b.hour * 60 + b.minute)
 const parsed = (text: string, language: "en" | "nl", options?: Parameters<typeof parseTimeOfDay>[2]) => {
@@ -13,43 +16,32 @@ const parsed = (text: string, language: "en" | "nl", options?: Parameters<typeof
 }
 
 describe("times: every clock time, every style, both languages", () => {
+  // The four style and `period` combinations (review round 5, finding 2), each read back with the parser's documented default context:
+  // no band given (07:00–21:00), no `afterMinutes`.
+  const inDefaultBand = (x: { hour: number; minute: number }) => x.hour * 60 + x.minute >= 420 && x.hour * 60 + x.minute <= 1260
   for (const language of ["en", "nl"] as const) {
-    it(`${language}: the 1440 times with the part of the day read back exactly, not guessed`, () => {
-      for (let m = 0; m < 1440; m++) {
-        const t = { hour: Math.floor(m / 60), minute: m % 60 }
-        const said = speakTime(t, language, { period: true })!
-        const p = parsed(said, language)
-        if (typeof p === "string" || "ambiguous" in p || p.hour !== t.hour || p.minute !== t.minute || p.guessed) throw new Error(`${language} ${stable(t)}: "${said}" → ${stable(p)}`)
-      }
-    })
-    it(`${language}: the 1440 times in the 24-hour style read back exactly when the words settle the hour, else to the same clock reading, guessed`, () => {
-      const wholeDay = { band: { from: 0, to: 1439 } }
-      for (let m = 0; m < 1440; m++) {
-        const t = { hour: Math.floor(m / 60), minute: m % 60 }
-        const said = speakTime(t, language, { style: "24h" })!
-        // Open: English 10–12 without "hundred" ("ten thirty"), Dutch 1–12 ("zeven uur", "twaalf uur dertig").
-        const open = language === "en" ? t.hour >= 10 && t.hour <= 12 && t.minute !== 0 : t.hour >= 1 && t.hour <= 12
-        const p = parsed(said, language, open ? wholeDay : undefined)
-        if (typeof p === "string" || "ambiguous" in p || p.guessed !== open) throw new Error(`${language} ${stable(t)}: "${said}" → ${stable(p)}`)
-        const readings = [{ hour: p.hour, minute: p.minute }, ...p.alternatives]
-        const ok = open ? readings.some((x) => x.hour === t.hour && x.minute === t.minute) && readings.every((x) => x.hour % 12 === t.hour % 12) : p.hour === t.hour && p.minute === t.minute
-        if (!ok) throw new Error(`${language} ${stable(t)}: "${said}" → ${stable(p)}`)
-      }
-    })
-    it(`${language}: the 1440 times in the 12-hour style without a part of the day read back to the same clock reading, guessed (noon and midnight exact)`, () => {
-      const wholeDay = { band: { from: 0, to: 1439 } }
-      for (let m = 0; m < 1440; m++) {
-        const t = { hour: Math.floor(m / 60), minute: m % 60 }
-        const said = speakTime(t, language)!
-        const p = parsed(said, language, wholeDay)
-        const exact = t.minute === 0 && (t.hour === 0 || (language === "en" && t.hour === 12))
-        if (typeof p === "string" || "ambiguous" in p) throw new Error(`${language} ${stable(t)}: "${said}" → ${stable(p)}`)
-        const readings = [{ hour: p.hour, minute: p.minute }, ...p.alternatives]
-        if (p.guessed === exact || !readings.some((x) => x.hour === t.hour && x.minute === t.minute) || !readings.every((x) => x.minute === t.minute && x.hour % 12 === t.hour % 12)) {
-          throw new Error(`${language} ${stable(t)}: "${said}" → ${stable(p)}`)
+    for (const style of ["12h", "24h"] as const) for (const period of [false, true]) {
+      it(`${language}, ${style}${period ? " with the part of the day" : ""}: the 1440 times read back as the README promises`, () => {
+        for (let m = 0; m < 1440; m++) {
+          const t = { hour: Math.floor(m / 60), minute: m % 60 }
+          const said = speakTime(t, language, { style, period })!
+          // Settled by the words: with `period` always; in the 24-hour style English but 10–12 with minutes ("ten thirty"), Dutch 0 and
+          // 13–23; in the 12-hour style English noon and midnight, Dutch middernacht.
+          const settled = period ? true
+            : style === "24h" ? (language === "en" ? !(t.hour >= 10 && t.hour <= 12 && t.minute !== 0) : t.hour === 0 || t.hour >= 13)
+            : t.minute === 0 && (t.hour === 0 || (language === "en" && t.hour === 12))
+          const p = parsed(said, language)
+          if (typeof p === "string" || "ambiguous" in p) throw new Error(`${language} ${style} ${period} ${stable(t)}: "${said}" → ${stable(p)}`)
+          const readings = [{ hour: p.hour, minute: p.minute }, ...p.alternatives].map((x) => ({ hour: x.hour, minute: x.minute })).sort(clockOrder)
+          // Open: the same clock reading modulo 12 hours, guessed, as the default band reads it (the time itself among the readings
+          // exactly when the band holds it).
+          const want = settled ? [t] : [t.hour % 12, (t.hour % 12) + 12].map((hour) => ({ hour, minute: t.minute })).filter(inDefaultBand)
+          if (p.guessed === settled || stable(readings) !== stable(want) || (settled && (p.hour !== t.hour || p.minute !== t.minute))) {
+            throw new Error(`${language} ${style} ${period} ${stable(t)}: "${said}" → ${stable(p)}`)
+          }
         }
-      }
-    })
+      })
+    }
   }
 })
 

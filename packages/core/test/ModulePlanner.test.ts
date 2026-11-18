@@ -34,6 +34,13 @@ const cases: ReadonlyArray<{ readonly name: string; readonly target: ModuleTarge
   },
   { name: "settings not valid, nothing runs: nothing", target: target("f2", { invalid: "x" }), current: now(), plan: plan({}) },
   {
+    // Review round 5 (p1-r5a finding 2): settings that cannot be read can leave the fingerprint as it was.
+    name: "settings not valid at the very fingerprint that runs: stop it, start nothing (never kept)",
+    target: target("f1", { invalid: "The settings could not be read" }),
+    current: now("f1"),
+    plan: plan({ stop: true })
+  },
+  {
     name: "a restart (its counter is in the fingerprint): stop, then start",
     target: target("[\"s\",[\"k\"],0,1]"),
     current: now("[\"s\",[\"k\"],0,0]"),

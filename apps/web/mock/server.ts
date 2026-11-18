@@ -144,6 +144,7 @@ import { answerHealthCheck } from "./health.ts"
 import { exampleEngineStatus, exampleHealth, exampleSnapshot, exampleUnavailableModule, exampleVoiceSection, exampleWeatherModule } from "@pva/protocol/examples"
 import { type WebSocket, WebSocketServer } from "ws"
 import { createAssistantsMock } from "./assistants.ts"
+import { type CapabilityParts, reconcileCapability } from "./capabilities.ts"
 import { fieldValueError } from "./fieldChecks.ts"
 import { seedTraces } from "./traces.ts"
 import { createVoiceAssistants, scenarioSettings, scriptedTurn } from "./voiceAssistants.ts"
@@ -1905,14 +1906,6 @@ const runningStatus = (id: string, m: ModuleInfo) =>
   : m.status
 /** A failure injected into a capability module's instances (tests: `/mock/module-error`); a saved token with "good" in it clears it. */
 const forcedErrors = new Map<string, string>()
-const ownableKeys = (m: ModuleInfo) => new Set(m.settings.fields.filter((f) => f.overridable === true && f.type !== "secret").map((f) => f.key))
-/** An instance's key: the effective non-secret values (an assistant's own applied), as the host keys them. */
-const instanceKey = (m: ModuleInfo, own: Readonly<Record<string, SettingValue>> | undefined) => {
-  const over = ownableKeys(m)
-  const values: Record<string, SettingValue> = { ...m.settings.values }
-  for (const [k, v] of Object.entries(own ?? {})) if (over.has(k)) values[k] = v
-  return JSON.stringify(Object.keys(values).sort().map((k) => [k, values[k]]))
-}
 /** The field errors the module's own checks give an assistant's own values (`ModuleHost.checkOwn`). */
 const checkOwn = (moduleId: string, own: Readonly<Record<string, unknown>>) => {
   const m = modules.find((x) => x.id === moduleId)
@@ -1921,44 +1914,15 @@ const checkOwn = (moduleId: string, own: Readonly<Record<string, unknown>>) => {
   return validate(m.settings, { values, secrets: {} }).flatMap((e) => (e.key === null ? [] : [{ field: e.key, message: e.message }]))
 }
 /**
- * A capability module runs while at least one switched-on assistant has it on; assistants whose effective values are
- * equal share one instance, an assistant with its own values may run another. Module infos are updated (and pushed)
- * only when they change. The shared instance is listed first.
+ * Every capability module follows the assistants (`reconcileCapability`, mock/capabilities.ts: an unavailable one
+ * stays unavailable). Module infos are updated (and pushed) only when they change.
  */
+const capabilityParts: CapabilityParts = { forced: (id) => forcedErrors.get(id), runningStatus, runningTools, instanceStatus }
 const syncCapabilities = () => {
   const list = assistantsMock.assistants()
   for (const m of [...modules]) {
     if (m.kind !== "capability") continue
-    const wanting = list.filter((a) => a.on && a.modules[m.id]?.on === true)
-    const over = ownableKeys(m)
-    const sharedKey = instanceKey(m, undefined)
-    const groups = new Map<string, { assistants: Array<string>; own: Set<string>; values: Record<string, SettingValue> | undefined }>()
-    for (const a of wanting) {
-      const own = a.modules[m.id]!.own
-      const key = instanceKey(m, own)
-      const g = groups.get(key) ?? { assistants: [], own: new Set<string>(), values: key === sharedKey ? undefined : (own as Record<string, SettingValue> | undefined) }
-      g.assistants.push(a.id)
-      if (key !== sharedKey) for (const [k, v] of Object.entries(own ?? {})) if (over.has(k) && JSON.stringify(v) !== JSON.stringify(m.settings.values[k])) g.own.add(k)
-      groups.set(key, g)
-    }
-    const forced = forcedErrors.get(m.id)
-    const status = runningStatus(m.id, m)
-    const ordered = [...groups.entries()].sort(([a], [b]) => (a === sharedKey ? -1 : b === sharedKey ? 1 : 0)).map(([, g]) => g)
-    const instances = ordered.map((g) => ({
-      assistants: g.assistants,
-      own: [...g.own],
-      state: forced !== undefined ? ("error" as const) : ("running" as const),
-      ...(forced !== undefined ? { error: `${forced} (for ${g.assistants.join(", ")})` } : instanceStatus(m.id, m, g.values) !== undefined ? { status: instanceStatus(m.id, m, g.values)! } : {})
-    }))
-    const { error: _e, status: _s, ...rest } = m
-    const next: ModuleInfo = {
-      ...rest,
-      enabled: wanting.length > 0,
-      state: wanting.length === 0 ? "disabled" : forced !== undefined ? "error" : "running",
-      tools: wanting.length > 0 && forced === undefined ? [...runningTools(m.id)] : [],
-      ...(wanting.length > 0 && forced !== undefined ? { error: forced } : wanting.length > 0 && status !== undefined ? { status } : {}),
-      instances
-    }
+    const next = reconcileCapability(m, list, capabilityParts)
     const same = (a: ModuleInfo, b: ModuleInfo) => JSON.stringify({ ...a, revision: 0 }) === JSON.stringify({ ...b, revision: 0 })
     if (!same(m, next)) setModule(m.id, () => next)
   }

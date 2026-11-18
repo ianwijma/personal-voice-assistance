@@ -139,6 +139,37 @@ describe("the Claude Code bridge attributes a call to the turn that issued it", 
       agent.shutdown()
     }), 20_000)
 
+  // Review round 5 (p1-r5b finding 1): pins the accepted limit of the fallback; Claude Code itself sends the id.
+  it.live("round 5: without a tool_use id (the fallback), a late identical call of a cancelled turn takes the next turn's claim and runs with that turn's handler and context; that turn's own call is refused", () =>
+    Effect.gen(function*() {
+      ran.length = 0
+      let kept: ToolHandler | undefined
+      const results: Record<string, { content: string; isError: boolean }> = {}
+      const fake = makeFakeSdk()
+      fake.setRespond(async (ctx) => {
+        ctx.delta("Let me check.")
+        ctx.announce("echo", { text: "same" })
+        kept = ctx.mcp()
+        await ctx.interrupted
+      })
+      const agent = yield* agentOf(fake)
+      yield* Stream.runHead(agent.turn(inputOf(1)).pipe(Stream.provideService(CurrentTurn, turnOf(1))))
+      fake.setRespond(async (ctx) => {
+        await new Promise((resolve) => setImmediate(resolve))
+        ctx.announce("echo", { text: "same" })
+        // Neither request carries an id: they are matched by name and input.
+        results.late = await kept!("echo", { text: "same" })
+        results.own = await kept!("echo", { text: "same" })
+        ctx.delta("Done.")
+        ctx.result()
+      })
+      yield* Stream.runDrain(agent.turn(inputOf(2)).pipe(Stream.provideService(CurrentTurn, turnOf(2))))
+      expect(results.late).toEqual({ content: "same", isError: false })
+      expect(results.own?.isError).toBe(true)
+      expect(ran).toEqual([{ text: "same", turn: 2, connection: "tab-2" }])
+      agent.shutdown()
+    }), 20_000)
+
   it.live("1: a call made after its turn finished is refused (it would otherwise reach the next turn's handler)", () =>
     Effect.gen(function*() {
       ran.length = 0

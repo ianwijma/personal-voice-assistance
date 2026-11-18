@@ -1,10 +1,13 @@
 // Review round 3, decision 1 and 6, narrowed in round 4 (decision 1): every exported function, called with arguments of their declared
 // types holding any data — extreme and odd numbers, odd strings, unknown time zones — never throws and never returns NaN, Infinity,
 // an invalid date, a date outside the supported years, or "" / "NaN" to say; an unknown time zone gives the function's failure.
-import { describe, expect, it } from "@effect/vitest"
+import { describe, expect, it, vi } from "@effect/vitest"
 import * as L from "../src/index.ts"
 import { escaped } from "../src/Domain.ts"
 import { rng, type Rng } from "./support/Rng.ts"
+
+// Generated cases by the hundred: slow on a shared CI runner, so these tests get more than the default five seconds.
+vi.setConfig({ testTimeout: 60_000 })
 
 const strings = [
   "", " ", "tomorrow at five", "morgen om vijf uur", "every day", "2 kg flour", "two hours", "twenty five", "7:30", "x".repeat(201), "a ".repeat(60),

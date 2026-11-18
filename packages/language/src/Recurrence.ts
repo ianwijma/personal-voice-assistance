@@ -7,7 +7,7 @@ import { ambiguous, notUnderstood, ok, type ClockTime, type Language, type Local
 import { bandOf, periodHours, resolveTime, timeOfDay, type Period, type TimeMatch, type TimeOfDay, type TimeOptions } from "./Time.ts"
 import { sliceText, tokenize } from "./Tokens.ts"
 import { ordinal } from "./Words.ts"
-import { addDays, daysInMonth, instantIn, localParts, normalizeTimeZone, zonedToInstant } from "./Zoned.ts"
+import { addDays, dayHappens, daysInMonth, instantIn, normalizeTimeZone, zonedToInstant } from "./Zoned.ts"
 
 export interface RecurrenceOptions extends Omit<TimeOptions, "afterMinutes"> {
   /** Epoch milliseconds or a Date, whose local date in `timeZone` is in the supported years. */
@@ -337,9 +337,9 @@ const firstAfter = (rule: RecurrenceRule, clock: ClockTime, today: LocalDate, no
     const start = { ...d, hour: clock.hour, minute: clock.minute, second: 0 }
     const instant = zonedToInstant(start, zone)
     // A day the zone skips altogether (Pacific/Apia, 30 December 2011) is not a start: its instant is the next day's, and a start
-    // on it would shift the phase of every-few-days rules by one day.
-    const back = localParts(instant, zone)
-    if (back.year !== d.year || back.month !== d.month || back.day !== d.day) continue
+    // on it would shift the phase of every-few-days rules by one day. A gap that only pushes the time past midnight (America/Nuuk,
+    // 28 March 2026 at 23:30) is an ordinary gap: the pre-gap reading, as everywhere else (review round 5, finding 1).
+    if (!dayHappens(d, zone)) continue
     if (instant > now) return { start, instant }
   }
   return undefined

@@ -1,13 +1,14 @@
 // Module requirements and `pnpm start doctor` (docs/MODULES-PLAN.md §4 P1; module-definition §C.3–C.5), with fake
 // program entries and a fake prober: nothing is run on this machine. The real registry is empty in this version.
 import { describe, expect, it } from "@effect/vitest"
+import { vi } from "vitest"
 import { defineModule, type Issue as HealthIssue, isMissingProgramError, isModuleStopped, makeModuleHost, makeTool, type ModuleHostApi, readOnlyPersistence, type Requirement } from "@pva/core"
 import type { Assistant } from "@pva/protocol"
-import { Cause, Effect, Fiber, Schema } from "effect"
+import { Cause, ConfigProvider, Effect, Fiber, Schema } from "effect"
 import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
-import { formatDoctor, loadDoctorSettings, runDoctor } from "../src/doctor.ts"
+import { doctorCommand, formatDoctor, loadDoctorSettings, runDoctor } from "../src/doctor.ts"
 import {
   detectDistro,
   installFix,
@@ -60,7 +61,7 @@ describe("versions: strict semver or unknown", () => {
 })
 
 describe("the requirement checker", () => {
-  it.effect("probes each program once, concurrently, without a shell, on the fixed path with 5 s, and judges from the cache", () =>
+  it.effect("probes each program once with its version argument, the fixed path and a 5 s timeout option, and judges again from the cache", () =>
     Effect.gen(function*() {
       const { calls, prober } = fakeProber({
         ffmpeg: ran("ffmpeg 6.1.1 Copyright (c) 2000-2023"),
@@ -216,7 +217,7 @@ describe("doctor", () => {
       ])
     }))
 
-  it.effect("a module no assistant has on is only a warning, and nothing to report exits 0", () =>
+  it.effect("an unmet requirement of a module no assistant has on is only a warning, and nothing to report exits 0", () =>
     Effect.gen(function*() {
       const unused = yield* runDoctor({ catalog: [music], env: {}, dataDir: "/nonexistent/pva-data", assistants: [assistantWith({})], prober: fakeProber({}).prober, tools: TOOLS })
       const report = formatDoctor(unused.issues, unused.modules)
@@ -257,7 +258,7 @@ describe("doctor", () => {
     }))
 
   // Review round 4 (p1-r4c finding 1): a missing installation is not "the defaults".
-  it.effect("a missing data directory, a missing settings file and a corrupt one are failures (exit 2), and nothing is written", () =>
+  it.effect("a missing data directory, a missing settings file and a corrupt one are failures, and nothing is written", () =>
     Effect.gen(function*() {
       const openVaultNone = async () => ({ state: () => "none" }) as never
       const root = mkdtempSync(join(tmpdir(), "pva-doctor-"))
@@ -273,6 +274,44 @@ describe("doctor", () => {
       expect(readdirSync(root)).toEqual(["settings.json"])
       expect(readFileSync(join(root, "settings.json"), "utf8")).toBe("{ not json")
       rmSync(root, { recursive: true, force: true })
+    }))
+
+  // Review round 5 (p1-r5c finding 7): the command itself ends with exit code 2 on a missing installation.
+  it.effect("doctor on a missing data directory says why and ends with exit code 2", () =>
+    Effect.gen(function*() {
+      const root = mkdtempSync(join(tmpdir(), "pva-doctor-"))
+      const out: Array<string> = []
+      const write = vi.spyOn(process.stdout, "write").mockImplementation((chunk: string | Uint8Array) => (out.push(String(chunk)), true))
+      const before = process.exitCode
+      try {
+        yield* doctorCommand.pipe(
+          Effect.provideService(ConfigProvider.ConfigProvider, ConfigProvider.fromEnvRecord({ PVA_DATA_DIR: join(root, "typo"), PVA_VAULT_PATH: join(root, "vault.enc") }))
+        )
+        expect(process.exitCode).toBe(2)
+      } finally {
+        process.exitCode = before
+        write.mockRestore()
+        rmSync(root, { recursive: true, force: true })
+      }
+      expect(out.join("")).toMatch(/^doctor: There is no data directory at .*typo: set PVA_DATA_DIR/)
+    }))
+
+  // Review round 5 (p1-r5a finding 4, p1-r5c finding 1): only the registry bounds a module's health issues.
+  it.effect("twenty warnings then an error from one module: the error is kept and doctor exits 1; modules over the bound: the true number left out", () =>
+    Effect.gen(function*() {
+      const reporting = (id: string, issues: ReadonlyArray<HealthIssue>) => defineModule({ id, name: id, description: "", health: () => Effect.succeed(issues), start: () => Effect.succeed({}) })
+      const late = reporting("late", [
+        ...Array.from({ length: 20 }, (_, i): HealthIssue => ({ id: `w${i}`, severity: i % 2 === 0 ? "warning" : "info", title: `Check ${i}`, detail: "" })),
+        { id: "e", severity: "error", title: "The shared dependency failed", detail: "" }
+      ])
+      const report = yield* runDoctor({ catalog: [late], env: {}, dataDir: "/nonexistent/pva-data", assistants: [assistantWith({})], prober: fakeProber({}).prober, tools: TOOLS })
+      const { exitCode, lines } = formatDoctor(report.issues, report.modules)
+      expect(exitCode).toBe(1)
+      expect(lines).toContain("module  late: no requirements; health: 21 issues.")
+      expect(lines).toContain("error   late: The shared dependency failed.")
+      const many = Array.from({ length: 6 }, (_, k) => reporting(`many${k}`, Array.from({ length: 150 }, (_, i): HealthIssue => ({ id: `e${i}`, severity: "error", title: `Error ${i}`, detail: "" }))))
+      const over = yield* runDoctor({ catalog: many, env: {}, dataDir: "/nonexistent/pva-data", assistants: [assistantWith({})], prober: fakeProber({}).prober, tools: TOOLS })
+      expect(over.issues.at(-1)?.title).toBe(`And ${6 * 150 - 99} more issues`)
     }))
 
   // Review round 4 (p1-r4c findings 3, 6): every module has its line, healthy and unchecked ones too; an issue says its device.
