@@ -31,7 +31,7 @@ import { buildDecisionPlan, type DecisionProvider } from "./Decision.ts"
 import { ToolError } from "./Errors.ts"
 import { type ExecutionGateway, type GatewayAccess, type GatewayOptions, isGatewayRefusal, makeExecutionGateway } from "./Gateway.ts"
 import { sealAction, sealTool } from "./GatewayPrivate.ts"
-import { boundIssues, makeIssueRegistry, type IssueRegistry, wireSafeIssue } from "./Issues.ts"
+import { makeIssueRegistry, type IssueRegistry, wireSafeIssue } from "./Issues.ts"
 import { type AssistantModule, type ContextProvider, metadataProblem, type Tool, toolMetadata } from "./Module.ts"
 import {
   type ActionCatalogue,
@@ -349,6 +349,11 @@ interface Desired {
   readonly enabled: boolean
   /** The owner has chosen on or off (saved); before that, `enabledByDefault` / `enabledWhenSet` decide. */
   readonly chosen: boolean
+  /**
+   * On by its `enabledWhenSet` key (before the owner chose): set once the key is seen set, kept while the vault is
+   * locked and across a stop and start, given up only when the owner changes the module's secrets and the key is unset.
+   */
+  readonly keyed: boolean
   readonly stored: Readonly<Record<string, unknown>>
   /** The secrets the vault reports (and configure changes). */
   readonly secrets: Readonly<Record<string, string>>
@@ -572,6 +577,19 @@ export const makeModuleHost = Effect.fnUntraced(function*(options: ModuleHostOpt
 
   // -- The catalogue --------------------------------------------------------------------------------------------------
 
+  /**
+   * Whether the module's `enabledWhenSet` key is set in the environment or in these secrets, as `resolveSettings`
+   * judges a secret (a non-empty value). Read directly, without decoding any other setting: a decoder that throws on
+   * another field leaves the module wanted and down with its settings error, never off.
+   */
+  const keySet = (def: ModuleDefinition<any>, secrets: Readonly<Record<string, string>>): boolean => {
+    const key = def.enabledWhenSet
+    const setting = key === undefined ? undefined : (def.settings as SettingsSpec | undefined)?.[key]
+    if (key === undefined || setting === undefined || !setting.secret) return false
+    const fromEnv = setting.env === undefined ? undefined : options.env[setting.env]
+    return (fromEnv !== undefined && fromEnv.length > 0) || (secrets[key] ?? "").length > 0
+  }
+
   const ids = new Set<string>()
   const cycles = usesCycles(options.catalog)
   const entries: Array<Entry> = options.catalog.map((def) => {
@@ -582,6 +600,7 @@ export const makeModuleHost = Effect.fnUntraced(function*(options: ModuleHostOpt
     const want: Desired = {
       enabled: record?.enabled ?? def.enabledByDefault,
       chosen: record?.enabled !== undefined,
+      keyed: keySet(def, options.persistence.initial.secrets[def.id] ?? {}),
       stored: record?.settings ?? {},
       secrets: options.persistence.initial.secrets[def.id] ?? {},
       secretEpoch: 0,
@@ -718,15 +737,14 @@ export const makeModuleHost = Effect.fnUntraced(function*(options: ModuleHostOpt
   // -- Desired state: who wants what ----------------------------------------------------------------------------------
 
   /**
-   * Its own switch: the owner's choice; before one, on by default, or on while the `enabledWhenSet` key is set
-   * (environment, saved or the vault). A module switched on by its key that runs keeps running when the vault locks.
+   * Its own switch: the owner's choice; before one, on by default, or on by its `enabledWhenSet` key (`Desired.keyed`:
+   * the key set in the environment, the saved secrets or the vault, and kept on when the vault locks). Read from the
+   * desired state alone, never from whether a run exists at the moment.
    */
   const switchOn = (entry: Entry, d: Desired): boolean => {
     if (d.chosen) return d.enabled
-    const key = entry.def.enabledWhenSet
-    if (entry.def.enabledByDefault || key === undefined) return entry.def.enabledByDefault
-    if (resolveFrom(entry, d, undefined, d.defaults).form.secrets[key]?.set === true) return true
-    return entry.run !== undefined
+    if (entry.def.enabledByDefault || entry.def.enabledWhenSet === undefined) return entry.def.enabledByDefault
+    return d.keyed || keySet(entry.def, d.secrets)
   }
 
   /** Someone wants the module (its switch, or an assistant has it on). */
@@ -810,7 +828,8 @@ export const makeModuleHost = Effect.fnUntraced(function*(options: ModuleHostOpt
       invalid: why,
       instances: [...valid, ...invalid],
       fingerprint,
-      attempt: JSON.stringify([fingerprint, d.vaultEpoch, d.statuses.map((st) => [st.state, st.detail]), d.retry]),
+      // Valid or not is part of it: settings that become valid again at an unchanged fingerprint are a new attempt.
+      attempt: JSON.stringify([fingerprint, why === undefined, d.vaultEpoch, d.statuses.map((st) => [st.state, st.detail]), d.retry]),
       shared,
       fieldErrors,
       secrets,
@@ -972,7 +991,7 @@ export const makeModuleHost = Effect.fnUntraced(function*(options: ModuleHostOpt
         detail: `A module offers at most ${MAX_MODULE_TEMPLATES}, and all modules' suggested assistants together must fit the admin page.`
       })
     }
-    return normaliseIssues(entry.def.id, entry.def.name, out)
+    return normaliseIssues(entry.def.id, out)
   }
 
   /** Every module's issues again (a change of demand changes the severity of the modules it reaches too). */
@@ -1752,8 +1771,8 @@ export const makeModuleHost = Effect.fnUntraced(function*(options: ModuleHostOpt
   /** Ask for a save of `entry` (synchronously, inside the write): returns the number its caller waits for. */
   const requestSave = (entry: Entry): number => {
     entry.saveRequested++
-    // An owner who never chose: what its default makes it (on while its key is set, or while it runs by it).
-    saveQueue.set(entry, entry.want.chosen ? entry.want.enabled : switchOn(entry, entry.want))
+    // An owner who never chose: what its default makes it (on by default, or on by its key: `Desired.keyed`).
+    saveQueue.set(entry, switchOn(entry, entry.want))
     Deferred.doneUnsafe(saveWake, Effect.void)
     return entry.saveRequested
   }
@@ -1916,13 +1935,16 @@ export const makeModuleHost = Effect.fnUntraced(function*(options: ModuleHostOpt
         if (errors.length > 0) return Effect.succeed(failure("invalid_settings", "Some settings are not valid", { moduleId: id, fieldErrors: errors }))
       }
       let seq = 0
+      const secretsChanged = !sameRecord(patched.secrets, base.secrets)
       const version = write(() => {
         entry.want = {
           ...entry.want,
           stored: patched.stored,
           secrets: patched.secrets,
           // Only a real change of a secret starts it again (the same token saved again changes nothing).
-          secretEpoch: entry.want.secretEpoch + (sameRecord(patched.secrets, base.secrets) ? 0 : 1),
+          secretEpoch: entry.want.secretEpoch + (secretsChanged ? 1 : 0),
+          // The owner's change of its secrets decides `keyed` anew; any other save keeps it (the vault may be locked).
+          keyed: secretsChanged ? keySet(entry.def, patched.secrets) : entry.want.keyed || keySet(entry.def, patched.secrets),
           retry: entry.want.retry + 1
         }
         seq = requestSave(entry)
@@ -1939,7 +1961,8 @@ export const makeModuleHost = Effect.fnUntraced(function*(options: ModuleHostOpt
       settled(write(() => {
         for (const entry of entries) {
           const next = all[entry.def.id] ?? {}
-          if (!sameRecord(next, entry.want.secrets)) entry.want = { ...entry.want, secrets: next, vaultEpoch: entry.want.vaultEpoch + 1 }
+          // A lock takes the secrets away but not `keyed`: a module on by its key stays on.
+          if (!sameRecord(next, entry.want.secrets)) entry.want = { ...entry.want, secrets: next, vaultEpoch: entry.want.vaultEpoch + 1, keyed: entry.want.keyed || keySet(entry.def, next) }
         }
       }))
     )
@@ -2074,7 +2097,7 @@ export const makeModuleHost = Effect.fnUntraced(function*(options: ModuleHostOpt
             return own(`${entry.def.name}'s health check failed`, Cause.hasInterruptsOnly(cause) ? "It was interrupted." : firstLine(cause))
           }
           return exit.value.value
-        }).pipe(Effect.flatMap((list) => Effect.sync(() => issues.set(source, normaliseIssues(entry.def.id, entry.def.name, Array.isArray(list) ? list : [])))))
+        }).pipe(Effect.flatMap((list) => Effect.sync(() => issues.set(source, normaliseIssues(entry.def.id, Array.isArray(list) ? list : [])))))
       }),
     { concurrency: "unbounded", discard: true }
   ))
@@ -2356,12 +2379,12 @@ export const makeModuleHost = Effect.fnUntraced(function*(options: ModuleHostOpt
 })
 
 /**
- * Module issues made safe for the wire and a terminal (`wireSafeIssue`), with the module's id as prefix and `module`;
- * at most 20 per module, the rest said in one more ("and 12 more").
+ * Module issues made safe for the wire and a terminal (`wireSafeIssue`), with the module's id as prefix and `module`.
+ * Not counted here: the issue registry sorts each source's list by severity, bounds it and counts what it left out.
  */
-function normaliseIssues(id: string, name: string, list: ReadonlyArray<Issue>): ReadonlyArray<Issue> {
+function normaliseIssues(id: string, list: ReadonlyArray<Issue>): ReadonlyArray<Issue> {
   const own = list.map((issue): Issue => ({ ...issue, id: String(issue.id ?? "").startsWith(`${id}.`) ? issue.id : `${id}.${issue.id}`, module: id }))
-  return boundIssues(own, 20, (more) => ({ id: `${id}.more`, module: id, severity: "warning", title: `${name} reported ${more} more issues`, detail: "Only the first ones are shown." }))
+  return own
     .map((issue, i) => {
       const safe = wireSafeIssue(issue, id, i)
       return safe.module === undefined ? { ...safe, module: id } : safe

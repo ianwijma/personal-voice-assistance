@@ -382,9 +382,10 @@ CurrentPrincipal: Context.Reference<Principal | undefined>       // the admitted
 - **Health.** The host keeps an issue registry (`ModuleHost.issues`: requirements, unavailable, failed starts, module
   code that hung, each module's `health()`). Every issue is normalised where it enters (`wireSafeIssue`): id, module,
   device, title and the fix's label and value are one line, a detail keeps its line breaks, no other control
-  character survives, every text is clipped to the wire's limits; at most 20 issues per module and, in all,
-  `MAX_HEALTH_ISSUES` (100) and 256 KB, the most severe kept (a source's own list is sorted by severity before it is
-  bounded), the true number left out said in one last issue ("And 12 more issues"). The protocol bounds the whole
+  character survives, every text is clipped to the wire's limits. Only the registry bounds them: each source's list
+  (a module's health result whole, however long) is sorted by severity before it is bounded, and in all at most
+  `MAX_HEALTH_ISSUES` (100) and 256 KB are kept, the most severe first, with the true number left out (of every
+  source) said in one last issue ("And 12 more issues"). The protocol bounds the whole
   `HealthInfo` too (`MAX_HEALTH_BYTES`, 256 KB serialised), so an accepted health message always fits a frame.
   `pnpm start doctor` prints one line per module (its requirements as judged, and its health: healthy, so many issues,
   not checked, or no check), then one line per issue with its fix and the device it is about (no control characters,
