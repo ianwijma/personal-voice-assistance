@@ -229,5 +229,33 @@ describe("SQLite store latency on 100,000 rows of ~1 KB", () => {
       assert.strictEqual(ended.value, total)
       console.log(`Household store: ending a conversation of ${total} rows at the legal maximum, steps of ${BULK_STEP_ROWS}: longest stop ${ended.worst.toFixed(1)} ms (${commits.length} steps)`)
       assert.isBelow(ended.worst, bound(10))
+
+      // A removal step right after a completed checkpoint: there, before the checkpoint worker started the new log, the
+      // step's commit started it and synced its header on the main thread (docs/STORING-DATA.md "The write-ahead log").
+      // Back to back, the steps above rarely land there; so 40 conversations of one step each, every one ended once the
+      // checkpoint after the removal before it has completed, with no write in between.
+      const ONE_STEP = 40
+      const insertInto = (conversationId: string, rows: number, from: number) =>
+        store.forModule("wide").transaction((tx) => {
+          for (let i = from; i < from + rows; i++) tx.collection(wideChat).insert(wideChatValue(i))
+        }).pipe(Effect.provideService(CurrentTurn, { turnId: 2, conversationId, source: "voice" as const }))
+      yield* insertInto("conv-before", 1, 0)
+      for (let k = 0; k < ONE_STEP; k++) yield* insertInto(`conv-step-${k}`, BULK_STEP_ROWS, k * BULK_STEP_ROWS)
+      // A removal first, so the first of them also follows a completed checkpoint.
+      assert.strictEqual(yield* store.endConversation("conv-before"), 1)
+      let afterCheckpoint = 0
+      let worstAfterCheckpoint = 0
+      for (let k = 0; k < ONE_STEP; k++) {
+        yield* store.scrubbed
+        // Every removal so far is covered by a completed checkpoint, and nothing was written since.
+        assert.isUndefined(store.removalPendingSince())
+        afterCheckpoint++
+        const one = yield* longestStop(store.endConversation(`conv-step-${k}`))
+        assert.strictEqual(one.value, BULK_STEP_ROWS)
+        worstAfterCheckpoint = Math.max(worstAfterCheckpoint, one.worst)
+      }
+      console.log(`Household store: ${afterCheckpoint} removal steps of ${BULK_STEP_ROWS} rows at the legal maximum, each right after a completed checkpoint: longest stop ${worstAfterCheckpoint.toFixed(1)} ms`)
+      assert.strictEqual(afterCheckpoint, ONE_STEP)
+      assert.isBelow(worstAfterCheckpoint, bound(10))
     }).pipe(Effect.scoped), { timeout: 240_000 })
 })
