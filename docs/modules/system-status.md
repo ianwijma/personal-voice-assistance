@@ -21,16 +21,23 @@ whether the speech engines are ready, and which devices are connected. It reads 
 
 | Tool | Parameters | Answers |
 |---|---|---|
-| `system_status` | `about?`: `all` (default), `modules`, `devices` | `{ spoken, fine, problems: [{ kind, state?, name?, reason? }], running, connectedDevices }`; "Everything is running: 12 modules. Connected devices: Kitchen display and Robin's phone." / "The key vault is locked, so modules that need a key are waiting for you to unlock it in Settings." |
+| `system_status` | `about?`: `all` (default), `modules`, `devices` | `{ spoken, fine, problems: [{ kind, state?, name? }], running, connectedDevices }`; "Everything is running: 12 modules. 2 devices are connected." / "The key vault is locked, so modules that need a key are waiting for you to unlock it in Settings." |
 
-Risk: read, speculative. At most three problems are named ("And two more."): the vault, the speech engines, modules that
-stopped with an error, then those that are unavailable. Typed action: `system-status.status` ("how is the server doing",
-"werkt alles").
+Risk: read, speculative. At most three problems are named ("And 2 more."): the vault, the speech engines (their state
+said in the household's language: "starting", "stopped with an error" / "aan het opstarten", "gestopt met een fout"),
+modules that stopped with an error, then those that are unavailable. A problem is its kind, state and module name only:
+**no module's error text or reason is ever passed on** (it can hold an address, a key's fragment or a person's name).
+Typed action: `system-status.status` ("how is the server doing", "werkt alles").
 
-**Privacy.** Module names and error text are about the house, not a person, but a hall screen is where visitors stand: on a
-`public` device, on a device the host does not know, and when there is no device, the answer is only "Everything is
-running." or "There is a problem. Check the settings page." (the asking device's privacy is read through `Devices` at
-the moment of answering). Shared and private devices hear the details.
+**Privacy.** Module names are about the house, not a person, but a hall screen is where visitors stand, and a device's
+name is often someone's ("Robin's phone"). The asking device's privacy is read through `Devices` at the moment of
+answering:
+
+| Device | Hears |
+|---|---|
+| `public` (with or without a default person), a device the host does not know, no device, no `Devices` service | only "Everything is running." or "There is a problem. Check the settings page." (`{ spoken, fine }`) |
+| `shared` | the problems by name (at most three), how many modules run, **how many** devices are connected |
+| `private` | the same, and the connected devices' names (at most five) |
 
 ## Settings
 
@@ -53,5 +60,6 @@ engine, and it says only what it has.
 - **Health issues with their fixes** (the research: "later it reads the issue registry"): the view does not carry the
   issue registry; adding `HostView.issues` would let it name the worst issue and its fix.
 - **A `list` presentation of issues** and any spoken line outside a reply: wave B.
-- **A new `HostModuleView.status` line**: the view has the state and the reason a module is unavailable, not the module's
-  status line, so the reason is not spoken (it is in the result for the model).
+- **A module's status line or reason**: the view has the reason a module is unavailable, as free text from the host,
+  which is neither spoken nor put in the result (see Privacy); naming the cause would need a short, safe reason code in
+  `HostModuleView`.

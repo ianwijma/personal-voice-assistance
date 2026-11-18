@@ -4,11 +4,9 @@ import { create, all } from "mathjs"
 import { makeEngine, MAX_CHARS } from "../src/engine.ts"
 
 const engine = makeEngine(create(all!), { cupMl: 250 })
-engine.setRates(new Map([["USD", 1.08], ["GBP", 0.86], ["JPY", 160]]))
 // Warm the library up, as the module does at start, so a timing measures the sum and not the first call.
 for (const s of ["1+2", "2^10", "5 cm to inch", "sqrt(4)"]) engine.evaluate(s)
 
-const SKIPPED: Array<string> = []
 const timed = (text: string) => {
   const start = performance.now()
   const result = engine.evaluate(text)
@@ -35,13 +33,22 @@ describe("the bounded evaluator", () => {
     assert.strictEqual((v("60 mph to km/h") as any).unit, "km / h")
     assert.strictEqual((v("60 mph to kph") as any).unit, "km / hour")
   })
-  it("converts currencies at the installed rates, and in lower case", () => {
-    const usd = engine.evaluate("108 USD to EUR")
-    assert.isTrue(usd.ok && Math.abs(usd.value - 100) < 1e-9 && usd.unit === "EUR")
-    const low = engine.evaluate("108 usd to eur")
-    assert.isTrue(low.ok && Math.abs(low.value - 100) < 1e-9)
-    const cross = engine.evaluate("1 GBP to USD")
-    assert.isTrue(cross.ok && Math.abs(cross.value - 1.08 / 0.86) < 1e-9)
+  it("refuses every currency, however it is written, before anything is parsed", () => {
+    const why = (s: string) => {
+      const r = engine.evaluate(s)
+      return r.ok ? "ok" : r.reason
+    }
+    for (const s of ["108 USD to EUR", "108 usd to eur", "50 Usd", "5 dollars", "10 euro in yen", "£5", "5 € to $", "3 pound sterling", "1 BTC to EUR"]) assert.strictEqual(why(s), "currency", s)
+    // Every ISO code, in capitals and in lower case, except one that is a unit's name: "cup" is the cup.
+    for (const code of Intl.supportedValuesOf("currency")) {
+      if (code === "CUP") continue
+      assert.strictEqual(why(`1 ${code}`), "currency", code)
+      assert.strictEqual(why(`1 ${code.toLowerCase()}`), "currency", code.toLowerCase())
+    }
+    assert.strictEqual(why("1 cup to ml"), "ok")
+    assert.notStrictEqual(why("1 CUP to ml"), "currency")
+    // Pounds and ounces are masses.
+    assert.strictEqual(why("10 pounds to kg"), "ok")
   })
   it("refuses what it must refuse, with a reason", () => {
     const why = (s: string) => {
@@ -74,15 +81,6 @@ describe("the bounded evaluator", () => {
       assert.isTrue(ms < 25, `${text.slice(0, 40)} took ${ms.toFixed(1)} ms`)
       if (result.ok) assert.isTrue(Number.isFinite(result.value), text.slice(0, 40))
     }
-  })
-  it("installs every ISO currency, skipping the codes mathjs already uses for another unit", () => {
-    const fresh = makeEngine(create(all!), { cupMl: 250 })
-    const everything = new Map(Intl.supportedValuesOf("currency").map((code, i) => [code, 1 + i / 100] as const))
-    const skipped = fresh.setRates(everything)
-    // Recorded (docs/modules/calculator.md): these cannot be converted, and say "I don't know the unit" instead of guessing.
-    assert.deepStrictEqual(skipped, SKIPPED)
-    assert.isAbove(everything.size - skipped.length, 140)
-    for (const code of ["USD", "GBP", "JPY", "CHF", "AUD", "CAD", "SEK", "NOK", "DKK", "PLN", "TRY", "BRL", "INR", "CNY"]) assert.isTrue(fresh.hasCurrency(code), code)
   })
   it("keeps to its stated bound: 12 parentheses deep, 60 nodes, 200 characters", () => {
     assert.strictEqual((engine.evaluate("(".repeat(13) + "1" + ")".repeat(13)) as any).reason, "too-complex")

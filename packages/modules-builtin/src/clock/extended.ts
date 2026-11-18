@@ -1,14 +1,15 @@
-// The extended `current_time` (docs/modules/clock.md): time in other places, what a time elsewhere is here, days until and
-// since a date, a date plus an amount, the week number, public holidays and sunrise and sunset. Everything is offline and
-// answered in a few milliseconds. The two libraries for holidays and the sun are loaded the first time they are used.
+// The extended `current_time` (docs/modules/clock.md): time in other places, what a time elsewhere is on a date, days
+// until and since a date, a date plus an amount, and the week number. Everything is offline, imports no library, and is
+// answered in a few milliseconds. Public holidays and sun times are not in this version.
 //
 // Dates come as ISO ("2026-12-25") or in words in the household's language ("3 March", "next monday"), read by
-// `@pva/language`, which never guesses: an ambiguous date is a question back to the person.
+// `@pva/language`, which never guesses: an ambiguous date is a question back to the person. A wall-clock time is never
+// guessed either: one the clocks jump over is said not to exist, one they go back over is a question (earlier or later).
 import { parseDateTime, parseTimeOfDay, speakDate, speakDuration, speakTime } from "@pva/language"
 import { defineTexts, say, type Language } from "@pva/module-contracts"
 import { findPlace, PLACES, type Place } from "./places.ts"
 
-export const OPS = ["now", "convert", "until", "since", "add", "week", "holidays", "sun"] as const
+export const OPS = ["now", "convert", "until", "since", "add", "week"] as const
 export type Op = (typeof OPS)[number]
 export const UNITS = ["days", "weeks", "months", "years"] as const
 
@@ -21,8 +22,10 @@ export interface ExtendedInput {
   readonly from?: string | undefined
   readonly amount?: number | undefined
   readonly unit?: (typeof UNITS)[number] | undefined
-  readonly country?: string | undefined
+  /** For op convert: which of a time that happens twice (the clocks go back over it). */
+  readonly repeat?: (typeof REPEATS)[number] | undefined
 }
+export const REPEATS = ["earlier", "later"] as const
 
 export const texts = defineTexts({
   en: {
@@ -39,6 +42,11 @@ export const texts = defineTexts({
     askWhich: "Do you mean {options}?",
     or: "or",
     convert: "{time} in {from} is {result} in {to}.",
+    convertOn: "{date}, {time} in {from} is {result} in {to}.",
+    convertDated: "{time} in {from} {fromDate} is {result} in {to} {toDate}.",
+    noSuchTime: "{time} does not exist in {place} {date}: the clocks go forward over it.",
+    twiceTime: "{time} happens twice in {place} {date}, because the clocks go back. Do you mean the earlier one or the later one?",
+    on: "on {date}",
     untilToday: "That is today.",
     untilTomorrow: "That is tomorrow.",
     untilPast: "That was {days} ago, {date}.",
@@ -48,17 +56,6 @@ export const texts = defineTexts({
     sincePast: "{days} since {date}.",
     added: "That is {date}.",
     week: "{date} is in week {week}.",
-    holidayYes: "Yes, {date} is a public holiday: {name}.",
-    holidayNo: "No, {date} is not a public holiday.",
-    holidayNext: "The next public holiday is {name}, {date}.",
-    holidayNone: "I found no public holiday ahead.",
-    holidayMore: "{list}.",
-    needCountry: "For which country? I can't tell from the time zone {zone}.",
-    unknownCountry: "I don't have public holidays for {country}.",
-    sunBoth: "Sunrise is at {rise} and sunset at {set}{where}.",
-    sunNone: "The sun does not rise and set {when}{where}.",
-    sunWhen: "on {date}",
-    sunWhere: " in {place}",
     outOfRange: "That date is too far away for me.",
     today: "today"
   },
@@ -76,6 +73,11 @@ export const texts = defineTexts({
     askWhich: "Bedoel je {options}?",
     or: "of",
     convert: "{time} in {from} is {result} in {to}.",
+    convertOn: "{date}, {time} in {from} is {result} in {to}.",
+    convertDated: "{time} in {from} {fromDate} is {result} in {to} {toDate}.",
+    noSuchTime: "{time} bestaat niet in {place} {date}: de klok springt er dan overheen.",
+    twiceTime: "{time} komt twee keer voor in {place} {date}, omdat de klok dan teruggaat. Bedoel je de eerste of de tweede keer?",
+    on: "op {date}",
     untilToday: "Dat is vandaag.",
     untilTomorrow: "Dat is morgen.",
     untilPast: "Dat was {days} geleden, {date}.",
@@ -85,17 +87,6 @@ export const texts = defineTexts({
     sincePast: "{days} sinds {date}.",
     added: "Dat is {date}.",
     week: "{date} valt in week {week}.",
-    holidayYes: "Ja, {date} is een feestdag: {name}.",
-    holidayNo: "Nee, {date} is geen feestdag.",
-    holidayNext: "De volgende feestdag is {name}, {date}.",
-    holidayNone: "Ik vond geen feestdag in de toekomst.",
-    holidayMore: "{list}.",
-    needCountry: "Voor welk land? Aan de tijdzone {zone} kan ik dat niet zien.",
-    unknownCountry: "Ik heb geen feestdagen voor {country}.",
-    sunBoth: "De zon komt op om {rise} en gaat onder om {set}{where}.",
-    sunNone: "De zon komt niet op en gaat niet onder {when}{where}.",
-    sunWhen: "op {date}",
-    sunWhere: " in {place}",
     outOfRange: "Die datum is te ver weg voor mij.",
     today: "vandaag"
   }
@@ -116,11 +107,21 @@ const offsetMs = (instant: number, zone: string): number => {
   const p = parts(instant, zone)
   return Date.UTC(p.year, p.month - 1, p.day, p.hour, p.minute, p.second) - Math.floor(instant / 1000) * 1000
 }
-/** The instant a wall-clock time is in a zone (twice, so a daylight-saving change between the guess and the answer settles). */
-const instantOf = (y: Ymd, hour: number, minute: number, zone: string): number => {
-  const guess = Date.UTC(y.year, y.month - 1, y.day, hour, minute)
-  const first = guess - offsetMs(guess, zone)
-  return guess - offsetMs(first, zone)
+/**
+ * Every instant at which a wall-clock time happens on a day in a zone, earliest first: none when the clocks jump over
+ * it, two when they go back over it. Each candidate offset (the zone's offset a day before, at, and a day after) is
+ * checked by reading the instant back.
+ */
+const instantsOf = (y: Ymd, hour: number, minute: number, zone: string): ReadonlyArray<number> => {
+  const wall = Date.UTC(y.year, y.month - 1, y.day, hour, minute)
+  const offsets = new Set([offsetMs(wall - 86_400_000, zone), offsetMs(wall, zone), offsetMs(wall + 86_400_000, zone)])
+  const found = new Set<number>()
+  for (const o of offsets) {
+    const instant = wall - o
+    const p = parts(instant, zone)
+    if (p.year === y.year && p.month === y.month && p.day === y.day && p.hour === hour && p.minute === minute) found.add(instant)
+  }
+  return [...found].sort((a, b) => a - b)
 }
 const dayNumber = (d: Ymd): number => Math.floor(Date.UTC(d.year, d.month - 1, d.day) / 86_400_000)
 const fromDayNumber = (n: number): Ymd => {
@@ -155,20 +156,12 @@ export const zoneKnown = (zone: string): boolean => {
   }
 }
 
-/** The country of a zone, for the holidays: the table's cities say it. */
-const COUNTRY: Readonly<Record<string, string>> = {
-  "Europe/Amsterdam": "NL", "Europe/Brussels": "BE", "Europe/London": "GB", "Europe/Dublin": "IE", "Europe/Paris": "FR", "Europe/Berlin": "DE", "Europe/Madrid": "ES",
-  "Europe/Lisbon": "PT", "Europe/Rome": "IT", "Europe/Vienna": "AT", "Europe/Zurich": "CH", "Europe/Copenhagen": "DK", "Europe/Stockholm": "SE", "Europe/Oslo": "NO",
-  "Europe/Helsinki": "FI", "Europe/Warsaw": "PL", "Europe/Prague": "CZ", "Europe/Athens": "GR", "Europe/Istanbul": "TR", "America/New_York": "US", "America/Chicago": "US",
-  "America/Denver": "US", "America/Los_Angeles": "US", "America/Toronto": "CA", "America/Vancouver": "CA", "Australia/Sydney": "AU", "Australia/Melbourne": "AU",
-  "Pacific/Auckland": "NZ", "Asia/Tokyo": "JP", "America/Paramaribo": "SR", "America/Curacao": "CW"
-}
-
 export interface Context {
   /** Epoch ms now. */
   readonly now: number
   /** The household's zone (the clock's own). */
   readonly zone: string
+  /** The household's language as it is set now. */
   readonly lang: Language
 }
 
@@ -220,9 +213,16 @@ const readDate = (text: string | undefined, zone: string, ctx: Context, optional
 const weekdayName = (d: Ymd, lang: Language): string =>
   new Intl.DateTimeFormat(lang === "nl" ? "nl-NL" : "en-GB", { weekday: "long", timeZone: "UTC" }).format(Date.UTC(d.year, d.month - 1, d.day))
 
-const homeCountry = (zone: string): string | undefined => COUNTRY[zone]
+/** A date to follow a clause: "today", "tomorrow", "yesterday" as they are, any other "on Sunday the fifteenth of March". */
+const onDate = (d: Ymd, lang: Language, today: Ymd): string => {
+  const said = dateWords(d, lang, today)
+  const diff = dayNumber(d) - dayNumber(today)
+  return Math.abs(diff) <= 1 || (lang === "nl" && Math.abs(diff) === 2) ? said : say(texts, lang, "on", { date: said })
+}
+const capital = (text: string): string => text.charAt(0).toUpperCase() + text.slice(1)
+const hhmm = (hour: number, minute: number): string => `${String(hour).padStart(2, "0")}:${String(minute).padStart(2, "0")}`
 
-export const run = async (input: ExtendedInput, ctx: Context): Promise<Record<string, unknown>> => {
+export const run = (input: ExtendedInput, ctx: Context): Record<string, unknown> => {
   const lang = ctx.lang
   const { zone, place } = where(input, ctx)
   const today = parts(ctx.now, zone)
@@ -241,18 +241,32 @@ export const run = async (input: ExtendedInput, ctx: Context): Promise<Record<st
       }
       const read = parseTimeOfDay(input.time.slice(0, 60), lang, { band: { from: "00:00", to: "23:59" } })
       if (read.kind !== "ok") throw new Say(say(texts, lang, "cantReadTime", { time: input.time.slice(0, 40) }))
-      const base = parts(ctx.now, fromZone)
-      const instant = instantOf(base, read.value.hour, read.value.minute, fromZone)
-      const there = parts(instant, zone)
+      const { hour, minute } = read.value
+      // The date is read in the source zone: absent, it is today there.
+      const day = readDate(input.date, fromZone, ctx, true)
       const nameOf = (z: string, p?: Place) => p?.name ?? findPlaceByZone(z) ?? z.split("/").pop()!.replace(/_/g, " ")
       const fromName = input.from !== undefined ? (findPlace(input.from)?.name ?? nameOf(fromZone)) : nameOf(fromZone)
+      const home = parts(ctx.now, ctx.zone)
+      const time = speak(lang, hour, minute)
+      const instants = instantsOf(day, hour, minute, fromZone)
+      if (instants.length === 0) throw new Say(say(texts, lang, "noSuchTime", { time, place: fromName, date: onDate(day, lang, home) }))
+      if (instants.length > 1 && input.repeat === undefined) throw new Say(say(texts, lang, "twiceTime", { time, place: fromName, date: onDate(day, lang, home) }))
+      const instant = instants.length > 1 && input.repeat === "later" ? instants[instants.length - 1]! : instants[0]!
+      const there = parts(instant, zone)
       const result = speak(lang, there.hour, there.minute)
-      const nextDay = dayNumber(there) - dayNumber(base)
+      const toName = nameOf(zone, place)
+      const nextDay = dayNumber(there) - dayNumber(day)
+      const given = input.date !== undefined && input.date.trim() !== ""
+      const spoken = nextDay !== 0
+        ? say(texts, lang, "convertDated", { time, from: fromName, fromDate: onDate(day, lang, home), result, to: toName, toDate: onDate(there, lang, home) })
+        : given
+        ? say(texts, lang, "convertOn", { date: capital(onDate(day, lang, home)), time, from: fromName, result, to: toName })
+        : say(texts, lang, "convert", { time, from: fromName, result, to: toName })
       return {
         op: "convert",
-        from: { timeZone: fromZone, time: `${String(read.value.hour).padStart(2, "0")}:${String(read.value.minute).padStart(2, "0")}` },
-        to: { timeZone: zone, time: `${String(there.hour).padStart(2, "0")}:${String(there.minute).padStart(2, "0")}`, ...(nextDay !== 0 ? { dayOffset: nextDay } : {}) },
-        spoken: say(texts, lang, "convert", { time: speak(lang, read.value.hour, read.value.minute), from: fromName, result, to: nameOf(zone, place) })
+        from: { timeZone: fromZone, date: iso(day), time: hhmm(hour, minute) },
+        to: { timeZone: zone, date: iso(there), time: hhmm(there.hour, there.minute), ...(nextDay !== 0 ? { dayOffset: nextDay } : {}) },
+        spoken
       }
     }
     case "until":
@@ -276,44 +290,6 @@ export const run = async (input: ExtendedInput, ctx: Context): Promise<Record<st
     case "week": {
       const date = readDate(input.date, zone, ctx, true)
       return { op: "week", date: iso(date), week: isoWeek(date), spoken: say(texts, lang, "week", { date: dateWords(date, lang, today), week: isoWeek(date) }) }
-    }
-    case "holidays": {
-      const country = (input.country ?? homeCountry(zone))?.toUpperCase()
-      if (country === undefined) throw new Say(say(texts, lang, "needCountry", { zone }))
-      if (!/^[A-Z]{2}$/.test(country)) throw new Say(say(texts, lang, "unknownCountry", { country: country.slice(0, 10) }))
-      const { default: Holidays } = await import("date-holidays")
-      const hd = new Holidays(country)
-      hd.setLanguages(lang)
-      if (hd.getCountries === undefined || hd.getHolidays(today.year).length === 0) throw new Say(say(texts, lang, "unknownCountry", { country }))
-      const of = (year: number) => hd.getHolidays(year).filter((h) => h.type === "public").map((h) => ({ date: h.date.slice(0, 10), name: h.name }))
-      if (input.date !== undefined && input.date.trim() !== "") {
-        const date = readDate(input.date, zone, ctx, false)
-        const found = of(date.year).find((h) => h.date === iso(date))
-        return found === undefined
-          ? { op: "holidays", date: iso(date), holiday: false, spoken: say(texts, lang, "holidayNo", { date: dateWords(date, lang, today) }) }
-          : { op: "holidays", date: iso(date), holiday: true, name: found.name, spoken: say(texts, lang, "holidayYes", { date: dateWords(date, lang, today), name: found.name }) }
-      }
-      const upcoming = [...of(today.year), ...of(today.year + 1)].filter((h) => h.date >= iso(today)).slice(0, 5)
-      const next = upcoming[0]
-      if (next === undefined) return { op: "holidays", upcoming: [], spoken: say(texts, lang, "holidayNone") }
-      const [y, m, d] = next.date.split("-").map(Number) as [number, number, number]
-      return { op: "holidays", country, upcoming, spoken: say(texts, lang, "holidayNext", { name: next.name, date: dateWords({ year: y, month: m, day: d }, lang, today) }) }
-    }
-    case "sun": {
-      const at = place ?? PLACES.find((p) => p.zone === zone)
-      if (at === undefined) throw new Say(say(texts, lang, "unknownPlace", { place: input.place ?? zone }))
-      const date = readDate(input.date, zone, ctx, true)
-      const loaded = await import("suncalc")
-      const SunCalc: typeof loaded = (loaded as unknown as { readonly default?: typeof loaded }).default ?? loaded
-      const noon = new Date(instantOf(date, 12, 0, zone))
-      const t = SunCalc.getTimes(noon, at.lat, at.lon)
-      const valid = (x: Date | null): x is Date => x !== null && !Number.isNaN(x.getTime())
-      const place$ = place === undefined ? "" : say(texts, lang, "sunWhere", { place: place.name })
-      if (!valid(t.sunrise) || !valid(t.sunset)) return { op: "sun", date: iso(date), spoken: say(texts, lang, "sunNone", { when: say(texts, lang, "sunWhen", { date: dateWords(date, lang, today) }), where: place$ }) }
-      const rise = parts(t.sunrise.getTime(), zone)
-      const set = parts(t.sunset.getTime(), zone)
-      const hhmm = (p: { hour: number; minute: number }) => `${String(p.hour).padStart(2, "0")}:${String(p.minute).padStart(2, "0")}`
-      return { op: "sun", date: iso(date), sunrise: hhmm(rise), sunset: hhmm(set), spoken: say(texts, lang, "sunBoth", { rise: speak(lang, rise.hour, rise.minute), set: speak(lang, set.hour, set.minute), where: place$ }) }
     }
   }
 }

@@ -1,6 +1,11 @@
 // The system-status module: `system_status`, how the assistant itself is doing, read from the host's own view
 // (`ctx.host.view()`: module states, the vault, the speech engines, the known devices) and nothing else. It probes no
 // network, reads no disk and runs no command. Stores nothing.
+//
+// What each device hears (docs/modules/system-status.md): a public device, a device the host does not know and a turn
+// with no device hear only whether things are fine. A shared device hears at most three problems by module name and
+// state, and how many devices are connected; only a private device hears the devices' names (a phone's name is
+// someone's). No error text, reason or detail of a module is ever passed on: they can hold addresses and names.
 import { ActionError, CurrentTurn, defineAction, defineModule, Devices, type HostView, makeTool } from "@pva/core"
 import { defineTexts, homeLanguage, type Language, say } from "@pva/module-contracts"
 import { speakList } from "@pva/language"
@@ -13,6 +18,9 @@ export const texts = defineTexts({
     problemHere: "There is a problem. Check the settings page.",
     vaultLocked: "The key vault is locked, so modules that need a key are waiting for you to unlock it in Settings.",
     engineState: "The speech engines are {state}.",
+    engineStarting: "starting",
+    engineReloading: "reloading",
+    engineFailed: "stopped with an error",
     moduleError: "{name} has stopped with an error.",
     moduleUnavailable: "{name} is unavailable.",
     moreProblems: "And {count} more.",
@@ -28,6 +36,9 @@ export const texts = defineTexts({
     problemHere: "Er is een probleem. Kijk op de instellingenpagina.",
     vaultLocked: "De sleutelkluis is op slot, dus modules die een sleutel nodig hebben wachten tot je hem ontgrendelt in de instellingen.",
     engineState: "De spraakmotoren zijn {state}.",
+    engineStarting: "aan het opstarten",
+    engineReloading: "aan het herladen",
+    engineFailed: "gestopt met een fout",
     moduleError: "{name} is gestopt met een fout.",
     moduleUnavailable: "{name} is niet beschikbaar.",
     moreProblems: "En nog {count}.",
@@ -42,29 +53,31 @@ export const texts = defineTexts({
 const MAX_PROBLEMS = 3
 const one = (text: string): string => text.replace(/[\u0000-\u001f\u007f]+/g, " ").slice(0, 80)
 
-/** What is wrong, from the host's view, worst first. */
+/** What is wrong, from the host's view, worst first: kinds, states and module names only, never a reason or error text. */
 export const problemsOf = (view: HostView) => {
-  const list: Array<{ readonly kind: "vault" | "engine" | "module"; readonly state?: string; readonly name?: string; readonly reason?: string }> = []
+  const list: Array<{ readonly kind: "vault" | "engine" | "module"; readonly state?: string; readonly name?: string }> = []
   if (view.vaultLocked === true) list.push({ kind: "vault" })
   if (view.engine !== undefined && !view.engine.ready) list.push({ kind: "engine", state: view.engine.state })
-  for (const m of view.modules) {
-    if (m.state === "error") list.push({ kind: "module", state: "error", name: m.name, ...(m.unavailable !== undefined ? { reason: one(m.unavailable) } : {}) })
-  }
-  for (const m of view.modules) {
-    if (m.state === "unavailable") list.push({ kind: "module", state: "unavailable", name: m.name, ...(m.unavailable !== undefined ? { reason: one(m.unavailable) } : {}) })
-  }
+  for (const m of view.modules) if (m.state === "error") list.push({ kind: "module", state: "error", name: one(m.name) })
+  for (const m of view.modules) if (m.state === "unavailable") list.push({ kind: "module", state: "unavailable", name: one(m.name) })
   return list
 }
 
+const engineWords = (state: string | undefined, lang: Language): string =>
+  say(texts, lang, state === "starting" ? "engineStarting" : state === "reloading" ? "engineReloading" : "engineFailed")
+
 type About = "all" | "modules" | "devices"
 
-const report = (view: HostView, lang: Language, about: About, detail: boolean) => {
+/** How much the asking device may hear: `none` (public, unknown, no device), `shared`, or `private`. */
+type Detail = "none" | "shared" | "private"
+
+const report = (view: HostView, lang: Language, about: About, detail: Detail) => {
   const problems = problemsOf(view)
   const running = view.modules.filter((m) => m.state === "running").length
   const off = view.modules.filter((m) => m.state === "disabled").length
   const connected = view.devices.filter((d) => d.connections > 0)
   // A public screen, or a device the host does not know, hears whether things are fine and nothing of what is wrong.
-  if (!detail) {
+  if (detail === "none") {
     const spoken = problems.length === 0 ? say(texts, lang, "fine") : say(texts, lang, "problemHere")
     return { spoken, fine: problems.length === 0 }
   }
@@ -75,7 +88,7 @@ const report = (view: HostView, lang: Language, about: About, detail: boolean) =
     for (const p of shown) {
       lines.push(
         p.kind === "vault" ? say(texts, lang, "vaultLocked")
-          : p.kind === "engine" ? say(texts, lang, "engineState", { state: p.state ?? "" })
+          : p.kind === "engine" ? say(texts, lang, "engineState", { state: engineWords(p.state, lang) })
           : say(texts, lang, p.state === "error" ? "moduleError" : "moduleUnavailable", { name: p.name ?? "" })
       )
     }
@@ -86,7 +99,7 @@ const report = (view: HostView, lang: Language, about: About, detail: boolean) =
     const names = connected.slice(0, 5).map((d) => one(d.name))
     lines.push(
       connected.length === 0 ? say(texts, lang, "devicesNone")
-        : connected.length <= 5 ? say(texts, lang, "devicesSome", { names: speakList(names, lang) ?? names.join(", ") })
+        : detail === "private" && connected.length <= 5 ? say(texts, lang, "devicesSome", { names: speakList(names, lang) ?? names.join(", ") })
         : say(texts, lang, "devicesCount", { count: connected.length })
     )
   }
@@ -107,17 +120,18 @@ export const systemStatusModule = defineModule({
   enabledByDefault: false,
   start: (ctx) =>
     Effect.sync(() => {
-      /** Whether the asking device may hear what is wrong: a shared or private one. Public, unknown and no device: only whether it is fine. */
+      /** How much the asking device may hear, looked up now: public, unknown and no device hear only whether it is fine. */
       const mayDetail = Effect.gen(function*() {
         const turn = yield* CurrentTurn
         const device = turn?.deviceId === undefined ? undefined : ctx.host.service(Devices)?.get(turn.deviceId)
-        return device !== undefined && device.place.privacy !== "public"
+        const privacy = device?.place.privacy
+        return (privacy === "private" ? "private" : privacy === "shared" ? "shared" : "none") as Detail
       })
       const tool = makeTool({
         name: "system_status",
         description:
           "How the assistant itself is doing: whether its modules, speech engines and key vault are fine, and which devices are connected. Use it for \"how is the server doing\" or \"is everything working\". " +
-          "Reads only what the assistant already knows; on a public screen it says only whether things are fine.",
+          "Reads only what the assistant already knows; on a public screen it says only whether things are fine. Say what it found; do not guess at causes.",
         parameters: Schema.Struct({
           about: Schema.optionalKey(Schema.Literals(["all", "modules", "devices"]).annotate({ description: "What to report on (default all)" }))
         }),

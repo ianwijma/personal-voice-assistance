@@ -1,6 +1,7 @@
-import { type AssistantModule, defineAction, defineModule, makeTool, Param, Setting, ToolError } from "@pva/core"
+import { type AssistantModule, defineAction, defineModule, type HostView, makeTool, Param, Setting, ToolError } from "@pva/core"
+import { homeLanguage, type Language } from "@pva/module-contracts"
 import { DateTime, Effect, Option, Schema } from "effect"
-import { Say, OPS, run as runExtended, UNITS } from "./clock/extended.ts"
+import { OPS, REPEATS, run as runExtended, Say, UNITS } from "./clock/extended.ts"
 
 export { run as extendedTime, texts as clockTexts, type ExtendedInput } from "./clock/extended.ts"
 
@@ -12,13 +13,23 @@ export interface ClockOptions {
 }
 
 /**
+ * Where the extended operations read the household's language, at each call (the Home section's, as it is set now; not
+ * the date format). Absent (the clock started without the host's view, as its version 1 callers start it): the
+ * language of the date format.
+ */
+export interface ClockLanguage {
+  readonly language?: () => Language
+}
+
+/**
  * Reference module: a context provider (local date and time, sent with every
  * turn in the LLM request's `context` field, separate from the cached system
  * prompt) and a read-only tool (time in another zone).
  * Time comes from Effect's `Clock`, so tests can use `TestClock`.
  */
-export const makeClock = (options: ClockOptions = {}): AssistantModule => {
+export const makeClock = (options: ClockOptions & ClockLanguage = {}): AssistantModule => {
   const locale = options.locale ?? "en-GB"
+  const language = options.language ?? ((): Language => (locale.toLowerCase().startsWith("nl") ? "nl" : "en"))
   const zone = options.timeZone === undefined || options.timeZone === "" ? Intl.DateTimeFormat().resolvedOptions().timeZone : options.timeZone
   const localZone = DateTime.zoneMakeNamedUnsafe(zone)
 
@@ -46,9 +57,8 @@ export const makeClock = (options: ClockOptions = {}): AssistantModule => {
     name: "current_time",
     description:
       "Get the current date and time in an IANA time zone, e.g. \"America/New_York\" or \"Asia/Tokyo\" (the household's own zone is in the context line). With no op, answers the time there. " +
-      "op converts or counts: \"convert\" (what `time` in zone `from` is in timeZone), \"until\" or \"since\" a `date` (days), \"add\" `amount` of `unit` to a date, \"week\" (week number of a date), " +
-      "\"holidays\" (the next public holidays, or whether `date` is one), \"sun\" (sunrise and sunset). `place` is a city name that replaces timeZone. " +
-      "Dates are ISO (2026-12-25) or words (\"3 March\", \"next monday\"); an ambiguous date is a question back to the person.",
+      "op converts or counts: \"convert\" (what `time` in zone `from` on `date`, default today there, is in timeZone), \"until\" or \"since\" a `date` (days), \"add\" `amount` of `unit` to a date, \"week\" (week number of a date). " +
+      "`place` is a city name that replaces timeZone. Dates are ISO (2026-12-25) or words (\"3 March\", \"next monday\"); an ambiguous date, a time that does not exist that day, and a time that happens twice when the clocks go back are a question back to the person: ask it, then call again (for a repeated time with `repeat`).",
     parameters: Schema.Struct({
       timeZone: Schema.String.annotate({ description: "IANA time zone name" }),
       op: optional(Schema.Literals(OPS).annotate({ description: "What to work out; absent: the time in timeZone" })),
@@ -56,9 +66,9 @@ export const makeClock = (options: ClockOptions = {}): AssistantModule => {
       date: optional(Schema.String.check(Schema.isMaxLength(120)).annotate({ description: "A date, ISO or in words; absent means today where the op allows" })),
       time: optional(Schema.String.check(Schema.isMaxLength(60)).annotate({ description: "A clock time, for op convert (\"15:00\", \"3 pm\")" })),
       from: optional(Schema.String.check(Schema.isMaxLength(60)).annotate({ description: "For op convert: the city or IANA zone `time` is in (default the household's zone)" })),
+      repeat: optional(Schema.Literals(REPEATS).annotate({ description: "For op convert: a time that happens twice when the clocks go back, the earlier or the later one (only when the person said which)" })),
       amount: optional(Schema.Int.check(Schema.isBetween({ minimum: -100_000, maximum: 100_000 })).annotate({ description: "For op add: how many (negative goes back)" })),
-      unit: optional(Schema.Literals(UNITS).annotate({ description: "For op add: days (default), weeks, months or years" })),
-      country: optional(Schema.String.check(Schema.isMaxLength(2)).annotate({ description: "For op holidays: ISO 3166 country code; default the country of the zone" }))
+      unit: optional(Schema.Literals(UNITS).annotate({ description: "For op add: days (default), weeks, months or years" }))
     }),
     speculative: true,
     latency: "instant",
@@ -71,8 +81,8 @@ export const makeClock = (options: ClockOptions = {}): AssistantModule => {
         })
       }
       return Effect.flatMap(DateTime.now, (now) =>
-        Effect.tryPromise({
-          try: () => runExtended({ timeZone, op: op ?? "now", ...rest }, { now: DateTime.toEpochMillis(now), zone, lang: locale.toLowerCase().startsWith("nl") ? "nl" : "en" }),
+        Effect.try({
+          try: () => runExtended({ timeZone, op: op ?? "now", ...rest }, { now: DateTime.toEpochMillis(now), zone, lang: language() }),
           catch: (error) => new ToolError({ message: error instanceof Say ? error.message : "I couldn't work that out." })
         }))
     }
@@ -130,8 +140,13 @@ export const clockActions = (options: ClockOptions & { readonly places?: Readonl
   return [timeNow]
 }
 
-/** The clock as a module: time zone and date format are settings. */
+/**
+ * The clock as a module: time zone and date format are settings. It declares API version 2 only to read the household's
+ * language through the host's view for the extended operations; everything else is as in version 1 (on by default, no
+ * shared part), and its start still takes the version 1 context its existing callers give it (no `host`).
+ */
 export const clockModule = defineModule({
+  apiVersion: 2,
   id: "clock",
   name: "Clock",
   description: "Tells the model the local date and time, and the time anywhere else.",
@@ -156,5 +171,10 @@ export const clockModule = defineModule({
       overridable: true
     })
   },
-  start: ({ settings }) => Effect.sync(() => ({ ...makeClock(settings), actions: clockActions(settings) }))
+  start: (ctx) =>
+    Effect.sync(() => {
+      const host = (ctx as { readonly host?: { readonly view: () => HostView } }).host
+      const language = host === undefined ? {} : { language: () => homeLanguage(host.view()) }
+      return { ...makeClock({ ...ctx.settings, ...language }), actions: clockActions(ctx.settings) }
+    })
 })
