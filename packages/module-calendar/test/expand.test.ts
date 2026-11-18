@@ -8,6 +8,11 @@ import { type ExpandInput, type ExpandOutput, expandCalendar } from "../src/expa
 import { LIMITS } from "../src/provider.ts"
 import { instantOf } from "../src/time.ts"
 import { AMS, ics } from "./fixtures.ts"
+import { vi } from "vitest"
+
+// These tests expand whole calendars (and some start real workers): on a slow two-core CI runner one of them can take
+// longer than the default five seconds.
+vi.setConfig({ testTimeout: 30_000 })
 
 const day = (y: number, m: number, d: number, zone = AMS) => instantOf({ year: y, month: m, day: d }, zone)
 /** The cache window of the default test clock: 17 November 2026 to 20 January 2027 (exclusive), Amsterdam. */

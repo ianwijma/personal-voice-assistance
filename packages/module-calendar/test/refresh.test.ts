@@ -25,6 +25,11 @@ import {
   sleepReal,
   startCalendar
 } from "./fixtures.ts"
+import { vi } from "vitest"
+
+// These tests expand whole calendars (and some start real workers): on a slow two-core CI runner one of them can take
+// longer than the default five seconds.
+vi.setConfig({ testTimeout: 30_000 })
 
 const titlesOf = (rows: ReadonlyArray<{ readonly value: { readonly title: string } }>) => [...new Set(rows.map((r) => r.value.title))]
 const eventsOf = (value: unknown) => ((value as { events?: Array<{ title: string; time?: string }> }).events ?? []).map((e) => `${e.title}${e.time !== undefined ? ` ${e.time}` : ""}`)

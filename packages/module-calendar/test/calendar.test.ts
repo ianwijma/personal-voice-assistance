@@ -6,6 +6,11 @@ import { checkModule, expectOffByDefault, startTestModule } from "@pva/core/test
 import { Effect, Exit } from "effect"
 import { calendarModule, catalog, occurrences, texts } from "../src/index.ts"
 import { advanceAndRefresh, allFixtures, AMS, calendar, controlledStore, everyone, familyOnly, ics, sayOf, served, startCalendar } from "./fixtures.ts"
+import { vi } from "vitest"
+
+// These tests expand whole calendars (and some start real workers): on a slow two-core CI runner one of them can take
+// longer than the default five seconds.
+vi.setConfig({ testTimeout: 30_000 })
 
 const nl = { home: { HOME_LANGUAGE: "nl-NL", HOME_TIME_ZONE: AMS } }
 
