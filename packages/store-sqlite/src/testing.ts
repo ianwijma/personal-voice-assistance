@@ -11,7 +11,7 @@ const checkpointer = (store: SqliteHouseholdStore) => {
   return c
 }
 
-/** How the store's new logs were started so far: by the worker, or in the window by the main thread. */
+/** What the worker's log starts came to so far (`LogStarts`). */
 export const logStarts = (store: SqliteHouseholdStore): LogStarts => checkpointer(store).logStarts()
 
 /**
@@ -24,3 +24,10 @@ export const setLogStartPauses = (store: SqliteHouseholdStore, pauses: { readonl
 
 /** Resolved when the worker next begins the pause named. */
 export const nextLogStartPause = (store: SqliteHouseholdStore, what: "gapMs" | "holdMs"): Promise<void> => checkpointer(store).nextPause(what)
+
+/** A checkpoint now, as the store makes them (`true`: done; a truncation a reader blocked is `false`). */
+export const checkpointNow = (store: SqliteHouseholdStore, kind: "passive" | "truncate"): Promise<boolean> =>
+  kind === "passive" ? checkpointer(store).passive() : checkpointer(store).truncate()
+
+/** The checkpoint worker connection's settings (`PRAGMA` values by name). */
+export const workerSettings = (store: SqliteHouseholdStore): Promise<Readonly<Record<string, number>>> => checkpointer(store).settings()
