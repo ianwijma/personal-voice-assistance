@@ -1,5 +1,8 @@
 import { type AssistantModule, defineAction, defineModule, makeTool, Param, Setting, ToolError } from "@pva/core"
 import { DateTime, Effect, Option, Schema } from "effect"
+import { Say, OPS, run as runExtended, UNITS } from "./clock/extended.ts"
+
+export { run as extendedTime, texts as clockTexts, type ExtendedInput } from "./clock/extended.ts"
 
 export interface ClockOptions {
   /** IANA zone of the user. Default: the system zone. */
@@ -38,18 +41,41 @@ export const makeClock = (options: ClockOptions = {}): AssistantModule => {
     })
   }
 
+  const optional = <S extends Schema.Top>(schema: S) => Schema.optionalKey(schema)
   const currentTime = makeTool({
     name: "current_time",
-    description: "Get the current date and time in an IANA time zone, e.g. \"America/New_York\" or \"Asia/Tokyo\".",
+    description:
+      "Get the current date and time in an IANA time zone, e.g. \"America/New_York\" or \"Asia/Tokyo\" (the household's own zone is in the context line). With no op, answers the time there. " +
+      "op converts or counts: \"convert\" (what `time` in zone `from` is in timeZone), \"until\" or \"since\" a `date` (days), \"add\" `amount` of `unit` to a date, \"week\" (week number of a date), " +
+      "\"holidays\" (the next public holidays, or whether `date` is one), \"sun\" (sunrise and sunset). `place` is a city name that replaces timeZone. " +
+      "Dates are ISO (2026-12-25) or words (\"3 March\", \"next monday\"); an ambiguous date is a question back to the person.",
     parameters: Schema.Struct({
-      timeZone: Schema.String.annotate({ description: "IANA time zone name" })
+      timeZone: Schema.String.annotate({ description: "IANA time zone name" }),
+      op: optional(Schema.Literals(OPS).annotate({ description: "What to work out; absent: the time in timeZone" })),
+      place: optional(Schema.String.check(Schema.isMaxLength(60)).annotate({ description: "A city (Tokyo, Den Haag): its zone is used instead of timeZone" })),
+      date: optional(Schema.String.check(Schema.isMaxLength(120)).annotate({ description: "A date, ISO or in words; absent means today where the op allows" })),
+      time: optional(Schema.String.check(Schema.isMaxLength(60)).annotate({ description: "A clock time, for op convert (\"15:00\", \"3 pm\")" })),
+      from: optional(Schema.String.check(Schema.isMaxLength(60)).annotate({ description: "For op convert: the city or IANA zone `time` is in (default the household's zone)" })),
+      amount: optional(Schema.Int.check(Schema.isBetween({ minimum: -100_000, maximum: 100_000 })).annotate({ description: "For op add: how many (negative goes back)" })),
+      unit: optional(Schema.Literals(UNITS).annotate({ description: "For op add: days (default), weeks, months or years" })),
+      country: optional(Schema.String.check(Schema.isMaxLength(2)).annotate({ description: "For op holidays: ISO 3166 country code; default the country of the zone" }))
     }),
     speculative: true,
-    execute: ({ timeZone }) =>
-      Option.match(DateTime.zoneMakeNamed(timeZone), {
-        onNone: () => Effect.fail(new ToolError({ message: `Unknown time zone "${timeZone}"` })),
-        onSome: (zone) => Effect.map(DateTime.now, (now) => describe(DateTime.setZone(now, zone)))
-      })
+    latency: "instant",
+    execute: ({ timeZone, op, ...rest }) => {
+      // No op: the original answer, unchanged.
+      if (op === undefined && rest.place === undefined) {
+        return Option.match(DateTime.zoneMakeNamed(timeZone), {
+          onNone: () => Effect.fail(new ToolError({ message: `Unknown time zone "${timeZone}"` })),
+          onSome: (zone) => Effect.map(DateTime.now, (now) => describe(DateTime.setZone(now, zone)))
+        })
+      }
+      return Effect.flatMap(DateTime.now, (now) =>
+        Effect.tryPromise({
+          try: () => runExtended({ timeZone, op: op ?? "now", ...rest }, { now: DateTime.toEpochMillis(now), zone, lang: locale.toLowerCase().startsWith("nl") ? "nl" : "en" }),
+          catch: (error) => new ToolError({ message: error instanceof Say ? error.message : "I couldn't work that out." })
+        }))
+    }
   })
 
   return { name: "clock", tools: [currentTime], context: [context] }
