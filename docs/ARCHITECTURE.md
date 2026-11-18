@@ -334,7 +334,7 @@ CurrentPrincipal: Context.Reference<Principal | undefined>       // the admitted
   local one, and so is one whose parts do not belong together: a turn without an assistant or device, a job or
   notification without its ids, a tool of no module for an assistant, and what serve mode's
   `GatewayAccess.principalProblem` refuses (the assistant does not exist; the device is not known; the device does not
-  have that assistant; the connection is not that device's; the person named is not in Members; the person named is not the device's default person). **The
+  have that assistant; the connection is not that device's; the person named is not in Members; a turn's person is not the device's default person). For a turn the person must be a member and the device's default person (a turn happens at a device); for a job or a notification the person must be a member and nothing ties it to the device's default person, since its origin was captured when it was scheduled and the device may have been given to someone else since: what may be revealed where is decided at delivery by the privacy rule (`Privacy.mayReveal`), not by this check. **The
   admitted call runs as that principal**: `execute` and `run` see exactly its `CurrentTurn`, `CurrentJob` and
   `CurrentPrincipal` (`asPrincipal`), and so do the calls they make. The checks, in order: the principal; the
   assistant has the module on; the tool is not in its `offTools` (`ModuleHostOptions.access`; skipped for the local

@@ -455,9 +455,11 @@ export const startServe = (options: ServeOptions): Effect.Effect<ServeHandle, Ht
         if (!assigned) return `the assistant "${assistantId}" is not on the device "${deviceId}".`
       }
       if (connection !== undefined && hub?.deviceOfConnection(connection) !== deviceId) return `the request did not come from the device "${deviceId}".`
-      // P5: on a device, the person is the device's default person (the only way a turn has a person: there is no voice
-      // identification).
-      if (person !== undefined && deviceFacts.placeOf(deviceId)?.defaultPerson !== person.id) return `the person is not the default person of the device "${deviceId}".`
+      // P5, turns only: a turn happens at a device, so its person can only be that device's default person (there is no
+      // voice identification). A job or a notification is deferred: its origin was captured when it was scheduled and the
+      // device may have been given to someone else since, so nothing ties its person to the device's default person; what
+      // may be shown or spoken where is decided at delivery (`Privacy.mayReveal`).
+      if (principal._tag === "turn" && person !== undefined && deviceFacts.placeOf(deviceId)?.defaultPerson !== person.id) return `the person is not the default person of the device "${deviceId}".`
       return undefined
     }
     const keys = makeKeys({ vault, store, host })
