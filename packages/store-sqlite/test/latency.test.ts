@@ -23,12 +23,11 @@ import {
 } from "@pva/core"
 import { makeMemoryHouseholdStore } from "@pva/core/testing"
 import { Effect, Schema } from "effect"
-import { mkdtempSync, statSync } from "node:fs"
-import { tmpdir } from "node:os"
+import { statSync } from "node:fs"
 import { join } from "node:path"
 import { DatabaseSync } from "node:sqlite"
 import { makeSqliteStore } from "../src/index.ts"
-import { bound } from "./latencyBound.ts"
+import { bound, latencyDir } from "./latencyBound.ts"
 
 const ROWS = 100_000
 const Note = Schema.Struct({ state: Schema.String, due: Schema.Finite, text: Schema.String })
@@ -100,7 +99,7 @@ const worstOf = (n: number, effect: Effect.Effect<unknown, unknown>) =>
 describe("SQLite store latency on 100,000 rows of ~1 KB", () => {
   it.live("turn reads are bounded index reads, the worst legal one under 10 ms; the main connection never checkpoints; long work never holds the event loop", () =>
     Effect.gen(function*() {
-      const dir = mkdtempSync(join(tmpdir(), "pva-latency-"))
+      const dir = latencyDir("pva-latency")
       const file = join(dir, "household.db")
       yield* Effect.scoped(Effect.gen(function*() {
         const store = yield* makeSqliteStore({ filename: file })
@@ -193,7 +192,7 @@ describe("SQLite store latency on 100,000 rows of ~1 KB", () => {
 
   it.live("a version upgrade at start: the most rows it migrates (MAX_MIGRATION_ROWS of ~1 KB) in one transaction, before serving", () =>
     Effect.gen(function*() {
-      const dir = mkdtempSync(join(tmpdir(), "pva-migration-"))
+      const dir = latencyDir("pva-migration")
       const file = join(dir, "household.db")
       const Note2 = Schema.Struct({ state: Schema.String, due: Schema.Finite, text: Schema.String, label: Schema.String })
       const v2 = defineCollection({ name: "notes", scope: "household", schema: Note2, indexes: ["state", "due", ["state", "due"]], maxChars: 1_200, migrate: { 1: (v: typeof Note.Type) => ({ ...v, label: v.state }) } })
@@ -212,7 +211,7 @@ describe("SQLite store latency on 100,000 rows of ~1 KB", () => {
 
   it.live("ending a conversation at the legal maximum (values of MAX_VALUE_CHARS, eight indexed fields at the indexed limit, secure deletion): each step of BULK_STEP_ROWS stays under 10 ms", () =>
     Effect.gen(function*() {
-      const dir = mkdtempSync(join(tmpdir(), "pva-bulk-"))
+      const dir = latencyDir("pva-bulk")
       const store = yield* makeSqliteStore({ filename: join(dir, "household.db") })
       yield* store.prepare([{ id: "wide", storage: { collections: [wideChat] } }])
       const turn = { turnId: 1, conversationId: "conv-wide", source: "voice" as const }

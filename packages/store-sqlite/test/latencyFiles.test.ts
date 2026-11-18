@@ -36,6 +36,14 @@ describe("latency tests are recognised by their import of latencyBound.ts", () =
     ]))
   })
 
+  it("a latency file that opens a SQLite file puts it on a real disk (latencyDir), never on a tmpfs /tmp", () => {
+    const onTmp = latencyTestFiles(root).filter((path) => {
+      const text = readFileSync(join(root, path), "utf8")
+      return /makeSqliteStore\(|new DatabaseSync\(/.test(text) && !/\blatencyDir\(/.test(text)
+    })
+    expect(onTmp, "take the database's directory from latencyDir() in packages/store-sqlite/test/latencyBound.ts").toEqual([])
+  })
+
   it("the rule: an import of latencyBound.ts, with bound() or bare; a mention elsewhere is not one", () => {
     expect(isLatencyTest(`import { bound } from "../../store-sqlite/test/latencyBound.ts"`)).toBe(true)
     expect(isLatencyTest(`import { bound } from "./latencyBound.ts"`)).toBe(true)
