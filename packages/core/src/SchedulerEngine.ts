@@ -149,6 +149,12 @@ export interface SchedulerEngine extends SchedulerHook {
   readonly runsInFlight: () => number
   /** Tests: completes once the loop is waiting again (after at most a few thousand yields). */
   readonly settled: Effect.Effect<void>
+  /**
+   * Tests: while the loop waits, the time (on the engine's clock) of its next pass, when it reads the store and claims
+   * what is due; `undefined` while it works. A test that moves its clock past several passes moves it to each in turn
+   * and lets the engine settle there (a pass may wait for the store's lock on real timers, which its clock does not see).
+   */
+  readonly nextPassAt: () => number | undefined
 }
 
 /** Finished rows removed by one maintenance pass at most (more: the next pass follows a second later). */
@@ -352,6 +358,8 @@ export const makeSchedulerEngine = (options: SchedulerEngineOptions): Effect.Eff
     let nextMaintenance = 0
     let closing = false
     let waiting = false
+    /** While the loop waits: when its next pass is due (`nextPassAt`). */
+    let nextPass: number | undefined
     /** Counts what the engine did (passes, runs, outcomes): `settled` waits until it stops moving. */
     let progress = 0
     /**
@@ -449,12 +457,26 @@ export const makeSchedulerEngine = (options: SchedulerEngineOptions): Effect.Eff
       return out as JobFields
     }
 
+    /**
+     * The engine's transactions in flight. A transaction is one synchronous step, so one is in flight across turns of
+     * the event loop only while it waits for the store's write lock (another connection holds it, as the checkpoint
+     * worker does while it starts a new log: tried again on real timers, at most a second). `settled` waits for them.
+     */
+    let writing = 0
+    let writesDone: Deferred.Deferred<void> | undefined
     /** One transaction on the scheduler's collections. */
     const tx = <X>(f: (t: TxParts) => X) =>
-      store.transaction((htx) => {
-        const own = htx.forCore(SCHEDULER_OWNER)
-        return f({ jobs: own.collection(jobs), counts: own.collection(jobCounts), tx: own }) as never
-      }) as Effect.Effect<X, StoreFailure>
+      Effect.suspend(() => {
+        writing++
+        return (store.transaction((htx) => {
+          const own = htx.forCore(SCHEDULER_OWNER)
+          return f({ jobs: own.collection(jobs), counts: own.collection(jobCounts), tx: own }) as never
+        }) as Effect.Effect<X, StoreFailure>).pipe(Effect.ensuring(Effect.sync(() => {
+          if (--writing > 0 || writesDone === undefined) return
+          Deferred.doneUnsafe(writesDone, Effect.void)
+          writesDone = undefined
+        })))
+      })
 
     const backoff = (attempt: number) => Math.min(MAX_BACKOFF_MS, retryBaseMs * 2 ** Math.max(0, attempt - 1))
 
@@ -1176,8 +1198,10 @@ export const makeSchedulerEngine = (options: SchedulerEngineOptions): Effect.Eff
           if (Cause.hasInterruptsOnly(step.cause)) return yield* Effect.interrupt
           log(`Scheduler: ${messageOf(Cause.squash(step.cause))}; trying again in 5 s`)
           waiting = true
+          nextPass = now() + 5_000
           yield* Effect.raceFirst(Deferred.await(woken), Effect.sleep(5_000))
           waiting = false
+          nextPass = undefined
           continue
         }
         if (step.value.again) {
@@ -1185,8 +1209,10 @@ export const makeSchedulerEngine = (options: SchedulerEngineOptions): Effect.Eff
           continue
         }
         waiting = true
+        nextPass = step.value.next
         yield* waitUntil(step.value.next, woken)
         waiting = false
+        nextPass = undefined
       }
     })
     yield* Effect.forkIn(loop, engineScope)
@@ -1254,12 +1280,18 @@ export const makeSchedulerEngine = (options: SchedulerEngineOptions): Effect.Eff
     const cancelAny: SchedulerEngine["cancelAny"] = (id) =>
       typeof id !== "string" || !SAFE_ID.test(id) ? Effect.succeed(false) : cancelWhere(undefined, { id }, ADMIN)
 
-    // Quiet: the loop waits, nothing woke it, and nothing moved for 20 turns of the scheduler (a run that sleeps on the
-    // clock does not move).
+    // Quiet: the loop waits, nothing woke it, no transaction of the engine waits for the store's lock, and nothing moved
+    // for 20 turns of the scheduler (a run that sleeps on the clock does not move). A transaction waiting for the lock
+    // waits on real timers, which a test's clock does not move: it is waited for, not counted as quiet.
     const settled: Effect.Effect<void> = Effect.gen(function*() {
       let seen = -1
       let still = 0
       for (let i = 0; i < 20_000; i++) {
+        if (writing > 0) {
+          writesDone ??= Deferred.makeUnsafe<void>()
+          yield* Deferred.await(writesDone)
+          still = 0
+        }
         yield* Effect.yieldNow
         if (waiting && !Deferred.isDoneUnsafe(signal) && progress === seen) {
           if (++still >= 20) return
@@ -1282,6 +1314,7 @@ export const makeSchedulerEngine = (options: SchedulerEngineOptions): Effect.Eff
         wake()
       },
       runsInFlight: () => runCount,
-      settled
+      settled,
+      nextPassAt: () => nextPass
     } satisfies SchedulerEngine
   })
