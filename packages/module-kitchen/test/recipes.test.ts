@@ -4,6 +4,7 @@
 import { assert, describe, it } from "@effect/vitest"
 import { startTestModule, type TestHouseholdInput } from "@pva/core/testing"
 import { Effect } from "effect"
+import { bound } from "../../store-sqlite/test/latencyBound.ts"
 import { NAMES } from "../src/allergens.ts"
 import { kitchenModule, names, products, recipes, recipeTexts } from "../src/index.ts"
 import { MAX_DIET_TERMS, RECIPE_SCAN } from "../src/recipes.ts"
@@ -605,9 +606,3 @@ describe("kitchen: time, provenance and what was read", () => {
 
 /** What an action said. */
 const spokenOf = (r: { readonly ok: boolean; readonly say?: string | undefined }) => r.say ?? ""
-
-/**
- * A latency bound as a test asserts it: as `packages/store-sqlite/test/latencyBound.ts` does, the bound measured on the
- * development machine, and three times it on CI's slower, noisier runners.
- */
-const bound = (ms: number): number => (process.env.CI ? ms * 3 : ms)
