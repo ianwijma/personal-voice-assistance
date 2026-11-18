@@ -918,6 +918,25 @@ export const notifyContract = (name: string, open: OpenNotifyStore) =>
         assert.deepStrictEqual(changes, ["kitchen-display"])
       }))
 
+    it.effect("r3-5: a withdrawal that succeeded in the held-but-unseen tail of a pass is told although the next read there fails", () =>
+      Effect.gen(function*() {
+        const { world, faults } = yield* startFaulty({ connected: ["kitchen-display"] })
+        const a = yield* world.sendOn("kitchen-display", { title: "A", priority: "ring" })
+        const b = yield* world.sendOn("kitchen-display", { title: "B", priority: "ring" })
+        assert.strictEqual(world.notify.ringingOn("kitchen-display").length, 2)
+        const changes: Array<string> = []
+        world.notify.onRingingChanged((d) => changes.push(d))
+        // Both resolved before a pass: the pass finds no open row, then reads A (withdrawn) and fails reading B.
+        yield* world.bell().resolve(a.notification.id)
+        yield* world.bell().resolve(b.notification.id)
+        faults.skipGets = 1
+        faults.gets = 1
+        yield* world.settle
+        assert.strictEqual(faults.gets, 0)
+        assert.deepStrictEqual(world.notify.ringingOn("kitchen-display").map((r) => r.id), [b.notification.id])
+        assert.deepStrictEqual(changes, ["kitchen-display"])
+      }))
+
     it.effect("a7: a wall-clock correction (the wall clock alone moves): forwards, the next run resolves what expired; backwards, nothing expires early", () =>
       Effect.gen(function*() {
         // A real date, so that a wall clock moved back is still a time after 1970.
