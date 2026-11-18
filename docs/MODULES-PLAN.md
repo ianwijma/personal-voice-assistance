@@ -178,6 +178,28 @@ Service keys and interfaces that the core provides or calls (`People`, `Privacy`
 `DeviceControl`, `Playback`) are defined in `@pva/core` by the PR that implements or first uses them. Keys that a module provides are defined in
 `@pva/module-contracts` by P11.
 
+### Order from here (decided when P1 to P6 were done)
+
+P1 to P6 each needed four to seven review rounds at the size first planned, and converged only after their scope
+was cut. P7 to P10 as first written below are each that large again. So from here the work is ordered to get
+modules built early, and P7 to P10 are built as small first versions:
+
+1. **P11, the scaffold**, on top of P6: packages, contracts, the test kit for what exists (store, scheduler,
+   gateway, people), `docs/MODULES.md`.
+2. **Wave A: the twelve modules that need only P1 to P6**, each its own PR on P11, written in parallel: core-tools,
+   web-search, lists, kitchen, smart-home, calendar, memory-and-notes, briefing, local-info, presence-and-people,
+   news-and-feeds, mcp-client. Where a first version in §5.1 names a phrase command or a presentation, that part
+   waits for wave B and the PR says so.
+3. **P7 to P10 as first versions** (each section below starts with what is built now), stacked on P11 in the order
+   P9 (notifications, speech, ringing), P7 (phrases and controls), P10 (presentation), P8 (risk policy in admin).
+   P9 comes first because timers, reminders and the "stop" of P7 all need it.
+4. **Wave B: the modules that need them**: timers-and-alarms, reminders, notifications, assistant-controls, music,
+   routines-and-automations, broadcast, images-and-photos; and the phrase commands and presentations wave A left
+   out, as one small PR per module.
+5. **Later, not in this piece of work**: connections and OAuth (the rest of P8) with the google and t3-code
+   modules, and calls-and-intercom with the `call` guard. They are the three modules whose first version is mostly
+   a security-sensitive flow or changes the audio protocol; they get their own plan.
+
 ### P1. Module API v2, tool context, the execution gateway
 
 - `defineModule` gains optional `apiVersion`, `version`, `requires`, `platforms`, `health`, `templates`, `uses` and
@@ -473,6 +495,24 @@ The scheduler does one thing: it calls a module's handler at a time, once.
 
 ### P7. Phrase commands, windows, session and device control
 
+**First version (what is built now).** Everything in this section that is not named here is later.
+
+- Phrase commands `after-wake` only: a module's instance declares phrases per language with typed slots and a
+  handler; after the wake phrase (or inside the follow-up window) a matching utterance runs the handler through the
+  gateway with no model call and answers with an optional spoken line. Longest phrase wins; duplicates within one
+  assistant are both left out and named on the Health page; the host's phrases are reserved.
+- The host's essential controls after the wake phrase: stop, never mind, repeat, louder, quieter. "Stop" stops, in
+  this order, what is ringing on the device (P9), the reply or announcement being spoken, and media the `Playback`
+  service says is playing in the room.
+- One window, owned by the host: `ringing` (opened and closed by P9), in which "stop" and the ringing
+  notification's action phrases are accepted without the wake phrase. Taken utterances never become a turn. No
+  module windows, no `capture`, no guards, no `audible` window.
+- `SessionControl`: stop the reply, cancel a pending interaction, repeat the last reply, start a new conversation.
+  `DeviceControl`: the reply volume (`output.volume` and a gain node on the voice page). The `Playback` key.
+- An utterance that is not taken goes through the gates exactly as today; the PR shows that with `TurnTrace`.
+- Not now: typed actions before the model, switching the assistant, sleep, microphone mute, earcons, wake-free
+  control while a reply is audible.
+
 The fast path the basics need: commands that run without the language model.
 
 - **Phrase commands.** A closed set of phrases per language with optional typed slots (the existing `Param`
@@ -540,6 +580,18 @@ The fast path the basics need: commands that run without the language model.
 
 ### P8. Connections and risk policy
 
+**First version (what is built now).** Everything in this section that is not named here is later.
+
+- The risk policy the gateway already enforces (P1: `read` and `change` allowed, `message` refused as needing
+  confirmation, `money` and `security` denied) becomes a household setting in admin: per class `allow`, `confirm`
+  (which refuses, with its own sentence) or `deny`, with `money` and `security` fixed at `deny`. One level only: no
+  narrowing by assistant or device.
+- A tool whose every declared class is refused is left out of the turn's tool list; every call is checked again
+  at execution with its validated input, on every entry path; the trace records the outcome.
+- `sensitivity`: a `personal` result is passed through `Privacy.mayReveal` for the asking device before it goes
+  back to the model.
+- Not now: connections, OAuth flows, `ctx.connections`.
+
 - Connection types (declared by modules) and connection records in settings, credentials in the vault, owned by the
   household or a person, with a status (`ok`, `locked`, `needs-reauth`) and a test call.
 - Flows: authorization code with PKCE and a loopback redirect with "paste the address you ended on", the device
@@ -557,6 +609,29 @@ The fast path the basics need: commands that run without the language model.
 - Admin: Connections, and the risk policy for the household, an assistant and a device.
 
 ### P9. Notification service, speech sequences, ringing
+
+**First version (what is built now).** Everything in this section that is not named here is later.
+
+- `ctx.notify`: `send` (title, text, priority `normal` or `ring`, an owner for `Privacy.mayReveal`, a target of the
+  origin device or everywhere, a dedupe key, an expiry, and actions) and `resolve`; notifications are rows of a
+  core collection, with `list` for the notifications module. Sending at a later time is a scheduler job of the
+  service's own core handler.
+- **One delivery decision** per notification and device, when it is delivered: do not disturb (for the house, on
+  or off with an optional end time kept by the scheduler; `notify.dnd` to read, set and clear it), a device that
+  cannot speak or show, and `Privacy.mayReveal`. Under do not disturb a `ring` is kept silent and listed; nothing
+  rings. Nothing may send above `ring`.
+- **Actions**: `stop` is the host's and always works. A request may name further actions (`snooze`, or a custom
+  id) with a handler the owning module registers in its `shared` part; a press or a ringing phrase reaches it
+  through the gateway with the notification id. While the handler cannot be reached, the action answers "I can't
+  do that right now".
+- **Speech**: `ctx.speech.say(target, text, { cue? })` speaks one announcement on a device, a room's devices or
+  everywhere, after whatever is being spoken there, through the same delivery decision; it returns a handle that
+  can be awaited (outside a turn only) and stopped; the host's "stop" stops it.
+- **Ringing**: `notification.ring` and `notification.resolved` messages; the voice page loops a local cue and shows
+  a plain card with the actions; the `ringing` window of P7 while it rings.
+- Not now: quiet hours and quiet rooms, per-device do not disturb, acceptance settings, ring policies beyond the
+  two targets, `update`, multi-segment sequences with skip, recording announcements in the conversation, the
+  missed badge, the admin inbox page.
 
 - **One delivery policy** for everything the house says or shows that nobody on that device just asked for. A
   notification and a spoken sequence both pass through it, per target device: do not disturb, quiet hours, quiet
@@ -596,6 +671,24 @@ The fast path the basics need: commands that run without the language model.
 - Admin: the inbox.
 
 ### P10. Presentation
+
+**First version (what is built now).** Everything in this section that is not named here is later.
+
+- Kinds: `card` (title, text, facts), `list` (bullets or a checklist with ticks), `timer` (a countdown to an
+  instant, with a label), `image` (one image with a credit) and `weather`; each with a `spoken` fallback and a
+  sensitivity.
+- Two ways in: a tool or action returns `{ forModel, present }`, and `ctx.present.show(target, presentation)`
+  returning a handle with `update` and `dismiss`, where the target is a device or a room.
+- The Presenter per device: a device that cannot show gets nothing and the note for the model says so;
+  `Privacy.mayReveal` for the device that would show it; one transient presentation at a time and pinned ones
+  (timers, a list) restored on reconnect; `present.show`, `present.update`, `present.dismiss`, and
+  `present.action` for a tick or a button, which runs through the gateway.
+- `/media/<hash>`: the server fetches an image once through `safeFetch`, checks its type and size, and serves it for
+  a day. No resizing.
+- P9's ring card is drawn by the presentation stage. One stage layout beside the character; every existing
+  character keeps working unchanged (`docs/CHARACTERS.md`).
+- Not now: `facts` as its own kind, `table`, `gallery`, `progress`, `confirm`, `handoff`, the `show` and `show_on`
+  tools, `present.status`, the reveal rule tied to clauses, resizing with `sharp`.
 
 - `packages/protocol/src/presentation.ts`: the kinds `text`, `card`, `facts`, `list` (bullets, numbered, checklist,
   pick), `table`, `image`, `gallery`, `timer`, `progress`, `weather`, `confirm`, `handoff`, each versioned, with
@@ -638,6 +731,11 @@ The fast path the basics need: commands that run without the language model.
 ## 5. The modules
 
 ### 5.1 One PR each
+
+**Waves** (see "Order from here" in §4). Wave A, on P11: rows 3, 4, 5, 7, 9, 12, 13, 17, 18, 19, 20, 22. Wave B,
+after the first versions of P7 to P10: rows 1, 2, 6, 8, 10, 11, 16, 21, and the parts of wave A that needed them.
+Later, with their own plan: rows 14, 15 and 23. Where a row below asks for something the first versions of P7 to
+P10 leave out (a `capture` window, a guard, a `gallery`, connections), that part of the row is later too.
 
 "Model" is who writes it: Opus for open-ended work, Sonnet where the first version is well defined. All are based on
 P11. Wave B starts when the module it waits for is written. Where a first version is larger than the research
