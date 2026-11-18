@@ -1,2 +1,2 @@
-// Answers `input` bytes of text.
-export default (input: number): string => "x".repeat(input)
+// Answers `chars` characters of text.
+export default (input: { readonly chars: number }): string => "x".repeat(input.chars)
