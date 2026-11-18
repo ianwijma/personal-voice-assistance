@@ -60,7 +60,8 @@ its headings (§18).
 
 The contracts you provide or consume are in `@pva/module-contracts` (§13); your tests give a consumer a **stub** of a
 contract (`stubService` in `@pva/core/testing`), never an imitation of the provider. Spoken numbers, times, dates,
-durations, quantities and recurrences are `@pva/language`; outgoing HTTP is `@pva/net`, `GET` and `HEAD` only (§12).
+durations, quantities and recurrences are `@pva/language`; outgoing HTTP is `@pva/net`: `GET` and `HEAD`, and a JSON `POST`
+to an address the owner typed (§12).
 
 ## 2. The shape of a module
 
@@ -791,16 +792,32 @@ serve tests (`apps/assistant/test/moduleRoutes*.test.ts` show how).
 
 ## 12. The network
 
-Outgoing HTTP is `@pva/net`, never `fetch`, and **in this wave it is `GET` and `HEAD` only**: a module whose first
-version needs another method (a `POST`, a WebDAV verb, a streamed request) or a library that makes its own requests is
-not in this wave.
+Outgoing HTTP is `@pva/net`; **a module never calls `fetch` itself** (nor `node:http`, nor a library that makes its own
+requests). In this wave that is `GET` and `HEAD` to any URL, and a `POST` with a JSON body only to an address the owner
+typed: a module whose first version needs another method (a `PUT`, a WebDAV verb), another body (a form, a file, a
+stream), a WebSocket or a `POST` to a URL a model or a page chose is not in this wave.
 
 - **`safeFetch(url, { accept, … })`** for public APIs and any URL a model chose: `accept` (the response types you take:
   `contentTypes.json`, `webPage`, `feed`, `image`, or your own) is required; only `http`/`https`, ports 80 and 443, no
   credentials in the URL, every non-public address refused (checked on the address it connects to, and on every
   redirect), limits on size (`maxBytes`, 2 MiB) and time (`timeoutMs`, 6 s; an action's call takes less, §10).
-- **`fetchOwnerConfiguredLan(url, …)`** only for an address the owner typed into your settings (a LAN SearXNG): it also
-  allows private addresses and other ports. **Never pass it a URL a model chose.**
+- **`fetchOwnerConfiguredLan(url, …)`** only for an address the owner typed into your settings (a LAN SearXNG, Home
+  Assistant, Grocy): it also allows private addresses, local names and other ports. **Never pass it a URL a model chose.**
+  - **`method: "POST", body: { json }`** when the API takes a JSON request (Home Assistant's `/api/services/…`,
+    `/api/template`). The helper serialises `json`, sets `Content-Type: application/json` and the length (yours are
+    refused) and refuses a body over `maxRequestBytes` (64 KiB; you may set up to 128 KiB, whose serialisation stops the
+    main thread under 5 ms: a heartbeat's longest gap 4.5–5.0 ms for the worst shape) before connecting; a value
+    `JSON.stringify` cannot write is `NetRefused` (`body`). The one `timeoutMs` includes serialising. **A POST is sent once,
+    to one server**: every 3xx answer is refused (`post-redirect`), it is never retried, and it moves to the host's next address only after a refused or
+    timed-out connect, when nothing was sent. So **a POST that failed may or may not have been carried out**: say so
+    ("I could not confirm the kitchen light is on"), and do not repeat it by yourself. Every other rule (addresses, headers,
+    the response type, `maxBytes`, the one `timeoutMs`, interruption) applies to the POST and its answer.
+  - **`typedLoopback: true`** when the owner's server may run on the assistant's own machine (`http://localhost:8123`):
+    loopback is then allowed only when the URL is text whose host, as written, is exactly `localhost` (ASCII, any case),
+    `[::1]` or a plain dotted quad `127.a.b.c`. Every other spelling (`2130706433`, `0x7f000001`, `127.1`, `127.0.0.1.`,
+    `localhost.`, `x.localhost`, `%6cocalhost`, `[::ffff:127.0.0.1]`, a `URL` object), a name that resolves to loopback and a
+    redirect to loopback stay refused. Without the option, every loopback address is refused. The kit's offline network
+    resolves `localhost` names to loopback, so your test passes only where serve mode would.
 - **`makeCachedJson`** for JSON with a time to live, `ETag` and stale-if-error.
 - **`userAgent(contact)`**: put the owner's contact (Home › API contact, `HOME_API_CONTACT`) in the User-Agent **only
   when the owner set one**.
@@ -862,8 +879,56 @@ it.effect("serves fixtures, fails every other host, and keeps the owner's LAN fo
   }))
 ```
 
+A POST in a module and in its test: the test reads the method and the body that was sent from `net.requests` (`body` is
+the text as sent), and a fixture function sees the request with its `method` and `body`.
+
+<!-- region: packages/module-contracts/test/kit/network.test.ts#net-post-module -->
+```ts
+/**
+ * The owner's Home Assistant (its address from the module's settings, `http://localhost:8123` included): a POST with a JSON body.
+ * Sent once: no redirect is followed and it is never retried, so a failure may or may not have switched the light.
+ */
+export const callService = (deps: NetDeps, baseUrl: string, token: string, domain: string, service: string, data: Readonly<Record<string, unknown>>) =>
+  fetchOwnerConfiguredLan(`${baseUrl}/api/services/${encodeURIComponent(domain)}/${encodeURIComponent(service)}`, {
+    accept: contentTypes.json,
+    method: "POST",
+    body: { json: data },
+    typedLoopback: true,
+    timeoutMs: 3_000,
+    headers: { authorization: `Bearer ${token}` },
+    ...deps
+  })
+```
+
+<!-- region: packages/module-contracts/test/kit/network.test.ts#net-post-test -->
+```ts
+it.effect("a POST to the owner's server: the test reads the method and the body that was sent", () =>
+  Effect.gen(function*() {
+    const net = makeOfflineNet(
+      {
+        "http://ha.lan:8123/api/services/light/turn_on": (request) =>
+          request.method === "POST" ? { body: [{ entity_id: "light.kitchen" }] } : { status: 405, body: "POST only" }
+      },
+      { lan: { "ha.lan": "192.168.1.20" } }
+    )
+    const deps = { resolver: net.resolver, connector: net.connector }
+    const answer = yield* callService(deps, "http://ha.lan:8123", "t0ken", "light", "turn_on", { entity_id: "light.kitchen", brightness_pct: 40 })
+    assert.deepStrictEqual(JSON.parse(answer.text()), [{ entity_id: "light.kitchen" }])
+    const [sent] = net.requests
+    assert.strictEqual(sent?.method, "POST")
+    assert.deepStrictEqual(JSON.parse(sent?.body ?? ""), { entity_id: "light.kitchen", brightness_pct: 40 })
+    assert.strictEqual(sent?.headers["content-type"], "application/json")
+    assert.strictEqual(sent?.headers["authorization"], "Bearer t0ken")
+    // A GET to the same fixture: no body recorded, the fixture sees the method.
+    const get = yield* fetchOwnerConfiguredLan("http://ha.lan:8123/api/services/light/turn_on", { accept: contentTypes.json, ...deps })
+    assert.strictEqual(get.status, 405)
+    assert.deepStrictEqual([net.requests[1]?.method, net.requests[1]?.body], ["GET", undefined])
+  }))
+```
+
 Everything that comes back (a page, a feed, an invitation's text) is untrusted data: pass it to the model marked as such,
-cut to a bound, never as instructions.
+cut to a bound, never as instructions. Parsing it with a library is not done on the main thread: §15, "Parsing off the
+main thread".
 
 ## 13. Services and contributions between modules
 
@@ -971,8 +1036,8 @@ breaks the runtime's rules. So:
 - **Stop when interrupted.** A turn is cut off by barge-in all the time; a stop gives your calls 10 s, then interrupts
   them. Never make long work uninterruptible; wait with `Effect.sleep`, never a busy loop; pass the `AbortSignal` on.
 - **Never block the event loop.** It also frames audio for every browser. No unbounded synchronous work: parse and
-  evaluate with bounds (an expression evaluator with limits on size and depth, or a worker stopped at a deadline; a
-  length limit alone does not bound a synchronous evaluator), keep transactions small, cut large inputs first.
+  evaluate with bounds (an expression evaluator with limits on size and depth, or `offThread`, §15; a length limit
+  alone does not bound a synchronous evaluator), keep transactions small, cut large inputs first.
 - **Finite cleanup.** Finalizers finish in 5 s (past that the host abandons them and says so on the Health page).
 - **Do not hand the host objects whose properties throw or change**, do not go around the gateway (sealed tools are not
   a security boundary, but going around them is a bug), and keep nothing of the host after your part closed.
@@ -994,6 +1059,196 @@ Nothing slow on the turn path; a claim about latency needs `TurnTrace` numbers, 
   tool is a fraction of a millisecond. A risk function has 2 ms; an action 5 s (§10).
 - Slow work (a feed refresh, a calendar refresh) is a job or a fiber in `shared` that keeps a cache; the turn reads the
   cache.
+
+### Parsing off the main thread: `offThread`
+
+The main thread plays and listens to audio for every device: nothing may hold it for more than about 10 ms. Parsing
+text from outside with a library is far slower and cannot be sliced (measured on the development machine: a web page
+into text 50 to 200 ms, much longer for a deeply nested one; a 1 MB RSS feed 52 to 75 ms; an article extraction 59 to
+91 ms; a spelling dictionary 400 ms). **Any parsing or computing on text from outside that could take more than a few
+milliseconds** (pages, feeds, calendars, documents, dictionaries) runs through `offThread` from `@pva/core`: a pure
+function in a fresh worker thread, started for the call and terminated after it.
+
+It is made for **trusted code on untrusted input**: your task file and the library it imports are compiled in and do
+not attack the helper; the input (a page, a feed, a calendar file) may be huge, deeply nested, or built to make a parser
+loop or allocate. What a worker thread cannot guarantee is said below.
+
+- **The task module** is a file of your own package (`src/<name>.task.ts`): an ES module, `.ts`, `.mts` or `.mjs`,
+  that default-exports one function `(input) => output` or a promise of it, and imports what it needs (the libraries
+  are your package's dependencies). A `.js`, `.cjs` or `.cts` task is refused (`load`) before a worker starts. A `.ts`
+  or `.mts` task is loaded through tsx in the worker; an `.mjs` one is not, so it can import JavaScript only. Name it
+  once with `offThreadTask`, with its type, so nothing of it is loaded on the main thread.
+- **The input has one narrow shape**: a string, a `Uint8Array` (a `Buffer` too), or one plain object or array, one
+  level deep with at most 32 entries, whose values are strings, `Uint8Array`s, finite numbers, booleans or `null`.
+  Anything else (a nested object or array, `undefined`, a `Date`, a class instance, another typed array, bytes on
+  shared memory) is refused with `input` before a worker starts. Its size (string code units × 2, plus bytes, plus 8
+  per other value, keys included) is at most `maxInputBytes`: 4 MiB, the default and the most a call may ask for,
+  checked before anything is copied. Bytes are copied onto a buffer of their own before they cross: the task never
+  sees the bytes beside them in a pooled `Buffer`, and what it writes stays in the worker. Pass a fetched body as it
+  is (cap the fetch first: `safeFetch`'s `maxBytes`), and the settings the task needs as a few plain fields: pass a
+  small record of your own, never an object parsed from outside (counting the keys of a huge one costs the main
+  thread before it is refused: 80 to 150 ms for 500,000 keys).
+- **The answer: return text or a small structure; a big structure is refused.** The worker serialises the answer
+  once, into one buffer that is checked, transferred, checked again and read on the main thread (the task's value
+  itself never crosses). Reading text or bytes costs the main thread by the byte, reading a structure by the object.
+  So `maxResultBytes` (default 128 KiB) may be raised to 4 MiB, but only an answer that is one string or one
+  `Uint8Array` may use more than 128 KiB. A structured answer (an object, an array, anything else) over 128 KiB fails
+  with `too-large` whatever the limit says, and its buffer is never read. No sparse arrays: an array with holes, or an
+  answer of more than 131,072 values in all, is refused too (a hole costs nothing to send but is allocated whole when
+  read). The longest stop of the main thread while
+  receiving the largest allowed answers, and what larger structures cost (development machine, worst of 5 calls):
+
+  | Answer | Allowed | Longest stop |
+  |---|---|---|
+  | a 4 MiB string | with `maxResultBytes` raised | 3.6 to 4.6 ms |
+  | 4 MiB of bytes | with `maxResultBytes` raised | 3.1 to 8.0 ms |
+  | 128 KiB of small objects (13,931 of them) | yes, the largest structure | 2.4 to 2.5 ms |
+  | 1 MiB of small objects | no | 19 to 21 ms |
+  | 4 MiB of small objects | no | 107 to 120 ms |
+
+- **The call**: `offThread(task, input, { timeoutMs, maxMemoryMb, maxResultBytes, maxInputBytes })`. It is an Effect:
+  call it from a tool, a job or a part's start; only from the main thread (a task that calls it is refused with
+  `nested`: tasks do not nest).
+  - `timeoutMs` is required (at most 60 s). It is one deadline, taken when the call begins: the time waiting for a
+    slot counts, a call whose deadline has passed is never started, and an answer after it is a `timeout`. It is real
+    time, so it holds under the test kit's clock too.
+  - The time limit stops **pure JavaScript**: loops, regular expressions, `Atomics.wait`. A **synchronous native call**
+    (`crypto.*Sync`, `fs.*Sync`, a native addon) cannot be stopped: it holds its slot until it returns, and the call
+    with it. A task must not make one whose cost depends on the input.
+  - Interrupting the call (barge-in, the module stopping) terminates the worker the same way.
+  - **At most two workers run at once** in the process, and **at most 32 calls wait** for a slot, in the order made;
+    one more fails at once with `busy` and keeps nothing. A module that fans out (a feed per source, a page per
+    result) must expect `busy` and treat it like a failed fetch.
+  - `maxMemoryMb` (default 128, 16 to 1,024) limits the worker's **JavaScript heap** as V8 enforces it (with it its
+    young generation, an eighth of it from 8 to 32 MB, and a 4 MB stack; one very large string may still get through
+    before the worker is stopped), not buffers outside the heap (an `ArrayBuffer`, a typed array). The real
+    protection against a huge allocation is the input limit above and your task's own caps on what it builds (a limit
+    on entries, on nodes, on characters).
+- **Output**: in the worker, `console.*` and `process.stdout.write` / `process.stderr.write` write nowhere before the
+  task is loaded (what a library prints could quote the input, and passing it on would cost the main thread). Writes
+  to the raw descriptors (`fs.writeSync(2, …)`) are not caught; a task does not make them.
+- **Each failure is an `OffThreadError`** with a `reason`, and a one-line `message` for the log that names the task and
+  never quotes the input: of a thrown value only its name, when it is a built-in one (`Error`, `TypeError`,
+  `RangeError`, `SyntaxError`, …), and its code, when it is one of a fixed list of Node's (`ERR_MODULE_NOT_FOUND`, …);
+  anything else is `other error`.
+
+  | `reason` | What happened | What the person hears |
+  |---|---|---|
+  | `timeout` | the time limit passed (waiting included); the worker was terminated | it took too long to read |
+  | `memory` | the worker ran out of `maxMemoryMb` | it could not be read |
+  | `too-large` | the answer was over `maxResultBytes`, is a structure over 128 KiB, holds an array with holes or more than 131,072 values | it could not be read (or: it is too long) |
+  | `failed` | the task threw or rejected (a stack overflow too, and a throw from a timer or a rejection nobody handled), or its answer cannot be serialised | it could not be read |
+  | `exited` | the worker ended without answering, or could not start | it could not be read |
+  | `load` | the task module is missing, has no default function, or is not a `.ts`, `.mts` or `.mjs` file: a bug of the module | it could not be read |
+  | `input` | the input is not of the shape above, or over `maxInputBytes`: a bug of the module (cap first) | it could not be read |
+  | `busy` | 32 calls were already waiting | as for a failed fetch: try later |
+  | `nested` | called from a worker thread (from a task): a bug of the module | it could not be read |
+
+- **Not**: no state shared between calls (each call is a fresh thread: a global set in one call is gone in the next),
+  no network and no store from the task (fetch first, store after, on the main thread), no secrets in the input
+  unless the task needs them. Of the server's environment variables the worker gets only `NODE_ENV`, `TMPDIR`,
+  `TMP`, `TEMP`, `TZ` and those whose names start with `TSX_`; every other one is left out. It is not a
+  sandbox: the worker keeps the server's working directory and file access, because the task is trusted code. Never
+  from a context provider or anywhere else on the turn path: the start-up cost below is more than a context
+  provider's 50 ms.
+- **The numbers** (`packages/core/test/OffThread.test.ts` prints them; development machine, two runs):
+  - Start-up, paid on every call by design (median of 5 calls): the thread alone 26 ms; a TypeScript task without
+    imports 110 ms (tsx's loader is started in each worker, so a `.ts` task loads the same under tsx, vitest and plain
+    node); a task importing `linkedom` 229 to 230 ms; one importing `feedsmith` 215 to 224 ms. Add it to the tool's
+    `latency` (a tool that parses a page is `slow`).
+  - The main thread's own share, the longest stop of a 1 ms timer over 5 calls: 1 MiB in and 100 KiB out 1.8 ms; the
+    largest legal input (4 MiB as counted) 3.6 to 4.0 ms as a string of two-byte characters, 1.8 to 1.9 ms as bytes,
+    1.5 to 1.9 ms as an object of 30 strings; a task writing 80 MB to console and the streams 1.2 to 1.5 ms.
+  - Refusals that never reach the main thread as data: a sparse answer of ten million entries (20 bytes serialised)
+    holds it 1.6 ms, an uncaught 32 MiB failure (a thrown `Error` or object from a timer, an unhandled rejection) 1.2
+    to 1.3 ms.
+  - A task that loops forever ends 4 ms after its time limit; an interrupted one is gone 3 to 4 ms after the
+    interruption.
+  - A rare stop of 6 to 8 ms on the main thread is its own garbage collection, not the helper's work (a GC observer
+    saw a major collection of about 7 ms, or a scavenge of 4 to 6 ms, during each such call).
+
+<!-- region: packages/module-contracts/test/kit/pageText.task.ts#offthread-task -->
+```ts
+// pageText.task.ts: a page from outside read into text. One pure function, plain data in and out; nothing shared,
+// no network, no store. It runs in a fresh worker thread for each call (offThread in the module).
+import { parseHTML } from "linkedom"
+
+export default (html: string): string => {
+  const { document } = parseHTML(html)
+  for (const node of document.querySelectorAll("script, style, noscript")) node.remove()
+  return (document.body?.textContent ?? "").replace(/\s+/g, " ").trim()
+}
+```
+
+<!-- region: packages/module-contracts/test/kit/offThread.test.ts#offthread-module -->
+```ts
+/** The task, named once: its file beside this one, and its default export's type (no import on the main thread). */
+const pageText = offThreadTask<typeof import("./pageText.task.ts").default>(new URL("./pageText.task.ts", import.meta.url))
+
+const pageTexts = defineTexts({
+  en: { slow: "That page took too long to read.", unreadable: "I couldn't read that page." },
+  nl: { slow: "Het lezen van die pagina duurde te lang.", unreadable: "Ik kon die pagina niet lezen." }
+})
+
+/** What the person hears when the parse failed: a page too slow to read, or one that cannot be read at all. */
+const pageFailure = (lang: "en" | "nl", e: OffThreadError) => say(pageTexts, lang, e.reason === "timeout" ? "slow" : "unreadable")
+
+export const readerModule = (deps: NetDeps) =>
+  defineModule({
+    apiVersion: 2,
+    id: "reader",
+    name: "Reader",
+    description: "Reads a web page.",
+    enabledByDefault: false,
+    requires: [{ network: "internet", why: "fetches the page asked for" }],
+    start: (ctx) =>
+      Effect.succeed({
+        tools: [makeTool({
+          name: "reader_read_page",
+          description: "Read the text of a web page.",
+          parameters: Schema.Struct({ url: Schema.String }),
+          risk: "read",
+          latency: "slow",
+          execute: ({ url }) => {
+            const lang = homeLanguage(ctx.host.view())
+            return safeFetch(url, { accept: contentTypes.webPage, maxBytes: 2 * 1024 * 1024, timeoutMs: 6_000, ...deps }).pipe(
+              // The parse runs in a worker: the main thread only posts the page and receives the text.
+              Effect.flatMap((response) => offThread(pageText, response.text(), { timeoutMs: 3_000, maxResultBytes: 128 * 1024 })),
+              Effect.map((text) => `Untrusted page text: ${text}`),
+              Effect.catchTag("OffThreadError", (e) => Effect.succeed(pageFailure(lang, e))),
+              // The fetch's own failures (refused, too large, too slow, a bad status): the page could not be read.
+              Effect.catch(() => Effect.succeed(say(pageTexts, lang, "unreadable")))
+            )
+          }
+        })]
+      })
+  })
+```
+
+Its test starts real workers; `offThreadWorkers()` in `@pva/core/testing` says how many are running:
+
+<!-- region: packages/module-contracts/test/kit/offThread.test.ts#offthread-test -->
+```ts
+const page = "<html><head><script>track()</script></head><body>\n<h1>Bins</h1>\n<p>Paper goes out on Tuesday.</p></body></html>"
+const net = makeOfflineNet({
+  "https://example.org/bins": { body: page, headers: { "content-type": "text/html" } },
+  "https://example.org/huge": { body: `<html><body><p>${"word ".repeat(100_000)}</p></body></html>`, headers: { "content-type": "text/html" } }
+})
+const on = yield* startTestModule(readerModule({ resolver: net.resolver, connector: net.connector }))
+// A real worker runs the task, in tests as in the app (its time limit is real time, not the kit's clock).
+assert.strictEqual((yield* on.tool("reader_read_page", { url: "https://example.org/bins" })).value, "Untrusted page text: Bins Paper goes out on Tuesday.")
+// Text over the result limit is a typed failure (`too-large`), which the module words itself.
+assert.strictEqual((yield* on.tool("reader_read_page", { url: "https://example.org/huge" })).value, "I couldn't read that page.")
+// Every worker has ended.
+assert.strictEqual(offThreadWorkers().running, 0)
+```
+
+### Latency tests
+
+A test file that asserts how long the main thread stops (the longest gap of a 1 ms heartbeat) or how long real work
+takes imports `packages/store-sqlite/test/latencyBound.ts` and writes its bounds as `bound(ms)`, and **that import is
+what makes it a latency test**: CI runs those files alone, one at a time after the rest (`vitest.latency.ts`), so other
+tests' busy threads do not lengthen what they measure, while `pnpm test` still runs everything together.
 
 ## 16. Speaking
 
@@ -1100,7 +1355,7 @@ Also: `makeTestTurn` (a synthetic turn from its input alone: no person, room or 
 `kit.turn()` for a turn of the household, and give each turn of a multi-turn test its own `turnId` and
 `conversationId`), `makeTestPeople`, `testConnectionOf`, `dietProblem`, `provide(moduleId, { services, contributions
 })`, `stubService(name, answers)` with `succeeds`, `fails`, `stops` and `returns`, `makeOfflineNet(fixtures, { lan })`
-(§12), `expectOffByDefault(catalog)`.
+(§12; its `requests` record each request's method and a POST's body), `expectOffByDefault(catalog)`.
 
 <!-- region: packages/module-contracts/test/kit/pinboard.test.ts#turns -->
 ```ts
