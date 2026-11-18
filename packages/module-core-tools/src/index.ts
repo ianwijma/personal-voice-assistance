@@ -1,50 +1,11 @@
-import { defineModule, type ModuleDefinition } from "@pva/core"
-import { Effect } from "effect"
+import type { ModuleDefinition } from "@pva/core"
+import { calculatorModule } from "./calculator.ts"
+import { knowledgeModule } from "./knowledge.ts"
+import { systemStatusModule } from "./systemStatus.ts"
 
-/**
- * Arithmetic, units and currency, worked out exactly, and random picks.
- *
- * A stub of the scaffold (docs/MODULES-PLAN.md §4 P11; §5.1 row 3, wave A): off by default, no tools yet.
- * Its own pull request writes it. What it is to do: docs/modules/calculator.md and docs/research/modules/core-tools.md.
- */
-export const calculatorModule = defineModule({
-  apiVersion: 2,
-  id: "calculator",
-  name: "Calculator",
-  description: "Arithmetic, units and currency, worked out exactly, and random picks.",
-  enabledByDefault: false,
-  start: () => Effect.succeed({})
-})
-
-/**
- * Short facts and definitions from Wikipedia, Wikidata and Wiktionary.
- *
- * A stub of the scaffold (docs/MODULES-PLAN.md §4 P11; §5.1 row 3, wave A): off by default, no tools yet.
- * Its own pull request writes it. What it is to do: docs/modules/knowledge.md and docs/research/modules/core-tools.md.
- */
-export const knowledgeModule = defineModule({
-  apiVersion: 2,
-  id: "knowledge",
-  name: "Knowledge",
-  description: "Short facts and definitions from Wikipedia, Wikidata and Wiktionary.",
-  enabledByDefault: false,
-  start: () => Effect.succeed({})
-})
-
-/**
- * How the assistant itself is doing: its modules, engines and devices.
- *
- * A stub of the scaffold (docs/MODULES-PLAN.md §4 P11; §5.1 row 3, wave A): off by default, no tools yet.
- * Its own pull request writes it. What it is to do: docs/modules/system-status.md and docs/research/modules/core-tools.md.
- */
-export const systemStatusModule = defineModule({
-  apiVersion: 2,
-  id: "system-status",
-  name: "System status",
-  description: "How the assistant itself is doing: its modules, engines and devices.",
-  enabledByDefault: false,
-  start: () => Effect.succeed({})
-})
+export { calculatorModule, makeCalculator } from "./calculator.ts"
+export { knowledgeModule, makeKnowledge } from "./knowledge.ts"
+export { systemStatusModule } from "./systemStatus.ts"
 
 /**
  * What the app runs from this package (`apps/assistant/src/modules.ts` lists it once, so this package's pull request

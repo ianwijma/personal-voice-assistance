@@ -12,25 +12,46 @@ This page belongs to the module's pull request, which touches its package and th
 
 ## What it does
 
-To be written.
+Answers "how is the server doing" and "is everything working" from what the assistant already knows about itself: the
+state of every module (running, switched off, stopped with an error, unavailable), whether the key vault is locked,
+whether the speech engines are ready, and which devices are connected. It reads **only the host's own view**
+(`ctx.host.view()`); it probes no network, reads no disk or load, runs no command, and stores nothing.
 
 ## Tools
 
-To be written: each tool and action, its parameters, its risk class, and what it answers (its `spoken` line).
+| Tool | Parameters | Answers |
+|---|---|---|
+| `system_status` | `about?`: `all` (default), `modules`, `devices` | `{ spoken, fine, problems: [{ kind, state?, name?, reason? }], running, connectedDevices }`; "Everything is running: 12 modules. Connected devices: Kitchen display and Robin's phone." / "The key vault is locked, so modules that need a key are waiting for you to unlock it in Settings." |
+
+Risk: read, speculative. At most three problems are named ("And two more."): the vault, the speech engines, modules that
+stopped with an error, then those that are unavailable. Typed action: `system-status.status` ("how is the server doing",
+"werkt alles").
+
+**Privacy.** Module names and error text are about the house, not a person, but a hall screen is where visitors stand: on a
+`public` device, on a device the host does not know, and when there is no device, the answer is only "Everything is
+running." or "There is a problem. Check the settings page." (the asking device's privacy is read through `Devices` at
+the moment of answering). Shared and private devices hear the details.
 
 ## Settings
 
-To be written.
+None.
 
 ## What it stores
 
-To be written: each collection, its scope, its `maxChars` and indexes, and how long rows stay.
+Nothing. **No personal content.**
 
 ## What it needs
 
-To be written: `requires`, `uses`, the services and contributions it provides or consumes, outside services.
+Nothing outside the process. It is useful on the server; in the CLI modes the view has no devices, no vault state and no
+engine, and it says only what it has.
 
 ## What was left out
 
-To be written. In wave A this lists, among the rest, every part of the plan's row that needs a phrase command, a
-presentation, a notification or a module's own speech (P7, P9, P10): those do not exist yet and come with wave B.
+- **The internet probe, disk space, load and memory, uptime** (research §5.5): "reads the host's own view only" (the lead's
+  note); the view has no such members. The smallest change that would provide them is a `HostView.system` member
+  (uptime, load, free disk) filled by the app.
+- **Health issues with their fixes** (the research: "later it reads the issue registry"): the view does not carry the
+  issue registry; adding `HostView.issues` would let it name the worst issue and its fix.
+- **A `list` presentation of issues** and any spoken line outside a reply: wave B.
+- **A new `HostModuleView.status` line**: the view has the state and the reason a module is unavailable, not the module's
+  status line, so the reason is not spoken (it is in the result for the model).
