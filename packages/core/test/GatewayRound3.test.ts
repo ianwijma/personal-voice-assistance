@@ -4,6 +4,7 @@
 // and the cost of the whole tool path, measured with `TurnTrace`'s tool times (finding 9).
 import { assert, describe, it } from "@effect/vitest"
 import { Deferred, Effect, Fiber, Layer, Schema, Stream } from "effect"
+import { vi } from "vitest"
 import { defineAction, Param } from "../src/Actions.ts"
 import type { AgentEvent, AgentTurnInput } from "../src/Agent.ts"
 import { choiceAnswer, type DecisionAnswer, type DecisionRequest, makeScriptedDecider } from "../src/Decision.ts"
@@ -112,6 +113,25 @@ describe("finding 7: the risk function runs after the access checks, bounded, an
       assert.deepStrictEqual(ran, [])
       mode = "ok"
       assert.strictEqual((yield* call("ok")).content, "opened")
+    }))
+})
+
+describe("a fixed or inferred risk is the host's lookup, so it has no budget", () => {
+  it.effect("a thread held while it is looked up (a collection, a busy machine) refuses nothing; a risk function stays bounded", () =>
+    Effect.gen(function*() {
+      const ran: Array<string> = []
+      const tool = (name: string, risk?: "read") =>
+        makeTool({ name, description: "", parameters: Schema.Struct({}), ...(risk !== undefined ? { risk } : {}), execute: () => Effect.sync(() => (ran.push(name), "ok")) })
+      const gateway = makeExecutionGateway({ access: { moduleOn: () => true, toolOff: () => false } })
+      const registry = makeToolRegistry([{ name: "home", tools: [tool("inferred"), tool("fixed", "read")] }], { gateway })
+      // Every reading of the clock is 10 ms after the one before: whatever is timed took longer than the budget.
+      let t = 0
+      const now = vi.spyOn(performance, "now").mockImplementation(() => (t += 10))
+      const results = yield* Effect.forEach(["inferred", "fixed"], (name) => Effect.provideService(registry.run({ id: name, name, input: {} }), CurrentTurn, turnOf("a"))).pipe(
+        Effect.ensuring(Effect.sync(() => now.mockRestore()))
+      )
+      assert.deepStrictEqual(results.map((r) => r.content), ["ok", "ok"])
+      assert.deepStrictEqual(ran, ["inferred", "fixed"])
     }))
 })
 
