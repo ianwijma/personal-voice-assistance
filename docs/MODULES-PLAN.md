@@ -619,9 +619,11 @@ The fast path the basics need: commands that run without the language model.
   core collection, with `list` for the notifications module. The service does not send later: a module that
   wants a notification at a later time schedules its own job and sends from its handler.
 - **Decided after review round 1** (36 blocking findings, most from per-notification jobs, one-shot deliveries,
-  actions without a claim and decisions taken before a wait): the service owns one repeating maintenance job (every
-  minute: expiry, the end of do not disturb, retention, a repair pass) and no other job, so expiry and the end of do
-  not disturb can be up to a minute late; delivery is reconciliation (one function makes what each connection of a
+  actions without a claim and decisions taken before a wait): the service owns two jobs and no per-notification job: one
+  one-shot job planned for the next thing that is due (an expiry, the end of do not disturb, retention, a stale claim,
+  a device that needs another pass; none when nothing is due) and one hourly safety net that does the full pass and
+  plans again, so expiry is on time ordinarily and up to an hour late only after a store failure lost the plan (a job
+  every minute, tried first, ran ten thousand times when a module's test advanced the clock by a week); delivery is reconciliation (one function makes what each connection of a
   device holds equal to what the live rows and the one decision allow now, asked again after every wait); an action
   is claimed on the row before module code runs and is admitted only from a device that holds the card (`stop`
   included; `stop` wins over a pending action); a handler may be called again for the same notification after a
