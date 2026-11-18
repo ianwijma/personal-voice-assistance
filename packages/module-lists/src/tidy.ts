@@ -49,7 +49,7 @@ export const tidy = (engine: Engine, settings: TidySettings, now: number, actor:
         // A deleted list past its undo window: every item, then the list itself.
         for (const status of ["open", "done", "removed"] as const) yield* sweep(row.id, status, () => true)
         if (steps < MAX_TIDY_STEPS) {
-          const left = yield* Effect.forEach(["open", "done", "removed"] as const, (status) => itemStore.list({ where: { place: placeOf(row.id, status) }, limit: 1 }))
+          const left = yield* Effect.forEach(["open", "done", "removed"] as const, (status) => itemStore.list({ where: { place: placeOf(row.id, status) }, orderBy: { field: "since" }, limit: 1 }))
           if (left.every((l) => l.length === 0)) yield* store.transaction((tx) => void tx.collection(lists).remove(row.id, { actor }))
         }
         continue

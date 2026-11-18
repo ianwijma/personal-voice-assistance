@@ -99,7 +99,7 @@ describe("lists_read and lists_overview", () => {
       assert.strictEqual(said(yield* kit.action("read", { from: 41 })), "The shopping list has only 40 things.")
       assert.strictEqual(said(yield* kit.action("read", { show: "done" })), "Nothing is ticked off on the shopping list.")
       yield* kit.action("complete", { item: "item 7 and item 8" })
-      assert.strictEqual(said(yield* kit.action("read", { show: "done" })), "Ticked off on the shopping list: item 7 and item 8.")
+      assert.strictEqual(said(yield* kit.action("read", { show: "done" })), "Ticked off on the shopping list: item 8 and item 7.")
       assert.strictEqual(said(yield* kit.action("read", { list: "to-do list" })), "The to-do list is empty.")
     }))
 

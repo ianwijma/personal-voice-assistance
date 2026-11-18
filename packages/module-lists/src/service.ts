@@ -60,7 +60,7 @@ export const makeListsService = (engine: Engine): ListsService => {
         if (found.live !== undefined) {
           const reopening = found.live.value.status === "done"
           if (reopening && list.value.open + 1 > MAX_OPEN) engine.refuse("full")
-          const row = t.update(found.live.id, (v) => replaced(reopening ? withStatus(v, "open", now) : v))
+          const row = t.update(found.live.id, (v) => replaced(reopening ? withStatus(v, "open", engine.nextSince(tx, SHOPPING, now)) : v))
           if (reopening) engine.bump(tx, SHOPPING, 1, -1)
           return { outcome: reopening ? "reopened" as const : "updated" as const, item: itemOf(row) }
         }
@@ -74,7 +74,7 @@ export const makeListsService = (engine: Engine): ListsService => {
           ...(note !== undefined ? { note } : {}),
           status: "open",
           place: placeOf(SHOPPING, "open"),
-          since: now,
+          since: engine.nextSince(tx, SHOPPING, now),
           match: matchOf(SHOPPING, text),
           ...(dedupeKey !== undefined ? { dedupeKey } : {})
         })

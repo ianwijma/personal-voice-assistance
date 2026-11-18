@@ -155,6 +155,15 @@ export const makeEngine = (store: ModuleStore) => {
     return rows.find((r) => r.value.status === "open") ?? rows.filter((r) => r.value.status === "done").toSorted((a, b) => b.value.since - a.value.since)[0]
   }
 
+  /**
+   * When an item opened now goes: a millisecond after the newest open one (one indexed read) when that is not before
+   * now, so items keep the order they were added in, also two adds in the same millisecond and items said together.
+   */
+  const nextSince = (tx: StoreTx, list: string, now: number): number => {
+    const newest = tx.collection(items).list({ where: { place: placeOf(list, "open") }, orderBy: { field: "since", direction: "desc" }, limit: 1 })[0]
+    return newest === undefined || newest.value.since < now ? now : newest.value.since + 1
+  }
+
   /** The quantity of `existing` with `extra` added: the same unit, or one `@pva/language` converts; else `undefined`. */
   const sumOf = (existing: Quantity, extra: Quantity): Quantity | undefined => {
     if (existing.unit === extra.unit) {
@@ -215,10 +224,7 @@ export const makeEngine = (store: ModuleStore) => {
     const added: Array<string> = []
     const already: Array<string> = []
     let reopened = 0
-    // Items keep the order they were added in: each a millisecond after the newest open one (one indexed read), so
-    // two adds in the same millisecond, or items said together, never tie.
-    const newest = t.list({ where: { place: placeOf(list, "open") }, orderBy: { field: "since", direction: "desc" }, limit: 1 })[0]
-    let order = newest === undefined || newest.value.since < now ? 0 : newest.value.since + 1 - now
+    let order = nextSince(tx, list, now) - now
     for (const p of plans) {
       switch (p.kind) {
         case "new": {
@@ -328,15 +334,19 @@ export const makeEngine = (store: ModuleStore) => {
       const steps: Array<UndoStep> = []
       let open = 0
       let done = 0
+      // Each a millisecond after the one before: the newest first is the last one said.
+      let order = 0
       for (const r of rows) {
         const from = r.value.status
         if (from === to) continue
-        const row = t.update(r.id, (v) => withStatus(v, to, now), { expectRev: r.rev })
+        const at = now + order++
+        const row = t.update(r.id, (v) => withStatus(v, to, at), { expectRev: r.rev })
         steps.push({ id: row.id, rev: row.rev, from, since: r.value.since })
         if (from === "open") open--
         if (from === "done") done--
         if (to === "done") done++
       }
+      if (steps.length === 0) return 0
       const after = bump(tx, list, open, done)
       remember(tx, key, { at: now, op, list, listRev: after.rev, steps })
       return steps.length
@@ -366,8 +376,9 @@ export const makeEngine = (store: ModuleStore) => {
       const reopening = change.reopen === true && found.value.status === "done"
       if (reopening && listRow.value.open + 1 > MAX_OPEN) throw new Refusal("full")
       const before = found.value
+      const at = reopening ? nextSince(tx, list, now) : now
       const row = tx.collection(items).update(found.id, (v) => {
-        let next: Item = reopening ? withStatus(v, "open", now) : v
+        let next: Item = reopening ? withStatus(v, "open", at) : v
         if (change.text !== undefined) next = { ...next, text: change.text, match: matchOf(list, change.text) }
         if (change.quantity === null) {
           const { quantity: _q, ...rest } = next
@@ -453,7 +464,9 @@ export const makeEngine = (store: ModuleStore) => {
         if (entry.op === "delete") {
           if (listRow === undefined || listRow.rev !== entry.listRev) return { result: "changed" as UndoResult, list: entry.list, row: listRow?.value }
           const named = normalise(listRow.value.name ?? "")
-          const clash = l.list({ limit: MAX_LISTS + 1 }).some((r) => r.id !== entry.list && r.value.deletedAt === undefined && normalise(r.value.name ?? "") === named)
+          const others = l.list({ limit: MAX_LISTS + 1 }).filter((r) => r.id !== entry.list && r.value.deletedAt === undefined)
+          // Its name was taken since, or there are as many lists as there may be: it stays deleted.
+          const clash = others.some((r) => normalise(r.value.name ?? "") === named) || liveLists(others).length >= MAX_LIVE_LISTS
           if (clash) return { result: "changed" as UndoResult, list: entry.list, row: listRow?.value }
           l.update(entry.list, (v) => {
             const { deletedAt: _d, ...rest } = v
@@ -552,6 +565,7 @@ export const makeEngine = (store: ModuleStore) => {
     resolveList,
     ensureList,
     bump,
+    nextSince,
     scan,
     find,
     findAnywhere,
