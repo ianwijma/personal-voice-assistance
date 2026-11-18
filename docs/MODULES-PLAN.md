@@ -187,9 +187,9 @@ modules built early, and P7 to P10 are built as small first versions:
 
 1. **P11, the scaffold**, on top of P6: packages, contracts, the test kit for what exists (store, scheduler,
    gateway, people), `docs/MODULES.md`.
-2. **Wave A: the twelve modules that need only P1 to P6**, each its own PR on P11, written in parallel: core-tools,
-   web-search, lists, kitchen, smart-home, calendar, memory-and-notes, briefing, local-info, presence-and-people,
-   news-and-feeds, mcp-client. Where a first version in §5.1 names a phrase command or a presentation, that part
+2. **Wave A: the eleven modules that need only P1 to P6**, each its own PR on P11, written in parallel: core-tools,
+   web-search, lists, kitchen, smart-home, calendar (ICS only), memory-and-notes, briefing, local-info,
+   presence-and-people, news-and-feeds. Where a first version in §5.1 names a phrase command or a presentation, that part
    waits for wave B and the PR says so.
 3. **P7 to P10 as first versions** (each section below starts with what is built now), stacked on P11 in the order
    P9 (notifications, speech, ringing), P7 (phrases and controls), P10 (presentation), P8 (risk policy in admin).
@@ -198,8 +198,9 @@ modules built early, and P7 to P10 are built as small first versions:
    routines-and-automations, broadcast, images-and-photos; and the phrase commands and presentations wave A left
    out, as one small PR per module.
 5. **Later, not in this piece of work**: connections and OAuth (the rest of P8) with the google and t3-code
-   modules, and calls-and-intercom with the `call` guard. They are the three modules whose first version is mostly
-   a security-sensitive flow or changes the audio protocol; they get their own plan.
+   modules; mcp-client, because `@pva/net` fetches with GET and HEAD only and an MCP client needs POST with
+   streamed answers to an address the owner typed; CalDAV in the calendar module, for the same reason; and
+   calls-and-intercom with the `call` guard. They get their own plan.
 
 ### P1. Module API v2, tool context, the execution gateway
 
@@ -732,14 +733,22 @@ The fast path the basics need: commands that run without the language model.
 - A conformance check, `checkModule`, that every module's tests call: form budgets, risk classes, store limits,
   scheduler rules, name and text bounds.
 - Packages only for the modules of waves A and B; no `sharp`.
+- **Decided after the scaffold's first review**: the shared contracts are `Lists` (the default shopping list
+  only), `Timers`, `HomeAssistant`, `Playback` and `BriefingSection`; `Mcp` and `CalendarProvider` are not shared
+  (their cross-module consumers are deferred). Test doubles of a contract are programmable stubs with no behaviour
+  of their own. The test kit starts a module in the real host, gateway, store and scheduler with a household fixed
+  for the test; it does not imitate the HTTP router. With the scaffold, four things below it are fixed: the default
+  risk policy is enforced by the gateway (it was only a hook), a tool without parameters is sent as an object
+  schema, the host refuses bad tool names at a module's start, and the scheduler checks a payload when a job is
+  scheduled.
 
 ## 5. The modules
 
 ### 5.1 One PR each
 
-**Waves** (see "Order from here" in §4). Wave A, on P11: rows 3, 4, 5, 7, 9, 12, 13, 17, 18, 19, 20, 22. Wave B,
+**Waves** (see "Order from here" in §4). Wave A, on P11: rows 3, 4, 5, 7, 9, 12, 13, 17, 18, 19, 20. Wave B,
 after the first versions of P7 to P10: rows 1, 2, 6, 8, 10, 11, 16, 21, and the parts of wave A that needed them.
-Later, with their own plan: rows 14, 15 and 23. Where a row below asks for something the first versions of P7 to
+Later, with their own plan: rows 14, 15, 22 and 23. Where a row below asks for something the first versions of P7 to
 P10 leave out (a `capture` window, a guard, a `gallery`, connections), that part of the row is later too.
 
 "Model" is who writes it: Opus for open-ended work, Sonnet where the first version is well defined. All are based on
