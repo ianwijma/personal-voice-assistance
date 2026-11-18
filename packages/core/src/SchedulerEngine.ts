@@ -86,8 +86,10 @@ import { CurrentJob, CurrentTurn, type JobOrigin, type TurnPerson } from "./Turn
  * - **Maintenance**, every `maintenanceMs` and also when nothing is due: finished rows older than `keepFinishedMs` are
  *   removed (at most `RETENTION_ROWS_PER_PASS` a pass, `RETENTION_STEP_ROWS` a transaction), the recovery rule, the
  *   recount of each module's live jobs (a counter that disagrees with the rows is repaired), the Health issues.
- * - **Fairness**: a pass claims at most one due job per published handler per round, and starts at the handler after
- *   the one whose job it last started, so one handler with many due jobs cannot keep another's waiting.
+ * - **Fairness**: a pass is one round: at most one due job per published handler (as published when the pass starts),
+ *   starting at the handler after the one whose job it last started. A pass that moved a job on is followed at once by
+ *   the next, so one handler with many due jobs cannot keep another's waiting, nor a handler published, a job become
+ *   due, maintenance or the Health issues.
  */
 
 export interface SchedulerEngineOptions {
@@ -153,7 +155,7 @@ export interface SchedulerEngine extends SchedulerHook {
 export const RETENTION_ROWS_PER_PASS = 200
 /** Finished rows removed by one transaction of retention: `BULK_STEP_ROWS`, at most one list of `jobs`. */
 export const RETENTION_STEP_ROWS = Math.min(BULK_STEP_ROWS, MAX_JOB_PAGE)
-/** Failed jobs shown as Health issues at most (the newest failures; one more issue says how many there are). */
+/** Failed jobs shown as Health issues at most (the newest failures; one more issue, without a number, says there are more). */
 export const MAX_JOB_ISSUES = 48
 /** The most jobs one page of the admin list holds (`listAll`): two reads of `MAX_JOB_PAGE`, with a yield between. */
 export const MAX_ADMIN_JOB_PAGE = 2 * MAX_JOB_PAGE
@@ -319,12 +321,8 @@ export const makeSchedulerEngine = (options: SchedulerEngineOptions): Effect.Eff
     let runCount = 0
     /** The handler whose job the loop started last: the next pass starts at the one after it (fairness). */
     let lastClaimed: string | undefined
+    /** The Health issues are to be read again (set by every committed change of a row with an issue, kept by a failed read). */
     let issuesDirty = true
-    /**
-     * Rows with a Health issue, when known: counted when the Health issues are read (exactly, when they fit the bound;
-     * else by reading the rest of the index, at each maintenance pass), and kept up by every committed change since.
-     */
-    let issueTotal: number | undefined
     let nextMaintenance = 0
     let closing = false
     let waiting = false
@@ -408,14 +406,9 @@ export const makeSchedulerEngine = (options: SchedulerEngineOptions): Effect.Eff
       if (row === undefined) counts.insert({ live }, { id: owner, actor })
       else counts.update(owner, () => ({ live }), { actor })
     }
-    /** A committed change of rows with a Health issue: they are read again after the pass, and counted. */
-    const issueChanged = (delta: number) => {
-      issuesDirty = true
-      if (issueTotal !== undefined) issueTotal = Math.max(0, issueTotal + delta)
-    }
-    /** After the commit of `t`: the issues changed when `before` or `after` had one. */
+    /** After the commit of `t`: when `before` or `after` had an issue, the Health issues are read again after the pass. */
     const noteIssue = (t: TxParts, before: boolean, after: boolean) => {
-      if (before || after) t.tx.afterCommit(() => issueChanged((after ? 1 : 0) - (before ? 1 : 0)))
+      if (before || after) t.tx.afterCommit(() => void (issuesDirty = true))
     }
     /** Replace `before` with `next` (with `expectRev` of `before`), and keep the counter. */
     const put = (t: TxParts, before: Row<StoredJob>, next: JobFields, actor: Actor): Row<StoredJob> => {
@@ -969,57 +962,43 @@ export const makeSchedulerEngine = (options: SchedulerEngineOptions): Effect.Eff
       }
     }
 
-    /** The rows of the issue index, newest failure first, a page at a time, after `after`. */
-    const issuePage = (after: Row<StoredJob> | undefined) =>
-      jobsOut.list({ where: { issue: true }, orderBy: { field: "failedAt", direction: "desc" }, limit: MAX_JOB_PAGE, ...(after !== undefined ? { after } : {}) })
-
     /**
      * The Health issues: the `MAX_JOB_ISSUES` newest failures (the issue index is ordered by failure time), and, only when
-     * there are more, one issue with how many there are. `recount` (the maintenance pass): that number is counted again
-     * by reading the rest of the index, a page at a time; between maintenance passes it is kept up by every committed
-     * change (`issueChanged`).
+     * there are more, one issue that says so (without a number: `MAX_JOB_ISSUES + 1` rows by the index are enough to
+     * know, and the Scheduled jobs page has them all). Read a page at a time, with a yield between pages. A read that
+     * fails leaves the issues to be read again (`issuesDirty`) and fails: the loop's pass fails with it and is tried
+     * again after the loop's back-off.
      */
-    const refresh = (recount: boolean): Effect.Effect<void> => options.issues === undefined ? Effect.sync(() => void (issuesDirty = false)) : Effect.gen(function*() {
-      issuesDirty = false
-      const rows: Array<Row<StoredJob>> = []
-      let last: Row<StoredJob> | undefined
-      let end = false
-      while (rows.length <= MAX_JOB_ISSUES) {
-        const page = yield* issuePage(last)
-        rows.push(...page)
-        if (page.length < MAX_JOB_PAGE) {
-          end = true
-          break
-        }
-        last = page[page.length - 1]
-        yield* Effect.yieldNow
-      }
-      if (end && rows.length <= MAX_JOB_ISSUES) issueTotal = rows.length
-      else if (recount || issueTotal === undefined || issueTotal <= MAX_JOB_ISSUES) {
-        let n = rows.length
-        while (!end) {
-          yield* Effect.yieldNow
-          const page = yield* issuePage(last)
-          n += page.length
-          end = page.length < MAX_JOB_PAGE
+    const refresh: Effect.Effect<void, StoreFailure> = Effect.suspend(() => {
+      if (options.issues === undefined) return Effect.sync(() => void (issuesDirty = false))
+      const issues = options.issues
+      return Effect.gen(function*() {
+        issuesDirty = false
+        const rows: Array<Row<StoredJob>> = []
+        let last: Row<StoredJob> | undefined
+        while (rows.length <= MAX_JOB_ISSUES) {
+          if (last !== undefined) yield* Effect.yieldNow
+          const want = Math.min(MAX_JOB_PAGE, MAX_JOB_ISSUES + 1 - rows.length)
+          const page = yield* jobsOut.list({ where: { issue: true }, orderBy: { field: "failedAt", direction: "desc" }, limit: want, ...(last !== undefined ? { after: last } : {}) })
+          rows.push(...page)
+          if (page.length < want) break
           last = page[page.length - 1]
         }
-        issueTotal = n
-      }
-      const names = moduleNames()
-      const list = rows.slice(0, MAX_JOB_ISSUES).map((r) => issueOf(r, names))
-      if (rows.length > MAX_JOB_ISSUES) {
-        list.push({
-          id: "core.scheduler.failed.more",
-          severity: "warning",
-          title: `${issueTotal} scheduled jobs have failed`,
-          detail: `The ${MAX_JOB_ISSUES} newest failures are listed here. The Scheduled jobs page has them all.`,
-          fix: { kind: "link", label: "Open Scheduled jobs", value: "#settings/diagnostics/scheduled" }
-        })
-      }
-      options.issues!.set("scheduler", list)
-    }).pipe(Effect.catch((e) => Effect.sync(() => log(`Scheduler: the Health issues were not refreshed: ${e.message}`))))
-    const refreshIssues = refresh(true)
+        const names = moduleNames()
+        const list = rows.slice(0, MAX_JOB_ISSUES).map((r) => issueOf(r, names))
+        if (rows.length > MAX_JOB_ISSUES) {
+          list.push({
+            id: "core.scheduler.failed.more",
+            severity: "warning",
+            title: "More scheduled jobs have failed than are listed here",
+            detail: "The newest failures are listed here; see the Scheduled jobs page for the others.",
+            fix: { kind: "link", label: "Open Scheduled jobs", value: "#settings/diagnostics/scheduled" }
+          })
+        }
+        issues.set("scheduler", list)
+      }).pipe(Effect.onError(() => Effect.sync(() => void (issuesDirty = true))))
+    })
+    const refreshIssues: Effect.Effect<void> = refresh.pipe(Effect.catch((e) => Effect.sync(() => log(`Scheduler: the Health issues were not refreshed: ${e.message}`))))
 
     /**
      * The recount of every module's live jobs: a counter that disagrees with the rows (left so by a module that caught
@@ -1065,7 +1044,7 @@ export const makeSchedulerEngine = (options: SchedulerEngineOptions): Effect.Eff
       const removed = yield* retention
       yield* recover(undefined)
       yield* recount
-      yield* refreshIssues
+      yield* refresh
       // A backlog of old rows drains a pass a second (each pass bounded).
       nextMaintenance = now() + (removed >= RETENTION_ROWS_PER_PASS ? 1_000 : maintenanceMs)
     })
@@ -1073,11 +1052,14 @@ export const makeSchedulerEngine = (options: SchedulerEngineOptions): Effect.Eff
     // ---- The loop
 
     /**
-     * One pass: the recovery rule for new handlers, maintenance when due, then the published handlers' due jobs, in
-     * rounds of at most one job per handler, starting at the handler after the one whose job it started last, until
-     * `maxRuns` run or nothing more is due.
+     * One pass, one round: the recovery rule for new handlers, maintenance when due, then the published handlers as they
+     * are when the round starts, at most one due job each (claimed, or found missed), starting at the handler after the
+     * one whose job it started last, until `maxRuns` run; then the Health issues when they changed. `again`: it moved a
+     * job on, so the loop starts the next pass at once (a handler published, a job become due, maintenance and the
+     * issues are all considered again before any handler gets a second job); else the loop sleeps until `next` or a wake.
+     * Stopped by the cap with nothing moved, it waits for a wake too: a run that ends wakes it.
      */
-    const pass: Effect.Effect<number, StoreFailure> = Effect.gen(function*() {
+    const pass: Effect.Effect<{ readonly next: number; readonly again: boolean }, StoreFailure> = Effect.gen(function*() {
       progress++
       if (pendingRecovery.size > 0) {
         const keys = new Set(pendingRecovery)
@@ -1088,30 +1070,25 @@ export const makeSchedulerEngine = (options: SchedulerEngineOptions): Effect.Eff
       let next = nextMaintenance
       const began = performance.now()
       let claimed = 0
+      let moved = 0
       const entries = [...published.values()]
       const first = entries.findIndex((e) => e.key === lastClaimed) + 1
-      let round = [...entries.slice(first), ...entries.slice(0, first)]
-      while (round.length > 0 && runCount < maxRuns) {
-        const again: Array<Published> = []
-        for (const entry of round) {
-          if (runCount >= maxRuns) break
-          if (published.get(entry.key) !== entry) continue
-          const step = yield* claimNext(entry)
-          if (step._tag === "later") next = Math.min(next, step.at)
-          else if (step._tag === "missed") again.push(entry)
-          else if (step._tag === "claimed") {
-            claimed++
-            lastClaimed = entry.key
-            yield* startRun(entry, step.row, step.due)
-            again.push(entry)
-          }
-          yield* Effect.yieldNow
+      for (const entry of [...entries.slice(first), ...entries.slice(0, first)]) {
+        if (runCount >= maxRuns) break
+        if (published.get(entry.key) !== entry) continue
+        const step = yield* claimNext(entry)
+        if (step._tag === "later") next = Math.min(next, step.at)
+        else if (step._tag === "missed") moved++
+        else if (step._tag === "claimed") {
+          claimed++
+          lastClaimed = entry.key
+          yield* startRun(entry, step.row, step.due)
         }
-        round = again
+        yield* Effect.yieldNow
       }
       options.observe?.({ kind: "pass", ms: performance.now() - began, handlers: entries.length, claimed })
-      if (issuesDirty) yield* refresh(false)
-      return next
+      if (issuesDirty) yield* refresh
+      return { next, again: claimed + moved > 0 }
     })
 
     /** Sleep until `at`, woken early by `woken`, by a jump of the wall clock, and at least every `jumpCheckMs`. */
@@ -1145,8 +1122,12 @@ export const makeSchedulerEngine = (options: SchedulerEngineOptions): Effect.Eff
           waiting = false
           continue
         }
+        if (step.value.again) {
+          yield* Effect.yieldNow
+          continue
+        }
         waiting = true
-        yield* waitUntil(step.value, woken)
+        yield* waitUntil(step.value.next, woken)
         waiting = false
       }
     })

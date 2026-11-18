@@ -11,7 +11,7 @@ import { assert, describe, it } from "@effect/vitest"
 import { Cause, Clock, Deferred, Effect, Exit, Fiber, Schema, Scope } from "effect"
 import { TestClock } from "effect/testing"
 import { makeEventBus } from "./EventBus.ts"
-import { defineCollection, type HostTx, type HouseholdStore, StoreError, type StoredModule } from "./HouseholdStore.ts"
+import { defineCollection, type HostTx, type HouseholdStore, type ModuleStore, StoreError, type StoredModule } from "./HouseholdStore.ts"
 import { type IssueRegistry, makeIssueRegistry } from "./Issues.ts"
 import { isModuleStopped } from "./ModuleApi.ts"
 import { defineAction } from "./Actions.ts"
@@ -58,20 +58,23 @@ const Ping = Schema.Struct({ n: Schema.Number })
 /** Prepare the store for the scheduler and these modules. */
 const prepared = (store: HouseholdStore, modules: ReadonlyArray<StoredModule> = []) => Effect.as(store.prepare(modules, [schedulerStorage]), store)
 
-/** An engine in a scope of its own (closing it is a server stop), with fast retries and the test clock. */
+/**
+ * An engine in a scope of its own (closing it is a server stop), with fast retries and the test clock. Its scope is a
+ * child of the case's: closed with the case at the latest (before the store the case opened earlier).
+ */
 export const engineOn = (store: HouseholdStore, options: Partial<SchedulerEngineOptions> = {}) =>
   Effect.gen(function*() {
-    const scope = yield* Scope.make()
+    const scope = yield* Scope.fork(yield* Effect.scope)
     const issues = options.issues ?? makeIssueRegistry()
     const engine = yield* Scope.provide(scope)(makeSchedulerEngine({ retryBaseMs: SECOND, outcomeRetryMs: [100, 200], ...options, store, issues }))
     const advance = (ms: number) => Effect.andThen(Effect.andThen(engine.settled, TestClock.adjust(ms)), engine.settled)
     return { engine, issues, advance, stop: Scope.close(scope, Exit.void), scope }
   })
 
-/** Register a core handler in a scope of its own (closing it withdraws the handler). */
+/** Register a core handler in a scope of its own (closing it withdraws the handler; the case's scope closes it at the latest). */
 const coreHandler = <P, I>(core: CoreScheduler, name: string, handler: Parameters<CoreScheduler["handle"]>[1] & { readonly payload: Schema.Codec<P, I> }) =>
   Effect.gen(function*() {
-    const scope = yield* Scope.make()
+    const scope = yield* Scope.fork(yield* Effect.scope)
     yield* Scope.provide(scope)(core.handle(name, handler))
     return { withdraw: Scope.close(scope, Exit.void) }
   })
@@ -91,10 +94,12 @@ const turn = (over: Partial<TurnContext> = {}): TurnContext => ({ turnId: 1, con
 
 /**
  * A store that fails the writes moving a `running` job on (an outcome, a recovery, a cancel of a running job) while
- * `faults.running` is above 0 (each failure counts it down; `Infinity`: always), with `StoreError` `busy`.
+ * `faults.running` is above 0 (each failure counts it down; `Infinity`: always), with `StoreError` `busy`; and the reads
+ * of the scheduler's jobs outside a transaction (`list`: the Health issues, the recovery rule, the admin list) while
+ * `faults.reads` is above 0 (counted in `faults.readsFailed`).
  */
 export const faultyStore = (inner: HouseholdStore) => {
-  const faults = { running: 0, failed: 0 }
+  const faults = { running: 0, failed: 0, reads: 0, readsFailed: 0 }
   const wrap = (htx: HostTx): HostTx => ({
     ...htx,
     forCore: (owner) => {
@@ -121,7 +126,28 @@ export const faultyStore = (inner: HouseholdStore) => {
       }
     }
   })
-  const store: HouseholdStore = { ...inner, transaction: (f) => inner.transaction((htx) => f(wrap(htx))) }
+  const forCore: HouseholdStore["forCore"] = (owner) => {
+    const own = inner.forCore(owner)
+    if (owner !== SCHEDULER_OWNER) return own
+    return {
+      ...own,
+      collection: (c) => {
+        const col = own.collection(c)
+        if (c.name !== jobs.name) return col
+        return {
+          ...col,
+          list: (query) =>
+            Effect.suspend(() => {
+              if (faults.reads <= 0) return col.list(query)
+              faults.reads--
+              faults.readsFailed++
+              return Effect.fail(new StoreError({ reason: "busy", message: "injected: a read failed" }))
+            })
+        }
+      }
+    }
+  }
+  const store: HouseholdStore = { ...inner, forCore, transaction: (f) => inner.transaction((htx) => f(wrap(htx))) }
   return { store, faults }
 }
 
@@ -148,6 +174,8 @@ const hostOn = (store: HouseholdStore, catalog: ReadonlyArray<ModuleDefinition<a
   makeModuleHost({ catalog, persistence: readOnlyPersistence(), env: {}, household: { store, events: makeEventBus() }, scheduler: engine, graceMs: 0, ...options })
 
 const issueIds = (issues: IssueRegistry) => issues.all().map((i) => i.id)
+/** The Health issue shown, besides the newest `MAX_JOB_ISSUES` failures, when there are more (it gives no number). */
+const MORE_FAILED_TITLE = "More scheduled jobs have failed than are listed here"
 
 export const schedulerContract = (name: string, open: OpenStore) =>
   describe(`Scheduler contract: ${name}`, () => {
@@ -1069,7 +1097,7 @@ export const schedulerContract = (name: string, open: OpenStore) =>
         assert.isUndefined(yield* core.get(fresh.id))
       }))
 
-    it.effect("Health issues: the 48 newest failures by failure time, and an issue saying how many only when there are more", () =>
+    it.effect("Health issues: the 48 newest failures by failure time, and one issue saying there are more (no number) only when there are", () =>
       Effect.gen(function*() {
         for (const n of [MAX_JOB_ISSUES - 1, MAX_JOB_ISSUES, MAX_JOB_ISSUES + 1, MAX_JOB_ISSUES + 12]) {
           const opened = yield* open()
@@ -1089,7 +1117,10 @@ export const schedulerContract = (name: string, open: OpenStore) =>
           const more = issues.all().find((i) => i.id === "core.scheduler.failed.more")
           assert.deepStrictEqual(ids.filter((id) => id !== "core.scheduler.failed.more").sort(), newest.sort(), `${n}`)
           if (n <= MAX_JOB_ISSUES) assert.isUndefined(more, `${n}`)
-          else assert.strictEqual(more?.title, `${n} scheduled jobs have failed`)
+          else {
+            assert.strictEqual(more?.title, MORE_FAILED_TITLE, `${n}`)
+            assert.strictEqual(more?.fix?.value, "#settings/diagnostics/scheduled")
+          }
           // Dismissing one: the next newest takes its place, and the number follows at once.
           assert.isTrue(yield* core.cancel("job_f000"))
           yield* advance(0)
@@ -1098,7 +1129,7 @@ export const schedulerContract = (name: string, open: OpenStore) =>
           if (n > MAX_JOB_ISSUES) assert.include(after, `core.scheduler.failed.job_f${String(MAX_JOB_ISSUES).padStart(3, "0")}`)
           const left = issues.all().find((i) => i.id === "core.scheduler.failed.more")
           if (n - 1 <= MAX_JOB_ISSUES) assert.isUndefined(left, `${n} - 1`)
-          else assert.strictEqual(left?.title, `${n - 1} scheduled jobs have failed`)
+          else assert.strictEqual(left?.title, MORE_FAILED_TITLE, `${n} - 1`)
         }
       }))
 
@@ -1502,6 +1533,122 @@ export const schedulerContract = (name: string, open: OpenStore) =>
         yield* advance(10 * SECOND)
         assert.deepStrictEqual(started.slice(2), [["b", 10 * SECOND], ["a", 10 * SECOND]])
         assert.strictEqual(engine.runsInFlight(), 2)
+      }))
+
+    it.effect("a pass is one round: a job that becomes due, and a handler published, while a quick handler keeps a backlog each run within two passes", () =>
+      Effect.gen(function*() {
+        let passes = 0
+        const { advance, engine } = yield* setup({ maxRuns: 100, maintenanceMs: DAY, observe: (e) => void (e.kind === "pass" && passes++) })
+        const a = engine.forCore("core.a")
+        const b = engine.forCore("core.b")
+        const c = engine.forCore("core.c")
+        // When something became runnable and when it ran: A's runs so far, and the passes so far.
+        const marks: Record<string, { readonly aRuns: number; readonly passes: number }> = {}
+        const mark = (what: string) => void (marks[what] = { aRuns, passes })
+        let aRuns = 0
+        const cScope = yield* Scope.fork(yield* Effect.scope)
+        yield* coreHandler(b, "work", { payload: Schema.Unknown, run: () => Effect.sync(() => mark("b ran")) })
+        // C's job waits for C's handler, which A's sixth run publishes.
+        yield* c.schedule({ handler: "work", inMs: 0 })
+        // A is quick: every run schedules its successor at once (inMs 0), and a few are due from the start, so A always
+        // has a due job (its backlog never runs dry, however its runs and the loop interleave) for 60 runs.
+        yield* coreHandler(a, "work", {
+          payload: Schema.Unknown,
+          run: () =>
+            Effect.gen(function*() {
+              aRuns++
+              if (aRuns === 3) {
+                yield* b.schedule({ handler: "work", inMs: 0 })
+                mark("b due")
+              }
+              if (aRuns === 6) {
+                yield* Scope.provide(cScope)(c.handle("work", { payload: Schema.Unknown, run: () => Effect.sync(() => mark("c ran")) }))
+                mark("c published")
+              }
+              if (aRuns < 60) yield* a.schedule({ handler: "work", inMs: 0 })
+            })
+        })
+        for (let i = 0; i < 3; i++) yield* a.schedule({ handler: "work", inMs: 0 })
+        yield* advance(0)
+        assert.isAtLeast(aRuns, 60)
+        for (const [due, ran] of [["b due", "b ran"], ["c published", "c ran"]] as const) {
+          assert.isDefined(marks[ran], ran)
+          // A pass takes at most one job of A: within two passes, A ran at most twice more.
+          assert.isAtMost(marks[ran]!.aRuns - marks[due]!.aRuns, 2, `${ran}: A's runs since ${due}`)
+          assert.isAtMost(marks[ran]!.passes - marks[due]!.passes, 2, `${ran}: passes since ${due}`)
+        }
+      }))
+
+    it.effect("a prepared job kept across a restart of its module is refused with ModuleStopped, even in a live transaction of the new part", () =>
+      Effect.gen(function*() {
+        const opened = yield* open()
+        const store = yield* prepared(opened.store, [{ id: "kit", storage: { collections: [notes] } }])
+        const { advance, engine } = yield* engineOn(store)
+        const held: { scheduler?: ModuleScheduler; store?: unknown } = {}
+        const r = recorder()
+        const kit = kitModule("kit", (s) => s.handle("ring", { payload: Schema.Unknown, run: r.run }), held)
+        const host = yield* hostOn(store, [kit], engine)
+        yield* host.startEnabled
+        const live = yield* held.scheduler!.schedule({ handler: "ring", key: "pasta", inMs: MINUTE })
+        const kept = yield* held.scheduler!.prepare({ handler: "ring", key: "pasta", inMs: SECOND })
+        yield* host.disable("kit")
+        yield* host.enable("kit")
+        const now = held.store as ModuleStore
+        const exit = yield* Effect.exit(now.transaction((tx) => {
+          tx.collection(notes).insert({ text: "with the old job" })
+          kept.writeIn(tx)
+        }))
+        assert.isTrue(Exit.isFailure(exit) && isModuleStopped(Cause.squash(exit.cause)))
+        // Nothing was written: not the job, not the note; the key's live job is still the one of before.
+        assert.isUndefined(yield* held.scheduler!.get(kept.id))
+        assert.strictEqual((yield* now.collection(notes).list()).length, 0)
+        assert.deepStrictEqual((yield* held.scheduler!.list({ key: "pasta" })).map((j) => [j.id, j.state]), [[live.id, "scheduled"]])
+        // A job the new part prepares is written as before.
+        const fresh = yield* held.scheduler!.prepare({ handler: "ring", inMs: SECOND })
+        yield* now.transaction((tx) => void fresh.writeIn(tx))
+        yield* advance(2 * SECOND)
+        assert.deepStrictEqual(r.calls.map((call) => call.due.jobId), [fresh.id])
+      }))
+
+    it.effect("a Health read that fails is tried again by the loop's back-off: a failed job shows, and a cancelled one goes, without maintenance", () =>
+      Effect.gen(function*() {
+        const opened = yield* open()
+        const { faults, store } = faultyStore(yield* prepared(opened.store))
+        const { advance, engine, issues } = yield* engineOn(store, { maintenanceMs: DAY })
+        const core = engine.forCore("core.test")
+        yield* core.handle("bad", { payload: Schema.Unknown, run: () => Effect.fail(new Error("no")) })
+        yield* advance(0)
+        const job = yield* core.schedule({ handler: "bad", inMs: SECOND })
+        faults.reads = 1
+        yield* advance(SECOND)
+        assert.strictEqual((yield* core.get(job.id))?.state, "failed")
+        assert.strictEqual(faults.readsFailed, 1)
+        // Read again after the loop's back-off (5 s; or sooner, when something wakes the loop), not at maintenance.
+        yield* advance(5 * SECOND)
+        assert.include(issueIds(issues), `core.scheduler.failed.${job.id}`)
+        faults.reads = 1
+        assert.isTrue(yield* core.cancel(job.id))
+        yield* advance(0)
+        assert.strictEqual(faults.readsFailed, 2)
+        yield* advance(5 * SECOND)
+        assert.notInclude(issueIds(issues), `core.scheduler.failed.${job.id}`)
+      }))
+
+    it.effect("the contract's helpers: an engine and a core handler made in a case are closed with the case's scope", () =>
+      Effect.gen(function*() {
+        const opened = yield* open()
+        const store = yield* prepared(opened.store)
+        const caseScope = yield* Scope.fork(yield* Effect.scope)
+        let interrupted = 0
+        const { advance, engine } = yield* Scope.provide(caseScope)(engineOn(store))
+        const core = engine.forCore("core.test")
+        yield* Scope.provide(caseScope)(coreHandler(core, "hold", { payload: Schema.Unknown, run: () => Effect.never.pipe(Effect.onInterrupt(() => Effect.sync(() => void interrupted++))) }))
+        yield* core.schedule({ handler: "hold", inMs: 0 })
+        yield* advance(0)
+        assert.strictEqual(engine.runsInFlight(), 1)
+        yield* Scope.close(caseScope, Exit.void)
+        assert.strictEqual(interrupted, 1)
+        assert.strictEqual(engine.runsInFlight(), 0)
       }))
 
     it.effect("closing the engine interrupts every run, a core handler's too; closing a handler's registration interrupts its runs", () =>

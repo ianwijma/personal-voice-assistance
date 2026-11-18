@@ -43,7 +43,7 @@ import { type ExecutionGateway, type GatewayAccess, type GatewayOptions, isGatew
 import { sealAction, sealTool } from "./GatewayPrivate.ts"
 import { makeIssueRegistry, type IssueRegistry, wireSafeIssue } from "./Issues.ts"
 import { type EventBus, hostEvent, makeEventBus, type ModuleEvents, type SubscriptionGate } from "./EventBus.ts"
-import { type Collection, type CollectionHandle, type HouseholdStore, makeClosedStore, type ModuleStore } from "./HouseholdStore.ts"
+import { type Collection, type CollectionHandle, type HouseholdStore, makeClosedStore, type ModuleStore, type StoreTx } from "./HouseholdStore.ts"
 import { type AssistantModule, type ContextProvider, metadataProblem, type Tool, toolMetadata } from "./Module.ts"
 import {
   type ActionCatalogue,
@@ -2910,15 +2910,24 @@ export const makeModuleHost = Effect.fnUntraced(function*(options: ModuleHostOpt
       store: storeFor(entry, effect),
       events: eventsFor(entry, part, effect),
       // P6: the part's scheduler; like the store handle, every call dies with `ModuleStopped` once the part has closed.
-      scheduler: schedulerFor(options.scheduler === undefined ? NO_SCHEDULER : options.scheduler.forPart(part.handle, runnerFor(entry, part)), effect)
+      scheduler: schedulerFor(options.scheduler === undefined ? NO_SCHEDULER : options.scheduler.forPart(part.handle, runnerFor(entry, part)), effect, now)
     }
   }
 
-  function schedulerFor(s: ModuleScheduler, effect: <A, E = never>(f: () => Effect.Effect<A, E>) => Effect.Effect<A, E>): ModuleScheduler {
+  /**
+   * The part's scheduler, every call guarded by the part's lifetime. A prepared job's `writeIn` is synchronous, so it
+   * takes the synchronous guard (`now`) before the scheduler writes anything: a job prepared by a part that has closed
+   * is refused with `ModuleStopped`, even inside a live transaction of the module's next part.
+   */
+  function schedulerFor(
+    s: ModuleScheduler,
+    effect: <A, E = never>(f: () => Effect.Effect<A, E>) => Effect.Effect<A, E>,
+    now: <A>(f: () => A) => A
+  ): ModuleScheduler {
     return {
       handle: (name, handler) => effect(() => s.handle(name, handler)),
       schedule: (request) => effect(() => s.schedule(request)),
-      prepare: (request) => effect(() => s.prepare(request)),
+      prepare: (request) => effect(() => Effect.map(s.prepare(request), (job) => ({ id: job.id, dueAt: job.dueAt, writeIn: (tx: StoreTx) => now(() => job.writeIn(tx)) }))),
       cancel: (target) => effect(() => s.cancel(target)),
       reschedule: (id, when) => effect(() => s.reschedule(id, when)),
       get: (id) => effect(() => s.get(id)),

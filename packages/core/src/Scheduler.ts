@@ -208,7 +208,8 @@ export interface PreparedJob {
    * transaction as it was: `StoreError` `invalid` for `MAX_LIVE_JOBS`, for a prepared job written already and for a
    * handle used outside its function (it may be caught to commit the rest). Any other failure is the store's, in the
    * middle of the job's writes: it must not be caught to go on with the same transaction (docs/SCHEDULING.md "Inside
-   * your own transaction"). Write a prepared job once.
+   * your own transaction"). Write a prepared job once. Like every call of `ctx.scheduler`, it dies with `ModuleStopped`
+   * once the part that prepared it has closed (before anything is written), even inside a transaction of the next part.
    */
   readonly writeIn: (tx: StoreTx) => JobRow
 }
