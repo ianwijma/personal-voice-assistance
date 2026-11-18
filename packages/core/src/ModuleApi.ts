@@ -416,12 +416,17 @@ export interface ModuleServicesV2 {
 export interface SharedContext<A> extends ModuleServicesV2 {
   readonly settings: Partial<A>
   /**
-   * The module's effective settings for an assistant, from the desired state this module was started with: the
-   * assistant's own values of `overridable` fields over the shared ones; with no assistant (or one that does not have
-   * the module on), the shared ones. A change of either restarts the module, so the answer is always that of the
-   * settings it runs with. Shared code that acts for a caller asks with the caller's assistant (`CurrentTurn`), so a
-   * weather briefing uses the asking assistant's place. `undefined` when those values are not valid (a required field
-   * with no value for that assistant). Throws `ModuleStopped` once the module has stopped.
+   * The module's effective settings for an assistant: the assistant's own values of `overridable` fields over the
+   * shared ones; with no assistant (or one that does not have the module on), the shared ones. It answers from the
+   * latest accepted state of the run: who has the module on, their own values, the saved values and the defaults as
+   * of the last change that kept the run, with the secrets the run started with. Changes that keep the run do not
+   * restart the module: an assistant that joins or leaves an existing instance, assistants that swap between equal
+   * instances, a changed default or saved value of an `overridable` field that no running instance uses (the module
+   * runs only for `uses`, or every assistant that has it on has its own value). So ask
+   * each time; do not cache what it answers on the assumption that every relevant change restarts the module.
+   * Shared code that acts for a caller asks with the caller's assistant (`CurrentTurn`), so a weather briefing uses
+   * the asking assistant's place. `undefined` when those values are not valid (a required field with no value for
+   * that assistant). Throws `ModuleStopped` once the module has stopped.
    */
   readonly settingsFor: (assistantId: string | undefined) => A | undefined
 }
