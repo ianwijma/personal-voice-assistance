@@ -3,6 +3,7 @@
 import { Effect, Schema } from "effect"
 import { makeTool } from "../../src/Module.ts"
 import { defineModule } from "../../src/ModuleDefinition.ts"
+import { Setting } from "../../src/Settings.ts"
 import type { ActionPress, ModuleNotify, ModuleSpeech, SpeechTarget } from "../../src/Notify.ts"
 import { notifyLanguageOf, notifyRefusalText } from "../../src/NotifyTexts.ts"
 
@@ -26,6 +27,8 @@ export const makeBell = (options: { readonly handler?: boolean } = {}) => {
     name: "Bell",
     description: "Rings a bell and says things.",
     enabledByDefault: false,
+    // A secret, so a test can see that what the module says passes the page boundary.
+    settings: { token: Setting.secret({ label: "Token" }) },
     shared: (ctx) =>
       Effect.gen(function*() {
         parts.notify = ctx.notify

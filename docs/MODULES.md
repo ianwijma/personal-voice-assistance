@@ -1335,22 +1335,31 @@ export const kettleModule = defineModule({
   enabledByDefault: false,
   shared: (ctx) =>
     Effect.gen(function*() {
+      // The service sends now. A notification for later is a job of the module's own, which sends from its handler
+      // (with the origin of the turn that scheduled it: it rings on the device that asked).
+      yield* ctx.scheduler.handle("boiled", {
+        payload: Schema.Struct({}),
+        run: () => {
+          const lang = homeLanguage(ctx.host.view())
+          return Effect.asVoid(ctx.notify.send({
+            title: say(kettleTexts, lang, "done"),
+            priority: "ring",
+            key: "kettle",
+            actions: [{ id: "snooze", label: say(kettleTexts, lang, "snooze") }],
+            handler: "kettle"
+          }))
+        }
+      }).pipe(Effect.orDie)
       // An action handler is registered in `shared`, like a job handler: published and withdrawn with the module.
-      // While the module is down, its actions answer "I can't do that right now"; `stop` always works.
+      // While the module is down, its actions answer "I can't do that right now"; `stop` always works. It runs as the
+      // press (its device is the origin), after the press claimed the notification; it may run again for the same
+      // notification after a store failure, so it does nothing twice (the job's key replaces an earlier one).
       yield* ctx.notify.handle("kettle", {
         run: (press) =>
           Effect.gen(function*() {
             const lang = homeLanguage(ctx.host.view())
-            // Runs as the press (its device is the origin). This one ends now, so its key is free for the next.
-            yield* ctx.notify.resolve(press.notificationId, "snooze")
-            yield* ctx.notify.send({
-              title: say(kettleTexts, lang, "done"),
-              priority: "ring",
-              key: "kettle",
-              inMs: 5 * 60_000,
-              actions: [{ id: "snooze", label: say(kettleTexts, lang, "snooze") }],
-              handler: "kettle"
-            })
+            // A job takes a turn's or a job's origin by itself, not a press's: name the device it rings on again.
+            yield* ctx.scheduler.schedule({ handler: "boiled", key: "kettle", inMs: 5 * 60_000, origin: { deviceId: press.deviceId } })
             return { say: say(kettleTexts, lang, "snoozed") }
           }).pipe(Effect.orElseSucceed(() => ({ say: say(kettleTexts, homeLanguage(ctx.host.view()), "failed"), keepOpen: true })))
       }).pipe(Effect.orDie)
@@ -1366,20 +1375,13 @@ export const kettleModule = defineModule({
         execute: () =>
           Effect.gen(function*() {
             const lang = homeLanguage(ctx.host.view())
-            // One transaction and an enqueue: fine on a turn. Sent later by the service's own scheduler job.
-            yield* ctx.notify.send({
-              title: say(kettleTexts, lang, "done"),
-              priority: "ring",
-              key: "kettle",
-              inMs: 3 * 60_000,
-              actions: [{ id: "snooze", label: say(kettleTexts, lang, "snooze") }],
-              handler: "kettle"
-            })
+            // The module's own job (one transaction): fine on a turn.
+            yield* ctx.scheduler.schedule({ handler: "boiled", key: "kettle", inMs: 3 * 60_000 })
             // An announcement in the room, after whatever is being said there. Inside a turn, never wait for `done`.
             yield* ctx.speech.say({ room: "Kitchen" }, say(kettleTexts, lang, "started"), { cue: true })
             return { spoken: say(kettleTexts, lang, "started") }
           }).pipe(
-            Effect.catchTag("NotifyError", () => Effect.succeed({ spoken: say(kettleTexts, homeLanguage(ctx.host.view()), "failed") })),
+            Effect.catchTag("SchedulerError", () => Effect.succeed({ spoken: say(kettleTexts, homeLanguage(ctx.host.view()), "failed") })),
             // No device in the kitchen, or none that may speak: the ring still comes.
             Effect.catchTag("SpeechError", () => Effect.succeed({ spoken: say(kettleTexts, homeLanguage(ctx.host.view()), "started") }))
           )

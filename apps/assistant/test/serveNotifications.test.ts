@@ -50,7 +50,7 @@ describe("notifications in serve mode", () => {
     const sent = await run(notify!.send({ title: "Pasta timer", text: "Ten minutes are up.", priority: "ring", target: "everywhere", actions: [{ id: "snooze", label: "Snooze" }], handler: "answer" }))
     const id = sent.notification.id
     const ring = await kitchen.waitFor("notification.ring", (m) => m.notification.id === id)
-    expect(ring.notification).toMatchObject({ title: "Pasta timer", text: "Ten minutes are up.", priority: "ring", silent: false, actions: [{ id: "stop", label: "Stop" }, { id: "snooze", label: "Snooze" }] })
+    expect(ring.notification).toMatchObject({ title: "Pasta timer", text: "Ten minutes are up.", priority: "ring", show: true, sound: true, actions: [{ id: "stop", label: "Stop" }, { id: "snooze", label: "Snooze" }] })
     await study.waitFor("notification.ring", (m) => m.notification.id === id)
     // A second page of the kitchen says hello while it rings: it gets the ring too.
     const kitchen2 = await ScriptedClient.connect({ url: server.url, deviceId: "kitchen-0001" })
