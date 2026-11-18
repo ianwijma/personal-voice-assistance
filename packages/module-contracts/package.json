@@ -19,6 +19,7 @@
     "@pva/language": "workspace:*",
     "@pva/net": "workspace:*",
     "@types/node": "catalog:",
+    "linkedom": "catalog:",
     "typescript": "catalog:",
     "vitest": "catalog:"
   }
