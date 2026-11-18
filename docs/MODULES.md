@@ -863,7 +863,8 @@ it.effect("serves fixtures, fails every other host, and keeps the owner's LAN fo
 ```
 
 Everything that comes back (a page, a feed, an invitation's text) is untrusted data: pass it to the model marked as such,
-cut to a bound, never as instructions.
+cut to a bound, never as instructions. Parsing it with a library is not done on the main thread: §15, "Parsing off the
+main thread".
 
 ## 13. Services and contributions between modules
 
@@ -971,8 +972,8 @@ breaks the runtime's rules. So:
 - **Stop when interrupted.** A turn is cut off by barge-in all the time; a stop gives your calls 10 s, then interrupts
   them. Never make long work uninterruptible; wait with `Effect.sleep`, never a busy loop; pass the `AbortSignal` on.
 - **Never block the event loop.** It also frames audio for every browser. No unbounded synchronous work: parse and
-  evaluate with bounds (an expression evaluator with limits on size and depth, or a worker stopped at a deadline; a
-  length limit alone does not bound a synchronous evaluator), keep transactions small, cut large inputs first.
+  evaluate with bounds (an expression evaluator with limits on size and depth, or `offThread`, §15; a length limit
+  alone does not bound a synchronous evaluator), keep transactions small, cut large inputs first.
 - **Finite cleanup.** Finalizers finish in 5 s (past that the host abandons them and says so on the Health page).
 - **Do not hand the host objects whose properties throw or change**, do not go around the gateway (sealed tools are not
   a security boundary, but going around them is a bug), and keep nothing of the host after your part closed.
@@ -994,6 +995,124 @@ Nothing slow on the turn path; a claim about latency needs `TurnTrace` numbers, 
   tool is a fraction of a millisecond. A risk function has 2 ms; an action 5 s (§10).
 - Slow work (a feed refresh, a calendar refresh) is a job or a fiber in `shared` that keeps a cache; the turn reads the
   cache.
+
+### Parsing off the main thread: `offThread`
+
+The main thread plays and listens to audio for every device: nothing may hold it for more than about 10 ms. Parsing
+text from outside with a library is far slower and cannot be sliced (measured on the development machine: a web page
+into text 50 to 200 ms, much longer for a deeply nested one; a 1 MB RSS feed 52 to 75 ms; an article extraction 59 to
+91 ms; a spelling dictionary 400 ms). **Any parsing or computing on text from outside that could take more than a few
+milliseconds** (pages, feeds, calendars, documents, dictionaries) runs through `offThread` from `@pva/core`: a pure
+function in a fresh worker thread, started for the call and terminated after it.
+
+- **The task module** is a file of your own package (`src/<name>.task.ts`) that default-exports one function
+  `(input) => output` or a promise of it, and imports what it needs (the libraries are your package's dependencies).
+  Input and output are plain data the structured clone carries: strings, numbers, booleans, arrays, plain objects,
+  `Uint8Array`. Name it once with `offThreadTask`, with its type, so nothing of it is loaded on the main thread.
+- **The call**: `offThread(task, input, { timeoutMs, maxMemoryMb, maxResultBytes })`. `timeoutMs` is required (at most
+  60 s) and counts from the call, also while it waits: at most two workers run at once in the process, later calls
+  wait in turn. `maxMemoryMb` is the worker's heap (default 128, at most 1,024); `maxResultBytes` the largest answer
+  (default 1 MiB, at most 16 MiB). It is an Effect: call it from a tool, a job or a part's start. Interrupting it
+  (barge-in, the module stopping) terminates the worker, whatever it is doing. The limit is real time, so it holds
+  under the test kit's clock too.
+- **Each failure is an `OffThreadError`** with a `reason`, and a one-line `message` for the log that names the task and
+  never quotes the input:
+
+  | `reason` | What happened | What the person hears |
+  |---|---|---|
+  | `timeout` | the time limit passed; the worker was terminated | it took too long to read |
+  | `memory` | the worker ran out of `maxMemoryMb` | it could not be read |
+  | `too-large` | the answer was over `maxResultBytes` | it could not be read (or: it is too long) |
+  | `failed` | the task threw or rejected (a stack overflow too), or its answer cannot be cloned | it could not be read |
+  | `exited` | the worker ended without answering | it could not be read |
+  | `load` | the task module is missing or has no default function: a bug of the module | it could not be read |
+
+- **Not**: no state shared between calls (each call is a fresh thread: a global set in one call is gone in the next),
+  no network and no store from the task (fetch first, store after, on the main thread), no secrets in the input
+  unless the task needs them (the worker gets none of the server's environment either). Never from a context provider
+  or anywhere else on the turn path: the start-up cost below is more than a context provider's 50 ms.
+- **Start-up cost, paid on every call by design** (`packages/core/test/OffThread.test.ts` prints it; the median of 5
+  calls on the development machine): the thread alone 28 ms; a TypeScript task without imports 111 ms (tsx's loader
+  is started in each worker, so a `.ts` task loads the same under tsx, vitest and plain node); a task importing
+  `linkedom` 232 ms; one importing `feedsmith` 230 ms. Add it to the tool's `latency` (a tool that parses a page is
+  `slow`). The main thread's own share is small: starting a worker, posting 1 MiB in and receiving 100 KiB holds it
+  1.8 ms at most; a task that loops forever ends 4 ms after its time limit.
+
+<!-- region: packages/module-contracts/test/kit/pageText.task.ts#offthread-task -->
+```ts
+// pageText.task.ts: a page from outside read into text. One pure function, plain data in and out; nothing shared,
+// no network, no store. It runs in a fresh worker thread for each call (offThread in the module).
+import { parseHTML } from "linkedom"
+
+export default (html: string): string => {
+  const { document } = parseHTML(html)
+  for (const node of document.querySelectorAll("script, style, noscript")) node.remove()
+  return (document.body?.textContent ?? "").replace(/\s+/g, " ").trim()
+}
+```
+
+<!-- region: packages/module-contracts/test/kit/offThread.test.ts#offthread-module -->
+```ts
+/** The task, named once: its file beside this one, and its default export's type (no import on the main thread). */
+const pageText = offThreadTask<typeof import("./pageText.task.ts").default>(new URL("./pageText.task.ts", import.meta.url))
+
+const pageTexts = defineTexts({
+  en: { slow: "That page took too long to read.", unreadable: "I couldn't read that page." },
+  nl: { slow: "Het lezen van die pagina duurde te lang.", unreadable: "Ik kon die pagina niet lezen." }
+})
+
+/** What the person hears when the parse failed: a page too slow to read, or one that cannot be read at all. */
+const pageFailure = (lang: "en" | "nl", e: OffThreadError) => say(pageTexts, lang, e.reason === "timeout" ? "slow" : "unreadable")
+
+export const readerModule = (deps: NetDeps) =>
+  defineModule({
+    apiVersion: 2,
+    id: "reader",
+    name: "Reader",
+    description: "Reads a web page.",
+    enabledByDefault: false,
+    requires: [{ network: "internet", why: "fetches the page asked for" }],
+    start: (ctx) =>
+      Effect.succeed({
+        tools: [makeTool({
+          name: "reader_read_page",
+          description: "Read the text of a web page.",
+          parameters: Schema.Struct({ url: Schema.String }),
+          risk: "read",
+          latency: "slow",
+          execute: ({ url }) => {
+            const lang = homeLanguage(ctx.host.view())
+            return safeFetch(url, { accept: contentTypes.webPage, maxBytes: 2 * 1024 * 1024, timeoutMs: 6_000, ...deps }).pipe(
+              // The parse runs in a worker: the main thread only posts the page and receives the text.
+              Effect.flatMap((response) => offThread(pageText, response.text(), { timeoutMs: 3_000, maxResultBytes: 128 * 1024 })),
+              Effect.map((text) => `Untrusted page text: ${text}`),
+              Effect.catchTag("OffThreadError", (e) => Effect.succeed(pageFailure(lang, e))),
+              // The fetch's own failures (refused, too large, too slow, a bad status): the page could not be read.
+              Effect.catch(() => Effect.succeed(say(pageTexts, lang, "unreadable")))
+            )
+          }
+        })]
+      })
+  })
+```
+
+Its test starts real workers; `offThreadWorkers()` in `@pva/core/testing` says how many are running:
+
+<!-- region: packages/module-contracts/test/kit/offThread.test.ts#offthread-test -->
+```ts
+const page = "<html><head><script>track()</script></head><body>\n<h1>Bins</h1>\n<p>Paper goes out on Tuesday.</p></body></html>"
+const net = makeOfflineNet({
+  "https://example.org/bins": { body: page, headers: { "content-type": "text/html" } },
+  "https://example.org/huge": { body: `<html><body><p>${"word ".repeat(100_000)}</p></body></html>`, headers: { "content-type": "text/html" } }
+})
+const on = yield* startTestModule(readerModule({ resolver: net.resolver, connector: net.connector }))
+// A real worker runs the task, in tests as in the app (its time limit is real time, not the kit's clock).
+assert.strictEqual((yield* on.tool("reader_read_page", { url: "https://example.org/bins" })).value, "Untrusted page text: Bins Paper goes out on Tuesday.")
+// Text over the result limit is a typed failure (`too-large`), which the module words itself.
+assert.strictEqual((yield* on.tool("reader_read_page", { url: "https://example.org/huge" })).value, "I couldn't read that page.")
+// Every worker has ended.
+assert.strictEqual(offThreadWorkers().running, 0)
+```
 
 ## 16. Speaking
 

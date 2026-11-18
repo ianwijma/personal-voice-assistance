@@ -38,6 +38,20 @@ export * from "./PendingIntents.ts"
 export * from "./People.ts"
 export * from "./Privacy.ts"
 export * from "./PromptText.ts"
+export {
+  OFF_THREAD_CONCURRENCY,
+  OFF_THREAD_DEFAULT_MEMORY_MB,
+  OFF_THREAD_DEFAULT_RESULT_BYTES,
+  OFF_THREAD_MAX_MEMORY_MB,
+  OFF_THREAD_MAX_RESULT_BYTES,
+  OFF_THREAD_MAX_TIMEOUT_MS,
+  offThread,
+  OffThreadError,
+  type OffThreadOptions,
+  OffThreadReason,
+  type OffThreadTask,
+  offThreadTask
+} from "./OffThread.ts"
 export * from "./Resample.ts"
 export * from "./Routing.ts"
 export * from "./Scheduler.ts"
