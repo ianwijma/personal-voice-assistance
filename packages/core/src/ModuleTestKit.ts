@@ -27,11 +27,11 @@ import {
   type SettingsPatch,
   type SettingValue
 } from "@pva/protocol"
-import { Clock, Effect, Exit, Fiber, type Schema, Scope } from "effect"
+import { Clock, Deferred, Effect, Exit, Fiber, type Schema, Scope } from "effect"
 import { TestClock } from "effect/testing"
 import type { ActionRunResult, ContributionKey, ModuleHostApi, ProvidedContribution, ProvidedService, ServiceKey } from "./ModuleApi.ts"
 import { type KnownDevice, Devices, makeDevices } from "./Devices.ts"
-import type { HouseholdStore, ModuleStore } from "./HouseholdStore.ts"
+import type { HouseholdStore, ModuleStore, Row } from "./HouseholdStore.ts"
 import { defineModule, type ModuleDefinition } from "./ModuleDefinition.ts"
 import { makeModuleHost, type ModuleHost, readOnlyPersistence } from "./ModuleHost.ts"
 import type { Registrar, StartedPart } from "./ModuleRegistrations.ts"
@@ -48,6 +48,9 @@ import { makeIssueRegistry } from "./Issues.ts"
 import { makeMemoryHouseholdStore } from "./MemoryHouseholdStore.ts"
 import { makeSchedulerEngine } from "./SchedulerEngine.ts"
 import { schedulerStorage } from "./SchedulerJobs.ts"
+import { type DndState, type Notification, notifications as notificationRows, NOTIFY_OWNER, notifyStorage, type PressAnswer, type StoredNotification } from "./Notify.ts"
+import { type DecisionRecord, makeNotifyEngine, notificationView, type NotifyMessage, type SpeechPort } from "./NotifyEngine.ts"
+import { notifyLanguageOf } from "./NotifyTexts.ts"
 
 // ---------------------------------------------------------------------------------------------------------------------
 // The household
@@ -274,6 +277,15 @@ export type SchedulerUse =
   | { readonly kind: "scheduled"; readonly moduleId: string; readonly call: "schedule" | "prepare"; readonly handler: string; readonly payload: unknown }
   | { readonly kind: "refused"; readonly moduleId: string; readonly call: "schedule" | "prepare" | "reschedule"; readonly reason: string; readonly message: string }
 
+/** One announcement the kit's speech played: where, what, when it started, and how it ended (absent: still playing). */
+export interface KitAnnouncement {
+  readonly deviceId: string
+  readonly text: string
+  readonly cue: boolean
+  readonly startedAt: number
+  readonly outcome?: "spoken" | "stopped"
+}
+
 /** A JSON copy of a payload as the scheduler stores it (an absent payload is `{}`). */
 const storedForm = (payload: unknown): unknown => {
   if (payload === undefined) return {}
@@ -437,6 +449,8 @@ export interface StartTestModuleOptions {
   /** Extra registrars (`ModuleHostOptions.registrars`), for the conformance check. */
   readonly registrars?: ReadonlyArray<Registrar>
   readonly graceMs?: number
+  /** P9: how long one announcement takes to play on the kit's speech (test-clock ms). Default 2,000. */
+  readonly speechMs?: number
 }
 
 export const DEFAULT_TEST_START = Date.UTC(2026, 10, 18, 9, 0, 0)
@@ -498,7 +512,7 @@ export const startTestModule = (definition: ModuleDefinition<any>, options: Star
     )
     // The household store and bus, and the scheduler engine, exactly as makeTestHousehold and makeTestScheduler make them.
     const store: HouseholdStore = makeMemoryHouseholdStore()
-    yield* store.prepare(catalog.map((m) => ({ id: m.id, storage: m.storage })), [schedulerStorage]).pipe(Effect.orDie)
+    yield* store.prepare(catalog.map((m) => ({ id: m.id, storage: m.storage })), [schedulerStorage, notifyStorage]).pipe(Effect.orDie)
     const events: Array<HouseholdEvent> = []
     const recording = { bus: makeEventBus({ observe: (event) => void events.push(event) }), events }
     connectStoreToBus(store, recording.bus)
@@ -513,6 +527,50 @@ export const startTestModule = (definition: ModuleDefinition<any>, options: Star
       pageText: (moduleId, text, max) => hostRef?.pageText(moduleId, text, max) ?? String(text).slice(0, max)
     }).pipe(Scope.provide(lifetime))
     const schedulerUses: Array<SchedulerUse> = []
+
+    // P9: the real notification service on the same store, clock and gateway; pages and voices are recorders.
+    const connectedNow = new Set(deviceList.filter((d) => d.connected !== false).map((d) => d.id))
+    const declaredOf = new Map(deviceList.map((d) => [d.id, d.capabilities] as const))
+    const pageMessages: Array<{ readonly deviceId: string; readonly message: NotifyMessage }> = []
+    const decisions: Array<DecisionRecord> = []
+    const announced: Array<KitAnnouncement> = []
+    const replying = new Map<string, Deferred.Deferred<void>>()
+    const speechMs = options.speechMs ?? 2_000
+    const speech: SpeechPort = {
+      quiet: (deviceId) => Effect.suspend(() => {
+        const d = replying.get(deviceId)
+        return d === undefined ? Effect.void : Deferred.await(d)
+      }),
+      play: (deviceId, text, o) =>
+        Effect.gen(function*() {
+          const record: { -readonly [K in keyof KitAnnouncement]: KitAnnouncement[K] } = { deviceId, text, cue: o.cue, startedAt: yield* Clock.currentTimeMillis }
+          announced.push(record)
+          yield* Effect.sleep(speechMs).pipe(Effect.onInterrupt(() => Effect.sync(() => void (record.outcome = "stopped"))))
+          record.outcome = "spoken"
+        })
+    }
+    const notify = yield* makeNotifyEngine({
+      store,
+      scheduler: engine,
+      devices: () => people.devices.list(),
+      connected: (deviceId) => connectedNow.has(deviceId),
+      // A kit device judged by the capabilities it was given; one given none is a page that never declared (it can do both).
+      canSpeak: (d) => {
+        const c = declaredOf.get(d.id)
+        return c === undefined || c.speaker?.media.includes("speech") === true
+      },
+      canShow: (d) => {
+        const c = declaredOf.get(d.id)
+        return c === undefined || c.display !== undefined
+      },
+      privacy: people.privacy,
+      outlet: () => ({ send: (deviceId, message) => void pageMessages.push({ deviceId, message }) }),
+      speech: () => speech,
+      gateway: () => hostRef?.gateway,
+      pageText: (moduleId, text, max) => hostRef?.pageText(moduleId, text, max) ?? String(text).slice(0, max),
+      language: () => notifyLanguageOf(home.HOME_LANGUAGE),
+      onDecision: (record) => void decisions.push(record)
+    }).pipe(Scope.provide(lifetime))
 
     // Who has which module on: every assistant has the module and the stand-ins on unless it says otherwise.
     let running = options.started ?? true
@@ -566,6 +624,7 @@ export const startTestModule = (definition: ModuleDefinition<any>, options: Star
       demand,
       household: { store, events: recording.bus },
       scheduler: observedScheduler(engine, schedulerUses),
+      notify,
       coreServices: people.coreServices,
       issues,
       localPrincipal: false,
@@ -593,7 +652,7 @@ export const startTestModule = (definition: ModuleDefinition<any>, options: Star
     hostRef = host
     yield* checked("after the start", driven(`the start of ${id}${(options.others ?? []).length > 0 ? " and the modules beside it" : ""}`, host.startEnabled))
 
-    const settle = Effect.andThen(engine.settled, Effect.repeat(Effect.yieldNow, { times: 20 }))
+    const settle = Effect.andThen(Effect.andThen(engine.settled, notify.settled), Effect.repeat(Effect.yieldNow, { times: 20 }))
 
     /** The turn serve mode would make on a device of the household (default its first device). */
     const turn = (t: TestTurnInput = {}): TurnContext => {
@@ -752,6 +811,67 @@ export const startTestModule = (definition: ModuleDefinition<any>, options: Star
       /** Change its saved settings and secrets as the owner would on its page (a module that runs is started again with them). */
       configure: (values: SettingsPatch["values"], secrets: SettingsPatch["secrets"] = {}) =>
         checked("after the settings change", driven(`the settings change of ${id}`, host.configure(id, { values, secrets }))),
+      /**
+       * P9: the notification service as the module's tests see it: the real service on the kit's store, clock and
+       * gateway, with the pages and the devices' voices recorded (docs/NOTIFICATIONS.md "Testing").
+       */
+      notify: {
+        /** The service itself (`ringingOn`, `stopRinging`, `stopSpeech`: what P7 calls). */
+        engine: notify,
+        /** Every notification of the module, live and resolved (until retention removes it), oldest first. */
+        all: Effect.gen(function*() {
+          const out: Array<Notification> = []
+          let after: Row<StoredNotification> | undefined
+          for (;;) {
+            const page = yield* store.forCore(NOTIFY_OWNER).collection(notificationRows).list({ orderBy: { field: "createdAt" }, limit: 12, ...(after !== undefined ? { after } : {}) }).pipe(Effect.orDie)
+            for (const row of page) if (row.value.module === id) out.push(notificationView(row))
+            if (page.length < 12) return out as ReadonlyArray<Notification>
+            after = page[page.length - 1]
+          }
+        }),
+        /** What the voice pages were sent, in order (`notification.ring`, `notification.resolved`), per device. */
+        messages: pageMessages as ReadonlyArray<{ readonly deviceId: string; readonly message: NotifyMessage }>,
+        /** Every delivery decision, in order: to which devices something went, and why not. */
+        decisions: decisions as ReadonlyArray<DecisionRecord>,
+        /** What was announced where, with when it started and how it ended. */
+        announced: announced as ReadonlyArray<KitAnnouncement>,
+        /** Press an action of a notification on a device (default the first), as a page's button does; the clock is driven. */
+        press: (notificationId: string, actionId: string, as: { readonly device?: string } = {}): Effect.Effect<PressAnswer> =>
+          checked(
+            `after pressing ${actionId}`,
+            Effect.andThen(
+              notify.press({ notificationId, actionId, deviceId: as.device ?? deviceList[0]?.id ?? "kitchen-display", connection: testConnectionOf(as.device ?? deviceList[0]?.id ?? "kitchen-display") }),
+              (a) => Effect.as(settle, a)
+            )
+          ),
+        /** A reply is being spoken on the device (`true`) or has ended: announcements there wait for it. */
+        replying: (deviceId: string, on: boolean) =>
+          Effect.suspend(() => {
+            const d = replying.get(deviceId)
+            if (on && d === undefined) replying.set(deviceId, Deferred.makeUnsafe<void>())
+            if (!on && d !== undefined) {
+              replying.delete(deviceId)
+              Deferred.doneUnsafe(d, Effect.void)
+            }
+            return settle
+          }),
+        /** A page of the device says hello (it gets what is open for it) or its last one goes. */
+        connect: (deviceId: string) =>
+          Effect.suspend(() => {
+            connectedNow.add(deviceId)
+            notify.connected(deviceId)
+            return settle
+          }),
+        disconnect: (deviceId: string) =>
+          Effect.sync(() => {
+            connectedNow.delete(deviceId)
+            notify.disconnected(deviceId)
+          }),
+        /** Do not disturb now. */
+        dnd: (): DndState => notify.dnd(),
+        /** Let deliveries and the scheduler finish what is due now. */
+        settle: settle
+      },
       /**
        * Fail the test when the value of a secret given to the kit (`options.secrets`, four characters or more) is in
        * any string of `values` (what the test passes: tool results, action outcomes, spoken lines, rows it read), each

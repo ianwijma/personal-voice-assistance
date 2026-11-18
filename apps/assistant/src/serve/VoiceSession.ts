@@ -1,5 +1,8 @@
 import { makeWebAudio, type WebAudio } from "@pva/audio-web"
 import {
+  announcementChime,
+  AudioError,
+  chunkClauses,
   type AudioOutput,
   type AgentTurnSetup,
   type ConversationEvent,
@@ -258,7 +261,23 @@ export interface VoiceSession {
   readonly holder: () => string | null
   /** A `device.pick` was accepted: the open windows close, so the picked assistant answers the next sentence (§5.3). */
   readonly pickAccepted: () => void
+  /**
+   * P9: announcements on this device (docs/NOTIFICATIONS.md "Speech"): `quiet` completes once nothing is spoken or
+   * heard here (no reply plays, no turn is in flight, the person is not speaking); `play` speaks a line with the
+   * answering assistant's voice (`TurnSetup.tts`, the reply's synthesis) through the session's one output lease, so a
+   * reply that starts takes the speaker from it (the announcement fails `superseded`) and two never sound at once.
+   */
+  readonly announce: {
+    readonly quiet: Effect.Effect<void>
+    readonly play: (text: string, options: { readonly cue: boolean }) => Effect.Effect<void, unknown>
+  }
 }
+
+/** The lease holder of announcements (never an assistant id: those are lower case letters, digits and `-`). */
+export const ANNOUNCE_HOLDER = "@announcement"
+
+/** How often `announce.quiet` looks again while it waits (the tracker's states change on events and on timers). */
+const QUIET_POLL_MS = 200
 
 /**
  * The trace service of one assistant's conversation in a session: turn ids from the session's one counter (unique
@@ -1060,7 +1079,31 @@ export const makeVoiceSession = (options: VoiceSessionOptions): Effect.Effect<Vo
       dispatcher
     }
 
+    /** Nothing is spoken or heard here: no play holds the lease and the state is not hearing, thinking or speaking. */
+    const isQuiet = () => {
+      const state = tracker.current().state
+      return lease.holder() === undefined && inFlight === undefined && (state === "idle" || state === "listening" || state === "asleep")
+    }
+    const announce: VoiceSession["announce"] = {
+      quiet: Effect.gen(function*() {
+        while (!isQuiet()) yield* Effect.sleep(QUIET_POLL_MS)
+      }),
+      play: (text, o) =>
+        Effect.gen(function*() {
+          const assistant = answering()
+          const setup = assistant === undefined ? undefined : yield* options.conversationSetup(assistant, options.deviceId).setup
+          const tts = setup?.tts ?? options.engine.built()?.providers.tts
+          if (tts === undefined) return yield* new AudioError({ message: "no voice on this device" })
+          if (setup?.ttsReady !== undefined) yield* setup.ttsReady
+          // The reply's synthesis: the line cut into clauses, synthesised as it plays.
+          const voice = tts.synthesize(Stream.make(text).pipe(chunkClauses())).pipe(Stream.map((chunk) => chunk.audio))
+          const audio = o.cue ? Stream.concat(Stream.make(announcementChime(tts.sampleRate)), voice) : voice
+          yield* lease.output(ANNOUNCE_HOLDER).play(audio, tts.sampleRate)
+        })
+    }
+
     return {
+      announce,
       key: options.key,
       deviceId: options.deviceId,
       name: options.name,

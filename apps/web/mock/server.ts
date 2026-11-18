@@ -54,6 +54,8 @@
  *
  * Control endpoints (for tests): GET /mock/log (client messages and microphone stats), POST /mock/reset,
  * POST /mock/turn (run the scripted voice turn now), POST /mock/send {"messages": [ServerMessage…]} (broadcast),
+ * POST /mock/notify {"title", "ring"?, "deviceId"?, "actions"?, "handlerDown"?} (P9: a notification card, delivered as the
+ * server does, again after each hello while open), POST /mock/notify/resolve {"id"},
  * POST /mock/drop (terminate every socket), POST /mock/offline {"ms": 3000} (drop and refuse connections for a while),
  * POST /mock/admin/end {"reason": "idle" | "expired"} (end every admin session), POST /mock/wake {"phrase", "armed"}
  * (the owner said the wake phrase), POST /mock/heard {"text", "matched"?, "accepted"?, "source"?} (a tester line; `accepted: null` or `source: null` leaves that field out), POST /mock/state
@@ -1428,7 +1430,11 @@ const requireAdmin = (c: Conn, requestId: string): boolean => {
   return true
 }
 
+type NotificationCardWire = Extract<ServerMessage, { type: "notification.ring" }>["notification"]
+/** Open notifications: the card, its device (absent: everywhere), whether its module's handler is down. */
+const mockNotifications = new Map<string, { readonly card: NotificationCardWire; readonly deviceId?: string; readonly handlerDown: boolean }>()
 const resetState = () => {
+  mockNotifications.clear()
   for (const t of scriptTimers) clearTimeout(t)
   scriptTimers = []
   for (const v of voiceSessions.values()) {
@@ -1480,6 +1486,22 @@ const after = (ms: number, f: () => void) => {
 
 const sendTo = (c: Conn, m: ServerMessage) => {
   if (c.ws.readyState === c.ws.OPEN) c.ws.send(encodeServerMessage(m))
+}
+
+// ---- P9: notifications, as the real server delivers them (docs/NOTIFICATIONS.md)
+
+const notifyConns = (deviceId: string | undefined) => [...conns].filter((c) => c.welcomed && c.frontend === "voice" && c.deviceId !== undefined && (deviceId === undefined || c.deviceId === deviceId))
+/** After a voice page's welcome, as the server does: every card open for its device, to that connection. */
+const notificationsAfterWelcome = (c: Conn) => {
+  if (c.frontend !== "voice" || c.deviceId === undefined) return
+  for (const n of mockNotifications.values()) if (n.deviceId === undefined || n.deviceId === c.deviceId) sendTo(c, { type: "notification.ring", notification: n.card })
+}
+const resolveMockNotification = (id: string, outcome: string) => {
+  const n = mockNotifications.get(id)
+  if (n === undefined) return false
+  mockNotifications.delete(id)
+  for (const c of notifyConns(n.deviceId)) sendTo(c, { type: "notification.resolved", id, outcome })
+  return true
 }
 /** Messages that carry admin data: only admin connections get them (protocol 5). */
 const ADMIN_ONLY: ReadonlySet<ServerMessage["type"]> = new Set(["engine", "module.changed", "section.changed", "vault", "env", "job", "models", "devices", "assistants", "device.types", "sessions", "trace", "wake.heard", "admin.snapshot", "health"])
@@ -2642,6 +2664,24 @@ const onClientMessage = (c: Conn, m: ClientMessage) => {
     case "ping":
       sendTo(c, { type: "pong", id: m.id })
       return
+    case "notification.action": {
+      // P9, as the real server: from a voice page of the card's device; `stop` always works; another action needs its
+      // module's handler (POST /mock/notify with "handlerDown": true makes it answer "I can't do that right now").
+      if (c.frontend !== "voice" || c.deviceId === undefined) return result(c, m.requestId, false, { code: "bad_message", message: "A notification is answered from a voice page of its device" })
+      const n = mockNotifications.get(m.id)
+      if (n === undefined) {
+        sendTo(c, { type: "notification.resolved", id: m.id })
+        return m.actionId === "stop"
+          ? sendTo(c, { type: "result", requestId: m.requestId, ok: true, say: "That has ended already." })
+          : sendTo(c, { type: "result", requestId: m.requestId, ok: false, error: { code: "bad_message", message: "That has ended already." }, say: "That has ended already." })
+      }
+      const cant = { type: "result" as const, requestId: m.requestId, ok: false, error: { code: "not_running" as const, message: "I can't do that right now." }, say: "I can't do that right now." }
+      if (n.deviceId !== undefined && n.deviceId !== c.deviceId) return sendTo(c, { ...cant, error: { code: "bad_message", message: cant.say } })
+      if (m.actionId !== "stop" && !n.card.actions.some((a) => a.id === m.actionId)) return sendTo(c, { ...cant, error: { code: "bad_message", message: cant.say } })
+      if (m.actionId !== "stop" && n.handlerDown) return sendTo(c, cant)
+      resolveMockNotification(m.id, m.actionId)
+      return sendTo(c, { type: "result", requestId: m.requestId, ok: true, say: "Done." })
+    }
     case "device.caps": {
       // Protocol 11: what the device can do changed, or its live state; admin's device list follows.
       if (c.frontend !== "voice" || c.deviceId === undefined) return
@@ -2745,6 +2785,7 @@ wss.on("connection", (ws: WebSocket) => {
         }
       })
       if (isAdminConn(c)) sendAdminSnapshot(c)
+      notificationsAfterWelcome(c)
       if (c.deviceId !== undefined) devicesChanged()
       if (resumed) {
         sessionUpdate(v, "resumed")
@@ -3304,6 +3345,31 @@ const http = createServer((req, res) => {
         const v = targetSession(payload.deviceId)
         for (const x of v !== undefined ? [v] : [...voiceSessions.values()]) setState(x, state)
         return json(res, 200, { ok: true })
+      }
+      case "/mock/notify": {
+        // P9: a notification delivered as the server would: {"id"?, "title", "text"?, "ring"?, "silent"?, "deviceId"?
+        // (absent: everywhere), "actions"? [{ id, label }], "handlerDown"?}. Sent to the voice pages of its device now
+        // and to each that says hello while it is open.
+        const id = typeof payload.id === "string" ? payload.id : `n-mock-${mockNotifications.size + 1}`
+        const title = typeof payload.title === "string" ? payload.title.slice(0, 60) : "Notification"
+        const ring = payload.ring === true
+        const card: NotificationCardWire = {
+          id,
+          title,
+          ...(typeof payload.text === "string" ? { text: payload.text.slice(0, 200) } : {}),
+          priority: ring ? "ring" : "normal",
+          silent: !ring || payload.silent === true,
+          actions: [{ id: "stop", label: "Stop" }, ...(Array.isArray(payload.actions) ? (payload.actions as Array<{ id: string; label: string }>).slice(0, 2) : [])],
+          sentAt: Date.now()
+        }
+        const deviceId = typeof payload.deviceId === "string" ? payload.deviceId : undefined
+        mockNotifications.set(id, { card, ...(deviceId !== undefined ? { deviceId } : {}), handlerDown: payload.handlerDown === true })
+        for (const c of notifyConns(deviceId)) sendTo(c, { type: "notification.ring", notification: card })
+        return json(res, 200, { id })
+      }
+      case "/mock/notify/resolve": {
+        const id = typeof payload.id === "string" ? payload.id : ""
+        return json(res, 200, { resolved: resolveMockNotification(id, typeof payload.outcome === "string" ? payload.outcome : "resolved") })
       }
       case "/mock/send": {
         const messages = Array.isArray(payload.messages) ? payload.messages : []

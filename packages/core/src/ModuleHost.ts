@@ -77,6 +77,7 @@ import { type ModuleDefinition, type ModuleInstance, ModuleStartError } from "./
 import { type InstanceTarget, type ModuleTarget, planModule, reachedBy, usesOrder } from "./ModulePlanner.ts"
 import type { PartHandle, PartState, Registrar, Registration } from "./ModuleRegistrations.ts"
 import { closedModuleScheduler, type ModuleScheduler, type PartRunner, type SchedulerHook } from "./Scheduler.ts"
+import { closedModuleNotify, type ModuleNotify, type ModuleSpeech, type NotifyHook } from "./Notify.ts"
 import {
   applicableOwnValues,
   applySettingsPatch,
@@ -446,9 +447,16 @@ export interface ModuleHostOptions {
    * call fails `unavailable`.
    */
   readonly scheduler?: SchedulerHook
+  /**
+   * P9: `ctx.notify` and `ctx.speech` of version 2 modules (`NotifyEngine.forPart`), given the part and the same runner
+   * (a press runs as a call in flight of the part's published module). Absent (the CLI modes): `notify.handle`
+   * registers nothing and every other call fails `unavailable`.
+   */
+  readonly notify?: NotifyHook
 }
 
 const NO_SCHEDULER = closedModuleScheduler("Timers and scheduled jobs run only in the server (pnpm start serve).")
+const NO_NOTIFY = closedModuleNotify("Notifications and announcements work only in the server (pnpm start serve).")
 
 // ---------------------------------------------------------------------------------------------------------------------
 // Internal state
@@ -2927,7 +2935,30 @@ export const makeModuleHost = Effect.fnUntraced(function*(options: ModuleHostOpt
       store: storeFor(entry, effect),
       events: eventsFor(entry, part, effect),
       // P6: the part's scheduler; like the store handle, every call dies with `ModuleStopped` once the part has closed.
-      scheduler: schedulerFor(options.scheduler === undefined ? NO_SCHEDULER : options.scheduler.forPart(part.handle, runnerFor(entry, part)), effect, now)
+      scheduler: schedulerFor(options.scheduler === undefined ? NO_SCHEDULER : options.scheduler.forPart(part.handle, runnerFor(entry, part)), effect, now),
+      // P9: the part's notifications and speech; like the others, every call dies with `ModuleStopped` once it has closed.
+      ...notifyFor(options.notify === undefined ? NO_NOTIFY : options.notify.forPart(part.handle, runnerFor(entry, part)), effect)
+    }
+  }
+
+  /** P9: `ctx.notify` and `ctx.speech` of one part, every call guarded by the part's lifetime. */
+  function notifyFor(
+    n: { readonly notify: ModuleNotify; readonly speech: ModuleSpeech },
+    effect: <A, E = never>(f: () => Effect.Effect<A, E>) => Effect.Effect<A, E>
+  ): { readonly notify: ModuleNotify; readonly speech: ModuleSpeech } {
+    return {
+      notify: {
+        send: (request) => effect(() => n.notify.send(request)),
+        resolve: (target, outcome) => effect(() => n.notify.resolve(target, outcome)),
+        list: (query) => effect(() => n.notify.list(query)),
+        handle: (name, handler) => effect(() => n.notify.handle(name, handler)),
+        dnd: {
+          get: effect(() => n.notify.dnd.get),
+          set: (o) => effect(() => n.notify.dnd.set(o)),
+          clear: effect(() => n.notify.dnd.clear)
+        }
+      },
+      speech: { say: (target, text, o) => effect(() => n.speech.say(target, text, o)) }
     }
   }
 

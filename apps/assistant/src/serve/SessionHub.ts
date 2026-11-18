@@ -1,5 +1,5 @@
 import type { AudioClientLink } from "@pva/audio-web"
-import { adminModules, type ConnectionRef, type HostDeviceView, type HostResult, makeConnectionRef, type ModuleHost, withinModuleFrame } from "@pva/core"
+import { adminModules, type ConnectionRef, type HostDeviceView, type HostResult, makeConnectionRef, type ModuleHost, type NotifyEngine, withinModuleFrame } from "@pva/core"
 import {
   type AdminSnapshot,
   type AdminState,
@@ -201,6 +201,12 @@ export interface HubOptions {
   readonly env?: EnvMover
   /** Household data for voice pages and device events (P4). Absent: none sent. */
   readonly household?: HouseholdHooks
+  /**
+   * P9: the notification service (docs/NOTIFICATIONS.md). A voice connection of a device gets what is open for it after
+   * its welcome (`connected`, that connection only); the device's last connection going ends its ringing
+   * (`disconnected`); a card's button is `notification.action`, answered with `result` (`say`). Absent: none of it.
+   */
+  readonly notify?: Pick<NotifyEngine, "connected" | "disconnected" | "press">
   /** P5: a device's connections, declaration or live state changed (the device facts rebuild their list). */
   readonly onDeviceChange?: () => void
   /**
@@ -786,6 +792,7 @@ export const makeSessionHub = (options: HubOptions): SessionHub => {
       deviceChanged()
       devicesChanged(true)
       if (last) options.household?.deviceDisconnected(id)
+      if (last) options.notify?.disconnected(id)
     }
     const key = client.sessionKey
     if (key === undefined) return
@@ -945,6 +952,8 @@ export const makeSessionHub = (options: HubOptions): SessionHub => {
         send: (m) => send(client, m)
       }
       if (firstOfDevice) options.household.deviceConnected(device!.id)
+      // P9: this connection gets the cards of what is open for its device (ringing again where it rang).
+      if (device !== undefined) options.notify?.connected(device.id, (m) => send(client, m))
       // A device the server already knows starts at once; a new one when its registration is written.
       if (device === undefined || registry.known(device.id)) startHousehold(client)
     }
@@ -1256,6 +1265,27 @@ export const makeSessionHub = (options: HubOptions): SessionHub => {
       }
       case "ping":
         return send(client, { type: "pong", id: message.id })
+      case "notification.action": {
+        // P9: a press on a card's button, from a voice page of the device it was shown on (the service checks that the
+        // notification is for this device; `stop` always works). Not an admin request: the house's own devices.
+        if (client.role !== "voice" || client.device === undefined || options.notify === undefined) {
+          return result(client, message.requestId, failure("bad_message", "A notification is answered from a voice page of its device"))
+        }
+        const notify = options.notify
+        const deviceId = client.device.id
+        return options.run(Effect.map(
+          notify.press({ notificationId: message.id, actionId: message.actionId, deviceId, connection: client.ref }),
+          (answer) => {
+            if (client.closed) return
+            send(
+              client,
+              answer.ok
+                ? { type: "result", requestId: message.requestId, ok: true, say: answer.say }
+                : { type: "result", requestId: message.requestId, ok: false, error: { code: answer.code === "not_running" ? "not_running" : "bad_message", message: answer.say }, say: answer.say }
+            )
+          }
+        ))
+      }
       case "device.caps": {
         // P5: only a voice connection with a device declares (admin pages and pages without a device are ignored).
         // Bounded here, whatever the page does: an empty message is ignored, the latest one wins, at most one is

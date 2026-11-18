@@ -82,6 +82,10 @@
  * (`DeviceCapabilities`, `DeviceLiveState`), `DeviceRecord.declared`, `DeviceListInfo.declared` / `live`, and
  * `RecordItemField.hidden` (a record field kept but not drawn: a person's id in Members), `EnvEntry.refused` (a known
  * variable that is not read, with why: `HOUSEHOLD_MEMBERS`). `DevicePlace.room` is one line of text.
+ * P9, additive within 11 (docs/NOTIFICATIONS.md): `notification.ring` and `notification.resolved` (server → voice
+ * pages; a page that does not know them ignores them), `notification.action` (a request a newer page sends; an older
+ * page never sends it, and the server needs nothing from a page that does not) and `Result.say`. No closed set
+ * gains a member: a press of an action whose handler is not running is answered with the existing `not_running`.
  */
 export const PROTOCOL_VERSION = 11
 

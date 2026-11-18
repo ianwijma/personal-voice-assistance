@@ -15,6 +15,7 @@ import {
   type JobInfo,
   type ModelSet,
   type ModuleInfo,
+  type NotificationCard,
   type Role,
   type ServerMessage,
   type ServerMessageType,
@@ -266,6 +267,12 @@ export interface ClientState {
   readonly pending: Readonly<Record<string, PendingRequest>>
   /** Counts the sessions the server ended on this page (`local/session-ended`): views keyed by it start afresh. */
   readonly sessionSeq: number
+  /**
+   * P9: the notification cards on this device (`notification.ring` until `notification.resolved`), oldest first, at
+   * most `MAX_CARDS`. Emptied at every welcome: the server sends what is open again after it. `quiet`: a button was
+   * pressed here, so the page's ring cue stops for it at once (the server's `resolved` takes the card down).
+   */
+  readonly notifications: ReadonlyArray<NotificationCard & { readonly quiet?: boolean }>
   readonly toasts: ReadonlyArray<Toast>
   readonly ui: {
     readonly chatOpen: boolean
@@ -291,6 +298,8 @@ export interface ClientState {
 export const MAX_TURNS = 300
 export const MAX_TRACES = 50
 export const MAX_TOASTS = 3
+/** The most notification cards a page keeps (the newest; the server keeps at most 64 open). */
+export const MAX_CARDS = 16
 
 export const emptyEngine: EngineStatus = { state: "starting", problems: [], reloadPending: false, reloadPendingFor: [], engines: [], voices: [] }
 /** Before the admin snapshot: no vault known, and this page is not admin. */
@@ -332,6 +341,7 @@ export const initialState: ClientState = {
   traceSeq: 0,
   pending: {},
   sessionSeq: 0,
+  notifications: [],
   toasts: [],
   ui: { chatOpen: false, chatView: undefined, sheetOpen: false, settingsOpen: false, settingsPath: [], settingsDirty: false, unread: 0, shortcutsOpen: false }
 }
@@ -376,6 +386,8 @@ export type LocalAction =
    * playing), and `sessionSeq` moves on so session-scoped views (the composer's draft) start afresh.
    */
   | { readonly type: "local/session-ended" }
+  /** P9: a button of a card was pressed here: its cue stops now (the card stays until the server resolves it). */
+  | { readonly type: "local/notification-pressed"; readonly id: string }
 
 export type Action = ServerMessage | LocalAction
 
@@ -668,7 +680,15 @@ const server: ServerHandlers = {
   // Household data (docs/STORING-DATA.md "Pages"): no page shows it yet (P10 is the first).
   "household.snapshot": (s) => s,
   "household.event": (s) => s,
-  "household.gap": (s) => s
+  "household.gap": (s) => s,
+  // P9: a card shown (or shown again, silent or not), and one taken down.
+  "notification.ring": (s, m) => {
+    const before = s.notifications.find((n) => n.id === m.notification.id)
+    const card = before?.quiet === true ? { ...m.notification, quiet: true } : m.notification
+    const rest = s.notifications.filter((n) => n.id !== m.notification.id)
+    return { ...s, notifications: [...rest, card].sort((a, b) => a.sentAt - b.sentAt).slice(-MAX_CARDS) }
+  },
+  "notification.resolved": (s, m) => (s.notifications.some((n) => n.id === m.id) ? { ...s, notifications: s.notifications.filter((n) => n.id !== m.id) } : s)
 }
 
 const local = (s: ClientState, a: LocalAction): ClientState => {
@@ -681,10 +701,13 @@ const local = (s: ClientState, a: LocalAction): ClientState => {
     case "local/socket-lost":
       // Requests in flight will never be answered on this socket; the player was flushed.
       return { ...s, pending: {}, audio: withoutPlaying(s.audio), liveTranscript: "" }
+    case "local/notification-pressed":
+      return { ...s, notifications: s.notifications.map((n) => (n.id === a.id ? { ...n, quiet: true } : n)) }
     case "local/session-ended":
       // Not a network drop: the old session is gone for good, and nothing of it stays on screen.
       return {
         ...s,
+        notifications: [],
         pending: {},
         audio: withoutPlaying(s.audio),
         liveTranscript: "",

@@ -4,6 +4,8 @@ import {
   Llm,
   LlmError,
   makeModuleHost,
+  makeNotifyEngine,
+  notifyLanguageOf,
   defaultRiskPolicy,
   makeToolRegistry,
   type ModuleDemand,
@@ -403,6 +405,40 @@ export const startServe = (options: ServeOptions): Effect.Effect<ServeHandle, Ht
       pageText: (moduleId, text, max) => hostRef?.pageText(moduleId, text, max) ?? oneLine(text, max),
       log: logInfo
     })
+    // P9: the notification service (docs/NOTIFICATIONS.md) on the same store and scheduler, made before the module host
+    // it gives `ctx.notify` and `ctx.speech` to. Pages (the hub), voices (the sessions), the gateway and the page
+    // boundary are bound once they exist; nothing is delivered before a page says hello.
+    /** Late-bound: the voice sessions (announcements; every session is told when what it hears with may have changed). */
+    let sessionsRef: VoiceSessions | undefined
+    const notify = yield* makeNotifyEngine({
+      store: household.store,
+      scheduler,
+      devices: () => deviceFacts.devices.list(),
+      connected: (deviceId) => hub?.deviceConnected(deviceId) === true,
+      canSpeak: (d) => deviceFacts.speakerAllowed(d.id, d.kind),
+      // A page that never declared what it can do draws cards (the voice page does); one that declared no display does not.
+      canShow: (d) => d.declared === undefined || d.capabilities.display !== undefined,
+      privacy: deviceFacts.privacy,
+      outlet: () =>
+        hub === undefined ? undefined : {
+          send: (deviceId, message) => {
+            for (const c of hub!.voiceConnections()) if (c.deviceId === deviceId) c.send(message)
+          }
+        },
+      speech: () =>
+        sessionsRef === undefined ? undefined : {
+          quiet: (deviceId) => Effect.suspend(() => sessionsRef?.get(deviceId)?.announce.quiet ?? Effect.void),
+          play: (deviceId, text, o) =>
+            Effect.suspend(() => {
+              const session = sessionsRef?.get(deviceId)
+              return session === undefined ? Effect.fail(new Error("nobody has started audio on that device")) : session.announce.play(text, o)
+            })
+        },
+      gateway: () => hostRef?.gateway,
+      pageText: (moduleId, text, max) => hostRef?.pageText(moduleId, text, max) ?? oneLine(text, max),
+      language: () => notifyLanguageOf(sections.value("HOME_LANGUAGE")),
+      log: logInfo
+    })
     // Capabilities run for the assistants that switch them on (`moduleDemand`, below; read from startEnabled on).
     const host = yield* makeModuleHost({
       // P5: the core's own services for modules (`host.service`).
@@ -410,6 +446,7 @@ export const startServe = (options: ServeOptions): Effect.Effect<ServeHandle, Ht
       routeTokens,
       issues,
       scheduler,
+      notify,
       catalog,
       persistence: store.modulePersistence,
       env,
@@ -854,8 +891,8 @@ export const startServe = (options: ServeOptions): Effect.Effect<ServeHandle, Ht
             })
         })
       })
-    /** Late-bound: every voice session is told when what it hears with may have changed. */
-    let sessionsRef: VoiceSessions | undefined
+    // (`sessionsRef`, made above for the notification service, is the late-bound list of voice sessions: every
+    // voice session is also told when what it hears with may have changed.)
     /** The real providers (no injected build, or the real builder passed explicitly): the pool builds them all. */
     const realBuild = options.build === undefined || options.build === defaultProviderBuilder
     const resources = yield* makeResourcePool({
@@ -1453,6 +1490,7 @@ export const startServe = (options: ServeOptions): Effect.Effect<ServeHandle, Ht
     })
     hub = makeSessionHub({
       household: push.hooks,
+      notify,
       onDeviceChange: deviceFacts.changed,
       speakerAllowed: deviceFacts.speakerAllowed,
       admin,

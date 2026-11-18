@@ -14,6 +14,7 @@ import type { ActionParam } from "./Actions.ts"
 import type { ModuleEvents } from "./EventBus.ts"
 import type { ModuleStore } from "./HouseholdStore.ts"
 import type { ModuleRoute, RouteTokens } from "./ModuleRoutes.ts"
+import type { ModuleNotify, ModuleSpeech } from "./Notify.ts"
 import type { ModuleScheduler } from "./Scheduler.ts"
 
 /**
@@ -442,6 +443,15 @@ export interface ModuleServicesV2 {
    * part has closed. In the CLI modes (no scheduler) `handle` succeeds and every other call fails `unavailable`.
    */
   readonly scheduler: ModuleScheduler
+  /**
+   * P9: notifications (docs/NOTIFICATIONS.md): `send`, `resolve` and `list` of the module's own, action handlers
+   * registered with `handle` during `shared` (published and withdrawn with the module), and do not disturb. Every call
+   * dies with `ModuleStopped` once the part has closed. In the CLI modes `handle` succeeds and every other call fails
+   * `unavailable`.
+   */
+  readonly notify: ModuleNotify
+  /** P9: one announcement on a device, a room's devices or everywhere, after whatever is spoken there (docs/NOTIFICATIONS.md). */
+  readonly speech: ModuleSpeech
 }
 
 /**

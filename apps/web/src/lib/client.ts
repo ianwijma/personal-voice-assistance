@@ -2,6 +2,7 @@ import type { Assistant, AssistantBody, AssistantId, ClientMessage, DeviceProfil
 import { type Outcome, outcomeOf } from "./assistants.ts"
 import { createDiagnosticsStore, type DiagnosticsStore, type MicProcessing } from "./audio/diagnostics.ts"
 import { CUE_RATE, wakeCue } from "./audio/cue.ts"
+import { makeRingLoop, ringCue } from "./audio/ringLoop.ts"
 import { levels, markInterrupted } from "./audio/levels.ts"
 import { type Guard, guardOf } from "./audio/lifecycle.ts"
 import { describeMicError, MicFallbackError, type PlayerEvent, VoiceAudio } from "./audio/VoiceAudio.ts"
@@ -158,6 +159,8 @@ const makeClientId = (): string => {
 const LOCAL_REPLY_ID = 0xffff_fff0
 /** The wake cue: another local id. */
 const CUE_REPLY_ID = LOCAL_REPLY_ID + 1
+/** P9: the ring cue of a notification card: another local id. */
+const RING_REPLY_ID = LOCAL_REPLY_ID + 2
 
 /**
  * THE place a player event becomes a playback report to the server (or none).
@@ -546,6 +549,28 @@ export const createAssistantClient = (options: { readonly frontend?: FrontendRol
     if (open !== undefined && open < LOCAL_REPLY_ID) return
     audio.playLocal(CUE_REPLY_ID, CUE_RATE, wakeCue())
   }
+
+  /**
+   * P9: the ring cue while a card that is not silent (and not pressed here) is shown (`audio/ringLoop.ts`). Only the tab
+   * that owns the device's audio plays it, once the audio was started (the Start gesture gave the page its audio
+   * permission) and runs, never over a reply or the echo test. Before that the card shows without sound, with a note.
+   */
+  const ringLoop = makeRingLoop({
+    wanted: () => store.get().notifications.some((n) => n.priority === "ring" && !n.silent && n.quiet !== true),
+    canPlay: () => {
+      const s = store.get()
+      if (frontend !== "voice" || !owner() || !audio.running || audio.contextState !== "running") return false
+      if (s.audio.playing !== undefined || echoRun !== undefined) return false
+      const open = audio.openReply()
+      return open === undefined || open >= LOCAL_REPLY_ID
+    },
+    play: () => audio.playLocal(RING_REPLY_ID, CUE_RATE, ringCue()),
+    silence: () => {
+      if (audio.running && audio.openReply() === RING_REPLY_ID) audio.replyStop(RING_REPLY_ID, false)
+    }
+  })
+  // continuation(state): runs synchronously on every store change; the loop reads the present state.
+  store.subscribe(() => ringLoop.update())
 
   // ---- Screen wake lock while this tab owns the audio ----
   let wakeLock: { release: () => Promise<void> } | undefined

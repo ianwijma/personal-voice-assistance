@@ -1,4 +1,5 @@
 import { Schema } from "effect"
+import { NotificationAction } from "./notifications.ts"
 import { AdminToken } from "./admin.ts"
 import { Assistant, AssistantBody, AssistantId, MAX_ASSISTANTS } from "./assistants.ts"
 import {
@@ -490,7 +491,8 @@ export const ClientMessage = Schema.Union([
   DevicePick,
   HealthCheck,
   ModuleAction,
-  DeviceCaps
+  DeviceCaps,
+  NotificationAction
 ]).pipe(Schema.toTaggedUnion("type"))
 export type ClientMessage = typeof ClientMessage.Type
 export type ClientMessageType = ClientMessage["type"]

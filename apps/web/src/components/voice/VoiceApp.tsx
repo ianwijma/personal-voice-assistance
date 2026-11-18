@@ -6,6 +6,7 @@ import { shallowEqual } from "@/lib/store.ts"
 import { ClientContext, useClientState } from "../context.tsx"
 import { ControlDock } from "../ControlDock.tsx"
 import { LiveAnnouncer } from "../LiveAnnouncer.tsx"
+import { NotificationCards } from "../NotificationCards.tsx"
 import { ShortcutsDialog } from "../ShortcutsDialog.tsx"
 import { Stage } from "../Stage.tsx"
 import { StateAnnouncer } from "../StateLabel.tsx"
@@ -58,6 +59,9 @@ function Shell() {
       </div>
       <div className="contents" inert={modal}>
         <ChatPanel />
+      </div>
+      <div className="contents" inert={modal}>
+        <NotificationCards />
       </div>
       <VoiceSheet />
       <ShortcutsDialog />

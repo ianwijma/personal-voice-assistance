@@ -21,6 +21,7 @@ import { VaultInfo } from "./vault.ts"
 import { ConversationId, ConversationReason, SessionInfo, SessionKey } from "./sessions.ts"
 import { HealthInfo } from "./health.ts"
 import { HouseholdEventMessage, HouseholdGapMessage, HouseholdSnapshotMessage } from "./household.ts"
+import { NotificationResolvedMessage, NotificationRingMessage } from "./notifications.ts"
 import { FieldActionResult } from "./settings.ts"
 
 /**
@@ -228,7 +229,12 @@ export const Result = Schema.Struct({
    */
   rev: Schema.optionalKey(NonNegativeInt),
   /** Protocol 10: present only on the result of `module.action` that ran: what the handler said, shown by the button. */
-  action: Schema.optionalKey(FieldActionResult)
+  action: Schema.optionalKey(FieldActionResult),
+  /**
+   * Additive within protocol 11 (P9): on the result of `notification.action`, the sentence to show for the press (the
+   * module's answer, or "I can't do that right now"), in the household's language.
+   */
+  say: Schema.optionalKey(Schema.String.check(Schema.isMaxLength(300)))
 })
 
 /**
@@ -441,7 +447,9 @@ export const ServerMessage = Schema.Union([
   HealthMessage,
   HouseholdSnapshotMessage,
   HouseholdEventMessage,
-  HouseholdGapMessage
+  HouseholdGapMessage,
+  NotificationRingMessage,
+  NotificationResolvedMessage
 ]).pipe(Schema.toTaggedUnion("type"))
 export type ServerMessage = typeof ServerMessage.Type
 export type ServerMessageType = ServerMessage["type"]

@@ -628,7 +628,18 @@ export const clientExamples: { readonly [T in ClientMessageType]: Extract<Client
     capabilities: exampleCapabilities,
     live: { visible: true, lastInteractionAt: 1_763_100_000_000 }
   },
+  // P9 (additive within 11): a press on a ring card's button.
+  "notification.action": { type: "notification.action", requestId: "n1", id: "n-4f2a", actionId: "stop" },
   ...assistantsClientExamples
+}
+
+/** The `result` of a `notification.action` whose handler is not running (P9, additive within 11). */
+export const exampleNotificationActionResult: Extract<ServerMessage, { readonly type: "result" }> = {
+  type: "result",
+  requestId: "n1",
+  ok: false,
+  error: { code: "not_running", message: "I can't do that right now." },
+  say: "I can't do that right now."
 }
 
 /** The `result` of a `module.action` that ran (protocol 10). */
@@ -760,6 +771,20 @@ export const serverExamples: { readonly [T in ServerMessageType]: Extract<Server
     }
   },
   "household.gap": { type: "household.gap", reason: "overflow" },
+  // P9 (additive within 11): a timer's ring card, and its end.
+  "notification.ring": {
+    type: "notification.ring",
+    notification: {
+      id: "n-4f2a",
+      title: "Pasta timer",
+      text: "Ten minutes are up.",
+      priority: "ring",
+      silent: false,
+      actions: [{ id: "stop", label: "Stop" }, { id: "snooze", label: "Snooze" }],
+      sentAt: 1_763_100_600_000
+    }
+  },
+  "notification.resolved": { type: "notification.resolved", id: "n-4f2a", outcome: "stop" },
   ...assistantsServerExamples
 }
 
