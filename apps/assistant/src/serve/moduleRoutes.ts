@@ -95,6 +95,8 @@ const FORWARDING_HEADERS = ["forwarded", "x-forwarded-for", "x-real-ip", "x-forw
 
 /** What a request refused at the module's slot cap is told to wait (`Retry-After`, seconds). */
 export const ROUTE_BUSY_RETRY_S = 5
+/** The status a call's log entry has when its caller went away before the answer (nothing was sent): nginx's 499. */
+export const ROUTE_CANCELLED_STATUS = 499
 /** Per-address rate windows kept at once (the oldest goes first); route totals are kept apart and never evicted. */
 const MAX_ADDRESS_WINDOWS = 4096
 /** Routes whose call log is kept (the least recently called goes first), live or retired. */
@@ -420,9 +422,30 @@ export const makeModuleRouter = (options: ModuleRouterOptions): ModuleRouter => 
     let moduleId = ""
     let token: string | undefined
     let answered = false
-    const finish = (answer: Answer) => {
+    /** Did the caller go away before the answer was written (the response closed unfinished)? */
+    let gone = false
+    let fiber: { readonly interruptUnsafe: () => void } | undefined
+    /**
+     * The one way a request ends (idempotent): its outcome is recorded exactly once, whatever ended it. An answer is
+     * written unless the caller has gone; a caller that went away is recorded as cancelled and nothing is written.
+     */
+    const settle = (answer: Answer | "cancelled") => {
       if (answered) return
       answered = true
+      if (answer === "cancelled" || gone) {
+        if (!req.complete) req.resume()
+        if (route !== undefined) {
+          record(moduleId, route, {
+            at: started,
+            address,
+            status: ROUTE_CANCELLED_STATUS,
+            ms: Math.max(0, now() - started),
+            ...(token !== undefined ? { token } : {}),
+            note: "Cancelled: the caller went away before the answer"
+          })
+        }
+        return
+      }
       const status = send(res, answer)
       if (!req.complete) req.resume()
       if (route !== undefined) {
@@ -436,6 +459,15 @@ export const makeModuleRouter = (options: ModuleRouterOptions): ModuleRouter => 
         })
       }
     }
+    const finish = (answer: Answer) => settle(answer)
+    // The caller went away: recorded once as cancelled; the wait for the answer is interrupted, which asks the handler
+    // to stop (its slot stays taken until it has ended).
+    res.on("close", () => {
+      if (res.writableEnded) return
+      gone = true
+      settle("cancelled")
+      fiber?.interruptUnsafe()
+    })
     // Everything of a request, admission to answer: whatever goes wrong is a 500 for this request, never the process's.
     const run = async (): Promise<void> => {
       const url = new URL(req.url ?? "/", "http://x")
@@ -533,13 +565,11 @@ export const makeModuleRouter = (options: ModuleRouterOptions): ModuleRouter => 
         yield* Effect.logError(`${label} failed`, exit.cause)
         return plain(500, "The module could not answer (see the server's log)")
       })
-      const fiber = Effect.runForkWith(options.services)(answer)
-      // The caller went away: the wait for the answer is interrupted, which asks the handler to stop (its slot stays
-      // taken until it has ended).
-      res.on("close", () => {
-        if (!res.writableEnded) fiber.interruptUnsafe()
-      })
-      fiber.addObserver((exit) => {
+      // Gone while the body was read or the route looked up: settled already, nothing is started.
+      if (gone) return
+      const running = Effect.runForkWith(options.services)(answer)
+      fiber = running
+      running.addObserver((exit) => {
         if (Exit.isSuccess(exit)) finish(exit.value)
         else if (!res.writableEnded) res.destroy()
       })
