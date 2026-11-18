@@ -805,16 +805,19 @@ stream), a WebSocket or a `POST` to a URL a model or a page chose is not in this
   Assistant, Grocy): it also allows private addresses, local names and other ports. **Never pass it a URL a model chose.**
   - **`method: "POST", body: { json }`** when the API takes a JSON request (Home Assistant's `/api/services/…`,
     `/api/template`). The helper serialises `json`, sets `Content-Type: application/json` and the length (yours are
-    refused) and refuses a body over `maxRequestBytes` (64 KiB; you may set up to 1 MiB) before connecting; a value
-    `JSON.stringify` cannot write is `NetRefused` (`body`). **A POST is sent once, to one server**: a redirect answer is
-    refused (`post-redirect`), it is never retried, and it moves to the host's next address only after a refused or
+    refused) and refuses a body over `maxRequestBytes` (64 KiB; you may set up to 128 KiB, whose serialisation stops the
+    main thread under 5 ms: a heartbeat's longest gap 4.5–5.0 ms for the worst shape) before connecting; a value
+    `JSON.stringify` cannot write is `NetRefused` (`body`). The one `timeoutMs` includes serialising. **A POST is sent once,
+    to one server**: every 3xx answer is refused (`post-redirect`), it is never retried, and it moves to the host's next address only after a refused or
     timed-out connect, when nothing was sent. So **a POST that failed may or may not have been carried out**: say so
     ("I could not confirm the kitchen light is on"), and do not repeat it by yourself. Every other rule (addresses, headers,
     the response type, `maxBytes`, the one `timeoutMs`, interruption) applies to the POST and its answer.
   - **`typedLoopback: true`** when the owner's server may run on the assistant's own machine (`http://localhost:8123`):
-    loopback is then allowed only when the host written in the URL is itself `localhost` (exactly) or a loopback literal
-    (`127.0.0.1`, `[::1]`). A name that resolves to loopback and a redirect to loopback stay refused. Without it, every
-    loopback address is refused.
+    loopback is then allowed only when the URL is text whose host, as written, is exactly `localhost` (ASCII, any case),
+    `[::1]` or a plain dotted quad `127.a.b.c`. Every other spelling (`2130706433`, `0x7f000001`, `127.1`, `127.0.0.1.`,
+    `localhost.`, `x.localhost`, `%6cocalhost`, `[::ffff:127.0.0.1]`, a `URL` object), a name that resolves to loopback and a
+    redirect to loopback stay refused. Without the option, every loopback address is refused. The kit's offline network
+    resolves `localhost` names to loopback, so your test passes only where serve mode would.
 - **`makeCachedJson`** for JSON with a time to live, `ETag` and stale-if-error.
 - **`userAgent(contact)`**: put the owner's contact (Home › API contact, `HOME_API_CONTACT`) in the User-Agent **only
   when the owner set one**.
