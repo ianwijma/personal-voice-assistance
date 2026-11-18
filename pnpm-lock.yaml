@@ -592,6 +592,9 @@ importers:
       '@pva/core':
         specifier: workspace:*
         version: link:../core
+      '@pva/language':
+        specifier: workspace:*
+        version: link:../language
       '@pva/module-contracts':
         specifier: workspace:*
         version: link:../module-contracts
@@ -645,6 +648,9 @@ importers:
       '@pva/core':
         specifier: workspace:*
         version: link:../core
+      '@pva/language':
+        specifier: workspace:*
+        version: link:../language
       '@pva/module-contracts':
         specifier: workspace:*
         version: link:../module-contracts
@@ -781,6 +787,12 @@ importers:
       '@pva/core':
         specifier: workspace:*
         version: link:../core
+      '@pva/language':
+        specifier: workspace:*
+        version: link:../language
+      '@pva/module-contracts':
+        specifier: workspace:*
+        version: link:../module-contracts
       effect:
         specifier: 'catalog:'
         version: 4.1.4
@@ -803,6 +815,9 @@ importers:
       '@pva/core':
         specifier: workspace:*
         version: link:../core
+      '@pva/language':
+        specifier: workspace:*
+        version: link:../language
       '@pva/module-contracts':
         specifier: workspace:*
         version: link:../module-contracts
@@ -927,6 +942,9 @@ importers:
       '@pva/core':
         specifier: workspace:*
         version: link:../core
+      '@pva/language':
+        specifier: workspace:*
+        version: link:../language
       '@pva/module-contracts':
         specifier: workspace:*
         version: link:../module-contracts
@@ -952,6 +970,9 @@ importers:
       '@pva/core':
         specifier: workspace:*
         version: link:../core
+      '@pva/language':
+        specifier: workspace:*
+        version: link:../language
       '@pva/module-contracts':
         specifier: workspace:*
         version: link:../module-contracts
@@ -980,6 +1001,9 @@ importers:
       '@pva/core':
         specifier: workspace:*
         version: link:../core
+      '@pva/language':
+        specifier: workspace:*
+        version: link:../language
       '@pva/module-contracts':
         specifier: workspace:*
         version: link:../module-contracts
@@ -1014,6 +1038,9 @@ importers:
       '@pva/core':
         specifier: workspace:*
         version: link:../core
+      '@pva/language':
+        specifier: workspace:*
+        version: link:../language
       '@pva/module-contracts':
         specifier: workspace:*
         version: link:../module-contracts
@@ -1039,6 +1066,9 @@ importers:
       '@pva/core':
         specifier: workspace:*
         version: link:../core
+      '@pva/language':
+        specifier: workspace:*
+        version: link:../language
       '@pva/module-contracts':
         specifier: workspace:*
         version: link:../module-contracts
@@ -1092,6 +1122,9 @@ importers:
       '@pva/core':
         specifier: workspace:*
         version: link:../core
+      '@pva/language':
+        specifier: workspace:*
+        version: link:../language
       '@pva/module-contracts':
         specifier: workspace:*
         version: link:../module-contracts
@@ -1148,6 +1181,9 @@ importers:
       '@pva/core':
         specifier: workspace:*
         version: link:../core
+      '@pva/language':
+        specifier: workspace:*
+        version: link:../language
       '@pva/module-contracts':
         specifier: workspace:*
         version: link:../module-contracts
