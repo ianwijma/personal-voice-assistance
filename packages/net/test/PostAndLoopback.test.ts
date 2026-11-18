@@ -172,13 +172,13 @@ describe("the helper owns the body", () => {
     expect(connector.requests).toHaveLength(1)
     expect(resolver.calls).toEqual(["ha.lan"])
   })
-  it("a caller may lower the limit or raise it up to 1 MiB, and no further", async () => {
+  it("a caller may lower the limit or raise it up to 128 KiB, and no further", async () => {
     const connector = fakeConnector(() => json())
-    const big = "y".repeat(512 * 1024)
+    const big = "y".repeat(128 * 1024 - 2)
     expect((await refusal(post("http://ha.lan/", big, { resolver: lanResolver(), connector }))).rule).toBe("body")
-    await Effect.runPromise(post("http://ha.lan/", big, { resolver: lanResolver(), connector, maxRequestBytes: 1024 * 1024 }))
+    await Effect.runPromise(post("http://ha.lan/", big, { resolver: lanResolver(), connector, maxRequestBytes: 128 * 1024 }))
     expect((await refusal(post("http://ha.lan/", { a: 1 }, { resolver: lanResolver(), connector, maxRequestBytes: 4 }))).rule).toBe("body")
-    for (const maxRequestBytes of [1024 * 1024 + 1, 0, -1, 1.5, Number.NaN, "10" as unknown as number]) {
+    for (const maxRequestBytes of [128 * 1024 + 1, 1024 * 1024, 0, -1, 1.5, Number.NaN, "10" as unknown as number]) {
       expect((await refusal(post("http://ha.lan/", 1, { resolver: lanResolver(), connector, maxRequestBytes }))).rule, String(maxRequestBytes)).toBe("options")
     }
     expect(connector.requests).toHaveLength(1)
