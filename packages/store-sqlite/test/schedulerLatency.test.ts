@@ -187,8 +187,9 @@ describe("scheduler latency on SQLite at the limits", () => {
         yield* engine.settled
       }))
       const claiming = passes.filter((p) => p.claimed > 0)
-      // Retention: 400 finished rows as large as a finished row can be (a live row also has its three index fields),
-      // older than seven days, removed in steps.
+      // Retention: 400 failed rows with the payload, key, ids, cron, zone and failure text at their longest, older than
+      // seven days, removed in steps. (Not quite the largest finished row: a cancelled retry also keeps its occurrence
+      // time, and a person's confidence can be a longer number.)
       const failure = storedError(`${'"\\'.repeat(300)}${"\udfff".repeat(300)}`)
       const fixture = withIndexes({
         module: "m".repeat(40),
@@ -226,7 +227,7 @@ describe("scheduler latency on SQLite at the limits", () => {
         `cron planning (Cron.next and Cron.prev, ${CRONS.length} expressions x ${ZONES.length} zones x ${FROMS.length} dates), synchronous: worst ${planWorst.toFixed(3)} ms; schedule with a cron, ${cronSchedule.length} calls: wall worst ${cronWorst.toFixed(2)} ms; a refused date ${refusedMs.toFixed(2)} ms`,
         `loop pass, 50 handlers, 1,000 jobs, nothing due, ${idlePasses.length} passes: worst ${idleWorst.toFixed(2)} ms wall (yielding between handlers); longest stop ${idle.worst.toFixed(2)} ms`,
         `loop pass claiming ${claiming.map((p) => p.claimed).join(" + ")} of 40 due jobs: worst ${Math.max(...claiming.map((p) => p.ms)).toFixed(2)} ms wall; longest stop ${busy.worst.toFixed(2)} ms`,
-        `retention, ${removing.reduce((n, s) => n + s.removed, 0)} rows of ${fixtureChars} characters (the largest finished row) in ${removing.length} transactions of ${RETENTION_STEP_ROWS}: longest stop over the passes (with the recovery rule, the recount and the issues) ${retention.worst.toFixed(2)} ms; wall per transaction worst ${stepWorst.toFixed(2)} ms`
+        `retention, ${removing.reduce((n, s) => n + s.removed, 0)} failed rows of ${fixtureChars} characters (every text field at its longest) in ${removing.length} transactions of ${RETENTION_STEP_ROWS}: longest stop over the passes (with the recovery rule, the recount and the issues) ${retention.worst.toFixed(2)} ms; wall per transaction worst ${stepWorst.toFixed(2)} ms`
       ]
       console.log(`Scheduler latency:\n  ${lines.join("\n  ")}`)
       assert.isAtLeast(fixtureChars, 2_100)

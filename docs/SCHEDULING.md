@@ -65,7 +65,8 @@ const job = yield* ctx.scheduler.schedule({
   `invalid`. Keep larger data in your own collection and schedule its id. It is decoded by the handler's schema when
   the job runs; a payload that does not decode fails the job, and it is not retried.
 - **Key**: one live (`scheduled` or `running`) job per module and key. Scheduling the same key again replaces the live
-  one, which becomes `cancelled`. Keys: 1–100 letters, digits and `_ . : @ / -`.
+  one, which becomes `cancelled` (and its Health issue, if it had one, goes); a finished job of that key, a `failed` one
+  too, is not touched. Keys: 1–100 letters, digits and `_ . : @ / -`.
 - **Origin**: the assistant, device and person of the turn that scheduled it (`CurrentTurn`), or, from inside a
   handler, of that handler's job (`CurrentJob`), unless you give one. The handler runs with it as its principal. Its
   ids are 1–64 letters, digits and `_ . : -` (every assistant, device and person id is).
@@ -91,7 +92,8 @@ yield* ctx.store.transaction((tx) => {
 store failure, so left uncaught it rolls everything back: `StoreError` `invalid` at the 200-job limit, for a prepared
 job written already, and for a handle used outside its function. Every refusal is decided **before the job's first
 write**, so you may catch one inside the function and commit the rest: nothing of the job was written. Write a
-prepared job once.
+prepared job once, from the part that prepared it: once that part has closed (your module stopped or restarted), its
+`writeIn` dies with `ModuleStopped` before writing anything, even inside a transaction of the module's next part.
 
 **Do not catch any other failure of `writeIn` and go on with the same transaction.** Such a failure is the store's own
 (a full disk), thrown in the middle of the job's writes (its counter, the key's old job, the new job). The store has no
@@ -153,14 +155,15 @@ before now (`due.dueAt`), and continues from the first occurrence after now, how
 ## Cancel, reschedule, get, list
 
 ```ts
-yield* ctx.scheduler.cancel(job.id)                    // or cancel({ key: "timer:pasta" }); true when it was live or failed
+yield* ctx.scheduler.cancel(job.id)                    // true when it was live or failed; cancel({ key: "timer:pasta" }): the key's live job
 yield* ctx.scheduler.reschedule(job.id, { inMs: 300_000 })   // or { at }; the job, or undefined when there is none
 yield* ctx.scheduler.get(job.id)                       // JobRow | undefined (live or finished, until removed)
 yield* ctx.scheduler.list()                            // your live jobs by due time, 10 a page; { key } for one key's
 ```
 
-- **cancel** makes a live job `cancelled`, or dismisses a `failed` one (its Health issue goes). A running handler is
-  **not interrupted**: what it then reports is ignored, and it is not run again. A finished job answers `false`.
+- **cancel** makes a live job `cancelled`, or dismisses a `failed` one by its id (its Health issue goes). `cancel({ key })`
+  finds the key's live job only: a failed one is dismissed by its id. A running handler is **not interrupted**: what it
+  then reports is ignored, and it is not run again. Any other finished job answers `false`.
 - **reschedule** gives a live job a new due time: it is `scheduled` again with attempt 0 (a repeating one continues
   from its cron after that occurrence). For a running job, the outcome of the present run is ignored. A finished job
   fails `state`; schedule a new one.
@@ -179,21 +182,26 @@ of the household's zone takes effect from the occurrence after it. The admin pag
 
 ## Health and the admin page
 
-- A **failed job** is a Health issue (warning) until it is cancelled (also by scheduling its key again) or removed with
-  the finished rows; a repeating job whose occurrence failed is one until an occurrence **succeeds** (a missed one does
-  not clear it). The 48 newest failures (by failure time) are listed; when there are more, one more issue says how many
-  (kept up as jobs fail and are dismissed, and counted again at each maintenance pass). The reason a handler gave
-  passed the page boundary before it was stored, and passes it again when it is shown.
+- A **failed job** is a Health issue (warning) until it is cancelled by its id (on the Scheduled jobs page, or
+  `cancel(job.id)`) or removed with the finished rows seven days on. A repeating job whose occurrence failed stays live
+  and is one until an occurrence **succeeds** (a missed one does not clear it), until it is cancelled, or until
+  scheduling its key again replaces it. The 48 newest failures (by failure time) are listed; when there are more, one
+  more issue says so and points to the Scheduled jobs page, without a number (reading 49 rows by the index is enough to
+  know). The issues are read again after every change of a job with an issue; a read that fails is tried again after
+  the loop's back-off (5 s), not left until maintenance. The reason a handler gave passed the page boundary before it
+  was stored, and passes it again when it is shown.
 - **Diagnostics › Scheduled jobs** lists every job a page at a time (`GET /api/scheduler/jobs?cursor=…`, at most 20 a
   page, read as two lists of 10 with a pause between): live jobs by due time, then the finished ones (kept seven days),
   newest first; "Load more" reads the next page. Payloads are never shown. "Cancel" works on live and failed jobs;
   cancelling a running job does not interrupt it.
 - **The list is not a snapshot.** Each page continues after the place of the last job of the page before. A job that
-  changes in between can be missed (a live job not yet read that is rescheduled to before that place) or shown twice
-  (a live job already shown that finishes meanwhile reappears among the finished ones; the page keeps the first). The
-  cursor is a random token of the running server, kept for its newest 256 pages (shared by every admin page): an older
-  one, or one from before a restart, is answered 400 and the page reads the list again from the top. Refresh, and the
-  reload after a cancel, start a new reading; a "Load more" still on its way is then dropped.
+  changes in between can be missed (a live job not yet read that is rescheduled to before that place) or come twice
+  (a live job already read that finishes meanwhile reappears among the finished ones, in a later page or in the same
+  answer; the page shows it once, as it came first). The cursor is a random token of the running server, kept for its
+  newest 256 pages (shared by every admin page): an older one, an empty one, or one from before a restart, is answered
+  400 and the page reads the list again from the top. Refresh, and the reload after a cancel, start a new reading at
+  once: the old reading's cursor is not used again, "Load more" waits until the new first page has arrived, and a
+  "Load more" still on its way is dropped.
 - `pnpm start doctor` lists the failed jobs, read-only from the database.
 - **Finished rows** (`done`, `failed`, `cancelled`, `missed`) are removed seven days after they finished, by the
   maintenance pass (every 10 minutes, also when nothing is due), so a row can stay up to that much longer: at most 200
@@ -228,9 +236,12 @@ read per published handler) or until its maintenance pass is due (every 10 minut
 Health issues, and the recount of each module's live jobs: a counter that disagrees with the rows is set to what they
 say), and is woken by a schedule, a reschedule, a cancel, a handler being published, a run ending, and a jump of the
 wall clock (it sleeps at most 10 s at a time and compares the wall clock with the monotonic one). A job whose handler
-is not published is never read by it. At most 32 runs at once, shared fairly: a pass claims in rounds of at most one
-job per handler, starting at the handler after the one whose job it started last, so a handler with many due jobs
-cannot keep another's waiting.
+is not published is never read by it. At most 32 runs at once, shared fairly: **a pass is one round**. It reads the
+published handlers as they are when it starts and takes at most one due job of each (starting at the handler after the
+one whose job it started last), up to the cap, then ends. When it claimed a job (or found one missed), the next pass
+starts at once; otherwise the loop sleeps until the next due time or a wake (at the cap, a run that ends wakes it). So a
+handler with many due jobs cannot keep another's waiting, and a job that becomes due, a handler published meanwhile,
+maintenance and the Health issues are all considered again before any handler gets a second job.
 
 ## Core services
 
@@ -244,7 +255,8 @@ when it is registered again.
 
 `packages/store-sqlite/test/schedulerLatency.test.ts`, SQLite on a file, at the limits: 1,000 jobs (five owners of 200,
 50 published handlers) with payloads of 1,000 JSON characters made of escapes, keys of 100 and origin ids of 64;
-retention rows of 2,134 characters, the largest a finished row can be (a live row also has its three index fields).
+retention rows of 2,134 characters: failed jobs with the payload, key, ids, cron, zone and failure text at their longest
+(not quite the largest finished row: a cancelled retry also keeps its occurrence time).
 The development machine (16-thread AMD Ryzen 9 7945HX laptop, shared with other agents), worst of three runs, after
 50 calls to warm up. Two kinds of number:
 

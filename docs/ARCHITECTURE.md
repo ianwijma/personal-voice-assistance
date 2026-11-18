@@ -862,8 +862,10 @@ SchedulerEngine = SchedulerHook & { forCore(owner: CoreOwner): CoreScheduler; li
   sleeps until the minimum or the maintenance pass (10 min: retention of finished rows older than 7 days in bounded
   steps, the recovery rule, the recount of each module's live jobs, the Health issues), at most 10 s at a time with the
   wall-clock jump check, and is woken by a schedule, reschedule, cancel, publication and a run's end. A job without a
-  published handler is never read. A pass claims in rounds of at most one job per handler, starting after the handler
-  whose job it started last (fair between handlers), until 32 run.
+  published handler is never read. A pass is one round: at most one due job of each handler published when it starts,
+  starting after the handler whose job it started last (fair between handlers), up to 32 runs; a pass that moved a job
+  on is followed at once by the next (a yield between), so new handlers, newly due jobs, maintenance and the Health
+  issues are considered before any handler gets a second job.
 - **A run**: claim (`running`, attempt + 1, the row's `rev` kept) in one transaction; the handler in a fiber of its own,
   through `PartRunner.inFlight`, with `CurrentJob` = the job's origin as its principal (the gateway admits it first),
   within its time limit (decoding included), forked in the engine's run scope (a core handler's in a scope of it that
@@ -873,7 +875,8 @@ SchedulerEngine = SchedulerHook & { forCore(owner: CoreOwner): CoreScheduler; li
   telling (idempotent: run again within its retries; otherwise one-off `failed`, repeating moves on), applied when its
   handler is published and by the maintenance pass.
 - **Inside a module's transaction**: `prepare` (an Effect, outside) then `job.writeIn(tx)` (synchronous, inside): it
-  joins the running transaction (the store's flat transactions) and wakes the engine after the commit. Every refusal
+  joins the running transaction (the store's flat transactions) and wakes the engine after the commit. It takes the
+  part's synchronous guard first: a prepared job kept past its part's close dies with `ModuleStopped`. Every refusal
   comes before its first write; a store failure after it must not be caught (the store cannot make a joined
   transaction fail whatever its caller catches).
 - **Rows**: `jobs` has `maxChars` 2,500 (the worst legal row, built by the contract), so one list reads
@@ -883,7 +886,8 @@ SchedulerEngine = SchedulerHook & { forCore(owner: CoreOwner): CoreScheduler; li
   finished newest first; not a snapshot; the cursor is a random token of this engine for the last row of a page, kept
   for its newest 256 pages, since the store continues a list only after a row object a list returned),
   `POST /api/scheduler/jobs/<id>/cancel` (`serve/schedulerApi.ts`, `@pva/protocol` `scheduledJobs.ts`, no protocol
-  bump), shown under Diagnostics › Scheduled jobs; issues under the source `scheduler`; `doctor` reads the failed jobs
+  bump), shown under Diagnostics › Scheduled jobs; issues under the source `scheduler` (the 48 newest failures, and one
+  issue without a number when there are more; a failed read is retried by the loop's back-off); `doctor` reads the failed jobs
   read-only.
 - **Turn path**: only a `schedule` (or `cancel`, `reschedule`, `prepare`) called by a tool: one synchronous transaction
   of at most a few single-row writes (measured in docs/SCHEDULING.md "Latency").
