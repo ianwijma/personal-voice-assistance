@@ -255,6 +255,54 @@ describe("the mock, through its handlers, as the server", { timeout: 30_000 }, (
     for (const p of [nothing, screenOnly, again]) p.ws.close()
   })
 
+  it("b4/b5/b7/b8 (round 2): another tab's declaration withdraws the old tab's card and its stale press fails; ids never collide; Dutch texts follow the saved language; closed connections leave no bookkeeping", async () => {
+    const http = url.replace(/^ws/, "http").replace(/\/ws$/, "")
+    const post = (path: string, body: unknown) => fetch(`${http}${path}`, { method: "POST", body: JSON.stringify(body) })
+    const both = { v: 1 as const, display: { class: "standard" as const, widthPx: 800, heightPx: 600, dpr: 1, touch: "coarse" as const, colour: true }, speaker: { media: ["speech" as const] } }
+    // b4: tab A shows a sounding ring; tab B of the same device declares no outputs: A's card is withdrawn, and A's
+    // Stop with the id it learned is refused.
+    const tabA = await Peer.open({ device: { id: "d-mock-round2-01", kind: "web-voice", name: "Round two", capabilities: both } })
+    const ring = (await (await post("/mock/notify", { title: "Ring", ring: true, deviceId: "d-mock-round2-01" })).json()) as { id: string }
+    await tabA.waitFor("notification.ring", (m) => m.notification.id === ring.id && m.notification.sound)
+    const tabB = await Peer.open({ device: { id: "d-mock-round2-01", kind: "web-voice", name: "Round two", capabilities: { v: 1 } } })
+    await tabA.waitFor("notification.resolved", (m) => m.id === ring.id && m.outcome === "withdrawn")
+    expect(tabB.messages.some((m) => m.type === "notification.ring")).toBe(false)
+    const stale = await tabA.request({ type: "notification.action", id: ring.id, actionId: "stop" })
+    expect([stale.ok, stale.say]).toEqual([false, "I can't do that right now."])
+    await post("/mock/notify/resolve", { id: ring.id })
+    // b5: generated ids skip every id issued or named; a named id is never reused, also after it was resolved.
+    const probe = (await (await post("/mock/notify", { title: "Probe" })).json()) as { id: string }
+    const n = Number(probe.id.replace("n-mock-", ""))
+    const named = [`n-mock-${n + 1}`, `n-mock-${n + 2}`]
+    for (const id of named) expect((await post("/mock/notify", { id, title: "Named" })).status).toBe(200)
+    const generated = (await (await post("/mock/notify", { title: "Generated" })).json()) as { id: string }
+    expect([probe.id, ...named]).not.toContain(generated.id)
+    await post("/mock/notify/resolve", { id: named[0] })
+    expect((await post("/mock/notify", { id: named[0], title: "Again" })).status).toBe(409)
+    for (const id of [probe.id, named[1], generated.id]) await post("/mock/notify/resolve", { id })
+    // b7: a Dutch household: the card's texts and the answers are Dutch (the service's words).
+    const a = await admin()
+    expect((await a.request({ type: "settings.update", sectionId: "home", patch: { values: { HOME_LANGUAGE: "nl-NL" }, secrets: {} } })).ok).toBe(true)
+    try {
+      const dutch = (await (await post("/mock/notify", { title: "Het water kookt", ring: true, deviceId: "d-mock-round2-02", actions: [{ id: "later", label: "Later" }], handlerDown: true })).json()) as { id: string }
+      const tabC = await Peer.open({ device: { id: "d-mock-round2-02", kind: "web-voice", name: "Dutch", capabilities: both } })
+      const card = await tabC.waitFor("notification.ring", (m) => m.notification.id === dutch.id)
+      expect(card.notification.texts).toEqual({ region: "Meldingen", startAudio: "Zet het geluid aan om het te horen." })
+      expect((await tabC.request({ type: "notification.action", id: dutch.id, actionId: "later" })).say).toBe("Dat kan ik nu niet doen.")
+      expect((await tabC.request({ type: "notification.action", id: dutch.id, actionId: "stop" })).say).toBe("Klaar.")
+      tabC.ws.close()
+      await tabC.closed
+    } finally {
+      expect((await a.request({ type: "settings.update", sectionId: "home", patch: { values: { HOME_LANGUAGE: "en-GB" }, secrets: {} } })).ok).toBe(true)
+    }
+    // b8: what a closed connection held is not kept.
+    for (const p of [tabA, tabB, a]) p.ws.close()
+    await Promise.all([tabA.closed, tabB.closed, a.closed])
+    await new Promise((r) => setTimeout(r, 100))
+    const book = (await (await post("/mock/notify/held", {})).json()) as { held: number; voiceConnections: number }
+    expect(book.held).toBeLessThanOrEqual(book.voiceConnections)
+  })
+
   it("a privacy change while the scripted turn is being heard: the reconnected page gets nothing of the old session", async () => {
     const a = await admin()
     const id = "d-mock-pending01"

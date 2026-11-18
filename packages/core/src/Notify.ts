@@ -37,8 +37,8 @@ import type { ConnectionRef, TurnPerson } from "./TurnContext.ts"
  * - **Actions** reach a handler the owning module registered in its `shared` part (`notify.handle`), claimed on the
  *   row first, one at a time per notification; `stop` is the host's and wins.
  * - **Speech** (`ctx.speech.say`) is one announcement per device queue, after whatever is being spoken there.
- * - The service owns **one repeating job** (`maintain`, every minute): expiry, the end of do not disturb, stale claims,
- *   retention and a reconciliation of every connected device.
+ * - Maintenance (expiry, the end of do not disturb, stale claims, retention, a reconciliation of every device) runs
+ *   when something is due (`due`, planned by `plan()`), with an hourly safety net (`hourly`).
  */
 
 // ---------------------------------------------------------------------------------------------------------------------
@@ -64,7 +64,11 @@ export const KEEP_RESOLVED_MS = 24 * 3_600_000
 export const MAX_DND_MS = 7 * 24 * 3_600_000
 /** An action handler's time limit (as a typed action's, `ACTION_TIMEOUT_MS`). */
 export const NOTIFY_ACTION_TIMEOUT_MS = 5_000
-/** A claim older than this is released by the maintenance job (the handler's limit and the outcome's retries are over). */
+/**
+ * A claim that no run in this process holds (after a restart, or a press that could not write its outcome) is released
+ * by maintenance once it is this old by wall time (or dated in the future: the wall clock moved back). A claim a run in
+ * this process holds is never released or replaced because wall time moved: that run ends by its own time limit.
+ */
 export const CLAIM_RELEASE_MS = 3 * NOTIFY_ACTION_TIMEOUT_MS
 /** The longest sentence a handler's answer may show (`ActionAnswer.say`), cut at the page boundary. */
 export const MAX_ANSWER_CHARS = 300
@@ -72,12 +76,19 @@ export const MAX_ANSWER_CHARS = 300
 export const MAX_SPEECH_CHARS = 300
 /** Announcements on one device at most, waiting or being spoken; one more on it is not queued (`busy`). */
 export const MAX_SPEECH_QUEUE = 8
-/** The service's one job: its schedule (every minute), its handler and its key under `core.notify`. */
-export const MAINTENANCE_CRON = "* * * * *"
-export const MAINTENANCE_HANDLER = "maintain"
+/**
+ * The service's two jobs under `core.notify` (D2b): `due`, one-shot, planned by `plan()` for the next thing that is due
+ * (none when nothing is); and `hourly`, repeating, the safety net that does the full pass and plans again, so a lost
+ * plan leaves nothing overdue for more than an hour. Each has a fixed key equal to its handler's name.
+ */
+export const DUE_HANDLER = "due"
+export const HOURLY_HANDLER = "hourly"
+export const HOURLY_CRON = "0 * * * *"
+/** When a device's reconciliation failed (or do not disturb could not be read), the next maintenance is this soon. */
+export const RETRY_AFTER_MS = 60_000
 /**
  * What one maintenance run does at most, each in transactions of one page (12 rows) with a yield between: open rows
- * read for expiry and stale claims, resolved rows removed. More waits for the next run, a minute later.
+ * read for expiry and stale claims, resolved rows removed. More is planned for at once (the next run follows).
  */
 export const MAINTENANCE_ROWS = 10 * 12
 
@@ -137,7 +148,7 @@ export interface NotifyRequest {
   readonly target?: NotifyTarget
   /** One open notification per module and key: sending it again while one is open answers that one (`deduped`). */
   readonly key?: string
-  /** It is resolved as `expired` this long after it is sent (up to a minute late). Default and maximum per priority. */
+  /** It is resolved as `expired` this long after it is sent. Default and maximum per priority. */
   readonly expiresInMs?: number
   /** At most `MAX_NOTIFICATION_ACTIONS`, with `handler`. */
   readonly actions?: ReadonlyArray<NotifyAction>
@@ -187,7 +198,7 @@ export interface NotifyListQuery {
 /** Do not disturb, for the house. While it is on nothing rings and nothing is announced. */
 export interface DndState {
   readonly on: boolean
-  /** When it ends by itself (the maintenance job, up to a minute late). Absent: until it is cleared. */
+  /** When it ends by itself (maintenance planned for that time). Absent: until it is cleared. */
   readonly until?: number
 }
 
@@ -240,7 +251,7 @@ export interface ModuleNotify {
   /** Do not disturb, for the house. */
   readonly dnd: {
     readonly get: Effect.Effect<DndState, NotifyError>
-    /** On, until it is cleared or until `until` (at most `MAX_DND_MS` ahead; it ends up to a minute late). */
+    /** On, until it is cleared or until `until` (at most `MAX_DND_MS` ahead). */
     readonly set: (options?: { readonly until?: number }) => Effect.Effect<DndState, NotifyError>
     readonly clear: Effect.Effect<DndState, NotifyError>
   }

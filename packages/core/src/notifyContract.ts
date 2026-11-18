@@ -25,8 +25,9 @@ import {
   CLAIM_RELEASE_MS,
   type DeviceOutputs,
   KEEP_RESOLVED_MS,
-  MAINTENANCE_CRON,
-  MAINTENANCE_HANDLER,
+  DUE_HANDLER,
+  HOURLY_CRON,
+  HOURLY_HANDLER,
   MAINTENANCE_ROWS,
   MAX_DND_MS,
   MAX_EXPIRY_MS,
@@ -59,6 +60,8 @@ export type OpenNotifyStore = () => Effect.Effect<NotifyContractStore, unknown, 
 const SECOND = 1_000
 const MINUTE = 60 * SECOND
 const HOUR = 60 * MINUTE
+/** The test clock's start in the wall-clock cases (a whole hour). */
+const WALL_START = Date.UTC(2026, 10, 19, 9)
 
 /** A known device of the cases. */
 export const contractDevice = (id: string, name: string, room: string, privacy: PrivacyPlace["privacy"], defaultPerson: string | null): KnownDevice => ({
@@ -117,8 +120,18 @@ const prepared = (store: HouseholdStore) => Effect.as(store.prepare([], [schedul
  * the maintenance sweep); `dnd`, the reads of do not disturb; `jobs`, the scheduler's job inserts (the maintenance job).
  */
 export const notifyFaultyStore = (inner: HouseholdStore) => {
-  const faults = { writes: 0, counts: 0, reads: 0, dnd: 0, jobs: 0, failed: 0 }
+  /** `skipReads`: reads let through before `reads` starts failing. */
+  const faults = { writes: 0, counts: 0, reads: 0, skipReads: 0, dnd: 0, jobs: 0, failed: 0 }
+  /**
+   * A wait before one of the service's transactions (as a busy store's retry wait is): `wait` is taken by the
+   * transaction after `skip` more have gone through, which then waits for it before it begins.
+   */
+  const gate: { skip: number; wait: Deferred.Deferred<void> | undefined } = { skip: 0, wait: undefined }
   const fault = (k: "writes" | "counts" | "reads" | "dnd" | "jobs") => {
+    if (k === "reads" && faults.reads > 0 && faults.skipReads > 0) {
+      faults.skipReads--
+      return
+    }
     if (faults[k] <= 0) return
     faults[k]--
     faults.failed++
@@ -156,7 +169,18 @@ export const notifyFaultyStore = (inner: HouseholdStore) => {
             })
         }
       }) as ModuleStore["collection"],
-      transaction: (f) => own.transaction((tx) => f(failing(tx)))
+      transaction: (f) =>
+        Effect.suspend(() => {
+          const run = own.transaction((tx) => f(failing(tx)))
+          if (gate.wait === undefined) return run
+          if (gate.skip > 0) {
+            gate.skip--
+            return run
+          }
+          const wait = gate.wait
+          gate.wait = undefined
+          return Effect.andThen(Deferred.await(wait), run)
+        })
     } satisfies ModuleStore
   }
   const reader: HouseholdStore["reader"] = (owner, c) => {
@@ -179,7 +203,7 @@ export const notifyFaultyStore = (inner: HouseholdStore) => {
       }
     }
   })
-  return { store: { ...inner, forCore, reader, transaction: (f) => inner.transaction((htx) => f(wrapHost(htx))) } satisfies HouseholdStore, faults }
+  return { store: { ...inner, forCore, reader, transaction: (f) => inner.transaction((htx) => f(wrapHost(htx))) } satisfies HouseholdStore, faults, gate }
 }
 
 /** One page (tab) of a device in the world. */
@@ -206,6 +230,10 @@ export const notifyWorld = (
     readonly unrecorded?: boolean
     readonly observe?: Parameters<typeof makeNotifyEngine>[0]["observe"]
     readonly speech?: Parameters<typeof makeNotifyEngine>[0]["speech"]
+    /** The wall clock's offset from the test clock (ms), shared with the case: a correction moves it alone. */
+    readonly wall?: { offset: number }
+    /** A wait before the service's next `schedule` call (a slow store under the scheduler), taken by that call. */
+    readonly scheduleGate?: { wait: Deferred.Deferred<void> | undefined }
   } = {}
 ) =>
   Effect.gen(function*() {
@@ -222,11 +250,27 @@ export const notifyWorld = (
     const issues = makeIssueRegistry()
     const ids = o.modules ?? ["bell"]
     let hostRef: { readonly gateway: ExecutionGateway; readonly pageText: (m: string, t: unknown, max: number) => string } | undefined
+    const wall = o.wall ?? { offset: 0 }
     const made = yield* Scope.provide(scope)(Effect.gen(function*() {
       const scheduler = yield* makeSchedulerEngine({ store, issues, retryBaseMs: SECOND, outcomeRetryMs: [100, 200], gateway: () => hostRef?.gateway })
       const notify = yield* makeNotifyEngine({
         store,
-        scheduler,
+        scheduler: o.scheduleGate === undefined ? scheduler : {
+          ...scheduler,
+          forCore: (owner) => {
+            const calls = scheduler.forCore(owner)
+            const gate = o.scheduleGate!
+            return {
+              ...calls,
+              schedule: (request) =>
+                Effect.suspend(() => {
+                  const wait = gate.wait
+                  gate.wait = undefined
+                  return wait === undefined ? calls.schedule(request) : Effect.andThen(Deferred.await(wait), calls.schedule(request))
+                })
+            }
+          }
+        },
         devices: () => devices,
         outputs: o.outputs ?? (() => ({ speak: true, show: true })),
         privacy: makePrivacy((id) => places.get(id), (id) => MEMBERS.has(id)),
@@ -242,6 +286,7 @@ export const notifyWorld = (
         }),
         speech: o.speech ?? (() => undefined),
         ...(o.observe !== undefined ? { observe: o.observe } : {}),
+        now: Effect.map(Clock.currentTimeMillis, (t) => t + wall.offset),
         gateway: () => hostRef?.gateway,
         // The host's own page boundary (secrets replaced, cut at whole characters).
         pageText: (m, text, max) => hostRef?.pageText(m, text, max) ?? String(text).slice(0, max),
@@ -339,6 +384,7 @@ export const notifyWorld = (
       ringsOn,
       resolvedOn,
       pressOn,
+      wall,
       stop: Scope.close(scope, Exit.void)
     }
   })
@@ -366,7 +412,7 @@ export const notifyContract = (name: string, open: OpenNotifyStore) =>
         before?.(faulty.faults)
         const world = yield* notifyWorld(faulty.store, o)
         yield* world.settle
-        return { world, faults: faulty.faults }
+        return { world, faults: faulty.faults, gate: faulty.gate, opened }
       })
 
     // ---- Sending and delivery
@@ -584,21 +630,52 @@ export const notifyContract = (name: string, open: OpenNotifyStore) =>
         for (const o of ["stop", "expired", "withdrawn"]) assert.strictEqual(reasonOf(yield* Effect.exit(world.bell("other").resolve(theirs.notification.id, o))), "invalid")
       }))
 
-    it.effect("D2: the service owns exactly one job, repeating every minute by key, also after a restart", () =>
+    // ---- Maintenance (D2b): a one-shot job planned for the next thing that is due, and an hourly safety net
+
+    /** The `due` job's time as the scheduler has it (`undefined`: none live). */
+    const dueJobAt = (world: Effect.Success<ReturnType<typeof notifyWorld>>) => Effect.map(notifyJobs(world), (live) => live.find((j) => j.handler === DUE_HANDLER)?.dueAt)
+
+    it.effect("D2b: two jobs at most: hourly by key always, and due (by key) only while something is due; also after a restart", () =>
       Effect.gen(function*() {
         const { opened, world } = yield* start()
-        yield* world.sendOn("kitchen-display", { title: "A", priority: "ring" })
-        yield* world.bell().dnd.set({ until: (yield* Clock.currentTimeMillis) + HOUR })
-        yield* world.bell().resolve((yield* world.rows)[0]!.id)
+        const t0 = yield* Clock.currentTimeMillis
+        // Nothing is due: the hourly job alone.
+        assert.deepStrictEqual((yield* notifyJobs(world)).map((j) => [j.handler, j.key, j.cron]), [[HOURLY_HANDLER, HOURLY_HANDLER, HOURLY_CRON]])
+        assert.isUndefined(world.notify.plannedAt())
+        // Something due that goes away before it is due: the due job goes with it.
+        yield* world.bell().dnd.set({ until: t0 + 5 * MINUTE })
+        yield* world.settle
+        assert.strictEqual(yield* dueJobAt(world), t0 + 5 * MINUTE)
+        yield* world.bell().dnd.clear
+        yield* world.settle
+        assert.isUndefined(yield* dueJobAt(world))
+        assert.isUndefined(world.notify.plannedAt())
+        const ring = yield* world.sendOn("kitchen-display", { title: "A", priority: "ring" })
+        assert.strictEqual(world.notify.plannedAt(), ring.notification.expiresAt)
+        yield* world.bell().dnd.set({ until: t0 + 5 * MINUTE })
+        yield* world.settle
+        assert.strictEqual(world.notify.plannedAt(), t0 + 5 * MINUTE)
         const live = yield* notifyJobs(world)
-        assert.deepStrictEqual(live.map((j) => [j.handler, j.key, j.cron]), [[MAINTENANCE_HANDLER, MAINTENANCE_HANDLER, MAINTENANCE_CRON]])
+        assert.deepStrictEqual(live.map((j) => [j.handler, j.key, j.dueAt]).sort(), [[DUE_HANDLER, DUE_HANDLER, t0 + 5 * MINUTE], [HOURLY_HANDLER, HOURLY_HANDLER, t0 + HOUR]])
         yield* world.stop
+        // A restart plans at start: the same two jobs, the due one at the same time.
         const again = yield* notifyWorld(yield* prepared(yield* opened.reopen))
         yield* again.settle
-        assert.strictEqual((yield* notifyJobs(again)).length, 1)
+        assert.strictEqual(again.notify.plannedAt(), t0 + 5 * MINUTE)
+        assert.deepStrictEqual((yield* notifyJobs(again)).map((j) => j.handler).sort(), [DUE_HANDLER, HOURLY_HANDLER])
+        // When it all has ended and been cleaned up, the due job goes.
+        yield* again.bell().dnd.clear
+        yield* again.bell().resolve(ring.notification.id)
+        yield* again.settle
+        const resolvedAt = (yield* again.rows)[0]!.value.finishedAt!
+        assert.strictEqual(again.notify.plannedAt(), resolvedAt + KEEP_RESOLVED_MS)
+        yield* again.advance(KEEP_RESOLVED_MS)
+        assert.deepStrictEqual(yield* again.rows, [])
+        assert.isUndefined(again.notify.plannedAt())
+        assert.deepStrictEqual((yield* notifyJobs(again)).map((j) => j.handler), [HOURLY_HANDLER])
       }))
 
-    it.effect("a15: a maintenance job that cannot be scheduled at start is a Health issue, and is scheduled at the next send", () =>
+    it.effect("a15: an hourly job that cannot be scheduled at start is a Health issue, and is scheduled at the next send", () =>
       Effect.gen(function*() {
         const { world, faults } = yield* startFaulty(undefined, (f) => (f.jobs = 1))
         assert.isFalse(world.notify.maintenanceScheduled())
@@ -609,36 +686,142 @@ export const notifyContract = (name: string, open: OpenNotifyStore) =>
         assert.strictEqual(world.ringsOn("kitchen-display").length, 1)
         assert.isTrue(world.notify.maintenanceScheduled())
         assert.deepStrictEqual(world.issues.all(), [])
-        assert.strictEqual((yield* notifyJobs(world)).length, 1)
+        assert.deepStrictEqual((yield* notifyJobs(world)).map((j) => j.handler).sort(), [DUE_HANDLER, HOURLY_HANDLER])
       }))
 
-    it.effect("expiry by the maintenance job: a ring is resolved expired within a minute after 15 minutes, a normal one after a day", () =>
+    it.effect("expiry on time: the due job resolves a notification at its expiry exactly (a minute, 15 minutes for a ring, a day for a normal one)", () =>
       Effect.gen(function*() {
         const { world } = yield* start()
+        const short = yield* world.sendOn("kitchen-display", { title: "Short", priority: "ring", expiresInMs: MINUTE })
         const ring = yield* world.sendOn("kitchen-display", { title: "Ring", priority: "ring" })
         const plain = yield* world.sendOn("kitchen-display", { title: "Plain" })
-        yield* world.advance(15 * MINUTE - SECOND)
-        assert.strictEqual((yield* world.rows).find((r) => r.id === ring.notification.id)?.value.state, "open")
-        yield* world.advance(MINUTE + SECOND)
-        const states = new Map((yield* world.rows).map((r) => [r.id, r.value.outcome ?? r.value.state] as const))
-        assert.strictEqual(states.get(ring.notification.id), "expired")
-        assert.strictEqual(states.get(plain.notification.id), "open")
+        const state = (id: string) => Effect.map(world.rows, (rows) => rows.find((r) => r.id === id)?.value.outcome ?? "open")
+        yield* world.advance(MINUTE - 1)
+        assert.strictEqual(yield* state(short.notification.id), "open")
+        yield* world.advance(1)
+        assert.strictEqual(yield* state(short.notification.id), "expired")
+        assert.strictEqual(world.notify.plannedAt(), ring.notification.expiresAt)
+        yield* world.advance(15 * MINUTE - MINUTE - 1)
+        assert.strictEqual(yield* state(ring.notification.id), "open")
+        yield* world.advance(1)
+        assert.strictEqual(yield* state(ring.notification.id), "expired")
         assert.deepStrictEqual(world.notify.ringingOn("kitchen-display"), [])
         assert.isTrue(world.resolvedOn("kitchen-display").some((m) => m.id === ring.notification.id && m.outcome === "expired"))
-        yield* world.advance(24 * HOUR)
-        assert.strictEqual((yield* world.rows).find((r) => r.id === plain.notification.id)?.value.outcome, "expired")
+        yield* world.advance(plain.notification.expiresAt - (yield* Clock.currentTimeMillis) - 1)
+        assert.strictEqual(yield* state(plain.notification.id), "open")
+        yield* world.advance(1)
+        assert.strictEqual(yield* state(plain.notification.id), "expired")
       }))
 
-    it.effect("a wall-clock jump: what expired meanwhile is resolved by the next maintenance run", () =>
+    it.effect("D2b: plan() runs after each kind of change: send, resolve, a press's outcome, do not disturb, a device marked for another pass", () =>
+      Effect.gen(function*() {
+        const { world, faults } = yield* startFaulty()
+        const t0 = yield* Clock.currentTimeMillis
+        const later = yield* world.sendOn("kitchen-display", { title: "Later", expiresInMs: 2 * HOUR })
+        assert.strictEqual(world.notify.plannedAt(), t0 + 2 * HOUR)
+        assert.strictEqual(yield* dueJobAt(world), t0 + 2 * HOUR)
+        // send: an earlier expiry moves it earlier.
+        const sooner = yield* world.sendOn("kitchen-display", { title: "Sooner", expiresInMs: HOUR, actions: [{ id: "snooze", label: "Snooze" }], handler: "answer" })
+        assert.strictEqual(yield* dueJobAt(world), t0 + HOUR)
+        // do not disturb with an earlier end; clearing it moves it back.
+        yield* world.bell().dnd.set({ until: t0 + 10 * MINUTE })
+        yield* world.settle
+        assert.strictEqual(yield* dueJobAt(world), t0 + 10 * MINUTE)
+        yield* world.bell().dnd.clear
+        yield* world.settle
+        assert.strictEqual(yield* dueJobAt(world), t0 + HOUR)
+        // a device marked for another pass: a minute from now.
+        faults.reads = 1
+        yield* world.open("robins-phone")
+        assert.strictEqual(yield* dueJobAt(world), t0 + MINUTE)
+        yield* world.advance(MINUTE)
+        assert.strictEqual(yield* dueJobAt(world), t0 + HOUR)
+        // a press's outcome (resolved): the next is the later one.
+        assert.isTrue((yield* world.pressOn("kitchen-display", sooner.notification.id, "snooze")).ok)
+        const doneAt = (yield* world.rows).find((r) => r.id === sooner.notification.id)!.value.finishedAt!
+        assert.strictEqual(yield* dueJobAt(world), t0 + 2 * HOUR)
+        // resolve: retention of the two resolved rows comes after the last expiry is gone.
+        yield* world.bell().resolve(later.notification.id)
+        yield* world.settle
+        assert.strictEqual(yield* dueJobAt(world), doneAt + KEEP_RESOLVED_MS)
+        assert.deepStrictEqual(world.issues.all(), [])
+      }))
+
+    it.effect("D2b: two changes at once plan once each, in turn: the job ends at the earliest", () =>
       Effect.gen(function*() {
         const { world } = yield* start()
-        const ring = yield* world.sendOn("kitchen-display", { title: "Ring", priority: "ring" })
-        yield* world.advance(3 * HOUR)
-        assert.strictEqual((yield* world.rows).find((r) => r.id === ring.notification.id)?.value.outcome, "expired")
-        assert.deepStrictEqual(world.notify.ringingOn("kitchen-display"), [])
+        const t0 = yield* Clock.currentTimeMillis
+        yield* Effect.all([
+          world.bell().send({ title: "One", target: "everywhere", expiresInMs: 3 * HOUR }),
+          world.bell().send({ title: "Two", target: "everywhere", expiresInMs: HOUR }),
+          world.bell().dnd.set({ until: t0 + 2 * HOUR })
+        ], { concurrency: "unbounded" })
+        yield* world.settle
+        assert.strictEqual(world.notify.plannedAt(), t0 + HOUR)
+        assert.strictEqual(yield* dueJobAt(world), t0 + HOUR)
+        assert.strictEqual((yield* notifyJobs(world)).length, 2)
       }))
 
-    it.effect(`a11: expiry needs no per-notification job: a maintenance run that fails is repeated by the next one`, () =>
+    it.effect("D2b: plans never interleave: a change while a plan is being written plans again after it, so the newest wins", () =>
+      Effect.gen(function*() {
+        const scheduleGate: { wait: Deferred.Deferred<void> | undefined } = { wait: undefined }
+        const { world } = yield* start({ scheduleGate })
+        const t0 = yield* Clock.currentTimeMillis
+        const slow = yield* Deferred.make<void>()
+        scheduleGate.wait = slow
+        yield* world.bell().send({ title: "Later", target: "everywhere", expiresInMs: 3 * HOUR })
+        for (let i = 0; i < 20 && scheduleGate.wait !== undefined; i++) yield* Effect.yieldNow
+        assert.isUndefined(scheduleGate.wait, "the first plan is writing its job")
+        yield* world.bell().send({ title: "Sooner", target: "everywhere", expiresInMs: HOUR })
+        for (let i = 0; i < 20; i++) yield* Effect.yieldNow
+        yield* Deferred.succeed(slow, undefined)
+        yield* world.settle
+        assert.strictEqual(yield* dueJobAt(world), t0 + HOUR)
+        assert.strictEqual(world.notify.plannedAt(), t0 + HOUR)
+      }))
+
+    it.effect("D2b: a lost plan (the due job could not be written) is a Health issue; the hourly job does the work within the hour and plans again", () =>
+      Effect.gen(function*() {
+        const { world, faults } = yield* startFaulty()
+        faults.jobs = 1
+        const ring = yield* world.sendOn("kitchen-display", { title: "Ring", priority: "ring", expiresInMs: 10 * MINUTE })
+        assert.deepStrictEqual(world.issues.all().map((i) => i.id), ["core.notify.plan"])
+        assert.isUndefined(yield* dueJobAt(world))
+        // Its expiry passes with no due job: still open until the hourly job, at the top of the hour.
+        yield* world.advance(HOUR - SECOND - (yield* Clock.currentTimeMillis) % HOUR)
+        assert.strictEqual((yield* world.rows)[0]?.value.state, "open")
+        yield* world.advance(SECOND)
+        assert.strictEqual((yield* world.rows)[0]?.value.outcome, "expired")
+        assert.deepStrictEqual(world.notify.ringingOn("kitchen-display"), [])
+        // And it planned again (retention of the resolved row): the issue is gone.
+        assert.deepStrictEqual(world.issues.all(), [])
+        assert.strictEqual(yield* dueJobAt(world), (yield* world.rows)[0]!.value.finishedAt! + KEEP_RESOLVED_MS)
+        assert.strictEqual(ring.notification.id, (yield* world.rows)[0]!.id)
+      }))
+
+    it.effect("a7: a wall-clock correction (the wall clock alone moves): forwards, the next run resolves what expired; backwards, nothing expires early", () =>
+      Effect.gen(function*() {
+        // A real date, so that a wall clock moved back is still a time after 1970.
+        yield* TestClock.setTime(WALL_START)
+        const wall = { offset: 0 }
+        const { world } = yield* start({ wall })
+        const ring = yield* world.sendOn("kitchen-display", { title: "Ring", priority: "ring" })
+        wall.offset = -3 * HOUR
+        yield* world.notify.maintainNow
+        yield* world.settle
+        assert.strictEqual((yield* world.rows)[0]?.value.state, "open")
+        wall.offset = 3 * HOUR
+        yield* world.notify.planNow
+        // Planned for now (or earlier) by the wall clock: the expiry has passed.
+        assert.isAtMost(world.notify.plannedAt()!, (yield* Clock.currentTimeMillis) + 3 * HOUR)
+        yield* world.notify.maintainNow
+        yield* world.settle
+        assert.strictEqual((yield* world.rows)[0]?.value.outcome, "expired")
+        assert.deepStrictEqual(world.notify.ringingOn("kitchen-display"), [])
+        assert.strictEqual(ring.notification.id, (yield* world.rows)[0]!.id)
+      }))
+
+    it.effect(`a11: expiry needs no per-notification job: a maintenance run that fails is repeated (at the latest by the hourly job)`, () =>
       Effect.gen(function*() {
         const { world, faults } = yield* startFaulty()
         const ring = yield* world.sendOn("kitchen-display", { title: "Ring", priority: "ring", expiresInMs: MINUTE })
@@ -646,15 +829,19 @@ export const notifyContract = (name: string, open: OpenNotifyStore) =>
         yield* world.advance(5 * MINUTE)
         assert.strictEqual((yield* world.rows).find((r) => r.id === ring.notification.id)?.value.state, "open")
         faults.reads = 0
-        yield* world.advance(MINUTE)
+        yield* world.advance(HOUR)
         assert.strictEqual((yield* world.rows).find((r) => r.id === ring.notification.id)?.value.outcome, "expired")
         assert.deepStrictEqual(world.notify.ringingOn("kitchen-display"), [])
       }))
 
-    it.effect(`retention: resolved rows are removed a day after, at most ${MAINTENANCE_ROWS} a run in transactions of a page; open ones stay`, () =>
+    it.effect(`a7: retention: one run removes exactly ${MAINTENANCE_ROWS} resolved rows past the day, at most a page per transaction; the next run the rest; open ones stay`, () =>
       Effect.gen(function*() {
         const modules = Array.from({ length: 14 }, (_, i) => `m${i}`)
-        const { world } = yield* start({ modules })
+        const removals: Array<number> = []
+        // A real date, so that a wall clock moved back is still a time after 1970.
+        yield* TestClock.setTime(WALL_START)
+        const wall = { offset: 0 }
+        const { world } = yield* start({ modules, wall, observe: (e) => void (e.kind === "retention" && removals.push(e.removed)) })
         // 130 resolved rows (more than one run, many pages), and one that stays open.
         for (let i = 0; i < 130; i++) {
           const m = modules[i % 13]!
@@ -662,19 +849,37 @@ export const notifyContract = (name: string, open: OpenNotifyStore) =>
           yield* world.bell(m).resolve(r.notification.id)
         }
         yield* world.bell("m13").send({ title: "Stays", target: "everywhere", expiresInMs: MAX_EXPIRY_MS.normal })
-        yield* world.advance(KEEP_RESOLVED_MS - MINUTE)
+        yield* world.settle
+        // Isolated runs: the wall clock alone moves past the day, so no job fires; each run is called once.
+        wall.offset = KEEP_RESOLVED_MS - MINUTE
+        yield* world.notify.maintainNow
         assert.strictEqual((yield* world.rows).length, 131)
-        // One run past the cutoff removes its maximum; the next the rest.
-        yield* world.advance(2 * MINUTE)
-        const left = (yield* world.rows).length
-        assert.isAtMost(left, 131 - MAINTENANCE_ROWS)
-        yield* world.advance(MINUTE)
+        removals.length = 0
+        wall.offset = KEEP_RESOLVED_MS + MINUTE
+        yield* world.notify.maintainNow
+        assert.strictEqual((yield* world.rows).length, 131 - MAINTENANCE_ROWS)
+        assert.strictEqual(removals.reduce((a, b) => a + b, 0), MAINTENANCE_ROWS)
+        assert.isAtMost(Math.max(...removals), 12)
+        yield* world.notify.maintainNow
         assert.deepStrictEqual((yield* world.rows).map((r) => r.value.title), ["Stays"])
+      }))
+
+    it.effect("retention on time: the due job removes a resolved row exactly a day after it was resolved", () =>
+      Effect.gen(function*() {
+        const { world } = yield* start()
+        // Off the hour, so that the hourly job cannot be what removes it.
+        yield* world.advance(17 * MINUTE)
+        const n = yield* world.sendOn("kitchen-display", { title: "Gone soon" })
+        yield* world.bell().resolve(n.notification.id)
+        yield* world.advance(KEEP_RESOLVED_MS - 1)
+        assert.strictEqual((yield* world.rows).length, 1)
+        yield* world.advance(1)
+        assert.deepStrictEqual(yield* world.rows, [])
       }))
 
     // ---- Do not disturb
 
-    it.effect("do not disturb: a ring is held silent; clearing it rings again; an end time ends it at the next maintenance run", () =>
+    it.effect("do not disturb: a ring is held silent; clearing it rings again; an end time ends it on time", () =>
       Effect.gen(function*() {
         const { world } = yield* start()
         const now = yield* Clock.currentTimeMillis
@@ -691,9 +896,10 @@ export const notifyContract = (name: string, open: OpenNotifyStore) =>
         yield* world.bell().dnd.clear
         yield* world.bell().dnd.set({ until: now + 5 * MINUTE })
         yield* world.settle
-        yield* world.advance(4 * MINUTE)
+        yield* world.advance(5 * MINUTE - 1)
         assert.isTrue((yield* world.bell().dnd.get).on)
-        yield* world.advance(2 * MINUTE)
+        yield* world.advance(1)
+        assert.deepStrictEqual(world.notify.dnd(), { on: false, known: true })
         assert.deepStrictEqual(yield* world.bell().dnd.get, { on: false })
         assert.strictEqual(world.ringsOn("kitchen-display").at(-1)?.sound, true)
         assert.strictEqual(reasonOf(yield* Effect.exit(world.bell().dnd.set({ until: now - 1 }))), "invalid")
@@ -707,10 +913,35 @@ export const notifyContract = (name: string, open: OpenNotifyStore) =>
         yield* world.sendOn("kitchen-display", { title: "Ring", priority: "ring" })
         assert.strictEqual(world.ringsOn("kitchen-display").at(-1)?.sound, false)
         assert.strictEqual(faults.dnd, 0)
-        // The next maintenance run reads it (off): it rings now.
+        // Planned a minute later: the due run reads it (off), and it rings now.
         yield* world.advance(MINUTE)
         assert.deepStrictEqual(world.notify.dnd(), { on: false, known: true })
         assert.strictEqual(world.ringsOn("kitchen-display").at(-1)?.sound, true)
+      }))
+
+    it.effect("a2 (round 2): a read of do not disturb that fails after start makes it unknown (on) and silences the holders; a later read restores it", () =>
+      Effect.gen(function*() {
+        const { world, faults } = yield* startFaulty()
+        assert.deepStrictEqual(world.notify.dnd(), { on: false, known: true })
+        yield* world.sendOn("kitchen-display", { title: "Ring", priority: "ring" })
+        assert.strictEqual(world.ringsOn("kitchen-display").at(-1)?.sound, true)
+        faults.dnd = 1
+        assert.strictEqual(reasonOf(yield* Effect.exit(world.bell().dnd.get)), "failed")
+        yield* world.settle
+        assert.deepStrictEqual(world.notify.dnd(), { on: true, known: false })
+        // The card it held is sent again silent; a new ring is silent too.
+        assert.strictEqual(world.ringsOn("kitchen-display").at(-1)?.sound, false)
+        yield* world.sendOn("kitchen-display", { title: "Another", priority: "ring" })
+        assert.strictEqual(world.ringsOn("kitchen-display").at(-1)?.sound, false)
+        assert.deepStrictEqual(world.notify.ringingOn("kitchen-display"), [])
+        // A maintenance read that fails does the same; a later successful read restores it and reconciles again.
+        faults.dnd = 1
+        yield* world.notify.maintainNow
+        assert.deepStrictEqual(world.notify.dnd(), { on: true, known: false })
+        assert.deepStrictEqual(yield* world.bell().dnd.get, { on: false })
+        yield* world.settle
+        assert.deepStrictEqual(world.notify.dnd(), { on: false, known: true })
+        assert.strictEqual(world.notify.ringingOn("kitchen-display").length, 2)
       }))
 
     // ---- Presses
@@ -869,6 +1100,148 @@ export const notifyContract = (name: string, open: OpenNotifyStore) =>
         assert.strictEqual((yield* world.rows)[0]?.value.state, "open")
         assert.deepStrictEqual(world.notify.ringingOn("kitchen-display").map((r) => r.id), [n.notification.id])
         assert.deepStrictEqual(world.resolvedOn("kitchen-display"), [])
+      }))
+
+    it.effect("a1 (round 2): a claim held by a run alive here is never taken over or released because the wall clock moved, forwards or backwards, maintenance or not", () =>
+      Effect.gen(function*() {
+        // A real date, so that a wall clock moved back is still a time after 1970.
+        yield* TestClock.setTime(WALL_START)
+        const wall = { offset: 0 }
+        const { world } = yield* start({ connected: ["kitchen-display", "robins-phone"], wall })
+        const n = yield* world.sendOn("kitchen-display", { title: "Both", priority: "ring", target: "everywhere", actions: [{ id: "snooze", label: "Snooze" }], handler: "answer" })
+        const release = yield* Deferred.make<void>()
+        let entries = 0
+        world.answer.current = () => Effect.andThen(Effect.sync(() => void entries++), Effect.as(Deferred.await(release), { say: "Handled." }))
+        const first = yield* Effect.forkChild(world.pressOn("kitchen-display", n.notification.id, "snooze"))
+        yield* world.settle
+        for (const offset of [MINUTE, CLAIM_RELEASE_MS * 10, -HOUR]) {
+          wall.offset = offset
+          yield* world.notify.maintainNow
+          yield* world.settle
+          assert.isDefined((yield* world.rows)[0]?.value.claim, `offset ${offset}`)
+          assert.deepStrictEqual(yield* world.pressOn("robins-phone", n.notification.id, "snooze"), { ok: false, say: "That is being handled already.", code: "busy" })
+        }
+        assert.strictEqual(entries, 1)
+        yield* Deferred.succeed(release, undefined)
+        assert.deepStrictEqual(yield* Fiber.join(first), { ok: true, say: "Handled." })
+        assert.strictEqual(entries, 1)
+      }))
+
+    it.effect("a1 (round 2): a claim no run here holds (its outcome could not be written) is released when stale, or when dated in the future after the clock moved back", () =>
+      Effect.gen(function*() {
+        // A real date, so that a wall clock moved back is still a time after 1970.
+        yield* TestClock.setTime(WALL_START)
+        const wall = { offset: 0 }
+        const { world, faults } = yield* startFaulty({ wall })
+        const n = yield* world.sendOn("kitchen-display", { title: "Write", actions: [{ id: "snooze", label: "Snooze" }], handler: "answer" })
+        world.answer.current = () => Effect.sync(() => ((faults.writes = 10), { say: "Done it." }))
+        const fiber = yield* Effect.forkChild(world.pressOn("kitchen-display", n.notification.id, "snooze"))
+        yield* world.settle
+        yield* TestClock.adjust(5 * SECOND)
+        assert.strictEqual((yield* Fiber.join(fiber)).code, "failed")
+        faults.writes = 0
+        assert.isDefined((yield* world.rows)[0]?.value.claim)
+        // Not stale yet by the wall clock: kept.
+        yield* world.notify.maintainNow
+        assert.isDefined((yield* world.rows)[0]?.value.claim)
+        // The wall clock moves back an hour: the claim is in the future, so no run can be holding it: released.
+        wall.offset = -HOUR
+        yield* world.notify.maintainNow
+        assert.isUndefined((yield* world.rows)[0]?.value.claim)
+        world.answer.current = () => Effect.succeed({ say: "Again." })
+        assert.deepStrictEqual(yield* world.pressOn("kitchen-display", n.notification.id, "snooze"), { ok: true, say: "Again." })
+      }))
+
+    it.effect("a3 (round 2): stopRinging finishes every ring it found even when its caller is interrupted while the store is busy", () =>
+      Effect.gen(function*() {
+        const { world, gate } = yield* startFaulty()
+        const one = yield* world.sendOn("kitchen-display", { title: "One", priority: "ring" })
+        const two = yield* world.sendOn("kitchen-display", { title: "Two", priority: "ring" })
+        const busy = yield* Deferred.make<void>()
+        gate.skip = 1
+        gate.wait = busy
+        const caller = yield* Effect.forkChild(world.notify.stopRinging("kitchen-display"))
+        yield* world.settle
+        assert.isUndefined(gate.wait, "the second stop waits on the busy store")
+        yield* Fiber.interrupt(caller)
+        yield* Deferred.succeed(busy, undefined)
+        yield* world.settle
+        const states = new Map((yield* world.rows).map((r) => [r.id, r.value.outcome ?? r.value.state] as const))
+        assert.deepStrictEqual([states.get(one.notification.id), states.get(two.notification.id)], ["stop", "stop"])
+        assert.deepStrictEqual(world.notify.ringingOn("kitchen-display"), [])
+      }))
+
+    it.effect("a4 (round 2): the ringing signal is told for each step that succeeded although a later step of the pass failed, once, and for removals outside a pass", () =>
+      Effect.gen(function*() {
+        const modules = ["m0", "m1"]
+        const { world, faults } = yield* startFaulty({ modules, connected: [] })
+        for (let i = 0; i < 12; i++) yield* world.bell(modules[i % 2]).send({ title: `R${i}`, priority: "ring", target: "everywhere" })
+        yield* world.settle
+        const changes: Array<string> = []
+        world.notify.onRingingChanged((d) => changes.push(d))
+        // The first page (12 rows) is read and sent; the next read fails.
+        faults.skipReads = 1
+        faults.reads = 1
+        const tab = yield* world.open("kitchen-display")
+        assert.strictEqual(world.holds(tab).size, 12)
+        assert.strictEqual(faults.reads, 0)
+        assert.deepStrictEqual(world.notify.ringingOn("kitchen-display").length, 12)
+        // The pass failed (it is planned again in a minute) ...
+        assert.strictEqual(world.notify.plannedAt(), (yield* Clock.currentTimeMillis) + MINUTE)
+        // ... and what it delivered was told.
+        assert.deepStrictEqual(changes, ["kitchen-display"])
+        // The retry changes nothing: nothing more is told.
+        world.notify.reconcile("kitchen-display")
+        yield* world.settle
+        assert.deepStrictEqual(changes, ["kitchen-display"])
+        // The page goes away with no pass (no reconcile): the next look at what the device holds (a press) drops it
+        // and tells it (nothing rings there now).
+        world.tabs.delete(tab.id)
+        const some = (yield* world.rows)[0]!.id
+        yield* world.notify.press({ notificationId: some, actionId: "stop", deviceId: "kitchen-display" })
+        assert.deepStrictEqual(changes, ["kitchen-display", "kitchen-display"])
+        assert.deepStrictEqual(world.notify.ringingOn("kitchen-display"), [])
+      }))
+
+    it.effect("a5 (round 2): every action outcome (kept open, a failing handler) repeats a failed pass of another device", () =>
+      Effect.gen(function*() {
+        const { world, faults } = yield* startFaulty({ connected: ["kitchen-display"] })
+        const n = yield* world.sendOn("kitchen-display", { title: "Both", priority: "ring", target: "everywhere", actions: [{ id: "snooze", label: "Snooze" }], handler: "answer" })
+        faults.reads = 1
+        const phone = yield* world.open("robins-phone")
+        assert.strictEqual(world.holds(phone).size, 0)
+        world.answer.current = () => Effect.succeed({ say: "Kept.", keepOpen: true })
+        assert.deepStrictEqual(yield* world.pressOn("kitchen-display", n.notification.id, "snooze"), { ok: true, say: "Kept." })
+        assert.isTrue(world.holds(phone).has(n.notification.id))
+        faults.reads = 1
+        const phone2 = yield* world.open("robins-phone")
+        assert.isFalse(world.holds(phone2).has(n.notification.id))
+        world.answer.current = () => Effect.fail("broken")
+        assert.strictEqual((yield* world.pressOn("kitchen-display", n.notification.id, "snooze")).code, "failed")
+        assert.isTrue(world.holds(phone2).has(n.notification.id))
+      }))
+
+    it.effect("a8 (round 2): a press that waited on a busy store is admitted against the state when its transaction runs; stop too", () =>
+      Effect.gen(function*() {
+        const { world, gate } = yield* startFaulty()
+        for (const action of ["snooze", "stop"]) {
+          world.places.set("kitchen-display", { privacy: "shared", defaultPerson: "p-sam" })
+          const n = yield* world.sendOn("kitchen-display", { title: `Sam's ${action}`, owner: "p-sam", actions: [{ id: "snooze", label: "Snooze" }], handler: "answer" })
+          assert.isTrue(world.holds(world.firstTab("kitchen-display")).has(n.notification.id))
+          const busy = yield* Deferred.make<void>()
+          gate.wait = busy
+          const press = yield* Effect.forkChild(world.notify.press({ notificationId: n.notification.id, actionId: action, deviceId: "kitchen-display", connection: makeConnectionRef(world.firstTab("kitchen-display")!.id) }))
+          yield* world.settle
+          // Meanwhile the kitchen becomes Robin's: the card is withdrawn.
+          world.places.set("kitchen-display", { privacy: "shared", defaultPerson: "p-robin" })
+          world.notify.reconcile("kitchen-display")
+          yield* world.settle
+          assert.isFalse(world.holds(world.firstTab("kitchen-display")).has(n.notification.id))
+          yield* Deferred.succeed(busy, undefined)
+          assert.deepStrictEqual(yield* Fiber.join(press), { ok: false, say: "I can't do that right now.", code: "unknown" })
+          assert.strictEqual((yield* world.rows).find((r) => r.id === n.notification.id)?.value.state, "open")
+        }
+        assert.deepStrictEqual(world.presses, [])
       }))
 
     // ---- Restarts, reconnects, failed passes

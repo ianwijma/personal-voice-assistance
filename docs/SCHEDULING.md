@@ -263,7 +263,8 @@ when it is registered again.
 retention rows of 2,134 characters: failed jobs with the payload, key, ids, cron, zone and failure text at their longest
 (not quite the largest finished row: a cancelled retry also keeps its occurrence time).
 The development machine (16-thread AMD Ryzen 9 7945HX laptop, shared with other agents), worst of three runs, after
-50 calls to warm up. Two kinds of number:
+50 calls to warm up, with `/tmp` on tmpfs except where a row says "real disk" (the test now puts its database on a
+real disk: docs/STORING-DATA.md "Latency"). Two kinds of number:
 
 - **longest stop**: the longest gap between ticks of a 1 ms timer over the whole window. Whatever the scheduler does
   synchronously in that window holds the main thread at most this long, so this is the bound on its blocked time (the
@@ -279,7 +280,7 @@ The development machine (16-thread AMD Ryzen 9 7945HX laptop, shared with other 
 | Cron planning (`Cron.next` and `Cron.prev`; 8 accepted expressions, weekly ones among them, in 4 zones with DST, from 5 dates at the changes) | (synchronous) | worst 0.80 ms; `schedule` with a cron, worst 1.2 ms |
 | one loop pass, nothing due (50 indexed reads, yielding between handlers), 20 passes | 1.7 ms | 4.4 ms a pass |
 | 40 due jobs of 20 handlers: two passes of 20 (one job per handler a pass) | 2.1 ms | worst 29 ms a pass (it yields between claims) |
-| retention of 400 rows in transactions of 10, with the recovery rule, the recount and the Health issues | 2.6 ms | worst 1.5 ms a transaction |
+| retention of 400 rows in transactions of 10, with the recovery rule, the recount and the Health issues | 2.6 ms (real disk: 2.7–9.7 ms; 19.8–24.5 ms before the checkpoint worker started the new log, docs/STORING-DATA.md "The write-ahead log") | worst 1.5 ms a transaction |
 
 A refused date expression (`0 0 31 2 *`) costs 0.5 ms: it is refused before it is parsed.
 

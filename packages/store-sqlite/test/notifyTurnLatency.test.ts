@@ -8,13 +8,11 @@ import { Conversation, type ConversationEvent, CurrentTurn, makeToolRegistry, MA
 import { contractDevice, notifyWorld } from "@pva/core/notify-contract"
 import { endOfTurn, makeMarkerTts, makeRecordingAudioOutput, makeScriptedLlm, sleep, speechStarted, textDelta } from "@pva/core/testing"
 import { encodeServerMessage } from "@pva/protocol"
-import { Effect, Layer, Queue, Stream } from "effect"
-import { mkdtempSync } from "node:fs"
-import { tmpdir } from "node:os"
+import { Effect, Fiber, Layer, Queue, Stream } from "effect"
 import { join } from "node:path"
 import { describe, expect, it } from "vitest"
 import { makeSqliteStore } from "../src/index.ts"
-import { bound } from "./latencyBound.ts"
+import { bound, latencyDir } from "./latencyBound.ts"
 
 const TURNS = 120
 const WARM = 20
@@ -27,14 +25,19 @@ describe("a ring in the middle of a turn", () => {
   it("moves end of turn -> playbackStart by less than 2 ms (TurnTrace, counterbalanced)", async () => {
     const measure = (withRing: boolean) =>
       Effect.scoped(Effect.gen(function*() {
-        const store = yield* makeSqliteStore({ filename: join(mkdtempSync(join(tmpdir(), "pva-notify-turn-")), "household.db") })
+        const store = yield* makeSqliteStore({ filename: join(latencyDir("pva-notify-turn"), "household.db") })
         yield* store.prepare([], [schedulerStorage, notifyStorage])
-        let frames = 0
-        const world = yield* notifyWorld(store, { devices: DEVICES, unrecorded: true, outlet: (_d, m) => void (frames += encodeServerMessage(m).length > 0 ? 1 : 0) })
+        const frames = { ring: 0, resolved: 0 }
+        const world = yield* notifyWorld(store, {
+          devices: DEVICES,
+          unrecorded: true,
+          outlet: (_d, m) => void (encodeServerMessage(m).length > 0 && (m.type === "notification.ring" ? frames.ring++ : frames.resolved++))
+        })
         const context = yield* Effect.context<never>()
         const rang: Array<string> = []
+        let sending: Fiber.Fiber<void, unknown> | undefined
         const ring = () =>
-          void Effect.runForkWith(context)(
+          void (sending = Effect.runForkWith(context)(
             Effect.map(
               world.bell().send({
                 title: Q.repeat(MAX_NOTIFICATION_TITLE_CHARS),
@@ -48,7 +51,7 @@ describe("a ring in the middle of a turn", () => {
               ),
               (r) => void rang.push(r.notification.id)
             )
-          )
+          ))
         const ended = yield* Queue.unbounded<Trace>()
         const onEvent = (e: ConversationEvent) => {
           if (e._tag === "TurnEnded") Queue.offerUnsafe(ended, e.trace)
@@ -59,7 +62,11 @@ describe("a ring in the middle of a turn", () => {
             Stream.make(speechStarted, endOfTurn(`Turn ${i}`)).pipe(Stream.concat(Stream.fromEffectDrain(Effect.gen(function*() {
               const t = yield* Queue.take(ended)
               audible.push(t.marks.playbackStart! - t.marks.endOfTurn!)
-              // Resolved between turns, so every turn's ring is a new delivery within the bounds.
+              // Between turns (outside what is measured): this turn's ring is sent and its delivery has finished on a
+              // slow runner too; then it is resolved, so every turn's ring is a new delivery within the bounds.
+              if (sending !== undefined) yield* Fiber.join(sending)
+              sending = undefined
+              yield* world.settle
               for (const id of rang.splice(0)) yield* world.bell().resolve(id)
               yield* world.settle
             })))), { concurrency: 1 })
@@ -79,8 +86,9 @@ describe("a ring in the middle of a turn", () => {
         }).pipe(Effect.provide(Layer.mergeAll(layer, makeMarkerTts().layer, makeRecordingAudioOutput({ chunkMillis: 0 }).layer)))
         return { audible: median(audible.slice(WARM)), p95: p95(audible.slice(WARM)), frames }
       }))
-    const without: Array<{ audible: number; p95: number; frames: number }> = []
-    const withRing: Array<{ audible: number; p95: number; frames: number }> = []
+    type Run = { audible: number; p95: number; frames: { ring: number; resolved: number } }
+    const without: Array<Run> = []
+    const withRing: Array<Run> = []
     for (const order of [[false, true], [true, false], [false, true], [true, false]] as const) {
       for (const w of order) (w ? withRing : without).push(await Effect.runPromise(measure(w)))
     }
@@ -89,9 +97,11 @@ describe("a ring in the middle of a turn", () => {
       `TurnTrace, end of turn -> playbackStart, median of ${TURNS - WARM} turns x 4 counterbalanced runs (model's first token at 5 ms): ` +
         `without a ring ${m(without, "audible").toFixed(3)} ms (p95 ${m(without, "p95").toFixed(3)}), ` +
         `with a ring to 64 devices mid-turn ${m(withRing, "audible").toFixed(3)} ms (p95 ${m(withRing, "p95").toFixed(3)}); ` +
-        `${withRing[0]!.frames} ring frames per run`
+        `${withRing[0]!.frames.ring} ring frames per run`
     )
-    expect(withRing[0]!.frames).toBeGreaterThanOrEqual(64 * (TURNS - 1))
+    // Every turn's ring reached every device, and was withdrawn from every device, in every run.
+    for (const run of withRing) expect(run.frames).toEqual({ ring: 64 * TURNS, resolved: 64 * TURNS })
+    for (const run of without) expect(run.frames).toEqual({ ring: 0, resolved: 0 })
     expect(m(withRing, "audible")).toBeLessThan(m(without, "audible") + bound(2))
   }, 240_000)
 })

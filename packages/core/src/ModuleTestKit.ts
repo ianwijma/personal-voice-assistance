@@ -213,8 +213,14 @@ export const makeTestPeople = (input: TestHouseholdInput = {}, live?: { readonly
     coreServices: [People.of(peopleService), Privacy.of(privacy), Devices.of(devicesService)] as ReadonlyArray<ProvidedService>,
     assistantsOn: (deviceId: string) => assistantsOf.get(deviceId) ?? [],
     isMember: (id: string) => people.has(id),
-    /** The device a connection of the kit's belongs to (`testConnectionOf`), or `undefined`. */
-    deviceOfConnection: (connection: ConnectionRef) => connections.get(connection.id)
+    /**
+     * The device a connection of the kit's belongs to (`testConnectionOf`), or `undefined`; with `live`, `undefined` too
+     * while that device is disconnected (serve mode's lookup of a closed connection).
+     */
+    deviceOfConnection: (connection: ConnectionRef) => {
+      const id = connections.get(connection.id)
+      return id !== undefined && (live === undefined || live.connected(id)) ? id : undefined
+    }
   }
 }
 
@@ -302,7 +308,7 @@ export interface KitAnnouncement {
   readonly text: string
   readonly cue: boolean
   readonly startedAt: number
-  readonly outcome?: "spoken" | "stopped"
+  readonly outcome?: "spoken" | "stopped" | "failed"
 }
 
 /** A JSON copy of a payload as the scheduler stores it (an absent payload is `{}`). */
@@ -584,7 +590,8 @@ export const startTestModule = (definition: ModuleDefinition<any>, options: Star
     const announced: Array<KitAnnouncement> = []
     /** A reply is being spoken on the device: announcements wait for it, and one that is playing is cut (as serve mode's lease does). */
     const replying = new Map<string, Deferred.Deferred<void>>()
-    const playing = new Map<string, Deferred.Deferred<void>>()
+    /** The announcement being played on a device: its cut, by a reply or by the device's page going. */
+    const playing = new Map<string, Deferred.Deferred<"reply" | "disconnected">>()
     const speechMs = options.speechMs ?? 2_000
     const speech: SpeechPort = {
       speak: (deviceId, text, o) =>
@@ -603,15 +610,20 @@ export const startTestModule = (definition: ModuleDefinition<any>, options: Star
             if (gate !== "go") return { skipped: gate } as const
             const record: { -readonly [K in keyof KitAnnouncement]: KitAnnouncement[K] } = { deviceId, text, cue: o.cue, startedAt: yield* Clock.currentTimeMillis }
             announced.push(record)
-            const cut = Deferred.makeUnsafe<void>()
+            const cut = Deferred.makeUnsafe<"reply" | "disconnected">()
             playing.set(deviceId, cut)
-            const how = yield* Effect.raceFirst(Effect.as(Effect.sleep(speechMs), "played" as const), Effect.as(Deferred.await(cut), "cut" as const)).pipe(
+            const how = yield* Effect.raceFirst(Effect.as(Effect.sleep(speechMs), "played" as const), Deferred.await(cut)).pipe(
               Effect.onInterrupt(() => Effect.sync(() => void (record.outcome = "stopped"))),
               Effect.ensuring(Effect.sync(() => void (playing.get(deviceId) === cut && playing.delete(deviceId))))
             )
-            if (how === "cut") {
+            if (how === "reply") {
               record.outcome = "stopped"
               return yield* Effect.fail(new Error("superseded"))
+            }
+            if (how === "disconnected") {
+              // Serve mode's audio fails the same way when the page that played it goes.
+              record.outcome = "failed"
+              return yield* Effect.fail(new Error("audio client disconnected"))
             }
             record.outcome = "spoken"
             return "spoken" as const
@@ -1047,7 +1059,7 @@ export const startTestModule = (definition: ModuleDefinition<any>, options: Star
             if (on && d === undefined) replying.set(deviceId, Deferred.makeUnsafe<void>())
             if (on) {
               const cut = playing.get(deviceId)
-              if (cut !== undefined) Deferred.doneUnsafe(cut, Effect.void)
+              if (cut !== undefined) Deferred.doneUnsafe(cut, Effect.succeed("reply" as const))
             }
             if (!on && d !== undefined) {
               replying.delete(deviceId)
@@ -1065,6 +1077,10 @@ export const startTestModule = (definition: ModuleDefinition<any>, options: Star
         disconnect: (deviceId: string) =>
           Effect.suspend(() => {
             connectedNow.delete(deviceId)
+            // As serve mode: the connection is gone (`deviceOfConnection`, tool calls made with it), and what was being
+            // spoken there fails with the audio client's disconnect.
+            const cut = playing.get(deviceId)
+            if (cut !== undefined) Deferred.doneUnsafe(cut, Effect.succeed("disconnected" as const))
             notify.reconcile(deviceId)
             return settle
           }),

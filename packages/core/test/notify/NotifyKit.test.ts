@@ -258,6 +258,30 @@ describe("speech outside a reply", () => {
       assert.isTrue((yield* bell.parts.speech!.say({ device: "kitchen-display" }, "Hello")).deliveries[0]!.queued)
     }))
 
+  it.effect("a6 (round 2): the kit's disconnect is serve mode's: the connection is gone for deviceOfConnection and tool calls made with it; an announcement being spoken there fails (audio client disconnected)", () =>
+    Effect.gen(function*() {
+      const bell = makeBell()
+      const kit = yield* startTestModule(bell.definition)
+      const connection = kit.turn({ device: "kitchen-display" }).connection!
+      const h = yield* bell.parts.speech!.say({ device: "kitchen-display" }, "The laundry is done")
+      yield* kit.advance(100)
+      yield* kit.notify.disconnect("kitchen-display")
+      yield* kit.advance(2_000)
+      assert.deepStrictEqual(yield* h.done, [{ deviceId: "kitchen-display", outcome: "failed", why: "audio client disconnected" }])
+      assert.strictEqual(kit.notify.announced[0]?.outcome, "failed")
+      assert.isUndefined(kit.people.deviceOfConnection(connection))
+      const offline = yield* kit.tool("bell_ring", { title: "Offline turn" }, { device: "kitchen-display" })
+      assert.deepStrictEqual([offline.ok, offline.content], [false, 'Not run: the request did not come from the device "kitchen-display".'])
+      // Back again: the connection is the device's, tools run, and a reply still cuts as before (stopped, a reply).
+      yield* kit.notify.connect("kitchen-display")
+      assert.strictEqual(kit.people.deviceOfConnection(connection), "kitchen-display")
+      assert.isTrue((yield* kit.tool("bell_ring", { title: "Online turn" }, { device: "kitchen-display" })).ok)
+      const next = yield* bell.parts.speech!.say({ device: "kitchen-display" }, "Again")
+      yield* kit.advance(100)
+      yield* kit.notify.replying("kitchen-display", true)
+      assert.deepStrictEqual(yield* next.done, [{ deviceId: "kitchen-display", outcome: "stopped", why: "a reply" }])
+    }))
+
   it.effect("a8: stop stops every device's announcement in one step, without its caller waiting for any of them", () =>
     Effect.gen(function*() {
       const bell = makeBell()

@@ -1250,7 +1250,9 @@ assert.strictEqual(offThreadWorkers().running, 0)
 A test file that asserts how long the main thread stops (the longest gap of a 1 ms heartbeat) or how long real work
 takes imports `packages/store-sqlite/test/latencyBound.ts` and writes its bounds as `bound(ms)`, and **that import is
 what makes it a latency test**: CI runs those files alone, one at a time after the rest (`vitest.latency.ts`), so other
-tests' busy threads do not lengthen what they measure, while `pnpm test` still runs everything together.
+tests' busy threads do not lengthen what they measure, while `pnpm test` still runs everything together. A latency
+test that opens a SQLite file takes its directory from `latencyDir()` in the same file, which is on a real disk (never
+tmpfs, where a sync costs nothing and a stop it causes would not show; docs/STORING-DATA.md "Latency").
 
 ## 16. Speaking
 
@@ -1311,7 +1313,7 @@ module's own socket ([NOTIFICATIONS.md](NOTIFICATIONS.md) has the calls, the bou
 
 - **`ctx.notify.send`**: a card on the device that asked (`target: "origin"`, the default) or everywhere, `normal`
   (silent) or `ring` (it rings until stopped), with an optional owner (personal content: the privacy rule decides per
-  device, when it is delivered), dedupe `key`, expiry (up to a minute late), and up to two actions beside the host's
+  device, when it is delivered), dedupe `key`, expiry (on time), and up to two actions beside the host's
   `stop`. It is delivered **now**: for a notification at a later time, schedule a job of your own and send from its
   handler (below). One transaction and an enqueue: fine on a turn.
 - **Action handlers are registered in `shared`** with `ctx.notify.handle(name, { run })`, like job handlers. While your

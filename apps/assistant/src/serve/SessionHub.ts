@@ -208,7 +208,7 @@ export interface HubOptions {
    * (a module action through the bounded admission, `stop` outside it), answered with `result` (`say`); the page's
    * Stop reaches the announcement being spoken (`stopSpeech`). Absent: none of it.
    */
-  readonly notify?: Pick<NotifyEngine, "reconcile" | "press" | "stopSpeech">
+  readonly notify?: Pick<NotifyEngine, "reconcile" | "press" | "stopSpeech" | "busyAnswer">
   /**
    * P7: a device's reply volume when it is not the default (`DeviceControl`), sent as `output.volume` to each of its
    * voice connections right after its `welcome`. Absent, or `undefined` for the device: nothing is sent.
@@ -482,10 +482,12 @@ export const makeSessionHub = (options: HubOptions): SessionHub => {
     client: Client,
     requestId: RequestId,
     work: Effect.Effect<HostResult | DeviceResult | AssistantResult | ActionOutcome, never>,
-    after?: (r: HostResult | DeviceResult | AssistantResult | ActionOutcome) => void
+    after?: (r: HostResult | DeviceResult | AssistantResult | ActionOutcome) => void,
+    /** The answer when the bound refuses it (default: the hub's own). */
+    refused?: () => HostResult
   ) => {
     if (client.pending >= maxPendingPerConnection || pendingTotal >= maxPendingTotal) {
-      return result(client, requestId, failure("busy", "Too many changes at once; try again in a moment"))
+      return result(client, requestId, refused?.() ?? failure("busy", "Too many changes at once; try again in a moment"))
     }
     client.pending++
     pendingTotal++
@@ -671,6 +673,10 @@ export const makeSessionHub = (options: HubOptions): SessionHub => {
     if (spoke && !(options.speakerAllowed?.(deviceId, kind) ?? true)) {
       const session = sessions.get(deviceId)
       if (session !== undefined && session.publisher.committedTurn() !== undefined) session.conversation.stop()
+      // P9: an announcement being spoken stops too, through the service (its play is interrupted, which tells the page
+      // to stop and flush what it holds, as for a reply). An output override is a boundary change: it ends the session,
+      // and the announcement with it (`VoiceSession.announce`).
+      if (session?.announce.playing() !== undefined) options.run(Effect.asVoid(options.notify?.stopSpeech(deviceId) ?? Effect.void))
     }
     return true
   }
@@ -1318,7 +1324,13 @@ export const makeSessionHub = (options: HubOptions): SessionHub => {
               : { ok: false, error: { code: answer.code === "not_running" ? "not_running" : answer.code === "busy" ? "busy" : "bad_message", message: answer.say }, say: answer.say }
         )
         // `stop` is always admitted; a module action goes through the hub's bounded admission (per connection and in all).
-        if (message.actionId !== STOP_ACTION) return limited(client, message.requestId, pressed)
+        // Refused by that bound: the service's sentence, in the household's language, as every other answer on the card.
+        if (message.actionId !== STOP_ACTION) {
+          return limited(client, message.requestId, pressed, undefined, () => {
+            const busy = notify.busyAnswer()
+            return { ok: false, error: { code: "busy", message: busy.say }, say: busy.say } as HostResult
+          })
+        }
         const requestId = message.requestId
         return options.run(Effect.map(pressed, (r) => {
           if (!client.closed) result(client, requestId, r)

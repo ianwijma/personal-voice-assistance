@@ -19,11 +19,9 @@ import {
 } from "@pva/core"
 import { endOfTurn, makeMarkerTts, makeRecordingAudioOutput, makeScriptedLlm, speechStarted, textDelta } from "@pva/core/testing"
 import { Effect, Layer, Queue, Schema, Stream } from "effect"
-import { mkdtempSync } from "node:fs"
-import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { makeSqliteStore } from "../src/index.ts"
-import { bound } from "./latencyBound.ts"
+import { bound, latencyDir } from "./latencyBound.ts"
 
 const Timer = Schema.Struct({ label: Schema.String, dueAt: Schema.Finite })
 const fmt = (ms: number) => `${Math.floor(ms / 60_000)}:${String(Math.floor((ms % 60_000) / 1000)).padStart(2, "0")}`
@@ -48,7 +46,7 @@ const median = (xs: ReadonlyArray<number>) => {
 const p95 = (xs: ReadonlyArray<number>) => [...xs].sort((a, b) => a - b)[Math.floor(xs.length * 0.95)]!
 
 const household = Effect.gen(function*() {
-  const store = yield* makeSqliteStore({ filename: join(mkdtempSync(join(tmpdir(), "pva-ambient-")), "household.db") })
+  const store = yield* makeSqliteStore({ filename: join(latencyDir("pva-ambient"), "household.db") })
   yield* store.prepare([{ id: "timers", storage: { collections: [timers, pinned] } }])
   const m = store.forModule("timers")
   // Plenty of rows: the ambient read takes the newest 20 per scope.
@@ -104,7 +102,7 @@ describe("ambient facts", () => {
             ambient: () => undefined
           }))
       }))
-      const store = yield* makeSqliteStore({ filename: join(mkdtempSync(join(tmpdir(), "pva-ambient-many-")), "household.db") })
+      const store = yield* makeSqliteStore({ filename: join(latencyDir("pva-ambient-many"), "household.db") })
       yield* store.prepare(modules.map((m) => ({ id: m.moduleId, storage: { collections: m.collections } })))
       for (const m of modules) {
         yield* store.forModule(m.moduleId).transaction((tx) => {

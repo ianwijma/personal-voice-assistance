@@ -935,10 +935,11 @@ NotificationCard = { id, title, text?, priority, show, sound, actions (stop firs
 NotifyHook (ModuleHostOptions.notify) = { forPart(part: PartHandle, runner: PartRunner): { notify; speech } }
 NotifyEngine  = NotifyHook & { reconcile(deviceId); reconcileAll(); press(PressRequest): Effect<PressAnswer>;
                                ringingOn(deviceId): RingingNotification[]; stopRinging(deviceId): Effect<number>; stopSpeech(deviceId): Effect<boolean>;
-                               onRingingChanged(listener): () => void; dnd(): DndState & { known }; maintenanceScheduled(); maintainNow; settled }
+                               onRingingChanged(listener): () => void; dnd(): DndState & { known }; busyAnswer(): PressAnswer;
+                               maintenanceScheduled(); plannedAt(); planNow; maintainNow; settled }
 PressRequest  = { notificationId, actionId, deviceId, connection?, person? }   PressAnswer = { ok, say, code?: "not_running" | "unknown" | "busy" | "failed" }
 makeNotifyEngine({ store, scheduler, devices, outputs(device): DeviceOutputs, privacy, outlet: () => NotifyOutlet?, speech: () => SpeechPort?,
-                   gateway, pageText, language, issues?, log?, newId?, onDecision?, observe?, outcomeRetryMs? }): Effect<NotifyEngine, never, Scope>
+                   gateway, pageText, language, issues?, log?, newId?, onDecision?, observe?, outcomeRetryMs?, now? }): Effect<NotifyEngine, never, Scope>
 NotifyOutlet  = { connections(deviceId): [{ id, send(NotifyMessage) }] }        // serve mode: the hub's voice connections of the device
 SpeechPort    = { speak(deviceId, text, { cue, gate: () => "go" | "wait" | NotDelivered }): Effect<"spoken" | { skipped }, unknown> }   // serve mode: VoiceSession.announce
 ```
@@ -953,15 +954,24 @@ SpeechPort    = { speak(deviceId, text, { cue, gate: () => "go" | "wait" | NotDe
 - **Reconciliation is the only sender**: per voice connection the engine keeps what it sent; `reconcile(device)` reads a
   page of open rows with the store's synchronous reader (`HouseholdStore.reader`), decides and sends in that step,
   yields, and ends with a step that rereads every held card it did not see. Passes run one at a time in one fiber; a
-  failed pass marks its device for the next trigger or the maintenance job.
-- **One job**: `core.notify/maintain`, cron every minute, scheduled by key when the engine starts (a failure is a Health
-  issue and is retried at the next send or hello): expiry, the end of do not disturb, stale claims (15 s), retention (a
-  day), each in bounded transactions, then every device reconciled. Do not disturb counts as on until it was read.
+  failed pass marks its device for the next trigger or the maintenance run planned a minute later. At a page's bound
+  (64) it withdraws what has ended before it adds. `onRingingChanged` compares with what it last told, after each step.
+- **Two jobs** (D2b): `plan()` (bounded indexed reads: the open rows, the oldest resolved row) keeps the one-shot
+  `core.notify/due` (key `due`) at the earliest of the next expiry, do not disturb's end, the oldest resolved row leaving
+  retention (a day), a stale claim's release and, while a device is marked for another pass or do not disturb is unknown,
+  a minute from now; none when nothing is due. It runs, serialised, after every change that can move that time, at the
+  end of every maintenance run and at start; a failure is a Health issue, planned again at the next change.
+  `core.notify/hourly` (cron `0 * * * *`, by key at every start) runs the same full pass, so a lost plan leaves nothing
+  overdue for more than an hour. A run: the end of do not disturb, expiry and stale claims, retention, each in bounded
+  transactions, then every device reconciled, then `plan()`. Do not disturb is read by one function: a failed read makes
+  it unknown (on) and reconciles every device. A claim of a run alive in this process is never released by the wall
+  clock (its 5 s limit is monotonic); the stored wall time is only for a claim with no run alive here.
 - **Serve mode** makes the engine after the scheduler and before the module host (`serveMode.ts`) with the device facts
   (`Devices.list`, `DeviceFacts.outputsOf`, the privacy rule), the hub's voice connections (outlet) and the voice
   sessions (speech). The hub reconciles a device when a page says hello (once its record is written), when one closes
   and when its declaration changes; answers `notification.action` with `press` (a module action through its bounded
-  admission, `stop` outside it); and sends the page's Stop on an announcement to `stopSpeech`. The CLI modes have none:
+  admission, `stop` outside it, its refusal `busyAnswer()`); sends the page's Stop on an announcement, and a declaration
+  that takes the speaker away while one plays, to `stopSpeech`. The CLI modes have none:
   `notify.handle` succeeds, every other call fails `unavailable` (`closedModuleNotify`).
 - **Presses**: admitted only for a connection that holds the card and while the decision allows it; a module action is
   claimed on the row in one transaction, then the handler runs through `PartRunner.inFlight` with the notification
@@ -971,11 +981,12 @@ SpeechPort    = { speak(deviceId, text, { cue, gate: () => "go" | "wait" | NotDe
   the output lease, no turn is in flight, no utterance is open in the recogniser and the state is not hearing, then plays
   with `OutputLease.playIfFree`, which checks under the lease's lock, in the step the play starts, that nothing plays and
   the gate (quiet and the service's decision) says go; otherwise it waits again or skips. A reply that starts supersedes
-  it.
+  it. It is bound to the session's lifetime: when the session ends its waits and play are cancelled and it fails ("the
+  voice session ended"); the device's next announcement uses the next session.
 - **Turn path**: only `send` (one synchronous transaction and an enqueue), `resolve` and `say` (decisions and an
   enqueue). Measured: docs/NOTIFICATIONS.md "Latency".
-- **P7 seams**: `ringingOn`, `onRingingChanged`, `stopRinging`, `stopSpeech`, `press` (P7 reads `ringingOn` at each final and
-  calls `stopRinging`, `stopSpeech` and `press`; `onRingingChanged` is not needed: the window is read, never cached). **P10**: the card is drawn by
+- **P7 seams**: `ringingOn`, `onRingingChanged`, `stopRinging` (recorded in one step, finished by work the service owns),
+  `stopSpeech`, `press`, `busyAnswer` (P7 reads `ringingOn` at each final and calls `stopRinging`, `stopSpeech` and `press`; it does not use `onRingingChanged`: the window is read, never cached). **P10**: the card is drawn by
   `apps/web/src/components/NotificationCards.tsx`, outside the character; the ring cue loop is `apps/web/src/lib/audio/ringLoop.ts`.
 
 ### Phrase commands, the essential controls, the ringing window (docs/MODULES-PLAN.md §4 P7, first version; how to use it: [docs/PHRASES.md](PHRASES.md))

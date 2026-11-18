@@ -128,8 +128,9 @@ describe("the scheduler in serve mode", () => {
       if (page.next === undefined) break
       cursor = page.next
     }
-    // P9: the notification service's one job (its maintenance, every minute) is listed too, under its core owner.
-    expect(listed.filter((j) => j.module === "core.notify").map((j) => [j.handler, j.state, j.cron])).toEqual([["maintain", "scheduled", "* * * * *"]])
+    // P9: the notification service's hourly safety net is listed too, under its core owner (its one-shot `due` job is
+    // there only while something is due; nothing is here).
+    expect(listed.filter((j) => j.module === "core.notify").map((j) => [j.handler, j.state, j.cron])).toEqual([["hourly", "scheduled", "0 * * * *"]])
     const all = listed.filter((j) => j.module !== "core.notify")
     expect(all).toHaveLength(LATER + 6)
     // Live first, by due time, then the finished ones; no payload on the wire.

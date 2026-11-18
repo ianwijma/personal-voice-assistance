@@ -15,11 +15,9 @@ import { contractDevice, notifyWorld } from "@pva/core/notify-contract"
 import { CurrentTurn, MAX_NOTIFICATION_LABEL_CHARS, MAX_NOTIFICATION_TEXT_CHARS, MAX_NOTIFICATION_TITLE_CHARS, MAX_OPEN_PER_MODULE, MAX_OPEN_TOTAL, MAX_SPEECH_CHARS, type NotifyMessage, notifyStorage, schedulerStorage } from "@pva/core"
 import { encodeServerMessage } from "@pva/protocol"
 import { Effect } from "effect"
-import { mkdtempSync } from "node:fs"
-import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { makeSqliteStore } from "../src/index.ts"
-import { bound } from "./latencyBound.ts"
+import { bound, latencyDir } from "./latencyBound.ts"
 
 /** The longest gap between ticks of a 1 ms timer while `effect` runs (what audio framing would see). */
 const longestStop = <A, E>(effect: Effect.Effect<A, E>) =>
@@ -61,7 +59,7 @@ const LINE = Q.repeat(MAX_SPEECH_CHARS)
 describe("notification latency on SQLite at the stated maximum", () => {
   it.live("send and say inside a tool call are short; reconciling 64 rings on 64 devices holds the main thread under the bound", () =>
     Effect.scoped(Effect.gen(function*() {
-      const store = yield* makeSqliteStore({ filename: join(mkdtempSync(join(tmpdir(), "pva-notify-latency-")), "household.db") })
+      const store = yield* makeSqliteStore({ filename: join(latencyDir("pva-notify-latency"), "household.db") })
       yield* store.prepare([], [schedulerStorage, notifyStorage])
       let frames = 0
       let bytes = 0
@@ -75,7 +73,7 @@ describe("notification latency on SQLite at the stated maximum", () => {
           frames++
           bytes += encodeServerMessage(message).length
         },
-        observe: (e) => void steps.push(e.ms),
+        observe: (e) => void (e.kind === "step" && steps.push(e.ms)),
         // Never quiet: announcements wait, so `say` measures the call alone.
         speech: () => ({ speak: () => Effect.never })
       })
