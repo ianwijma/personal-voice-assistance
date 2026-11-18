@@ -1,10 +1,10 @@
 // How far a ring arriving in the middle of a turn moves the turn's first audio (docs/NOTIFICATIONS.md "Latency"),
-// measured with TurnTrace (at most 2 ms is asserted; 0.8 ms measured): the same scripted turn (the real Conversation, zero-delay synthesis and output, a language
+// measured with TurnTrace (at most 2 ms is asserted): the same scripted turn (the real Conversation, zero-delay synthesis and output, a language
 // model whose first token comes 5 ms after the request) with and without a ring sent while the model "thinks". The
-// ring is the heaviest delivery the bounds allow at once: everywhere, to 64 connected devices, every card encoded as
+// ring is the heaviest delivery the bounds allow at once: everywhere, to 64 connected devices, every text at its bound with the costliest characters, two actions, through the host's page boundary, every card encoded as
 // the hub encodes a frame, on the SQLite store, in the same process and on the same thread as the turn. Runs are
 // counterbalanced (without, with, with, without, …); the medians are printed and compared.
-import { Conversation, type ConversationEvent, CurrentTurn, makeToolRegistry, notifyStorage, schedulerStorage, type Trace, TurnTrace } from "@pva/core"
+import { Conversation, type ConversationEvent, CurrentTurn, makeToolRegistry, MAX_NOTIFICATION_LABEL_CHARS, MAX_NOTIFICATION_TEXT_CHARS, MAX_NOTIFICATION_TITLE_CHARS, notifyStorage, schedulerStorage, type Trace, TurnTrace } from "@pva/core"
 import { contractDevice, notifyWorld } from "@pva/core/notify-contract"
 import { endOfTurn, makeMarkerTts, makeRecordingAudioOutput, makeScriptedLlm, sleep, speechStarted, textDelta } from "@pva/core/testing"
 import { encodeServerMessage } from "@pva/protocol"
@@ -20,6 +20,7 @@ const TURNS = 120
 const WARM = 20
 const median = (xs: ReadonlyArray<number>) => [...xs].sort((a, b) => a - b)[Math.floor(xs.length / 2)]!
 const p95 = (xs: ReadonlyArray<number>) => [...xs].sort((a, b) => a - b)[Math.floor(xs.length * 0.95)]!
+const Q = "\""
 const DEVICES = Array.from({ length: 64 }, (_, i) => contractDevice(`device-${String(i).padStart(2, "0")}-xxxxxxxx`, `Device ${i}`, `Room ${i % 8}`, "shared", null))
 
 describe("a ring in the middle of a turn", () => {
@@ -35,7 +36,14 @@ describe("a ring in the middle of a turn", () => {
         const ring = () =>
           void Effect.runForkWith(context)(
             Effect.map(
-              world.bell().send({ title: "Pasta timer", text: "Ten minutes are up.", priority: "ring", target: "everywhere", actions: [{ id: "snooze", label: "Snooze" }], handler: "answer" }).pipe(
+              world.bell().send({
+                title: Q.repeat(MAX_NOTIFICATION_TITLE_CHARS),
+                text: Q.repeat(MAX_NOTIFICATION_TEXT_CHARS),
+                priority: "ring",
+                target: "everywhere",
+                actions: [{ id: "a".repeat(32), label: Q.repeat(MAX_NOTIFICATION_LABEL_CHARS) }, { id: "b".repeat(32), label: Q.repeat(MAX_NOTIFICATION_LABEL_CHARS) }],
+                handler: "answer"
+              }).pipe(
                 Effect.provideService(CurrentTurn, { turnId: 1, conversationId: "c", source: "voice", assistantId: "jeff", deviceId: DEVICES[0]!.id })
               ),
               (r) => void rang.push(r.notification.id)
