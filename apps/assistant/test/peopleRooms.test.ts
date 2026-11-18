@@ -20,7 +20,7 @@ import { join } from "node:path"
 import { describe, expect, it } from "vitest"
 import { makeDeviceFacts } from "../src/serve/deviceFacts.ts"
 import { makeDeviceRegistry } from "../src/serve/devices.ts"
-import { DIET_KEYS, loadedMembers, makePeopleService, MEMBERS_KEY, peopleFrom, RETIRED_KEY, withPersonIds } from "../src/serve/people.ts"
+import { DIET_KEYS, effectiveMembersOf, makePeopleService, MEMBERS_KEY, RETIRED_KEY, withPersonIds } from "../src/serve/people.ts"
 import { migrateV4ToV5, readStoredSettings, type SettingsFile } from "../src/serve/SettingsStore.ts"
 import { openStore } from "./support/store.ts"
 
@@ -49,9 +49,14 @@ describe("Members: ids and the People service", () => {
     expect(out.OTHER).toBe(1)
     const same = { [MEMBERS_KEY]: [{ id: "p-a0000001", name: "A" }] as never }
     expect(withPersonIds(same, same)[MEMBERS_KEY]).toBe(same[MEMBERS_KEY])
-    expect(peopleFrom([{ id: "p-a0000001", name: " A ", aliases: ["Ay", 3] }, { name: "no id" }, { id: "p-b0000001", name: "" }, "junk"])).toEqual([
+    expect(effectiveMembersOf({ [MEMBERS_KEY]: [{ id: "p-a0000001", name: " A ", aliases: ["Ay"] }] }).people).toEqual([
       { id: "p-a0000001", name: "A", aliases: ["Ay"], pronunciation: "", diet: { allergies: [], diets: [], dislikes: [] } }
     ])
+    // Review round 4: a value that does not pass the field's validation as a whole is no members at all.
+    for (const bad of [[{ id: "p-a0000001", name: "A", aliases: ["Ay", 3] }], [{ id: "p-a0000001", name: "A" }, { id: "p-b0000001", name: "" }], [{ id: "p-a0000001", name: "A" }, "junk"], "junk"]) {
+      expect(effectiveMembersOf({ [MEMBERS_KEY]: bad })).toMatchObject({ valid: false, people: [], repaired: false })
+      expect(effectiveMembersOf({ [MEMBERS_KEY]: bad }).referenceable.size).toBe(0)
+    }
   })
 
   it("review round 3: an id is kept only when it is a committed member's; a removed person's id is retired and never issued again", () => {
@@ -81,17 +86,18 @@ describe("Members: ids and the People service", () => {
 
   it("review round 3: Members are read repaired at load: a second record with an id already seen gets a fresh, stable id; the shared id is ambiguous", () => {
     const raw = [{ id: "p-same0001", name: "Ann" }, { id: "p-same0001", name: "Bo" }, { name: "Cy" }]
-    const a = loadedMembers(raw)
+    const a = effectiveMembersOf({ [MEMBERS_KEY]: raw })
     expect(a.repaired).toBe(true)
     const ids = (a.value as ReadonlyArray<Json>).map((m) => m.id)
     expect(ids[0]).toBe("p-same0001")
     expect(new Set(ids).size).toBe(3)
     expect([...a.ambiguous]).toEqual(["p-same0001"])
-    expect(loadedMembers(raw)).toBe(a)
+    expect(effectiveMembersOf({ [MEMBERS_KEY]: raw })).toBe(a)
+    expect([...a.referenceable]).toEqual(ids.slice(1))
     // The same file read again (another start) gives the same ids.
-    expect((loadedMembers(structuredClone(raw)).value as ReadonlyArray<Json>).map((m) => m.id)).toEqual(ids)
+    expect((effectiveMembersOf({ [MEMBERS_KEY]: structuredClone(raw) }).value as ReadonlyArray<Json>).map((m) => m.id)).toEqual(ids)
     const fine = [{ id: "p-a0000001", name: "A" }]
-    expect(loadedMembers(fine)).toMatchObject({ value: fine, repaired: false })
+    expect(effectiveMembersOf({ [MEMBERS_KEY]: fine })).toMatchObject({ value: [{ id: "p-a0000001", name: "A" }], repaired: false })
   })
 
   it("list, get, find, diets, and a diet written through the settings like an admin edit", async () => {
@@ -104,6 +110,7 @@ describe("Members: ids and the People service", () => {
     const patches: Array<SettingsPatch> = []
     const people = makePeopleService({
       value: (k) => values[k],
+      members: () => effectiveMembersOf(values),
       edit: (build) =>
         Effect.sync(() => {
           const patch = build((k) => values[k])
@@ -128,7 +135,7 @@ describe("Members: ids and the People service", () => {
     expect(patches.at(-1)!.values).toEqual({ [DIET_KEYS.allergies]: ["sesame"] })
     const missing = await run(Effect.flip(people.setDiet({ person: "p-nobody00" }, { allergies: ["x"] })))
     expect(missing).toMatchObject({ code: "unknown_person" })
-    const refusing = makePeopleService({ value: (k) => values[k], edit: () => Effect.succeed({ ok: false as const, message: "nope" }) })
+    const refusing = makePeopleService({ value: (k) => values[k], members: () => effectiveMembersOf(values), edit: () => Effect.succeed({ ok: false as const, message: "nope" }) })
     expect(await run(Effect.flip(refusing.setDiet("household", { diets: ["vegan"] })))).toMatchObject({ code: "not_saved", message: "nope" })
   })
 })
@@ -245,21 +252,18 @@ const fileWithDevices = (devices: Json, assistant: Json = {}): SettingsFile =>
   }) as unknown as SettingsFile
 
 describe("device facts", () => {
-  const people = new Map([["p-sam00001", "Sam"]])
+  const members = { [MEMBERS_KEY]: [{ id: "p-sam00001", name: "Sam" }] }
   const file = fileWithDevices({
     "kitchen-01": { kind: WEB_VOICE_KIND, name: "Kitchen speaker", firstSeen: 1, lastSeen: 5, own: { place: { ...BUILT_IN_PLACE, room: " Kitchen ", defaultPerson: "p-sam00001" } }, rev: 1, declared: { capabilities: { v: 1, speaker: { media: ["speech"] }, microphone: { farField: true } }, seenAt: 5 } },
     "ipad-00001": { kind: WEB_VOICE_KIND, name: "Kitchen iPad", firstSeen: 1, lastSeen: 4, own: { place: { ...BUILT_IN_PLACE, room: "kitchen" } }, rev: 1, declared: { capabilities: tablet, seenAt: 4 } },
     "gone-00001": { kind: WEB_VOICE_KIND, name: "Old phone", firstSeen: 1, lastSeen: 3, own: { place: { ...BUILT_IN_PLACE, privacy: "private", defaultPerson: "p-removed1" } }, rev: 1 },
     "tv-0000001": { kind: WEB_VOICE_KIND, name: "Living room TV", firstSeen: 1, lastSeen: 2, own: { capabilities: { noDisplay: true, excludeKinds: [], noSpeaker: false } }, rev: 1, declared: { capabilities: tablet, seenAt: 2 } }
-  })
+  }, members)
   const connected = new Set(["kitchen-01", "ipad-00001"])
   const facts = makeDeviceFacts({
     file: () => file,
     declaredOf: () => undefined,
     live: (id) => ({ connected: connected.has(id), visible: true }),
-    isPerson: (id) => people.has(id),
-    nameOfPerson: (id) => people.get(id),
-    peopleVersion: () => people
   })
 
   it("places (a removed person is nobody), targets for the feed, and a turn's room and person", () => {
@@ -380,7 +384,7 @@ describe("device facts", () => {
       own: { place: { ...BUILT_IN_PLACE, room: `Room ${i % 8}`, defaultPerson: i % 2 === 0 ? "p-sam00001" : null } },
       rev: 1,
       declared: { capabilities: tablet, seenAt: i }
-    }])))
+    }])), members)
     const tabs = Array.from({ length: 256 }, (_, i) => ({ device: ids[i % 64]!, visible: i % 3 !== 0, at: i }))
     const bigFacts = makeDeviceFacts({
       file: () => big,
@@ -398,9 +402,6 @@ describe("device facts", () => {
         }
         return { connected, visible, lastInteractionAt }
       },
-      isPerson: (id) => people.has(id),
-      nameOfPerson: (id) => people.get(id),
-      peopleVersion: () => people
     })
     const self = ids[0]!
     const measure = (withLine: boolean) =>
@@ -565,10 +566,7 @@ describe("review round 1: declarations are ordered by arrival, never by the cloc
       file: () => store.settings(),
       declaredOf: (id) => registry.declaredOf(id),
       lastSeenOf: (id) => registry.lastSeenOf(id),
-      live: () => ({ connected: false, visible: false }),
-      isPerson: () => false,
-      nameOfPerson: () => undefined,
-      peopleVersion: () => undefined
+      live: () => ({ connected: false, visible: false })
     })
     expect(facts.devices.get("tab-000006")!.lastSeen).toBe(16 * 60_000)
   })
