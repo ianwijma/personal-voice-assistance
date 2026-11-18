@@ -7,6 +7,7 @@ import { makeRequirementChecker, type Prober, type ToolEntry } from "./requireme
 import { DataDirConfig, loadSettingsStore } from "./serve/SettingsStore.ts"
 import { openVault, type Vault, VaultPathConfig } from "./serve/Vault.ts"
 import { householdIssues } from "@pva/store-sqlite"
+import { schedulerDoctorIssues } from "./serve/scheduler.ts"
 
 /**
  * `pnpm start doctor` (module-definition-config-and-dependencies.md §C.5, after `brew doctor`): the household
@@ -59,7 +60,9 @@ export const runDoctor = (options: DoctorOptions): Effect.Effect<ReadonlyArray<I
     // The household database (P4): opens, passes SQLite's quick check, is not from a newer version, holds no module
     // data newer than that module (judged read-only against the catalog), has a recent backup.
     const household = yield* householdIssues(options.dataDir, { modules: options.catalog.map((d) => ({ id: d.id, name: d.name, storage: d.storage })) })
-    return [...household, ...host.issues.all()]
+    // P6: failed scheduled jobs (read from the database; the engine runs only in the server).
+    const scheduled = yield* schedulerDoctorIssues(options.dataDir, options.catalog)
+    return [...household, ...scheduled, ...host.issues.all()]
   }))
 
 const LABEL: Readonly<Record<Issue["severity"], string>> = { error: "error  ", warning: "warning", info: "info   " }

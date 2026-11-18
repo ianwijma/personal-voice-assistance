@@ -10,6 +10,7 @@ import {
   type ContextProvider,
   type FeedProblem,
   type ModuleDefinition,
+  schedulerStorage,
   type TurnContext,
   StoreError
 } from "@pva/core"
@@ -47,7 +48,8 @@ const assemble = (
   people?: () => ReadonlyArray<string>
 ) =>
   Effect.gen(function*() {
-    yield* store.prepare(declared(catalog))
+    // P6: the scheduler's collections (core.scheduler) are judged and upgraded with the modules'.
+    yield* store.prepare(declared(catalog), [schedulerStorage])
     for (const d of catalog) {
       const verdict = store.availability(d.id)
       if (verdict !== undefined && d.storage !== undefined) log(`Module ${d.name}: ${verdict.reason}`)

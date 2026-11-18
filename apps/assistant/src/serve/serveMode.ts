@@ -125,7 +125,8 @@ import { makeVoiceSessions, type VoiceSessions } from "./VoiceSessions.ts"
 import { makeRoutingService, ROUTING_KEYS } from "./routing.ts"
 import { openServeHousehold } from "./household.ts"
 import { makeHouseholdPush } from "./HouseholdPush.ts"
-import { Devices, hostEvent, People, Privacy, withContextProvider } from "@pva/core"
+import { Devices, hostEvent, makeIssueRegistry, oneLine, People, Privacy, withContextProvider } from "@pva/core"
+import { openServeScheduler } from "./scheduler.ts"
 import { boundaryChanged, makeDeviceFacts, membersRemoved } from "./deviceFacts.ts"
 import {
   makeMembersGate,
@@ -395,11 +396,27 @@ export const startServe = (options: ServeOptions): Effect.Effect<ServeHandle, Ht
       nameOfPerson: (id) => people.nameOf(id),
       peopleVersion: () => sections.value(MEMBERS_KEY)
     })
+    // P6: the scheduler (docs/SCHEDULING.md) on the household store, made before the module host it gives
+    // `ctx.scheduler` to; its Health issues go to the registry the host keeps. The gateway that admits a job's
+    // principal and the page boundary are the host's (bound once it exists; nothing runs before modules start).
+    const issues = makeIssueRegistry()
+    let hostRef: Pick<ModuleHost, "gateway" | "pageText"> | undefined
+    const scheduler = yield* openServeScheduler({
+      store: household.store,
+      catalog,
+      issues,
+      timeZone: () => String(sections.value("HOME_TIME_ZONE") ?? ""),
+      gateway: () => hostRef?.gateway,
+      pageText: (moduleId, text, max) => hostRef?.pageText(moduleId, text, max) ?? oneLine(text, max),
+      log: logInfo
+    })
     // Capabilities run for the assistants that switch them on (`moduleDemand`, below; read from startEnabled on).
     const host = yield* makeModuleHost({
       // P5: the core's own services for modules (`host.service`).
       coreServices: [People.of(people), Privacy.of(deviceFacts.privacy), Devices.of(deviceFacts.devices)],
       routeTokens,
+      issues,
+      scheduler,
       catalog,
       persistence: store.modulePersistence,
       env,
@@ -434,6 +451,7 @@ export const startServe = (options: ServeOptions): Effect.Effect<ServeHandle, Ht
         home: () => sections.list().find((x) => x.id === "home")?.form.values ?? {}
       }
     })
+    hostRef = host
     /** Serve mode's check that a principal's parts belong together (`GatewayAccess.principalProblem`). */
     const principalProblem = (principal: Principal): string | undefined => {
       const parts = principal._tag === "turn"
@@ -1612,6 +1630,7 @@ export const startServe = (options: ServeOptions): Effect.Effect<ServeHandle, Ht
     })
     const api = makeApi({
       moduleRoutes: moduleRouter,
+      scheduler,
       admin,
       catalog: voiceCatalog,
       favourites,

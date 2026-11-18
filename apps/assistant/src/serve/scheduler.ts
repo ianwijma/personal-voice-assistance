@@ -1,19 +1,16 @@
 import {
-  describeCounts,
+  type ExecutionGateway,
   type HouseholdStore,
   type Issue,
   type IssueRegistry,
-  type JobRow,
   type JobView,
-  LIVE_STATES,
-  logDelivery,
-  makeIssueRegistry,
+  jobs,
   makeSchedulerEngine,
+  MAX_JOB_PAGE,
   type ModuleDefinition,
+  SCHEDULER_OWNER,
   type SchedulerEngine,
-  schedulerIssues,
-  sqlJobTable,
-  type StoreError
+  schedulerStorage
 } from "@pva/core"
 import type { ScheduledJob } from "@pva/protocol"
 import { householdDbPath, makeSqliteStore } from "@pva/store-sqlite"
@@ -21,93 +18,86 @@ import { Effect, type Scope } from "effect"
 import { existsSync } from "node:fs"
 
 /**
- * The scheduler in the app (docs/SCHEDULING.md): serve mode runs the engine on the household store it writes; the CLI
- * modes have none (their store is read-only, and `ctx.scheduler` fails `unavailable` there). `doctor` reads the job
- * table read-only.
+ * The scheduler in the app (docs/SCHEDULING.md): serve mode runs the engine on the household store it writes, and the
+ * module host gives every version 2 module its `ctx.scheduler` from it (`ModuleHostOptions.scheduler`). The CLI modes
+ * have none (their store is read-only: `ctx.scheduler` fails `unavailable` there). `doctor` reads the failed jobs
+ * read-only.
  */
 
-const catalogNames = (catalog: ReadonlyArray<ModuleDefinition<any>>) => {
-  const list = catalog.map((d) => ({ id: d.id, name: d.name }))
-  return () => list
-}
-
 /**
- * Serve mode: the engine on the household store, delivery by log until P9 (`scheduler.setDelivery`), and the issue
- * registry its issues go to, which the module host is then given (`ModuleHostOptions.issues`).
+ * Serve mode: the engine on the household store (prepared with `schedulerStorage`), its issues in `issues` (the
+ * registry the module host is then given). The gateway and the page boundary are the module host's, made after it.
  */
 export const openServeScheduler = (options: {
   readonly store: HouseholdStore
   readonly catalog: ReadonlyArray<ModuleDefinition<any>>
+  readonly issues: IssueRegistry
   /** `HOME_TIME_ZONE`. */
   readonly timeZone: () => string | undefined
+  readonly gateway: () => ExecutionGateway | undefined
+  readonly pageText: (moduleId: string, text: unknown, max: number) => string
   readonly log: (line: string) => void
-}): Effect.Effect<{ readonly scheduler: SchedulerEngine; readonly issues: IssueRegistry }, StoreError, Scope.Scope> =>
-  Effect.gen(function*() {
-    const issues = makeIssueRegistry()
-    const scheduler = yield* makeSchedulerEngine({
-      table: sqlJobTable(options.store),
-      delivery: logDelivery(options.log),
-      issues,
-      timeZone: options.timeZone,
-      modules: catalogNames(options.catalog),
-      log: options.log
-    })
-    return { scheduler, issues }
+}): Effect.Effect<SchedulerEngine, never, Scope.Scope> => {
+  const names = options.catalog.map((d) => ({ id: d.id, name: d.name }))
+  return makeSchedulerEngine({
+    store: options.store,
+    issues: options.issues,
+    timeZone: options.timeZone,
+    modules: () => names,
+    gateway: options.gateway,
+    pageText: options.pageText,
+    log: options.log
   })
+}
 
-/** One job as the admin page sees it (`GET /api/scheduler/jobs`). */
+/** One job as the admin page sees it (`GET /api/scheduler/jobs`). No payload. */
 export const scheduledJobOnWire = (view: JobView): ScheduledJob => {
   const j = view.job
-  const onDue = j.onDue
   return {
     id: j.id,
     module: j.module,
     moduleName: view.moduleName,
-    kind: j.kind,
+    handler: j.handler,
     ...(j.key !== undefined ? { key: j.key } : {}),
-    ...(j.label !== undefined ? { label: j.label } : {}),
     state: j.state,
-    ...(j.dueAt !== undefined ? { dueAt: j.dueAt } : {}),
-    ...(j.remainingMs !== undefined ? { remainingMs: j.remainingMs } : {}),
+    dueAt: j.dueAt,
     ...(j.cron !== undefined ? { cron: j.cron } : {}),
     ...(j.timeZone !== undefined ? { timeZone: j.timeZone } : {}),
-    action: onDue === undefined ? "task" : "notify" in onDue ? "notify" : "handler",
-    ...(onDue !== undefined && "handler" in onDue ? { handler: onDue.handler } : {}),
-    scope: j.scope,
-    origin: j.origin,
-    waiting: j.waiting,
-    orphaned: view.orphaned,
-    ...(j.lastRunAt !== undefined ? { lastRunAt: j.lastRunAt } : {}),
+    late: j.late,
+    origin: {
+      ...(j.origin.assistantId !== undefined ? { assistantId: j.origin.assistantId } : {}),
+      ...(j.origin.deviceId !== undefined ? { deviceId: j.origin.deviceId } : {}),
+      ...(j.origin.person !== undefined ? { personId: j.origin.person.id } : {})
+    },
+    attempt: j.attempt,
     ...(j.lastError !== undefined ? { lastError: j.lastError } : {}),
+    ...(j.failedAt !== undefined ? { failedAt: j.failedAt } : {}),
+    ...(j.finishedAt !== undefined ? { finishedAt: j.finishedAt } : {}),
+    orphaned: view.orphaned,
     createdAt: j.createdAt,
     updatedAt: j.updatedAt
   }
 }
 
 /**
- * `pnpm start doctor`: the scheduler's issues read from the database (read-only; the engine does not run), and one
- * line with the counts. No database, or no job table yet: nothing.
+ * `pnpm start doctor`: the failed jobs (read-only from the database; the engine runs only in the server), at most two
+ * pages, one line each. No database, or no scheduler data yet: nothing.
  */
 export const schedulerDoctorIssues = (dataDir: string, catalog: ReadonlyArray<ModuleDefinition<any>>): Effect.Effect<ReadonlyArray<Issue>> =>
   Effect.scoped(Effect.gen(function*() {
     const file = householdDbPath(dataDir)
     if (!existsSync(file)) return []
     const store = yield* makeSqliteStore({ filename: file, readOnly: true })
-    const table = sqlJobTable(store)
-    const live = yield* table.query({ states: LIVE_STATES, limit: 10_000 })
-    const failed = yield* table.query({ states: ["failed"], limit: 10_000 })
-    const names = catalogNames(catalog)
-    const moduleName = (id: string) => names().find((m) => m.id === id)?.name ?? id
-    const isOrphan = (id: string) => !names().some((m) => m.id === id)
-    const failing = (j: JobRow) => j.lastFailedAt !== undefined
-    const counts = {
-      live: live.length,
-      failed: failed.length + live.filter(failing).length,
-      waiting: live.filter((j) => j.waiting).length,
-      orphaned: live.filter((j) => isOrphan(j.module)).length,
-      // The engine does not run here: a task row in `running` is one the server runs now (or ran when it stopped).
-      tasksRunning: live.filter((j) => j.kind === "task" && j.state === "running").length
-    }
-    const summary: Issue = { id: "core.scheduler.count", severity: "info", title: `Scheduled jobs: ${describeCounts(counts)}`, detail: "" }
-    return [summary, ...schedulerIssues({ live, failed: failed.slice(0, 50), moduleName, isOrphan })]
+    yield* store.prepare(catalog.map((d) => ({ id: d.id, storage: d.storage })), [schedulerStorage])
+    const c = store.forCore(SCHEDULER_OWNER).collection(jobs)
+    const first = yield* c.list({ where: { issue: true }, limit: MAX_JOB_PAGE })
+    const names = new Map(catalog.map((d) => [d.id, d.name] as const))
+    const out: Array<Issue> = first.map((row) => ({
+      id: `core.scheduler.failed.${row.id}`,
+      severity: "warning" as const,
+      title: `A scheduled job of ${names.get(row.value.module) ?? row.value.module} failed: ${row.value.handler}${row.value.key !== undefined ? ` (${row.value.key})` : ""}`.slice(0, 200),
+      detail: (row.value.lastError ?? "").replace(/\s+/g, " ").slice(0, 300)
+    }))
+    if (first.length === MAX_JOB_PAGE) out.push({ id: "core.scheduler.failed.more", severity: "warning", title: `More than ${MAX_JOB_PAGE} scheduled jobs failed`, detail: "The Scheduled jobs page has them all." })
+    return out
   })).pipe(Effect.orElseSucceed(() => [] as ReadonlyArray<Issue>))

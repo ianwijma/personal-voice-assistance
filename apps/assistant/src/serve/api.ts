@@ -184,7 +184,7 @@ export const makeApi = (options: ApiOptions) => {
         if (!revoked) return yield* fail(404, "not_found", "There is no such token (it may have been revoked already)")
         return json(200, { revoked: true })
       }
-      const scheduled = schedulerRoute(path, method, options.scheduler)
+      const scheduled = schedulerRoute(path, method, query, options.scheduler)
       if (scheduled !== undefined) return yield* scheduled
       if (path === "voice-providers") {
         yield* only("GET")

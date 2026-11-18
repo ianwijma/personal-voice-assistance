@@ -149,6 +149,7 @@ import { createVoiceAssistants, scenarioSettings, scriptedTurn } from "./voiceAs
 import { encodeWav, MOCK_PROVIDERS } from "./voices.ts"
 import { createModelPickersMock } from "./modelPickers.ts"
 import { createModuleRoutesMock, demoHomeAction, demoHomeModule, TokenRefusal } from "./demoHome.ts"
+import { createScheduledJobsMock, MockSchedulerError } from "./scheduledJobs.ts"
 import { boundaryKey, checkDietList, checkMembersValue, cleanDeviceName, type Condition, type FieldError, speakerAllowedFrom } from "@pva/protocol"
 
 const PORT = Number(process.env.MOCK_PORT ?? 8787)
@@ -958,6 +959,8 @@ let conversationSeq = 0
 let modules = initialModules()
 // Reads the mock's vault each time (declared below): locked, tokens are neither listed nor changed.
 const moduleRoutesMock = createModuleRoutesMock(() => vault.state === "locked")
+/** P6: the scheduled jobs (as the real server's /api/scheduler/jobs). */
+let scheduledJobsMock = createScheduledJobsMock()
 /** Protocol 7: assistants, device types and the devices' own sections (mock/assistants.ts). */
 const assistantsMock = createAssistantsMock({
   modules: () => modules,
@@ -1407,6 +1410,7 @@ const resetState = () => {
   lastSessions = ""
   modules = initialModules()
   moduleRoutesMock.reset()
+  scheduledJobsMock = createScheduledJobsMock()
   forcedErrors.clear()
   models = initialModels()
   sections = withWarnings(initialSections())
@@ -2915,6 +2919,23 @@ const apiRoute = async (req: IncomingMessage, res: ServerResponse, path: string,
       if (error instanceof TokenRefusal) throw new ApiFail(error.status, error.code, error.message)
       throw error
     }
+  }
+  // P6: the scheduled jobs, a page at a time (as the real server's /api/scheduler/jobs).
+  if (path === "scheduler/jobs") {
+    only("GET")
+    const limit = query.get("limit")
+    try {
+      return { status: 200, body: scheduledJobsMock.list(query.get("cursor") ?? undefined, limit === null ? undefined : Number(limit)) }
+    } catch (e) {
+      if (e instanceof MockSchedulerError) throw new ApiFail(e.status, e.code, e.message)
+      throw e
+    }
+  }
+  const cancelJob = /^scheduler\/jobs\/([A-Za-z0-9_.:-]{1,200})\/cancel$/.exec(path)
+  if (cancelJob !== null) {
+    only("POST")
+    if (!scheduledJobsMock.cancel(cancelJob[1]!)) throw new ApiFail(404, "not_found", "There is no such live or failed job (it may have finished or been removed)")
+    return { status: 200, body: { cancelled: true } }
   }
   // Protocol 10: the admin view of module routes and their tokens (as the real server's /api/module-routes).
   const routesMatch = /^module-routes(?:\/([a-z][a-z0-9-]{0,39})\/tokens(?:\/([a-f0-9]{8,32}))?)?$/.exec(path)
