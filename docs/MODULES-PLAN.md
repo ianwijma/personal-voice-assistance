@@ -616,8 +616,16 @@ The fast path the basics need: commands that run without the language model.
 
 - `ctx.notify`: `send` (title, text, priority `normal` or `ring`, an owner for `Privacy.mayReveal`, a target of the
   origin device or everywhere, a dedupe key, an expiry, and actions) and `resolve`; notifications are rows of a
-  core collection, with `list` for the notifications module. Sending at a later time is a scheduler job of the
-  service's own core handler.
+  core collection, with `list` for the notifications module. The service does not send later: a module that
+  wants a notification at a later time schedules its own job and sends from its handler.
+- **Decided after review round 1** (36 blocking findings, most from per-notification jobs, one-shot deliveries,
+  actions without a claim and decisions taken before a wait): the service owns one repeating maintenance job (every
+  minute: expiry, the end of do not disturb, retention, a repair pass) and no other job, so expiry and the end of do
+  not disturb can be up to a minute late; delivery is reconciliation (one function makes what each connection of a
+  device holds equal to what the live rows and the one decision allow now, asked again after every wait); an action
+  is claimed on the row before module code runs and is admitted only from a device that holds the card (`stop`
+  included; `stop` wins over a pending action); a handler may be called again for the same notification after a
+  store failure; do not disturb that could not be read counts as on; `send` returns a view, not a list cursor.
 - **One delivery decision** per notification and device, when it is delivered: do not disturb (for the house, on
   or off with an optional end time kept by the scheduler; `notify.dnd` to read, set and clear it), a device that
   cannot speak or show, and `Privacy.mayReveal`. Under do not disturb a `ring` is kept silent and listed; nothing
