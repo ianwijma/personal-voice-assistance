@@ -34,6 +34,17 @@ import type { Json, JsonObject } from "./common.ts"
  * An entity id that is not exposed is `unknown_entity`. Reading the state of any exposed entity, a lock's included,
  * is allowed.
  *
+ * **Which services a call may name: an allow-list.** The provider admits only a fixed table of ordinary services: on,
+ * off and toggle for lights, switches, fans and on/off helpers (a light's brightness only where it can be dimmed);
+ * open, close, stop and set position for covers of a blind class (a cover of any other class, or of none, is refused);
+ * set temperature and set HVAC mode for thermostats; the playback, seek, volume, mute, source, shuffle, repeat,
+ * play-media and browse-media services of media players; and `scene.turn_on` for a scene whose every entity the
+ * provider would change itself. Each is admitted only on entities of the service's own domain, with only its listed
+ * data fields as plain values. Any other service (any integration's own: `zwave_js.*`, `mqtt.*`, `homeassistant.*`,
+ * `script.*`, …), field or target is `refused` before anything is sent: a refuse-list cannot be complete, because an
+ * integration's service can reach a lock through an ordinary sensor of the same device. The provider's page
+ * (docs/modules/home-assistant.md, "The services a call may name") lists the table.
+ *
  * **State.** `entities()`, `entity(id)`, `areas()` and `people()` answer at once from the module's cache (no network).
  * The cache is what Home Assistant said last; `connection()` says whether it is live:
  *

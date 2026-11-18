@@ -3,12 +3,26 @@
 // turn sees, and an old turn's tool is refused once its module was withdrawn (round 3: stop before start).
 import { assert, it } from "@effect/vitest"
 import { defineModule, makeTool, type ModuleHostApi, readOnlyPersistence } from "@pva/core"
-import { Effect, Schema } from "effect"
+import { Deferred, Effect, Schema } from "effect"
 import { TestClock } from "effect/testing"
-import { startCliModules } from "../src/modules.ts"
+import { type CliModules, startCliModules } from "../src/modules.ts"
 import { makeRequirementChecker, type Prober } from "../src/requirements.ts"
 
-const settle = Effect.repeat(Effect.yieldNow, { times: 100 })
+/**
+ * Resolved once the module's states since now (as the host announces them, after it rebuilt the snapshot) satisfy
+ * `done`: the change itself, not a number of yields (a start that takes longer still ends before the next turn reads).
+ */
+const once = (modules: CliModules, id: string, done: (states: ReadonlyArray<string>) => boolean) =>
+  Effect.gen(function*() {
+    const reached = yield* Deferred.make<void>()
+    const states: Array<string> = []
+    const off = modules.host.subscribe((info) => {
+      if (info.id !== id) return
+      states.push(info.state)
+      if (done(states)) Deferred.doneUnsafe(reached, Effect.void)
+    })
+    return Deferred.await(reached).pipe(Effect.ensuring(Effect.sync(off)))
+  })
 
 it.effect("a restart and a program that went missing reach the next CLI turn; a turn holding the old registry is refused", () =>
   Effect.gen(function*() {
@@ -36,8 +50,10 @@ it.effect("a restart and a program that went missing reach the next CLI turn; a 
     assert.deepStrictEqual(first.registry.specs.map((s) => s.name), ["mcp_one"])
 
     tools.current = ["mcp_one", "mcp_two"]
+    // Started again: running after it stopped.
+    const restarted = yield* once(modules, "mcp", (states) => states.includes("stopping") && states.at(-1) === "running")
     yield* host!.requestRestart("the server's tool list changed")
-    yield* settle
+    yield* restarted
     const second = yield* modules.setup("base")
     assert.deepStrictEqual(second.registry.specs.map((s) => s.name), ["mcp_one", "mcp_two"], "the next turn has the new tools")
 
@@ -48,8 +64,9 @@ it.effect("a restart and a program that went missing reach the next CLI turn; a 
     yield* TestClock.adjust(10_000)
 
     // A program it requires failed at run time: the next turn offers none of its tools, and says it is not set up.
+    const withdrawn = yield* once(modules, "mcp", (states) => states.at(-1) === "unavailable")
     yield* host!.reportMissingProgram("mpv")
-    yield* settle
+    yield* withdrawn
     const third = yield* modules.setup("base")
     assert.deepStrictEqual(third.registry.specs, [])
     assert.match(third.system, /MCP is not set up on this server/)
