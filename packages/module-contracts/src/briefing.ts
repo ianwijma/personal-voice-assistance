@@ -26,6 +26,9 @@ import type { Language } from "./common.ts"
  *   owner who is not a member, it says nothing personal at all, not even a name, and only counts the items in
  *   `withheld` (which the briefing words without a name: "Some personal items are not read out here."). A result with
  *   personal content says whose (`owner`): one person's at most; a section never mixes two people's in one result.
+ *   The briefing is the asking person's: the consumer keeps a section's personal content only when its `owner` is the
+ *   person of the asking turn, on every kind of device, and drops it silently otherwise. So answer for the asking
+ *   person (`request.turn`'s person) and do not gather other members' items for them.
  * - **Be fast and local**: answer from the module's own cache or store (its job keeps it fresh); no network call on
  *   this path unless the cache is empty, and then within the budget. A section that has nothing to say returns
  *   `{ _tag: "empty" }`; one whose data is unavailable fails with `BriefingSectionError`.

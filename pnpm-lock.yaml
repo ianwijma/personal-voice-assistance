@@ -790,6 +790,9 @@ importers:
       '@pva/language':
         specifier: workspace:*
         version: link:../language
+      '@pva/module-contracts':
+        specifier: workspace:*
+        version: link:../module-contracts
       effect:
         specifier: 'catalog:'
         version: 4.1.4
