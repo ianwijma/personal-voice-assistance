@@ -165,6 +165,29 @@ const JUMP_MS = 2_000
 const MAX_BACKOFF_MS = 10 * 60_000
 const ZONE = /^[A-Za-z0-9_/+-]{1,48}$/
 const CRON_TEXT = /^[0-9A-Za-z*/,?#LW -]+$/
+
+/**
+ * Why the scheduler would refuse `expr` as a job's cron schedule (in `timeZone`, default the server's), or `undefined`
+ * when it accepts it: the same checks `schedule` and `prepare` make (docs/SCHEDULING.md, "Cron"). For a module's own
+ * checks of a schedule it builds, and for `checkModule`.
+ */
+export const isSchedulerCron = (expr: unknown, timeZone?: string): string | undefined => {
+  if (typeof expr !== "string" || expr.length > MAX_CRON_CHARS || !CRON_TEXT.test(expr)) return `cron must be a cron expression of at most ${MAX_CRON_CHARS} characters`
+  // Checked before it is parsed or planned: a day of month or a month can make `Cron.next` search for years.
+  const segments = expr.trim().split(/\s+/)
+  if ((segments.length !== 5 && segments.length !== 6) || segments[segments.length - 3] !== "*" || segments[segments.length - 2] !== "*") {
+    return `"${expr}": cron is for system jobs, with minute, hour and day-of-week fields (and seconds first, if you like); day of month and month must be *. For a date, schedule a one-off job (at) and schedule the next one from its handler`
+  }
+  if (timeZone !== undefined && (typeof timeZone !== "string" || !ZONE.test(timeZone))) return "timeZone must be a time zone name (Europe/Amsterdam)"
+  const parsed = Cron.parse(expr, timeZone ?? Intl.DateTimeFormat().resolvedOptions().timeZone)
+  if (Result.isFailure(parsed)) return `"${expr}"${timeZone !== undefined ? ` in ${timeZone}` : ""} is not a cron schedule: ${parsed.failure.message}`
+  try {
+    if (!Number.isFinite(Cron.next(parsed.success, new Date()).getTime())) return `"${expr}" never fires (there is no time it matches)`
+  } catch {
+    return `"${expr}" never fires (there is no time it matches)`
+  }
+  return undefined
+}
 const SYSTEM: Actor = { kind: "system", name: "scheduler" }
 const ADMIN: Actor = { kind: "admin" }
 
@@ -191,6 +214,8 @@ interface Published {
   readonly retries: number
   readonly timeoutMs: number
   readonly decode: (u: unknown) => Effect.Effect<unknown, Schema.SchemaError>
+  /** Why a stored payload does not decode with the handler's schema, or `undefined` (checked when a job is scheduled). */
+  readonly payloadProblem: (u: unknown) => string | undefined
   readonly run: (payload: any, due: DueInfo) => Effect.Effect<void, unknown>
   /** A module part's: how it runs as a call in flight. Absent for a core handler. */
   readonly runner?: PartRunner
@@ -221,7 +246,8 @@ const fromStore = (e: StoreFailure): SchedulerError =>
 
 /** A payload as it is stored: `JSON.stringify`'s form, at most `MAX_PAYLOAD_CHARS`. */
 const payloadOf = (payload: unknown): { readonly ok: true; readonly value: Schema.Json } | { readonly ok: false; readonly message: string } => {
-  if (payload === undefined) return { ok: true, value: null }
+  // An absent payload is the empty object, so a handler whose payload is `Schema.Struct({})` takes it.
+  if (payload === undefined) return { ok: true, value: {} }
   let text: string | undefined
   try {
     text = JSON.stringify(payload)
@@ -313,7 +339,7 @@ export const makeSchedulerEngine = (options: SchedulerEngineOptions): Effect.Eff
     /** Published handlers by `<owner>/<name>`. */
     const published = new Map<string, Published>()
     /** Handlers registered during a start and not yet published, by owner (two of one name refuse the start). */
-    const staged = new Map<string, Set<{ readonly name: string; readonly part: PartHandle }>>()
+    const staged = new Map<string, Set<{ readonly name: string; readonly part: PartHandle; readonly payloadProblem: (u: unknown) => string | undefined }>>()
     /** The claim revs of the runs alive in this process (a running row whose rev is here is not recovered). */
     const alive = new Set<number>()
     /** Handlers published since the loop last applied the recovery rule to them. */
@@ -488,14 +514,11 @@ export const makeSchedulerEngine = (options: SchedulerEngineOptions): Effect.Eff
         return { ...base, dueAt: at + Math.round(request.inMs) }
       }
       const expr = request.cron
-      if (typeof expr !== "string" || expr.length > MAX_CRON_CHARS || !CRON_TEXT.test(expr)) return `cron must be a cron expression of at most ${MAX_CRON_CHARS} characters`
-      // Checked before it is parsed or planned: a day of month or a month can make `Cron.next` search for years.
-      const segments = expr.trim().split(/\s+/)
-      if ((segments.length !== 5 && segments.length !== 6) || segments[segments.length - 3] !== "*" || segments[segments.length - 2] !== "*") {
-        return `"${expr}": cron is for system jobs, with minute, hour and day-of-week fields (and seconds first, if you like); day of month and month must be *. For a date, schedule a one-off job (at) and schedule the next one from its handler`
-      }
       const tz = request.timeZone
-      if (tz !== undefined && (typeof tz !== "string" || !ZONE.test(tz))) return "timeZone must be a time zone name (Europe/Amsterdam)"
+      // The text, its fields and the zone (`isSchedulerCron`, which modules and checkModule use too).
+      const problem = isSchedulerCron(expr, tz)
+      if (problem !== undefined) return problem
+      if (typeof expr !== "string") return "cron must be a cron expression"
       const parsed = cronIn(expr, tz ?? householdZone())
       if (typeof parsed === "string") return `"${expr}"${tz !== undefined ? ` in ${tz}` : ""} is not a cron schedule: ${parsed}`
       const fields = { ...base, cron: expr, ...(tz !== undefined ? { timeZone: tz } : {}) }
@@ -542,6 +565,17 @@ export const makeSchedulerEngine = (options: SchedulerEngineOptions): Effect.Eff
       return view
     }
 
+    /**
+     * Why `payload` does not fit the handler `name` of `owner` as it is published now, or as it was registered by the
+     * start being published (a module that schedules in `shared` right after `handle`); `undefined` when it fits or no
+     * such handler is there now (a job may be scheduled before its handler appears: it is checked when it runs).
+     */
+    const payloadProblemOf = (owner: string, name: string, payload: unknown): string | undefined => {
+      const check = published.get(`${owner}/${name}`)?.payloadProblem ?? [...(staged.get(owner) ?? [])].findLast((t) => t.name === name)?.payloadProblem
+      const problem = check?.(payload)
+      return problem === undefined ? undefined : `the payload does not fit the handler "${name}": ${problem}`
+    }
+
     /** The module calls of one owner (a module, or a core service). */
     const callsFor = (owner: string, actor: Actor): Omit<ModuleScheduler, "handle"> => {
       const prepare = (request: ScheduleRequest): Effect.Effect<PreparedJob & { readonly fields: JobFields }, SchedulerError> =>
@@ -551,6 +585,8 @@ export const makeSchedulerEngine = (options: SchedulerEngineOptions): Effect.Eff
           if (typeof origin === "string") return yield* invalid(origin)
           const fields = planOf(owner, request, now(), origin)
           if (typeof fields === "string") return yield* invalid(fields)
+          const payloadWrong = payloadProblemOf(owner, fields.handler, fields.payload)
+          if (payloadWrong !== undefined) return yield* invalid(payloadWrong)
           const id = newId()
           let written = false
           return {
@@ -610,11 +646,14 @@ export const makeSchedulerEngine = (options: SchedulerEngineOptions): Effect.Eff
             const row = t.jobs.get(id)
             if (row === undefined || row.value.module !== owner) return { _tag: "none" as const }
             if (!isLive(row.value.state)) return { _tag: "finished" as const, state: row.value.state }
+            const payloadWrong = payloadProblemOf(owner, row.value.handler, row.value.payload)
+            if (payloadWrong !== undefined) return { _tag: "invalid" as const, message: payloadWrong }
             t.tx.afterCommit(wake)
             return { _tag: "ok" as const, row: put(t, row, clean({ ...fieldsOf(row.value), state: "scheduled", dueAt: Math.round(dueAt), attempt: 0, occurrenceAt: undefined }), actor) }
           }).pipe(Effect.mapError(fromStore))
           if (out._tag === "none") return undefined
           if (out._tag === "finished") return yield* failedWith("state", `The job is ${out.state}; schedule a new one instead`)
+          if (out._tag === "invalid") return yield* invalid(out.message)
           return viewOf(owner, undefined, out.row)
         })
 
@@ -672,12 +711,27 @@ export const makeSchedulerEngine = (options: SchedulerEngineOptions): Effect.Eff
       const timeoutMs = handler.timeoutMs ?? DEFAULT_HANDLER_TIMEOUT_MS
       if (!Number.isFinite(timeoutMs) || timeoutMs < 100 || timeoutMs > MAX_HANDLER_TIMEOUT_MS) return `The job handler "${name}": timeoutMs must be 100 to ${MAX_HANDLER_TIMEOUT_MS}`
       let decode: Published["decode"]
+      let payloadProblem: Published["payloadProblem"]
       try {
-        decode = Schema.decodeUnknownEffect(Schema.toCodecJson(handler.payload)) as Published["decode"]
+        const codec = Schema.toCodecJson(handler.payload)
+        decode = Schema.decodeUnknownEffect(codec) as Published["decode"]
+        const decodeNow = Schema.decodeUnknownExit(codec)
+        // Only a decoding that fails at once is a problem here; one that cannot be decided synchronously (a schema with
+        // asynchronous decoding) is checked when the job runs, as before.
+        payloadProblem = (u) => {
+          try {
+            const exit = decodeNow(u)
+            if (Exit.isSuccess(exit)) return undefined
+            const failed = exit.cause.reasons.find(Cause.isFailReason)
+            return failed === undefined ? undefined : messageOf(failed.error)
+          } catch {
+            return undefined
+          }
+        }
       } catch (error) {
         return `The job handler "${name}": its payload schema has no JSON form (${messageOf(error)})`
       }
-      return { owner, name, key: `${owner}/${name}`, idempotent: handler.idempotent === true, retries, timeoutMs, decode, run: handler.run }
+      return { owner, name, key: `${owner}/${name}`, idempotent: handler.idempotent === true, retries, timeoutMs, decode, payloadProblem, run: handler.run }
     }
 
     const forPart = (part: PartHandle, runner: PartRunner): ModuleScheduler => ({
@@ -687,7 +741,7 @@ export const makeSchedulerEngine = (options: SchedulerEngineOptions): Effect.Eff
           const checked = checkedHandler(part.moduleId, name, handler)
           if (typeof checked === "string") return Effect.fail(invalid(checked))
           const entry: Published = { ...checked, runner }
-          const token = { name, part }
+          const token = { name, part, payloadProblem: checked.payloadProblem }
           const mine = staged.get(part.moduleId) ?? new Set()
           staged.set(part.moduleId, mine)
           const unstage = () => {

@@ -398,8 +398,11 @@ export interface ModuleHostOptions {
    * Absent: no access checks (the CLI modes).
    */
   readonly access?: GatewayAccess
-  /** The gateway's later check (P8: the risk policy). There is no confirmation hook (§2 row 6). */
-  readonly gatewayHooks?: Pick<GatewayOptions, "risk">
+  /**
+   * The gateway's risk policy (`defaultRiskPolicy`: serve mode, the CLI modes and the test kit give it) and its later
+   * check. Absent: every class is allowed (hand-made hosts of tests). There is no confirmation hook (§2 row 6).
+   */
+  readonly gatewayHooks?: Pick<GatewayOptions, "risk" | "riskPolicy">
   /**
    * A call with no turn and no job runs for the local principal (the CLI modes: the person at the terminal). Default:
    * true without `access`, false with it (serve mode: such a call is refused).
@@ -676,6 +679,11 @@ const sameRecord = (a: Readonly<Record<string, string>>, b: Readonly<Record<stri
 }
 
 const describe = (error: unknown) => (error instanceof Error ? error.message : String(error))
+
+/** The longest tool name model providers take (Anthropic, OpenAI). */
+export const MAX_TOOL_NAME_CHARS = 64
+/** A tool name model providers take: 1 to 64 of A–Z, a–z, 0–9, `_` and `-`. */
+export const TOOL_NAME_PATTERN = /^[A-Za-z0-9_-]{1,64}$/
 
 /** What a bounded call into module code came to. */
 type Bounded<A> = { readonly _tag: "done"; readonly exit: Exit.Exit<A, unknown> } | { readonly _tag: "hung" }
@@ -1937,6 +1945,14 @@ export const makeModuleHost = Effect.fnUntraced(function*(options: ModuleHostOpt
     const actionIds = contributed.actions.map((a) => a.id)
     const duplicateAction = actionIds.find((n, i) => actionIds.indexOf(n) !== i)
     if (duplicateAction !== undefined) return { ok: false, message: `The module declares the action "${duplicateAction}" twice` }
+    // Tool names as model providers take them: a name they refuse, a duplicate, or an action's generated name that would
+    // have to be cut is a failed start that names it, never passed on or cut silently.
+    const longAction = contributed.actions.find((a) => `${run.entry.def.id}_${a.definition.id}`.length > MAX_TOOL_NAME_CHARS)
+    if (longAction !== undefined) {
+      return { ok: false, message: `The action "${longAction.definition.id}" would be offered as the tool "${run.entry.def.id}_${longAction.definition.id}", longer than ${MAX_TOOL_NAME_CHARS} characters: shorten the action id` }
+    }
+    const badName = contributed.tools.find((t) => !TOOL_NAME_PATTERN.test(t.name))
+    if (badName !== undefined) return { ok: false, message: `The tool name "${badName.name.slice(0, 80)}" is not 1 to ${MAX_TOOL_NAME_CHARS} of A–Z, a–z, 0–9, _ and -` }
     const names = contributed.tools.map((t) => t.name)
     const duplicate = names.find((n, i) => names.indexOf(n) !== i)
     if (duplicate !== undefined) return { ok: false, message: `The module declares the tool "${duplicate}" twice` }
@@ -2676,10 +2692,11 @@ export const makeModuleHost = Effect.fnUntraced(function*(options: ModuleHostOpt
       ? entry.shown.demand === undefined || entry.shown.demand.some((d) => d.assistantId === assistantId)
       : options.access.moduleOn(assistantId, entry.def.id))
 
-  /** The assistant may use this action (the gateway's first two checks). */
-  const offered = (assistantId: string | undefined, entry: Entry, actionId: string) =>
+  /** The assistant may use this action (the gateway's first two checks), and the risk policy refuses not every class it can be. */
+  const offered = (assistantId: string | undefined, entry: Entry, action: RegisteredAction) =>
     moduleOnFor(assistantId, entry) &&
-    (assistantId === undefined || options.access === undefined || !options.access.toolOff(assistantId, entry.def.id, actionToolName(entry.def.id, actionId)))
+    gateway.offers(action.definition) &&
+    (assistantId === undefined || options.access === undefined || !options.access.toolOff(assistantId, entry.def.id, actionToolName(entry.def.id, action.definition.id)))
 
   /** An unavailable module the caller has on (an assistant's choice, or its saved switch without demand). */
   const unavailableFor = (entry: Entry, assistantId: string | undefined) => {
@@ -2718,11 +2735,11 @@ export const makeModuleHost = Effect.fnUntraced(function*(options: ModuleHostOpt
     entries.flatMap((entry) => {
       if (unavailableFor(entry, assistantId) && moduleOnFor(assistantId, entry)) {
         const standIns = unavailablePartOf(entry, entry.shown.unavailable!).module.intentActions ?? []
-        return standIns.filter((a) => offered(assistantId, entry, a.definition.id)).map((action) => ({ entry, action }))
+        return standIns.filter((a) => offered(assistantId, entry, a)).map((action) => ({ entry, action }))
       }
       const running = instanceUsedBy(entry, assistantId)
       if (running === undefined) return []
-      return running.actions.filter((a) => offered(assistantId, entry, a.definition.id)).map((action) => ({ entry, action }))
+      return running.actions.filter((a) => offered(assistantId, entry, a)).map((action) => ({ entry, action }))
     })
 
   const actions: ActionCatalogue = {

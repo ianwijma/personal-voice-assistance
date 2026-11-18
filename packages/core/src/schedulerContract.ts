@@ -265,8 +265,9 @@ export const schedulerContract = (name: string, open: OpenStore) =>
       Effect.gen(function*() {
         const { advance, core, issues } = yield* setup()
         const r = recorder()
-        yield* core.handle("ping", { payload: Ping, idempotent: true, run: r.run })
+        // Scheduled before its handler is published, so it could not be checked then (once it is, `schedule` refuses it).
         const job = yield* core.schedule({ handler: "ping", payload: { n: "not a number" }, inMs: 0 })
+        yield* core.handle("ping", { payload: Ping, idempotent: true, run: r.run })
         yield* advance(MINUTE)
         const after = yield* core.get(job.id)
         assert.strictEqual(after?.state, "failed")

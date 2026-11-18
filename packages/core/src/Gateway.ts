@@ -2,7 +2,8 @@ import { Effect, Schema } from "effect"
 import { ACTION_TIMEOUT_MS, ActionError, type ActionOutcome, actionToolName, actionValues, type RegisteredAction } from "./Actions.ts"
 import { ToolError } from "./Errors.ts"
 import { actionRunnerOf, registerConfirmedRunner, toolRunnerOf } from "./GatewayPrivate.ts"
-import { declaredSensitivity, riskOf, type Sensitivity, type Tool, type ToolLatency, type ToolMetadata, type ToolRisk } from "./Module.ts"
+import { declaredSensitivity, riskOf, type Sensitivity, type Tool, type ToolLatency, type ToolMetadata, toolMetadata, type ToolRisk } from "./Module.ts"
+import type { RiskPolicy } from "./RiskPolicy.ts"
 import {
   type ConnectionRef,
   CurrentJob,
@@ -38,11 +39,16 @@ import {
  * 4. only then the module's risk function on the validated input (a generated action tool's input is turned into the
  *    action's values once; those are classified, admitted and run), within `RISK_BUDGET_MS`; one that throws,
  *    answers an undeclared class or is too slow refuses the call with a generic sentence (details to the log);
- * 5. the risk policy (`GatewayOptions.risk`, empty until P8).
+ * 5. the risk policy on that class (`GatewayOptions.riskPolicy`, `defaultRiskPolicy` in serve mode, the CLI modes and
+ *    the test kit): `confirm` and `deny` refuse, each with its own sentence;
+ * 6. the later hook (`GatewayOptions.risk`), empty in this stack.
  *
  * Checks 2 and 3 apply to a turn's assistant and to a job made for an assistant; a local call and a notification's
  * action skip them. An action declared `confirm: true` is refused on every path here (confirmation is off in this
  * stack); only core's confirmed path (`GatewayPrivate.confirmedRunnerOf`, `Conversation`) runs one.
+ *
+ * A tool or action whose every declared class the policy refuses is left out of a turn's tool list and action catalogue
+ * (`offers`, read by `makeToolRegistry` and the host's catalogue); a call that names it anyway is refused by check 5.
  *
  * **Adding a check (later PRs):** fill the `risk` hook where the gateway is made (`makeExecutionGateway`, given to the
  * module host by serve mode as `ModuleHostOptions.gatewayHooks`); a new kind of check is one more optional hook in
@@ -108,7 +114,9 @@ export type GatewayHook = (call: GatewayCall) => Effect.Effect<GatewayDecision>
 export interface GatewayOptions {
   /** Absent: the access checks are skipped (tests, the CLI modes). */
   readonly access?: GatewayAccess
-  /** Check 3, the risk policy (P8). */
+  /** Check 5, the risk policy on the call's class. Absent: every class is allowed (tests, hand-made registries). */
+  readonly riskPolicy?: RiskPolicy
+  /** Check 6, a later hook (P8). */
   readonly risk?: GatewayHook
   /**
    * What a call with no explicit principal, no `CurrentTurn` and no `CurrentJob` is: `local` (the CLI modes: the
@@ -159,6 +167,11 @@ export interface ExecutionGateway {
   ) => Effect.Effect<ActionOutcome | void, ActionError>
   /** The principal a call made now would run for, or why there is none (`host.actions.list` lists by it). */
   readonly principal: Effect.Effect<Principal | { readonly refused: string }>
+  /**
+   * Whether a tool or action is offered at all: the risk policy allows at least one class it declares (or infers).
+   * One it refuses for every class is left out of tool lists and catalogues; its calls are refused anyway.
+   */
+  readonly offers: (meta: ToolMetadata & { readonly speculative?: boolean | undefined }) => boolean
 }
 
 const decoders = new WeakMap<Tool, (u: unknown) => Effect.Effect<unknown, Schema.SchemaError>>()
@@ -208,6 +221,7 @@ const runForTool = (registered: RegisteredAction, values: Readonly<Record<string
 
 export const makeExecutionGateway = (options: GatewayOptions = {}): ExecutionGateway => {
   const access = options.access
+  const riskPolicy = options.riskPolicy
   const withoutPrincipal = options.withoutPrincipal ?? (access === undefined ? "local" : "refuse")
   // Made once: nothing is allocated per call for the checks.
   const hooks: ReadonlyArray<GatewayHook> = [options.risk].filter((h): h is GatewayHook => h !== undefined)
@@ -275,7 +289,9 @@ export const makeExecutionGateway = (options: GatewayOptions = {}): ExecutionGat
   const admit = (call: GatewayCall): Effect.Effect<GatewayDecision> =>
     Effect.suspend(() => {
       const problem = accessProblem(call)
-      return problem !== undefined ? Effect.succeed(refuse(problem)) : runHooks(call)
+      if (problem !== undefined) return Effect.succeed(refuse(problem))
+      const verdict = riskPolicy?.(call.risk)
+      return verdict !== undefined && verdict.outcome !== "allow" ? Effect.succeed(refuse(verdict.reason)) : runHooks(call)
     })
 
   /** The call with its principal resolved (its risk not yet). */
@@ -327,6 +343,8 @@ export const makeExecutionGateway = (options: GatewayOptions = {}): ExecutionGat
       if (failure !== undefined || risk === undefined) {
         return Effect.as(Effect.logWarning(`Execution gateway: ${call.name} (module ${call.moduleId ?? "none"}) refused: ${failure}`), UNJUDGED)
       }
+      const verdict = riskPolicy?.(risk)
+      if (verdict !== undefined && verdict.outcome !== "allow") return Effect.succeed(verdict.reason)
       return Effect.map(runHooks({ ...call, risk }), (decision) => (decision._tag === "Allow" ? undefined : decision.reason))
     })
 
@@ -400,7 +418,16 @@ export const makeExecutionGateway = (options: GatewayOptions = {}): ExecutionGat
     return problem === undefined ? p : { refused: problem }
   })
 
-  const gateway: ExecutionGateway = { admit, tool, action, principal }
+  const offers: ExecutionGateway["offers"] = (meta) => {
+    if (riskPolicy === undefined) return true
+    try {
+      return toolMetadata(meta).risks.some((r) => riskPolicy(r).outcome === "allow")
+    } catch {
+      return false
+    }
+  }
+
+  const gateway: ExecutionGateway = { admit, tool, action, principal, offers }
   // Core's confirmed path (`Conversation`, after a consumed spoken yes): reachable from inside core only.
   registerConfirmedRunner(gateway, (registered, values) => runAction(registered, values, {}, true))
   return gateway

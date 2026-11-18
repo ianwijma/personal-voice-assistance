@@ -5,6 +5,7 @@ import {
   Llm,
   LlmError,
   makeModuleHost,
+  defaultRiskPolicy,
   makeToolRegistry,
   type ModuleDemand,
   type Principal,
@@ -428,6 +429,9 @@ export const startServe = (options: ServeOptions): Effect.Effect<ServeHandle, Ht
       programMissing: (tool) => checker.markMissing(tool),
       // Serve mode: a call with no turn and no job is refused (a missing context never means "allowed").
       localPrincipal: false,
+      // The risk policy (P1's default): read and change run; message, money and security are refused, and a tool that
+      // can only be one of those is not offered at all.
+      gatewayHooks: { riskPolicy: defaultRiskPolicy },
       // The execution gateway's first checks, on every call (and the turn's action catalogue): the assistant has the
       // module on, and the tool is not one it switched off. Agents and decision providers are not per assistant.
       access: {

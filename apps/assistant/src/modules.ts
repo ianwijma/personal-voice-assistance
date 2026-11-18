@@ -1,5 +1,5 @@
 import { claudeSubscriptionAgent } from "@pva/agent-claude-code"
-import { makeModuleHost, type ModuleDefinition, type ModuleDemand, type ModuleHost, type ModulePersistence, type ModuleSnapshot, readOnlyPersistence, type TurnSetup, withContextProvider } from "@pva/core"
+import { defaultRiskPolicy, makeModuleHost, type ModuleDefinition, type ModuleDemand, type ModuleHost, type ModulePersistence, type ModuleSnapshot, readOnlyPersistence, type TurnSetup, withContextProvider } from "@pva/core"
 import { homeAssistantModule } from "@pva/module-home-assistant"
 import { catalog as assistantControlsModules } from "@pva/module-assistant-controls"
 import { catalog as briefingModules } from "@pva/module-briefing"
@@ -163,6 +163,8 @@ export const startCliModules = (
       requirements: checker.check,
       // The CLI modes have no assistants: a call runs for the person at the terminal.
       localPrincipal: true,
+      // The same risk policy as serve mode: message, money and security are refused here too.
+      gatewayHooks: { riskPolicy: defaultRiskPolicy },
       programMissing: (tool) => checker.markMissing(tool)
     })
     yield* host.startEnabled

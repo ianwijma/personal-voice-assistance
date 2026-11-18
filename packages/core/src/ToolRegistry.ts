@@ -1,4 +1,4 @@
-import { Context, Effect, Layer, Schema } from "effect"
+import { Context, Effect, Layer, Schema, SchemaAST as AST } from "effect"
 import type { ActionError, ActionOutcome, RegisteredAction } from "./Actions.ts"
 import type { ToolCall, ToolResult, ToolSpec } from "./Domain.ts"
 import { type ActionCallOptions, defaultGateway, type ExecutionGateway, prepareTool } from "./Gateway.ts"
@@ -38,7 +38,19 @@ export class ToolRegistry extends Context.Service<ToolRegistry, {
     Layer.sync(ToolRegistry, () => makeToolRegistry(modules))
 }
 
-const toSpec = (tool: Tool): ToolSpec => {
+/** Whether a schema is a struct with no fields and nothing else (a tool without parameters), whatever its annotations. */
+const isEmptyStruct = (schema: Schema.Top): boolean => {
+  const ast = schema.ast
+  return AST.isObjects(ast) && ast.propertySignatures.length === 0 && ast.indexSignatures.length === 0
+}
+
+/**
+ * A tool as a model provider and the Claude Code bridge receive it: its name, description and parameters as a JSON
+ * Schema. A tool without parameters (an empty `Schema.Struct({})`, whatever its annotations) is sent as
+ * `{ "type": "object", "properties": {} }`, because providers take only an object schema as a tool's input.
+ */
+export const toolSpec = (tool: Tool): ToolSpec => {
+  if (isEmptyStruct(tool.parameters)) return { name: tool.name, description: tool.description, inputSchema: { type: "object", properties: {} } }
   const document = Schema.toJsonSchemaDocument(tool.parameters)
   const inputSchema: Record<string, unknown> = { ...document.schema }
   if (Object.keys(document.definitions).length > 0) inputSchema.$defs = document.definitions
@@ -59,7 +71,11 @@ const encodeResult = (value: unknown): string => {
 }
 
 export interface ToolRegistryOptions {
-  /** The gateway every call goes through. Default: `defaultGateway` (no access checks, no hooks). */
+  /**
+   * The gateway every call goes through. Default: `defaultGateway` (no access checks, no hooks). A tool or action its
+   * risk policy refuses for every class (`ExecutionGateway.offers`) is left out of `specs` and `actions`; a call that
+   * names it anyway reaches the gateway, which refuses it.
+   */
   readonly gateway?: ExecutionGateway
 }
 
@@ -75,12 +91,12 @@ export const makeToolRegistry = (modules: ReadonlyArray<AssistantModule>, option
       tools.set(tool.name, { tool, moduleId: module.name })
       // The input decoder is made here, once per tool (cached across registries), never on a call.
       prepareTool(tool)
-      if (tool.action !== undefined) actions.push(tool.action)
+      if (tool.action !== undefined && gateway.offers(tool.action.definition)) actions.push(tool.action)
     }
-    actions.push(...(module.intentActions ?? []))
+    actions.push(...(module.intentActions ?? []).filter((a) => gateway.offers(a.definition)))
     providers.push(...(module.context ?? []))
   }
-  const specs = Array.from(tools.values(), ({ tool }) => toSpec(tool))
+  const specs = Array.from(tools.values()).filter(({ tool }) => gateway.offers(tool.action?.definition ?? tool)).map(({ tool }) => toolSpec(tool))
 
   const run = (call: ToolCall): Effect.Effect<ToolResult> => {
     const entry = tools.get(call.name)
