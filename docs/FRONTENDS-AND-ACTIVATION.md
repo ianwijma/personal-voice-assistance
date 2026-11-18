@@ -278,7 +278,7 @@ New and changed messages (schema constant → `type`):
 | server | `Result` (changed) | `result` | + `admin?: AdminSession` (successful `admin.login` only) |
 | server | `EngineSummaryMessage` | `engine.summary` | `{ engine: EngineSummary }`, everyone |
 | server | `AdminStateMessage` | `admin.state` | `{ admin: AdminState }`, the connection concerned |
-| server | `AdminSnapshotMessage` | `admin.snapshot` | `{ snapshot: AdminSnapshot }`, admin only |
+| server | `AdminSnapshotMessage` | `admin.snapshot` | `{ snapshot: AdminSnapshot }`, admin only. Protocol 10: a module that does not fit the snapshot's share is a light entry there (`ModuleInfo.details: "follow"`), and its complete `module.changed` follows at once in the same send (docs/ARCHITECTURE.md, Bounds) |
 | server | `DeviceProfileMessage` | `device.profile` | `{ deviceId?, profile, editable }`, the device's connections |
 | server | `Frontends` | `frontends` | `{ frontends: FrontendKindInfo[] }`, admin only |
 | server | `Devices` | `devices` | `{ devices: DeviceInfo[] }`, admin only |

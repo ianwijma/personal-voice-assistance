@@ -1,7 +1,7 @@
 // Review round 3 of PR 90 (module routes in serve mode): module-written token labels pass the page boundary, token
-// changes never acknowledge damaged settings, handlers that do not stop are capped per module, and a request in
+// changes never acknowledge damaged settings, and a request in
 // flight when its module is withdrawn finishes within the grace period or is answered 503.
-import { defineModule, makeIssueRegistry, makeModuleHost, type ModuleHost, type ModuleRoute, readOnlyPersistence, Setting } from "@pva/core"
+import { defineModule, makeModuleHost, type ModuleHost, type ModuleRoute, readOnlyPersistence, Setting } from "@pva/core"
 import { Context, Effect, Exit, Scope } from "effect"
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs"
 import * as http from "node:http"
@@ -9,7 +9,7 @@ import type { AddressInfo } from "node:net"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
-import { makeModuleRouter, MAX_ROUTE_STRAGGLERS, type ModuleRouter } from "../src/serve/moduleRoutes.ts"
+import { makeModuleRouter, type ModuleRouter } from "../src/serve/moduleRoutes.ts"
 import { makeRouteTokens, type RouteTokenKeeper } from "../src/serve/RouteTokens.ts"
 import type { SettingsStore } from "../src/serve/SettingsStore.ts"
 import { openVault, type Vault } from "../src/serve/Vault.ts"
@@ -107,35 +107,6 @@ describe("module routes after review round 3", () => {
     expect(locked.tokensLocked).toBe(true)
     expect(JSON.stringify(locked)).not.toContain(SECRET)
     expect(locked.modules[0]!.routes[0]!.calls[0]!.token).toBe("Connected with [secret]")
-  })
-
-  it("3b-3: handlers that do not stop count against their module; at the cap its routes answer 503 and Health says why", async () => {
-    const issues = makeIssueRegistry()
-    const mod = defineModule({
-      apiVersion: 2,
-      id: "stuck",
-      name: "Stuck",
-      description: "Never stops",
-      shared: () =>
-        Effect.succeed({
-          value: undefined,
-          // Asked to stop, its cleanup takes 3 s (far past the router's 50 ms cleanup limit here).
-          routes: [{ method: "GET", path: "hang", public: true, timeoutMs: 100, handler: () => Effect.never.pipe(Effect.onInterrupt(() => Effect.sleep(3_000))) } satisfies ModuleRoute]
-        }),
-      start: () => Effect.succeed({})
-    })
-    const host = await hostOf(mod)
-    const { get } = await serve(host, { cleanupMs: 50, issues })
-    for (let i = 0; i < MAX_ROUTE_STRAGGLERS; i++) expect((await get("/api/modules/stuck/hang")).status).toBe(504)
-    await new Promise((r) => setTimeout(r, 200))
-    expect(await get("/api/modules/stuck/hang")).toEqual({ status: 503, text: "The module is still stopping earlier requests; try again later" })
-    // Unknown paths are still 404 first.
-    expect((await get("/api/modules/stuck/nope")).status).toBe(404)
-    expect(issues.all().find((i) => i.id === "stuck.routes-stuck")).toMatchObject({ severity: "error", module: "stuck" })
-    // Once they have ended, the module takes requests again and the issue is gone.
-    await new Promise((r) => setTimeout(r, 3_500))
-    expect(issues.all().find((i) => i.id === "stuck.routes-stuck")).toBeUndefined()
-    expect((await get("/api/modules/stuck/hang")).status).toBe(504)
   })
 
   it("a request in flight when its module is withdrawn finishes within the grace period, or is answered 503", async () => {

@@ -1,4 +1,4 @@
-import { HealthIssue, type HealthIssue as Issue, MAX_HEALTH_ISSUES } from "@pva/protocol"
+import { HealthIssue, type HealthIssue as Issue, MAX_HEALTH_BYTES, MAX_HEALTH_ISSUES } from "@pva/protocol"
 import { Schema } from "effect"
 
 /**
@@ -22,8 +22,8 @@ export interface IssueRegistry {
 
 const RANK: Readonly<Record<Issue["severity"], number>> = { error: 0, warning: 1, info: 2 }
 
-/** The UTF-8 size all issues together may have on the wire (well under the 1 MiB frame, with the rest of a snapshot). */
-export const ISSUES_BUDGET_BYTES = 256 * 1024
+/** The UTF-8 size all issues together may have on the wire: the protocol's `MAX_HEALTH_BYTES` (under the 1 MiB frame, with the rest of a snapshot). */
+export const ISSUES_BUDGET_BYTES = MAX_HEALTH_BYTES
 
 const isWireIssue = Schema.is(HealthIssue)
 
@@ -76,7 +76,8 @@ export const boundIssues = (list: ReadonlyArray<Issue>, max: number, more: (coun
 const encoder = new TextEncoder()
 
 export const makeIssueRegistry = (): IssueRegistry => {
-  const bySource = new Map<string, { readonly key: string; readonly issues: ReadonlyArray<Issue> }>()
+  /** Per source: its issues (the most severe `MAX_HEALTH_ISSUES`) and how many more it reported (left out). */
+  const bySource = new Map<string, { readonly key: string; readonly issues: ReadonlyArray<Issue>; readonly omitted: number }>()
   const listeners = new Set<() => void>()
   let all: ReadonlyArray<Issue> | undefined
   return {
@@ -94,7 +95,7 @@ export const makeIssueRegistry = (): IssueRegistry => {
         out.push(issue)
         bytes += size
       }
-      const left = sorted.length - out.length
+      const left = sorted.length - out.length + [...bySource.values()].reduce((n, s) => n + s.omitted, 0)
       if (left > 0) {
         out.push({ id: "issues.more", severity: "warning", title: `And ${left} more issue${left === 1 ? "" : "s"}`, detail: "Only the first ones fit on this page; fix these and check again." })
       }
@@ -102,12 +103,18 @@ export const makeIssueRegistry = (): IssueRegistry => {
       return all
     },
     set: (source, raw) => {
-      // Normalised at the boundary, for every source (the host's module sources and the app's own).
-      const issues = raw.slice(0, MAX_HEALTH_ISSUES).map((issue, i) => wireSafeIssue(issue, source, i))
-      const key = JSON.stringify(issues)
-      if ((bySource.get(source)?.key ?? "[]") === key) return
+      // Bounded after sorting by severity (an error past the bound is kept before warnings), with the number left out
+      // kept for the last issue; then normalised at the boundary, for every source (the host's and the app's own).
+      const rank = (issue: Issue) => RANK[issue.severity] ?? RANK.warning
+      const issues = raw.map((issue, i) => ({ issue, i }))
+        .sort((a, b) => rank(a.issue) - rank(b.issue) || a.i - b.i)
+        .slice(0, MAX_HEALTH_ISSUES)
+        .map(({ issue }, i) => wireSafeIssue(issue, source, i))
+      const omitted = raw.length - issues.length
+      const key = JSON.stringify([issues, omitted])
+      if ((bySource.get(source)?.key ?? JSON.stringify([[], 0])) === key) return
       if (issues.length === 0) bySource.delete(source)
-      else bySource.set(source, { key, issues: [...issues] })
+      else bySource.set(source, { key, issues: [...issues], omitted })
       all = undefined
       for (const listener of listeners) {
         try {

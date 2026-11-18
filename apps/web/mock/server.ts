@@ -35,9 +35,10 @@
  *                   web-voice default (asleep after a claim) and a third device that has it among three phrases.
  *   admin-disabled  no admin password: `admin.state.enabled` is false and every login is refused.
  *   admin-backoff   every wrong admin password refuses logins for 30 s.
- *   health          like typed (protocol 9): Diagnostics › Health lists a module error and a core warning; the Music
- *                   module is unavailable (yt-dlp is missing) and suggests a DJ template; Check again takes 1 s and
- *                   clears the clock warning. Every other scenario has an empty, checked registry.
+ *   health          like typed (protocol 9): Diagnostics › Health lists a module error and a module warning for one
+ *                   device (the kitchen speaker); the Music module is unavailable (yt-dlp is missing) and suggests a
+ *                   DJ template; Check again takes 1 s and clears the speaker warning. Every other scenario has an
+ *                   empty, checked registry.
  * In every scenario the vault starts as "none" (no vault yet) unless the scenario says otherwise.
  *
  * Protocol 5 (docs/FRONTENDS-AND-ACTIVATION.md): pages say `frontend: "voice" | "admin"` in hello. The admin
@@ -140,15 +141,17 @@ import {
   type VoiceEntry,
   voiceFor
 } from "@pva/protocol"
+import { answerHealthCheck } from "./health.ts"
 import { exampleEngineStatus, exampleHealth, exampleSnapshot, exampleUnavailableModule, exampleVoiceSection, exampleWeatherModule } from "@pva/protocol/examples"
 import { type WebSocket, WebSocketServer } from "ws"
 import { createAssistantsMock, SAM_ID } from "./assistants.ts"
+import { type CapabilityParts, reconcileCapability } from "./capabilities.ts"
 import { fieldValueError } from "./fieldChecks.ts"
 import { seedTraces } from "./traces.ts"
 import { createVoiceAssistants, scenarioSettings, scriptedTurn } from "./voiceAssistants.ts"
 import { encodeWav, MOCK_PROVIDERS } from "./voices.ts"
 import { createModelPickersMock } from "./modelPickers.ts"
-import { createModuleRoutesMock, demoHomeAction, demoHomeModule, TokenRefusal } from "./demoHome.ts"
+import { createModuleRoutesMock, DEMO_DEFINITION_ACTIONS, demoHomeAction, demoHomeModule, TokenRefusal } from "./demoHome.ts"
 import { createScheduledJobsMock, MockSchedulerError } from "./scheduledJobs.ts"
 import { boundaryKey, checkDietList, checkMembersValue, cleanDeviceName, type Condition, type FieldError, speakerAllowedFrom } from "@pva/protocol"
 
@@ -961,6 +964,8 @@ let modules = initialModules()
 const moduleRoutesMock = createModuleRoutesMock(() => vault.state === "locked")
 /** P6: the scheduled jobs (as the real server's /api/scheduler/jobs). */
 let scheduledJobsMock = createScheduledJobsMock()
+/** Buttons whose press is running (`<module>/<key>`): a second press is `busy`, as on the host. */
+const pressing = new Set<string>()
 /** Protocol 7: assistants, device types and the devices' own sections (mock/assistants.ts). */
 const assistantsMock = createAssistantsMock({
   modules: () => modules,
@@ -1436,6 +1441,7 @@ const resetState = () => {
   modules = initialModules()
   moduleRoutesMock.reset()
   scheduledJobsMock = createScheduledJobsMock()
+  pressing.clear()
   forcedErrors.clear()
   models = initialModels()
   sections = withWarnings(initialSections())
@@ -2091,14 +2097,6 @@ const runningStatus = (id: string, m: ModuleInfo) =>
   : m.status
 /** A failure injected into a capability module's instances (tests: `/mock/module-error`); a saved token with "good" in it clears it. */
 const forcedErrors = new Map<string, string>()
-const ownableKeys = (m: ModuleInfo) => new Set(m.settings.fields.filter((f) => f.overridable === true && f.type !== "secret").map((f) => f.key))
-/** An instance's key: the effective non-secret values (an assistant's own applied), as the host keys them. */
-const instanceKey = (m: ModuleInfo, own: Readonly<Record<string, SettingValue>> | undefined) => {
-  const over = ownableKeys(m)
-  const values: Record<string, SettingValue> = { ...m.settings.values }
-  for (const [k, v] of Object.entries(own ?? {})) if (over.has(k)) values[k] = v
-  return JSON.stringify(Object.keys(values).sort().map((k) => [k, values[k]]))
-}
 /** The field errors the module's own checks give an assistant's own values (`ModuleHost.checkOwn`). */
 const checkOwn = (moduleId: string, own: Readonly<Record<string, unknown>>) => {
   const m = modules.find((x) => x.id === moduleId)
@@ -2107,44 +2105,15 @@ const checkOwn = (moduleId: string, own: Readonly<Record<string, unknown>>) => {
   return validate(m.settings, { values, secrets: {} }).flatMap((e) => (e.key === null ? [] : [{ field: e.key, message: e.message }]))
 }
 /**
- * A capability module runs while at least one switched-on assistant has it on; assistants whose effective values are
- * equal share one instance, an assistant with its own values may run another. Module infos are updated (and pushed)
- * only when they change. The shared instance is listed first.
+ * Every capability module follows the assistants (`reconcileCapability`, mock/capabilities.ts: an unavailable one
+ * stays unavailable). Module infos are updated (and pushed) only when they change.
  */
+const capabilityParts: CapabilityParts = { forced: (id) => forcedErrors.get(id), runningStatus, runningTools, instanceStatus }
 const syncCapabilities = () => {
   const list = assistantsMock.assistants()
   for (const m of [...modules]) {
     if (m.kind !== "capability") continue
-    const wanting = list.filter((a) => a.on && a.modules[m.id]?.on === true)
-    const over = ownableKeys(m)
-    const sharedKey = instanceKey(m, undefined)
-    const groups = new Map<string, { assistants: Array<string>; own: Set<string>; values: Record<string, SettingValue> | undefined }>()
-    for (const a of wanting) {
-      const own = a.modules[m.id]!.own
-      const key = instanceKey(m, own)
-      const g = groups.get(key) ?? { assistants: [], own: new Set<string>(), values: key === sharedKey ? undefined : (own as Record<string, SettingValue> | undefined) }
-      g.assistants.push(a.id)
-      if (key !== sharedKey) for (const [k, v] of Object.entries(own ?? {})) if (over.has(k) && JSON.stringify(v) !== JSON.stringify(m.settings.values[k])) g.own.add(k)
-      groups.set(key, g)
-    }
-    const forced = forcedErrors.get(m.id)
-    const status = runningStatus(m.id, m)
-    const ordered = [...groups.entries()].sort(([a], [b]) => (a === sharedKey ? -1 : b === sharedKey ? 1 : 0)).map(([, g]) => g)
-    const instances = ordered.map((g) => ({
-      assistants: g.assistants,
-      own: [...g.own],
-      state: forced !== undefined ? ("error" as const) : ("running" as const),
-      ...(forced !== undefined ? { error: `${forced} (for ${g.assistants.join(", ")})` } : instanceStatus(m.id, m, g.values) !== undefined ? { status: instanceStatus(m.id, m, g.values)! } : {})
-    }))
-    const { error: _e, status: _s, ...rest } = m
-    const next: ModuleInfo = {
-      ...rest,
-      enabled: wanting.length > 0,
-      state: wanting.length === 0 ? "disabled" : forced !== undefined ? "error" : "running",
-      tools: wanting.length > 0 && forced === undefined ? [...runningTools(m.id)] : [],
-      ...(wanting.length > 0 && forced !== undefined ? { error: forced } : wanting.length > 0 && status !== undefined ? { status } : {}),
-      instances
-    }
+    const next = reconcileCapability(m, list, capabilityParts)
     const same = (a: ModuleInfo, b: ModuleInfo) => JSON.stringify({ ...a, revision: 0 }) === JSON.stringify({ ...b, revision: 0 })
     if (!same(m, next)) setModule(m.id, () => next)
   }
@@ -2183,7 +2152,9 @@ const startModule = (c: Conn, requestId: string, id: string) => {
       : id === "claude-subscription"
       ? { text: `Ready · ${String(m.settings.values.model)} · max plan`, tone: "ok" as const }
       : m.status
-    setModule(id, (x) => ({ ...x, state: "running", tools, ...(status !== undefined ? { status } : {}) }))
+    // Its declared routes are published again with the start.
+    const routes = initialModules().find((x) => x.id === id)?.routes
+    setModule(id, (x) => ({ ...x, state: "running", tools, ...(status !== undefined ? { status } : {}), ...(routes !== undefined ? { routes } : {}) }))
     result(c, requestId, true)
     if (id === "claude-subscription") refreshEngine()
   })
@@ -2325,8 +2296,9 @@ const onClientMessage = (c: Conn, m: ClientMessage) => {
         startModule(c, m.requestId, m.moduleId)
         return
       }
+      // As the real host: its routes are withdrawn when it starts stopping (its tokens are kept).
       setModule(m.moduleId, (x) => {
-        const { error: _e, status: _s, ...rest } = x
+        const { error: _e, status: _s, routes: _r, ...rest } = x
         return { ...rest, enabled: false, state: "stopping", tools: [] }
       })
       result(c, m.requestId, true)
@@ -2425,23 +2397,37 @@ const onClientMessage = (c: Conn, m: ClientMessage) => {
       if (mod === undefined) return result(c, m.requestId, false, { code: "unknown_module", message: `No module ${m.moduleId}.` })
       const field = mod.settings.fields.find((f) => f.key === m.key)
       if (field?.type !== "action") return result(c, m.requestId, false, { code: "unknown_action", message: `${mod.name} has no action "${m.key}"` })
+      // As the host: an instance's button needs its module running; one press per button at a time.
+      if (mod.state !== "running" && !DEMO_DEFINITION_ACTIONS.has(`${mod.id}/${m.key}`)) {
+        return result(c, m.requestId, false, { code: "not_running", message: `${mod.name} is not running` })
+      }
+      const pressKey = `${mod.id}/${m.key}`
+      if (pressing.has(pressKey)) return result(c, m.requestId, false, { code: "busy", message: "That button is still running" })
+      pressing.add(pressKey)
       const values = !field.requiresSaved && m.values !== undefined ? { ...mod.settings.values, ...m.values } : mod.settings.values
       const action = demoHomeAction(m.key, values) ?? { ok: true, text: "Done.", tone: "ok" as const }
-      after(500, () => sendTo(c, { type: "result", requestId: m.requestId, ok: true, action }))
+      after(500, () => {
+        pressing.delete(pressKey)
+        sendTo(c, { type: "result", requestId: m.requestId, ok: true, action })
+      })
       return
     }
     case "health.check": {
       if (requireAdmin(c, m.requestId)) return
-      // As the server: answered once it has started; the outcome follows as `health`. A check already running is
-      // joined, not started again (one completion for any number of requests).
-      result(c, m.requestId, true)
-      if (health.checking) return
-      health = { ...health, checking: true }
-      broadcast({ type: "health", health })
-      after(1000, () => {
-        health = { issues: health.issues.filter((i) => i.id !== "music.speaker.kitchen"), checkedAt: Date.now(), checking: false }
-        broadcast({ type: "health", health })
+      // As the server: the current health first, then the result; the outcome follows as `health`. A check already
+      // running is joined, not started again (one completion for any number of requests).
+      const state = { health }
+      answerHealthCheck(state, {
+        send: (message) => sendTo(c, message),
+        broadcast: (message) => {
+          health = state.health
+          broadcast(message)
+        },
+        result: () => result(c, m.requestId, true),
+        after,
+        finished: (h) => ({ ...h, issues: h.issues.filter((i) => i.id !== "music.speaker.kitchen"), checkedAt: Date.now() })
       })
+      health = state.health
       return
     }
     case "engine.reload": {

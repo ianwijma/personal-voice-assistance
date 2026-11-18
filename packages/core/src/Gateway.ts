@@ -20,6 +20,9 @@ import {
  * intent agent (`ToolRegistry.runAction`), and a module's `host.actions.run` all come here; later a phrase command, a
  * tap on a presentation, a routine step and a notification action do too. Every tool and action the module host
  * publishes is sealed (`GatewayPrivate.ts`): its own `execute` / `run` refuses, and only this file runs the real one.
+ * Sealing stops accidental direct calls; it is not a security boundary against code compiled into the process
+ * (docs/MODULES-PLAN.md §3.5): such code can hand a sealed handle to another gateway, relabel it, or read what a
+ * registrar receives.
  *
  * For every call it resolves **on whose behalf** it runs (`Principal`): the explicit one a caller passes (a
  * notification, P9), else the turn (`CurrentTurn`), else the job (`CurrentJob`), else the principal of the gateway
@@ -122,8 +125,10 @@ export interface GatewayCallOptions {
 /** How one action call is made. */
 export interface ActionCallOptions extends GatewayCallOptions {
   /**
-   * Run once the call is admitted, just before the action runs (the intent agent speaks its announcement then, never
-   * before admission). Not run for a refused call.
+   * Run once the call is admitted (the first admission), before `holdUntil`: the intent agent releases its
+   * announcement then, so it is synthesised while the turn is still speculative and plays at promotion. Not run for a
+   * call refused at that admission. A call refused at the second admission (after `holdUntil`) does not run, but its
+   * announcement may already have been released (docs/ARCHITECTURE.md, "The execution gateway": a known limit).
    */
   readonly onAdmitted?: Effect.Effect<void>
   /**
@@ -313,8 +318,9 @@ export const makeExecutionGateway = (options: GatewayOptions = {}): ExecutionGat
       const started = performance.now()
       try {
         risk = riskOf(meta, call.input)
-      } catch (error) {
-        failure = error instanceof Error ? error.message : String(error)
+      } catch {
+        // A bounded category only: what the module threw (or answered) may hold anything, so it is not logged.
+        failure = "its risk function threw or answered a class it does not declare"
       }
       const ms = performance.now() - started
       if (failure === undefined && ms > RISK_BUDGET_MS) failure = `its risk function took ${ms.toFixed(1)} ms (at most ${RISK_BUDGET_MS} ms)`

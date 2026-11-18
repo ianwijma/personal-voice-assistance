@@ -537,11 +537,11 @@ describe("module routes after review round 1", () => {
     })
     try {
       for (; generation < 300; generation++) {
-        live = [{ moduleId: "churn", route: routeOf(generation), scope }]
+        live = [{ moduleId: "churn", route: routeOf(generation), scope, stopped: Effect.never }]
         expect((await raw(`/api/modules/churn/gen${generation}`, { port: churn.port })).status).toBe(200)
       }
       // The first generation's pattern comes back: its old calls were let go; the latest one's are kept.
-      live = [{ moduleId: "churn", route: routeOf(0), scope }, { moduleId: "churn", route: routeOf(299), scope }]
+      live = [{ moduleId: "churn", route: routeOf(0), scope, stopped: Effect.never }, { moduleId: "churn", route: routeOf(299), scope, stopped: Effect.never }]
       const view = await Effect.runPromise(churn.router.view("churn"))
       expect(view.modules[0]!.routes.map((r) => r.calls.length)).toEqual([0, 1])
     } finally {
@@ -554,7 +554,8 @@ describe("module routes after review round 1", () => {
     const live: Array<PublishedRoute> = [{
       moduleId: "said",
       route: { method: "GET", path: "x", guards: ["admin"], description: "Uses KEY", handler: () => Effect.succeed({ status: 200 }) },
-      scope
+      scope,
+      stopped: Effect.never
     }]
     const seen: Array<string> = []
     const said = await otherRouter({

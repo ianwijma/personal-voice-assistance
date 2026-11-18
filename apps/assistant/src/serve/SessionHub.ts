@@ -1,5 +1,5 @@
 import type { AudioClientLink } from "@pva/audio-web"
-import { type ConnectionRef, type HostDeviceView, type HostResult, makeConnectionRef, type ModuleHost } from "@pva/core"
+import { adminModules, type ConnectionRef, type HostDeviceView, type HostResult, makeConnectionRef, type ModuleHost, withinModuleFrame } from "@pva/core"
 import {
   type AdminSnapshot,
   type AdminState,
@@ -17,6 +17,7 @@ import {
   type FrontendRole,
   MAX_PASSWORD_CHARS,
   micSequenceGap,
+  type ModuleInfo,
   PROTOCOL_VERSION,
   type RequestId,
   type ServerMessage,
@@ -837,9 +838,9 @@ export const makeSessionHub = (options: HubOptions): SessionHub => {
     }
   }
 
-  const adminSnapshot = (): AdminSnapshot => ({
+  const adminSnapshot = (modules: ReadonlyArray<ModuleInfo>): AdminSnapshot => ({
     engine: options.engine.status(),
-    modules: options.host.modules().map(access.module),
+    modules: [...modules],
     sections: options.sections.list().map(access.section),
     traces: [...sessions.traces()],
     vault: keys.info(true),
@@ -852,6 +853,22 @@ export const makeSessionHub = (options: HubOptions): SessionHub => {
     deviceTypes: [...assistants.deviceTypes()],
     ...(options.health !== undefined ? { health: options.health.info() } : {})
   })
+
+  /**
+   * `admin.snapshot`, then at once, in the same send, a `module.changed` for every module the snapshot carries only
+   * as a light entry (`adminModules`: the modules' complete projections together within `ADMIN_MODULES_SHARE_BYTES`,
+   * each within `MODULE_FRAME_MAX_BYTES`). The send limit is judged before the snapshot, not between its frames: they
+   * are one answer, and a page that falls behind afterwards is dropped as before.
+   */
+  const sendAdminSnapshot = (client: Client) => {
+    const { modules, follow } = adminModules(options.host.modules().map((m) => withinModuleFrame(access.module(m))))
+    if (client.closed || overLimit(client)) return
+    client.connection.sendText(encodeServerMessage({ type: "admin.snapshot", snapshot: adminSnapshot(modules) }))
+    for (const module of follow) {
+      if (client.closed) return
+      client.connection.sendText(encodeServerMessage({ type: "module.changed", module }))
+    }
+  }
 
   const hello = (client: Client, message: ClientMessage, arrival: number) => {
     if (message.type !== "hello") return drop(client, CloseCode.helloTimeout, "the first message must be hello")
@@ -916,7 +933,7 @@ export const makeSessionHub = (options: HubOptions): SessionHub => {
       connectionId: client.connection.id,
       snapshot: first
     })
-    if (client.adminToken !== undefined) send(client, { type: "admin.snapshot", snapshot: adminSnapshot() })
+    if (client.adminToken !== undefined) sendAdminSnapshot(client)
     const firstOfDevice = client.device !== undefined && ![...clients].some((c) => c !== client && c.helloed && !c.closed && c.device?.id === client.device!.id)
     client.helloed = true
     if (client.device !== undefined) deviceChanged()
@@ -968,7 +985,7 @@ export const makeSessionHub = (options: HubOptions): SessionHub => {
     if (previous !== undefined && previous !== outcome.session.token) admin.logout(previous)
     send(client, { type: "result", requestId, ok: true, admin: outcome.session })
     send(client, { type: "admin.state", admin: adminState(client) })
-    send(client, { type: "admin.snapshot", snapshot: adminSnapshot() })
+    sendAdminSnapshot(client)
   }
 
   /** `arrival`: the message's number in the order the hub received messages (`DeviceRegistry.arrival`). */

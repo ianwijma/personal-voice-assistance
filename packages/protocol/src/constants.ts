@@ -71,7 +71,8 @@
  * 10: extended settings fields and module routes (docs/MODULES-PLAN.md §4 P3). `SettingField` gains `textList`,
  * `records`, `combo`, `action` and `info` and `SettingValue` a list of records (new members of closed sets: a
  * version 9 page would refuse a form that uses them); `ErrorCode` gains `unknown_action` and `not_running`.
- * Additive, within 10: `module.action` (admin only) and `Result.action`, `ModuleInfo.routes`, and the module route
+ * Additive, within 10: `module.action` (admin only) and `Result.action`, `ModuleInfo.routes`, `ModuleInfo.toolsLeft`,
+ * `ModuleInfo.details` (a light snapshot entry whose complete entry follows in `module.changed`), and the module route
  * API (`moduleRoutes.ts`); the household messages to voice pages (§4 P4: `household.snapshot`, `household.event`,
  * `household.gap`, `household.ts`), which a page that does not show household data ignores.
  *

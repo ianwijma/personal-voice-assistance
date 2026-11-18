@@ -179,3 +179,30 @@ describe("a hidden field's local error (review round 2)", () => {
     expect(configureModule.mock.calls[0]![1].values).toEqual({ enabled: false })
   })
 })
+
+// PR 90 review round 5, finding 5B-4: a refreshed form treats a field with a shown local error as edited, like Save
+// and Test do: it keeps the text being typed and its error, and the form says it changed elsewhere.
+describe("a newer form from the server while a record's number is invalid", () => {
+  it("keeps the cleared input and its error, keeps the other side's change of the rest, and marks the form stale", () => {
+    const { store, save } = setup()
+    const rows = screen.getAllByTestId("record")
+    fireEvent.click(rows[0]!.querySelector<HTMLElement>("[aria-expanded]")!)
+    fireEvent.change(within(rows[0]!).getByLabelText("Low"), { target: { value: "" } })
+    expect(screen.getByText(/^Level 1, Low: /)).toBeInTheDocument()
+    expect(save().disabled).toBe(true)
+    // Another admin saves Low 2 for the first level, and a new title.
+    act(() => {
+      store.dispatch({
+        type: "module.changed",
+        module: { ...lists, revision: 2, settings: { ...lists.settings, values: { ...lists.settings.values, title: "Theirs", levels: [{ name: "A", low: 2 }, { name: "B", low: 2 }] } } }
+      })
+    })
+    // The edit and its error stay; the form says it is not the latest.
+    const first = screen.getAllByTestId("record")[0]!
+    expect((within(first).getByLabelText("Low") as HTMLInputElement).value).toBe("")
+    expect(screen.getByText(/^Level 1, Low: /)).toBeInTheDocument()
+    expect(screen.getByText("Changed in another tab")).toBeInTheDocument()
+    expect((screen.getByLabelText("Title") as HTMLInputElement).value).toBe("Theirs")
+    expect(save().disabled).toBe(true)
+  })
+})

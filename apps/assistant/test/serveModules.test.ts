@@ -2,7 +2,7 @@
 // WP-12a/12b/12c): the Home line reaches the prompt the model receives, Weather and Clock follow Home unless set, an
 // assistant's own module values run its own instance (and are checked at `assistant.save`), and Home Assistant
 // (against the fake Home Assistant server) gives its tools to the assistant that has it on.
-import { defineModule, LOCAL_PRINCIPAL, Llm, type LlmEvent, makeConnectionRef, type ModuleDefinition, type Principal, Setting, type TurnContext } from "@pva/core"
+import { defineModule, type JobOrigin, LOCAL_PRINCIPAL, Llm, type LlmEvent, makeConnectionRef, type ModuleDefinition, type Principal, Setting, type TurnContext } from "@pva/core"
 import { homeAssistantModule } from "@pva/module-home-assistant"
 import { clockModule, weatherModule } from "@pva/modules-builtin"
 import type { ClientMessage, ModuleInfo } from "@pva/protocol"
@@ -321,6 +321,13 @@ describe("module API v2 in serve mode (review round 3)", () => {
     // default person (servePeopleRooms.test.ts has the cases with people).
     expect(await as(turn({ person: { id: "p1", how: "chosen" } }))).toBe("Not run: the person is not in Members.")
     expect(await as(LOCAL_PRINCIPAL)).toBe("Not run: there is no local principal here.")
+    // Review round 4 (p1-r4b finding 5): a job's person is checked whether or not the job names a device. P5: the
+    // check is Members (this server has none here), with or without a device.
+    const job = (parts: Partial<JobOrigin>): Principal => ({ _tag: "job", job: { jobId: "j", moduleId: "greeter", ...parts } })
+    expect(await as(job({}))).toBe("ran: hello")
+    expect(await as(job({ person: { id: "nobody", how: "chosen" } }))).toBe("Not run: the person is not in Members.")
+    expect(await as(job({ assistantId: "alpha", person: { id: "nobody", how: "chosen" } }))).toBe("Not run: the person is not in Members.")
+    expect(await as(job({ assistantId: "alpha", deviceId, person: { id: "nobody", how: "chosen" } }))).toBe("Not run: the person is not in Members.")
   })
 
   it("with the vault unlocked at boot, a module starts after serve mode is built, and one nobody has on never starts", async () => {
@@ -334,8 +341,15 @@ describe("module API v2 in serve mode (review round 3)", () => {
         settings: { token: Setting.secret({ label: "Token" }) },
         start: ({ host }) =>
           Effect.sync(() => {
-            // Reads what serve mode builds (the devices through the hub): it must exist by now.
-            started.push(`${id}: ${host.view().devices.length >= 0 ? "built" : "?"}`)
+            // Every attempt is recorded, before anything that could throw (review round 4, p1-r4c finding 9); serve
+            // mode builds the engine before it opens the host, so an attempt that does not see it is premature.
+            let ready = false
+            try {
+              ready = host.view().engine !== undefined
+            } catch {
+              ready = false
+            }
+            started.push(`${id}: ${ready ? "built" : "early"}`)
             return {}
           })
       })

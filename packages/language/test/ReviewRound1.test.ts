@@ -258,9 +258,10 @@ describe("finding 19: only valid rules are read", () => {
   for (const bad of ["FREQ=DAILY;BYDAY=0MO", "FREQ=WEEKLY;BYDAY=2TU", "FREQ=DAILY;BYDAY=1MO", "FREQ=DAILY;FREQ=WEEKLY", "FREQ=DAILY;INTERVAL=2;INTERVAL=3", "FREQ=DAILY;COUNT=3;UNTIL=20270101T000000Z",
     "FREQ=DAILY;INTERVAL=1e3", "FREQ=DAILY;INTERVAL=+2", "FREQ=DAILY;INTERVAL=0x10", "FREQ=DAILY;COUNT=0", "FREQ=DAILY;COUNT=1.5", "FREQ=MONTHLY;BYDAY=6MO", "FREQ=YEARLY;BYDAY=54MO",
     "FREQ=MONTHLY;BYMONTHDAY=32", "FREQ=MONTHLY;BYMONTHDAY=1,1", "FREQ=YEARLY;BYMONTH=2;BYMONTHDAY=30", "FREQ=WEEKLY;BYMONTHDAY=1", "FREQ=DAILY;UNTIL=20270230T000000Z",
-    "FREQ=DAILY;WKST=XX", "FREQ=DAILY;", "FREQ=DAILY;;COUNT=2"])
-    it(`"${bad}" is invalid`, () => expect(parseRRule(bad).kind).toBe("invalid"))
-  for (const other of ["FREQ=MONTHLY;BYSETPOS=1", "FREQ=DAILY;BYSETPOS=1;BYHOUR=9", "FREQ=SECONDLY", "FREQ=DAILY;BYSECOND=5", "FREQ=YEARLY;BYWEEKNO=20", "FREQ=YEARLY;BYYEARDAY=100",
+    "FREQ=DAILY;WKST=XX", "FREQ=DAILY;", "FREQ=DAILY;;COUNT=2", "FREQ=MONTHLY;BYSETPOS=1"])
+    // Not `ok`; `invalid` or `unsupported` is a hint (review round 5, findings 7 and 8).
+    it(`"${bad}" is not ok`, () => expect(parseRRule(bad).kind).not.toBe("ok"))
+  for (const other of ["FREQ=DAILY;BYSETPOS=1;BYHOUR=9", "FREQ=SECONDLY", "FREQ=DAILY;BYSECOND=5", "FREQ=YEARLY;BYWEEKNO=20", "FREQ=YEARLY;BYYEARDAY=100",
     "FREQ=DAILY;X-NAME=1", "FREQ=DAILY;BYHOUR=9", "FREQ=YEARLY;BYDAY=20MO;BYMONTHDAY=1", "FREQ=MONTHLY;BYMONTH=10;BYMONTHDAY=13;BYDAY=FR", "FREQ=DAILY;UNTIL=20271231"])
     it(`"${other}" is unsupported`, () => expect(parseRRule(other).kind).toBe("unsupported"))
   it("valid rules round-trip", () => {

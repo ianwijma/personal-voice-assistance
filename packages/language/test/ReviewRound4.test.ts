@@ -91,7 +91,8 @@ describe("round 4 findings", () => {
     }
   })
   it("21: a malformed value of a part not expanded is invalid", () => {
-    for (const r of ["FREQ=DAILY;BYHOUR=garbage", "FREQ=DAILY;BYHOUR=99", "FREQ=YEARLY;BYWEEKNO=0", "FREQ=DAILY;UNTIL=20270230"]) expect(parseRRule(r).kind, r).toBe("invalid")
+    // Not `ok`; `invalid` or `unsupported` is a hint (review round 5, findings 7 and 8).
+    for (const r of ["FREQ=DAILY;BYHOUR=garbage", "FREQ=DAILY;BYHOUR=99", "FREQ=YEARLY;BYWEEKNO=0", "FREQ=DAILY;UNTIL=20270230"]) expect(parseRRule(r).kind, r).not.toBe("ok")
     for (const r of ["FREQ=DAILY;BYHOUR=9", "FREQ=YEARLY;BYWEEKNO=20", "FREQ=DAILY;UNTIL=20270228"]) expect(parseRRule(r).kind, r).toBe("unsupported")
   })
   it("22: ambiguous candidates keep their minutes", () => {

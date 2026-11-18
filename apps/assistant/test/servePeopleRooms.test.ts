@@ -1167,6 +1167,15 @@ const gatewayFor = async (deviceId: string, person: string) => {
   return exit._tag === "Success" ? "ran" : String((exit.cause as { readonly reasons?: ReadonlyArray<{ readonly error?: { readonly message?: string } }> }).reasons?.[0]?.error?.message ?? "failed")
 }
 
+/** The gateway's answer for a job of `person` that names no device and no assistant (`principalProblem`). */
+const jobGatewayFor = async (person: string, deviceId?: string) => {
+  const host = server!.handle.host
+  const where = (host.snapshot().assistantParts.get("alpha") ?? []).find((p) => p.moduleId === "probe")!.module.tools!.find((t) => t.name === "where")!
+  const principal = { _tag: "job", job: { jobId: "j-r4", moduleId: "probe", person: { id: person, how: "chosen" }, ...(deviceId === undefined ? {} : { deviceId }) } } as const
+  const exit = await Effect.runPromise(Effect.exit(host.gateway.tool("probe", where, {}, { principal })))
+  return exit._tag === "Success" ? "ran" : String((exit.cause as { readonly reasons?: ReadonlyArray<{ readonly error?: { readonly message?: string } }> }).reasons?.[0]?.error?.message ?? "failed")
+}
+
 const AMBIENT = { HOME_AMBIENT_FACTS: "all" }
 
 /**
@@ -1234,6 +1243,9 @@ describe("review round 4: a retired id pasted back into the settings file", () =
     expect(hostRef!.service(Devices)!.get("kitchen-r4-01")?.place.defaultPerson).toBeNull()
     expect(privacy.mayReveal(samId, "kitchen-r4-01")).toBe(false)
     expect(await gatewayFor("kitchen-r4-01", samId)).toBe("Not run: the person is not in Members.")
+    // Merged final P1: a job that names only a person (no device) is checked too, against the effective Members.
+    expect(await jobGatewayFor(samId)).toBe("Not run: the person is not in Members.")
+    expect(await jobGatewayFor(robinId)).toBe("ran")
     // The repair is written (Kim's id is the committed one), and the tablet's reference to the retired id is cleared.
     await until("the repair written", () => {
       const onDisk = JSON.parse(readFileSync(path, "utf8")) as Json
@@ -1526,4 +1538,31 @@ describe("review round 4: every membership predicate in the server agrees with P
     expect(restarts).toBeGreaterThan(4)
     expect(checked).toBeGreaterThan(50)
   }, 240_000)
+})
+
+describe("a job's person: a deferred call is not tied to the device's default person", () => {
+  it("a job for (device, Sam) still runs after the device's default person became Robin; a removed member or an unknown device is refused", async () => {
+    const { admin, samId, robinId } = await boot()
+    await pageOn("kitchen-job-01")
+    expect((await saveDevice(admin, "kitchen-job-01", { place: placeOf(samId) })).ok).toBe(true)
+    // A turn must still be the device's default person; a job (scheduled while it was Sam's) is admitted.
+    expect(await gatewayFor("kitchen-job-01", samId)).toBe("ran")
+    expect(await gatewayFor("kitchen-job-01", robinId)).toBe('Not run: the person is not the default person of the device "kitchen-job-01".')
+    expect(await jobGatewayFor(samId, "kitchen-job-01")).toBe("ran")
+    // The device is given to Robin: the job's origin is the one captured when it was scheduled.
+    expect((await saveDevice(admin, "kitchen-job-01", { place: placeOf(robinId) })).ok).toBe(true)
+    expect(await jobGatewayFor(samId, "kitchen-job-01")).toBe("ran")
+    expect(await gatewayFor("kitchen-job-01", samId)).toBe('Not run: the person is not the default person of the device "kitchen-job-01".')
+    // A device with nobody as default person: a turn naming a person is refused, a job is not.
+    expect((await saveDevice(admin, "kitchen-job-01", { place: placeOf(null) })).ok).toBe(true)
+    expect(await gatewayFor("kitchen-job-01", samId)).toBe('Not run: the person is not the default person of the device "kitchen-job-01".')
+    expect(await jobGatewayFor(samId, "kitchen-job-01")).toBe("ran")
+    // An unknown device is refused as before.
+    expect(await jobGatewayFor(samId, "no-such-device")).toBe('Not run: the device "no-such-device" is not known.')
+    // Sam is removed from Members: the job naming a device and Sam is refused.
+    const robin = (server!.handle.store.settings().assistant.HOUSEHOLD_MEMBERS as ReadonlyArray<Json>).find((m) => m.id === robinId)!
+    expect((await request(admin, { type: "settings.update", sectionId: "members", patch: { values: { HOUSEHOLD_MEMBERS: [robin] as never }, secrets: {} } })).ok).toBe(true)
+    expect(await jobGatewayFor(samId, "kitchen-job-01")).toBe("Not run: the person is not in Members.")
+    expect(await jobGatewayFor(robinId, "kitchen-job-01")).toBe("ran")
+  })
 })

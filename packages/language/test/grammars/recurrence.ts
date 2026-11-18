@@ -1,7 +1,7 @@
 // The spoken-recurrence grammar of the README ("Spoken recurrence") for the tests, and its meaning: the RRULE it says and its first
 // occurrence after now, found with the tests' own calendar (support/Zone.ts).
 import { fixed, lit, oneOf, words, type Grammar, type Rule } from "../support/Cfg.ts"
-import { daysIn, instantsOf, plusDays, wallOf, weekdayOf, type Day } from "../support/Zone.ts"
+import { canonicalZone, dayHappensRef, daysIn, instantsOf, plusDays, sameDay, wallOf, weekdayOf, type Day, type Wall } from "../support/Zone.ts"
 import { ordinalRules } from "./dates.ts"
 import { number, type Lang } from "./numbers.ts"
 import { inPart, settleReading, timeGrammar, type Period, type Reading } from "./times.ts"
@@ -147,6 +147,8 @@ const partTime: Record<Period, { hour: number; minute: number } | undefined> = {
 export interface RecurrenceMeaning {
   readonly rrule: string
   readonly dtstart: string
+  /** The first occurrence's local date and clock time (review round 5, finding 5). */
+  readonly start: Wall
   readonly time?: { readonly hour: number; readonly minute: number; readonly guessed: boolean; readonly alternatives: ReadonlyArray<{ readonly hour: number; readonly minute: number }> }
   readonly partOfDay?: Period
   readonly timeDefaulted: boolean
@@ -193,14 +195,18 @@ export const recurrenceMeaning = (r: RecurrenceReading, now: number, zone: strin
       case "YEARLY": return b.date !== undefined ? d.month === b.date.month && d.day === b.date.day : d.month === today.month && d.day === today.day
     }
   }
+  // The search starts at today's civil date (README: spoken recurrence, 'on or after today's civil date'; round 6, finding 1).
   for (let k = 0; k <= 366 * 8 + 31; k++) {
     const d = plusDays(today, k)
     if (d.year > 2199) return undefined
     if (!selects(d)) continue
     const instant = instantsOf({ ...d, hour: clock.hour, minute: clock.minute, second: 0 }, zone)[0]!
+    // Never a day the zone skips altogether; a gap that only pushes the time past midnight is an ordinary gap (round 5, finding 1).
+    if (!sameDay(wallOf(instant, zone), d) && !dayHappensRef(d, zone)) continue
     if (instant <= now) continue
     return {
-      rrule, dtstart: `DTSTART;TZID=${zone}:${pad(d.year, 4)}${pad(d.month)}${pad(d.day)}T${pad(clock.hour)}${pad(clock.minute)}00`,
+      rrule, dtstart: `DTSTART;TZID=${canonicalZone(zone)}:${pad(d.year, 4)}${pad(d.month)}${pad(d.day)}T${pad(clock.hour)}${pad(clock.minute)}00`,
+      start: { ...d, hour: clock.hour, minute: clock.minute, second: 0 },
       ...(time !== undefined ? { time } : {}), ...(b.part !== undefined ? { partOfDay: b.part } : {}), timeDefaulted: time === undefined
     }
   }

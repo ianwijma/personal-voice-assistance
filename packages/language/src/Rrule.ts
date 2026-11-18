@@ -3,7 +3,7 @@ import type { ClockTime, Language, LocalDate, LocalDateTime } from "./Result.ts"
 import { speakTime } from "./Speak.ts"
 import { monthNames, numberToWords, ordinalToWords, weekdayNames } from "./Words.ts"
 import {
-  dateOfDay, dayNumber, daysInMonth, isValidLocal, lastDay, localParts, normalizeTimeZone, pad, weekdayOfDay, zonedToInstant
+  dateOfDay, dayNumber, daysInMonth, isValidLocal, lastDay, localParts, normalizeTimeZone, pad, weekdayOfDay, zonedInstants, zonedToInstant
 } from "./Zoned.ts"
 
 /** The longest RRULE or DTSTART text read. */
@@ -52,7 +52,11 @@ export interface RecurrenceRule {
 export const maxInterval = 999
 export const maxCount = 1000
 
-/** What `parseRRule` and `readSeries` say. `unsupported`: valid RFC 5545 outside the set above. `invalid`: not RFC 5545. */
+/**
+ * What `parseRRule` and `readSeries` say. `ok` exactly for a rule of the set above, never for anything else. `unsupported` and
+ * `invalid` carry a reason for a person to read; which of the two is a hint (README; review round 5, findings 7 and 8): `unsupported`
+ * is meant for valid RFC 5545 outside the set, `invalid` for what is not RFC 5545, but a rule both outside and malformed may be either.
+ */
 export type RRuleRead =
   | { readonly kind: "ok"; readonly rule: RecurrenceRule }
   | { readonly kind: "unsupported"; readonly reason: string }
@@ -67,11 +71,15 @@ const maxDays = [31, 29, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
 const rfcParts: ReadonlySet<string> = new Set(["FREQ", "UNTIL", "COUNT", "INTERVAL", "BYSECOND", "BYMINUTE", "BYHOUR", "BYDAY", "BYMONTHDAY", "BYYEARDAY", "BYWEEKNO", "BYMONTH", "BYSETPOS", "WKST"])
 const notExpanded: ReadonlySet<string> = new Set(["BYSECOND", "BYMINUTE", "BYHOUR", "BYYEARDAY", "BYWEEKNO", "BYSETPOS"])
 
-/** A comma-separated list of whole numbers from `min` to `max`, each once; 0 only when `min` is 0; a sign only when `signed`. */
-const intList = (value: string, min: number, max: number, signed = true): Array<number> | undefined => {
+/**
+ * A comma-separated list of whole numbers from `min` to `max`, each once; 0 only when `min` is 0; a sign only when `signed`; at most
+ * `digits` digits (RFC 5545's `monthnum` and `ordmoday` are one or two: "BYMONTH=003" is not one; review round 5, finding 8).
+ */
+const intList = (value: string, min: number, max: number, signed = true, digits = 3): Array<number> | undefined => {
   const out: Array<number> = []
+  const pattern = new RegExp(`^${signed ? "[+-]?" : ""}\\d{1,${digits}}$`)
   for (const d of value.split(",")) {
-    if (!(signed ? /^[+-]?\d{1,3}$/ : /^\d{1,3}$/).test(d)) return undefined
+    if (!pattern.test(d)) return undefined
     const n = Number(d)
     if (n < min || n > max || (n === 0 && min !== 0) || out.includes(n)) return undefined
     out.push(n)
@@ -169,15 +177,24 @@ const shapeProblem = (rule: RecurrenceRule): RRuleRead | undefined => {
   return undefined
 }
 
+const printableAscii = /^[\x20-\x7e]*$/
+/** Trims ASCII spaces only: `trim()` would also remove U+00A0, U+2028, U+FEFF and the like, which RFC 5545 text never contains. */
+const trimSpaces = (text: string): string => text.replace(/^ +| +$/g, "")
+
+/** Upper-case ASCII letters only: Unicode look-alikes (dotless i, long s) must not fold into rule tokens. */
+const asciiUpper = (text: string): string => text.replace(/[a-z]/g, (c) => c.toUpperCase())
+
 /**
  * Read an `RRULE` value ("FREQ=WEEKLY;BYDAY=MO,WE") or line ("RRULE:FREQ=…") by RFC 5545 §3.3.10: every part once, digits only for
- * numbers, ordinals in range and only where the frequency allows them. `ok` with the rule (lists sorted), `unsupported` with the
- * reason for valid rules outside the supported set (see the top of this file), `invalid` for anything that is not an RRULE.
+ * numbers, ordinals in range and only where the frequency allows them. `ok` with the rule (lists sorted) exactly for a rule of the
+ * supported set (see the top of this file), never for anything else; otherwise `unsupported` (meant for valid rules outside the set)
+ * or `invalid` (meant for anything that is not an RRULE), with a reason — which of the two is a hint, not a contract (`RRuleRead`).
  */
 export const parseRRule: (text: string) => RRuleRead = guarded((text: string): RRuleRead => {
   if (typeof text !== "string") return invalidRule("Not text")
   if (text.length > maxRuleText) return unsupported(`An RRULE longer than ${maxRuleText} characters is not read`)
-  const body = text.trim().replace(/^RRULE:/i, "")
+  if (!printableAscii.test(text)) return invalidRule("Not printable ASCII")
+  const body = trimSpaces(text).replace(/^RRULE:/i, "")
   if (body === "") return invalidRule("Empty")
   const seen = new Set<string>()
   let freq: string | undefined
@@ -191,8 +208,8 @@ export const parseRRule: (text: string) => RRuleRead = guarded((text: string): R
   for (const part of body.split(";")) {
     const eq = part.indexOf("=")
     if (eq <= 0) return invalidRule(`"${part}" is not NAME=VALUE`)
-    const key = part.slice(0, eq).toUpperCase()
-    const value = part.slice(eq + 1).toUpperCase()
+    const key = asciiUpper(part.slice(0, eq))
+    const value = asciiUpper(part.slice(eq + 1))
     if (value === "") return invalidRule(`${key} has no value`)
     if (seen.has(key)) return invalidRule(`${key} is given twice`)
     seen.add(key)
@@ -245,8 +262,8 @@ export const parseRRule: (text: string) => RRuleRead = guarded((text: string): R
           byDay.push({ weekday: m[2] as Weekday, ...(nth !== undefined ? { nth } : {}) })
         }
         break
-      case "BYMONTHDAY": { const l = intList(value, -31, 31); if (l === undefined) return invalidRule("BYMONTHDAY must be 1–31 or -1…-31, each once"); byMonthDay = l; break }
-      case "BYMONTH": { const l = intList(value, 1, 12); if (l === undefined || value.includes("-") || value.includes("+")) return invalidRule("BYMONTH must be 1–12, each once"); byMonth = l; break }
+      case "BYMONTHDAY": { const l = intList(value, -31, 31, true, 2); if (l === undefined) return invalidRule("BYMONTHDAY must be 1–31 or -1…-31, each once"); byMonthDay = l; break }
+      case "BYMONTH": { const l = intList(value, 1, 12, true, 2); if (l === undefined || value.includes("-") || value.includes("+")) return invalidRule("BYMONTH must be 1–12, each once"); byMonth = l; break }
     }
   }
   if (freq === undefined) return invalidRule("No FREQ")
@@ -292,7 +309,8 @@ const dtstartPattern = /^DTSTART;TZID=([^:;"]+):(\d{4})(\d{2})(\d{2})T(\d{2})(\d
  */
 export const parseDtstart: (text: string) => Dtstart | undefined = guarded((text: string): Dtstart | undefined => {
   if (typeof text !== "string" || text.length > maxRuleText) return undefined
-  const m = dtstartPattern.exec(text.trim())
+  if (!printableAscii.test(text)) return undefined
+  const m = dtstartPattern.exec(trimSpaces(text))
   if (m === null) return undefined
   const timeZone = normalizeTimeZone(m[1]!)
   const start = { year: Number(m[2]), month: Number(m[3]), day: Number(m[4]), hour: Number(m[5]), minute: Number(m[6]), second: Number(m[7]) }
@@ -429,7 +447,7 @@ export const readSeries: (spec: RecurrenceSpec) => SeriesRead = guarded((spec: R
   if (rule.kind !== "ok") return rule
   const dt = parseDtstart(spec.dtstart)
   if (dt === undefined) {
-    const line = typeof spec.dtstart === "string" ? spec.dtstart.trim() : ""
+    const line = typeof spec.dtstart === "string" ? trimSpaces(spec.dtstart) : ""
     return /^DTSTART[;:]/i.test(line) || /^\d{4}-?\d{2}-?\d{2}/.test(line)
       ? { kind: "unsupported", reason: `DTSTART must be DTSTART;TZID=<IANA zone>:YYYYMMDDTHHMMSS in ${minYear}–${maxYear} (no UTC, floating or date-only start)` }
       : { kind: "invalid", reason: "Not a DTSTART" }
@@ -499,11 +517,25 @@ const expand = (s: Series, after: number, limit: number): Occurrences => {
     return out.length < limit
   }
   const why = eachDay(s, count === undefined ? afterDay : startDay, take)
-  // `limit` first (as many as were asked for), then the series' own end, then the end of the supported years. An UNTIL before the
-  // first instant an instance after 31 December 2199 could have also ends the series inside the supported years.
+  // `limit` first (as many as were asked for), then the series' own end, then the end of the supported years. With UNTIL, the series
+  // goes on past them only when it has an instance after 31 December 2199 at or before UNTIL (review round 5, finding 4).
   if (out.length >= limit) return { instants: out, stop: "limit" }
   if (ended || why !== "range") return { instants: out, stop: "series" }
-  return { instants: out, stop: until < instantOf(s, lastDay + 1) ? "series" : "range" }
+  return { instants: out, stop: s.rule.until === undefined || instanceBeyondRange(s, until) ? "range" : "series" }
+}
+
+/**
+ * Whether a series has an instance after the supported years that is at or before `until`: a day after 31 December 2199 that the rule
+ * selects, in a period in phase with DTSTART's, whose instant is not after `until`. An UNTIL is at most 2199-12-31T23:59:59Z and no
+ * zone is more than a day ahead of UTC, so only the first days of 2200 can be (in zones far east); they are checked one by one.
+ */
+const instanceBeyondRange = (s: Series, until: number): boolean => {
+  const p0 = periodOf(s.rule, dayNumber(s.start.year, s.start.month, s.start.day))
+  for (let day = lastDay + 1; (day - 2) * 86_400_000 <= until; day++) {
+    const p = periodOf(s.rule, day)
+    if ((p - p0) % s.rule.interval === 0 && daysOfPeriod(s, p).includes(day) && instantOf(s, day) <= until) return true
+  }
+  return false
 }
 
 /**
@@ -580,7 +612,7 @@ export interface DescribeOptions {
  * UNTIL (", until 31 December 2027 at 23:00" / ", tot 31 december 2027 om 23:00", in `timeZone`) — or that it returns `undefined`.
  * They are not promised to read back with `parseRecurrence`. `undefined` for a rule outside the supported set, an interval above one
  * or a plain weekly, monthly or yearly rule without `start`, a `start` the rule does not select, a `timeZone` this machine does not
- * know, an UNTIL without `timeZone`, or a time that is not a clock time.
+ * know, an UNTIL without `timeZone` or in an hour that zone's clocks repeat, or a time that is not a clock time.
  */
 export const describeRRule: (rrule: string | RecurrenceRule, language: Language, options?: DescribeOptions) => string | undefined = guarded((rrule: string | RecurrenceRule, language: Language, options: DescribeOptions = {}): string | undefined => {
   if (!isLanguage(language) || !isOptions(options)) return undefined
@@ -657,7 +689,10 @@ export const describeRRule: (rrule: string | RecurrenceRule, language: Language,
   return tail === undefined ? undefined : text + tail
 }, undefined)
 
-/** ", 5 times" / ", until 31 December 2027 at 23:00": what a description says after the rule; "" without COUNT and UNTIL; `undefined` for an UNTIL without a zone. */
+/**
+ * ", 5 times" / ", until 31 December 2027 at 23:00": what a description says after the rule; "" without COUNT and UNTIL; `undefined`
+ * for an UNTIL without a zone, or one in an hour the zone's clocks repeat.
+ */
 const countAndUntil = (rule: RecurrenceRule, language: Language, timeZone: string | undefined): string | undefined => {
   const en = language === "en"
   if (rule.count !== undefined) return en ? `, ${rule.count} ${rule.count === 1 ? "time" : "times"}` : `, ${rule.count} keer`
@@ -665,6 +700,9 @@ const countAndUntil = (rule: RecurrenceRule, language: Language, timeZone: strin
   const zone = timeZone === undefined ? undefined : normalizeTimeZone(timeZone)
   if (zone === undefined) return undefined
   const p = localParts(untilInstant(rule.until), zone)
+  // A cutoff in an hour the clocks repeat (02:15 on the autumn day in Amsterdam) is two moments said the same: which one cannot be
+  // said, so the rule is not described (review round 5, finding 3).
+  if (zonedInstants(p, zone).length > 1) return undefined
   const clock = `${pad(p.hour)}:${pad(p.minute)}${p.second === 0 ? "" : `:${pad(p.second)}`}`
   return en ? `, until ${p.day} ${monthNames.en[p.month - 1]} ${p.year} at ${clock}` : `, tot ${p.day} ${monthNames.nl[p.month - 1]} ${p.year} om ${clock}`
 }

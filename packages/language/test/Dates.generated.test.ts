@@ -1,11 +1,14 @@
 // Dates and times (review round 3, decision 6): every calendar day of several years in each date form, the date speaker over
 // ±400/800 days, generated phrases with their meaning computed by the tests' own calendar, and their mutants.
-import { describe, expect, it } from "@effect/vitest"
+import { describe, expect, it, vi } from "@effect/vitest"
 import { parseDateTime, speakDate, type DateTimeValue } from "../src/index.ts"
 import { stable } from "./support/Cfg.ts"
 import { generatedParse, mutantsParse, type GrammarCheck } from "./support/Check.ts"
 import { plusDays, weekdayOf, type Day } from "./support/Zone.ts"
 import { dateGrammar, meaning, type DateReading, type Expected } from "./grammars/dates.ts"
+
+// Generated cases by the hundred: slow on a shared CI runner, so these tests get more than the default five seconds.
+vi.setConfig({ testTimeout: 60_000 })
 
 const project = (v: DateTimeValue): Expected => ({
   date: { year: v.date.year, month: v.date.month, day: v.date.day }, weekday: v.weekday,
