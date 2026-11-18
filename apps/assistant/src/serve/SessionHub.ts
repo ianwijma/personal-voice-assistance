@@ -287,6 +287,8 @@ interface Client {
    * replaced).
    */
   householdStarted?: boolean
+  /** P9: this connection was given what is open for its device (once its device is known). */
+  notifyStarted?: boolean
   /** P5: this tab is visible (until it says otherwise) and when it was last used (`device.caps.live`). */
   visible: boolean
   lastInteractionAt: number | undefined
@@ -624,12 +626,24 @@ export const makeSessionHub = (options: HubOptions): SessionHub => {
     options.household.connected(client.voice)
   }
 
+  /** P9: a voice connection of a known device gets the cards of what is open for its device (that connection only). */
+  const startNotify = (client: Client) => {
+    if (client.role !== "voice" || client.device === undefined || client.notifyStarted === true || client.closed || options.notify === undefined) return
+    client.notifyStarted = true
+    options.notify.connected(client.device.id, (m) => send(client, m))
+  }
+
   const registerDevice = (device: DeviceHello) =>
     options.run(Effect.andThen(registry.seen(device, connectedDevices()), Effect.sync(() => {
       refreshDevices()
       devicesChanged(false)
       // Written (or refused): the device's connections that waited for it start their feed now.
-      for (const c of clients) if (c.device?.id === device.id && c.helloed) startHousehold(c)
+      for (const c of clients) {
+        if (c.device?.id === device.id && c.helloed) {
+          startHousehold(c)
+          startNotify(c)
+        }
+      }
     })))
 
   /**
@@ -952,10 +966,10 @@ export const makeSessionHub = (options: HubOptions): SessionHub => {
         send: (m) => send(client, m)
       }
       if (firstOfDevice) options.household.deviceConnected(device!.id)
-      // P9: this connection gets the cards of what is open for its device (ringing again where it rang).
-      if (device !== undefined) options.notify?.connected(device.id, (m) => send(client, m))
       // A device the server already knows starts at once; a new one when its registration is written.
       if (device === undefined || registry.known(device.id)) startHousehold(client)
+      // P9: the cards of what is open for its device (ringing again where it rang); a new device once it is recorded.
+      if (device !== undefined && registry.known(device.id)) startNotify(client)
     }
     if (client.device !== undefined) registerDevice(client.device)
     if (key !== undefined) sessions.connections(key, connectionsOf(key))

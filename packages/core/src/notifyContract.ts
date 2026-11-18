@@ -587,7 +587,7 @@ export const notifyContract = (name: string, open: OpenNotifyStore) =>
         assert.deepStrictEqual(world.resolvedOn("kitchen-display"), [])
         // A press of stop while the store fails: not resolved, still ringing; then it works.
         faulty.faults.writes = 1
-        yield* world.notify.press({ notificationId: ring.notification.id, actionId: "stop", deviceId: "kitchen-display" })
+        assert.deepStrictEqual(yield* world.notify.press({ notificationId: ring.notification.id, actionId: "stop", deviceId: "kitchen-display" }), { ok: false, say: "That didn't work.", code: "failed" })
         assert.deepStrictEqual(world.notify.ringingOn("kitchen-display").map((r) => r.id), [ring.notification.id])
         assert.isTrue(yield* world.bell().resolve(ring.notification.id))
         yield* world.settle

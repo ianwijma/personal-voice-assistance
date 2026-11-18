@@ -166,6 +166,8 @@ const SWEEP_ROWS = 20 * MAX_NOTIFY_PAGE
 /** Resolved rows one retention run removes at most (more: the next run, ten minutes later). */
 const RETENTION_ROWS = 10 * MAX_NOTIFY_PAGE
 const RETENTION_CRON = "*/10 * * * *"
+/** Devices one step of a delivery decides and sends to before it yields. */
+const DEVICE_STEP = 8
 
 type Fields = Omit<StoredNotification, "dedupe" | "liveModule">
 
@@ -395,27 +397,45 @@ export const makeNotifyEngine = (options: NotifyEngineOptions): Effect.Effect<No
     const wake = yield* Queue.sliding<void>(1)
     const kick = () => void Queue.offerUnsafe(wake, undefined)
 
+    /**
+     * One notification to some devices: each device decided (privacy asked for it at that moment) and sent, in steps
+     * of `DEVICE_STEP` devices with a yield between them, so a delivery to every device never holds the main thread
+     * (which also frames audio and runs the turns) for more than a few cards. Answers the synchronous time it took.
+     */
+    const deliverTo = (id: string, v: StoredNotification, targets: ReadonlyArray<KnownDevice>, via?: (message: NotifyMessage) => void) =>
+      Effect.gen(function*() {
+        let ms = 0
+        for (let i = 0; i < targets.length; i += DEVICE_STEP) {
+          if (i > 0) yield* Effect.yieldNow
+          const started = performance.now()
+          for (const d of targets.slice(i, i + DEVICE_STEP)) apply(id, v, [{ deviceId: d.id, decision: decideNotification(id, v, d) }], via)
+          ms += performance.now() - started
+        }
+        return ms
+      })
+
     const deliverOne = (id: string) =>
       Effect.gen(function*() {
         const row = yield* core.collection(notifications).get(id)
         if (row === undefined || row.value.state !== "open") return
-        const started = performance.now()
         const targets = targetsOf(row.value)
-        apply(id, row.value, targets.map((d) => ({ deviceId: d.id, decision: decideNotification(id, row.value, d) })))
-        options.observe?.({ kind: "pass", ms: performance.now() - started, notifications: 1, devices: targets.length })
+        const ms = yield* deliverTo(id, row.value, targets)
+        options.observe?.({ kind: "pass", ms, notifications: 1, devices: targets.length })
       })
 
-    /** Every open notification, oldest first, page by page (bounded), handed to `each`; a yield between pages. */
-    const eachOpen = (each: (row: Row<StoredNotification>) => void) =>
+    /** Every open notification, oldest first, page by page (bounded), handed to `each`; a yield after each one. */
+    const eachOpen = (each: (row: Row<StoredNotification>) => Effect.Effect<void>) =>
       Effect.gen(function*() {
         let after: Row<StoredNotification> | undefined
         for (let read = 0; read < SWEEP_ROWS;) {
           const page = yield* core.collection(notifications).list({ where: { state: "open" }, orderBy: { field: "sentAt" }, limit: MAX_NOTIFY_PAGE, ...(after !== undefined ? { after } : {}) })
-          for (const row of page) each(row)
+          for (const row of page) {
+            yield* each(row)
+            yield* Effect.yieldNow
+          }
           read += page.length
           if (page.length < MAX_NOTIFY_PAGE) return
           after = page[page.length - 1]
-          yield* Effect.yieldNow
         }
       })
 
@@ -425,27 +445,26 @@ export const makeNotifyEngine = (options: NotifyEngineOptions): Effect.Effect<No
         if (device === undefined) return
         let count = 0
         let ms = 0
-        yield* eachOpen((row) => {
-          const v = row.value
-          if (v.target !== "everywhere" && v.deviceId !== deviceId) return
-          const started = performance.now()
-          apply(row.id, v, [{ deviceId, decision: decideNotification(row.id, v, device) }], via)
-          ms += performance.now() - started
-          count++
-        })
+        yield* eachOpen((row) =>
+          Effect.suspend(() => {
+            const v = row.value
+            if (v.target !== "everywhere" && v.deviceId !== deviceId) return Effect.void
+            count++
+            return Effect.map(deliverTo(row.id, v, [device], via), (t) => void (ms += t))
+          })
+        )
         options.observe?.({ kind: "pass", ms, notifications: count, devices: 1 })
       })
 
     const deliverAll = Effect.gen(function*() {
       let count = 0
       let ms = 0
-      yield* eachOpen((row) => {
-        const started = performance.now()
-        const targets = targetsOf(row.value)
-        apply(row.id, row.value, targets.map((d) => ({ deviceId: d.id, decision: decideNotification(row.id, row.value, d) })))
-        ms += performance.now() - started
-        count++
-      })
+      yield* eachOpen((row) =>
+        Effect.suspend(() => {
+          count++
+          return Effect.map(deliverTo(row.id, row.value, targetsOf(row.value)), (t) => void (ms += t))
+        })
+      )
       options.observe?.({ kind: "pass", ms, notifications: count, devices: options.devices().length })
     })
 
@@ -714,9 +733,9 @@ export const makeNotifyEngine = (options: NotifyEngineOptions): Effect.Effect<No
         const v = row.value
         if (v.target !== "everywhere" && v.deviceId !== request.deviceId) return answer(false, "cantNow", "unknown")
         if (request.actionId === STOP_ACTION) {
-          // The host's: always works, whatever the module is doing.
-          yield* resolveRow(row.id, STOP_ACTION, request.deviceId).pipe(Effect.orElseSucceed(() => false))
-          return answer(true, "done")
+          // The host's: always works, whatever the module is doing (a store that fails it is said, and it keeps ringing).
+          const stopped = yield* Effect.exit(resolveRow(row.id, STOP_ACTION, request.deviceId))
+          return Exit.isSuccess(stopped) ? answer(true, "done") : answer(false, "failed", "failed")
         }
         if (!v.actions.some((a) => a.id === request.actionId) || v.handler === undefined) return answer(false, "cantNow", "unknown")
         const entry = published.get(`${v.module}/${v.handler}`)
