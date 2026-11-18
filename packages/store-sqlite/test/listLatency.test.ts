@@ -6,12 +6,10 @@ import { assert, describe, it } from "@effect/vitest"
 import { type Collection, DEFAULT_MAX_CHARS, defineCollection, type HouseholdStore, LIST_BUDGET_CHARS, MAX_LIST_LIMIT, MAX_VALUE_CHARS, maxListRows } from "@pva/core"
 import { makeMemoryHouseholdStore } from "@pva/core/testing"
 import { Effect, Schema } from "effect"
-import { mkdtempSync } from "node:fs"
-import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { DatabaseSync } from "node:sqlite"
 import { makeSqliteStore } from "../src/index.ts"
-import { bound } from "./latencyBound.ts"
+import { bound, latencyDir } from "./latencyBound.ts"
 
 /**
  * The worst legal lists: structured values filling `maxChars` exactly, `maxListRows` of them, at the three ends of the
@@ -93,7 +91,7 @@ const fillFile = (file: string, fixtures: ReturnType<typeof listFixtures>) => {
 describe("the worst legal list", () => {
   it.live("on both stores: structured values at the three ends of the list rule (rows × maxChars ≤ LIST_BUDGET_CHARS) block the main thread under 10 ms, the first call after a start as well as later ones", () =>
     Effect.gen(function*() {
-      const dir = mkdtempSync(join(tmpdir(), "pva-list-"))
+      const dir = latencyDir("pva-list")
       const file = join(dir, "household.db")
       // SQLite: the collections are made by a store that is then closed, their rows written into the file, and a
       // fresh store prepared (a start of the server, which warms what a first read would compile) is timed.
