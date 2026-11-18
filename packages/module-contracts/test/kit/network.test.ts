@@ -34,6 +34,23 @@ export const searchOwnServer = (deps: NetDeps, baseUrl: string, query: string) =
   fetchOwnerConfiguredLan(`${baseUrl}/search?format=json&q=${encodeURIComponent(query)}`, { accept: contentTypes.json, timeoutMs: 3_000, ...deps })
 // #endregion net-module
 
+// #region net-post-module
+/**
+ * The owner's Home Assistant (its address from the module's settings, `http://localhost:8123` included): a POST with a JSON body.
+ * Sent once: no redirect is followed and it is never retried, so a failure may or may not have switched the light.
+ */
+export const callService = (deps: NetDeps, baseUrl: string, token: string, domain: string, service: string, data: Readonly<Record<string, unknown>>) =>
+  fetchOwnerConfiguredLan(`${baseUrl}/api/services/${encodeURIComponent(domain)}/${encodeURIComponent(service)}`, {
+    accept: contentTypes.json,
+    method: "POST",
+    body: { json: data },
+    typedLoopback: true,
+    timeoutMs: 3_000,
+    headers: { authorization: `Bearer ${token}` },
+    ...deps
+  })
+// #endregion net-post-module
+
 describe("the network in a module's test", () => {
   // #region net-test
   it.effect("serves fixtures, fails every other host, and keeps the owner's LAN for the LAN function", () =>
@@ -69,6 +86,41 @@ describe("the network in a module's test", () => {
       }
       const missing = yield* safeFetch("https://api.example.org/nothing-here", { accept: contentTypes.webPage, ...deps })
       assert.strictEqual(missing.status, 404)
+    }))
+
+  // #region net-post-test
+  it.effect("a POST to the owner's server: the test reads the method and the body that was sent", () =>
+    Effect.gen(function*() {
+      const net = makeOfflineNet(
+        {
+          "http://ha.lan:8123/api/services/light/turn_on": (request) =>
+            request.method === "POST" ? { body: [{ entity_id: "light.kitchen" }] } : { status: 405, body: "POST only" }
+        },
+        { lan: { "ha.lan": "192.168.1.20" } }
+      )
+      const deps = { resolver: net.resolver, connector: net.connector }
+      const answer = yield* callService(deps, "http://ha.lan:8123", "t0ken", "light", "turn_on", { entity_id: "light.kitchen", brightness_pct: 40 })
+      assert.deepStrictEqual(JSON.parse(answer.text()), [{ entity_id: "light.kitchen" }])
+      const [sent] = net.requests
+      assert.strictEqual(sent?.method, "POST")
+      assert.deepStrictEqual(JSON.parse(sent?.body ?? ""), { entity_id: "light.kitchen", brightness_pct: 40 })
+      assert.strictEqual(sent?.headers["content-type"], "application/json")
+      assert.strictEqual(sent?.headers["authorization"], "Bearer t0ken")
+      // A GET to the same fixture: no body recorded, the fixture sees the method.
+      const get = yield* fetchOwnerConfiguredLan("http://ha.lan:8123/api/services/light/turn_on", { accept: contentTypes.json, ...deps })
+      assert.strictEqual(get.status, 405)
+      assert.deepStrictEqual([net.requests[1]?.method, net.requests[1]?.body], ["GET", undefined])
+    }))
+  // #endregion net-post-test
+
+  it.effect("a POST to a host the test network does not have is a refused connect, and nothing is answered", () =>
+    Effect.gen(function*() {
+      const net = makeOfflineNet({}, { lan: { "ha.lan": "192.168.1.20" } })
+      const failed = yield* Effect.flip(fetchOwnerConfiguredLan("http://192.168.1.99:8123/api/template", {
+        accept: contentTypes.json, method: "POST", body: { json: { template: "x" } }, resolver: net.resolver, connector: net.connector
+      }))
+      assert.strictEqual(failed._tag, "NetFailure")
+      assert.deepStrictEqual(net.requests.map((r) => [r.method, r.body]), [["POST", '{"template":"x"}']])
     }))
 
   it.effect("the contact goes into the User-Agent only when the owner set one", () =>
