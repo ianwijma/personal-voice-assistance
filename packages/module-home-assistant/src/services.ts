@@ -81,7 +81,8 @@ export const SERVICES: Readonly<Record<string, ServiceRule>> = {
 /** Why a call's data does not fit its rule (`undefined`: it fits): `refused` for a field not listed or a value that is not plain, `invalid` for a value out of its range. */
 export const checkData = (rule: ServiceRule, data: Readonly<Record<string, unknown>>): { readonly reason: "refused" | "invalid"; readonly detail: string } | undefined => {
   for (const [key, value] of Object.entries(data)) {
-    const field = rule.fields[key]
+    // An own field of the rule only: `constructor`, `toString` or `__proto__` as a data field must not find Object.prototype.
+    const field = Object.hasOwn(rule.fields, key) ? rule.fields[key] : undefined
     if (field === undefined) return { reason: "refused", detail: `data field ${JSON.stringify(key.slice(0, 40))} is not one this service takes` }
     if (value === null || typeof value === "object") return { reason: "refused", detail: `data field ${key} is not a plain value` }
     switch (field.kind) {
@@ -101,6 +102,6 @@ export const checkData = (rule: ServiceRule, data: Readonly<Record<string, unkno
         break
     }
   }
-  for (const [key, field] of Object.entries(rule.fields)) if (field.required === true && !(key in data)) return { reason: "invalid", detail: `data field ${key} is required` }
+  for (const [key, field] of Object.entries(rule.fields)) if (field.required === true && !Object.hasOwn(data, key)) return { reason: "invalid", detail: `data field ${key} is required` }
   return undefined
 }

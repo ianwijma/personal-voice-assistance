@@ -135,6 +135,11 @@ classes, a thermostat or a media player. A scene with no list, or with anything 
 garage door, a gate, a switch), is not offered and is refused by name or id with the reason. **Scripts are not run**:
 what a script does cannot be seen from outside it (see "What was left out").
 
+**A switch does whatever is wired to it.** The module cannot see what a switch, a fan or an on/off helper sets in
+motion: a relay on a garage door or an automation started by a helper would be switched like a coffee machine. If any
+switch or helper in the house does something of that kind, leave "switches, fans and helpers" out of the kinds
+(`domains`), or keep that one out of Home Assistant's area and name lists the assistant uses.
+
 **What a target names.** A target is resolved over the whole house, never only over the options a choice list can
 carry: a known id or a unique name always works. A name (a room, an other name, a device) that is more than one thing
 is a question ("Shared is more than one thing in Home Assistant: Shared (alpha) and Shared (beta). Which one do you
