@@ -10,6 +10,8 @@ import {
   defineCollection,
   makeAmbientFacts,
   makeToolRegistry,
+  MAX_AMBIENT_ROWS,
+  maxListRows,
   type Row,
   type Trace,
   TurnTrace,
@@ -21,6 +23,7 @@ import { mkdtempSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { makeSqliteStore } from "../src/index.ts"
+import { bound } from "./latencyBound.ts"
 
 const Timer = Schema.Struct({ label: Schema.String, dueAt: Schema.Finite })
 const fmt = (ms: number) => `${Math.floor(ms / 60_000)}:${String(Math.floor((ms % 60_000) / 1000)).padStart(2, "0")}`
@@ -69,7 +72,7 @@ describe("ambient facts", () => {
       }
       console.log(`ambient facts on SQLite (200 timers, 1 pinned list): median ${median(times.slice(20)).toFixed(3)} ms, p95 ${p95(times.slice(20)).toFixed(3)} ms, worst ${Math.max(...times.slice(20)).toFixed(3)} ms, ${text.length} characters`)
       assert.isAtMost(text.length, 600)
-      assert.isBelow(p95(times.slice(20)), 50)
+      assert.isBelow(p95(times.slice(20)), bound(50))
       assert.include(text, "This screen shows the shopping list.")
       // Another device does not get this device's line; "module-on" leaves out modules the assistant has off.
       const elsewhere = yield* ambientLines(options).pipe(Effect.provideService(CurrentTurn, { ...turn, deviceId: "study-001" }))
@@ -78,6 +81,57 @@ describe("ambient facts", () => {
       assert.strictEqual(off, "")
       assert.strictEqual(yield* ambientLines({ ...options, mode: () => "off" }), "")
     }).pipe(Effect.scoped), 60_000)
+
+  it.live("many full ambient collections (two modules of 64, each the most rows an ambient read takes at maxChars 2,000): the event loop is held for one collection's reads at a time, under 10 ms, never for the batch", () =>
+    Effect.gen(function*() {
+      const Numbers = Schema.Struct({ values: Schema.Array(Schema.Finite) })
+      const empty = JSON.stringify({ values: [] }).length
+      // Exactly 2,000 characters of JSON: 999 zeros and their commas, plus the frame.
+      const value = { values: Array.from({ length: (2_000 - empty + 1) / 2 }, () => 0) }
+      assert.strictEqual(JSON.stringify(value).length, 2_000)
+      // The most rows a list of values of 2,000 characters may ask for: the largest legal ambientRows there.
+      const rows = Math.min(MAX_AMBIENT_ROWS, maxListRows({ maxChars: 2_000 }))
+      const modules = ["first", "second"].map((moduleId) => ({
+        moduleId,
+        collections: Array.from({ length: 64 }, (_, i) =>
+          defineCollection({
+            name: `c${i}`,
+            scope: "household",
+            schema: Numbers,
+            maxChars: 2_000,
+            ambientRows: rows,
+            // Nothing in the rows merits a fact this turn: no line stops the reading early.
+            ambient: () => undefined
+          }))
+      }))
+      const store = yield* makeSqliteStore({ filename: join(mkdtempSync(join(tmpdir(), "pva-ambient-many-")), "household.db") })
+      yield* store.prepare(modules.map((m) => ({ id: m.moduleId, storage: { collections: m.collections } })))
+      for (const m of modules) {
+        yield* store.forModule(m.moduleId).transaction((tx) => {
+          for (const c of m.collections) for (let i = 0; i < rows; i++) tx.collection(c).insert(value)
+        })
+      }
+      const turn = { turnId: 1, conversationId: "c", source: "voice" as const, deviceId: "kitchen-01", assistantId: "jev" }
+      const options = { store, modules, mode: (): AmbientMode => "all" }
+      let worst = 0
+      let longestRun = 0
+      for (let run = 0; run < 10; run++) {
+        let last = performance.now()
+        let stop = 0
+        const timer = setInterval(() => {
+          const now = performance.now()
+          stop = Math.max(stop, now - last)
+          last = now
+        }, 1)
+        const t0 = performance.now()
+        yield* ambientLines(options).pipe(Effect.provideService(CurrentTurn, turn))
+        longestRun = Math.max(longestRun, performance.now() - t0)
+        clearInterval(timer)
+        worst = Math.max(worst, stop, performance.now() - last)
+      }
+      console.log(`ambient facts, 2 × 64 collections of ${rows} rows of 2,000 characters: longest event-loop stop ${worst.toFixed(2)} ms (each run ${longestRun.toFixed(1)} ms at most, within its 50 ms budget plus one collection)`)
+      assert.isBelow(worst, bound(10))
+    }).pipe(Effect.scoped), 120_000)
 
   it.live("TurnTrace: end of turn → request sent and → playback start, ambient facts on and off", () =>
     Effect.gen(function*() {
