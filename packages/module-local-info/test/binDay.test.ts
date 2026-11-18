@@ -241,6 +241,24 @@ describe("bin-day: the stored copy, the jobs and the briefing section", () => {
       assert.strictEqual((yield* kit.moduleStore().collection(collections).list({})).length, 9)
     }))
 
+  it.effect("a refresh called off while it runs writes nothing: the link changed under it", () =>
+    Effect.gen(function*() {
+      const net = serve()
+      let release: () => void = () => undefined
+      const gate = new Promise<void>((resolve) => (release = resolve))
+      const slow = binDayModule({ resolver: net.resolver, connector: async (request) => (request.url.pathname === "/calendar.ics" ? (await gate, net.connector(request)) : net.connector(request)) })
+      const kit = yield* startTestModule(slow, { settings, started: true })
+      const daily = (yield* kit.jobs).find((j) => j.key === "refresh-daily")!
+      const run = yield* Effect.forkChild(Effect.exit(kit.runJob(daily.id)))
+      yield* kit.advance(100)
+      // The owner points the module at another link while the fetch is still waiting: the module restarts with it.
+      yield* kit.configure({ icsUrl: "https://other.example.org/c.ics" })
+      release()
+      yield* kit.advance(10_000)
+      yield* Fiber.join(run)
+      assert.deepStrictEqual(yield* kit.moduleStore().collection(collections).list({}), [])
+    }))
+
   const section = (kit: { readonly contributions: any }) =>
     Effect.map(kit.contributions(BriefingSections) as Effect.Effect<ReadonlyArray<BriefingSection>>, (all) => all.find((s) => s.id === "bin-day")!)
   const request = (kit: { readonly turn: () => any }, over: Partial<BriefingRequest>, now: number): BriefingRequest => ({

@@ -35,9 +35,7 @@ export const texts = defineTexts({
     at: "{day} at {time}",
     typeWind: "wind", typeSnow: "snow and ice", typeThunder: "thunderstorms", typeFog: "fog", typeHeat: "high temperatures",
     typeCold: "low temperatures", typeCoast: "coastal conditions", typeFire: "forest fire risk", typeAvalanche: "avalanches",
-    typeRain: "rain", typeFlood: "flooding", typeRainFlood: "rain and flooding", typeOther: "dangerous weather",
-    briefingRain: "{rain}",
-    withoutBriefing: "Weather"
+    typeRain: "rain", typeFlood: "flooding", typeRainFlood: "rain and flooding", typeOther: "dangerous weather"
   },
   nl: {
     noPlace: "Ik weet nog niet waar thuis is. De eigenaar kan het instellen onder Thuis, of noem een plaats.",
@@ -72,9 +70,7 @@ export const texts = defineTexts({
     at: "{day} om {time}",
     typeWind: "wind", typeSnow: "sneeuw en ijzel", typeThunder: "onweer", typeFog: "mist", typeHeat: "hoge temperaturen",
     typeCold: "lage temperaturen", typeCoast: "kustomstandigheden", typeFire: "kans op bosbrand", typeAvalanche: "lawines",
-    typeRain: "regen", typeFlood: "overstroming", typeRainFlood: "regen en overstroming", typeOther: "gevaarlijk weer",
-    briefingRain: "{rain}",
-    withoutBriefing: "Weer"
+    typeRain: "regen", typeFlood: "overstroming", typeRainFlood: "regen en overstroming", typeOther: "gevaarlijk weer"
   }
 })
 
