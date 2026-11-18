@@ -108,7 +108,9 @@ export const usePageForms = (defs: ReadonlyArray<PageFormDef>, saved: (key: stri
         if (state === undefined) {
           next = { ...next, [def.key]: fresh(def) }
         } else if (prev !== undefined && (prev.revision !== def.revision || prev.form !== def.form)) {
-          const sync = reconcile(state.sync, prev.form, def.form, def.revision)
+          // Fields that show a local error count as edited, as for Save and Test (`computeViews`).
+          const invalid = Object.keys(computeViews([prev], { [def.key]: state }, saved)[0]!.localErrors)
+          const sync = reconcile(state.sync, prev.form, def.form, def.revision, invalid)
           if (sync !== state.sync) next = { ...next, [def.key]: { ...state, sync } }
         }
         previous.current.set(def.key, def)

@@ -763,8 +763,8 @@ starts: it takes the slot, starts the press's fiber and puts an observer on it i
 slot back exactly once, when that fiber has really ended, whatever ended the wait for it. At the cap a press is
 refused `busy` before any module code runs, and Health says so (`<module>.presses-busy`) until one of the module's
 slots is free again. The answer never waits for cleanup: it is the first of the press's result, its 8 s deadline
-("Did not finish within 8 s"), its owner being stopped after the grace period (`not_running`) and the caller going
-away (no answer); in the last three the press is interrupted and not waited for, and its slot and its button stay
+("Did not finish within 8 s"), its owner being stopped after the grace period (`not_running`) and its caller being
+interrupted (no answer); in the last three the press is interrupted and not waited for, and its slot and its button stay
 taken until its interruption and finalizers have ended. A press that never ends keeps its slot until the process
 stops (docs/MODULES-PLAN.md §3.5). Only a declared `action` field (or the generated
 `test` of an agent or decision provider) is a button: a `fieldActions` entry without a field is never run
@@ -774,6 +774,8 @@ provider failure too ("Failed after N ms; the server's log says why."). Result t
 then clipped to 500 characters; a generated agent Test redacts the answer before quoting it short. The page sends `module.action { moduleId, key, values? }` (admin only); the
 `result` carries `action: { ok, text, tone }`, shown next to the button. Codes: `unknown_module`,
 `unknown_action` (not a button), `not_running` (an instance handler of a module that does not run), `busy`.
+A "Test" press runs to its result or its time limit whether or not the page that pressed it is still connected; its
+result is discarded if nobody is there (closing the page does not stop it).
 
 **Module routes.** A version 2 module's `shared` part may return `routes`; each is answered under
 `/api/modules/<moduleId>/<path>` while that shared part is the published one (so a stopped module's paths answer
@@ -867,11 +869,16 @@ RouteResponse = { status /* 200–599 */, headers?, body?: string | Uint8Array |
   reason. A module holds at most 20 tokens, judged inside the store's serialized save (two mints at once cannot both
   take the last place). While the settings files are damaged and wait for the owner's save (`blocked()`), no token can
   be minted or revoked (409 `blocked`, checked again inside the serialized save): a token change never counts as the
-  owner's word that the files are right, so it never unblocks the store or starts anything. Modules mint, list and revoke their own through `host.routeTokens` (`mint(name, label)`,
+  owner's word that the files are right, so it never unblocks the store or starts anything. A mint or revoke that
+  waited behind another save while the vault was locked is refused as locked (503), checked inside the serialized
+  save, never acknowledged without effect. A stored record whose id or details the wire would refuse, or one past a
+  module's 20, is ignored for checking and listing alike, with one Health issue (`route-tokens.ignored`) saying how
+  many. Modules mint, list and revoke their own through `host.routeTokens` (`mint(name, label)`,
   `list`, `revoke(id)`); the owner does it on the module page, choosing the token's purpose (its name) when the
   module's routes accept more than one.
 - **Admin view** (`GET /api/module-routes[?module=<id>]`, admin token): each module's routes with guards and limits,
-  the last 20 calls of each (time, caller address, status, token label, why it was refused; memory only), and its
+  the last 20 calls of each (time, caller address, status, token label, why it was refused; memory only; every ending
+  is recorded once, a caller that went away before the answer as `499` "Cancelled"), and its
   tokens (also of a module that does not run, so a stopped module's tokens can be revoked without starting it), and
   `behindProxy`; `POST /api/module-routes/<id>/tokens { name, label }` mints (201, the secret once), `DELETE
   /api/module-routes/<id>/tokens/<tokenId>` revokes; a module that is not installed is 404 (a stopped one is fine).

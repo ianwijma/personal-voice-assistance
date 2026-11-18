@@ -11,7 +11,10 @@ import type { ModuleSlots } from "./ModuleSlots.ts"
  *   from the press's admission (checked and reserved in one synchronous step) until its fiber has really ended,
  *   whatever its deadline or its cleanup take. Only
  *   the press's own end frees its key, so an old press can never free a newer one's. The answer never waits for the
- *   press's cleanup: it is the first of its result, its deadline, the owner being stopped, the caller going away.
+ *   press's cleanup: it is the first of its result, its deadline, the owner being stopped, the caller being
+ *   interrupted (the admin page's connection does not interrupt it: a "Test" press runs to its result or its time
+ *   limit whether or not the page that pressed it is still connected, and its result is discarded if nobody is
+ *   there).
  * - `inFlight` says what still runs; `settled` waits, without asking anything to stop, until it has all ended.
  * - `signal` (one synchronous step) refuses new presses, answers those in flight `stopped` at once and asks them to
  *   stop, waiting for nothing; `stop` does the same and then waits until each has ended (the host bounds that wait:

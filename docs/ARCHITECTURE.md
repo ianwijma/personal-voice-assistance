@@ -434,14 +434,27 @@ CurrentPrincipal: Context.Reference<Principal | undefined>       // the admitted
   Health issues (256 KiB) and templates (128 KiB): 40 modules at their budget take 320 KiB. What the running instance
   adds (`combo` suggestions, `info` values) is trimmed to what the form leaves of the budget, the note saying "and N
   more". A field's default goes through its own decoder: one the field refuses is a declaration error, and the decoded
-  value is kept in `defaultValue` and the description.
+  value is kept in `defaultValue` and the description. **The complete form** (round 5): the form as sent (fields,
+  effective values, errors and warnings) and the module's listed tools may take `MODULE_FORM_MAX_BYTES` (48 KiB). A
+  save that would exceed it is refused, naming the largest field; settings already larger (a hand-edited file) are not
+  valid: no form, one error naming the largest field and saying to reduce it in the settings file, the module down
+  like any with invalid settings, its values never cut. What the instance adds, then the listed tools (at most 100,
+  descriptions shortened to 300 characters after secret matching, `ModuleInfo.toolsLeft` counting the rest; the
+  model's catalogue is unchanged), are trimmed to what is left. In `admin.snapshot` all modules' forms and tool lists
+  together take at most `ADMIN_FORMS_SHARE_BYTES` (448 KiB, `withinAdminShare` in the hub): over it, forms are withheld
+  largest first, each with a note naming its largest field, until they fit. A field's decoder and checks are module
+  code: the host runs each through its containment (`SettingsSources.contain`, P1's `moduleCode`), so one that throws
+  is that field's error and its form stays for repair. A module with any catalogue error (a cycle too) gets the empty
+  form. Text is cut at whole characters.
 - **Slots** (P3, `ModuleSlots.ts`): a route handler or a press runs in a slot of its module, taken before its fiber
   starts and given back exactly once when that fiber has really ended (`ModuleSlots.run` takes it, starts the fiber
   and installs the observer; there is no other way to start one). At most 16 handlers (`MAX_ROUTE_SLOTS`) and 4
   presses (`MAX_PRESS_SLOTS`) per module at once; at the cap a request gets 503 with `Retry-After` and a press is
   refused `busy`, before any module code runs, and Health has `<module>.routes-busy` / `<module>.presses-busy` until a
   slot is free. The answer is the first of the result, the deadline, the host's stop signal after the grace period
-  and the caller going away; it never waits for cleanup (the fiber is interrupted, not awaited, and keeps its slot
+  and the caller going away (a route's caller disconnecting; for a press, its caller being interrupted: a "Test"
+  press runs to its result or its time limit whether or not the page that pressed it is still connected, and its
+  result is discarded if nobody is there); it never waits for cleanup (the fiber is interrupted, not awaited, and keeps its slot
   until it ends). Code that never ends keeps its slot until the process stops.
 - **Module routes** (P3, docs/UI-AND-MODULES.md §1.11): `ModuleRoute = { method, path, guards?: ("admin" | "token" |
   "lan")[], public?, token?, body?, bodyLimitBytes? (8 KB, ≤ 1 MB), rateLimit? (30/min per caller, 120 in all),
