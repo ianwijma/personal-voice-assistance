@@ -1312,7 +1312,7 @@ module's own socket ([NOTIFICATIONS.md](NOTIFICATIONS.md) has the calls, the bou
 
 - **`ctx.notify.send`**: a card on the device that asked (`target: "origin"`, the default) or everywhere, `normal`
   (silent) or `ring` (it rings until stopped), with an optional owner (personal content: the privacy rule decides per
-  device, when it is delivered), dedupe `key`, expiry (up to a minute late), and up to two actions beside the host's
+  device, when it is delivered), dedupe `key`, expiry (on time), and up to two actions beside the host's
   `stop`. It is delivered **now**: for a notification at a later time, schedule a job of your own and send from its
   handler (below). One transaction and an enqueue: fine on a turn.
 - **Action handlers are registered in `shared`** with `ctx.notify.handle(name, { run })`, like job handlers. While your
