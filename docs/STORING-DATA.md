@@ -432,17 +432,30 @@ its own connection (the file header's user version, set to the value it has: a w
 page 1 as the new log's first frame) and pays the sync on its thread. The main thread's next commit appends to a log
 that has started and syncs nothing. No sync is skipped and no connection's `synchronous` is lowered.
 
-- **The window.** A main-thread commit that lands between the checkpoint and the worker's write still starts the log
-  and syncs. The two are consecutive statements in the worker, so the window is the time between them; the worker
-  sees such a commit (its `BEGIN IMMEDIATE` is busy, or the emptied log is not empty any more) and leaves the log as
-  it is. In `schedulerLatency.test.ts`, whose retention pass removes 400 rows in 40 transactions back to back, it was
-  hit once in 8 runs (22 new logs: 21 started by the worker, 1 by the main thread).
+- **When.** After a truncating checkpoint that emptied the log, after one that copied everything but found a reader
+  at the newest snapshot (the truncation is still not done and is retried: starting a log acknowledges no removal),
+  and after a passive checkpoint that copied everything. The worker's connection makes no automatic checkpoint of its
+  own (`wal_autocheckpoint = 0`, as the main one): one would copy the frame it just wrote, and the next main-thread
+  commit would start a new log after all.
+- **The window.** A commit by another connection (in the app, the main thread) between the checkpoint and the worker's
+  write starts the log itself and syncs. The two are consecutive statements in the worker, so the window is the time
+  between them. Which connection started the log is read from the log's header (its checkpoint sequence and salts
+  change whenever a log starts again). When the worker finds the write lock taken, it tries again with the store's own
+  pauses (1 ms doubling to 100 ms, 1 s in all): the transaction holding it may write nothing or roll back, and then the
+  worker still starts the log. In `schedulerLatency.test.ts`, whose retention pass removes 400 rows in 40 transactions
+  back to back, 8 runs (5 on the real disk, 3 with two busy loops on its two cores) started 26 new logs, **all by the
+  worker; the window was not hit**. 7 times the worker's write went into the log as it was (a reader still held its
+  newest snapshot, so it could not start again; nobody synced a new header), and the lock was never taken for the whole
+  wait.
 - **A write behind the worker.** While the worker holds the write lock for its write (one or two syncs), a main-thread
   write finds the store busy and tries again on a timer, like any busy store: the event loop is not held
-  (`logStart.test.ts`: a write behind a lock held 300 ms waited 330 to 430 ms, with a longest stop of at most 1.7 ms).
-- **What it changed**, on the real disk: the retention pass's longest stop went from 19.8–24.5 ms to 2.7–9.7 ms, and a
-  one-row commit right after a removal's checkpoint from 13 ms (median; worst 25 ms) to 0.2 ms (worst 1.5 ms). On
-  tmpfs nothing changed (a sync costs nothing there).
+  (`logStart.test.ts`: a write behind a lock held 300 ms waited 328 to 430 ms, with a longest stop of at most 1.8 ms).
+- **Closing.** Before the main connection closes, the worker makes the last truncating checkpoint (no new log after
+  it) and closes its connection, so the main connection's close finds an empty log: nothing to copy, nothing to sync.
+- **What it changed**, on the real disk: the retention pass's longest stop went from 19.8–24.5 ms to 2.7–9.7 ms, a
+  one-row commit right after a removal's checkpoint from 13 ms (median; worst 25 ms) to 0.2 ms (worst 1.5 ms), and 40
+  removal steps of a conversation at the legal maximum, each right after a completed checkpoint, from 26–35 ms to
+  2.3 ms (`latency.test.ts`). On tmpfs nothing changed (a sync costs nothing there).
 
 ## Backups
 
