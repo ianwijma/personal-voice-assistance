@@ -17,11 +17,14 @@
   },
   "dependencies": {
     "@pva/protocol": "workspace:*",
-    "effect": "catalog:"
+    "effect": "catalog:",
+    "tsx": "catalog:"
   },
   "devDependencies": {
     "@effect/vitest": "catalog:",
     "@types/node": "catalog:",
+    "feedsmith": "catalog:",
+    "linkedom": "catalog:",
     "typescript": "catalog:",
     "vitest": "catalog:"
   }
