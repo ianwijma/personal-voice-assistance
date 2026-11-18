@@ -136,8 +136,10 @@ yield* ctx.store.transaction((tx) => {                                          
   than the store waits; nothing was done; try again. A transaction whose beginning finds the lock taken is tried again
   after pauses on timers (never blocking the event loop) that double from 1 ms up to 100 ms, for about one second in
   all. That covers the store's own checkpoint worker, which holds the write lock while it truncates the log after a
-  removal, so a module does not see `busy` in ordinary operation: only when something holds the lock for that long
-  (a second server on the same file, an external tool).
+  removal and while it starts the new log ("The write-ahead log": two syncs, about 25 ms on the development machine's
+  disk, a few hundred on a slow SD card), so a module does not see `busy` in ordinary operation: only when something
+  holds the lock for that long (a second server on the same file, an external tool, a disk whose syncs take more than
+  half a second).
 - **Actor.** Every row records who changed it last (`updatedBy`: a turn with its device and person, a job, the admin, a
   tap on a device, the module itself). Pass `{ actor }` from jobs and taps. An actor is checked before it is stored (a
   known kind with its fields as strings, a turn's id a finite number): anything else is `invalid`.
@@ -447,9 +449,13 @@ that has started and syncs nothing. No sync is skipped and no connection's `sync
   worker; the window was not hit**. 7 times the worker's write went into the log as it was (a reader still held its
   newest snapshot, so it could not start again; nobody synced a new header), and the lock was never taken for the whole
   wait.
-- **A write behind the worker.** While the worker holds the write lock for its write (one or two syncs), a main-thread
-  write finds the store busy and tries again on a timer, like any busy store: the event loop is not held
-  (`logStart.test.ts`: a write behind a lock held 300 ms waited 328 to 430 ms, with a longest stop of at most 1.8 ms).
+- **A write behind the worker.** The worker holds the write lock for its write's two syncs (the new header and the
+  commit, at full synchronisation): about 24 ms on the development machine's disk (12 ms each), a few hundred on a slow
+  SD card. A main-thread write in that time, a turn's `schedule` included, finds the store busy and tries again on a
+  timer, like any busy store: it waits that long, the event loop is not held (`logStart.test.ts`: a write behind a lock
+  held 300 ms waited 328 to 430 ms, with a longest stop of at most 1.8 ms), and nothing is dropped. Only a lock held
+  past the store's second of pauses makes the write fail `busy` (a `schedule` then returns that failure to its
+  caller; a scheduler outcome is tried again after 0.25, 1 and 4 s before its job is left to the recovery rule).
 - **Closing.** Before the main connection closes, the worker makes the last truncating checkpoint (no new log after
   it) and closes its connection, so the main connection's close finds an empty log: nothing to copy, nothing to sync.
 - **What it changed**, on the real disk: the retention pass's longest stop went from 19.8–24.5 ms to 2.7–9.7 ms, a
