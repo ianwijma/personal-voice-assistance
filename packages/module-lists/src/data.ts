@@ -7,13 +7,16 @@ import { texts } from "./texts.ts"
 // ---------------------------------------------------------------------------------------------------------------------
 // Bounds
 
-/** The ids of the two lists every household has (rows made on the first write that needs them). */
+/** The ids of the two lists every household has (their rows are made when the module starts). */
 export const SHOPPING = "shopping"
 export const TODO = "todo"
 
 /** Open items per list: the contract's bound for the shopping list, kept for every list. */
 export const MAX_OPEN = LISTS_LIMITS.openItems
-/** Lists that may exist at once, the two default ones included; deleted lists waiting for their undo window count too. */
+/**
+ * List rows that may exist at once, the two default ones included (they exist from the module's start); deleted lists
+ * waiting for their undo window count too. One read of the `lists` collection takes them all.
+ */
 export const MAX_LISTS = 50
 /** Lists that are not deleted, the two default ones included. */
 export const MAX_LIVE_LISTS = 30
@@ -82,8 +85,11 @@ export const Item = Schema.Struct({
   place: StoredText(48),
   /** When it entered its status (added, ticked off, removed): epoch ms. */
   since: EPOCH_MS,
-  /** A hash of the list and the normalised text: finds "milk" said again as one indexed read. */
-  match: StoredText(32),
+  /**
+   * `<hash>:<status>`: a hash of the list and the normalised text, and the status, indexed with `since`. "Milk" said
+   * again finds the open milk first as one indexed read, however many ticked-off ones there are.
+   */
+  match: StoredText(40),
   /** The key another module gave it (`Lists.addItem`); at most one item that is not removed has it. */
   dedupeKey: Schema.optionalKey(StoredText(LISTS_LIMITS.keyChars))
 })
@@ -96,7 +102,9 @@ export const items = defineCollection({
   // The worst legal item is 1,450 characters of JSON (checkModule computes it), so one list read takes 16 rows:
   // every read of a list pages with `after`.
   maxChars: 1_500,
-  indexes: [["place", "since"], "match", "dedupeKey"]
+  indexes: [["place", "since"], ["match", "since"], "dedupeKey"],
+  // Version 1 kept the hash alone in `match`; version 2 adds the status, so the index finds open items first.
+  migrate: { 1: (v: { readonly match: string; readonly status: string }) => ({ ...v, match: `${v.match}:${v.status}` }) }
 })
 
 /** The most rows one list read of items takes (`maxListRows`: 16). */
@@ -185,8 +193,8 @@ export const normalise = (text: string): string => {
   return words.join(" ")
 }
 
-/** The `match` of an item: a hash of its list and its normalised text (bounded, and the same for "Eggs" and "egg"). */
-export const matchOf = (list: string, text: string) => createHash("sha256").update(`${list}\n${normalise(text)}`).digest("hex").slice(0, 32)
+/** The `match` of an item in a status: a hash of its list and its normalised text (the same for "Eggs" and "egg"), and the status. */
+export const matchOf = (list: string, text: string, status: ItemStatus) => `${createHash("sha256").update(`${list}\n${normalise(text)}`).digest("hex").slice(0, 32)}:${status}`
 
 // ---------------------------------------------------------------------------------------------------------------------
 // Saying
@@ -215,4 +223,13 @@ export const itemOf = (row: Row<Item>): ListItem => ({
 })
 
 /** The fields of an item that change with its status. */
-export const withStatus = (value: Item, status: ItemStatus, since: number): Item => ({ ...value, status, place: placeOf(value.list, status), since })
+export const withStatus = (value: Item, status: ItemStatus, since: number): Item => ({
+  ...value,
+  status,
+  place: placeOf(value.list, status),
+  match: `${value.match.slice(0, 32)}:${status}`,
+  since
+})
+
+/** An item with another text (its `match` follows it). */
+export const withText = (value: Item, text: string): Item => ({ ...value, text, match: matchOf(value.list, text, value.status) })

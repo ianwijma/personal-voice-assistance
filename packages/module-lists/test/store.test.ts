@@ -24,7 +24,7 @@ describe("storage", () => {
         status: "removed",
         place: `${list}:removed`.padEnd(48, "x"),
         since: 8_640_000_000_000_000,
-        match: "f".repeat(32),
+        match: `${"f".repeat(32)}:removed`,
         dedupeKey: `k:${"/".repeat(LISTS_LIMITS.keyChars - 2)}`
       }
       yield* store.collection(items).insert(largest)
@@ -32,7 +32,8 @@ describe("storage", () => {
       yield* store.collection(lists).insert(listRow, { id: list })
       yield* store.collection(undo).insert({ at: 8_640_000_000_000_000, op: "add", list, steps: [] }, { id: undoIdOf("c") })
       assert.strictEqual((yield* store.collection(items).list({})).length, 1)
-      assert.strictEqual((yield* store.collection(lists).list({})).length, 1)
+      // Beside the two default lists, made at the start.
+      assert.strictEqual((yield* store.collection(lists).list({})).length, 3)
       assert.strictEqual((yield* store.collection(undo).list({})).length, 1)
     }))
 
@@ -60,9 +61,9 @@ describe("storage", () => {
         }
       })
       yield* kit.action("add", { items: "milk" }, { device: "kitchen-display" })
-      yield* kit.action("add", { items: "bread" }, { device: "robins-phone", conversationId: "c-2" })
-      yield* kit.action("add", { items: "tea" }, { device: "porch-screen", conversationId: "c-3" })
-      yield* kit.tool("lists_create", { name: "Gifts", items: "socks" }, { device: "hall-screen", conversationId: "c-4" })
+      yield* kit.action("add", { items: "bread" }, { device: "robins-phone", conversationId: "conversation-robin" })
+      yield* kit.action("add", { items: "tea" }, { device: "porch-screen", conversationId: "conversation-porch" })
+      yield* kit.tool("lists_create", { name: "Gifts", items: "socks" }, { device: "hall-screen", conversationId: "conversation-hall" })
       for (const device of ["kitchen-display", "robins-phone", "hall-screen", "porch-screen", "living-room-speaker"]) {
         assert.strictEqual(said(yield* kit.action("read", {}, { device })), "The shopping list has 3 things: milk, bread and tea.", device)
         assert.strictEqual(said(yield* kit.action("read", { list: "gifts" }, { device })), "The Gifts list has one thing: socks.", device)
@@ -72,7 +73,10 @@ describe("storage", () => {
         yield* kit.moduleStore().collection(lists).list({}),
         yield* kit.moduleStore().collection(undo).list({})
       ].map((rs) => rs.map((r) => ({ id: r.id, value: r.value }))))
-      for (const person of ["p-sam", "p-robin", "p-alex", "kitchen-display", "robins-phone", "porch-screen", "conversation-1", "c-2"]) assert.notInclude(rows, person)
+      // Needles that a random row id (hex and dashes) cannot hold by chance.
+      for (const person of ["p-sam", "p-robin", "p-alex", "kitchen-display", "robins-phone", "porch-screen", "hall-screen", "conversation-1", "conversation-robin", "conversation-porch", "conversation-hall"]) {
+        assert.notInclude(rows, person)
+      }
     }))
 })
 

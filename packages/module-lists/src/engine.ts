@@ -1,7 +1,7 @@
-import { type ModuleStore, type ParamOption, resolveOption, type Row, type StoreFailure, type StoreTx } from "@pva/core"
+import { type ModuleStore, type ParamOption, resolveOption, type Row, type StoreFailure, type StoreTx, type WriteOptions } from "@pva/core"
 import { convertAmount, type UnitId } from "@pva/language"
-import { isLine, type Language, LISTS_LIMITS, say } from "@pva/module-contracts"
-import { Effect } from "effect"
+import { type Language, LISTS_LIMITS, say } from "@pva/module-contracts"
+import { Effect, Semaphore } from "effect"
 import {
   type Item,
   ITEM_PAGE,
@@ -25,7 +25,8 @@ import {
   type UndoMerge,
   type UndoStep,
   UNDO_WINDOW_MS,
-  withStatus
+  withStatus,
+  withText
 } from "./data.ts"
 import { addAmounts, type SaidItem, sayItem } from "./parse.ts"
 import { texts } from "./texts.ts"
@@ -40,6 +41,13 @@ const DEFAULT_ALIASES: Readonly<Record<string, ReadonlyArray<string>>> = {
   [SHOPPING]: ["shopping", "shopping list", "groceries", "grocery list", "list", "the list", "boodschappen", "boodschappenlijst", "boodschappenlijstje", "lijst", "lijstje"],
   [TODO]: ["to do", "to-do", "todo", "to do list", "to-do list", "todo list", "tasks", "task list", "takenlijst", "taken", "to-dolijst", "te doen"]
 }
+
+/** A list's choice value when it was said as the speaker's own ("my shopping list"): there are no personal lists. */
+const MINE = "~mine"
+
+/** A list choice's value as a list id, and whether it was said as the speaker's own. */
+export const listChoice = (value: string | undefined): { readonly list: string | undefined; readonly mine: boolean } =>
+  value !== undefined && value.endsWith(MINE) ? { list: value.slice(0, -MINE.length), mine: true } : { list: value, mine: false }
 
 /** A list the household has now: a default one (whether or not its row exists yet) or a named one that is not deleted. */
 export interface LiveList {
@@ -61,10 +69,12 @@ export type UndoResult = "nothing" | "changed" | "done" | "partly"
 
 const defaultRow = (kind: "shopping" | "todo"): ListRow => ({ kind, open: 0, done: 0 })
 
+export type RefusalReason = "full" | "gone" | "changed" | "taken" | "too-many"
+
 /** Thrown inside a transaction to roll it back with nothing written; caught right outside it. */
 class Refusal {
-  readonly reason: "full" | "gone" | "changed"
-  constructor(reason: "full" | "gone" | "changed") {
+  readonly reason: RefusalReason
+  constructor(reason: RefusalReason) {
     this.reason = reason
   }
 }
@@ -94,12 +104,24 @@ export const makeEngine = (store: ModuleStore) => {
   const itemStore = store.collection(items)
   const undoStore = store.collection(undo)
   let cache: ReadonlyArray<Row<ListRow>> = []
+  /**
+   * One at a time: every operation that reads and then writes lists or items (each tool, action and service call,
+   * each step of the nightly clean-up), and every read that reports a count with items, runs under this one permit,
+   * so no two of them interleave. What decides outside the transaction it writes in still checks again inside it.
+   */
+  const lock = Semaphore.makeUnsafe(1)
+  const serial = <A, E, R>(effect: Effect.Effect<A, E, R>): Effect.Effect<A, E, R> => lock.withPermits(1)(effect)
 
-  /** Read every list (one read: `MAX_LISTS` rows fit one page) and keep them for the choices. */
+  /** Read every list (one read: the at most `MAX_LISTS` rows fit one page) and keep them for the choices. */
   const loadLists = Effect.map(listStore.list({ limit: MAX_LISTS + 1 }), (rows) => {
     cache = rows
     return rows
   })
+
+  /** The two default lists' rows, made when the module starts, so they are always counted in the bound of `MAX_LISTS`. */
+  const ensureDefaults = serial(store.transaction((tx) => {
+    for (const d of DEFAULTS) if (tx.collection(lists).get(d.id) === undefined) tx.collection(lists).insert(defaultRow(d.kind), { id: d.id })
+  }))
 
   /** The lists the household has now, default ones first, then named ones as made. */
   const liveLists = (rows: ReadonlyArray<Row<ListRow>> = cache): ReadonlyArray<LiveList> => {
@@ -109,9 +131,13 @@ export const makeEngine = (store: ModuleStore) => {
     return [...defaults, ...named.map((r) => ({ id: r.id, row: r.value, rev: r.rev }))]
   }
 
-  /** The choices of a list parameter, in the household's language, with the other names people use. */
-  const options = (lang: Language): ReadonlyArray<ParamOption> =>
-    liveLists().map(({ id, row }) => {
+  /**
+   * The choices of a list parameter, in the household's language, with the other names people use. With `mine`, each
+   * list also as the speaker's own ("my shopping list", "mijn boodschappenlijst"), whose value says so (`listChoice`):
+   * there are no personal lists, so it is the household's list, and the answer says that.
+   */
+  const options = (lang: Language, mine = false): ReadonlyArray<ParamOption> => {
+    const plain = liveLists().map(({ id, row }): ParamOption => {
       if (id === SHOPPING || id === TODO) {
         const label = listPhrase(id, row, lang).replace(/^(the|de) /, "")
         return { value: id, label, aliases: DEFAULT_ALIASES[id]! }
@@ -119,6 +145,13 @@ export const makeEngine = (store: ModuleStore) => {
       const name = row?.name ?? id
       return { value: id, label: name, aliases: [`${name} list`, `${name}lijst`, `lijst ${name}`] }
     })
+    if (!mine) return plain
+    const own = plain.map((o): ParamOption => {
+      const names = [o.label, ...(o.aliases ?? [])]
+      return { value: `${o.value}${MINE}`, label: `${lang === "nl" ? "mijn" : "my"} ${o.label}`, aliases: names.flatMap((n) => [`my ${n}`, `mijn ${n}`]) }
+    })
+    return [...plain, ...own]
+  }
 
   /** The list some words name, or `undefined`. */
   const resolveList = (words: string, lang: Language): string | undefined => {
@@ -126,6 +159,10 @@ export const makeEngine = (store: ModuleStore) => {
     if (trimmed === "") return undefined
     return resolveOption(options(lang), trimmed)?.value
   }
+
+  /** Every name a default list answers to, in both languages: a new list may not take one. */
+  const defaultNames = (): ReadonlyArray<string> =>
+    DEFAULTS.flatMap(({ id }) => [listPhrase(id, undefined, "en"), listPhrase(id, undefined, "nl"), ...DEFAULT_ALIASES[id]!].map((n) => n.replace(/^(the|de) /, "")))
 
   // -- inside a transaction ---------------------------------------------------------------------------------------
 
@@ -138,8 +175,9 @@ export const makeEngine = (store: ModuleStore) => {
     return d === undefined ? undefined : l.insert(defaultRow(d.kind), { id })
   }
 
-  const bump = (tx: StoreTx, id: string, open: number, done: number): Row<ListRow> =>
-    tx.collection(lists).update(id, (v) => ({ ...v, open: Math.min(MAX_OPEN, Math.max(0, v.open + open)), done: Math.max(0, v.done + done) }))
+  /** A list's counts changed by deltas, in the transaction that changed its items (`actor`: the job's, from the job). */
+  const bump = (tx: StoreTx, id: string, open: number, done: number, options?: WriteOptions): Row<ListRow> =>
+    tx.collection(lists).update(id, (v) => ({ ...v, open: Math.min(MAX_OPEN, Math.max(0, v.open + open)), done: Math.max(0, v.done + done) }), options)
 
   /** Write the conversation's undo entry (one level: it replaces the last one). */
   const remember = (tx: StoreTx, key: UndoKey, entry: UndoEntry) => {
@@ -147,12 +185,6 @@ export const makeEngine = (store: ModuleStore) => {
     const u = tx.collection(undo)
     if (u.get(key) === undefined) u.insert(entry, { id: key })
     else u.update(key, () => entry)
-  }
-
-  /** The item that `text` names on the list by its match: open first, then the most recently ticked off. */
-  const matchIn = (tx: StoreTx, list: string, text: string): Row<Item> | undefined => {
-    const rows = tx.collection(items).list({ where: { match: matchOf(list, text) }, limit: ITEM_PAGE }).filter((r) => r.value.list === list && r.value.status !== "removed")
-    return rows.find((r) => r.value.status === "open") ?? rows.filter((r) => r.value.status === "done").toSorted((a, b) => b.value.since - a.value.since)[0]
   }
 
   /**
@@ -177,93 +209,139 @@ export const makeEngine = (store: ModuleStore) => {
     return amount <= LISTS_LIMITS.maxAmount ? { amount, unit: existing.unit } : undefined
   }
 
+  /** The item `text` names on a list in one status, by its indexed `match`: the oldest open one, or the newest of another status. */
+  const exactIn = (tx: StoreTx, list: string, text: string, status: ItemStatus): Row<Item> | undefined =>
+    tx.collection(items).list({ where: { match: matchOf(list, text, status) }, orderBy: { field: "since", direction: status === "open" ? "asc" : "desc" }, limit: 1 })[0]
+
   /**
-   * Add what was said to a list, in one transaction. With `merge`, an item said again is merged into the open one
-   * (its amount added, or set when it had none; an amount in another unit goes into the note) or a ticked-off one is
-   * put back; otherwise it is added. Refuses `full` before writing anything when the list would pass `MAX_OPEN`.
+   * Add what was said to a list, in one transaction. Said items are taken in order against what the list has and what
+   * this request already planned, so "two litres of milk and 500 ml of milk" is one item of 2.5 l. With `merge`, an
+   * item said again adds its amount to an open item of that name whose amount it can be added to (the same unit, or
+   * one `@pva/language` converts), or gives one without an amount its amount; an amount of another kind ("a bag" beside
+   * "1 kg") is a second item of the same name with its own amount, never lost and never hidden; said without an
+   * amount, an open item is already there; a ticked-off one is put back on the list. Without `merge`, everything said
+   * is a new item. Refuses `full` before writing anything when the list would pass `MAX_OPEN`. Every change it makes
+   * is recorded for undo with the item's whole state before it (status, amount and note, also their absence).
    */
   const addIn = (tx: StoreTx, list: string, said: ReadonlyArray<SaidItem>, merge: boolean, now: number, lang: Language) => {
     const listRow = ensureList(tx, list)
     if (listRow === undefined) throw new Refusal("gone")
     const t = tx.collection(items)
-    // Plan first (reads only), so a refusal writes nothing.
-    type Plan =
-      | { readonly kind: "new"; readonly said: SaidItem }
-      | { readonly kind: "already"; readonly said: SaidItem }
-      | { readonly kind: "merge"; readonly said: SaidItem; readonly row: Row<Item>; readonly quantity?: Quantity; readonly note?: string }
-      | { readonly kind: "reopen"; readonly said: SaidItem; readonly row: Row<Item> }
-    const plans: Array<Plan> = []
-    const planned = new Map<string, number>()
-    for (const s of said) {
-      const key = normalise(s.text)
-      // Said twice in one request ("milk and milk"): the first plan wins and the second merges into nothing.
-      if (planned.has(key)) {
-        plans.push({ kind: "already", said: s })
-        continue
-      }
-      planned.set(key, plans.length)
-      const found = merge ? matchIn(tx, list, s.text) : undefined
-      if (found === undefined) plans.push({ kind: "new", said: s })
-      else if (found.value.status === "done") plans.push({ kind: "reopen", said: s, row: found })
-      else if (s.quantity === undefined) plans.push({ kind: "already", said: s })
-      else if (found.value.quantity === undefined) plans.push({ kind: "merge", said: s, row: found, quantity: s.quantity })
-      else {
-        const sum = sumOf(found.value.quantity, s.quantity)
-        if (sum !== undefined) plans.push({ kind: "merge", said: s, row: found, quantity: sum })
-        else {
-          const extra = sayItem(s.text, s.quantity, lang)
-          const note = found.value.note === undefined ? extra : `${found.value.note}; ${extra}`
-          plans.push(isLine(note, LISTS_LIMITS.noteChars) ? { kind: "merge", said: s, row: found, note } : { kind: "already", said: s })
-        }
+    /** An item this request adds, or one the list has that it may change; plan first (reads only), so a refusal writes nothing. */
+    interface Slot {
+      readonly row?: Row<Item>
+      text: string
+      quantity: Quantity | undefined
+      kind: "new" | "open" | "reopen"
+      touched: boolean
+      /** Said without an amount while the list had it open: "already has". */
+      already?: string
+    }
+    const slots: Array<Slot> = []
+    const byKey = new Map<string, { readonly open: Array<Slot>; done: Row<Item> | undefined; doneRead: boolean }>()
+    const touch = (slot: Slot) => {
+      if (!slot.touched) {
+        slot.touched = true
+        if (!slots.includes(slot)) slots.push(slot)
       }
     }
-    const opening = plans.filter((p) => p.kind === "new" || p.kind === "reopen").length
+    for (const s of said) {
+      if (!merge) {
+        touch({ text: s.text, quantity: s.quantity, kind: "new", touched: false })
+        continue
+      }
+      const key = normalise(s.text)
+      let known = byKey.get(key)
+      if (known === undefined) {
+        const open = t.list({ where: { match: matchOf(list, s.text, "open") }, orderBy: { field: "since", direction: "asc" }, limit: ITEM_PAGE })
+        known = { open: open.map((row) => ({ row, text: row.value.text, quantity: row.value.quantity, kind: "open" as const, touched: false })), done: undefined, doneRead: false }
+        byKey.set(key, known)
+      }
+      const add = (slot: Slot) => {
+        known!.open.push(slot)
+        touch(slot)
+      }
+      const reopen = (quantity: Quantity | undefined) => {
+        if (!known!.doneRead) {
+          known!.done = exactIn(tx, list, s.text, "done")
+          known!.doneRead = true
+        }
+        const row = known!.done
+        if (row === undefined) return false
+        known!.done = undefined
+        add({ row, text: row.value.text, quantity: quantity ?? row.value.quantity, kind: "reopen", touched: false })
+        return true
+      }
+      const open = known.open
+      if (s.quantity === undefined) {
+        const first = open[0]
+        if (first !== undefined) {
+          if (!first.touched && first.kind === "open") first.already ??= s.text
+          continue
+        }
+        if (!reopen(undefined)) add({ text: s.text, quantity: undefined, kind: "new", touched: false })
+        continue
+      }
+      const extra = s.quantity
+      const summable = open.find((slot) => slot.quantity !== undefined && sumOf(slot.quantity, extra) !== undefined)
+      if (summable !== undefined) {
+        summable.quantity = sumOf(summable.quantity!, extra)
+        touch(summable)
+        continue
+      }
+      const bare = open.find((slot) => slot.quantity === undefined)
+      if (bare !== undefined) {
+        bare.quantity = extra
+        touch(bare)
+        continue
+      }
+      // Open ones of another kind of amount: a second item. None open: a ticked-off one put back, else a new one.
+      if (open.length > 0 || !reopen(extra)) add({ text: s.text, quantity: extra, kind: "new", touched: false })
+    }
+    const opening = slots.filter((slot) => slot.kind !== "open").length
     if (listRow.value.open + opening > MAX_OPEN) throw new Refusal("full")
     const steps: Array<UndoStep> = []
     const merged: Array<UndoMerge> = []
     const added: Array<string> = []
-    const already: Array<string> = []
     let reopened = 0
     let order = nextSince(tx, list, now) - now
-    for (const p of plans) {
-      switch (p.kind) {
-        case "new": {
-          const value: Item = {
-            list,
-            text: p.said.text,
-            ...(p.said.quantity !== undefined ? { quantity: p.said.quantity } : {}),
-            status: "open",
-            place: placeOf(list, "open"),
-            since: now + order++,
-            match: matchOf(list, p.said.text)
-          }
-          const row = t.insert(value)
-          steps.push({ id: row.id, rev: row.rev, from: "absent" })
-          added.push(sayItem(value.text, value.quantity, lang))
-          break
+    for (const slot of slots) {
+      if (slot.kind === "new") {
+        const value: Item = {
+          list,
+          text: slot.text,
+          ...(slot.quantity !== undefined ? { quantity: slot.quantity } : {}),
+          status: "open",
+          place: placeOf(list, "open"),
+          since: now + order++,
+          match: matchOf(list, slot.text, "open")
         }
-        case "reopen": {
-          const before = p.row.value
-          const at = now + order++
-          const row = t.update(p.row.id, (v) => ({ ...withStatus(v, "open", at), ...(p.said.quantity !== undefined ? { quantity: p.said.quantity } : {}) }), { expectRev: p.row.rev })
-          steps.push({ id: row.id, rev: row.rev, from: "done", since: before.since })
-          if (p.said.quantity !== undefined && before.quantity !== undefined) merged.push({ id: row.id, rev: row.rev, quantity: before.quantity })
-          added.push(sayItem(row.value.text, row.value.quantity, lang))
-          reopened++
-          break
-        }
-        case "merge": {
-          const before = p.row.value
-          const row = t.update(p.row.id, (v) => ({ ...v, ...(p.quantity !== undefined ? { quantity: p.quantity } : {}), ...(p.note !== undefined ? { note: p.note } : {}) }), { expectRev: p.row.rev })
-          merged.push({ id: row.id, rev: row.rev, ...(before.quantity !== undefined ? { quantity: before.quantity } : {}), ...(before.note !== undefined ? { note: before.note } : {}) })
-          added.push(sayItem(row.value.text, row.value.quantity, lang))
-          break
-        }
-        case "already":
-          already.push(sayItem(p.said.text, undefined, lang))
-          break
+        const row = t.insert(value)
+        steps.push({ id: row.id, rev: row.rev, from: "absent" })
+        added.push(sayItem(value.text, value.quantity, lang))
+        continue
       }
+      const found = slot.row!
+      const at = now + order++
+      const row = t.update(found.id, (v) => {
+        const next = slot.kind === "reopen" ? withStatus(v, "open", at) : v
+        const { quantity: _q, ...rest } = next
+        return slot.quantity === undefined ? rest : { ...rest, quantity: slot.quantity }
+      }, { expectRev: found.rev })
+      if (slot.kind === "reopen") {
+        steps.push({ id: row.id, rev: row.rev, from: "done", since: found.value.since })
+        reopened++
+      }
+      // Its amount and note before, their absence included: undo puts back exactly what was there.
+      merged.push({
+        id: row.id,
+        rev: row.rev,
+        ...(found.value.quantity !== undefined ? { quantity: found.value.quantity } : {}),
+        ...(found.value.note !== undefined ? { note: found.value.note } : {})
+      })
+      added.push(sayItem(row.value.text, row.value.quantity, lang))
     }
+    const already = [...byKey.values()].flatMap((k) => k.open.filter((slot) => slot.already !== undefined && !slot.touched).map((slot) => slot.already!))
     const after = steps.length + merged.length > 0 ? bump(tx, list, opening, -reopened) : listRow
     return { added, already, steps, merged, listRev: after.rev }
   }
@@ -284,46 +362,63 @@ export const makeEngine = (store: ModuleStore) => {
       return { rows, cut: beyond.length > 0 }
     })
 
+  /** The item `text` names on a list in one status, by its indexed `match` (one read): the oldest open one, the newest ticked-off one. */
+  const exact = (list: string, text: string, status: ItemStatus) =>
+    Effect.map(itemStore.list({ where: { match: matchOf(list, text, status) }, orderBy: { field: "since", direction: status === "open" ? "asc" : "desc" }, limit: 1 }), (rows) => rows[0])
+
+  /** What a find answers: the row, or none; `cut` when a scan stopped at its bound, so "not on the list" is not known. */
+  interface Found {
+    readonly row: Row<Item> | undefined
+    readonly cut: boolean
+  }
+
   /**
-   * The item `text` names on a list: by its match (one indexed read), else the closest name among its open items (and
-   * ticked-off ones when `done`), by the core's own name matching (sound and one edit away). Bounded by `SCAN_ROWS`
-   * per status.
+   * The item `text` names on a list: an open one by its match (one indexed read), then (with `done`) a ticked-off one,
+   * else the closest name among its open items (and ticked-off ones, the newest first, with `done`), by the core's own
+   * name matching (sound and one edit away). Bounded by `SCAN_ROWS` per status; `cut` says a scan reached its bound.
    */
   const find = (list: string, text: string, done: boolean) =>
     Effect.gen(function*() {
-      const exact = (yield* itemStore.list({ where: { match: matchOf(list, text) }, limit: ITEM_PAGE })).filter(
-        (r) => r.value.list === list && (r.value.status === "open" || (done && r.value.status === "done"))
-      )
-      const best = exact.find((r) => r.value.status === "open") ?? exact[0]
-      if (best !== undefined) return best
-      const statuses: ReadonlyArray<ItemStatus> = done ? ["open", "done"] : ["open"]
-      for (const status of statuses) {
-        const { rows } = yield* scan(list, status, SCAN_ROWS)
-        const wanted = normalise(text)
-        const same = rows.find((r) => normalise(r.value.text) === wanted)
-        if (same !== undefined) return same
-        const option = resolveOption(rows.map((r) => ({ value: r.id, label: r.value.text })), text)
-        if (option !== undefined) return rows.find((r) => r.id === option.value)
+      const open = yield* exact(list, text, "open")
+      if (open !== undefined) return { row: open, cut: false } satisfies Found
+      if (done) {
+        const ticked = yield* exact(list, text, "done")
+        if (ticked !== undefined) return { row: ticked, cut: false } satisfies Found
       }
-      return undefined
+      const statuses: ReadonlyArray<ItemStatus> = done ? ["open", "done"] : ["open"]
+      let cut = false
+      const wanted = normalise(text)
+      for (const status of statuses) {
+        const scanned = yield* scan(list, status, SCAN_ROWS, status === "open" ? "asc" : "desc")
+        cut ||= scanned.cut
+        const same = scanned.rows.find((r) => normalise(r.value.text) === wanted)
+        if (same !== undefined) return { row: same, cut: false } satisfies Found
+        const option = resolveOption(scanned.rows.map((r) => ({ value: r.id, label: r.value.text })), text)
+        if (option !== undefined) return { row: scanned.rows.find((r) => r.id === option.value), cut: false } satisfies Found
+      }
+      return { row: undefined, cut } satisfies Found
     })
 
-  /** The list an item is on when no list was named: an exact match on any list (default lists first), else the closest name on the shopping list, then the to-do list. */
+  /**
+   * The list an item is on when no list was named: an open item by its exact name on any list (default lists first),
+   * then a ticked-off one (with `done`), else the closest name on the shopping list, then the to-do list.
+   */
   const findAnywhere = (text: string, done: boolean) =>
     Effect.gen(function*() {
       const live = liveLists(yield* loadLists)
-      for (const l of live) {
-        const exact = (yield* itemStore.list({ where: { match: matchOf(l.id, text) }, limit: ITEM_PAGE })).filter(
-          (r) => r.value.list === l.id && (r.value.status === "open" || (done && r.value.status === "done"))
-        )
-        const best = exact.find((r) => r.value.status === "open") ?? exact[0]
-        if (best !== undefined) return { list: l.id, row: best }
+      for (const status of (done ? ["open", "done"] : ["open"]) as ReadonlyArray<ItemStatus>) {
+        for (const l of live) {
+          const row = yield* exact(l.id, text, status)
+          if (row !== undefined) return { list: l.id, row, cut: false }
+        }
       }
+      let cut = false
       for (const id of [SHOPPING, TODO]) {
-        const row = yield* find(id, text, done)
-        if (row !== undefined) return { list: id, row }
+        const found = yield* find(id, text, done)
+        if (found.row !== undefined) return { list: id, row: found.row, cut: false }
+        cut ||= found.cut
       }
-      return undefined
+      return { list: undefined, row: undefined, cut }
     })
 
   /** Tick off or remove rows found before (each still at the rev it was read at, or the whole change is a conflict). */
@@ -379,7 +474,7 @@ export const makeEngine = (store: ModuleStore) => {
       const at = reopening ? nextSince(tx, list, now) : now
       const row = tx.collection(items).update(found.id, (v) => {
         let next: Item = reopening ? withStatus(v, "open", at) : v
-        if (change.text !== undefined) next = { ...next, text: change.text, match: matchOf(list, change.text) }
+        if (change.text !== undefined) next = withText(next, change.text)
         if (change.quantity === null) {
           const { quantity: _q, ...rest } = next
           next = rest
@@ -410,18 +505,24 @@ export const makeEngine = (store: ModuleStore) => {
       return { kind: "ok", added: r.added, already: r.already } satisfies AddResult
     })
 
-  /** A new named list, with its first items, as one change that can be undone. */
+  /**
+   * A new named list, with its first items, as one change that can be undone. Its name and both limits are decided
+   * inside the transaction that makes it, on the catalogue as it is then: two devices making "Camping" at once make
+   * one, and the 31st list is never made.
+   */
   const create = (name: string, kind: "shopping" | "todo" | "generic", said: ReadonlyArray<SaidItem>, key: UndoKey, now: number, lang: Language) =>
     Effect.gen(function*() {
-      const rows = yield* loadLists
-      const live = liveLists(rows)
-      const wanted = normalise(name)
-      // Taken: the name of a list there is, or one of the names the default lists answer to, in either language.
-      const taken = options(lang).some((o) => [o.label, ...(o.aliases ?? [])].some((n) => normalise(n) === wanted)) || live.some((l) => normalise(l.row?.name ?? "") === wanted)
-      if (taken) return { kind: "taken" as const }
-      if (live.length >= MAX_LIVE_LISTS || rows.length >= MAX_LISTS) return { kind: "too-many" as const }
       const id = globalThis.crypto.randomUUID()
+      const wanted = normalise(name)
+      const reserved = defaultNames().map(normalise)
       const result = yield* refusable(store, (tx) => {
+        const rows = tx.collection(lists).list({ limit: MAX_LISTS + 1 })
+        const live = liveLists(rows)
+        // Taken: the name of a list there is, or one of the names the default lists answer to, in either language.
+        if (reserved.includes(wanted) || live.some((l) => l.row?.name !== undefined && normalise(l.row.name) === wanted)) throw new Refusal("taken")
+        // The default lists' rows count even when they are not there (yet): they are made whenever they are needed.
+        const missing = DEFAULTS.filter((d) => !rows.some((r) => r.id === d.id)).length
+        if (live.length >= MAX_LIVE_LISTS || rows.length + missing >= MAX_LISTS) throw new Refusal("too-many")
         tx.collection(lists).insert({ name, kind, open: 0, done: 0 }, { id })
         const r = said.length > 0 ? addIn(tx, id, said, true, now, lang) : { added: [], steps: [], listRev: tx.collection(lists).get(id)!.rev }
         remember(tx, key, { at: now, op: "create", list: id, listRev: r.listRev, steps: r.steps })
@@ -511,7 +612,7 @@ export const makeEngine = (store: ModuleStore) => {
             let next: Item = s.from === v.status ? v : withStatus(v, s.from as ItemStatus, s.since ?? now)
             if (entry.before !== undefined) {
               const { quantity: _q, note: _n, ...rest } = next
-              next = { ...rest, text: entry.before.text, match: matchOf(v.list, entry.before.text), ...(entry.before.quantity !== undefined ? { quantity: entry.before.quantity } : {}), ...(entry.before.note !== undefined ? { note: entry.before.note } : {}) }
+              next = { ...withText(rest as Item, entry.before.text), ...(entry.before.quantity !== undefined ? { quantity: entry.before.quantity } : {}), ...(entry.before.note !== undefined ? { note: entry.before.note } : {}) }
             }
             if (merge !== undefined) {
               const { quantity: _q, note: _n, ...rest } = next
@@ -551,9 +652,11 @@ export const makeEngine = (store: ModuleStore) => {
 
   return {
     store,
+    serial,
+    ensureDefaults,
     /** A transaction whose function may `refuse` before it writes: the refusal is its value. */
     refusable: <X>(f: (tx: StoreTx) => X) => refusable(store, f),
-    refuse: (reason: "full" | "gone" | "changed"): never => {
+    refuse: (reason: RefusalReason): never => {
       throw new Refusal(reason)
     },
     itemStore,
@@ -569,6 +672,7 @@ export const makeEngine = (store: ModuleStore) => {
     scan,
     find,
     findAnywhere,
+    exact,
     setStatus,
     clear,
     update,

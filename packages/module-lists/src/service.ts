@@ -31,8 +31,9 @@ const failed = (e: StoreFailure) =>
 
 /**
  * The `Lists` service (`packages/module-contracts/src/lists.ts`): four operations on the household's shopping list, by
- * a consumer's key. Each is one store transaction of a few single-row reads and writes. It records no undo entry: the
- * consumer's own changes are its business, and "undo" reverses what was said to the lists module.
+ * a consumer's key. Each is one store transaction of a few single-row reads and writes, run one at a time with the
+ * module's own changes (`engine.serial`). It records no undo entry: the consumer's own changes are its business, and
+ * "undo" reverses what was said to the lists module.
  */
 export const makeListsService = (engine: Engine): ListsService => {
   const { store } = engine
@@ -55,7 +56,7 @@ export const makeListsService = (engine: Engine): ListsService => {
         const found = dedupeKey === undefined ? { live: undefined, removed: [] } : keyed(t.list({ where: { dedupeKey }, limit: ITEM_PAGE }))
         const replaced = (v: Item): Item => {
           const { quantity: _q, note: _n, ...rest } = v
-          return { ...rest, text, match: matchOf(SHOPPING, text), ...(q !== undefined ? { quantity: q } : {}), ...(note !== undefined ? { note } : {}) }
+          return { ...rest, text, match: matchOf(SHOPPING, text, v.status), ...(q !== undefined ? { quantity: q } : {}), ...(note !== undefined ? { note } : {}) }
         }
         if (found.live !== undefined) {
           const reopening = found.live.value.status === "done"
@@ -75,7 +76,7 @@ export const makeListsService = (engine: Engine): ListsService => {
           status: "open",
           place: placeOf(SHOPPING, "open"),
           since: engine.nextSince(tx, SHOPPING, now),
-          match: matchOf(SHOPPING, text),
+          match: matchOf(SHOPPING, text, "open"),
           ...(dedupeKey !== undefined ? { dedupeKey } : {})
         })
         engine.bump(tx, SHOPPING, 1, 0)
@@ -123,5 +124,10 @@ export const makeListsService = (engine: Engine): ListsService => {
       return live === undefined ? undefined : itemOf(live)
     })
 
-  return { addItem, completeByKey, removeByKey, find }
+  return {
+    addItem: (request) => engine.serial(addItem(request)),
+    completeByKey: (key) => engine.serial(completeByKey(key)),
+    removeByKey: (key) => engine.serial(removeByKey(key)),
+    find: (key) => engine.serial(find(key))
+  }
 }

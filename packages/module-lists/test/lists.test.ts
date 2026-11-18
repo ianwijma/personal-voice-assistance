@@ -52,21 +52,23 @@ describe("lists_add", () => {
       assert.include(unknown.content, "Unknown list \"camping\"")
     }))
 
-  it.effect("merges an item said again: nothing twice, amounts added, a ticked-off one put back", () =>
+  it.effect("merges an item said again: nothing twice, amounts added, another kind of amount a second item, a ticked-off one put back", () =>
     Effect.gen(function*() {
       const kit = yield* startTestModule(listsModule)
       yield* kit.action("add", { items: "milk and 500 grams of flour" })
       assert.strictEqual(said(yield* kit.action("add", { items: "Milk" })), "The shopping list already has Milk.")
       assert.strictEqual(said(yield* kit.action("add", { items: "1 kilo of flour and eggs" })), "Added 1.5 kilograms of flour and eggs to the shopping list.")
       assert.strictEqual(said(yield* kit.action("add", { items: "two milk" })), "Added 2 milk to the shopping list.")
-      assert.strictEqual(said(yield* kit.action("add", { items: "a bag of flour" })), "Added 1.5 kilograms of flour to the shopping list.")
-      const flour = (yield* kit.moduleStore().collection(items).list({})).find((x) => x.value.text === "flour")
-      assert.strictEqual(flour?.value.note, "a bag of flour")
+      // A bag cannot be added to kilograms: a second flour with its own amount, said back as it is.
+      assert.strictEqual(said(yield* kit.action("add", { items: "a bag of flour" })), "Added a bag of flour to the shopping list.")
+      const flour = (yield* kit.moduleStore().collection(items).list({})).filter((x) => x.value.text === "flour")
+      assert.sameDeepMembers(flour.map((f) => f.value.quantity), [{ amount: 1_500, unit: "g" }, { amount: 1, unit: "bag" }])
+      assert.isTrue(flour.every((f) => f.value.note === undefined))
       // Ticked off, then said again: back on the list, not a second item.
       yield* kit.action("complete", { item: "eggs" })
       assert.strictEqual(said(yield* kit.action("add", { items: "egg" })), "Added eggs to the shopping list.")
       const open = (yield* kit.moduleStore().collection(items).list({})).filter((x) => x.value.status === "open").map((x) => x.value.text)
-      assert.sameMembers(open, ["milk", "flour", "eggs"])
+      assert.sameMembers(open, ["milk", "flour", "flour", "eggs"])
       // With merging off, an item said again is a second item.
       const plain = yield* startTestModule(listsModule, { settings: { mergeDuplicates: false } })
       yield* plain.action("add", { items: "milk" })

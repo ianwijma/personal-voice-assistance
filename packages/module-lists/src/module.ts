@@ -3,7 +3,7 @@ import { homeLanguage, isLine, type Language, Lists, LISTS_LIMITS, say, StoredTe
 import { speakList } from "@pva/language"
 import { Clock, Effect, Schema } from "effect"
 import { type Item, items, listPhrase, lists, MAX_CLEAR, MAX_LIVE_LISTS, MAX_OPEN, MAX_PER_REQUEST, NAME_CHARS, normalise, type Quantity, SHOPPING, TODO, undo, undoIdOf } from "./data.ts"
-import { type Engine, isRefusal, makeEngine, speak } from "./engine.ts"
+import { type Engine, isRefusal, listChoice, makeEngine, speak } from "./engine.ts"
 import { type SaidItem, sayItem, type SplitMode, splitItems, takeListSuffix } from "./parse.ts"
 import { makeListsService } from "./service.ts"
 import { texts } from "./texts.ts"
@@ -85,12 +85,15 @@ export const listsModule = defineModule({
   description: "Shopping and to-do lists: add, read, tick off and remove items.",
   enabledByDefault: false,
   settings,
-  storage: { version: 1, collections: [lists, items, undo] },
+  // Version 2: an item's `match` holds its status too (indexed with `since`), so a name finds the open item first.
+  storage: { version: 2, collections: [lists, items, undo] },
   shared: (ctx) =>
     Effect.gen(function*() {
       const engine = makeEngine(ctx.store)
-      // The list choices of the typed actions are read synchronously: keep the (at most 50) list rows. A store that is
-      // not there (a CLI mode without one) leaves them empty; every call then says it could not read the lists.
+      // The two default lists exist from the start, so they always count toward the bound on list rows. The list
+      // choices of the typed actions are read synchronously: keep the (at most 50) list rows. A store that is not
+      // there or is read-only (a CLI mode) leaves them as they are; every call then says it could not read the lists.
+      yield* engine.ensureDefaults.pipe(Effect.ignore)
       yield* engine.loadLists.pipe(Effect.ignore)
       yield* ctx.scheduler.handle("tidy", {
         payload: Schema.Struct({}),
@@ -117,7 +120,13 @@ export const listsModule = defineModule({
       const mode = ctx.settings.splitItems as SplitMode
       const merge = ctx.settings.mergeDuplicates
       const readItems = ctx.settings.readItems
-      const listParam = Param.dynamic({ label: "List", options: () => engine.options(lang()), optional: true })
+      // Each list also as the speaker's own ("my shopping list"): there are no personal lists, so that is the
+      // household's list, and the answer says so (`listChoice`).
+      const listParam = Param.dynamic({ label: "List", options: () => engine.options(lang(), true), optional: true })
+      /** The list a list parameter named, and whether it was said as the speaker's own. */
+      const chosen = (value: string | undefined) => listChoice(value)
+      /** Run one at a time with every other change and count-and-items read of the module (`engine.serial`). */
+      const serial = engine.serial
       const actionError = (message: string) => new ActionError({ message })
       const toolError = (message: string) => new ToolError({ message })
 
@@ -155,26 +164,32 @@ export const listsModule = defineModule({
         },
         risk: "change",
         latency: "instant",
-        run: ({ items: text, list }) =>
-          Effect.gen(function*() {
+        run: ({ items: text, list: value }) =>
+          serial(Effect.gen(function*() {
             const l = lang()
             yield* engine.loadLists.pipe(Effect.mapError((e) => actionError(storeSentence(l, e, true))))
-            // The typed path hands over the rest of the sentence: "milk to the shopping list".
-            const named = list === undefined ? takeListSuffix(text.replace(/\s+/g, " ").trim(), LIST_MARKERS, (w) => engine.resolveList(w, l)) : { text, list }
+            const picked = chosen(value)
+            // The typed path hands over the rest of the sentence: "milk to the shopping list", "melk op mijn lijstje".
+            const named = picked.list === undefined ? takeListSuffix(text.replace(/\s+/g, " ").trim(), LIST_MARKERS, (w) => engine.resolveList(w, l)) : { text, list: picked.list, mine: picked.mine }
+            // A list said the way a list is named, that the household does not have: refused, nothing written elsewhere.
+            if (named.unknown !== undefined) return yield* Effect.fail(actionError(speak(l, "unknownList", { name: named.unknown, items: listOf(engine.listNames(l), l, 8) })))
             const target = named.list ?? SHOPPING
             const things = said(named.text, l)
             if (typeof things === "string") return yield* Effect.fail(actionError(things))
             const now = yield* Clock.currentTimeMillis
             const key = yield* undoKey
             const result = yield* engine.add(target, things, merge, key, now, l).pipe(Effect.mapError((e) => actionError(storeSentence(l, e, false))))
-            const phrase = engine.phraseOf(target, l)
+            const plain = engine.phraseOf(target, l)
             if (isRefusal(result)) {
-              return yield* Effect.fail(actionError(result.reason === "full" ? speak(l, "full", { list: phrase, count: MAX_OPEN }) : speak(l, "unknownList", { name: phrase, items: listOf(engine.listNames(l), l, 8) })))
+              return yield* Effect.fail(actionError(result.reason === "full" ? speak(l, "full", { list: plain, count: MAX_OPEN }) : speak(l, "unknownList", { name: plain, items: listOf(engine.listNames(l), l, 8) })))
             }
-            if (result.added.length === 0) return { say: speak(l, "already", { list: phrase, items: listOf(result.already, l) }) }
-            if (result.already.length === 0) return { say: speak(l, "added", { list: phrase, items: listOf(result.added, l) }) }
-            return { say: speak(l, "addedAndAlready", { list: phrase, items: listOf(result.added, l), already: listOf(result.already, l) }) }
-          })
+            // "My shopping list": there are no personal lists, so it went on the household's, and the answer says so.
+            const shared = named.mine === true
+            const phrase = shared ? say(texts, l, "householdsList", { name: l === "en" ? plain.replace(/^the /, "") : plain }) : plain
+            if (result.added.length === 0) return { say: speak(l, shared ? "alreadyShared" : "already", { list: phrase, items: listOf(result.already, l) }) }
+            if (result.already.length === 0) return { say: speak(l, shared ? "addedShared" : "added", { list: phrase, items: listOf(result.added, l) }) }
+            return { say: speak(l, shared ? "addedAndAlreadyShared" : "addedAndAlready", { list: phrase, items: listOf(result.added, l), already: listOf(result.already, l) }) }
+          }))
       })
 
       // -- read --------------------------------------------------------------------------------------------------------
@@ -191,19 +206,23 @@ export const listsModule = defineModule({
         },
         speculative: true,
         latency: "instant",
+        // Under the module's one permit: the count and the items it names come from one state of the list.
         run: ({ list, show, from }) =>
-          Effect.gen(function*() {
+          serial(Effect.gen(function*() {
             const l = lang()
-            const target = list ?? SHOPPING
+            const target = chosen(list).list ?? SHOPPING
             const phrase = engine.phraseOf(target, l)
             const unreadable = (e: StoreFailure) => actionError(storeSentence(l, e, true))
             const counts = yield* engine.countsOf(target).pipe(Effect.mapError(unreadable))
             const start = from ?? 1
             if (show === "done") {
               if (counts.done === 0) return { say: speak(l, "noneDone", { list: phrase }) }
-              const { rows } = yield* engine.scan(target, "done", readItems, "desc").pipe(Effect.mapError(unreadable))
-              const named = rows.map((r) => sayItem(r.value.text, r.value.quantity, l))
-              return { say: speak(l, "readDone", { list: phrase, items: moreOf(named, counts.done, l) }) }
+              if (start > counts.done) return { say: speak(l, "readDonePastEnd", { list: phrase, count: counts.done }) }
+              // The newest first, from item `from` on: at most `from - 1 + readItems` rows (≤ 510), page by page.
+              const { rows } = yield* engine.scan(target, "done", start - 1 + readItems, "desc").pipe(Effect.mapError(unreadable))
+              const named = rows.slice(start - 1).map((r) => sayItem(r.value.text, r.value.quantity, l))
+              const words = moreOf(named, counts.done - (start - 1), l)
+              return { say: start > 1 ? speak(l, "readDoneFrom", { list: phrase, from: start, items: words }) : speak(l, "readDone", { list: phrase, items: words }) }
             }
             if (counts.open === 0) return { say: speak(l, "empty", { list: phrase }) }
             if (start > counts.open) return { say: speak(l, "readPastEnd", { list: phrase, count: counts.open }) }
@@ -214,7 +233,7 @@ export const listsModule = defineModule({
             const words = moreOf(shown, left, l)
             if (start > 1) return { say: speak(l, "readFrom", { list: phrase, from: start, items: words }) }
             return { say: counts.open === 1 ? speak(l, "readOne", { list: phrase, items: words }) : speak(l, "readOpen", { list: phrase, count: counts.open, items: words }) }
-          })
+          }))
       })
 
       /** The items shown, and "and N more" for the rest of `total`. */
@@ -231,33 +250,38 @@ export const listsModule = defineModule({
           yield* engine.loadLists
           const cleaned = text.replace(/\s+/g, " ").trim()
           const named = list === undefined ? takeListSuffix(cleaned, OFF_MARKERS, (w) => engine.resolveList(w, l)) : { text: cleaned, list }
+          if (named.unknown !== undefined) return { kind: "said" as const, sentence: speak(l, "unknownList", { name: named.unknown, items: listOf(engine.listNames(l), l, 8) }) }
           const things = said(named.text.replace(/\s+(?:off|af)$/i, ""), l)
           if (typeof things === "string") return { kind: "said" as const, sentence: things }
           let target = named.list
           const found: Array<Row<Item>> = []
           const missing: Array<string> = []
+          // Not found while a scan stopped at its bound: whether it is there is not known, so never "not on the list".
+          const unsure: Array<string> = []
           for (const s of things) {
-            let row: Row<Item> | undefined
+            let hit: { readonly row: Row<Item> | undefined; readonly cut: boolean }
             if (target === undefined) {
-              const hit = yield* engine.findAnywhere(s.text, done)
-              if (hit !== undefined) {
-                target = hit.list
-                row = hit.row
-              }
-            } else row = yield* engine.find(target, s.text, done)
+              const anywhere = yield* engine.findAnywhere(s.text, done)
+              if (anywhere.list !== undefined) target = anywhere.list
+              hit = anywhere
+            } else hit = yield* engine.find(target, s.text, done)
+            const row = hit.row
             if (row !== undefined && !found.some((f) => f.id === row.id)) found.push(row)
-            else if (row === undefined) missing.push(s.text)
+            else if (row === undefined) (hit.cut ? unsure : missing).push(s.text)
           }
-          return { kind: "found" as const, list: target ?? SHOPPING, found, missing }
+          return { kind: "found" as const, list: target ?? SHOPPING, found, missing, unsure }
         })
 
       const tickOrRemove = (to: "done" | "removed") => ({ item, list }: { readonly item: string; readonly list: string | undefined }) =>
-        Effect.gen(function*() {
+        serial(Effect.gen(function*() {
           const l = lang()
-          const r = yield* findAll(item, list, to === "removed", l).pipe(Effect.mapError((e) => actionError(storeSentence(l, e, true))))
+          const r = yield* findAll(item, chosen(list).list, to === "removed", l).pipe(Effect.mapError((e) => actionError(storeSentence(l, e, true))))
           if (r.kind === "said") return yield* Effect.fail(actionError(r.sentence))
           const phrase = engine.phraseOf(r.list, l)
-          const notOn = r.missing.length > 0 ? speak(l, "notOnList", { list: phrase, items: listOf(r.missing, l) }) : ""
+          const notOn = [
+            ...(r.missing.length > 0 ? [speak(l, "notOnList", { list: phrase, items: listOf(r.missing, l) })] : []),
+            ...(r.unsure.length > 0 ? [speak(l, "searchCut", { list: phrase, items: listOf(r.unsure, l) })] : [])
+          ].join(" ")
           if (r.found.length === 0) return { say: notOn }
           const now = yield* Clock.currentTimeMillis
           const key = yield* undoKey
@@ -266,7 +290,7 @@ export const listsModule = defineModule({
           const names = listOf(r.found.map((f) => f.value.text), l)
           const sentence = speak(l, to === "done" ? "completed" : "removed", { list: phrase, items: names })
           return { say: notOn === "" ? sentence : `${sentence} ${notOn}` }
-        })
+        }))
 
       const complete = defineAction({
         id: "complete",
@@ -300,9 +324,9 @@ export const listsModule = defineModule({
         risk: "change",
         latency: "instant",
         run: ({ list }) =>
-          Effect.gen(function*() {
+          serial(Effect.gen(function*() {
             const l = lang()
-            const target = list ?? SHOPPING
+            const target = chosen(list).list ?? SHOPPING
             const phrase = engine.phraseOf(target, l)
             const now = yield* Clock.currentTimeMillis
             const key = yield* undoKey
@@ -310,7 +334,7 @@ export const listsModule = defineModule({
             if (isRefusal(r)) return yield* Effect.fail(actionError(speak(l, "unsaved")))
             if (r.count === 0) return { say: speak(l, "noneDone", { list: phrase }) }
             return { say: speak(l, r.more ? "clearedSome" : "cleared", { list: phrase, count: r.count }) }
-          })
+          }))
       })
 
       // -- undo --------------------------------------------------------------------------------------------------------
@@ -323,7 +347,7 @@ export const listsModule = defineModule({
         risk: "change",
         latency: "instant",
         run: () =>
-          Effect.gen(function*() {
+          serial(Effect.gen(function*() {
             const l = lang()
             const now = yield* Clock.currentTimeMillis
             const key = yield* undoKey
@@ -335,7 +359,7 @@ export const listsModule = defineModule({
             if ("op" in r && r.op === "create") return { say: speak(l, "undoneCreate", { list: phrase }) }
             if ("op" in r && r.op === "delete") return { say: speak(l, "undoneDelete", { list: phrase }) }
             return { say: speak(l, "undoneList", { list: phrase }) }
-          })
+          }))
       })
 
       // -- overview ----------------------------------------------------------------------------------------------------
@@ -348,20 +372,21 @@ export const listsModule = defineModule({
         speculative: true,
         latency: "instant",
         run: () =>
-          Effect.gen(function*() {
+          serial(Effect.gen(function*() {
             const l = lang()
             const rows = yield* engine.loadLists.pipe(Effect.mapError((e) => actionError(storeSentence(l, e, true))))
             const live = engine.liveLists(rows)
             const entries = live.map((x) => say(texts, l, "overviewEntry", { list: listPhrase(x.id, x.row, l), count: x.row?.open ?? 0 }))
             return { say: speak(l, "overview", { count: live.length, items: listOf(entries, l, 8) }) }
-          })
+          }))
       })
 
       // -- tools for the model only ------------------------------------------------------------------------------------
       /** A list named by the model, or a sentence when there is none of that name. */
       const listNamed = (name: string | undefined, l: Language): { readonly id: string } | { readonly sentence: string } => {
         if (name === undefined) return { id: SHOPPING }
-        const id = engine.resolveList(name, l)
+        // "My camping list": there are no personal lists, so the household's list of that name.
+        const id = engine.resolveList(name.replace(/^\s*(?:my|mijn)\s+/i, ""), l)
         return id === undefined ? { sentence: speak(l, "unknownList", { name, items: listOf(engine.listNames(l), l, 8) }) } : { id }
       }
 
@@ -386,7 +411,7 @@ export const listsModule = defineModule({
         risk: "change",
         latency: "instant",
         execute: (input) =>
-          Effect.gen(function*() {
+          serial(Effect.gen(function*() {
             const l = lang()
             const unread = (e: StoreFailure) => toolError(storeSentence(l, e, true))
             yield* engine.loadLists.pipe(Effect.mapError(unread))
@@ -396,10 +421,13 @@ export const listsModule = defineModule({
               if ("sentence" in named) return { spoken: named.sentence }
               target = named.id
             }
-            const hit = target === undefined
+            const found = target === undefined
               ? yield* engine.findAnywhere(input.item, true).pipe(Effect.mapError(unread))
-              : onList(yield* engine.find(target, input.item, true).pipe(Effect.mapError(unread)), target)
-            if (hit === undefined) return { spoken: speak(l, "notOnList", { list: engine.phraseOf(target ?? SHOPPING, l), items: input.item }) }
+              : { list: target, ...(yield* engine.find(target, input.item, true).pipe(Effect.mapError(unread))) }
+            if (found.row === undefined || found.list === undefined) {
+              return { spoken: speak(l, found.cut ? "searchCut" : "notOnList", { list: engine.phraseOf(target ?? SHOPPING, l), items: input.item }) }
+            }
+            const hit = { list: found.list, row: found.row }
             const row = hit.row
             const quantity: Quantity | null | undefined = input.clearAmount === true
               ? null
@@ -421,7 +449,7 @@ export const listsModule = defineModule({
             const phrase = engine.phraseOf(hit.list, l)
             if (isRefusal(done)) return { spoken: done.reason === "full" ? speak(l, "full", { list: phrase, count: MAX_OPEN }) : speak(l, "unsaved") }
             return { spoken: speak(l, "updated", { list: phrase, items: sayItem(done.value.text, done.value.quantity, l) + (done.value.note !== undefined ? ` (${done.value.note})` : "") }) }
-          })
+          }))
       })
 
       const createTool = makeTool({
@@ -435,7 +463,7 @@ export const listsModule = defineModule({
         risk: "change",
         latency: "instant",
         execute: ({ name, kind, items: text }) =>
-          Effect.gen(function*() {
+          serial(Effect.gen(function*() {
             const l = lang()
             const cleanName = name.replace(/\s+/g, " ").trim().replace(/\s+(list|lijst)$/i, "")
             if (normalise(cleanName) === "") return { spoken: speak(l, "badName", { count: NAME_CHARS }) }
@@ -444,12 +472,14 @@ export const listsModule = defineModule({
             const now = yield* Clock.currentTimeMillis
             const key = yield* undoKey
             const r = yield* engine.create(cleanName, kind ?? "generic", things, key, now, l).pipe(Effect.mapError((e) => toolError(storeSentence(l, e, false))))
-            if (isRefusal(r)) return { spoken: speak(l, "unsaved") }
-            if (r.kind === "taken") return { spoken: speak(l, "nameTaken", { name: cleanName }) }
-            if (r.kind === "too-many") return { spoken: speak(l, "tooManyLists", { count: MAX_LIVE_LISTS }) }
+            if (isRefusal(r)) {
+              if (r.reason === "taken") return { spoken: speak(l, "nameTaken", { name: cleanName }) }
+              if (r.reason === "too-many") return { spoken: speak(l, "tooManyLists", { count: MAX_LIVE_LISTS }) }
+              return { spoken: speak(l, "unsaved") }
+            }
             const phrase = engine.phraseOf(r.id, l)
             return { spoken: r.added.length === 0 ? speak(l, "created", { list: phrase }) : speak(l, "createdWith", { list: phrase, items: listOf(r.added, l) }) }
-          })
+          }))
       })
 
       const deleteTool = makeTool({
@@ -459,7 +489,7 @@ export const listsModule = defineModule({
         risk: "change",
         latency: "instant",
         execute: ({ list }) =>
-          Effect.gen(function*() {
+          serial(Effect.gen(function*() {
             const l = lang()
             yield* engine.loadLists.pipe(Effect.mapError((e) => toolError(storeSentence(l, e, true))))
             const named = listNamed(list, l)
@@ -471,17 +501,14 @@ export const listsModule = defineModule({
             const r = yield* engine.deleteList(named.id, key, now).pipe(Effect.mapError((e) => toolError(storeSentence(l, e, false))))
             if (isRefusal(r)) return { spoken: speak(l, "unknownList", { name: list, items: listOf(engine.listNames(l), l, 8) }) }
             return { spoken: speak(l, "deleted", { list: phrase }) }
-          })
+          }))
       })
 
       return {
         actions: [add, read, complete, remove, clearDone, undoAction, overview],
         tools: [updateTool, createTool, deleteTool],
         instructions:
-          "Lists are the household's: everyone sees them on every device, and there are no personal lists yet, so when someone asks for a list of their own, say so before putting anything on a shared list. Put everything said in one lists_add call; lists_undo reverses the last list change of this conversation."
+          "Lists are the household's: everyone sees them on every device. There are no personal lists yet: \"my shopping list\" is the household's, and lists_add says so in its answer. Put everything said in one lists_add call; lists_undo reverses the last list change of this conversation."
       }
     })
 })
-
-/** A found row on a list named before, in the shape `findAnywhere` answers. */
-const onList = (row: Row<Item> | undefined, list: string) => (row === undefined ? undefined : { list, row })
