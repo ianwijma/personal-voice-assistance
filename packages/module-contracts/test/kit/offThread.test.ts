@@ -6,7 +6,11 @@ import { defineModule, makeTool, offThread, type OffThreadError, offThreadTask }
 import { makeOfflineNet, offThreadWorkers, startTestModule } from "@pva/core/testing"
 import { type Connector, contentTypes, type Resolver, safeFetch } from "@pva/net"
 import { Effect, Schema } from "effect"
+import { vi } from "vitest"
 import { defineTexts, homeLanguage, say } from "../../src/index.ts"
+
+// Real workers start here (a quarter of a second each, several times that on a slow CI runner).
+vi.setConfig({ testTimeout: 60_000 })
 
 interface NetDeps {
   readonly resolver?: Resolver
@@ -57,6 +61,8 @@ export const readerModule = (deps: NetDeps) =>
   })
 // #endregion offthread-module
 
+const spin = offThreadTask<typeof import("./spin.task.ts").default>(new URL("./spin.task.ts", import.meta.url))
+
 describe("a module that parses off the main thread", () => {
   it.effect("reads a page through a worker in the test too, and says so when the page cannot be read", () =>
     Effect.gen(function*() {
@@ -74,5 +80,13 @@ describe("a module that parses off the main thread", () => {
       // Every worker has ended.
       assert.strictEqual(offThreadWorkers().running, 0)
       // #endregion offthread-test
+      // The time limit is real time, not the kit's clock: a task that never ends is stopped at its limit although
+      // this test's clock never moves, and the module words it as a page too slow to read.
+      const t0 = performance.now()
+      const slow = yield* Effect.flip(offThread(spin, "", { timeoutMs: 500 }))
+      assert.strictEqual(slow.reason, "timeout")
+      assert.isBelow(performance.now() - t0, 10_000)
+      assert.strictEqual(pageFailure("en", slow), "That page took too long to read.")
+      assert.strictEqual(offThreadWorkers().running, 0)
     }))
 })
