@@ -796,21 +796,30 @@ export const makeModuleHost = Effect.fnUntraced(function*(options: ModuleHostOpt
     src: { readonly stored: Readonly<Record<string, unknown>>; readonly secrets: Readonly<Record<string, string>> },
     own: Readonly<Record<string, unknown>> | undefined,
     defaults: Readonly<Record<string, unknown>> | undefined
-  ): ResolvedSettings<any> =>
-    moduleCode(
+  ): ResolvedSettings<any> => {
+    // The messages of field code that threw (`faults`; a field's error wraps one): a fault, not an invalid value, so
+    // it stops the shared part even on an assistant-owned field (`sharedOf`), as a whole resolution that throws does.
+    const thrown = new Set<string>()
+    const contain: Contain = (f, fallback) => moduleCode(entry, f, (message) => (thrown.add(message), fallback(message)))
+    const resolved = moduleCode(
       entry,
-      () =>
+      (): ResolvedSettings<any> =>
         resolveSettings(entry.def.settings, {
           stored: src.stored,
           secrets: src.secrets,
           env: options.env,
-          contain: containFor(entry),
+          contain,
           ...envOrigin,
           ...(defaults !== undefined ? { defaults } : {}),
           ...(own !== undefined ? { own } : {})
         }),
       (message) => ({ value: undefined, form: { fields: [], values: {}, secrets: {}, errors: [{ key: null, message }] } })
     )
+    if (thrown.size > 0) faults.set(resolved.form, thrown)
+    return resolved
+  }
+  /** Per resolved form, the messages of the field code that threw while it was resolved (`resolveRaw`). */
+  const faults = new WeakMap<SettingsForm, ReadonlySet<string>>()
   /**
    * The module's settings from these sources. Settings whose complete form is larger than `MODULE_FORM_MAX_BYTES`
    * are not valid, like any settings a field refuses: no form, one error naming the largest field (its values are
@@ -966,7 +975,10 @@ export const makeModuleHost = Effect.fnUntraced(function*(options: ModuleHostOpt
     const without = (record: Readonly<Record<string, unknown>>) => Object.fromEntries(Object.entries(record).filter(([k]) => !owned.has(k)))
     // Only the fields the shared part receives are judged here: an assistant-owned field's invalid shared default
     // does not stop it (each instance validates its own effective settings in full).
-    const errors = resolved.form.errors.filter((e) => e.key === null || !owned.has(e.key))
+    // Field code that threw is a fault of the module, never only an assistant's value: it stops the shared part too.
+    const thrown = faults.get(resolved.form)
+    const fault = (message: string) => thrown !== undefined && [...thrown].some((m) => message.includes(m))
+    const errors = resolved.form.errors.filter((e) => e.key === null || !owned.has(e.key) || fault(e.message))
     const raw: Record<string, unknown> = { ...resolved.form.values }
     for (const [key, setting] of Object.entries(entry.def.settings as SettingsSpec)) {
       if (!setting.secret) continue

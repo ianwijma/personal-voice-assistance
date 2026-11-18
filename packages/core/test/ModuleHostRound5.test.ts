@@ -130,7 +130,7 @@ describe("the enabling key is read without decoding the other settings (finding 
       const host = yield* makeModuleHost({
         catalog: [implicit],
         env: {},
-        persistence: readOnlyPersistence({ modules: { implicit: { settings: { place: "Paris" } } }, secrets: { implicit: { token: "t" } } })
+        persistence: readOnlyPersistence({ modules: { implicit: { settings: { place: "Paris" } } }, secrets: { implicit: { token: "r5-implicit-token" } } })
       })
       yield* host.startEnabled
       const m = info(host, "implicit")
