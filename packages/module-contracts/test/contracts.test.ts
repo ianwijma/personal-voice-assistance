@@ -1,128 +1,39 @@
-// The contracts' rules a consumer relies on, on their fakes; `useService`; the two authoring helpers. Each fake is what a
-// consumer's tests give it through the test kit (`provide`), so its behaviour is checked here once.
+// What a consumer of a contract relies on that is code, not documentation: `useService` and `ProviderOff`, the keys'
+// ids, and the two authoring helpers. A consumer's tests give it a stub of the contract (`stubService` in
+// `@pva/core/testing`), programmed with what the contract's documentation allows; the consumer below is the example
+// docs/MODULES.md quotes.
 import { assert, describe, it } from "@effect/vitest"
-import { CurrentTurn, defineModule, makeTool, ModuleStopped } from "@pva/core"
-import { makeTestTurn, provide, STORED_TEXT_PATTERN_SOURCE, startTestModule } from "@pva/core/testing"
-import { Effect, Fiber, Schema, Stream } from "effect"
+import { defineModule, makeTool, type ModuleHostApi } from "@pva/core"
+import { fails, provide, startTestModule, STORED_TEXT_PATTERN_SOURCE, stops, stubService } from "@pva/core/testing"
+import { Effect, Schema } from "effect"
 import {
   BriefingSections,
-  CalendarProviders,
   defineTexts,
   HomeAssistant,
   homeLanguage,
+  isContractId,
   Lists,
+  ListsError,
   type ListsService,
+  Playback,
   ProviderOff,
+  providerOffText,
   say,
   STORED_TEXT_PATTERN,
   StoredText,
+  Timers,
   useService
 } from "../src/index.ts"
-import {
-  haEntity,
-  makeFakeBriefingSection,
-  makeFakeCalendarProvider,
-  makeFakeHomeAssistant,
-  makeFakeLists,
-  makeFakeMcp,
-  makeFakePlayback,
-  makeFakeTimers
-} from "../src/fakes.ts"
 
-describe("Lists (fake)", () => {
-  it.effect("a dedupe key names one item: added, updated, completed, reopened, removed", () =>
-    Effect.gen(function*() {
-      const { service, items } = makeFakeLists()
-      const source = { module: "kitchen", ref: "product:rice" }
-      const add = (text: string) => service.addItem({ list: { kind: "shopping" }, text, source, dedupeKey: "kitchen:product:rice" })
-      assert.strictEqual((yield* add("Rice")).outcome, "added")
-      assert.strictEqual((yield* add("Rice, 1 kg")).outcome, "updated")
-      assert.strictEqual(items.length, 1)
-      assert.strictEqual((yield* service.completeByKey("kitchen:product:rice"))?.status, "done")
-      assert.strictEqual((yield* add("Rice")).outcome, "reopened")
-      assert.isTrue(yield* service.removeByKey("kitchen:product:rice"))
-      assert.isUndefined(yield* service.completeByKey("kitchen:product:rice"))
-      // A key must begin with the source module's id.
-      const bad = yield* Effect.flip(service.addItem({ list: { kind: "shopping" }, text: "x", source, dedupeKey: "lists:x" }))
-      assert.strictEqual(bad.reason, "invalid")
-      assert.strictEqual((yield* service.find({ name: "shopping" }))?.openItems, 0)
-    }))
-})
-
-describe("Timers (fake)", () => {
-  it.effect("rings on the turn's device unless told otherwise; no device at all is no_device", () =>
-    Effect.gen(function*() {
-      const { service } = makeFakeTimers({ now: () => 0 })
-      const timer = yield* service.start({ durationMs: 60_000, label: "eggs", source: { module: "routines" } }).pipe(Effect.provideService(CurrentTurn, makeTestTurn({ device: "kitchen-display" })))
-      assert.deepStrictEqual(timer.ringOn, { deviceId: "kitchen-display" })
-      const none = yield* Effect.flip(service.start({ durationMs: 60_000, source: { module: "routines" } }))
-      assert.strictEqual(none.reason, "no_device")
-      const short = yield* Effect.flip(service.start({ durationMs: 10, ringOn: { deviceId: "x" }, source: { module: "routines" } }))
-      assert.strictEqual(short.reason, "invalid")
-    }))
-})
-
-describe("HomeAssistant (fake)", () => {
-  it.effect("a subscriber gets a snapshot first, then changes; a reconnect is a fresh snapshot, not news", () =>
-    Effect.gen(function*() {
-      const ha = makeFakeHomeAssistant({ entities: [haEntity("media_player.kitchen", "idle")] })
-      const seen: Array<string> = []
-      const fiber = yield* Effect.forkChild(Stream.runForEach(Stream.take(ha.service.changes, 4), (c) => Effect.sync(() => void seen.push(c._tag === "snapshot" ? `snapshot:${c.reason}` : c._tag))))
-      yield* Effect.repeat(Effect.yieldNow, { times: 5 })
-      ha.set(haEntity("media_player.kitchen", "playing"))
-      ha.setConnection("connected")
-      yield* Fiber.join(fiber)
-      assert.deepStrictEqual(seen, ["snapshot:subscribed", "changed", "connection", "snapshot:reconnected"])
-    }))
-
-  it.effect("refuses what the transport refuses for everyone, and unexposed entities", () =>
-    Effect.gen(function*() {
-      const ha = makeFakeHomeAssistant({ entities: [haEntity("cover.garage", "closed", { deviceClass: "garage" }), haEntity("media_player.kitchen", "idle")] })
-      assert.strictEqual((yield* Effect.flip(ha.service.callService({ domain: "lock", service: "unlock", target: { entityIds: ["lock.front"] } }))).reason, "refused")
-      assert.strictEqual((yield* Effect.flip(ha.service.callService({ domain: "cover", service: "open_cover", target: { entityIds: ["cover.garage"] } }))).reason, "refused")
-      assert.strictEqual((yield* Effect.flip(ha.service.callService({ domain: "light", service: "turn_on", target: { entityIds: ["light.hidden"] } }))).reason, "unknown_entity")
-      yield* ha.service.callService({ domain: "media_player", service: "media_pause", target: { entityIds: ["media_player.kitchen"] } })
-      ha.setConnection("reconnecting")
-      assert.strictEqual((yield* Effect.flip(ha.service.callService({ domain: "media_player", service: "media_play", target: { entityIds: ["media_player.kitchen"] } }))).reason, "not_connected")
-    }))
-})
-
-describe("Playback, Mcp, calendar providers and briefing sections (fakes)", () => {
-  it.effect("their recorded behaviour", () =>
-    Effect.gen(function*() {
-      const playback = makeFakePlayback({ Kitchen: { state: "playing", player: "Kitchen speakers", volume: 0.5 } })
-      assert.strictEqual(playback.service.inRoom("kitchen")?.state, "playing")
-      assert.isTrue(yield* playback.service.pause("Kitchen"))
-      assert.isFalse(yield* playback.service.pause("Kitchen"))
-      assert.strictEqual(yield* playback.service.changeVolume("Kitchen", { by: 0.1 }), 0.6)
-
-      const mcp = makeFakeMcp({ "https://t3.lan/mcp": { tools: [{ name: "overview", description: "d", inputSchema: { type: "object" }, annotations: { readOnlyHint: true } }], call: () => ({ isError: false, text: "2 threads", truncated: false }) } })
-      const text = yield* Effect.scoped(Effect.gen(function*() {
-        const client = yield* mcp.service.open({ name: "T3", url: "https://t3.lan/mcp" })
-        return (yield* client.callTool("overview", {})).text
-      }))
-      assert.strictEqual(text, "2 threads")
-      assert.isTrue(mcp.opened[0]?.closed)
-
-      const cal = makeFakeCalendarProvider({
-        id: "ics",
-        sources: [{ id: "ics:school", label: "School", owner: "household", writable: false }],
-        events: [{ sourceId: "ics:school", uid: "u1", title: "Sports day", start: { date: "2026-11-20" }, end: { date: "2026-11-21" }, status: "confirmed", owner: "household", repeats: false }]
-      })
-      const read = yield* cal.provider.events("ics:school", { from: Date.UTC(2026, 10, 18), to: Date.UTC(2026, 10, 25) })
-      assert.deepStrictEqual(read.events.map((e) => e.title), ["Sports day"])
-      assert.strictEqual((yield* Effect.flip(cal.provider.add!("ics:school", { title: "x", start: { at: 0 }, end: { at: 1 } }))).reason, "read_only")
-
-      const section = makeFakeBriefingSection({ id: "weather", result: { _tag: "section", sentences: ["Rain from three."], priority: "lead", withheld: 0 } })
-      const result = yield* section.section.gather({ turn: makeTestTurn(), kind: "morning", length: "short", maxSentences: 1, language: "en", now: 0 })
-      assert.strictEqual(result._tag, "section")
-      assert.strictEqual(section.requests[0]?.turn.deviceId, "kitchen-display")
-    }))
-})
-
-describe("useService", () => {
+describe("a consumer of a service", () => {
   // #region consumer
-  /** A consumer: asks the lists module through useService and says so when it is off. */
+  /** The consumer's own sentences, in both languages; a contract's errors carry a reason, which it words itself. */
+  const consumerTexts = defineTexts({
+    en: { added: "Rice is on the shopping list.", full: "The shopping list is full.", failed: "I couldn't reach the shopping list." },
+    nl: { added: "Rijst staat op het boodschappenlijstje.", full: "Het boodschappenlijstje is vol.", failed: "Ik kon het boodschappenlijstje niet bereiken." }
+  })
+
+  /** A consumer: asks the lists module through useService, and says so in the household's language when it is off. */
   const consumer = defineModule({
     apiVersion: 2,
     id: "consumer",
@@ -136,36 +47,66 @@ describe("useService", () => {
           description: "Add rice to the shopping list.",
           parameters: Schema.Struct({}),
           risk: "change",
-          execute: () =>
-            useService(ctx.host, Lists, "lists", (lists) => lists.addItem({ list: { kind: "shopping" }, text: "Rice", source: { module: "consumer" }, dedupeKey: "consumer:rice" })).pipe(
-              Effect.map((r) => r.outcome),
-              Effect.catchTag("ProviderOff", (off) => Effect.succeed(off.message)),
-              Effect.catchTag("ListsError", (e) => Effect.succeed(e.message))
+          execute: () => {
+            const lang = homeLanguage(ctx.host.view())
+            return useService(ctx.host, Lists, (lists) => lists.addItem({ text: "Rice", dedupeKey: "consumer:rice" })).pipe(
+              Effect.map(() => say(consumerTexts, lang, "added")),
+              Effect.catchTag("ProviderOff", () => Effect.succeed(providerOffText(lang, "Lists"))),
+              Effect.catchTag("ListsError", (e) => Effect.succeed(say(consumerTexts, lang, e.reason === "limit" ? "full" : "failed")))
             )
+          }
         })]
       })
   })
   // #endregion consumer
 
-  it.effect("the provider on, off, and stopping mid-call", () =>
+  it.effect("the provider on, off, full, and stopping mid-call", () =>
     Effect.gen(function*() {
       // #region consumer-test
-      const fake = makeFakeLists()
-      const on = yield* startTestModule(consumer, { provide: [provide("lists", { services: [Lists.of(fake.service)] })] })
-      assert.strictEqual((yield* on.tool("consumer_add", {})).value, "added")
-      const off = yield* startTestModule(consumer)
-      assert.strictEqual((yield* off.tool("consumer_add", {})).value, "The lists module is off.")
+      // A stub answers what the test programs, and records what it was asked; it does nothing of its own.
+      const lists = stubService<ListsService>("lists", {
+        addItem: (request) => Effect.succeed({ outcome: "added", item: { id: "item-1", text: request.text, status: "open", ...(request.dedupeKey !== undefined ? { dedupeKey: request.dedupeKey } : {}) } })
+      })
+      const on = yield* startTestModule(consumer, { provide: [provide("lists", { services: [Lists.of(lists.service)] })] })
+      assert.strictEqual((yield* on.tool("consumer_add", {})).value, "Rice is on the shopping list.")
+      assert.deepStrictEqual(lists.calls.addItem, [[{ text: "Rice", dedupeKey: "consumer:rice" }]])
+      // The answers the contract allows: full, and the provider stopping during the call.
+      lists.answer("addItem", fails(new ListsError({ reason: "limit", detail: "500 open items" })))
+      assert.strictEqual((yield* on.tool("consumer_add", {})).value, "The shopping list is full.")
+      lists.answer("addItem", stops())
+      assert.strictEqual((yield* on.tool("consumer_add", {})).value, "The Lists module is off.")
+      // No lists module at all, in a Dutch household.
+      const off = yield* startTestModule(consumer, { household: { home: { HOME_LANGUAGE: "nl-NL" } } })
+      assert.strictEqual((yield* off.tool("consumer_add", {})).value, "De module Lists staat uit.")
       // #endregion consumer-test
-      // A provider whose part closed during the call dies with ModuleStopped: the consumer sees ProviderOff.
-      const stopping: ListsService = { ...fake.service, addItem: () => Effect.die(new ModuleStopped({ message: "stopped" })) }
-      const r = yield* Effect.flip(useService({ service: () => stopping as never }, Lists, "lists", (l) => l.addItem({ list: { kind: "shopping" }, text: "x", source: { module: "c" } })))
-      assert.instanceOf(r, ProviderOff)
     }))
 })
 
-describe("the contribution keys and the authoring helpers", () => {
+describe("useService", () => {
+  it.effect("the service missing, and a ModuleStopped defect, become ProviderOff with the key's id; typed errors pass through", () =>
+    Effect.gen(function*() {
+      const none: Pick<ModuleHostApi, "service"> = { service: () => undefined }
+      const off = yield* Effect.flip(useService(none, Lists, (l) => l.find("consumer:rice")))
+      assert.instanceOf(off, ProviderOff)
+      assert.strictEqual(off.service, "lists")
+      const stopping = stubService<ListsService>("lists", { find: stops() })
+      const stopped = yield* Effect.flip(useService({ service: () => stopping.service as never }, Lists, (l) => l.find("consumer:rice")))
+      assert.instanceOf(stopped, ProviderOff)
+      const failing = stubService<ListsService>("lists", { find: fails(new ListsError({ reason: "busy", detail: "store busy" })) })
+      const typed = yield* Effect.flip(useService({ service: () => failing.service as never }, Lists, (l) => l.find("consumer:rice")))
+      assert.instanceOf(typed, ListsError)
+    }))
+})
+
+describe("the keys and the authoring helpers", () => {
   it("keys have the ids the plan names", () => {
-    assert.deepStrictEqual([Lists.id, HomeAssistant.id, BriefingSections.id, CalendarProviders.id], ["lists", "home-assistant", "briefing.sections", "calendar.providers"])
+    assert.deepStrictEqual([Lists.id, Timers.id, HomeAssistant.id, Playback.id, BriefingSections.id], ["lists", "timers", "home-assistant", "playback", "briefing.sections"])
+  })
+
+  it("isContractId takes an explicit bound", () => {
+    assert.isTrue(isContractId("a".repeat(200), 200))
+    assert.isFalse(isContractId("a".repeat(201), 200))
+    assert.isFalse(isContractId("a b", 10))
   })
 
   it("StoredText keeps text whose JSON is at most twice as long, and the kit knows its pattern", () => {
@@ -178,9 +119,11 @@ describe("the contribution keys and the authoring helpers", () => {
     assert.isFalse(ok("x".repeat(31)))
   })
 
-  it("texts in two languages, the household's language", () => {
+  it("texts in two languages, the household's language, and the provider-off sentence in both", () => {
     const texts = defineTexts({ en: { added: "Added {item}." }, nl: { added: "{item} staat erop." } })
     assert.strictEqual(say(texts, homeLanguage({ home: { HOME_LANGUAGE: "nl-NL" } }), "added", { item: "rijst" }), "rijst staat erop.")
     assert.strictEqual(say(texts, homeLanguage({ home: { HOME_LANGUAGE: "de-DE" } }), "added", { item: "rice" }), "Added rice.")
+    assert.strictEqual(providerOffText("en", "Smart home"), "The Smart home module is off.")
+    assert.strictEqual(providerOffText("nl", "Smart home"), "De module Smart home staat uit.")
   })
 })

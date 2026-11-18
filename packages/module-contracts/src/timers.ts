@@ -3,8 +3,8 @@ import { Data, type Effect } from "effect"
 
 /**
  * `Timers`: the timers module's service (docs/MODULES-PLAN.md §5.2; docs/research/modules/timers-and-alarms.md §4, §12).
- * Provided by `timers` (`packages/module-timers`), used by `routines` (a step that starts a timer) and later `kitchen`
- * (a recipe step's timer).
+ * Provided by `timers` (`packages/module-timers`, wave B), used by `routines` (a step that starts a timer) and later
+ * `kitchen` (a recipe step's timer).
  *
  * **What it is.** One operation: start a named countdown that rings on one device, exactly as if the person had said
  * "set a pasta timer for ten minutes" there. The timer is household data like every timer: listed, adjusted, paused
@@ -16,38 +16,44 @@ import { Data, type Effect } from "effect"
  * does not know is `unknown_device`. A consumer never picks a device the person did not ask for: it passes the turn's
  * own, or one the person named and the consumer resolved with `Devices`.
  *
- * **Bounds.** `durationMs` a whole number from 1,000 (one second) to 86,400,000 (a day); `label` at most
- * `TIMERS_LIMITS.labelChars` of one line ("Rice, step 4"); at most `TIMERS_LIMITS.running` running timers in the
- * household (one more is `limit`).
+ * **Bounds.** Checked by the provider; a request outside them is `invalid` and starts nothing.
+ *
+ * - `durationMs`: a whole number from `minMs` (one second) to `maxMs` (a day).
+ * - `label`: 1 to `labelChars` characters (UTF-16 units) of one line ("Rice, step 4"); absent: "timer".
+ * - `ringOn.deviceId`: a device id as the server gives it (8 to 64 of `[A-Za-z0-9_-]`).
+ * - At most `running` running timers in the household; one more is `limit`.
+ *
+ * **Ids.** `TimerInfo.id` is chosen by the timers module: a store row id (1 to 200 of `[A-Za-z0-9_.:-]`), the same for
+ * the timer's whole life, never reused.
+ *
+ * **Errors.** `TimersError.reason` says what happened; the consumer words it in its own two languages. `detail` is
+ * for the log only.
  *
  * **Latency.** One store transaction and one scheduled job (a few milliseconds): fine on a turn's path.
  *
  * **When the timers module is off or stops**: `host.service(Timers)` is `undefined`, and a call made while it stops may
- * die with `ModuleStopped`; `useService(host, Timers, "timers", …)` makes both `ProviderOff`. Say "The timers module is
- * off." A routine step reports it as its failure; nothing is retried.
+ * die with `ModuleStopped`; `useService(host, Timers, …)` makes both `ProviderOff`. A routine step reports it as its
+ * failure; nothing is retried.
  */
 export const TIMERS_LIMITS = { minMs: 1_000, maxMs: 86_400_000, labelChars: 60, running: 50 } as const
 
 export interface StartTimerRequest {
   readonly durationMs: number
-  /** What it is for ("pasta"); absent: "timer". */
   readonly label?: string
   /** Where it rings; absent: the device of the call (see above). */
   readonly ringOn?: { readonly deviceId: string }
-  /** Who starts it: the consumer's module id and its own reference ("recipe:42:step:4"). */
-  readonly source: { readonly module: string; readonly ref?: string }
 }
 
 export interface TimerInfo {
   readonly id: string
-  readonly label?: string
+  readonly label: string
   readonly durationMs: number
   /** Epoch ms. */
   readonly dueAt: number
   readonly ringOn: { readonly deviceId: string }
 }
 
-/** A refusal or failure; `message` is one sentence that can be spoken as it is. */
+/** A refusal or failure (see "Errors" above). */
 export class TimersError extends Data.TaggedError("TimersError")<{
   /**
    * `invalid`: outside the bounds. `no_device`: the call has no device and none was given. `unknown_device`: the server
@@ -55,7 +61,7 @@ export class TimersError extends Data.TaggedError("TimersError")<{
    * `failed`: anything else.
    */
   readonly reason: "invalid" | "no_device" | "unknown_device" | "limit" | "busy" | "failed"
-  readonly message: string
+  readonly detail: string
 }> {}
 
 export interface TimersService {

@@ -13,10 +13,19 @@ import type { Json, JsonObject } from "./common.ts"
  * tools (music's `music_play` is `change`), and each call it makes through `callService` must fit the call the gateway
  * admitted for it: music's "pause the kitchen" calls `media_player.media_pause` on the kitchen's player, nothing else.
  *
- * **What it refuses whoever asks** (`refused`), because `money` and `security` stay denied in this stack (§2 row 5)
- * and what a script does cannot be seen from outside it: any service of the domains `REFUSED_DOMAINS`, and any service on
- * a `cover` whose device class is `garage`, `gate` or `door`. It also refuses an entity or area the owner did not
- * expose (`unknown_entity`). Reading the state of any exposed entity, a lock's included, is allowed.
+ * **How a call names what it acts on: entity ids only**, in this version. `target.entityIds` lists 1 to
+ * `HA_LIMITS.targets` exposed entity ids; nothing else selects an entity. The provider refuses (`refused`), before
+ * anything reaches Home Assistant:
+ *
+ * - a call without `target.entityIds`, or with any other target key (areas, devices, floors, labels): an area could
+ *   hold a lock, so "everything in the garage" is never a way to reach one;
+ * - `data` that names a target itself (`entity_id`, `area_id`, `device_id`, `floor_id`, `label_id`, at any depth);
+ * - any service of the domains `REFUSED_DOMAINS`, and any service on an entity of such a domain;
+ * - any service on a `cover` whose device class is in `SECURITY_COVER_CLASSES` (a garage door, a gate, a door):
+ *   `money` and `security` stay denied in this stack (§2 row 5), and a script's effect cannot be seen from outside it.
+ *
+ * An entity id that is not exposed is `unknown_entity`. Reading the state of any exposed entity, a lock's included,
+ * is allowed.
  *
  * **State.** `entities()`, `entity(id)`, `areas()` and `people()` answer at once from the module's cache (no network).
  * The cache is what Home Assistant said last; `connection()` says whether it is live:
@@ -25,36 +34,59 @@ import type { Json, JsonObject } from "./common.ts"
  * - `reconnecting`: the socket dropped; the cache is as it was when it dropped (it may be stale);
  * - `unknown`: no state has arrived since the module started (the cache is empty).
  *
- * **Changes.** `changes` is a stream for the consumer to run in its own part's scope (`Effect.forkScoped` in `shared`).
- * Each run first gets a `snapshot` of the cache now (`reason: "subscribed"`), then one `changed` or `removed` per entity
- * change and a `connection` per change of the connection state. After a reconnect the stream sends a fresh `snapshot`
- * (`reason: "reconnected"`); when a consumer falls more than `HA_LIMITS.queue` changes behind, its queue is dropped and
- * it gets a `snapshot` (`reason: "overflow"`). **A snapshot is a state, not news**: a consumer compares it with what it
- * knew and must never read it as things having just happened (presence must not announce everyone as having just
+ * `people()` is the `person` entities of `entities()` in another shape: the two always agree, and a change of a person
+ * entity comes on `changes()` as a `changed` of that entity.
+ *
+ * **Changes.** `changes()` makes a stream for the consumer to run in its own part's scope (`Effect.forkScoped` in
+ * `shared`). Each run first gets a `snapshot` of the cache now (`reason: "subscribed"`), then one `changed` or
+ * `removed` per entity change and a `connection` per change of the connection state. After a reconnect it sends a
+ * fresh `snapshot` (`reason: "reconnected"`). When a consumer falls more than `HA_LIMITS.queue` changes behind, the
+ * changes it has not taken are dropped and the next thing it gets is a `snapshot` (`reason: "overflow"`) of the cache
+ * at that moment, followed by the changes after it. **A snapshot is a state, not news**: a consumer compares it with
+ * what it knew and never reads it as things having just happened (presence must not announce everyone as having just
  * arrived after a reconnect; music must not take a player that was already playing for one that just started).
  *
- * **Bounds.** At most `HA_LIMITS.entities` exposed entities and `HA_LIMITS.areas` areas are kept; an entity's
- * `attributes` as JSON at most `HA_LIMITS.attributeChars` (larger ones are left out and `attributesCut` is true); names
- * at most `HA_LIMITS.nameChars`. A call's `data` as JSON at most `HA_LIMITS.dataChars`, at most `HA_LIMITS.targets`
- * entity and area ids; a response at most `HA_LIMITS.responseChars` as JSON (cut: `responseCut`).
+ * **Bounds and ids.** Home Assistant chooses every id here; they are stable for as long as the owner does not rename
+ * the entity or area in Home Assistant. The provider never cuts an id: an entity or area whose id is longer than
+ * `idChars` or not of the form below is left out of the cache (and so is not exposed).
+ *
+ * - `entityId`: `<domain>.<object id>`, lower case letters, digits and `_`, at most `HA_LIMITS.idChars`; `domain` is
+ *   its first part; `areaId` lower case letters, digits and `_`, at most `idChars`.
+ * - `name`, area `name`, each alias: one line, cut to `HA_LIMITS.nameChars`; at most `HA_LIMITS.aliases` aliases (the
+ *   rest left out).
+ * - `state`: HA's state text, at most `HA_LIMITS.stateChars` (HA's own limit); `deviceClass` at most `idChars`.
+ * - `attributes` as JSON at most `HA_LIMITS.attributeChars`; a larger set is left out (`{}`, `attributesCut: true`).
+ * - At most `HA_LIMITS.entities` entities and `HA_LIMITS.areas` areas are kept (the rest left out, by id order).
+ * - A call: `domain` and `service` lower case letters, digits and `_`, at most `idChars` each; `data` as JSON at most
+ *   `HA_LIMITS.dataChars`; otherwise `invalid`. A response at most `HA_LIMITS.responseChars` as JSON (larger:
+ *   left out and `responseCut: true`).
  *
  * **Time.** `callService` answers within `HA_LIMITS.callTimeoutMs` (`timeout` after that; the call may still have
  * happened in Home Assistant, so a consumer says "Home Assistant didn't answer in time", not that nothing happened).
  * A call while the socket is down is `not_connected` at once; it is never queued.
  *
- * **When smart-home is off or stops**: `host.service(HomeAssistant)` is `undefined`; a stream it gave ends; a call
- * made while it stops may die with `ModuleStopped`. `useService(host, HomeAssistant, "smart home", …)` makes it
- * `ProviderOff`. A consumer whose whole job is Home Assistant (music, presence) names `home-assistant` in `uses`, and
- * runs its `changes` again when the service is back (look it up again; it is a new provider after a restart).
+ * **Errors.** `HomeAssistantError.reason` is for the consumer to word in its own two languages; `detail` for the log
+ * only (never a token).
  *
- * **Privacy.** HA's `person` states are where people are: household data in this stack (§5.1 row 19), shown on any
- * device that asks; a consumer that reports them follows its own document's privacy section.
+ * **When smart-home is off or stops**: `host.service(HomeAssistant)` is `undefined`; a stream it gave ends; a call
+ * made while it stops may die with `ModuleStopped`. `useService(host, HomeAssistant, …)` makes it `ProviderOff`. A
+ * consumer whose whole job is Home Assistant (music, presence) names `home-assistant` in `uses`, and runs `changes()`
+ * again when the service is back (look it up again: it is a new provider after a restart).
+ *
+ * **Privacy.** Where a person is (a `person` entity's state, a phone's zone, anything that follows one person) is
+ * **personal** data of that person, not household data, whatever device asks. The transport hands it to its consumer
+ * as it is; the consumer (presence) maps each HA person to a member of the household (its own setting) and passes
+ * what it would say through `Privacy.mayReveal(member, turn)` at the moment of saying it. An HA person mapped to no
+ * member, or to someone who is no longer a member, is revealed nowhere.
  */
 export const HA_LIMITS = {
   entities: 5_000,
   areas: 500,
-  attributeChars: 4_000,
+  idChars: 255,
   nameChars: 200,
+  aliases: 20,
+  stateChars: 255,
+  attributeChars: 4_000,
   dataChars: 4_000,
   targets: 50,
   responseChars: 16_000,
@@ -78,6 +110,9 @@ export const REFUSED_DOMAINS: ReadonlyArray<string> = [
 
 /** Cover device classes that are `security` (a garage door is, a blind is not). */
 export const SECURITY_COVER_CLASSES: ReadonlyArray<string> = ["garage", "gate", "door"]
+
+/** Keys of a call's `data` that name a target; a call whose `data` holds one, at any depth, is refused. */
+export const TARGET_DATA_KEYS: ReadonlyArray<string> = ["entity_id", "area_id", "device_id", "floor_id", "label_id"]
 
 export interface HaEntity {
   /** "media_player.kitchen". */
@@ -105,7 +140,7 @@ export interface HaArea {
   readonly aliases: ReadonlyArray<string>
 }
 
-/** A Home Assistant `person` entity, as presence reads it. */
+/** A Home Assistant `person` entity, as presence reads it (personal: see "Privacy" above). */
 export interface HaPerson {
   /** "person.sam". */
   readonly entityId: string
@@ -125,18 +160,18 @@ export type HaChange =
     readonly connection: HaConnection
     readonly entities: ReadonlyArray<HaEntity>
     readonly areas: ReadonlyArray<HaArea>
-    readonly people: ReadonlyArray<HaPerson>
   }
   | { readonly _tag: "changed"; readonly entity: HaEntity; readonly previous: HaEntity | undefined }
   | { readonly _tag: "removed"; readonly entityId: string }
   | { readonly _tag: "connection"; readonly connection: HaConnection }
 
 export interface HaServiceCall {
-  /** "media_player", "music_assistant": lower case letters, digits and `_`. */
+  /** "media_player", "music_assistant". */
   readonly domain: string
   /** "media_pause", "play_media". */
   readonly service: string
-  readonly target?: { readonly entityIds?: ReadonlyArray<string>; readonly areaIds?: ReadonlyArray<string> }
+  /** The entities it acts on (see "How a call names what it acts on"). */
+  readonly target: { readonly entityIds: ReadonlyArray<string> }
   readonly data?: JsonObject
   /** Ask for the service's response (`return_response`); only for services that give one. */
   readonly returnResponse?: boolean
@@ -147,15 +182,15 @@ export interface HaServiceResult {
   readonly responseCut?: boolean
 }
 
-/** A refusal or failure; `message` is one sentence that can be spoken ("Home Assistant isn't connected."). */
+/** A refusal or failure (see "Errors" above). */
 export class HomeAssistantError extends Data.TaggedError("HomeAssistantError")<{
   /**
-   * `not_connected`: the socket is down. `refused`: a domain or cover the transport refuses. `unknown_entity`: not an
-   * exposed entity or a known area. `invalid`: a call outside the bounds. `timeout`: no answer in time (it may have
-   * happened). `failed`: Home Assistant answered with an error.
+   * `not_connected`: the socket is down. `refused`: a target form, domain, entity or cover the transport refuses.
+   * `unknown_entity`: not an exposed entity. `invalid`: a call outside the bounds. `timeout`: no answer in time (it may
+   * have happened). `failed`: Home Assistant answered with an error.
    */
   readonly reason: "not_connected" | "refused" | "unknown_entity" | "invalid" | "timeout" | "failed"
-  readonly message: string
+  readonly detail: string
 }> {}
 
 export interface HomeAssistantService {
@@ -164,9 +199,10 @@ export interface HomeAssistantService {
   readonly entities: () => ReadonlyArray<HaEntity>
   readonly entity: (entityId: string) => HaEntity | undefined
   readonly areas: () => ReadonlyArray<HaArea>
+  /** The `person` entities of `entities()` (see "State"). */
   readonly people: () => ReadonlyArray<HaPerson>
-  /** See "Changes" above. */
-  readonly changes: Stream.Stream<HaChange>
+  /** A new stream of the cache's changes (see "Changes"). */
+  readonly changes: () => Stream.Stream<HaChange>
   readonly callService: (call: HaServiceCall) => Effect.Effect<HaServiceResult, HomeAssistantError>
 }
 
