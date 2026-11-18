@@ -75,7 +75,8 @@ that work can start. Each is cheap to change before the PR that builds it is mer
 ### 3.2 What a module PR may touch
 
 - Its own package under `packages/module-<id>/` (source, tests, `package.json`).
-- Its own section in `docs/MODULES.md`.
+- Its own file `docs/modules/<id>.md` (P11 creates a stub for each and links it from `docs/MODULES.md`, so no two
+  module PRs edit the same file).
 - `pnpm-lock.yaml`, only when it adds a dependency the scaffold did not foresee; the PR description names it. The
   lead resolves lockfile conflicts between module PRs with `pnpm install` when restacking.
 - Nothing else. The scaffold PR (§4, P11) has already created the package, registered it in the catalogue, added
@@ -101,7 +102,7 @@ document is not built now. Every module:
 - offers its fast-path commands as typed actions with `examples` (and phrase commands where §5 says so), so they can
   run without the language model;
 - is tested against fakes of every outside service, with no network in tests;
-- writes its section in `docs/MODULES.md`: what it does, its tools, settings, what it stores, what it needs, and what
+- writes its file `docs/modules/<id>.md`: what it does, its tools, settings, what it stores, what it needs, and what
   was left out.
 
 Nested configuration (the steps of a routine, the tool policy of an MCP server) is authored as JSON in a text field
@@ -726,7 +727,11 @@ The fast path the basics need: commands that run without the language model.
 - A module test kit in `@pva/core/testing`: an in-memory store, a scheduler on a test clock, recorders for
   notifications, speech and presentations, a `CurrentTurn` builder, a fake connection, a fake `host` with services
   and contributions, and a helper that runs a tool or a phrase command through the real gateway.
-- `docs/MODULES.md`: how to write a module against API v2, and one section per module to be filled by its PR.
+- `docs/MODULES.md`: how to write a module against API v2, with a reference module that is real code; and one stub
+  file per module under `docs/modules/`, to be filled by its PR.
+- A conformance check, `checkModule`, that every module's tests call: form budgets, risk classes, store limits,
+  scheduler rules, name and text bounds.
+- Packages only for the modules of waves A and B; no `sharp`.
 
 ## 5. The modules
 
