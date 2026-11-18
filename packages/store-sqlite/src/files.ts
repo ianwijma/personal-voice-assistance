@@ -147,6 +147,9 @@ export const copyFilePrivately = async (from: string, path: string): Promise<str
 
 // ---- Checkpoints: a worker thread with a connection of its own
 
+/** The size the write-ahead log's file is cut back to when a log starts again (`PRAGMA journal_size_limit`). */
+export const JOURNAL_SIZE_LIMIT = 4 * 1024 * 1024
+
 /**
  * The worker's copy of `quiet.ts`: only Node's ExperimentalWarning for `node:sqlite` is dropped; every other warning
  * passes (exported for its test).
@@ -169,24 +172,86 @@ const CHECKPOINTER = `
 const { parentPort, workerData } = require("node:worker_threads")
 ${WORKER_WARNING_FILTER}
 const { DatabaseSync } = require("node:sqlite")
+const { statSync } = require("node:fs")
 let db
 const open = () => {
   if (db !== undefined) return db
   db = new DatabaseSync(workerData.file)
   db.exec("PRAGMA busy_timeout = 0")
+  // The connection that starts a log again cuts its file back to this size: this one does now (startLog), so it
+  // has the main connection's limit (SqliteStore.ts).
+  db.exec("PRAGMA journal_size_limit = ${JOURNAL_SIZE_LIMIT}")
   return db
+}
+const walSize = () => {
+  try {
+    return statSync(workerData.file + "-wal").size
+  } catch {
+    return 0
+  }
+}
+// Tests only (@pva/store-sqlite/testing): pause between a checkpoint and the start of the new log (gapMs), or while
+// holding the write lock for it (holdMs), telling the main thread when the pause begins. Zero: no pause, no message.
+const pauses = { gapMs: 0, holdMs: 0 }
+const sleeper = new Int32Array(new SharedArrayBuffer(4))
+const pause = (what) => {
+  const ms = pauses[what]
+  if (ms <= 0) return
+  parentPort.postMessage({ pausing: what })
+  Atomics.wait(sleeper, 0, 0, ms)
+}
+// After a checkpoint that let the log start again, the next connection to write starts it and syncs its new header
+// (SQLite does so even with synchronous = NORMAL). Here that is this connection, with one tiny write right after the
+// checkpoint, so the sync is this thread's and not the main thread's next commit. "done": started here; "busy": a
+// main-thread write holds the lock (it starts the log); "started": a main-thread commit came first (a log emptied by
+// a truncating checkpoint is not empty any more); "failed": the write failed (the main thread starts the log).
+const startLog = (c, emptied) => {
+  pause("gapMs")
+  try {
+    c.exec("BEGIN IMMEDIATE")
+  } catch {
+    return "busy"
+  }
+  try {
+    if (emptied && walSize() > 0) {
+      c.exec("ROLLBACK")
+      return "started"
+    }
+    pause("holdMs")
+    // The smallest write that is one: the file header's user version set to the value it has (unused by the store).
+    // Page 1 is written as the new log's first frame. (An UPDATE to the same value writes nothing.)
+    const version = Number(c.prepare("PRAGMA user_version").get().user_version)
+    c.exec("PRAGMA user_version = " + version)
+    c.exec("COMMIT")
+    return "done"
+  } catch {
+    try {
+      c.exec("ROLLBACK")
+    } catch {}
+    return "failed"
+  }
 }
 parentPort.on("message", (m) => {
   try {
+    if (m.op === "pauses") {
+      pauses.gapMs = m.gapMs
+      pauses.holdMs = m.holdMs
+      parentPort.postMessage({ id: m.id, ok: true })
+      return
+    }
     const c = open()
     if (m.op === "passive") {
       const r = c.prepare("PRAGMA wal_checkpoint(PASSIVE)").get()
-      parentPort.postMessage({ id: m.id, ok: Number(r.busy) === 0, log: Number(r.log), done: Number(r.checkpointed) })
+      const ok = Number(r.busy) === 0
+      // Every frame copied: the next write starts the log from its beginning.
+      const start = ok && Number(r.log) > 0 && Number(r.checkpointed) === Number(r.log) ? startLog(c, false) : undefined
+      parentPort.postMessage({ id: m.id, ok, log: Number(r.log), done: Number(r.checkpointed), start })
     } else {
       // The bulk of the copying without the writer lock; then the truncation, which takes it briefly.
       c.prepare("PRAGMA wal_checkpoint(PASSIVE)").get()
       const r = c.prepare("PRAGMA wal_checkpoint(TRUNCATE)").get()
-      parentPort.postMessage({ id: m.id, ok: Number(r.busy) === 0 })
+      const ok = Number(r.busy) === 0
+      parentPort.postMessage({ id: m.id, ok, start: ok ? startLog(c, true) : undefined })
     }
   } catch (e) {
     parentPort.postMessage({ id: m.id, ok: false, error: String(e) })
@@ -194,23 +259,45 @@ parentPort.on("message", (m) => {
 })
 `
 
+/** How the worker's start of a new log went (`startLog` in the worker), counted for tests. */
+export interface LogStarts {
+  /** Started by the worker: the main thread's next commit appends and does not sync. */
+  readonly byWorker: number
+  /** The window: a main-thread write held the lock or committed first, so the main thread started the log (and synced). */
+  readonly byMainThread: number
+  /** The worker's write failed (the main thread starts the log). */
+  readonly failed: number
+}
+
+/** Each serving store's checkpointer, for `@pva/store-sqlite/testing` (set once when the store is made). */
+export const checkpointerOf = new WeakMap<object, Checkpointer>()
+
 export interface Checkpointer {
   /** Copy what the log holds into the file without waiting for anyone (`PASSIVE`); `true` when all of it was copied. */
   readonly passive: () => Promise<boolean>
   /** Copy everything and empty the log (`TRUNCATE`, after a removal); `false` when a reader holds an older snapshot. */
   readonly truncate: () => Promise<boolean>
   readonly close: () => Promise<void>
+  /** Tests (`@pva/store-sqlite/testing`): how the new logs were started so far. */
+  readonly logStarts: () => LogStarts
+  /** Tests: make the worker pause before starting a new log (`gapMs`) or while holding the lock for it (`holdMs`). */
+  readonly setPauses: (pauses: { readonly gapMs: number; readonly holdMs: number }) => Promise<void>
+  /** Tests: resolved when the worker next begins the pause named. */
+  readonly nextPause: (what: "gapMs" | "holdMs") => Promise<void>
 }
 
 /**
  * The store's checkpoints, on one worker thread with a connection of its own that never waits for a lock
  * (`busy_timeout = 0`): the event loop is never held by the copying, and the main connection makes no checkpoint of
- * its own (`wal_autocheckpoint = 0`).
+ * its own (`wal_autocheckpoint = 0`). After a checkpoint that copied everything the worker also starts the new log
+ * (`startLog`), so the main thread's next commit does not sync its header (docs/STORING-DATA.md "The write-ahead log").
  */
 export const makeCheckpointer = (file: string): Checkpointer => {
   let worker: Worker | undefined
   let next = 0
   const waiting = new Map<number, (m: { ok: boolean }) => void>()
+  const starts = { byWorker: 0, byMainThread: 0, failed: 0 }
+  const pausing: Array<{ readonly what: string; readonly resolve: () => void }> = []
   const failAll = () => {
     for (const f of waiting.values()) f({ ok: false })
     waiting.clear()
@@ -220,7 +307,14 @@ export const makeCheckpointer = (file: string): Checkpointer => {
     if (worker !== undefined) return worker
     const w = new Worker(CHECKPOINTER, { eval: true, workerData: { file } })
     w.unref()
-    w.on("message", (m: { id: number; ok: boolean }) => {
+    w.on("message", (m: { id: number; ok: boolean; start?: string; pausing?: string }) => {
+      if (m.pausing !== undefined) {
+        for (const p of pausing.splice(0)) if (p.what === m.pausing) p.resolve(); else pausing.push(p)
+        return
+      }
+      if (m.start === "done") starts.byWorker++
+      else if (m.start === "busy" || m.start === "started") starts.byMainThread++
+      else if (m.start === "failed") starts.failed++
       const f = waiting.get(m.id)
       waiting.delete(m.id)
       f?.(m)
@@ -230,12 +324,12 @@ export const makeCheckpointer = (file: string): Checkpointer => {
     worker = w
     return w
   }
-  const ask = (op: "passive" | "truncate") =>
+  const ask = (op: "passive" | "truncate" | "pauses", extra: object = {}) =>
     new Promise<boolean>((resolve) => {
       const id = next++
       waiting.set(id, (m) => resolve(m.ok === true))
       try {
-        start().postMessage({ id, op })
+        start().postMessage({ ...extra, id, op })
       } catch {
         waiting.delete(id)
         resolve(false)
@@ -244,6 +338,11 @@ export const makeCheckpointer = (file: string): Checkpointer => {
   return {
     passive: () => ask("passive"),
     truncate: () => ask("truncate"),
+    logStarts: () => ({ ...starts }),
+    setPauses: async (p) => {
+      await ask("pauses", { gapMs: p.gapMs, holdMs: p.holdMs })
+    },
+    nextPause: (what) => new Promise<void>((resolve) => void pausing.push({ what, resolve })),
     close: async () => {
       const w = worker
       worker = undefined
