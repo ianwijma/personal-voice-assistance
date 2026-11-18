@@ -155,19 +155,28 @@ const decoded = (s: string) => {
 }
 
 /**
+ * The shortest part of a private link that counts as a credential: its file name, that name's stem (without the
+ * extension) and each query value from 8 characters; any other path component from 12 (so a plain word of a provider's
+ * path, `calendar`, is not one).
+ */
+export const SECRET_PART_CHARS = 8
+const PATH_PART_CHARS = 12
+
+/**
  * What text read from a calendar must not contain, for a calendar read from a private link (a secret): the address
- * itself (with and without its scheme, as typed and decoded), its path and query, and each of its parts long enough to
- * be a token (12 characters or more: `private-0a1b2c…`, a base64 key, an e-mail address). Lower case; compared with
- * text that is lower-cased and decoded too. A typed address is not a secret: nothing is forbidden for it.
+ * itself (with and without its scheme, as typed and decoded), its path and query, its file name and that name's stem
+ * (`long-secret-123456789` of `…/long-secret-123456789.ics`), each query value, and each other path component long
+ * enough to be a token. Lower case; compared with text that is lower-cased and decoded too. The one set is applied to
+ * everything read from the feed (titles, places, UIDs) and to its validator (`ETag`; `Last-Modified` is not read). A
+ * typed address is not a secret: nothing is forbidden for it.
  */
 export const secretPartsOf = (c: Pick<CalendarConfig, "link">, address: string): ReadonlyArray<string> => {
   if (c.link === "address") return []
   const parts = new Set<string>()
-  const add = (s: string) => {
-    const t = s.trim().toLowerCase()
-    if (t.length >= 8) {
-      parts.add(t)
-      parts.add(decoded(t))
+  const add = (s: string, min = SECRET_PART_CHARS) => {
+    for (const form of [s, decoded(s)]) {
+      const t = form.trim().toLowerCase()
+      if (t.length >= min) parts.add(t)
     }
   }
   add(address)
@@ -181,7 +190,19 @@ export const secretPartsOf = (c: Pick<CalendarConfig, "link">, address: string):
   if (url !== undefined) {
     add(`${url.host}${url.pathname}${url.search}`)
     add(`${url.pathname}${url.search}`)
-    for (const piece of `${url.pathname}${url.search}${url.hash}`.split(/[/?&=#;]+/)) if (piece.length >= 12 || decoded(piece).length >= 12) add(piece)
+    const path = url.pathname.split("/").filter((x) => x !== "")
+    const file = path.at(-1)
+    for (const piece of path.slice(0, -1)) add(piece, PATH_PART_CHARS)
+    if (file !== undefined) {
+      add(file)
+      // The file name's stem: the credential without its extension.
+      add(decoded(file).replace(/\.[A-Za-z0-9]{1,6}$/, ""))
+    }
+    for (const [key, value] of url.searchParams) {
+      add(value)
+      add(`${key}=${value}`)
+    }
+    if (url.hash.length > 1) add(url.hash.slice(1))
   }
-  return [...parts].filter((p) => p.length >= 8)
+  return [...parts]
 }

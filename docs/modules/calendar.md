@@ -29,6 +29,24 @@ that is not a well-formed calendar (cut off, components not closed) or that is o
 last good read stays and answers say since when ("Family could not be refreshed since today at ten o'clock; this is
 what I had then.").
 
+In particular, before the library sees an event:
+
+- **Every schedule value is checked** for its exact syntax and real ranges (`DTSTART`, `DTEND`, `RECURRENCE-ID`, each
+  `EXDATE` and `RDATE` value, a rule's `UNTIL`; month, the day of that month and year, hour 0 to 23, minute and second 0
+  to 59, a leap second read as 59). A bad start, end or recurrence id leaves the event out; a bad exclusion, extra date
+  or `UNTIL` leaves the series out (guessing which instance was meant would be worse). `DUE` belongs to tasks, which
+  are not read.
+- **A `VTIMEZONE` counts only when it can be used**: at least one observance with a start and both offsets. Otherwise
+  its name is tried as an IANA zone, and failing that the event is left out.
+- **A rule's implicit day is made explicit**: a `YEARLY` rule without `BYMONTHDAY`, `BYDAY`, `BYYEARDAY` or `BYWEEKNO`
+  gets its start's month (unless `BYMONTH` is given) and day, a `MONTHLY` one without `BYMONTHDAY` or `BYDAY` its
+  start's day, so a day a month or year does not have (29 February, the 31st) is skipped, not moved to the next day.
+- **An override that cannot be read still takes out the instance it replaces** (counted once); one whose recurrence id
+  cannot be read, or that changes a range, takes out its whole series.
+
+A recurring local time that does not exist on the day the clocks go forward (a daily 02:30 in Amsterdam on the last
+Sunday of March) is read an hour later that day and counts toward `COUNT`, as Google, Apple and Outlook show it.
+
 **A refresh is published whole.** Each good read is written as a new generation of the calendar's rows and then, in
 one transaction, made the calendar's current one, with what it was read from (a fingerprint of the address, the owner,
 the household's zone). Answers read only rows of each calendar's current generation, and only while that provenance
@@ -66,9 +84,12 @@ not (a public screen whose default person is known) are only counted. Other memb
 
 Event titles and places come from outside: they are cut to one line (120 and 80 characters), descriptions, alarms and
 attachments are never read, and every result that holds them says they are calendar text, not instructions. Text that
-holds a private link the calendar was read from (or a secret part of it: its path, a token in it), plainly, escaped,
-percent-encoded or in other case, is dropped before anything is cut, kept or hashed; an event whose UID holds it is
-left out; an `ETag` that holds it is not kept.
+holds a private link the calendar was read from, or a secret part of it, plainly, escaped, percent-encoded or in
+other case, is dropped before anything is cut, kept or hashed; an event whose UID holds it is left out; an `ETag`
+that holds it is not kept (the next refresh then asks unconditionally; `Last-Modified` is not read). The secret parts
+are the link with and without its scheme, its path and query, its file name and that name's stem
+(`long-secret-123456789` of `…/long-secret-123456789.ics`) and each query value from 8 characters, and each other
+path component from 12 (so a word of a provider's path such as `calendar` is not one).
 
 ## Tools
 
@@ -114,8 +135,13 @@ calendars an answer covers, "The calendars have not been read yet. Try again in 
 **Bounds on a turn**: a day is one indexed range read page by page, at most 200 rows (more: "There are more events
 than I read"); a search reads at most 1,000 rows in start order, and "next" at most 1,000 over the days ahead (today's
 read from the rows that have not ended), every row read counting; each says when it stopped short instead of answering
-"nothing", and "next" never names an event from a day it read only in part. Each answer reads the calendars' states
-before and after its rows, and reads again when a refresh published meanwhile.
+"nothing", and "next" never names an event from a day it read only in part: it says up to which day it found
+nothing ("I found nothing called opera up to Sunday the third of January 2027; after that there are too many events
+for me to look through."), or, when it could not read even today whole, "There are too many events around now for me
+to tell which comes next; ask me what is on today instead." Each answer reads the calendars' states before and after
+its rows, and reads again when a refresh published meanwhile. Between pages, and before each day it reads, a turn gives
+the event loop a real turn (a macrotask); who may hear what is then decided in one synchronous step after the last
+read.
 
 ## Settings
 

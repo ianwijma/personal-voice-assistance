@@ -119,6 +119,111 @@ const paramOf = (params: string, name: string): string | undefined => {
   return m === null ? undefined : (m[2] ?? m[1])
 }
 
+const OFFSET = /^[+-]\d{4}(?:\d{2})?$/
+
+/**
+ * Whether a VTIMEZONE can be used: at least one STANDARD or DAYLIGHT observance with a local DTSTART and both offsets
+ * (`TZOFFSETFROM`, `TZOFFSETTO`). An empty or broken definition is not one: its name is then tried as an IANA zone,
+ * and failing that its events cannot be read (an empty definition would otherwise read as UTC).
+ */
+const usableZone = (lines: ReadonlyArray<string>): boolean => {
+  let inObservance = false
+  let start = false
+  let from = false
+  let to = false
+  for (const l of lines) {
+    const p = splitLine(l)
+    if (p === undefined) continue
+    const value = p.value.trim()
+    if (p.name === "BEGIN" && (value.toUpperCase() === "STANDARD" || value.toUpperCase() === "DAYLIGHT")) {
+      inObservance = true
+      start = from = to = false
+    } else if (p.name === "END" && inObservance) {
+      if (start && from && to) return true
+      inObservance = false
+    } else if (inObservance) {
+      if (p.name === "DTSTART" && /^\d{8}T\d{6}$/.test(value) && checkDateTime(value) !== undefined) start = true
+      else if (p.name === "TZOFFSETFROM" && OFFSET.test(value)) from = true
+      else if (p.name === "TZOFFSETTO" && OFFSET.test(value)) to = true
+    }
+  }
+  return false
+}
+
+const daysIn = (year: number, month: number) => [31, year % 4 === 0 && (year % 100 !== 0 || year % 400 === 0) ? 29 : 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31][month - 1]!
+
+/** A DATE (`YYYYMMDD`) of a real day, or `undefined`. */
+const checkDate = (v: string): string | undefined => {
+  const m = /^(\d{4})(\d{2})(\d{2})$/.exec(v)
+  if (m === null) return undefined
+  const [y, mo, d] = [Number(m[1]), Number(m[2]), Number(m[3])]
+  return mo >= 1 && mo <= 12 && d >= 1 && d <= daysIn(y, mo) ? v : undefined
+}
+
+/** A DATE-TIME (`YYYYMMDDTHHMMSS`, `Z` or not) of a real day and time, a leap second read as 59; or `undefined`. */
+const checkDateTime = (v: string): string | undefined => {
+  const m = /^(\d{8})T(\d{2})(\d{2})(\d{2})(Z?)$/.exec(v)
+  if (m === null || checkDate(m[1]!) === undefined) return undefined
+  const [h, mi, se] = [Number(m[2]), Number(m[3]), Number(m[4])]
+  if (h > 23 || mi > 59 || se > 60) return undefined
+  return se === 60 ? `${m[1]}T${m[2]}${m[3]}59${m[5]}` : v
+}
+
+const DURATION = /^[+-]?P(?:\d+W|(?=\d|T\d)(?:\d+D)?(?:T(?=\d)(?:\d+H)?(?:\d+M)?(?:\d+S)?)?)$/
+
+/**
+ * Every value of a time property checked for its exact syntax and real ranges (month, the day of that month and
+ * year, hour 0 to 23, minute and second 0 to 59; a leap second read as 59), before the library could normalise one
+ * (it reads 30 February as 2 March, hour 25 as the next day): the values as they are to be read, or `undefined`.
+ */
+const checkValues = (p: { readonly name: string; readonly params: string; readonly value: string }): string | undefined => {
+  const kind = (paramOf(p.params, "VALUE") ?? "").toUpperCase()
+  const values = p.value.trim().split(",")
+  if (values.length === 0 || ((p.name === "DTSTART" || p.name === "DTEND" || p.name === "RECURRENCE-ID") && values.length !== 1)) return undefined
+  const out: Array<string> = []
+  for (const v of values) {
+    let c: string | undefined
+    if (kind === "PERIOD" || v.includes("/")) {
+      if (p.name !== "RDATE" || (kind !== "PERIOD" && kind !== "")) return undefined
+      const [a, b, ...rest] = v.split("/")
+      const from = checkDateTime(a ?? "")
+      const to = b === undefined || rest.length > 0 ? undefined : DURATION.test(b) ? b : checkDateTime(b)
+      c = from !== undefined && to !== undefined ? `${from}/${to}` : undefined
+    } else if (kind === "DATE") c = checkDate(v)
+    else if (kind === "" || kind === "DATE-TIME") c = checkDateTime(v)
+    if (c === undefined) return undefined
+    out.push(c)
+  }
+  return out.join(",")
+}
+
+/** A rule's `UNTIL`, when it has one, is a real date or date-time. */
+const untilIsValid = (rule: string): boolean => {
+  const until = /(?:^|;)UNTIL=([^;]*)/i.exec(rule)?.[1]
+  return until === undefined || checkDate(until) !== undefined || checkDateTime(until) !== undefined
+}
+
+/**
+ * A YEARLY rule without BYMONTHDAY, BYDAY, BYYEARDAY or BYWEEKNO gets its start's day (and month, unless BYMONTH is
+ * given); a MONTHLY one without BYMONTHDAY or BYDAY its start's day: what RFC 5545 leaves implicit, made explicit, so
+ * the library skips a month or year that does not have the day (29 February, the 31st) instead of moving it.
+ */
+const explicitDay = (rule: string, start: string): { readonly rule: string; readonly implicit: { readonly day: number; readonly month?: number } } | undefined => {
+  const parts = rule.split(";").filter((x) => x !== "")
+  const has = (key: string) => parts.some((x) => x.toUpperCase().startsWith(`${key}=`))
+  const freq = parts.find((x) => x.toUpperCase().startsWith("FREQ="))?.slice(5).toUpperCase()
+  const m = /^(\d{4})(\d{2})(\d{2})/.exec(start)
+  if (m === null) return undefined
+  const month = Number(m[2])
+  const day = Number(m[3])
+  if (freq === "YEARLY" && !has("BYMONTHDAY") && !has("BYDAY") && !has("BYYEARDAY") && !has("BYWEEKNO")) {
+    const withMonth = has("BYMONTH")
+    return { rule: [...parts, ...(withMonth ? [] : [`BYMONTH=${month}`]), `BYMONTHDAY=${day}`].join(";"), implicit: withMonth ? { day } : { day, month } }
+  }
+  if (freq === "MONTHLY" && !has("BYMONTHDAY") && !has("BYDAY")) return { rule: [...parts, `BYMONTHDAY=${day}`].join(";"), implicit: { day } }
+  return undefined
+}
+
 /** RFC 5545 text unescaped (`\,`, `\;`, `\\`, `\n`). */
 const unescapeText = (s: string) => s.replace(/\\([,;\\nN])/g, (_, c: string) => (c === "n" || c === "N" ? "\n" : c))
 
@@ -222,7 +327,8 @@ const splitBlocks = (text: string, limits: ExpandLimits, tainted: (s: string) =>
         zone.push("END:VTIMEZONE")
         const id = zone.map(splitLine).find((z) => z?.name === "TZID")?.value.trim()
         if (id !== undefined && id !== "") {
-          if (zone.length <= MAX_TIMEZONE_LINES && zones.size < MAX_TIMEZONES && !zones.has(id)) zones.set(id, zone.join("\r\n"))
+          // Kept only when it can be used: within the bounds, with at least one observance that has its offsets.
+          if (zone.length <= MAX_TIMEZONE_LINES && zones.size < MAX_TIMEZONES && !zones.has(id) && usableZone(zone)) zones.set(id, zone.join("\r\n"))
           else if (!zones.has(id)) droppedZones.add(id)
         }
         zone = undefined
@@ -307,90 +413,170 @@ export const expandCalendar = (ICAL: ICAL, input: ExpandInput): ExpandOutput => 
     return true
   }
 
-  // ---- Each event's lines made ready for the library: zones resolved, floating times the household's.
-  const ready: Array<{ readonly text: string; readonly zones: ReadonlyArray<string> }> = []
+  // ---- Each event's lines made ready for the library: every schedule value checked, zones resolved, floating times
+  // the household's, a rule's implicit day made explicit. What cannot be read is left out and counted; an override that
+  // cannot be read still takes out the instance it replaces (a cancellation by its recurrence id), and one whose
+  // recurrence id cannot be read takes out its whole series.
+  interface Ready {
+    readonly text: string
+    readonly zones: ReadonlyArray<string>
+    readonly uid: string | undefined
+    /** A cancellation to use instead when this event turns out unreadable later (its parse fails): an override's. */
+    readonly fallback: { readonly text: string; readonly zones: ReadonlyArray<string> } | "poison" | undefined
+    /** The day (and month) a rule's implicit day was made explicit with: every instance must fall on it. */
+    readonly implicit: { readonly day: number; readonly month?: number } | undefined
+  }
+  const ready: Array<Ready> = []
+  /** Series left out whole: their UIDs; counted once each. */
+  const poisoned = new Set<string>()
+
+  /** One time property's line made ready, or why not: `event` (the event cannot be read), `series` (nor its series). */
+  const prepareTime = (l: string, p: { readonly name: string; readonly params: string; readonly value: string }, named: Set<string>): string | "event" | "series" => {
+    const fails = p.name === "EXDATE" || p.name === "RDATE" ? "series" : "event"
+    const checked = checkValues(p)
+    if (checked === undefined) return fails
+    const line = checked === p.value ? l : `${p.name}${p.params}:${checked}`
+    const tzid = paramOf(p.params, "TZID")
+    const isDate = (paramOf(p.params, "VALUE") ?? "").toUpperCase() === "DATE"
+    if (tzid !== undefined) {
+      if (!zoneOf(tzid)) return fails
+      if (blocks.zones.has(tzid)) named.add(tzid)
+      return line
+    }
+    if (isDate) return line
+    // A date-time without a TZID: UTC when every value ends in Z, floating (the household's) when none does.
+    const values = checked.split(",").map((v) => v.split("/")[0]!)
+    const utcCount = values.filter((v) => /z$/i.test(v)).length
+    if (utcCount === values.length) return line
+    if (utcCount === 0) return `${p.name};TZID=${HOME_TZID}${p.params}:${checked}`
+    return fails
+  }
+
   for (const ev of blocks.events) {
+    const lines = ev.lines.map((l) => ({ l, p: splitLine(l)! }))
+    const uidLine = lines.find((x) => x.p.name === "UID")
+    const uid = uidLine !== undefined && uidLine.p.value !== "" ? unescapeText(uidLine.p.value) : undefined
+    const ridLine = lines.find((x) => x.p.name === "RECURRENCE-ID")
+    /** The cancellation that stands in for an unreadable override, or `poison` when its recurrence id cannot be read. */
+    const standIn = (): Ready["fallback"] => {
+      if (ridLine === undefined) return undefined
+      if (uid === undefined || /THISANDFUTURE/i.test(paramOf(ridLine.p.params, "RANGE") ?? "")) return "poison"
+      const named = new Set<string>()
+      const rid = prepareTime(ridLine.l, ridLine.p, named)
+      if (rid === "event" || rid === "series") return "poison"
+      return { text: ["BEGIN:VEVENT", uidLine!.l, rid, "STATUS:CANCELLED", "END:VEVENT"].join("\r\n"), zones: [...named] }
+    }
+    /** This event cannot be read: counted once; an override still takes out its instance. */
+    const leaveOut = (series: boolean) => {
+      const stand = series ? "poison" : standIn()
+      if (stand === "poison" && uid !== undefined) poisoned.add(uid)
+      else {
+        unreadable++
+        if (stand !== undefined && stand !== "poison") ready.push({ ...stand, uid, fallback: undefined, implicit: undefined })
+      }
+    }
     if (ev.bad) {
-      unreadable++
+      leaveOut(false)
       continue
     }
     const out: Array<string> = []
     const named = new Set<string>()
-    let ok = true
-    for (const l of ev.lines) {
-      const p = splitLine(l)!
+    let failure: "event" | "series" | undefined
+    let start: string | undefined
+    for (const { l, p } of lines) {
       if (p.name === "EXRULE") {
-        ok = false
+        failure = "series"
         break
+      }
+      if (p.name === "RRULE") {
+        if (!untilIsValid(p.value)) {
+          failure = "series"
+          break
+        }
+        out.push(l)
+        continue
       }
       if (!TIME_PROPS.has(p.name)) {
         out.push(l)
         continue
       }
-      const tzid = paramOf(p.params, "TZID")
-      const isDate = (paramOf(p.params, "VALUE") ?? "").toUpperCase() === "DATE" || /^\d{8}$/.test(p.value.trim())
-      if (tzid !== undefined) {
-        if (!zoneOf(tzid)) {
-          ok = false
-          break
-        }
-        if (blocks.zones.has(tzid)) named.add(tzid)
-        out.push(l)
+      const line = prepareTime(l, p, named)
+      if (line === "event" || line === "series") {
+        failure = failure === "series" ? "series" : line
+        if (line === "series") break
         continue
       }
-      if (isDate) {
-        out.push(l)
-        continue
-      }
-      // A date-time without a TZID: UTC when every value ends in Z, floating (the household's) when none does.
-      const values = p.value.split(",").flatMap((v) => v.split("/").slice(0, 1))
-      const utc = values.filter((v) => /z$/i.test(v.trim())).length
-      if (utc === values.length) out.push(l)
-      else if (utc === 0) out.push(`${p.name};TZID=${HOME_TZID}${p.params}:${p.value}`)
-      else {
-        ok = false
-        break
-      }
+      if (p.name === "DTSTART") start = splitLine(line)!.value
+      out.push(line)
     }
-    if (!ok) {
-      unreadable++
+    if (failure !== undefined) {
+      leaveOut(failure === "series")
       continue
     }
-    ready.push({ text: out.join("\r\n"), zones: [...named] })
+    // A YEARLY or MONTHLY rule's implicit day (and month) made explicit, so a day a month or year does not have is
+    // skipped (RFC 5545 §3.3.10), never moved to the next one by the library.
+    let implicit: Ready["implicit"]
+    const text = out.map((l) => {
+      const p = splitLine(l)!
+      if (p.name !== "RRULE" || start === undefined) return l
+      const made = explicitDay(p.value, start)
+      if (made === undefined) return l
+      implicit = made.implicit
+      return `RRULE${p.params}:${made.rule}`
+    })
+    ready.push({ text: text.join("\r\n"), zones: [...named], uid, fallback: standIn(), implicit })
   }
 
   // ---- Parsed one by one (one malformed event never fails the file), with the time zones it names.
-  const parsed: Array<{ readonly c: Component; readonly i: number }> = []
+  const parsed: Array<{ readonly c: Component; readonly i: number; readonly implicit: Ready["implicit"] }> = []
+  const parse = (r: { readonly text: string; readonly zones: ReadonlyArray<string> }) => {
+    const root = new ICAL.Component(ICAL.parse(["BEGIN:VCALENDAR", "VERSION:2.0", ...r.zones.map((z) => blocks.zones.get(z)!), r.text, "END:VCALENDAR"].join("\r\n")))
+    return root.getFirstSubcomponent("vevent")
+  }
   for (let i = 0; i < ready.length; i++) {
     const r = ready[i]!
+    let vevent: Component | null = null
     try {
-      const root = new ICAL.Component(ICAL.parse(["BEGIN:VCALENDAR", "VERSION:2.0", ...r.zones.map((z) => blocks.zones.get(z)!), r.text, "END:VCALENDAR"].join("\r\n")))
-      const vevent = root.getFirstSubcomponent("vevent")
-      if (vevent === null) {
-        unreadable++
-        continue
-      }
-      // A cancelled instance needs no start: its RECURRENCE-ID is enough to take it out (RFC 5546 tombstones).
-      const tombstone = vevent.getFirstProperty("recurrence-id") !== null && String(vevent.getFirstPropertyValue("status") ?? "").toUpperCase() === "CANCELLED"
-      if (vevent.getFirstProperty("dtstart") === null && !tombstone) {
-        unreadable++
-        continue
-      }
-      parsed.push({ c: vevent, i })
+      vevent = parse(r)
     } catch {
-      unreadable++
+      vevent = null
+    }
+    // A cancelled instance needs no start: its RECURRENCE-ID is enough to take it out (RFC 5546 tombstones).
+    const tombstone = vevent !== null && vevent.getFirstProperty("recurrence-id") !== null && String(vevent.getFirstPropertyValue("status") ?? "").toUpperCase() === "CANCELLED"
+    if (vevent !== null && (vevent.getFirstProperty("dtstart") !== null || tombstone)) {
+      parsed.push({ c: vevent, i, implicit: r.implicit })
+      continue
+    }
+    // It cannot be read after all: counted, and an override still takes out its instance.
+    if (r.fallback === "poison" && r.uid !== undefined) {
+      poisoned.add(r.uid)
+      continue
+    }
+    unreadable++
+    if (r.fallback !== undefined && r.fallback !== "poison") {
+      try {
+        const stand = parse(r.fallback)
+        if (stand !== null) parsed.push({ c: stand, i, implicit: undefined })
+        else if (r.uid !== undefined) poisoned.add(r.uid)
+      } catch {
+        if (r.uid !== undefined) poisoned.add(r.uid)
+      }
     }
   }
+  unreadable += poisoned.size
 
-  // ---- Grouped by UID: the series (or single event) and its exceptions.
-  const groups = new Map<string, { master?: Component; exceptions: Array<Component> }>()
-  for (const { c, i } of parsed) {
+  // ---- Grouped by UID: the series (or single event) and its exceptions; a series left out whole is not grouped.
+  const groups = new Map<string, { master?: Component; exceptions: Array<Component>; implicit?: Ready["implicit"] }>()
+  for (const { c, i, implicit } of parsed) {
     const uidValue = c.getFirstPropertyValue("uid")
     const uid = typeof uidValue === "string" && uidValue !== "" ? uidValue : `\u0000no-uid-${i}`
+    if (poisoned.has(uid)) continue
     const g = groups.get(uid) ?? { exceptions: [] }
     if (c.getFirstProperty("recurrence-id") !== null) g.exceptions.push(c)
-    else if (g.master === undefined) g.master = c
-    else unreadable++ // two events of one UID, neither an exception: which is meant is not known
+    else if (g.master === undefined) {
+      g.master = c
+      if (implicit !== undefined) g.implicit = implicit
+    } else unreadable++ // two events of one UID, neither an exception: which is meant is not known
     groups.set(uid, g)
   }
 
@@ -477,7 +663,7 @@ export const expandCalendar = (ICAL: ICAL, input: ExpandInput): ExpandOutput => 
           emit(uid, ridOf(e.recurrenceId), e, undefined, start, endOf(e, e.startDate, start, true), e.startDate.isDate, mine)
         }
       } else if (statusOf(g.master) !== "CANCELLED") {
-        expandSeries(uid, g.master, g.exceptions, mine)
+        expandSeries(uid, g.master, g.exceptions, g.implicit, mine)
       }
     } catch (e) {
       if (e instanceof TooMany) return { ok: false, reason: "too-many" }
@@ -491,7 +677,7 @@ export const expandCalendar = (ICAL: ICAL, input: ExpandInput): ExpandOutput => 
     if (out.length > limits.occurrences || rows > limits.rows) return { ok: false, reason: "too-many" }
   }
 
-  function expandSeries(uid: string, masterC: Component, exceptionCs: ReadonlyArray<Component>, into: Array<Occ>) {
+  function expandSeries(uid: string, masterC: Component, exceptionCs: ReadonlyArray<Component>, implicit: Ready["implicit"], into: Array<Occ>) {
     // Period RDATEs: the library's iterator gets their starts; their own ends are kept by start.
     const periodEnds = new Map<number, number>()
     for (const prop of masterC.getAllProperties("rdate")) {
@@ -546,6 +732,9 @@ export const expandCalendar = (ICAL: ICAL, input: ExpandInput): ExpandOutput => 
         if (x.component.getFirstProperty("dtstart") !== null) horizon = Math.max(horizon, input.to + Math.max(0, rid - instant(x.startDate)))
       } else horizon = Math.max(horizon, rid + 1)
     }
+    // The instances that do not come from the rule (DTSTART, RDATEs) are not checked against its implicit day.
+    const fromDates = new Set<number>([instant(event.startDate)])
+    for (const prop of masterC.getAllProperties("rdate")) for (const v of prop.getValues() as ReadonlyArray<Time>) fromDates.add(instant(v))
     const iterator = event.iterator()
     let count = 0
     for (let steps = 0; ; steps++) {
@@ -554,6 +743,8 @@ export const expandCalendar = (ICAL: ICAL, input: ExpandInput): ExpandOutput => 
       if (t === undefined || t === null) break
       const nominal = instant(t)
       if (nominal >= horizon) break
+      // Every instance of a rule whose day was implicit falls on that day: one the library moved is not guessed at.
+      if (implicit !== undefined && !fromDates.has(nominal) && (t.day !== implicit.day || (implicit.month !== undefined && t.month !== implicit.month))) throw new Unreadable()
       if (nominal >= cancelledFrom || cancelled.has(ridOf(t))) continue
       const d = event.getOccurrenceDetails(t)
       const item = d.item as Event

@@ -276,7 +276,10 @@ describe("calendar: the tools and actions", () => {
       assert.deepStrictEqual((yield* kit.tool("calendar_find", { text: "opera" })).value, {
         spoken: "I found nothing called opera on the calendar. There are more events than I read; this is the first part."
       })
-      assert.deepStrictEqual((yield* kit.tool("calendar_next", { match: "opera" })).value, { spoken: "I looked through the next 1000 events and found nothing; there are more." })
+      // The bound reached on a later day: nothing up to the last day read whole, and no number (deciding review, finding 8).
+      const through = "I found nothing called opera up to Sunday the third of January 2027; after that there are too many events for me to look through."
+      assert.deepStrictEqual((yield* kit.tool("calendar_next", { match: "opera" })).value, { spoken: through })
+      assert.deepStrictEqual(yield* kit.action("when_is", { match: "opera" }), { ok: true, say: through })
       // Within the bounds the answer is found as usual.
       assert.strictEqual(((yield* kit.tool("calendar_next", { match: "lesson 900" })).value as { next: { title: string } }).next.title, "Lesson 900")
     }))

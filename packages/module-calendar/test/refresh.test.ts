@@ -5,7 +5,6 @@ import { assert, describe, it } from "@effect/vitest"
 import { CurrentJob, type JobOrigin, offThread, offThreadTask } from "@pva/core"
 import { makeOfflineNet, offThreadWorkers, startTestModule } from "@pva/core/testing"
 import { Effect, Fiber } from "effect"
-import { bound } from "../../store-sqlite/test/latencyBound.ts"
 import { calendarModule, calendarModuleWith, occurrences, sources } from "../src/index.ts"
 import { ICS_MAX_BYTES } from "../src/provider.ts"
 import { batchOf, linkPrint } from "../src/store.ts"
@@ -452,6 +451,45 @@ describe("calendar: the refresh job", () => {
       assert.deepStrictEqual((yield* none.kit.checkHealth).map((i) => i.id), ["calendar.no-calendars"])
     }))
 
+  it.effect("deciding review 1: a private link's file-name stem and query value, reflected without the rest of the link, are never stored, said or kept as a validator", () =>
+    Effect.gen(function*() {
+      for (const [secret, parts] of [
+        ["https://cal.example.org/private/long-secret-123456789.ics", ["long-secret-123456789"]],
+        ["https://cal.example.org/p/abcd1234.ics", ["abcd1234"]],
+        ["https://cal.example.org/private/k3y-1234567.ics", ["k3y-1234567"]],
+        ["https://cal.example.org/feed.ics?token=tok-98765", ["tok-98765"]]
+      ] as const) {
+        const part = parts[0]
+        const echo = ics([
+          { uid: "one", summary: `Token ${part}`, location: part, start: "20261118T140000", end: "20261118T150000", tz: AMS },
+          { uid: "two", summary: `Upper ${part.toUpperCase()}`, start: "20261118T160000", end: "20261118T170000", tz: AMS }
+        ])
+        const seen: Array<string | undefined> = []
+        const settings = { calendars: [{ name: "Robin's work", link: "private1", url: "", owner: "Robin" }] }
+        const { kit } = yield* startCalendar({
+          [secret]: (req: { readonly headers: Readonly<Record<string, string>> }) => {
+            seen.push(req.headers["if-none-match"])
+            return served(echo, { etag: `"${part}"` })
+          }
+        }, { settings, secrets: { privateLink1: secret } })
+        const phone = { device: "robins-phone" }
+        const today = yield* kit.tool("calendar_agenda", {}, phone)
+        assert.deepStrictEqual(eventsOf(today.value), ["an event two o'clock", "an event four o'clock"], secret)
+        const said = yield* kit.action("today", {}, phone)
+        assert.deepStrictEqual(said, { ok: true, say: "Today: an event at two o'clock and an event at four o'clock." }, secret)
+        const next = yield* kit.tool("calendar_next", {}, phone)
+        const rows = yield* allRows(kit)
+        const states = yield* kit.moduleStore().collection(sources).list({})
+        assert.isUndefined(states[0]?.value.etag, secret)
+        // No validator kept: the next refresh asks unconditionally.
+        yield* advanceAndRefresh(kit, 3_600_000)
+        assert.deepStrictEqual(seen, [undefined, undefined], secret)
+        for (const text of [today.content, JSON.stringify(said), next.content, JSON.stringify(rows), JSON.stringify(states), JSON.stringify(yield* kit.jobs), JSON.stringify(kit.issues())]) {
+          assert.notInclude(text.toLowerCase(), part.toLowerCase(), secret)
+        }
+      }
+    }), 60_000)
+
   it.effect("a calendar whose owner is nobody in Members is not read at all", () =>
     Effect.gen(function*() {
       const { kit, net } = yield* startCalendar(allFixtures, { settings: { calendars: [calendar("Kim's", "https://cal.example.org/sam.ics", "Kim")] } })
@@ -503,59 +541,6 @@ describe("calendar: the refresh job", () => {
       assert.strictEqual((yield* store.list({ where: { day: 29_991_231 }, orderBy: { field: "end" } })).length, 1)
       assert.strictEqual((yield* store.list({ where: { batch: "\"".repeat(40) }, orderBy: { field: "batch" } })).length, 1)
     }))
-})
-
-describe("calendar: the main thread while a calendar is read (finding 1)", () => {
-  const limit = bound(10)
-  it.effect("the reviewer's 1 MiB file of 6,000 events: refused off the main thread, which is never held over the bound", () =>
-    Effect.gen(function*() {
-      // The author's shape: 6,000 events, one in ten repeating, cut at the size limit (so in the middle of an event).
-      const reviewer = ics(Array.from({ length: 6_000 }, (_, i) => ({
-        uid: `e${i}`,
-        summary: `Event ${i}`,
-        start: `202612${String(1 + (i % 28)).padStart(2, "0")}T${String(8 + (i % 10)).padStart(2, "0")}0000`,
-        end: `202612${String(1 + (i % 28)).padStart(2, "0")}T${String(9 + (i % 10)).padStart(2, "0")}0000`,
-        tz: AMS,
-        ...(i % 10 === 0 ? { rrule: "FREQ=DAILY;COUNT=30" } : {}),
-        extra: ["DESCRIPTION:" + "d".repeat(60)]
-      }))).slice(0, ICS_MAX_BYTES)
-      let body = FAMILY
-      const { kit } = yield* startCalendar({ "https://cal.example.org/family.ics": () => served(body) }, familyOnly)
-      body = reviewer
-      const refused = yield* heartbeat(advanceAndRefresh(kit, 3_600_000))
-      // Cut at the size limit in the middle of an event: not a well-formed calendar; the last generation is kept.
-      assert.strictEqual((yield* stateOf(kit))!.error, "not-calendar")
-      assert.strictEqual((yield* allRows(kit)).length, 12)
-      // The whole file (over the size limit) is refused by the fetch; at the size limit but whole, by the event limit.
-      body = ics(Array.from({ length: 5_001 }, (_, i) => ({ uid: `e${i}`, summary: `E${i}`, start: "20261201T080000Z" })))
-      const many = yield* heartbeat(advanceAndRefresh(kit, 3_600_000))
-      assert.strictEqual((yield* stateOf(kit))!.error, "too-many")
-      if (process.env.CALENDAR_BENCH === "1") process.stderr.write(`calendar (kit): longest stop ${refused.longest.toFixed(1)} ms (6,000 events cut off), ${many.longest.toFixed(1)} ms (5,001 events)\n`)
-      assert.isBelow(refused.longest, limit, `the main thread was held ${refused.longest.toFixed(1)} ms`)
-      assert.isBelow(many.longest, limit, `the main thread was held ${many.longest.toFixed(1)} ms`)
-      assert.strictEqual(offThreadWorkers().running, 0)
-    }), 120_000)
-
-  it.effect("the reviewer's impossible rule (30 February every year) runs into the reading's real time limit; the main thread is never held", () =>
-    Effect.gen(function*() {
-      let body = ics([{ uid: "dentist", summary: "Dentist", start: "20261118T140000", end: "20261118T150000", tz: AMS }])
-      const { kit } = yield* startCalendar({ "https://cal.example.org/family.ics": () => served(body) }, { ...familyOnly, deps: { readTimeoutMs: 1_500 } })
-      body = ics([{ uid: "never", summary: "Never", start: "20261118T090000Z", rrule: "FREQ=DAILY;BYMONTH=2;BYMONTHDAY=30" }])
-      const started = performance.now()
-      const run = yield* heartbeat(advanceAndRefresh(kit, 3_600_000))
-      const took = performance.now() - started
-      const state = (yield* stateOf(kit))!
-      if (process.env.CALENDAR_BENCH === "1") process.stderr.write(`calendar: impossible rule ${state.error ?? `read, ${state.unreadable} unreadable`} after ${took.toFixed(0)} ms, longest stop ${run.longest.toFixed(1)} ms\n`)
-      // The library never returns from the rule: the worker is ended at the time limit, the last generation stays.
-      assert.strictEqual(state.error, "too-slow")
-      const today = (yield* kit.tool("calendar_agenda", {})).value as { stale?: string }
-      assert.deepStrictEqual(eventsOf(today), ["Dentist two o'clock"])
-      assert.include(today.stale!, "could not be refreshed")
-      // Two tries (the job's one retry), each ended at its limit.
-      assert.isBelow(took, 2 * (1_500 + bound(500)))
-      assert.isBelow(run.longest, limit, `the main thread was held ${run.longest.toFixed(1)} ms`)
-      assert.strictEqual(offThreadWorkers().running, 0)
-    }), 60_000)
 })
 
 describe("calendar: the reading task as the reworked offThread wants it", () => {

@@ -2,6 +2,7 @@ import { ActionError, CurrentTurn, defineAction, makeTool, Param, type Row, type
 import { speakList } from "@pva/language"
 import { isLine, say, StoredText } from "@pva/module-contracts"
 import { Effect, Schema } from "effect"
+import { yieldToLoop } from "./answer.ts"
 import { capital, FIND_ROWS, identityOf, type Moment, NEXT_ROWS, type Notes, noteList, type Reader, resolveDay, type Spoken, type View, type Who } from "./read.ts"
 import { WINDOW_DAYS } from "./refresh.ts"
 import { type Occurrence, ROWS_PAGE } from "./store.ts"
@@ -57,7 +58,8 @@ type NextAnswer =
   | { readonly kind: "spoken"; readonly spoken: Spoken }
   | { readonly kind: "shown"; readonly v: View; readonly r: Row<Occurrence>; readonly notes: Notes }
   | { readonly kind: "reduced"; readonly v: View; readonly r: Row<Occurrence>; readonly notes: Notes }
-  | { readonly kind: "none"; readonly v: View; readonly cut: boolean; readonly notes: Notes }
+  /** None found: `cut` when the scan stopped short; `through`, the last day it read whole (none: not even today). */
+  | { readonly kind: "none"; readonly v: View; readonly cut: boolean; readonly through?: LocalDate; readonly notes: Notes }
 
 export const makeTools = (reader: Reader) => {
   const failedTool = () => Effect.map(reader.moment(undefined), (m) => new ToolError({ message: say(texts, m.lang, "unreadable") }))
@@ -172,38 +174,43 @@ export const makeTools = (reader: Reader) => {
           const rows: Array<Row<Occurrence>> = []
           let read = 0
           for (let k = 0; k <= WINDOW_DAYS; k++) {
-            if (read >= NEXT_ROWS) return { rows, cut: true, stopped: false }
+            const through = k > 0 ? addDays(m.today, k - 1) : undefined
+            if (read >= NEXT_ROWS) return { rows, cut: true, stopped: false, through }
             const d = addDays(m.today, k)
             const day = yield* reader.readDay(d, k === 0 ? m.now : undefined)
             read += day.read
             rows.push(...day.rows)
-            rows.sort((a, b) => a.value.start - b.value.start || a.value.end - b.value.end)
             const v = reader.view(m, st)
             const who = v.who(input.who)
-            if ("spoken" in who) return { rows, cut: false, stopped: true }
-            const found = decideNext(v, rows, who, input.match)
+            if ("spoken" in who) return { rows, cut: false, stopped: true, through: undefined }
+            // Only this day's rows can hold the first event not found before: a day's rows include every event still
+            // going on from an earlier day, and those were looked at then.
+            const found = decideNext(v, day.rows, who, input.match)
             if (day.cut) {
               // A day read only in part: an event found in what was read is next only if nothing unread starts before it.
               const last = day.rows.at(-1)?.value.start
               const sure = k > 0 && found.hit !== undefined && last !== undefined && found.hit.value.start <= last
-              return { rows, cut: !sure, stopped: sure }
+              return { rows, cut: !sure, stopped: sure, through }
             }
-            if (found.hit !== undefined) return { rows, cut: false, stopped: true }
+            if (found.hit !== undefined) return { rows, cut: false, stopped: true, through: undefined }
+            // A real turn of the event loop between days.
+            yield* yieldToLoop
           }
-          return { rows, cut: false, stopped: false }
+          return { rows, cut: false, stopped: false, through: undefined }
         })
       )
-      // Decided again now, after the last read, for this turn.
+      // Decided again now, after the last read, for this turn, over every row read in start order.
+      const rows = [...scan.rows].sort((a, b) => a.value.start - b.value.start || a.value.end - b.value.end)
       const v = reader.view(m, states)
       const who = v.who(input.who)
       if ("spoken" in who) return { kind: "spoken", spoken: who } as NextAnswer
       const covered = v.relevant(who)
       const pre = v.precheck(covered)
       if (pre !== undefined) return { kind: "spoken", spoken: pre } as NextAnswer
-      const found = decideNext(v, scan.rows, who, input.match)
+      const found = decideNext(v, rows, who, input.match)
       const notSearched = input.match !== undefined && v.unsearched(covered)
       // Read only in part where it stopped: an unread event may come first, so no event is called the next one.
-      if (scan.cut) return { kind: "none", v, cut: true, notes: v.coverage(covered, { withheld: found.withheld, notSearched }) } as NextAnswer
+      if (scan.cut) return { kind: "none", v, cut: true, ...(scan.through !== undefined ? { through: scan.through } : {}), notes: v.coverage(covered, { withheld: found.withheld, notSearched }) } as NextAnswer
       if (found.hit === undefined) {
         // Stopped at an event that is not one now (it changed while reading): the read was not complete either.
         const cut = scan.cut || scan.stopped
@@ -226,17 +233,26 @@ export const makeTools = (reader: Reader) => {
     return say(texts, v.m.lang, "untilTo", { when: start, to: val.allDay ? v.dayWords(last) : v.momentWords(val.end) })
   }
 
+  /**
+   * What "none found" says. A scan cut short never claims a number or "nothing": it says up to which day it found
+   * nothing, and when it could not read even today whole, that there are too many events around now to tell which is
+   * next (and offers today's agenda).
+   */
+  const noneSentence = (a: Extract<NextAnswer, { kind: "none" }>, match: string | undefined) => {
+    const lang = a.v.m.lang
+    if (a.cut) {
+      if (a.through === undefined) return say(texts, lang, "nextUnsure")
+      const day = a.v.dayWords(a.through)
+      return match === undefined ? say(texts, lang, "nextNoneThrough", { day }) : say(texts, lang, "nextNoneMatchingThrough", { match, day })
+    }
+    return match === undefined ? say(texts, lang, "nextNone", { days: WINDOW_DAYS }) : say(texts, lang, "nextNoneMatching", { match, days: WINDOW_DAYS })
+  }
+
   const nextResult = (input: { readonly match?: string; readonly who?: string }) =>
     Effect.map(nextAnswer(input), (a) => {
       if (a.kind === "spoken") return a.spoken
       const lang = a.v.m.lang
-      if (a.kind === "none") {
-        if (a.cut) return spokenWith(say(texts, lang, "nextCut", { count: NEXT_ROWS }), a.notes)
-        return spokenWith(
-          input.match === undefined ? say(texts, lang, "nextNone", { days: WINDOW_DAYS }) : say(texts, lang, "nextNoneMatching", { match: input.match, days: WINDOW_DAYS }),
-          a.notes
-        )
-      }
+      if (a.kind === "none") return spokenWith(noneSentence(a, input.match), a.notes)
       const d = dateOf(a.r.value.start, a.v.m.zone)
       if (a.kind === "reduced") return { busy: { day: a.v.dayWords(d), ...a.v.reduced(d, a.r) }, ...a.notes }
       const val = a.r.value
@@ -266,6 +282,7 @@ export const makeTools = (reader: Reader) => {
               return { rows, cut: beyond.length > 0 }
             }
             after = page.at(-1)
+            yield* yieldToLoop
           }
         })
       )
@@ -461,13 +478,7 @@ export const makeTools = (reader: Reader) => {
     Effect.map(nextAnswer(input), (a) => {
       if (a.kind === "spoken") return a.spoken.spoken
       const lang = a.v.m.lang
-      if (a.kind === "none") {
-        if (a.cut) return spokenWith(say(texts, lang, "nextCut", { count: NEXT_ROWS }), a.notes).spoken
-        return spokenWith(
-          input.match === undefined ? say(texts, lang, "nextNone", { days: WINDOW_DAYS }) : say(texts, lang, "nextNoneMatching", { match: input.match, days: WINDOW_DAYS }),
-          a.notes
-        ).spoken
-      }
+      if (a.kind === "none") return spokenWith(noneSentence(a, input.match), a.notes).spoken
       if (a.kind === "reduced") {
         const d = dateOf(a.r.value.start, a.v.m.zone)
         const red = a.v.reduced(d, a.r)

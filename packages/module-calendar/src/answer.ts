@@ -69,7 +69,7 @@ export const encodeAnswer = (out: ExpandOutput): string => {
 export const ANSWER_BATCH = 200
 
 /** A real yield to the event loop (a macrotask), so audio and timers run between batches. */
-const yieldToLoop = Effect.promise(() => new Promise<void>((resolve) => setImmediate(resolve)))
+export const yieldToLoop = Effect.promise(() => new Promise<void>((resolve) => setImmediate(resolve)))
 
 const isInt = (v: unknown, lo: number, hi: number): v is number => typeof v === "number" && Number.isInteger(v) && v >= lo && v <= hi
 const isText = (v: unknown, max: number): v is string => typeof v === "string" && v.length <= max && !/[\u0000-\u001f\u007f-\u009f\u2028\u2029]/.test(v)

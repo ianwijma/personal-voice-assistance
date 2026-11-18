@@ -108,7 +108,16 @@ describe("calendar: every answer says what it covers", () => {
       const [section] = yield* kit.contributions(BriefingSections, hall)
       const r = yield* kit.asTurn(section!.gather({ turn: kit.turn(hall), kind: "morning", length: "normal", maxSentences: 2, language: "en", now: yield* kit.now }), hall)
       assert.include(text(r), CUT.replace(/\.$/, ""))
-      // "Next" from now: the day's rows that have not ended are more than it reads, so it says it looked and stopped.
-      assert.deepStrictEqual((yield* kit.tool("calendar_next", {})).value, { spoken: "I looked through the next 1000 events and found nothing; there are more." })
+      // "Next" from now: today's events that have not ended are more than it reads, so it cannot name the earliest. It
+      // says so, with no number and no "nothing", and offers today's agenda (deciding review, finding 8).
+      const unsure = "There are too many events around now for me to tell which comes next; ask me what is on today instead."
+      assert.deepStrictEqual((yield* kit.tool("calendar_next", {})).value, { spoken: unsure })
+      assert.deepStrictEqual((yield* kit.tool("calendar_next", { match: "talk" })).value, { spoken: unsure })
+      assert.deepStrictEqual(yield* kit.action("next_event"), { ok: true, say: unsure })
+      assert.deepStrictEqual(yield* kit.action("when_is", { match: "slot" }), { ok: true, say: unsure })
+      const nl = yield* startCalendar({ "https://cal.example.org/c.ics": served(crowded) }, { settings: { calendars: [calendar("Slots", "https://cal.example.org/c.ics")] }, household: { home: { HOME_LANGUAGE: "nl-NL", HOME_TIME_ZONE: AMS } } })
+      const onzeker = "Er zijn rond nu te veel afspraken om te zeggen welke de volgende is; vraag me liever wat er vandaag in de agenda staat."
+      assert.deepStrictEqual((yield* nl.kit.tool("calendar_next", {})).value, { spoken: onzeker })
+      assert.deepStrictEqual(yield* nl.kit.action("next_event"), { ok: true, say: onzeker })
     }), 60_000)
 })

@@ -299,4 +299,76 @@ describe("calendar: reading ICS files", () => {
     assert.deepStrictEqual(r.occurrences.map((o) => [o.title, o.location ?? ""]), [["", "Room A"], ["", "Room 1"], ["", ""], ["", ""], ["", ""], ["Fine", ""]])
     assert.strictEqual(r.unreadable, 1)
   })
+
+  it("deciding review 2: a recurring local time that does not exist on the day the clocks go forward is read an hour later, and COUNT counts it (north and south)", () => {
+    // RFC 5545 is of two minds here; the library, and Google, Apple and Outlook, show the instance an hour later.
+    const ams = read(raw(["UID:g", "SUMMARY:Early", "DTSTART;TZID=Europe/Amsterdam:20270327T023000", "DURATION:PT30M", "RRULE:FREQ=DAILY;COUNT=3"]), { from: day(2027, 3, 26), to: day(2027, 4, 5) })
+    assert.deepStrictEqual(spans(ams), [
+      "2027-03-27T01:30:00.000Z–2027-03-27T02:00:00.000Z",
+      "2027-03-28T01:30:00.000Z–2027-03-28T02:00:00.000Z",
+      "2027-03-29T00:30:00.000Z–2027-03-29T01:00:00.000Z"
+    ])
+    const sydney = (y: number, m: number, d: number) => day(y, m, d, "Australia/Sydney")
+    const syd = read(raw(["UID:g", "SUMMARY:Early", "DTSTART;TZID=Australia/Sydney:20261003T023000", "DURATION:PT30M", "RRULE:FREQ=DAILY;COUNT=3"]), { from: sydney(2026, 10, 2), to: sydney(2026, 10, 10), zone: "Australia/Sydney" })
+    assert.deepStrictEqual(spans(syd), [
+      "2026-10-02T16:30:00.000Z–2026-10-02T17:00:00.000Z",
+      "2026-10-03T16:30:00.000Z–2026-10-03T17:00:00.000Z",
+      "2026-10-04T15:30:00.000Z–2026-10-04T16:00:00.000Z"
+    ])
+  })
+
+  it("deciding review 3: a day a month or year does not have is skipped, not moved; ordinary rules are as before", () => {
+    const leap = raw(["UID:l", "SUMMARY:Leap", "DTSTART;VALUE=DATE:20240229", "RRULE:FREQ=YEARLY;COUNT=3"])
+    // Asked in 2025: 29 February 2025 does not exist, and is not 1 March.
+    assert.deepStrictEqual(read(leap, { from: day(2025, 2, 27), to: day(2025, 5, 1) }).occurrences, [])
+    // Asked in 2028: the second instance.
+    assert.deepStrictEqual(read(leap, { from: day(2028, 2, 27), to: day(2028, 5, 1) }).occurrences.map((o) => o.first), [20280229])
+    const months = (dtstart: string) => read(raw(["UID:m", "SUMMARY:M", `DTSTART;VALUE=DATE:${dtstart}`, "RRULE:FREQ=MONTHLY;COUNT=4"]), { from: day(2027, 1, 1), to: day(2027, 8, 1) }).occurrences.map((o) => o.first)
+    assert.deepStrictEqual(months("20270131"), [20270131, 20270331, 20270531, 20270731])
+    assert.deepStrictEqual(months("20270130"), [20270130, 20270330, 20270430, 20270530])
+    assert.deepStrictEqual(months("20270110"), [20270110, 20270210, 20270310, 20270410])
+    const yearly = read(raw(["UID:y", "SUMMARY:Y", "DTSTART;VALUE=DATE:20250615", "RRULE:FREQ=YEARLY"]), { from: day(2027, 6, 1), to: day(2027, 7, 1) })
+    assert.deepStrictEqual(yearly.occurrences.map((o) => o.first), [20270615])
+    // Rules that name their days are left as they are.
+    const named = read(raw(["UID:b", "SUMMARY:B", "DTSTART:20261102T090000Z", "RRULE:FREQ=MONTHLY;BYDAY=1MO;COUNT=3"]), { from: day(2026, 11, 1), to: day(2027, 2, 1) })
+    assert.deepStrictEqual(named.occurrences.map((o) => o.first), [20261102, 20261207, 20270104])
+    assert.strictEqual(yearly.unreadable + named.unreadable, 0)
+  })
+
+  it("deciding review 4: values that are not real dates or times are unreadable: the event, or for an exclusion, extra date or end of a rule the series, left out and counted", () => {
+    const one = (...lines: ReadonlyArray<string>) => read(raw(["UID:x", "SUMMARY:X", ...lines]))
+    for (const bad of [["DTSTART;VALUE=DATE:20270230"], ["DTSTART:20261118T250000Z", "DURATION:PT1H"], ["DTSTART:20261118T096100Z", "DURATION:PT1H"], ["DTSTART:20261118T090000Z", "DTEND:20261131T100000Z"], ["DTSTART:2026111T090000Z"]]) {
+      const r = one(...bad)
+      assert.deepStrictEqual([r.occurrences.length, r.unreadable], [0, 1], bad.join(" "))
+    }
+    for (const bad of ["EXDATE:20261119T096000Z", "RDATE:20261130T090000Z,20261131T090000Z", "RDATE;VALUE=PERIOD:20261120T090000Z/20261120T250000Z"]) {
+      const r = one("DTSTART:20261118T090000Z", "RRULE:FREQ=DAILY;COUNT=3", bad)
+      assert.deepStrictEqual([r.occurrences.length, r.unreadable], [0, 1], bad)
+    }
+    const until = one("DTSTART:20261118T090000Z", "RRULE:FREQ=DAILY;UNTIL=20261132T000000Z")
+    assert.deepStrictEqual([until.occurrences.length, until.unreadable], [0, 1])
+    // A leap second reads as the 59th.
+    assert.deepStrictEqual(one("DTSTART:20261118T095960Z", "DURATION:PT1M").occurrences.map((o) => iso(o.start)), ["2026-11-18T09:59:59.000Z"])
+  })
+
+  it("deciding review 5: a VTIMEZONE without a usable observance does not resolve its name: an IANA name is then read as that zone, any other leaves its event out", () => {
+    const empty = (tzid: string) => ["BEGIN:VCALENDAR", "VERSION:2.0", "BEGIN:VTIMEZONE", `TZID:${tzid}`, "END:VTIMEZONE", "BEGIN:VEVENT", "UID:one", "SUMMARY:Appointment", `DTSTART;TZID=${tzid}:20261118T090000`, `DTEND;TZID=${tzid}:20261118T100000`, "END:VEVENT", "END:VCALENDAR", ""].join("\r\n")
+    const custom = read(empty("Custom/Incomplete"))
+    assert.deepStrictEqual([custom.occurrences.length, custom.unreadable], [0, 1])
+    assert.deepStrictEqual(starts(read(empty("Europe/Amsterdam"))), ["2026-11-18T08:00:00.000Z Appointment"])
+  })
+
+  it("deciding review 6: an override that cannot be read still takes out the instance it replaces; one whose recurrence id cannot be read takes out the series", () => {
+    const master = ["UID:one", "SUMMARY:Appointment", "DTSTART;TZID=Europe/Amsterdam:20261118T090000", "DTEND;TZID=Europe/Amsterdam:20261118T100000", "RRULE:FREQ=DAILY;COUNT=4"]
+    const zone = read(raw(master, ["UID:one", "SUMMARY:Unreadable moved", "RECURRENCE-ID;TZID=Europe/Amsterdam:20261119T090000", "DTSTART;TZID=Unknown/Zone:20261119T120000", "DURATION:PT1H"]))
+    assert.deepStrictEqual(starts(zone), ["2026-11-18T08:00:00.000Z Appointment", "2026-11-20T08:00:00.000Z Appointment", "2026-11-21T08:00:00.000Z Appointment"])
+    assert.strictEqual(zone.unreadable, 1)
+    const long = read(raw(master, ["UID:one", "SUMMARY:Overlong", "RECURRENCE-ID;TZID=Europe/Amsterdam:20261119T090000", "DTSTART;TZID=Europe/Amsterdam:20261119T120000", `EXDATE:${Array.from({ length: 600 }, () => "20270101T090000Z").join(",")}`]))
+    assert.deepStrictEqual(starts(long), starts(zone))
+    assert.strictEqual(long.unreadable, 1)
+    for (const rid of ["RECURRENCE-ID;TZID=Unknown/Zone:20261119T090000", "RECURRENCE-ID:20261119T256000Z", "RECURRENCE-ID;RANGE=THISANDFUTURE;TZID=Europe/Amsterdam:20261119T090000"]) {
+      const r = read(raw(master, ["UID:one", "SUMMARY:Unreadable", rid, "DTSTART;TZID=Unknown/Zone:20261119T120000"]))
+      assert.deepStrictEqual([r.occurrences.length, r.unreadable], [0, 1], rid)
+    }
+  })
 })

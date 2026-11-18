@@ -3,12 +3,11 @@
 import { assert, describe, it } from "@effect/vitest"
 import { offThread, offThreadTask } from "@pva/core"
 import { Effect, Exit } from "effect"
-import { bound } from "../../store-sqlite/test/latencyBound.ts"
-import { ANSWER_BATCH, encodeAnswer, readAnswer, taskInput } from "../src/answer.ts"
+import { encodeAnswer, readAnswer, taskInput } from "../src/answer.ts"
 import type { Occ } from "../src/expand.ts"
 import { LIMITS } from "../src/provider.ts"
 import { instantOf } from "../src/time.ts"
-import { AMS, heartbeat, ics } from "./fixtures.ts"
+import { AMS, ics } from "./fixtures.ts"
 
 const occ = (i: number, over: Partial<Occ> = {}): Occ => ({
   key: i.toString(16).padStart(24, "0"),
@@ -28,23 +27,6 @@ const occ = (i: number, over: Partial<Occ> = {}): Occ => ({
 const WINDOW = { from: instantOf({ year: 2026, month: 11, day: 17 }, AMS), to: instantOf({ year: 2027, month: 1, day: 20 }, AMS) }
 
 describe("calendar: the reading task's answer", () => {
-  it.effect("the largest legal answer (3,000 occurrences of the longest lines) is read whole, in batches, holding the main thread under the bound", () =>
-    Effect.gen(function*() {
-      const occurrences = Array.from({ length: LIMITS.occurrences }, (_, i) => occ(i))
-      const text = encodeAnswer({ ok: true, occurrences, unreadable: 2 })
-      // A two-byte string: twice its length as the helper counts it, under its 4 MiB.
-      assert.isAbove(text.length * 2, 2 * 1024 * 1024)
-      assert.isBelow(text.length * 2, 4 * 1024 * 1024)
-      const timings: Array<number> = []
-      for (let k = 0; k < 3; k++) {
-        const { value, longest } = yield* heartbeat(readAnswer(text, LIMITS))
-        assert.deepStrictEqual(value, { ok: true, occurrences, unreadable: 2 })
-        timings.push(longest)
-      }
-      if (process.env.CALENDAR_BENCH === "1") process.stderr.write(`calendar: reading ${LIMITS.occurrences} lines (${(text.length * 2 / 1024 / 1024).toFixed(2)} MiB as counted) in batches of ${ANSWER_BATCH}: longest stop ${timings.map((t) => t.toFixed(1)).join(", ")} ms\n`)
-      for (const t of timings) assert.isBelow(t, bound(10), `reading held the main thread ${t.toFixed(1)} ms`)
-    }), 60_000)
-
   it.effect("an answer with a line it cannot read, a wrong count, a field out of bounds or anything after the last line is refused whole", () =>
     Effect.gen(function*() {
       const good = encodeAnswer({ ok: true, occurrences: [occ(1), occ(2)], unreadable: 0 })

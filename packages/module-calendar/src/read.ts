@@ -2,6 +2,7 @@ import { Devices, type ModuleHostApi, type ModuleStore, People, Privacy, type Ro
 import { numberToWords, parseDateTime, speakDate, speakList, speakMoment, speakNumber, speakTime } from "@pva/language"
 import { type Language, say } from "@pva/module-contracts"
 import { Clock, Data, Effect } from "effect"
+import { yieldToLoop } from "./answer.ts"
 import { addressOf, type CalendarConfig, type CalendarSettings, type OwnerOf, ownerOf } from "./config.ts"
 import { WINDOW_DAYS } from "./refresh.ts"
 import { allStates, batchOf, linkPrint, type Occurrence, occurrences, ownerKey, ROWS_PAGE, type SourceState, sources } from "./store.ts"
@@ -146,6 +147,8 @@ export const makeReader = (env: ReadEnv) => {
       const out: Array<Row<Occurrence>> = []
       let after: Row<Occurrence> | undefined
       let read = 0
+      // A real turn of the event loop before each day read, and between its pages.
+      yield* yieldToLoop
       for (;;) {
         const page = yield* rowsC.list({ where: { day }, orderBy: order, limit: ROWS_PAGE, ...(after !== undefined ? { after } : {}) })
         read += page.length
@@ -154,6 +157,8 @@ export const makeReader = (env: ReadEnv) => {
         if (page.length < ROWS_PAGE || (fromNow !== undefined && page.some((r) => r.value.end <= fromNow))) return { rows: sortRows(out), read, cut: false } satisfies DayRead
         after = page.at(-1)
         if (read >= DAY_ROWS) break
+        // A real turn of the event loop between pages: a turn's reads never hold it for more than a page.
+        yield* yieldToLoop
       }
       const beyond = yield* rowsC.list({ where: { day }, orderBy: order, limit: 1, after: after! })
       return { rows: sortRows(out), read, cut: beyond.length > 0 && (fromNow === undefined || beyond[0]!.value.end > fromNow) } satisfies DayRead
