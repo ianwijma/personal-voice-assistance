@@ -1,6 +1,6 @@
 import { RouteTokenError, type RouteTokens, type RouteTokenStore } from "@pva/core"
-import { MAX_ROUTE_TOKENS_PER_MODULE, type RouteTokenInfo } from "@pva/protocol"
-import { Effect } from "effect"
+import { MAX_ROUTE_TOKENS_PER_MODULE, RouteTokenInfo } from "@pva/protocol"
+import { Effect, Schema } from "effect"
 import { createHash, randomBytes, timingSafeEqual } from "node:crypto"
 import { ROUTE_TOKENS_ENTRY, type SettingsStore } from "./SettingsStore.ts"
 
@@ -11,6 +11,10 @@ import { ROUTE_TOKENS_ENTRY, type SettingsStore } from "./SettingsStore.ts"
  * once, by `mint`. A presented token is hashed and compared with each stored hash of the route's module and name in
  * constant time (`timingSafeEqual`). While the vault is locked nothing can be checked, listed or minted: token routes
  * answer 503. Revoking a token removes it at once. When it was last used is kept in memory only.
+ *
+ * A stored record counts only if its id and metadata are what the wire allows (`RouteTokenInfo`) and its module holds
+ * no more than `MAX_ROUTE_TOKENS_PER_MODULE` before it; any other (a hand-edited file) is ignored for authentication
+ * and listing alike, and `report` is told how many were ignored (a Health issue).
  */
 
 interface Stored {
@@ -36,6 +40,8 @@ const parse = (text: string): Stored | undefined => {
   }
 }
 
+const isTokenInfo = Schema.is(RouteTokenInfo)
+
 const sha256 = (text: string): Buffer => createHash("sha256").update(text, "utf8").digest()
 
 export type TokenCheck =
@@ -47,6 +53,8 @@ export interface RouteTokenKeeper extends RouteTokenStore {
   readonly check: (moduleId: string, name: string, presented: string) => TokenCheck
   /** The tokens can be read now (no vault, or an unlocked one). */
   readonly readable: () => boolean
+  /** Read the stored tokens now (when they can be), so that `report` says how many are ignored. */
+  readonly audit: () => void
 }
 
 export const makeRouteTokens = (options: {
@@ -54,14 +62,32 @@ export const makeRouteTokens = (options: {
   /** The key vault exists and is locked. */
   readonly locked: () => boolean
   readonly now?: () => number
+  /** How many stored records are ignored now (called when that number changes; 0 once none is). */
+  readonly report?: (ignored: number) => void
 }): RouteTokenKeeper => {
   const now = options.now ?? Date.now
   const lastUsed = new Map<string, number>()
-  const all = (): ReadonlyArray<readonly [string, Stored]> =>
-    Object.entries(options.store.secrets().modules[ROUTE_TOKENS_ENTRY] ?? {}).flatMap(([id, text]) => {
-      const stored = parse(text)
-      return stored === undefined ? [] : [[id, stored] as const]
+  let reported = 0
+  /** The stored tokens that count: valid as the wire says, at most the bound per module (the first ones). */
+  const all = (): ReadonlyArray<readonly [string, Stored]> => {
+    const held = new Map<string, number>()
+    const entries = Object.entries(options.store.secrets().modules[ROUTE_TOKENS_ENTRY] ?? {})
+    const admitted = entries.flatMap(([id, text]) => {
+      const stored = typeof text === "string" ? parse(text) : undefined
+      if (stored === undefined) return []
+      if (!isTokenInfo({ id, moduleId: stored.moduleId, name: stored.name, label: stored.label, createdAt: stored.createdAt })) return []
+      const n = held.get(stored.moduleId) ?? 0
+      if (n >= MAX_ROUTE_TOKENS_PER_MODULE) return []
+      held.set(stored.moduleId, n + 1)
+      return [[id, stored] as const]
     })
+    const ignored = entries.length - admitted.length
+    if (ignored !== reported) {
+      reported = ignored
+      options.report?.(ignored)
+    }
+    return admitted
+  }
   const infoOf = (id: string, t: Stored): RouteTokenInfo => ({
     id,
     moduleId: t.moduleId,
@@ -80,7 +106,8 @@ export const makeRouteTokens = (options: {
         ? f()
         : Effect.fail(new RouteTokenError({ reason: "blocked", message: `Tokens cannot be changed until the settings are saved once: ${blocked}` }))
     })
-  const saveFailed = (e: { readonly message: string }) => new RouteTokenError({ reason: "failed", message: e.message })
+  /** A save refused because the vault locked meanwhile (checked again inside the store's serialized save) is `locked`. */
+  const saveFailed = (e: { readonly message: string }) => (options.locked() ? lockedError() : new RouteTokenError({ reason: "failed", message: e.message }))
 
   const forModule = (moduleId: string): RouteTokens => ({
     list: whenReadable(() => Effect.succeed(all().filter(([, t]) => t.moduleId === moduleId).map(([id, t]) => infoOf(id, t)))),
@@ -123,6 +150,9 @@ export const makeRouteTokens = (options: {
   return {
     forModule,
     readable: () => !options.locked(),
+    audit: () => {
+      if (!options.locked()) all()
+    },
     check: (moduleId, name, presented) => {
       if (options.locked()) return { ok: false, reason: "locked" }
       const digest = sha256(presented)

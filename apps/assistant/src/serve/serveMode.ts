@@ -320,7 +320,9 @@ export const startServe = (options: ServeOptions): Effect.Effect<ServeHandle, Ht
     const checker = makeRequirementChecker({ dataDir: options.dataDir })
     yield* checker.probeCatalog(catalog)
     // P3: module route tokens, with the module secrets (in the vault once there is one).
-    const routeTokens = makeRouteTokens({ store, locked: () => vault.state() === "locked" })
+    // Stored token records that are not valid are ignored, with one Health issue (its registry is the host's, below).
+    let tokenIssues: ((ignored: number) => void) | undefined
+    const routeTokens = makeRouteTokens({ store, locked: () => vault.state() === "locked", report: (ignored) => tokenIssues?.(ignored) })
     // Capabilities run for the assistants that switch them on (`moduleDemand`, below; read from startEnabled on).
     const host = yield* makeModuleHost({
       routeTokens,
@@ -1399,6 +1401,15 @@ export const startServe = (options: ServeOptions): Effect.Effect<ServeHandle, Ht
       ...(options.modelListTimeoutMs !== undefined ? { listTimeoutMs: options.modelListTimeoutMs } : {}),
       ...(options.modelCatalogNow !== undefined ? { now: options.modelCatalogNow } : {})
     })
+    tokenIssues = (ignored) =>
+      host.issues.set("route-tokens", ignored === 0 ? [] : [{
+        id: "route-tokens.ignored",
+        severity: "warning",
+        title: `${ignored} stored route token${ignored === 1 ? " is" : "s are"} ignored`,
+        detail: "They are not valid (a changed id or details, or more than a module may hold), so they do not let anyone in and are not listed. Mint new tokens for the callers that need them.",
+        fix: { kind: "link", label: "Open Modules", value: "#settings/shared/modules" }
+      }])
+    routeTokens.audit()
     // P3: module HTTP routes under /api/modules/ (docs/UI-AND-MODULES.md §1.11), and their admin view in the API.
     const moduleRouter = makeModuleRouter({
       host,
