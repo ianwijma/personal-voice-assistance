@@ -2,7 +2,7 @@ import { defineModule, type ModuleDefinition } from "@pva/core"
 import { Effect } from "effect"
 
 /**
- * Calendars from ICS links and CalDAV: what is on, when, free time, and adding an event.
+ * Calendars from ICS links: what is on, when, and free time (CalDAV and adding an event come later).
  *
  * A stub of the scaffold (docs/MODULES-PLAN.md §4 P11; §5.1 row 12, wave A): off by default, no tools yet.
  * Its own pull request writes it. What it is to do: docs/modules/calendar.md and docs/research/modules/calendar.md.

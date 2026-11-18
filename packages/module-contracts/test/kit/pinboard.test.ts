@@ -1,9 +1,14 @@
 // The reference module (pinboard.ts) started through the test kit: every part run as a turn or a job, in the real host,
 // gateway and scheduler, on the test clock, with no network. docs/MODULES.md walks through it.
 import { assert, describe, it } from "@effect/vitest"
+import { CurrentJob, type JobOrigin } from "@pva/core"
 import { checkModule, startTestModule } from "@pva/core/testing"
 import { Effect } from "effect"
-import { notes, pinboardModule, SCAN_ROWS, texts } from "./pinboard.ts"
+import { type Note, notes, pinboardModule, SCAN_ROWS, texts } from "./pinboard.ts"
+
+/** Notes as a test writes them straight into the store. */
+const household = (text: string, pinnedAt: number): Note => ({ text, whose: "household", pinnedAt })
+const personal = (text: string, owner: string, pinnedAt: number): Note => ({ text, owner, whose: "personal", pinnedAt })
 
 describe("the reference module (docs/MODULES.md)", () => {
   // #region check
@@ -46,6 +51,38 @@ describe("the reference module (docs/MODULES.md)", () => {
     }))
   // #endregion whose
 
+  it.effect("a personal note pinned on a public screen whose default person is known: stored as theirs, never repeated there", () =>
+    Effect.gen(function*() {
+      const board = yield* startTestModule(pinboardModule, {
+        household: { devices: [{ id: "hall-screen", name: "Hall screen", room: "Hall", privacy: "public", defaultPerson: "p-sam" }] }
+      })
+      const plain = yield* board.tool("pinboard_pin", { text: "Private appointment", forMe: true }, { device: "hall-screen" })
+      assert.deepStrictEqual(plain.value, { spoken: "Pinned, only for you." })
+      const timed = yield* board.tool("pinboard_pin", { text: "Private call", forMe: true, hours: 2 }, { device: "hall-screen" })
+      assert.deepStrictEqual(timed.value, { spoken: "Pinned for 2 hours, only for you." })
+      assert.notInclude(plain.content + timed.content, "Private ")
+      const rows = yield* board.moduleStore().collection(notes).list({})
+      assert.sameMembers(rows.map((r) => `${r.value.owner} ${r.value.text}`), ["p-sam Private appointment", "p-sam Private call"])
+      // A household note is repeated on the same screen: it is no one's.
+      assert.deepStrictEqual((yield* board.tool("pinboard_pin", { text: "Bins out" }, { device: "hall-screen" })).value, { spoken: "Pinned: Bins out." })
+    }))
+
+  it.effect("a note must be one line: a line break is refused before the module runs", () =>
+    Effect.gen(function*() {
+      const board = yield* startTestModule(pinboardModule)
+      const refused = yield* board.tool("pinboard_pin", { text: "one\ntwo" })
+      assert.isFalse(refused.ok)
+      assert.deepStrictEqual(yield* board.moduleStore().collection(notes).list({}), [])
+    }))
+
+  it.effect("a row with every indexed field at its largest is stored (the store refuses an illegal indexed value when it is written)", () =>
+    Effect.gen(function*() {
+      const board = yield* startTestModule(pinboardModule)
+      const largest: Note = { text: "\"".repeat(200), owner: "p-" + "a".repeat(38), whose: "household", pinnedAt: 8_640_000_000_000_000 }
+      yield* board.moduleStore().collection(notes).insert(largest)
+      assert.strictEqual((yield* board.moduleStore().collection(notes).list({})).length, 1)
+    }))
+
   it.effect("a shared device with no default person shows nobody's personal notes; a member who is nobody's default is read only on a private device", () =>
     Effect.gen(function*() {
       const board = yield* startTestModule(pinboardModule, {
@@ -59,8 +96,8 @@ describe("the reference module (docs/MODULES.md)", () => {
       })
       const store = board.moduleStore().collection(notes)
       const now = yield* board.now
-      yield* store.insert({ text: "Alex's dentist", owner: "p-alex", pinnedAt: now })
-      yield* store.insert({ text: "Sam's dentist", owner: "p-sam", pinnedAt: now - 1 })
+      yield* store.insert(personal("Alex's dentist", "p-alex", now))
+      yield* store.insert(personal("Sam's dentist", "p-sam", now - 1))
       const living = yield* board.tool("pinboard_read", {}, { device: "living-room-speaker" })
       assert.deepStrictEqual(living.value, { notes: [], more: 0, withheld: "2 personal notes are not read out here." })
       const kitchen = yield* board.tool("pinboard_read", {}, { device: "kitchen-display" })
@@ -76,6 +113,11 @@ describe("the reference module (docs/MODULES.md)", () => {
       assert.deepStrictEqual(pinned.value, { spoken: "Vastgeprikt: Melk halen." })
       const asked = yield* board.tool("pinboard_pin", { text: "Tandarts", forMe: true }, { device: "hall-screen" })
       assert.deepStrictEqual(asked.value, { spoken: "Voor wie is het briefje? Ik weet hier niet wie het vraagt." })
+      // A failure of its own: at the scheduler's 200 live jobs (the daily job is one), a timed note is not pinned.
+      for (let i = 0; i < 199; i++) assert.isTrue((yield* board.tool("pinboard_pin", { text: `Briefje ${i}`, hours: 1 })).ok)
+      const full = yield* board.tool("pinboard_pin", { text: "Nog een", hours: 1 })
+      assert.isFalse(full.ok)
+      assert.include(full.content, "Het briefje kon niet worden vastgeprikt.")
     }))
 
   it.effect("reads more notes than one list returns, page by page, and says so when its bounded scan is cut short", () =>
@@ -83,10 +125,10 @@ describe("the reference module (docs/MODULES.md)", () => {
       const board = yield* startTestModule(pinboardModule)
       const store = board.moduleStore().collection(notes)
       const now = yield* board.now
-      for (let i = 0; i < 60; i++) yield* store.insert({ text: `note ${i}`, pinnedAt: now - i * 1000 })
+      for (let i = 0; i < 60; i++) yield* store.insert(household(`note ${i}`, now - i * 1000))
       const read = yield* board.tool("pinboard_read", {})
       assert.deepStrictEqual(read.value, { notes: Array.from({ length: 10 }, (_, i) => `note ${i}`), more: 50 })
-      for (let i = 60; i < SCAN_ROWS + 2; i++) yield* store.insert({ text: `note ${i}`, pinnedAt: now - i * 1000 })
+      for (let i = 60; i < SCAN_ROWS + 2; i++) yield* store.insert(household(`note ${i}`, now - i * 1000))
       const cut = (yield* board.tool("pinboard_read", {})).value as { more: number; cut?: string }
       assert.strictEqual(cut.more, SCAN_ROWS - 10)
       assert.strictEqual(cut.cut, `I read the newest ${SCAN_ROWS} notes; there are more.`)
@@ -101,7 +143,7 @@ describe("the reference module (docs/MODULES.md)", () => {
       assert.match(refused.content, /^Not run: pinboard_pin is switched off/)
       const store = board.moduleStore().collection(notes)
       const now = yield* board.now
-      yield* store.insert({ text: "old", pinnedAt: now - 3 * 86_400_000 })
+      yield* store.insert(household("old", now - 3 * 86_400_000))
       const action = yield* board.action("clear")
       assert.isFalse(action.ok)
       const asTool = yield* board.tool("pinboard_clear", {})
@@ -109,22 +151,57 @@ describe("the reference module (docs/MODULES.md)", () => {
       assert.deepStrictEqual((yield* store.list({})).map((r) => r.value.text), ["old"])
     }))
 
+  it.effect("the action makes progress behind personal notes it keeps, and saying it again finishes the job", () =>
+    Effect.gen(function*() {
+      // A long retention, so the daily job takes nothing down during the test.
+      const board = yield* startTestModule(pinboardModule, { settings: { keepDays: 365 } })
+      const store = board.moduleStore().collection(notes)
+      const now = yield* board.now
+      const old = now - 30 * 86_400_000
+      // 500 personal notes, older than every household note: a scan of all notes would read only them.
+      for (let i = 0; i < SCAN_ROWS; i++) yield* store.insert(personal(`Sam's ${i}`, "p-sam", old - 10_000 + i))
+      yield* store.insert(household("behind them", old))
+      assert.deepStrictEqual(yield* board.action("clear"), { ok: true, say: "Cleared 1 old notes." })
+      // More old household notes than one scan reads: it says so, and the second clear takes the rest.
+      for (let i = 0; i <= SCAN_ROWS; i++) yield* store.insert(household(`old ${i}`, old + i))
+      yield* store.insert(household("new", now))
+      assert.deepStrictEqual(yield* board.action("clear"), { ok: true, say: `Cleared ${SCAN_ROWS} old notes; there are more, so say it again.` })
+      assert.deepStrictEqual(yield* board.action("clear"), { ok: true, say: "Cleared 1 old notes." })
+      const left = yield* store.list({ where: { whose: "household" }, orderBy: { field: "pinnedAt" } })
+      assert.deepStrictEqual(left.map((r) => r.value.text), ["new"])
+    }))
+
   it.effect("the action clears old household notes and keeps personal ones", () =>
     Effect.gen(function*() {
       const board = yield* startTestModule(pinboardModule)
       const store = board.moduleStore().collection(notes)
       const now = yield* board.now
-      yield* store.insert({ text: "old", pinnedAt: now - 3 * 86_400_000 })
-      yield* store.insert({ text: "old and Sam's", owner: "p-sam", pinnedAt: now - 3 * 86_400_000 })
-      yield* store.insert({ text: "new", pinnedAt: now })
+      yield* store.insert(household("old", now - 3 * 86_400_000))
+      yield* store.insert(personal("old and Sam's", "p-sam", now - 3 * 86_400_000))
+      yield* store.insert(household("new", now))
       assert.deepStrictEqual(yield* board.action("clear"), { ok: true, say: "Cleared 1 old notes." })
       assert.sameMembers((yield* store.list({})).map((r) => r.value.text), ["old and Sam's", "new"])
     }))
 
   // #region job
+  /** The module with what each of its job handlers sees as `CurrentJob` while it runs, recorded (a test's own wrapper). */
+  const recordingJobs = (seen: Array<JobOrigin | undefined>): typeof pinboardModule => ({
+    ...pinboardModule,
+    shared: (ctx) =>
+      pinboardModule.shared!({
+        ...ctx,
+        scheduler: {
+          ...ctx.scheduler,
+          handle: (name, handler) =>
+            ctx.scheduler.handle(name, { ...handler, run: (payload, due) => Effect.andThen(Effect.flatMap(CurrentJob, (job) => Effect.sync(() => void seen.push(job))), handler.run(payload, due)) })
+        }
+      })
+  })
+
   it.effect("a note pinned for some hours: the note and its job in one transaction; the job runs with the turn's origin", () =>
     Effect.gen(function*() {
-      const board = yield* startTestModule(pinboardModule)
+      const seen: Array<JobOrigin | undefined> = []
+      const board = yield* startTestModule(recordingJobs(seen))
       const r = yield* board.tool("pinboard_pin", { text: "Oven is hot", forMe: true, hours: 2 }, { device: "kitchen-display" })
       assert.deepStrictEqual(r.value, { spoken: "Pinned for 2 hours: Oven is hot." })
       const [note] = yield* board.moduleStore().collection(notes).list({})
@@ -140,6 +217,12 @@ describe("the reference module (docs/MODULES.md)", () => {
       assert.deepStrictEqual(yield* board.moduleStore().collection(notes).list({}), [])
       const removed = board.events.find((e) => e.type === "pinboard.notes.changed" && e.actor?.kind === "job")
       assert.deepStrictEqual(removed?.actor, { kind: "job", jobId: job.id })
+      // What the handler saw as it ran, after the restart: the turn's assistant, device and person.
+      const ran = seen.filter((j) => j?.jobId === job.id)
+      assert.strictEqual(ran.length, 1)
+      assert.strictEqual(ran[0]?.assistantId, "jeff")
+      assert.strictEqual(ran[0]?.deviceId, "kitchen-display")
+      assert.strictEqual(ran[0]?.person?.id, "p-sam")
     }))
 
   it.effect("the daily job takes down notes older than the setting, at 04:00", () =>
@@ -149,8 +232,8 @@ describe("the reference module (docs/MODULES.md)", () => {
       assert.strictEqual(job?.cron, "0 4 * * *")
       const store = board.moduleStore().collection(notes)
       const now = yield* board.now
-      yield* store.insert({ text: "stale", pinnedAt: now - 2 * 86_400_000 })
-      yield* store.insert({ text: "fresh", pinnedAt: now })
+      yield* store.insert({ text: "stale", whose: "household", pinnedAt: now - 2 * 86_400_000 })
+      yield* store.insert({ text: "fresh", whose: "household", pinnedAt: now })
       yield* board.runJob(job!.id)
       assert.deepStrictEqual((yield* store.list({})).map((r) => r.value.text), ["fresh"])
     }))
@@ -166,7 +249,9 @@ describe("the reference module (docs/MODULES.md)", () => {
       const pinned = yield* board.tool("pinboard_pin", { text: "Keep me" })
       const read = yield* board.tool("pinboard_read", {})
       const cleared = yield* board.action("clear")
-      yield* board.expectNoSecrets(pinned, read, cleared)
+      // The kit reads no collection itself: the test passes the rows its module wrote.
+      const rows = yield* board.moduleStore().collection(notes).list({})
+      yield* board.expectNoSecrets(pinned, read, cleared, rows)
     }))
   // #endregion secrets
 

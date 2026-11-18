@@ -6,7 +6,7 @@
 // part as a turn or a job; it passes `checkModule`. The `#region` blocks are quoted in docs/MODULES.md (`docs.test.ts`
 // keeps the two the same).
 import { ActionError, CurrentJob, CurrentTurn, defineAction, defineCollection, defineModule, type HostView, makeTool, Privacy, type Row, Setting, ToolError } from "@pva/core"
-import { defineTexts, homeLanguage, say, StoredText } from "@pva/module-contracts"
+import { defineTexts, homeLanguage, isLine, say, StoredText } from "@pva/module-contracts"
 import { Clock, Effect, Schema } from "effect"
 import { randomUUID } from "node:crypto"
 
@@ -16,6 +16,8 @@ export const texts = defineTexts({
   en: {
     pinned: "Pinned: {text}.",
     pinnedUntil: "Pinned for {hours} hours: {text}.",
+    pinnedPrivately: "Pinned, only for you.",
+    pinnedPrivatelyUntil: "Pinned for {hours} hours, only for you.",
     empty: "The pinboard is empty.",
     cleared: "Cleared {count} old notes.",
     clearedSome: "Cleared {count} old notes; there are more, so say it again.",
@@ -29,6 +31,8 @@ export const texts = defineTexts({
   nl: {
     pinned: "Vastgeprikt: {text}.",
     pinnedUntil: "Vastgeprikt voor {hours} uur: {text}.",
+    pinnedPrivately: "Vastgeprikt, alleen voor jou.",
+    pinnedPrivatelyUntil: "Vastgeprikt voor {hours} uur, alleen voor jou.",
     empty: "Het prikbord is leeg.",
     cleared: "{count} oude briefjes weggehaald.",
     clearedSome: "{count} oude briefjes weggehaald; er zijn er meer, zeg het nog eens.",
@@ -50,6 +54,8 @@ export const Note = Schema.Struct({
   text: StoredText(200),
   /** Absent: the household's. Present: personal, shown only where `Privacy.mayReveal(owner, device)` says so. */
   owner: Schema.optionalKey(PERSON_ID),
+  /** Whose kind of note it is, indexed with `pinnedAt`, so the household's notes can be listed without the personal ones. */
+  whose: Schema.Literals(["household", "personal"]),
   /** Epoch ms; indexed, so lists can be ordered by it and read page by page. */
   pinnedAt: Schema.Int.check(Schema.isBetween({ minimum: 0, maximum: 8_640_000_000_000_000 }))
 })
@@ -61,7 +67,9 @@ export const notes = defineCollection({
   schema: Note,
   // The worst legal note is about 700 characters of JSON (checkModule computes it): 800 lets one list read 31 rows.
   maxChars: 800,
-  indexes: ["pinnedAt"]
+  // Indexed values are bounded scalars (a literal, a bounded integer): the store refuses anything else when it is
+  // written, and pinboard.test.ts writes a row with each at its largest.
+  indexes: ["pinnedAt", ["whose", "pinnedAt"]]
 })
 // #endregion collection
 
@@ -212,7 +220,8 @@ export const pinboardModule = defineModule({
         name: "pinboard_pin",
         description: "Pin a short note on the pinboard, for everyone or only for the person asking, optionally for some hours.",
         parameters: Schema.Struct({
-          text: StoredText(200).annotate({ description: "The note, one short line" }),
+          // Stored text, and one line: `StoredText` alone allows a line break, so `isLine` checks the rest.
+          text: StoredText(200).check(Schema.makeFilter((t: string) => isLine(t, 200) || "one line, without line breaks")).annotate({ description: "The note, one short line" }),
           forMe: Schema.optionalKey(Schema.Boolean.annotate({ description: "Only for the person asking" })),
           hours: Schema.optionalKey(Schema.Int.check(Schema.isBetween({ minimum: 1, maximum: 72 })).annotate({ description: "Take it down after this many hours" }))
         }),
@@ -225,11 +234,15 @@ export const pinboardModule = defineModule({
             // Personal content needs an owner. Nobody known is asking (a public screen, no default person): ask whose,
             // and write nothing. Never store it as the household's instead, and never repeat the text here.
             if (forMe === true && person === undefined) return { spoken: say(texts, lang, "whose") }
-            const note: Note = { text, pinnedAt: yield* Clock.currentTimeMillis, ...(forMe === true && person !== undefined ? { owner: person } : {}) }
+            const owner = forMe === true ? person : undefined
+            const note: Note = { text, whose: owner === undefined ? "household" : "personal", pinnedAt: yield* Clock.currentTimeMillis, ...(owner !== undefined ? { owner } : {}) }
             const failed = () => new ToolError({ message: say(texts, lang, "unsaved") })
+            // The confirmation repeats a personal note only where it may be revealed: a public screen with a default
+            // person knows whose it is, and still must not show it. Asked now, for this device.
+            const quiet = owner !== undefined && ctx.host.service(Privacy)?.mayReveal(owner, turn) !== true
             if (hours === undefined) {
               yield* board.insert(note).pipe(Effect.mapError(failed))
-              return { spoken: say(texts, lang, "pinned", { text }) }
+              return { spoken: quiet ? say(texts, lang, "pinnedPrivately") : say(texts, lang, "pinned", { text }) }
             }
             // The note and the job that takes it down are written in one transaction: both or neither. The row's id is
             // chosen first, so the job's payload can name it; the job inherits this turn's origin.
@@ -239,7 +252,7 @@ export const pinboardModule = defineModule({
               tx.collection(notes).insert(note, { id })
               job.writeIn(tx)
             }).pipe(Effect.mapError(failed))
-            return { spoken: say(texts, lang, "pinnedUntil", { hours, text }) }
+            return { spoken: quiet ? say(texts, lang, "pinnedPrivatelyUntil", { hours }) : say(texts, lang, "pinnedUntil", { hours, text }) }
           })
       })
       // #endregion change-tool
@@ -255,15 +268,19 @@ export const pinboardModule = defineModule({
           Effect.gen(function*() {
             const lang = languageOf(ctx.host.view())
             const cutoff = (yield* Clock.currentTimeMillis) - 86_400_000
-            const scan = yield* scanNotes((q) => board.list({ orderBy: { field: "pinnedAt", direction: "asc" }, ...q })).pipe(
+            // The household's notes only, oldest first, through the index on [whose, pinnedAt]: every row read is one
+            // the action may take down, so the personal notes it keeps never stand in its way.
+            const scan = yield* scanNotes((q) => board.list({ where: { whose: "household" }, orderBy: { field: "pinnedAt", direction: "asc" }, ...q })).pipe(
               Effect.mapError(() => new ActionError({ message: say(texts, lang, "unreadable") }))
             )
-            const old = scan.rows.filter((r) => r.value.owner === undefined && r.value.pinnedAt < cutoff)
+            const old = scan.rows.filter((r) => r.value.pinnedAt < cutoff)
             yield* ctx.store.transaction((tx) => {
               for (const row of old) tx.collection(notes).remove(row.id)
             }).pipe(Effect.mapError(() => new ActionError({ message: say(texts, lang, "uncleared") })))
-            // A bounded scan that was cut short says so: what it did, and that there is more.
-            return { say: say(texts, lang, scan.cut ? "clearedSome" : "cleared", { count: old.length }) }
+            // Cut short while every note it read was old: there may be more old ones, and saying it again reaches them,
+            // because the ones it took down are gone. Otherwise it reached a note that stays, and is done.
+            const more = scan.cut && old.length === scan.rows.length
+            return { say: say(texts, lang, more ? "clearedSome" : "cleared", { count: old.length }) }
           })
       })
       // #endregion action

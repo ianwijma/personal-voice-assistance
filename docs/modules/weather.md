@@ -2,12 +2,13 @@
 
 Today's weather and the forecast for the home or a named place, from Open-Meteo.
 
-- Package: `packages/modules-builtin` (`src/weather.ts` and files beside it)
+- Package: `packages/modules-builtin`: `src/weather.ts`, and new files only under `src/weather/`
 - Plan: [docs/MODULES-PLAN.md](../MODULES-PLAN.md) §5.1 row 18 (wave A); extended by the local-info pull request (`weather_rain_soon`, `weather_forecast`, `weather_warnings`, a briefing section)
 - Research: [docs/research/modules/local-info.md](../research/modules/local-info.md)
 - How to write it: [docs/MODULES.md](../MODULES.md)
 
-An existing module. The local-info pull request extends it in `weather.ts` and new files beside it, and fills in this page
+An existing module. The local-info pull request extends it in `src/weather.ts` and in new files only under
+`src/weather/` (exported from `weather.ts`; never other files of `modules-builtin`), and fills in this page
 (docs/MODULES.md, "What a module pull request may touch").
 
 ## What it does
