@@ -22,6 +22,7 @@ const TEXTS = {
     noDevice: "There is no device there to say it on.",
     notSaid: "That can't be announced here.",
     handling: "That is being handled already.",
+    tooMany: "Too much at once; try again in a moment.",
     region: "Notifications",
     startAudio: "Start audio to hear it."
   },
@@ -39,6 +40,7 @@ const TEXTS = {
     noDevice: "Daar is geen apparaat om het op te zeggen.",
     notSaid: "Dat kan hier niet worden omgeroepen.",
     handling: "Daar wordt al aan gewerkt.",
+    tooMany: "Te veel tegelijk; probeer het zo opnieuw.",
     region: "Meldingen",
     startAudio: "Zet het geluid aan om het te horen."
   }

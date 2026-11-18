@@ -439,6 +439,9 @@ export const makeVoiceSession = (options: VoiceSessionOptions): Effect.Effect<Vo
       asleep: () => route.config().withoutPhrase === "nobody" && !route.awake(now())
     })
     yield* Effect.addFinalizer(() => Effect.sync(() => tracker.dispose()))
+    /** Done when this session ends (`conversation.end`, or its scope closing): announcements on it end too. */
+    const sessionEnded = Deferred.makeUnsafe<void>()
+    yield* Effect.addFinalizer(() => Effect.sync(() => void Deferred.doneUnsafe(sessionEnded, Effect.void)))
     /** A window closes by time without the state changing (the device keeps listening): the same state, the new holder. */
     const holderCheck = () => {
       const holder = holderNow()
@@ -1072,6 +1075,8 @@ export const makeVoiceSession = (options: VoiceSessionOptions): Effect.Effect<Vo
         for (const target of dispatcher.conversations().values()) target.conversation.start()
       },
       end: Effect.suspend(() => {
+        // An announcement in progress belongs to this session: it ends with it.
+        Deferred.doneUnsafe(sessionEnded, Effect.void)
         const d = detach
         detach = undefined
         started = false
@@ -1091,9 +1096,13 @@ export const makeVoiceSession = (options: VoiceSessionOptions): Effect.Effect<Vo
       const state = tracker.current().state
       return lease.holder() === undefined && inFlight === undefined && !utteranceOpen && (state === "idle" || state === "listening" || state === "asleep")
     }
+    const sessionOver = () => new AudioError({ message: "the voice session ended" })
     const announce: VoiceSession["announce"] = {
+      // Bound to this session's lifetime: when it ends (the device claimed by another page, its boundary changed, it
+      // left), the waits (voice readiness, quiet) and any playing are cancelled and the announcement fails, so the
+      // device's queue moves on with the session that follows.
       speak: (text, o) =>
-        Effect.gen(function*() {
+        Deferred.isDoneUnsafe(sessionEnded) ? Effect.fail(sessionOver()) : Effect.raceFirst(Effect.gen(function*() {
           // The voice first: everything after this is a wait for quiet, then the last checks as the output is taken.
           const assistant = answering()
           const setup = assistant === undefined ? undefined : yield* options.conversationSetup(assistant, options.deviceId).setup
@@ -1110,7 +1119,7 @@ export const makeVoiceSession = (options: VoiceSessionOptions): Effect.Effect<Vo
             if (how.notStarted === "busy" || how.notStarted === "wait") continue
             return { skipped: how.notStarted }
           }
-        }),
+        }), Effect.andThen(Deferred.await(sessionEnded), Effect.fail(sessionOver()))),
       playing: () => (lease.holder() === ANNOUNCE_HOLDER ? web.playingTurn() : undefined)
     }
 

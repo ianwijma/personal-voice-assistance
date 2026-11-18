@@ -1452,7 +1452,7 @@ export const makeNotifyEngine = (options: NotifyEngineOptions): Effect.Effect<No
       plannedAt: () => plannedAt,
       planNow,
       maintainNow: maintain,
-      busyAnswer: () => answer(false, "busy", "busy"),
+      busyAnswer: () => answer(false, "tooMany", "busy"),
       settled: Effect.gen(function*() {
         for (let i = 0; i < 5_000 && (working || all || dirty.size > 0); i++) yield* Effect.yieldNow
       })
