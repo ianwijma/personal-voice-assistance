@@ -1,6 +1,6 @@
 import type { Issue, StoredModule } from "@pva/core"
 import { Clock, Effect } from "effect"
-import { existsSync, statSync } from "node:fs"
+import { statSync } from "node:fs"
 import { dirname, join } from "node:path"
 import { makeSqliteStore, type SqliteHouseholdStore } from "./SqliteStore.ts"
 
@@ -93,18 +93,23 @@ export const householdIssues = (
 ): Effect.Effect<ReadonlyArray<Issue>> =>
   Effect.scoped(Effect.gen(function*() {
     const file = householdDbPath(dataDir)
-    // No file yet: nothing to check (the server makes it at its first start).
-    if (!existsSync(file)) return [] as ReadonlyArray<Issue>
-    const opened = yield* Effect.result(makeSqliteStore({ filename: file, readOnly: true, ...(options.backupDir !== undefined ? { backupDir: options.backupDir } : {}) }))
-    if (opened._tag === "Failure") {
-      return [{
-        id: "core.household.open",
-        severity: "error",
-        title: "The household database cannot be opened",
-        detail: opened.failure.message,
-        fix: { kind: "link", label: "How to restore a backup", value: "docs/STORING-DATA.md#restoring-a-backup" }
-      }] satisfies ReadonlyArray<Issue>
+    const cannotOpen = (detail: string): ReadonlyArray<Issue> => [{
+      id: "core.household.open",
+      severity: "error",
+      title: "The household database cannot be opened",
+      detail,
+      fix: { kind: "link", label: "How to restore a backup", value: "docs/STORING-DATA.md#restoring-a-backup" }
+    }]
+    // No file yet (and only that: ENOENT): nothing to check (the server makes it at its first start). Any other reason
+    // it cannot be looked at (a directory without access, an I/O error) is a database that cannot be opened.
+    try {
+      statSync(file)
+    } catch (e) {
+      if ((e as { code?: unknown }).code === "ENOENT") return [] as ReadonlyArray<Issue>
+      return cannotOpen(`${file} cannot be read: ${e instanceof Error ? e.message : String(e)}`)
     }
+    const opened = yield* Effect.result(makeSqliteStore({ filename: file, readOnly: true, ...(options.backupDir !== undefined ? { backupDir: options.backupDir } : {}) }))
+    if (opened._tag === "Failure") return cannotOpen(opened.failure.message)
     const store = opened.success
     const issues: Array<Issue> = []
     const check = yield* Effect.result(store.check)

@@ -12,8 +12,9 @@ import { CurrentTurn, type TurnContext } from "./TurnContext.ts"
  * Budget: it returns within it by doing **bounded synchronous work only**, not by racing a timeout it could not win
  * (a synchronous read cannot be preempted). Per collection with `ambient` lines it makes one index read per visible
  * scope of at most `ambientRows` rows (never more than `MAX_AMBIENT_ROWS`), newest first, and runs the module's
- * `ambient` function once; it stops reading when `AMBIENT_BUDGET_MS` has passed (it checks the time before each
- * collection, so the stretch is the budget plus one bounded read and one call at most) or the text reaches
+ * `ambient` function once; between two collections it yields to the scheduler, so the event loop (audio, sockets) is
+ * held for one collection's reads at a time, never for the whole batch; it stops reading when `AMBIENT_BUDGET_MS` has
+ * passed (it checks the time before each collection, so the total is the budget plus one collection at most) or the text reaches
  * `AMBIENT_MAX_CHARS` (whole lines, in catalog order; a module's lines are its own order). Behind the household switch
  * `HOME_AMBIENT_FACTS`: `off` (the default, until its effect on a hosted model's first token is measured),
  * `all`, `module-on` (only from modules the turn's assistant has on).
@@ -90,11 +91,15 @@ export const ambientLines = (options: AmbientOptions): Effect.Effect<string> =>
     const max = options.maxChars ?? AMBIENT_MAX_CHARS
     const lines: Array<string> = []
     let used = 0
+    let first = true
     for (const m of options.modules) {
       if (options.usable !== undefined && !options.usable(m.moduleId)) continue
       if (mode === "module-on" && (turn?.assistantId === undefined || options.moduleOn?.(turn.assistantId, m.moduleId) !== true)) continue
       for (const c of m.collections) {
         if (c.ambient === undefined) continue
+        // One collection's reads at a time: the event loop runs between them.
+        if (!first) yield* Effect.yieldNow
+        first = false
         if (clock() >= deadline) return lines.join("\n")
         const reader = options.store.reader(m.moduleId, c)
         if (reader === undefined) continue

@@ -1,5 +1,6 @@
 import type { HouseholdScope, ModuleUnavailable } from "@pva/protocol"
 import { Effect, Schema } from "effect"
+import { runHook } from "./storeHooks.ts"
 import { CurrentTurn, type TurnContext, type TurnSource } from "./TurnContext.ts"
 
 /**
@@ -96,8 +97,8 @@ export const currentActor = (moduleId: string, given?: Actor): Effect.Effect<Act
  * `read-only`: the CLI modes read the store and never write it; `invalid`: the call itself is wrong (an undeclared
  * collection or another declaration of it, an unindexed filter, a limit above `maxListRows`, a value that does not
  * match the schema, a transaction function that returned a promise or an Effect, a handle used after its transaction);
- * `busy`: another connection held the database's write lock for longer than the store waits (a few milliseconds, never
- * on the event loop); nothing was done, try again; `failed`: the database said no.
+ * `busy`: something held the database's write lock for longer than the store waits (about one second, on timers, never
+ * on the event loop: a second server, an external tool); nothing was done, try again; `failed`: the database said no.
  */
 export class StoreError extends Schema.TaggedError<StoreError>()("StoreError", {
   reason: Schema.Literals(["unavailable", "read-only", "invalid", "busy", "failed"]),
@@ -687,11 +688,13 @@ export const MAX_VALUE_CHARS = 16_000
 export const DEFAULT_MAX_CHARS = 2_000
 /**
  * The most characters of values one `list` may decode: a list asks for at most `maxListRows(c)` rows, so
- * rows × `maxChars` stays within it. Chosen by measuring structured values (arrays of small objects, arrays of
- * numbers) at the limits, so the worst legal list blocks the main thread under 10 ms with a margin of two
- * (docs/STORING-DATA.md "Latency").
+ * rows × `maxChars` stays within it. Chosen by measuring the costliest ordinary built-in schema shapes found (arrays
+ * of small objects, of numbers, of an untagged union of four structs, of nested structs of optional fields and
+ * literal unions) at the three ends of the rule on both stores, so the worst legal list blocks the main thread under
+ * 10 ms with a margin of two (docs/STORING-DATA.md "Lists" and "Latency"). A schema much costlier to decode is its
+ * author's to keep small (a smaller `maxChars`).
  */
-export const LIST_BUDGET_CHARS = 120_000
+export const LIST_BUDGET_CHARS = 25_000
 const listRowsFor = (maxChars: number) => Math.max(1, Math.min(MAX_LIST_LIMIT, Math.floor(LIST_BUDGET_CHARS / maxChars)))
 /** The most rows one `list` of `c` may ask for: `min(MAX_LIST_LIMIT, floor(LIST_BUDGET_CHARS / c.maxChars))`. */
 export const maxListRows = (c: Pick<Collection<unknown>, "maxChars">): number => listRowsFor(c.maxChars)
@@ -729,7 +732,8 @@ export const makeClosedStore = (reason: string): HouseholdStore => {
     forModule: owner,
     forCore: owner,
     transaction: () => fail,
-    afterCommit: (f) => Effect.sync(f),
+    // Run now, as the engine runs a hook outside a transaction: a throw is caught, a promise it returns is observed.
+    afterCommit: (f) => Effect.sync(() => runHook(f, () => {}, "An after-commit callback")),
     publish: (event) => {
       for (const l of listeners) {
         try {

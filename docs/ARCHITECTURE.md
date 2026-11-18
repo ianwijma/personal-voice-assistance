@@ -539,10 +539,10 @@ HouseholdPage = { offer(released); refresh(); restart(); pending(); step(): Page
   Both stores run one engine (`packages/core/src/StoreEngine.ts`) over a small synchronous backend (SQLite's
   statements, or maps with an undo list in `MemoryHouseholdStore.ts`). Calls are synchronous on the main thread, which
   also frames audio, so nothing unbounded runs there: a `list` is one named index (`INDEXED BY`) read in its own order
-  up to its limit (at most `min(100, 120,000 / maxChars)` rows of values of at most the collection's `maxChars`, so at
-  most 120,000 characters of structured values decoded: docs/STORING-DATA.md "Latency"), a write one row; the
-  connection never checkpoints (`wal_autocheckpoint = 0`) and never waits for a lock (`busy_timeout = 0`; `busy` is a
-  typed failure, a transaction's begin is retried on a timer). Serve mode opens the file read-write after the writer
+  up to its limit (at most `min(100, 25,000 / maxChars)` rows of values of at most the collection's `maxChars`, so at
+  most 25,000 characters of structured values decoded: docs/STORING-DATA.md "Latency"), a write one row; the
+  connection never checkpoints (`wal_autocheckpoint = 0`) and never waits for a lock (`busy_timeout = 0`; a
+  transaction's begin is retried on timers for about a second, then `busy` is a typed failure). Serve mode opens the file read-write after the writer
   lock (a newer file is refused after a read-only look, untouched); the CLI modes read-only (writes fail `read-only`);
   node's `ExperimentalWarning` for `node:sqlite`, and only that text, is filtered (`store-sqlite/src/quiet.ts`).
 - **Collections only, no SQL anywhere in the interface.** Modules and core services (the scheduler, notifications)
