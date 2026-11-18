@@ -686,6 +686,9 @@ const local = (s: ClientState, a: LocalAction): ClientState => {
         woke: undefined,
         holder: undefined,
         holderTold: false,
+        // Review round 4: what the recogniser heard (the admin phrase tester) and the notices of the old session go too.
+        heard: [],
+        toasts: [],
         sessionSeq: s.sessionSeq + 1,
         ui: { ...s.ui, chatView: undefined, unread: 0 }
       }

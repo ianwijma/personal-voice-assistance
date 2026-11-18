@@ -65,7 +65,8 @@ with its wake phrases and an optional follow-up time), `withoutPhrase`, `matchin
 person) and `capabilities` (what the owner takes away from what the device declares in `hello.device.capabilities`;
 docs/ARCHITECTURE.md, "People, rooms and device capabilities"; saving a change of privacy, default person or a
 capabilities override ends the device's session: its pages are closed with `CloseCode.settingsChanged`, reconnect at
-once and show "Settings changed; the conversation started again"). Effective settings = built-in defaults ← the type's defaults (admin: Devices › Every browser) ← the device's own
+once and show "Settings changed; the conversation started again"; at the close, everything the page showed of the old
+session goes: the conversation, the draft, the stage's caption, what the recogniser heard and the notices). Effective settings = built-in defaults ← the type's defaults (admin: Devices › Every browser) ← the device's own
 sections (admin: Devices › the device; each section "Own value · Reset"). They are stored in `data/settings.json` version 5
 (`deviceTypes`, `devices`). Protocol 5's `DeviceProfile` (activation, one phrase list, follow-up, voice, interrupt mode,
 audio, captions) was that, flat and per field; its stored form is read only by the version 3 migration.

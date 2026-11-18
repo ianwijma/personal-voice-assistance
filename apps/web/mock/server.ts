@@ -1062,15 +1062,30 @@ const memberIds = (): ReadonlySet<string> => {
   }
   return new Set(ids)
 }
-/** Protocol 11: a person without an id (just added) gets one, in the patch itself. */
+/** The ids of people removed from Members since the scenario started (the server's `HOUSEHOLD_MEMBERS_RETIRED`). */
+let retiredMemberIds = new Set<string>()
+/**
+ * Protocol 11, as the server (`withPersonIds`): an incoming id is kept only when it is a committed member's and not
+ * retired, for the first row that carries it; every other row (a new person, a copied row, a stale tab's row of someone
+ * removed, a made-up id) gets a fresh id, never a committed, retired or supplied one. In the patch itself.
+ */
 const withPersonIds = (patch: SettingsPatch) => {
   const list = patch.values.HOUSEHOLD_MEMBERS
   if (!Array.isArray(list)) return
+  const committed = memberIds()
+  const supplied = new Set(list.flatMap((r) => (typeof r === "object" && r !== null && !Array.isArray(r) && typeof (r as Record<string, unknown>).id === "string" ? [(r as Record<string, unknown>).id as string] : [])))
   const used = new Set<string>()
+  const fresh = () => {
+    for (;;) {
+      const id = `p-${randomBytes(4).toString("hex")}`
+      if (!committed.has(id) && !retiredMemberIds.has(id) && !supplied.has(id) && !used.has(id)) return id
+    }
+  }
   ;(patch.values as Record<string, SettingValue | null>).HOUSEHOLD_MEMBERS = list.map((r) => {
     if (typeof r !== "object" || r === null || Array.isArray(r)) return r
     const record = r as Record<string, unknown>
-    const id = typeof record.id === "string" && /^[a-z0-9][a-z0-9_-]{0,39}$/.test(record.id) && !used.has(record.id) ? record.id : `p-${randomBytes(4).toString("hex")}`
+    const given = typeof record.id === "string" ? record.id : undefined
+    const id = given !== undefined && committed.has(given) && !retiredMemberIds.has(given) && !used.has(given) ? given : fresh()
     used.add(id)
     return { ...record, id }
   }) as unknown as SettingValue
@@ -1428,6 +1443,7 @@ const resetState = () => {
   loginRefusedUntil = 0
   logoutFails = false
   devices = seededDevices()
+  retiredMemberIds = new Set()
   assistantsMock.reset(scenario === "long-phrase")
   syncCapabilities()
   voice.reset()
@@ -2384,6 +2400,8 @@ const onClientMessage = (c: Conn, m: ClientMessage) => {
       if (changed.has("llm-openai-accounts")) assistantsChanged()
       if (changed.has("members")) {
         const removed = [...membersBefore].some((id) => !memberIds().has(id))
+        // As the server: a removed person's id is retired, never issued or kept again.
+        for (const id of membersBefore) if (!memberIds().has(id)) retiredMemberIds.add(id)
         if (assistantsMock.clearDefaultPeople(memberIds())) assistantsChanged()
         // As the server: a person leaving Members ends every device's session.
         if (removed) endChangedSessions(boundariesBefore, true)

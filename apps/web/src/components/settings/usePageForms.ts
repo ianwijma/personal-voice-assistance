@@ -200,29 +200,40 @@ export const usePageForms = (defs: ReadonlyArray<PageFormDef>, saved: (key: stri
       setSaving(true)
       setSavedFlash(false)
       let allOk = true
-      for (const view of toSave) {
-        update(view.def.key, ({ message: _m, ...s }) => ({ ...s, serverErrors: [], confirm: [] }))
-        // continuation(state): the saved form is read from `latest.current` / `previous.current` when the answer comes.
-        const result = view.def.kind === "section"
-          ? await fns.section(view.def.id, view.patch, options.confirm === true) // continuation(state): see above
-          : await fns.module(view.def.id, view.patch) // continuation(state): see above
-        if (result.ok) {
-          // The broadcast (section.changed / module.changed) arrived first and carries the saved values.
-          const def = latest.current.find((d) => d.key === view.def.key) ?? view.def
-          previous.current.set(def.key, def)
-          update(view.def.key, () => fresh(def))
-          continue
+      // Review round 4: whatever happens to a request (refused before it is sent, a lost connection), the save ends
+      // and the form says why; Save and Cancel are usable again.
+      try {
+        for (const view of toSave) {
+          update(view.def.key, ({ message: _m, ...s }) => ({ ...s, serverErrors: [], confirm: [] }))
+          // continuation(state): the saved form is read from `latest.current` / `previous.current` when the answer comes.
+          let result: ResultMessage
+          try {
+            result = view.def.kind === "section"
+              ? await fns.section(view.def.id, view.patch, options.confirm === true) // continuation(state): see above
+              : await fns.module(view.def.id, view.patch) // continuation(state): see above
+          } catch (e) {
+            const why = e instanceof Error && e.message !== "" ? e.message : String(e)
+            result = { type: "result", requestId: "", ok: false, error: { code: "internal", message: `The settings were not saved: ${why}`.slice(0, 500) } }
+          }
+          if (result.ok) {
+            // The broadcast (section.changed / module.changed) arrived first and carries the saved values.
+            const def = latest.current.find((d) => d.key === view.def.key) ?? view.def
+            previous.current.set(def.key, def)
+            update(view.def.key, () => fresh(def))
+            continue
+          }
+          allOk = false
+          const fieldErrors = result.error?.fieldErrors ?? []
+          const warnings = result.error?.warnings ?? []
+          update(view.def.key, (s) => {
+            const { message: _m, ...rest } = s
+            const message = fieldErrors.length === 0 && warnings.length === 0 ? result.error?.message ?? "The settings were not saved." : undefined
+            return { ...rest, serverErrors: fieldErrors, confirm: warnings, ...(message !== undefined ? { message } : {}) }
+          })
         }
-        allOk = false
-        const fieldErrors = result.error?.fieldErrors ?? []
-        const warnings = result.error?.warnings ?? []
-        update(view.def.key, (s) => {
-          const { message: _m, ...rest } = s
-          const message = fieldErrors.length === 0 && warnings.length === 0 ? result.error?.message ?? "The settings were not saved." : undefined
-          return { ...rest, serverErrors: fieldErrors, confirm: warnings, ...(message !== undefined ? { message } : {}) }
-        })
+      } finally {
+        setSaving(false)
       }
-      setSaving(false)
       if (allOk) {
         setSavedFlash(true)
         if (options.reload === true) await fns.reload() // continuation(none): nothing runs after the reload's answer
