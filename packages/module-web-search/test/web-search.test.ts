@@ -436,7 +436,7 @@ describe("web-search", () => {
         expect(yield* p.tool("read_page", { url: "http://192.168.1.1/admin" }), "pageLan")
         expect(yield* p.tool("read_page", { url: "ftp://files.example.com/x" }), "pageRefused")
         expect(yield* p.tool("read_page", { url: "https://blocked.example.com/x" }), "pageBlocked")
-        expect(yield* p.tool("read_page", { url: "https://files.example.com/doc.pdf" }), "pagePdf")
+        expect(yield* p.tool("read_page", { url: "https://files.example.com/doc.pdf" }), "pageType")
         expect(yield* p.tool("read_page", { url: "https://files.example.com/pic.png" }), "pageType")
         expect(yield* p.tool("read_page", { url: "https://files.example.com/gone" }), "pageFailed")
         expect(yield* p.tool("read_page", { url: "https://files.example.com/empty" }), "pageEmpty")
@@ -682,8 +682,8 @@ describe("web-search", () => {
         assert.include(text(r), "I can't open that address.", url)
       }
       assert.include(text(yield* kit.tool("read_page", { url: "https://www.blocked.example.com/x" })), "blocked list")
-      assert.include(text(yield* kit.tool("read_page", { url: "https://files.example.com/doc.pdf" })), "I can't read PDF files yet.")
-      assert.include(text(yield* kit.tool("read_page", { url: "https://files.example.com/pic.png" })), "not that kind of file")
+      assert.include(text(yield* kit.tool("read_page", { url: "https://files.example.com/doc.pdf" })), "not PDFs or other files")
+      assert.include(text(yield* kit.tool("read_page", { url: "https://files.example.com/pic.png" })), "not PDFs or other files")
       assert.include(text(yield* kit.tool("read_page", { url: "https://files.example.com/gone" })), "I couldn't open that page.")
       // Nothing private was ever fetched: only the public fixture host was asked.
       assert.isTrue(n.net.requests.every((x) => x.url.startsWith("https://files.example.com/")))

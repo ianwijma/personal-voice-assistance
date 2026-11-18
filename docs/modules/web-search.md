@@ -149,7 +149,7 @@ Left out because the plan's row says so ("left for later"):
 
 Left out by decision of this first version:
 
-- **PDFs.** `read_page` refuses a PDF with "I can't read PDF files yet." *before* its body is read: the response-type policy
+- **PDFs.** `read_page` refuses a PDF, like any other file, with "I can only read web pages and plain text, not PDFs or other files." *before* its body is read (the network helper no longer says which type was refused, so there is one sentence for all of them): the response-type policy
   is HTML and plain text only, narrower than the `webPage` preset. A PDF could now be parsed in the page task's worker
   with its time limit; that is a later version. The dependency is still in `package.json` (the lockfile is not this PR's
   to change).

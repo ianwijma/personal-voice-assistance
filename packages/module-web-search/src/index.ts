@@ -342,7 +342,7 @@ export const webSearchModule = (deps: NetDeps = {}) =>
                     case "NetTooLarge": return new ToolError({ message: say(texts, language, "pageBig") })
                     case "NetRefused":
                       if (e.rule === "address" || e.rule === "host-name") return new ToolError({ message: say(texts, language, "pageLan") })
-                      if (e.rule === "content-type") return new ToolError({ message: say(texts, language, e.detail.includes("application/pdf") ? "pagePdf" : "pageType") })
+                      if (e.rule === "content-type") return new ToolError({ message: say(texts, language, "pageType") })
                       return new ToolError({ message: say(texts, language, "pageRefused") })
                     default: return new ToolError({ message: say(texts, language, "pageFailed") })
                   }
