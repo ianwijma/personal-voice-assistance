@@ -1,6 +1,7 @@
 // The cleaning of text from outside, and the feed parse task itself (called here directly, as a pure function; the
 // module runs it in a worker thread).
 import { assert, describe, it } from "@effect/vitest"
+import { bound } from "../../store-sqlite/test/latencyBound.ts"
 import parse, { type ParseOutput } from "../src/parseFeed.task.ts"
 import { cleanArticle, cleanSummary, cleanTitle, CUT_MARKER, decodeEntities, stripMarkup, titleKey } from "../src/text.ts"
 
@@ -61,7 +62,7 @@ describe("titles cleaned for speech", () => {
     const brackets = "<".repeat(40_000)
     const start = performance.now()
     assert.strictEqual(stripMarkup(brackets), "")
-    assert.isBelow(performance.now() - start, 200)
+    assert.isBelow(performance.now() - start, bound(200))
   })
   it("an address made of entities is taken out after decoding", () => {
     assert.strictEqual(cleanSummary("Read https&#58;//evil.example/x now"), "Read now")
