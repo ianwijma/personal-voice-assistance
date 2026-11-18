@@ -122,6 +122,11 @@ export interface DeviceRegistry {
    */
   readonly persist: Effect.Effect<void>
   /**
+   * Whether a declaration still waits to be written or a write of declarations runs (tests: the record has settled
+   * only when this is false; a record that equals a declaration may still be an older write's).
+   */
+  readonly writing: () => boolean
+  /**
    * `device.forget` (admin). The record goes in one serialized step, and with it everything the device declared, also
    * what arrived while that was written. A connected device's session is ended by the boundary (its connections close
    * at the commit and say hello again as a new device, declaring what they can do then).
@@ -346,6 +351,7 @@ export const makeDeviceRegistry = (options: DeviceRegistryOptions): DeviceRegist
       return true
     },
     persist,
+    writing: () => persisting !== undefined || persistable(),
     nameOf: (id) => stored()[id]?.name,
     kindOfDevice: (id) => stored()[id]?.kind,
     forget: (id) =>
