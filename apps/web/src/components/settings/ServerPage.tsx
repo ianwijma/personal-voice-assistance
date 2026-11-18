@@ -44,14 +44,16 @@ export function ServerPage({ page, extra }: { readonly page: NavPage; readonly e
 
   const defs: ReadonlyArray<PageFormDef> = useMemo(() => [
     ...sections.map((s): PageFormDef => ({ key: `s:${s.id}`, kind: "section", id: s.id, form: s.form, revision: s.revision, readOnly: s.protected === true && !admin })),
-    ...pageModules.map((module) => ({ key: `m:${module.id}`, kind: "module" as const, id: module.id, form: module.settings, revision: module.revision, readOnly: module.protected === true && !admin })),
+    // A module the page knows only from a light snapshot entry (`details: "follow"`) has no form yet: its complete
+    // entry follows at once, and the form is made from that (never from the light entry's empty form).
+    ...pageModules.filter((m) => m.details === undefined).map((module) => ({ key: `m:${module.id}`, kind: "module" as const, id: module.id, form: module.settings, revision: module.revision, readOnly: module.protected === true && !admin })),
     ...links.flatMap((l) => {
       const m = modules[l.module.id]
-      return m === undefined || l.module.optIn === undefined
+      return m === undefined || m.details !== undefined || l.module.optIn === undefined
         ? []
         : [{ key: `m:${m.id}`, kind: "module" as const, id: m.id, form: m.settings, revision: m.revision, readOnly: m.protected === true && !admin, only: [l.module.optIn] }]
     })
-  ], [sections, pageModules.map((m) => `${m.id}:${m.revision}:${m.protected}`).join(","), links.map((l) => `${l.module.id}:${modules[l.module.id]?.revision}`).join(","), modules, admin])
+  ], [sections, pageModules.map((m) => `${m.id}:${m.revision}:${m.protected}:${m.details}`).join(","), links.map((l) => `${l.module.id}:${modules[l.module.id]?.revision}`).join(","), modules, admin])
 
   const values = useMemo(() => savedValues(allSections), [allSections])
   const forms = usePageForms(defs, (key) => values.get(key), {
@@ -140,6 +142,15 @@ function ModuleBlock({ module: m, editable, first, forms, vault }: {
   const sharedUsers = users.filter((a) => ownerOf(a) === undefined || ownerOf(a) === "settings, the same as these")
   const owners = users.filter((a) => ownerOf(a) !== undefined && ownerOf(a) !== "settings, the same as these")
   const link = (a: (typeof users)[number]) => <a href={formatSettingsHash(["assistants", a.id, "modules"])} className="text-voice underline-offset-4 hover:underline">{a.name}</a>
+  // Known only from a light snapshot entry: its complete entry follows at once. Nothing to switch or edit until then.
+  if (m.details === "follow") {
+    return (
+      <section className={cx("flex flex-col gap-2", !first && "border-t border-line/60 pt-7")} data-testid={`module-block-${m.id}`} aria-busy="true">
+        <h3 className="text-[16px] font-medium text-ink">{m.name}</h3>
+        <p className="text-[13px] text-ink-muted" data-testid="module-loading">Loading…</p>
+      </section>
+    )
+  }
   return (
     <section className={cx("flex flex-col gap-5", !first && "border-t border-line/60 pt-7")} data-testid={`module-block-${m.id}`}>
       <div className="flex flex-col gap-1">

@@ -409,8 +409,10 @@ CurrentPrincipal: Context.Reference<Principal | undefined>       // the admitted
   applies the page's draft for `requiresSaved: false` buttons, refuses to run on settings that do not resolve, allows
   8 s (answered at the deadline; the press runs on in its slot until it has ended) and one press per button at a
   time; a failure is a generic sentence (details logged). A
-  press is owned (`FieldActionOwner`, start / in flight / stop) by the host (a definition handler; made with the host,
-  stopped first when it closes) or by the instance part that runs it (made with the part; `closePart` stops it before
+  press is owned (`FieldActionOwner`, start / in flight / stop) by the host (a definition handler; made with the host;
+  when the host closes, one synchronous step stops all admission, signals the host's presses, withdraws every run and
+  signals its presses and calls, and wakes the worker; only then is the definition presses' cleanup awaited, bounded,
+  before any module's resources are released) or by the instance part that runs it (made with the part; `closePart` stops it before
   it closes the part's scope, in the host's closing order); the button stays busy until the press has ended. A version 2 instance gets `refreshForm()` to have its `info()` and `settingOptions()` described
   again (a closed combo shows its static options only).
 - **Secrets and admin pages** (P3, docs/UI-AND-MODULES.md "Secrets and the admin page"): (1) the host never puts a
@@ -419,7 +421,9 @@ CurrentPrincipal: Context.Reference<Principal | undefined>       // the admitted
   code writes is the module's responsibility (never a secret, or anything derived from one); (3) `PageBoundary.ts` is
   the safety net with an exact contract: every exact, case-sensitive occurrence of a current or earlier secret value of
   that module, of any length, is replaced by `[secret]` before clipping. Earlier values are kept per holder (`remember`
-  / `release`: a part until `closePart`, a press until it has ended and been answered, a health check, tokens a part
+  / `release`: a part until `closePart`, a press until it has ended and been answered, a health check until its fiber
+  has really ended (one left at its time limit may still be cleaning up; the answer does not wait) and its issues are
+  published, tokens a part
   minted) with no eviction while the holder lives; past 1024 values per module the module's texts are replaced by a
   fixed sentence instead. Encoded or transformed secrets are not promised to be found. `ModuleHost.pageText` and
   `ModuleHost.routeView` give the router the same boundary.
@@ -429,21 +433,39 @@ CurrentPrincipal: Context.Reference<Principal | undefined>       // the admitted
   host cuts what a module returns at run time (`info` 1000 characters, results 500, options to the bound) before it is
   sent. **One check of the whole form** (round 4): when the host is made, each module's described form is encoded with
   the wire's own `SettingField` schema (record items and options included) and measured against
-  `MODULE_FORM_BUDGET_BYTES` (8 KiB of fields as JSON, with 256 bytes kept per `combo` and `info` field for run-time
-  notes); a module whose form does not encode or is larger does not start (Health `<module>.form`, its error names the
-  field) and its form is not sent. Every module's form travels in the one `admin.snapshot` frame (1 MiB) beside the
-  Health issues (256 KiB) and templates (128 KiB): 40 modules at their budget take 320 KiB. What the running instance
+  `MODULE_FORM_BUDGET_BYTES` (8 KiB: the complete field array as JSON, brackets and commas included, the generated
+  Test button too, with 256 bytes kept per `combo` and `info` field for run-time notes); a module whose form does not
+  encode or is larger does not start (Health `<module>.form`, its error names the field from which on it is too large)
+  and its form is not sent. What the running instance
   adds (`combo` suggestions, `info` values) is trimmed to what the form leaves of the budget, the note saying "and N
   more". A field's default goes through its own decoder: one the field refuses is a declaration error, and the decoded
-  value is kept in `defaultValue` and the description. **The complete form** (round 5): the form as sent (fields,
-  effective values, errors and warnings) and the module's listed tools may take `MODULE_FORM_MAX_BYTES` (48 KiB). A
-  save that would exceed it is refused, naming the largest field; settings already larger (a hand-edited file) are not
+  value is kept in `defaultValue` and the description. **The complete form** (rounds 5 and 6): the form as it is sent
+  and the module's listed tools may take `MODULE_FORM_MAX_BYTES` (48 KiB). One function in the host builds that form
+  (`sentForm`: its messages through the page boundary, the generated Test button, the whole form as UTF-8 JSON with
+  its envelope and the notes' room), and the load check, the save check and `info()` all measure its output. A save
+  that would exceed it is refused, naming the largest field; settings already larger (a hand-edited file) are not
   valid: no form, one error naming the largest field and saying to reduce it in the settings file, the module down
-  like any with invalid settings, its values never cut. What the instance adds, then the listed tools (at most 100,
-  descriptions shortened to 300 characters after secret matching, `ModuleInfo.toolsLeft` counting the rest; the
-  model's catalogue is unchanged), are trimmed to what is left. In `admin.snapshot` all modules' forms and tool lists
-  together take at most `ADMIN_FORMS_SHARE_BYTES` (448 KiB, `withinAdminShare` in the hub): over it, forms are withheld
-  largest first, each with a note naming its largest field, until they fit. A field's decoder and checks are module
+  like any with invalid settings, its values never cut. A form larger only because the boundary lengthened a message
+  (a secret replaced inside an error) is sent with its messages cut shorter (to 1000, 500, 200 and at last 100
+  characters), never its values. What the instance adds, then the listed tools (at most 100, descriptions shortened
+  to 300 characters after secret matching, `ModuleInfo.toolsLeft` counting the rest; the model's catalogue is
+  unchanged), are trimmed to what is left, and the decorated form is measured once more. **One module, one frame**
+  (round 6, `ModuleFrames.ts`): each kind of a module's projection is bounded on its own (the form and tools 48 KiB;
+  at most 32 routes of at most 300-character paths and 500-character descriptions; at most one instance per assistant,
+  16, with errors of at most 2000 characters; templates within their 128 KiB share), and `withinModuleFrame`, applied
+  where `module.changed` is built (serve mode) and to every snapshot entry, is the one final guard on what they make
+  together: the encoded `module.changed` is at most `MODULE_FRAME_MAX_BYTES` (256 KiB, a quarter of the 1 MiB frame);
+  over it the projection is shortened in this order until it fits: the listed routes (the page lists them all from
+  `GET /api/module-routes`), the listed tools (`toolsLeft`), the instances' errors (to 200 characters), and last the
+  form (replaced by one error naming its largest field). **What does not fit the snapshot follows it** (round 6,
+  `adminModules` in `SessionHub.sendAdminSnapshot`): `admin.snapshot` carries each module's complete projection
+  while the modules together stay within `ADMIN_MODULES_SHARE_BYTES` (448 KiB, measured on the encoded projections,
+  leaving 576 KiB for the Health issues' 256 KiB and the rest); a module that does not fit is a light entry there
+  (identity, switch, state and its error cut to 300 characters, `details: "follow"`), immediately followed, in the
+  same send and before anything else, by its own `module.changed` with the complete projection. Nothing is withheld
+  because of other modules. The send limit is judged before the snapshot, not between it and its follow-up frames.
+  The page keeps a complete entry it has when a light one arrives, shows a module it knows only lightly as loading
+  (no switch, no form), and makes its form from the complete entry. A field's decoder and checks are module
   code: the host runs each through its containment (`SettingsSources.contain`, P1's `moduleCode`), so one that throws
   is that field's error and its form stays for repair. A module with any catalogue error (a cycle too) gets the empty
   form. Text is cut at whole characters.

@@ -765,9 +765,10 @@ part, consumers before providers) first stops its presses, interrupting each and
 then closes the part's scope, so what a press uses (the instance's resources, then its shared part's) is still open
 for its cleanup; both within the host's time limit for closing a part, past which the part is abandoned and reported
 like a finalizer that hangs. A press is admitted only by a published part; one in flight when its module is withdrawn
-gets the host's grace period, like the module's calls, and is interrupted when the part is closed. The host's own owner is made with the host and stopped first when
-the host closes, before anything else; from then on every press is answered `not_running`, as is a press on a part
-being closed. **Slots** (`packages/core/src/ModuleSlots.ts`): a press runs in a slot of its module, at most 4 at once
+gets the host's grace period, like the module's calls, and is interrupted when the part is closed. The host's own owner is made with the host. When
+the host closes, it stops admitting anything, signals its own presses, withdraws every module and signals their
+presses and calls, all in one step; only then does it wait (bounded) for its own presses' cleanup, before any module's
+resources are released. From then on every press is answered `not_running`, as is a press on a part being closed. **Slots** (`packages/core/src/ModuleSlots.ts`): a press runs in a slot of its module, at most 4 at once
 (`MAX_PRESS_SLOTS`, across all its owners, so restarts cannot pile them up). `ModuleSlots.run` is the only way a press
 starts: it takes the slot, starts the press's fiber and puts an observer on it in one step, and the observer gives the
 slot back exactly once, when that fiber has really ended, whatever ended the wait for it. At the cap a press is
@@ -881,9 +882,12 @@ RouteResponse = { status /* 200–599 */, headers?, body?: string | Uint8Array |
   be minted or revoked (409 `blocked`, checked again inside the serialized save): a token change never counts as the
   owner's word that the files are right, so it never unblocks the store or starts anything. A mint or revoke that
   waited behind another save while the vault was locked is refused as locked (503), checked inside the serialized
-  save, never acknowledged without effect. A stored record whose id or details the wire would refuse, or one past a
-  module's 20, is ignored for checking and listing alike, with one Health issue (`route-tokens.ignored`) saying how
-  many. Modules mint, list and revoke their own through `host.routeTokens` (`mint(name, label)`,
+  save, never acknowledged without effect. One canonical list of the stored records decides checking, listing, the
+  limit, mint and revoke (`keptTokens`): a record counts only if its id and details are what the wire allows, its
+  secret's hash is not an earlier record's, and it is within its module's 20, in a fixed order (when made, then id).
+  Any other record is ignored for checking and listing alike, with one Health issue (`route-tokens.ignored`) saying how
+  many, and a mint or revoke saves exactly the list after its change, so ignored records are dropped from the file
+  then and can never take a revoked token's place. Modules mint, list and revoke their own through `host.routeTokens` (`mint(name, label)`,
   `list`, `revoke(id)`); the owner does it on the module page, choosing the token's purpose (its name) when the
   module's routes accept more than one.
 - **Admin view** (`GET /api/module-routes[?module=<id>]`, admin token): each module's routes with guards and limits,
