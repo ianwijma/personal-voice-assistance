@@ -19,7 +19,8 @@ import {
   type TurnSetup,
   type TurnTrace,
   type VoiceRef,
-  voiceKey
+  voiceKey,
+  withinModuleFrame
 } from "@pva/core"
 import {
   type Assistant,
@@ -324,7 +325,9 @@ export const startServe = (options: ServeOptions): Effect.Effect<ServeHandle, Ht
     const checker = makeRequirementChecker({ dataDir: options.dataDir })
     yield* checker.probeCatalog(catalog)
     // P3: module route tokens, with the module secrets (in the vault once there is one).
-    const routeTokens = makeRouteTokens({ store, locked: () => vault.state() === "locked" })
+    // Stored token records that are not valid are ignored, with one Health issue (its registry is the host's, below).
+    let tokenIssues: ((ignored: number) => void) | undefined
+    const routeTokens = makeRouteTokens({ store, locked: () => vault.state() === "locked", report: (ignored) => tokenIssues?.(ignored) })
 
     // The household store (docs/STORING-DATA.md): opened after the writer lock, and every module's data judged and
     // upgraded before any module is made. A database from a newer assistant stops the start here.
@@ -393,6 +396,8 @@ export const startServe = (options: ServeOptions): Effect.Effect<ServeHandle, Ht
       if (parts === undefined) return undefined
       const { assistantId, connection, deviceId, person } = parts
       if (assistantId !== undefined && !assistantsNow().has(assistantId)) return `the assistant "${assistantId}" does not exist.`
+      // A person is checked whether or not the call names a device (a job may name a person and no device).
+      if (person !== undefined) return "this server knows no people yet."
       if (deviceId === undefined) return undefined
       if (!devices.known(deviceId) && hub?.deviceConnected(deviceId) !== true) return `the device "${deviceId}" is not known.`
       if (assistantId !== undefined) {
@@ -402,7 +407,6 @@ export const startServe = (options: ServeOptions): Effect.Effect<ServeHandle, Ht
         if (!assigned) return `the assistant "${assistantId}" is not on the device "${deviceId}".`
       }
       if (connection !== undefined && hub?.deviceOfConnection(connection) !== deviceId) return `the request did not come from the device "${deviceId}".`
-      if (person !== undefined) return "this server knows no people yet."
       return undefined
     }
     const keys = makeKeys({ vault, store, host })
@@ -1421,7 +1425,8 @@ export const startServe = (options: ServeOptions): Effect.Effect<ServeHandle, Ht
     }
     health.subscribe((info) => hubNow.broadcast({ type: "health", health: info }))
     host.subscribe((module) => {
-      hubNow.broadcast({ type: "module.changed", module: access.module(module) })
+      // One module's projection, within one frame (`withinModuleFrame`, the guard the snapshot's entries pass too).
+      hubNow.broadcast({ type: "module.changed", module: withinModuleFrame(access.module(module)) })
       if (module.id === SUBSCRIPTION_AGENT_ID && theEngine.status().engines.some((e) => e.provider === SUBSCRIPTION_PROVIDER)) theEngine.refreshStatus()
     })
     sections.subscribe((section) => hubNow.broadcast({ type: "section.changed", section: access.section(section) }))
@@ -1482,6 +1487,15 @@ export const startServe = (options: ServeOptions): Effect.Effect<ServeHandle, Ht
       ...(options.modelListTimeoutMs !== undefined ? { listTimeoutMs: options.modelListTimeoutMs } : {}),
       ...(options.modelCatalogNow !== undefined ? { now: options.modelCatalogNow } : {})
     })
+    tokenIssues = (ignored) =>
+      host.issues.set("route-tokens", ignored === 0 ? [] : [{
+        id: "route-tokens.ignored",
+        severity: "warning",
+        title: `${ignored} stored route token${ignored === 1 ? " is" : "s are"} ignored`,
+        detail: "They are not valid (a changed id or details, or more than a module may hold), so they do not let anyone in and are not listed. Mint new tokens for the callers that need them.",
+        fix: { kind: "link", label: "Open Modules", value: "#settings/shared/modules" }
+      }])
+    routeTokens.audit()
     // P3: module HTTP routes under /api/modules/ (docs/UI-AND-MODULES.md §1.11), and their admin view in the API.
     const moduleRouter = makeModuleRouter({
       host,

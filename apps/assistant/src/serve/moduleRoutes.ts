@@ -3,8 +3,9 @@ import {
   DEFAULT_ROUTE_RATE,
   DEFAULT_ROUTE_TIMEOUT_MS,
   type IssueRegistry,
-  makeStragglers,
+  makeModuleSlots,
   matchRoutePath,
+  MAX_ROUTE_SLOTS,
   type ModuleHost,
   type ModuleRoute,
   outsideTurns,
@@ -12,7 +13,7 @@ import {
   type RouteRequest,
   type RouteResponse,
   RouteTokenError,
-  stragglerIssues
+  slotIssues
 } from "@pva/core"
 import {
   DEFAULT_ROUTE_BODY_BYTES,
@@ -23,7 +24,7 @@ import {
   ROUTE_CALL_LOG_SIZE,
   type RouteTokenInfo
 } from "@pva/protocol"
-import { Cause, type Context, Effect, Exit, Fiber, Option } from "effect"
+import { Cause, type Context, Effect, Exit } from "effect"
 import type * as http from "node:http"
 import * as net from "node:net"
 import type { AdminSessions } from "./AdminSessions.ts"
@@ -38,16 +39,16 @@ import type { RouteTokenKeeper } from "./RouteTokens.ts"
  * marks as cross-site, `Sec-Fetch-Site` or a foreign `Origin`; no CORS header is ever sent) → rate limit (429, per
  * caller address and per route) → guards, every declared one must pass: `lan` (403), `admin` (401), `token` (503
  * while the vault is locked, else 401) → body (413 over the limit or on a route that takes none, 415 not JSON, 400 bad
- * JSON) → the route is still its module's published one (503 after a restart or stop) → the handler, in its own fiber
- * in the shared part's scope with its time limit (504 at the deadline; the handler is interrupted and its cleanup
- * runs on in the background), a failure answering 500 (logged; nothing of it is sent). Nothing here runs on a turn's
- * path or the WebSocket's.
+ * JSON) → the route is still its module's published one (503 after a restart or stop) → the handler, in a slot of
+ * its module (`ModuleSlots`: 503 with `Retry-After` when all `MAX_ROUTE_SLOTS` are taken, before any module code runs)
+ * and in its own fiber in the shared part's scope, a failure answering 500 (logged; nothing of it is sent). Nothing
+ * here runs on a turn's path or the WebSocket's.
  *
- * **Handlers that do not stop.** The 504 is prompt, but a handler's cleanup may not end (an uninterruptible loop, a
- * finalizer that never returns). One still running `cleanupMs` (10 s) after it was interrupted is logged and counts as
- * a straggler of its module until it really ends (`Stragglers`); at `MAX_ROUTE_STRAGGLERS` the module's routes answer
- * every new request 503 (after 404/405) until some end, and Health says so. Only the log line is bounded in time; the
- * work is bounded in number.
+ * **The answer never waits for cleanup.** It is the first of: the handler's result, its deadline (504), the host's
+ * stop signal after the grace period (503), the caller going away (nothing to answer). In the last three the handler
+ * is interrupted and not waited for; its slot stays taken until its fiber has really ended (its finalizers included),
+ * so at most `MAX_ROUTE_SLOTS` handlers of a module ever run at once, however they ended. While a module has refused a
+ * request at its cap, Health says so (`routes:<moduleId>`); the issue clears when one of its slots is free again.
  *
  * **Reverse proxies.** The caller's address is the socket's, and forwarding headers (`Forwarded`, `X-Forwarded-For`,
  * `X-Real-IP`, …) are never read for it. The server cannot tell a proxied request from a local one by itself (a proxy
@@ -59,7 +60,7 @@ import type { RouteTokenKeeper } from "./RouteTokens.ts"
 
 export interface ModuleRouterOptions {
   readonly host: Pick<ModuleHost, "routes" | "modules" | "pageText" | "routeView">
-  /** Where the router reports a module whose handlers did not stop (`routes:<moduleId>`). Absent: not reported. */
+  /** Where the router reports a module whose route slots were all taken when it refused a request (`routes:<moduleId>`). Absent: not reported. */
   readonly issues?: IssueRegistry
   readonly admin: Pick<AdminSessions, "enabled" | "check" | "touch">
   readonly tokens: RouteTokenKeeper
@@ -67,10 +68,11 @@ export interface ModuleRouterOptions {
   readonly services: Context.Context<never>
   /** The server's scheme: its own origin is `<scheme>://<Host>`. Default `http`. */
   readonly scheme?: "http" | "https"
-  /** A reverse proxy is in front (`SERVE_BEHIND_PROXY`): no caller counts as on the home network. Default false. */
+  /**
+   * A reverse proxy is in front (`SERVE_BEHIND_PROXY`): no caller counts as on the home network, and the same-origin
+   * check of a route that is not public ignores the scheme (`crossSiteReason`). Default false.
+   */
   readonly behindProxy?: boolean
-  /** How long a timed-out handler's cleanup may take in the background before it is logged. Default 10 s. */
-  readonly cleanupMs?: number
   readonly now?: () => number
   /** The caller's address. Default: the socket's (`req.socket.remoteAddress`); tests give others. */
   readonly remoteAddress?: (req: http.IncomingMessage) => string | undefined
@@ -91,10 +93,10 @@ export const isModuleRoutePath = (url: string | undefined): boolean => (url ?? "
 
 const FORWARDING_HEADERS = ["forwarded", "x-forwarded-for", "x-real-ip", "x-forwarded-host", "x-forwarded-proto"]
 
-/** How long a timed-out handler's interruption may take before it is logged and counted (`ModuleRouterOptions.cleanupMs`). */
-export const ROUTE_CLEANUP_MS = 10_000
-/** Handlers of one module that did not stop before its routes refuse new requests (503). */
-export const MAX_ROUTE_STRAGGLERS = 8
+/** What a request refused at the module's slot cap is told to wait (`Retry-After`, seconds). */
+export const ROUTE_BUSY_RETRY_S = 5
+/** The status a call's log entry has when its caller went away before the answer (nothing was sent): nginx's 499. */
+export const ROUTE_CANCELLED_STATUS = 499
 /** Per-address rate windows kept at once (the oldest goes first); route totals are kept apart and never evicted. */
 const MAX_ADDRESS_WINDOWS = 4096
 /** Routes whose call log is kept (the least recently called goes first), live or retired. */
@@ -287,12 +289,22 @@ const declaredLength = (req: http.IncomingMessage): number | "unknown" | "none" 
  * Why a browser request from another site is refused, or `undefined`. `Sec-Fetch-Site` other than `same-origin`,
  * `same-site` or `none`, or an `Origin` that is not this server's own (`<scheme>://<Host>`, the Host already passed
  * the allowed-hosts check). A request with neither header (a script, a webhook sender) is judged by the guards.
+ *
+ * `behindProxy` (`SERVE_BEHIND_PROXY`): a proxy that terminates TLS makes the browser's scheme unknowable here, so the
+ * scheme is ignored and the `Origin`'s host and port must equal the `Host` header exactly (the proxy must pass `Host`
+ * through unchanged). No forwarding header is read.
  */
-export const crossSiteReason = (req: http.IncomingMessage, scheme: "http" | "https"): string | undefined => {
+export const crossSiteReason = (req: http.IncomingMessage, scheme: "http" | "https", behindProxy = false): string | undefined => {
   const site = req.headers["sec-fetch-site"]
   if (typeof site === "string" && !["same-origin", "same-site", "none"].includes(site.trim().toLowerCase())) return "Requests from another site are refused"
   const origin = req.headers.origin
-  if (typeof origin === "string" && origin.toLowerCase() !== `${scheme}://${req.headers.host ?? ""}`.toLowerCase()) return "Requests from another site are refused"
+  if (typeof origin !== "string") return undefined
+  const host = (req.headers.host ?? "").toLowerCase()
+  if (behindProxy) {
+    const authority = /^[a-z][a-z0-9+.-]*:\/\/([^/?#]+)$/i.exec(origin)?.[1]
+    return host !== "" && authority !== undefined && authority.toLowerCase() === host ? undefined : "Requests from another site are refused"
+  }
+  if (origin.toLowerCase() !== `${scheme}://${host}`) return "Requests from another site are refused"
   return undefined
 }
 
@@ -309,13 +321,12 @@ export const makeModuleRouter = (options: ModuleRouterOptions): ModuleRouter => 
   const now = options.now ?? Date.now
   const scheme = options.scheme ?? "http"
   const behindProxy = options.behindProxy === true
-  const cleanupMs = options.cleanupMs ?? ROUTE_CLEANUP_MS
   const limiter = makeLimiter(now)
   const nameOf = (moduleId: string) => options.host.modules().find((m) => m.id === moduleId)?.name ?? moduleId
-  const stragglers = makeStragglers({
-    cap: MAX_ROUTE_STRAGGLERS,
-    cleanupMs,
-    changed: (moduleId, count) => options.issues?.set(`routes:${moduleId}`, stragglerIssues(moduleId, nameOf(moduleId), "routes", count, MAX_ROUTE_STRAGGLERS))
+  // The route slots of each module: the only way a handler is started (`ModuleSlots.run`).
+  const slots = makeModuleSlots({
+    cap: MAX_ROUTE_SLOTS,
+    report: (moduleId, full) => options.issues?.set(`routes:${moduleId}`, full ? slotIssues(moduleId, nameOf(moduleId), "routes", MAX_ROUTE_SLOTS) : [])
   })
   // The last calls per route (`moduleId method path`); at most `MAX_LOGGED_ROUTES` routes, least recently called first out.
   const logs = new Map<string, Array<RouteCall>>()
@@ -367,14 +378,10 @@ export const makeModuleRouter = (options: ModuleRouterOptions): ModuleRouter => 
       return { refused: plain(405, "Method not allowed", { Allow: [...new Set(matching.map((m) => m.route.method))].join(", ") }) }
     }
     const { route, params, published } = found
-    // Too many of its earlier handlers did not stop: no new work for the module until some end.
-    if (stragglers.full(moduleId)) {
-      return { route, refused: plain(503, "The module is still stopping earlier requests; try again later", { "Retry-After": String(Math.ceil(cleanupMs / 1000)) }) }
-    }
     // A page on another site may make a browser send a simple request (no preflight) with the browser's own address:
     // refused before anything of the route runs. A public route (a GET without a body) is a browser's to arrive on.
     if (route.public !== true) {
-      const reason = crossSiteReason(req, scheme)
+      const reason = crossSiteReason(req, scheme, behindProxy)
       if (reason !== undefined) return { route, refused: plain(403, reason) }
     }
     const rate = { ...DEFAULT_ROUTE_RATE, ...route.rateLimit }
@@ -415,9 +422,30 @@ export const makeModuleRouter = (options: ModuleRouterOptions): ModuleRouter => 
     let moduleId = ""
     let token: string | undefined
     let answered = false
-    const finish = (answer: Answer) => {
+    /** Did the caller go away before the answer was written (the response closed unfinished)? */
+    let gone = false
+    let fiber: { readonly interruptUnsafe: () => void } | undefined
+    /**
+     * The one way a request ends (idempotent): its outcome is recorded exactly once, whatever ended it. An answer is
+     * written unless the caller has gone; a caller that went away is recorded as cancelled and nothing is written.
+     */
+    const settle = (answer: Answer | "cancelled") => {
       if (answered) return
       answered = true
+      if (answer === "cancelled" || gone) {
+        if (!req.complete) req.resume()
+        if (route !== undefined) {
+          record(moduleId, route, {
+            at: started,
+            address,
+            status: ROUTE_CANCELLED_STATUS,
+            ms: Math.max(0, now() - started),
+            ...(token !== undefined ? { token } : {}),
+            note: "Cancelled: the caller went away before the answer"
+          })
+        }
+        return
+      }
       const status = send(res, answer)
       if (!req.complete) req.resume()
       if (route !== undefined) {
@@ -431,6 +459,15 @@ export const makeModuleRouter = (options: ModuleRouterOptions): ModuleRouter => 
         })
       }
     }
+    const finish = (answer: Answer) => settle(answer)
+    // The caller went away: recorded once as cancelled; the wait for the answer is interrupted, which asks the handler
+    // to stop (its slot stays taken until it has ended).
+    res.on("close", () => {
+      if (res.writableEnded) return
+      gone = true
+      settle("cancelled")
+      fiber?.interruptUnsafe()
+    })
     // Everything of a request, admission to answer: whatever goes wrong is a 500 for this request, never the process's.
     const run = async (): Promise<void> => {
       const url = new URL(req.url ?? "/", "http://x")
@@ -501,36 +538,38 @@ export const makeModuleRouter = (options: ModuleRouterOptions): ModuleRouter => 
       const timeoutMs = current.timeoutMs ?? DEFAULT_ROUTE_TIMEOUT_MS
       const label = `module route ${moduleId} ${current.method} ${current.path}`
       const answer = Effect.gen(function*() {
-        // In the shared part's scope: when that part is closed (after a restart's grace period) the handler is
-        // interrupted (503), so it never runs on with its resources gone.
-        // Outside any turn or job, whatever the serving fiber carries (module code the host starts never sees one).
-        const fiber = yield* Effect.forkIn(outsideTurns(Effect.suspend(() => current.handler(request))), live.scope)
-        const exit = yield* Fiber.await(fiber).pipe(
-          Effect.timeoutOption(timeoutMs),
-          Effect.onInterrupt(() => Effect.sync(() => fiber.interruptUnsafe()))
-        )
-        if (Option.isNone(exit)) {
-          // The caller gets its 504 now; the interruption and the handler's finalizers run on. One that has not ended
-          // `cleanupMs` later is logged and counted against the module's cap until it does.
-          fiber.interruptUnsafe()
-          yield* stragglers.watch(moduleId, fiber, Effect.logWarning(`${label}: still cleaning up ${cleanupMs} ms after its time limit`))
-          return plain(504, "The module did not answer in time")
+        // In a slot of its module, in the shared part's scope (when that part is closed the handler is interrupted, so
+        // it never runs on with its resources gone), outside any turn or job, whatever the serving fiber carries
+        // (module code the host starts never sees one). The answer is the first of its result, its deadline, the
+        // host's stop signal and this fiber's interruption (the caller went away); none waits for its cleanup.
+        const outcome = yield* slots.run(moduleId, outsideTurns(Effect.suspend(() => current.handler(request))), {
+          timeoutMs,
+          stopped: live.stopped,
+          scope: live.scope
+        })
+        switch (outcome._tag) {
+          case "full":
+            return plain(503, "The module is busy with earlier requests; try again later", { "Retry-After": String(ROUTE_BUSY_RETRY_S) })
+          case "timeout":
+            return plain(504, "The module did not answer in time")
+          case "stopped":
+            return plain(503, "The module stopped while answering; try again")
         }
-        if (Exit.isSuccess(exit.value)) {
-          const encoded = encodeResponse(exit.value.value)
+        const exit = outcome.exit
+        if (Exit.isSuccess(exit)) {
+          const encoded = encodeResponse(exit.value)
           if (encoded.status === 500 && encoded.note !== undefined) yield* Effect.logError(`${label}: ${encoded.note}`)
           return encoded
         }
-        if (Cause.hasInterruptsOnly(exit.value.cause)) return plain(503, "The module stopped while answering; try again")
-        yield* Effect.logError(`${label} failed`, exit.value.cause)
+        if (Cause.hasInterruptsOnly(exit.cause)) return plain(503, "The module stopped while answering; try again")
+        yield* Effect.logError(`${label} failed`, exit.cause)
         return plain(500, "The module could not answer (see the server's log)")
       })
-      const fiber = Effect.runForkWith(options.services)(answer)
-      // The caller went away: stop the handler.
-      res.on("close", () => {
-        if (!res.writableEnded) fiber.interruptUnsafe()
-      })
-      fiber.addObserver((exit) => {
+      // Gone while the body was read or the route looked up: settled already, nothing is started.
+      if (gone) return
+      const running = Effect.runForkWith(options.services)(answer)
+      fiber = running
+      running.addObserver((exit) => {
         if (Exit.isSuccess(exit)) finish(exit.value)
         else if (!res.writableEnded) res.destroy()
       })

@@ -236,8 +236,8 @@ export const makeCachedJson = (deps: CachedJsonDeps = {}): CachedJson => {
       let value: unknown
       try {
         value = JSON.parse(response.text().replace(/^\uFEFF/, ""))
-      } catch (e) {
-        return yield* Effect.fail(new NetBadJson({ url, detail: e instanceof Error ? e.message : String(e) }))
+      } catch {
+        return yield* Effect.fail(new NetBadJson({ url, detail: "the response is not valid JSON" }))
       }
       const etag = response.headers["etag"]
       cache.setIfNewer(key, { value, ...(etag !== undefined ? { etag } : {}), url: response.url, storedAt: now(), sequence })
@@ -271,33 +271,40 @@ export const makeCachedJson = (deps: CachedJsonDeps = {}): CachedJson => {
       // One request per representation and fetch setup; the caller's own signal is not part of it.
       const f = options.fetch
       const flightKey = `${key}\n${f?.maxBytes ?? ""}|${f?.timeoutMs ?? ""}|${f?.maxRedirects ?? ""}|${idOf(f?.resolver)}|${idOf(f?.connector)}`
-      let shared = inflight.get(flightKey)
-      if (shared === undefined) {
-        const deferred = Deferred.makeUnsafe<Outcome, CachedJsonError>()
-        const s: Shared = { deferred, interrupt: () => undefined, waiters: 0, settled: false }
-        const settle = Effect.sync(() => { s.settled = true; if (inflight.get(flightKey) === s) inflight.delete(flightKey) })
-        const fiber = yield* refresh(url, key, plain, options).pipe(
-          Effect.exit,
-          Effect.flatMap((exit) => settle.pipe(Effect.andThen(Deferred.done(deferred, exit)))),
-          // Interrupted (no one waits, or the runtime stops): anyone still waiting is told, never left hanging.
-          Effect.onInterrupt(() => settle.pipe(Effect.andThen(Deferred.interrupt(deferred)))),
-          Effect.forkDetach
-        )
-        ;(s as { interrupt: () => void }).interrupt = () => fiber.interruptUnsafe()
-        inflight.set(flightKey, s)
-        shared = s
-      }
-      const s = shared
-      s.waiters++
-      const leave = Effect.sync(() => {
-        s.waiters--
-        // Nobody waits any more: cancel the request, and let the next caller start a new one.
-        if (s.waiters === 0 && !s.settled) {
-          if (inflight.get(flightKey) === s) inflight.delete(flightKey)
-          s.interrupt()
+      // Joining or starting the flight, and registering this caller as a waiter with its cleanup, is one uninterruptible step; only the
+      // wait itself is interruptible (review round 5, finding 1). The slot is published in the same synchronous step that creates it,
+      // before its refresh can run, so a refresh that settles removes exactly its own slot and a settled slot is never inserted.
+      const outcome = yield* Effect.uninterruptibleMask((restore) => Effect.gen(function* () {
+        let s = inflight.get(flightKey)
+        const created = s === undefined
+        if (s === undefined) {
+          s = { deferred: Deferred.makeUnsafe<Outcome, CachedJsonError>(), interrupt: () => undefined, waiters: 0, settled: false }
+          inflight.set(flightKey, s)
         }
-      })
-      const outcome = yield* untilAborted(Deferred.await(s.deferred), options.fetch?.signal, url).pipe(Effect.exit, Effect.ensuring(leave))
+        const own = s
+        own.waiters++
+        if (created) {
+          const settle = Effect.sync(() => { own.settled = true; if (inflight.get(flightKey) === own) inflight.delete(flightKey) })
+          const fiber = yield* refresh(url, key, plain, options).pipe(
+            Effect.exit,
+            Effect.flatMap((exit) => settle.pipe(Effect.andThen(Deferred.done(own.deferred, exit)))),
+            // Interrupted (no one waits, or the runtime stops): anyone still waiting is told, never left hanging.
+            Effect.onInterrupt(() => settle.pipe(Effect.andThen(Deferred.interrupt(own.deferred)))),
+            Effect.forkDetach
+          )
+          // This caller is a waiter until its `leave`, so nobody can find the flight without waiters before the handle is set.
+          ;(own as { interrupt: () => void }).interrupt = () => fiber.interruptUnsafe()
+        }
+        const leave = Effect.sync(() => {
+          own.waiters--
+          // Nobody waits any more: cancel the request, and let the next caller start a new one.
+          if (own.waiters === 0 && !own.settled) {
+            if (inflight.get(flightKey) === own) inflight.delete(flightKey)
+            own.interrupt()
+          }
+        })
+        return yield* restore(untilAborted(Deferred.await(own.deferred), options.fetch?.signal, url)).pipe(Effect.exit, Effect.ensuring(leave))
+      }))
       if (Exit.isSuccess(outcome)) {
         const o = outcome.value
         return { value: o.value as A, source: o.source, ageMs: o.ageMs } satisfies JsonResult<A>

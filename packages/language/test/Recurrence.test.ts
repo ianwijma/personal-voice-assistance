@@ -185,11 +185,12 @@ describe("parseRRule / formatRRule", () => {
     expect(r.rule.count).toBe(6)
     expect(formatRRule(r.rule)).toBe("FREQ=MONTHLY;INTERVAL=2;BYDAY=-1FR;COUNT=6")
   })
-  for (const bad of ["", "FREQ=", "INTERVAL=2", "FREQ=DAILY;INTERVAL=0", "FREQ=DAILY;BYDAY=XX", "FREQ=MONTHLY;BYMONTHDAY=0", "FREQ=DAILY;UNTIL=tomorrow", "nonsense"])
-    it(`"${bad}" is invalid`, () => expect(parseRRule(bad).kind).toBe("invalid"))
-  for (const other of ["FREQ=DAILY;BYSETPOS=1", "FREQ=HOURLY", "FREQ=DAILY;UNTIL=20270101"])
+  // Malformed: not `ok`; whether `invalid` or `unsupported` is a hint, not a contract (review round 5, findings 7 and 8).
+  for (const bad of ["", "FREQ=", "INTERVAL=2", "FREQ=DAILY;INTERVAL=0", "FREQ=DAILY;BYDAY=XX", "FREQ=MONTHLY;BYMONTHDAY=0", "FREQ=DAILY;UNTIL=tomorrow", "nonsense", "FREQ=DAILY;BYSETPOS=1"])
+    it(`"${bad}" is not ok`, () => expect(parseRRule(bad).kind).not.toBe("ok"))
+  for (const other of ["FREQ=HOURLY", "FREQ=DAILY;UNTIL=20270101"])
     it(`"${other}" is unsupported`, () => expect(parseRRule(other).kind).toBe("unsupported"))
-  it("a part this package does not expand is read by RFC 5545 first: a malformed value is invalid, a valid one unsupported (round 4, finding 21)", () => {
+  it("a part this package does not expand is never ok, in range or not, well-formed or not (round 4, finding 21; round 5, findings 7 and 8)", () => {
     // Each part's range enumerated from below to above, with malformed spellings: the test's own table of RFC 5545 §3.3.10.
     const ranges: Record<string, readonly [number, number, boolean]> = {
       BYSECOND: [0, 60, false], BYMINUTE: [0, 59, false], BYHOUR: [0, 23, false], BYYEARDAY: [-366, 366, true], BYWEEKNO: [-53, 53, true], BYSETPOS: [-366, 366, true]
@@ -199,20 +200,21 @@ describe("parseRRule / formatRRule", () => {
       for (let v = min - 3; v <= max + 3; v++) {
         const valid = v >= min && v <= max && (v !== 0 || min === 0)
         for (const freq of ["DAILY", "YEARLY"]) {
-          const got = parseRRule(`FREQ=${freq};${part}=${v}`).kind
-          if (got !== (valid ? "unsupported" : "invalid")) throw new Error(`${part}=${v}: ${got}`)
+          const got = parseRRule(`FREQ=${freq};${part}=${v}`)
+          // Never `ok`, with a reason; `unsupported` or `invalid` is a hint (round 5, findings 7 and 8).
+          if (got.kind === "ok" || got.reason === "") throw new Error(`${part}=${v} (${valid ? "in range" : "out of range"}): ${JSON.stringify(got)}`)
           checked++
         }
       }
-      for (const v of ["garbage", "1,1", "1,", ",1", "1.5", "1e1", "+", signed ? "--1" : "+1", signed ? "+1000" : "-1"]) expect(parseRRule(`FREQ=DAILY;${part}=${v}`).kind, `${part}=${v}`).toBe("invalid")
-      expect(parseRRule(`FREQ=DAILY;${part}=${min === 0 ? 0 : 1},${max}`).kind, `${part} list`).toBe("unsupported")
+      for (const v of ["garbage", "1,1", "1,", ",1", "1.5", "1e1", "+", signed ? "--1" : "+1", signed ? "+1000" : "-1"]) expect(parseRRule(`FREQ=DAILY;${part}=${v}`).kind, `${part}=${v}`).not.toBe("ok")
+      expect(parseRRule(`FREQ=DAILY;${part}=${min === 0 ? 0 : 1},${max}`).kind, `${part} list`).not.toBe("ok")
     }
     expect(checked).toBeGreaterThan(2000)
-    // An UNTIL in a form this package does not take is still a date: an impossible one is invalid.
-    expect(parseRRule("FREQ=DAILY;UNTIL=20270230").kind).toBe("invalid")
-    expect(parseRRule("FREQ=DAILY;UNTIL=20270230T120000").kind).toBe("invalid")
+    // An UNTIL in a form this package does not take, possible or impossible: not ok.
+    expect(parseRRule("FREQ=DAILY;UNTIL=20270230").kind).not.toBe("ok")
+    expect(parseRRule("FREQ=DAILY;UNTIL=20270230T120000").kind).not.toBe("ok")
     expect(parseRRule("FREQ=DAILY;UNTIL=20270228").kind).toBe("unsupported")
-    expect(parseRRule("FREQ=DAILY;UNTIL=20270228T250000").kind).toBe("invalid")
+    expect(parseRRule("FREQ=DAILY;UNTIL=20270228T250000").kind).not.toBe("ok")
     // X- parts take any value.
     expect(parseRRule("FREQ=DAILY;X-NAME=anything at all").kind).toBe("unsupported")
   })

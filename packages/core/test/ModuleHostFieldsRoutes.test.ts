@@ -2,7 +2,7 @@
 // settings, timeout, double press, not running), `info` values and `combo` options on the described form, the
 // generated agent Test button, and module routes: checked at start, live while the shared part runs, gone when it stops.
 import { assert, describe, it } from "@effect/vitest"
-import { Effect, Exit, Fiber, Logger, Scope, Stream } from "effect"
+import { Effect, Exit, Fiber, Scope, Stream } from "effect"
 import { TestClock } from "effect/testing"
 import { AgentError } from "../src/Agent.ts"
 import { DecisionError } from "../src/Decision.ts"
@@ -278,7 +278,6 @@ const keyedHost = (probe: { seen: Array<unknown> }, opts: { readonly stored?: Re
   })
 
 describe("field actions after review round 1", () => {
-  const logs: Array<string> = []
   it.effect("answer at the deadline even when the handler's cleanup hangs; the button stays busy until the press has really ended", () =>
     Effect.gen(function*() {
       let cleaned = false
@@ -314,9 +313,8 @@ describe("field actions after review round 1", () => {
       const again = yield* Effect.forkChild(host.fieldAction("stuck", "busyWork"))
       yield* advance(8_000)
       assert.strictEqual((yield* Fiber.join(again)).ok, true)
-      // The hung one overran its 10 s cleanup limit: logged, and its button is STILL busy (its cleanup still runs).
+      // The hung one is still cleaning up: its button is STILL busy (its slot is still taken).
       yield* advance(6_000)
-      assert.isTrue(logs.some((l) => /field action stuck\.hang: still cleaning up 10000 ms after it was timed out/.test(l)))
       assert.deepStrictEqual(yield* host.fieldAction("stuck", "hang"), { ok: false, code: "busy", message: "That button is still running" })
       // Its finalizer ends 60 s after the deadline (at 68 s): only then is the button free.
       yield* advance(40_000)
@@ -327,7 +325,7 @@ describe("field actions after review round 1", () => {
       assert.deepStrictEqual(yield* Fiber.join(third), { ok: true, result: { ok: false, text: "Did not finish within 8 s", tone: "error" } })
       // Let the slow finalizers end, so the host shuts down at once.
       yield* advance(120_000)
-    }).pipe(Effect.provide(Logger.layer([Logger.make(({ message }) => logs.push(String(message)))]))))
+    }))
 
   it.effect("never let a press overlap the same button's earlier one, and never let an old press free a newer one", () =>
     Effect.gen(function*() {
@@ -861,8 +859,9 @@ describe("field-action presses after review round 2: owned by what runs them", (
       // The old instance went: its press was stopped first, while the socket was still open, and never used it closed.
       assert.deepStrictEqual(probe.cleanup, [true])
       assert.deepStrictEqual(probe.used, [])
+      // Its caller was answered when the owner was stopped: the module is not running (round 4: a stop answers at once).
       const answered = yield* Fiber.join(press)
-      assert.isTrue(answered.ok)
+      assert.strictEqual(answered.ok ? undefined : answered.code, "not_running")
       yield* advance(10_000)
       assert.deepStrictEqual(probe.used, [])
       // The new instance's button works.

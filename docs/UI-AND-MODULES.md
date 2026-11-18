@@ -334,7 +334,7 @@ The **module host** (`packages/core/src/ModuleHost.ts`, new, Node-free; persiste
 |---|---|---|---|
 | `disabled` | Not running; intent off | startup with intent off; disable completed | `starting` on enable |
 | `starting` | `start` is running (10 s limit) | enable; startup with intent on; retry | `running`, `error` |
-| `running` | Instance is in the snapshot | `start` succeeded | `stopping` on disable; stays `running` on reconfigure |
+| `running` | Instance is in the snapshot | `start` succeeded | `stopping` on disable, and on a reconfigure that changes what it runs (then `starting`); stays `running` on one that does not |
 | `stopping` | Removed from the snapshot; its calls in flight get up to 10 s, then its scope closes | disable; a change of what it runs | `disabled`, or `starting` again |
 | `error` | Intent on, not running. `error` says why | start failed or timed out; saved settings invalid; tool name clash | `starting` on enable (retry) or reconfigure; `disabled` on disable |
 | `unavailable` | Cannot run on this server (protocol 9, §1.10.3); `unavailable` says why and how to fix it | a required program or the platform is missing, or an unsupported `apiVersion` | `starting` (if wanted) once "Check again" finds it available |
@@ -354,8 +354,9 @@ Rules:
 - **System prompt and cache.** The system prompt of a turn is `base prompt + instructions of running modules (catalog order) + voice block`, built when the snapshot changes. A module change that alters the tool list or the instructions changes the cached prefix (tools → system → messages), so the next request writes a new cache entry: expect a slower first token on that one turn, visible in its trace. Context providers do not affect the cache.
 - **Context providers** are wrapped by the host with a 50 ms timeout; a slow provider contributes nothing to that turn and logs a warning (it must not add latency to every turn).
 - **Runtime trouble after start** (the Home Assistant server goes away): tools return `ToolError` as today; the module may set an `error`-tone status. The host does not restart modules automatically.
-- **Startup**: modules with intent on start concurrently with the engine build; neither waits for the other. A module still starting when the first turn begins is simply not in that turn's snapshot.
-- **Shutdown**: every module is stopped, consumers first, without grace; the whole close is bounded (30 s), and module code that does not finish closing in time is left to finish on its own and logged.
+- **Startup**: in the CLI modes, modules with intent on start concurrently with the engine build; neither waits for the other. In serve mode the host starts nothing before `startEnabled`, which serve mode calls once what the modules depend on is built. A module still starting when the first turn begins is simply not in that turn's snapshot.
+- **Shutdown**: every module is withdrawn first, in one step (nothing of any module stays published or callable, and every host object answers `ModuleStopped`); then the parts are closed, consumers first, without grace; the whole close is bounded (30 s), and module code that does not finish closing in time is left to finish on its own and logged.
+- **The grace period** covers the calls admitted to the stopping module itself (its tools, actions and context providers). A call another module makes into its service while it stops may fail; the consumer handles that failure.
 
 ### 1.5 Validation and error reporting
 
@@ -516,10 +517,15 @@ module's shared settings only: the `overridable` fields, which an assistant may 
 stop it; each instance validates its own effective settings in full). Shared code acting for a caller asks
 `ctx.settingsFor(assistantId)`: the shared (not overridable) values and that assistant's own value of each overridable
 field over the shared default; the
-current shared defaults with no assistant, `undefined` when they are not valid. It answers from the desired state the
-module was started with: a changed default of an overridable field (Amsterdam to London) changes an instance, so the
-module starts again and its `settingsFor` gives London from then on. Sockets, caches, handlers, services and
-contributions belong there. What it returns as `value`, every instance receives as `ctx.shared`.
+current shared defaults with no assistant, `undefined` when they are not valid. It answers from the latest accepted
+state of the run (who has the module on, their own values, the saved values and the defaults as of the last change that
+kept the run), with the secrets the run started with. Not every change that alters its answer restarts the module: an
+assistant joining or leaving an existing instance, assistants swapping between equal instances, and a changed default
+or saved value of an overridable field that no running instance uses (Amsterdam to London while the module runs only
+for `uses`) keep the run, and the same `settingsFor` answers London from then on. A change that does alter an instance
+restarts the module as below. So a module must not cache what `settingsFor` answers (or other shared state derived
+from it) on the assumption that every relevant change restarts it: ask when acting. Sockets, caches, handlers,
+services and contributions belong there. What it returns as `value`, every instance receives as `ctx.shared`.
 
 The shared part and the instances it serves start, run, stop and close **together** (docs/ARCHITECTURE.md "Module
 host"):
@@ -547,10 +553,12 @@ host"):
   a provider follows its consumers transitively.
 - A module used only through `uses` (no instance) is `running` while its shared part runs, and its `health()` gets
   `running: true`.
-- `requestRestart` (from the shared part or an instance) stops the module and starts it again, at most once every 5 s:
-  requests in between are merged into the next restart, and one made after the last restart began always leads to
-  another, so a tool list that changed again is not lost. One made during the part's own start applies once it is
-  published. The restart starts with the module's current settings and the secrets it ran with (a locked vault does
+- `requestRestart` (from a live shared part or instance) stops the module and starts it again. It is recorded in one
+  step (an interrupted caller made it whole or not at all). Requests are taken up at most once per 5 s, the ones in
+  between merged into the next restart: a module cannot restart itself in a tight loop (this is not a minimum
+  distance between two restarts). One made after the last one was taken up always leads to another, so a tool list
+  that changed again is not lost. A request from a part that is starting, from a start that failed, or from a part
+  being stopped (a finalizer) is ignored. The restart starts with the module's current settings and the secrets it ran with (a locked vault does
   not stop it). Restarts and every other start run outside any turn: the new start never sees the requesting tool's
   `CurrentTurn`. A host object that old code keeps after its part closed answers with `ModuleStopped`.
 #### 1.10.2 Services and contributions
@@ -603,8 +611,10 @@ requirements, why it is unavailable, a failed start (kept current), module code 
 again), and the last `health()` result. Every issue is normalised where it enters, whoever reported it: id, module,
 device, title and the fix's label and value are one line each, a detail keeps its line breaks, no other control
 character survives (no terminal escape reaches doctor's output or the page), every text is clipped to the wire's
-limits; one that still does not fit is replaced by a warning that says so. At most 20 issues per module, and
-`MAX_HEALTH_ISSUES` (100) and 256 KB in all, the rest said in one last issue ("And 12 more issues"); every list the
+limits; one that still does not fit is replaced by a warning that says so. Only the registry bounds them: a module's
+whole list is sorted by severity (so an error after many warnings is kept), and at most `MAX_HEALTH_ISSUES` (100) and
+256 KB in all are kept, the most severe first, the true number left out said in one last issue ("And 12 more
+issues"); every list the
 protocol gained for this (issues, templates per module, a template's modules and phrases, a tool's risks) has a
 maximum, so no message exceeds the frame limit.
 
@@ -632,8 +642,11 @@ opaque reference to the connection the request came in on (a voice turn: the tab
 turn starts; a typed turn: the tab that typed it, `TextInput.connection`). The Claude Code bridge captures it at the
 turn's start and gives it to every tool call the SDK makes **for that turn**: Claude Code announces each tool use in
 the turn's stream before it calls the tool, and the bridge routes a call only to the turn whose stream announced it
-(same name and input), never to "the turn in progress now"; a call of a turn that ended or was interrupted is refused,
-and one waiting inside the bridge when its turn is cancelled does not start. It is `undefined` in the CLI modes; a job
+(the same `tool_use` id, which Claude Code sends with the call), never to "the turn in progress now"; a call of a turn
+that ended or was interrupted is refused, and one waiting inside the bridge when its turn is cancelled does not start.
+A call that arrives without an id (an older Claude Code) is matched by name and input instead; then a late identical
+call of an ended turn can take a later turn's matching claim and run with that later turn's handler and context, and
+the later turn's own call is refused. The guarantee above holds for calls that carry an id. It is `undefined` in the CLI modes; a job
 carries its own origin (`CurrentJob`, P6).
 
 Every tool call and action run goes through one **execution gateway** (`Gateway.ts`): `ToolRegistry.run` (the model's
@@ -752,13 +765,19 @@ part, consumers before providers) first stops its presses, interrupting each and
 then closes the part's scope, so what a press uses (the instance's resources, then its shared part's) is still open
 for its cleanup; both within the host's time limit for closing a part, past which the part is abandoned and reported
 like a finalizer that hangs. A press is admitted only by a published part; one in flight when its module is withdrawn
-gets the host's grace period, like the module's calls, and is interrupted when the part is closed. The host's own owner is made with the host and stopped first when
-the host closes, before anything else; from then on every press is answered `not_running`, as is a press on a part
-being closed. It has 8 s: at the deadline the press is answered "Did not finish within 8 s" at once while its
-interruption and finalizers run on in the background; one still running 10 s later (`FIELD_ACTION_CLEANUP_MS`) is
-logged, still waited for (its button stays busy), and counts as a straggler of its module; at 4
-(`MAX_PRESS_STRAGGLERS`, across all its parts, so restarts cannot pile them up) the module's buttons are answered
-`busy` until some end, and Health says so (`<module>.presses-stuck`). Only a declared `action` field (or the generated
+gets the host's grace period, like the module's calls, and is interrupted when the part is closed. The host's own owner is made with the host. When
+the host closes, it stops admitting anything, signals its own presses, withdraws every module and signals their
+presses and calls, all in one step; only then does it wait (bounded) for its own presses' cleanup, before any module's
+resources are released. From then on every press is answered `not_running`, as is a press on a part being closed. **Slots** (`packages/core/src/ModuleSlots.ts`): a press runs in a slot of its module, at most 4 at once
+(`MAX_PRESS_SLOTS`, across all its owners, so restarts cannot pile them up). `ModuleSlots.run` is the only way a press
+starts: it takes the slot, starts the press's fiber and puts an observer on it in one step, and the observer gives the
+slot back exactly once, when that fiber has really ended, whatever ended the wait for it. At the cap a press is
+refused `busy` before any module code runs, and Health says so (`<module>.presses-busy`) until one of the module's
+slots is free again. The answer never waits for cleanup: it is the first of the press's result, its 8 s deadline
+("Did not finish within 8 s"), its owner being stopped after the grace period (`not_running`) and its caller being
+interrupted (no answer); in the last three the press is interrupted and not waited for, and its slot and its button stay
+taken until its interruption and finalizers have ended. A press that never ends keeps its slot until the process
+stops (docs/MODULES-PLAN.md §3.5). Only a declared `action` field (or the generated
 `test` of an agent or decision provider) is a button: a `fieldActions` entry without a field is never run
 (`unknown_action`). A failure or defect is answered with one generic
 sentence ("It failed; the server's log says why.") and its details go to the server's log; a generated Test's
@@ -766,6 +785,8 @@ provider failure too ("Failed after N ms; the server's log says why."). Result t
 then clipped to 500 characters; a generated agent Test redacts the answer before quoting it short. The page sends `module.action { moduleId, key, values? }` (admin only); the
 `result` carries `action: { ok, text, tone }`, shown next to the button. Codes: `unknown_module`,
 `unknown_action` (not a button), `not_running` (an instance handler of a module that does not run), `busy`.
+A "Test" press runs to its result or its time limit whether or not the page that pressed it is still connected; its
+result is discarded if nobody is there (closing the page does not stop it).
 
 **Module routes.** A version 2 module's `shared` part may return `routes`; each is answered under
 `/api/modules/<moduleId>/<path>` while that shared part is the published one (so a stopped module's paths answer
@@ -811,12 +832,17 @@ RouteResponse = { status /* 200–599 */, headers?, body?: string | Uint8Array |
   JSON; a chunked body is counted as it arrives), the route is still its module's published one (503 "restarted or
   stopped meanwhile": the body may have taken its time), then the handler. Whatever goes wrong unexpectedly in any of
   these steps is a 500 for that request, never the process's.
-- **The handler** runs in its own fiber in its shared part's scope: when that part is closed (a restart's or a stop's
-  grace period over) the handler is interrupted and the caller gets 503. At its time limit the caller gets 504 at
-  once; the interruption and the handler's finalizers run on in the background. One that has not ended 10 s later
-  (`ROUTE_CLEANUP_MS`) is logged and counts as a straggler of its module until it does; at 8
-  (`MAX_ROUTE_STRAGGLERS`) every new request to the module's routes is answered 503 (after 404 and 405) until some
-  end, and Health says so (`<module>.routes-stuck`). The work is bounded in number, not in time. A failure or defect answers 500 (logged; nothing of it is sent).
+- **The handler** runs in a **slot** of its module (`ModuleSlots`, as presses do), in its own fiber in its shared
+  part's scope (when that part is closed the handler is interrupted). At most 16 handlers of a module run at once
+  (`MAX_ROUTE_SLOTS`): the slot is taken before the handler starts and given back exactly once, when its fiber has
+  really ended (an observer on the fiber), however the wait for it ended. At the cap a request is answered 503 with
+  `Retry-After` (`ROUTE_BUSY_RETRY_S`) before any module code runs, and Health says so (`<module>.routes-busy`) until
+  one of the module's slots is free again. **The answer never waits for cleanup**: it is the first of the handler's
+  result, its time limit (504), the host's stop signal once a restart's or a stop's grace period is over (503,
+  `PublishedRoute.stopped`) and the caller going away (nothing to answer); in the last three the handler is
+  interrupted and not waited for, and its slot stays taken until its interruption and finalizers have ended. A
+  handler that never ends keeps its slot until the process stops (docs/MODULES-PLAN.md §3.5); nothing is abandoned
+  on top. A failure or defect answers 500 (logged; nothing of it is sent).
   The response must have a final status (200–599; anything else is a 500, logged), and header names and values must
   be valid (else the whole answer is a 500, and the call log records the status really sent). Nothing here runs on a
   turn or the WebSocket. Answers carry `Cache-Control: no-store` and `nosniff`; a handler cannot set framing headers
@@ -826,7 +852,10 @@ RouteResponse = { status /* 200–599 */, headers?, body?: string | Uint8Array |
   that is not this server's own (`<scheme>://<Host>`, the Host having passed the allowed-hosts check of §4.6;
   `SERVE_ALLOWED_ORIGINS` does not count, as no CORS is sent). A page elsewhere could otherwise make the browser of
   someone at home send a simple POST from a home address. A request with neither header (a script, a webhook
-  sender) is judged by the guards alone. A `public` route answers only GET (the browser arriving on an OAuth callback
+  sender) is judged by the guards alone. With `SERVE_BEHIND_PROXY` the scheme is ignored (a proxy that terminates
+  TLS makes it unknowable upstream) and the `Origin`'s host and port must equal the `Host` header exactly, so **the
+  proxy must pass `Host` through unchanged** (Caddy and `tailscale serve` do by default); no forwarding header is
+  read. A sibling origin on another port, a foreign origin and `null` are still refused. A `public` route answers only GET (the browser arriving on an OAuth callback
   from the provider's site) and reads no body.
 - **Rate limits**: a route's total is counted apart from the per-address windows and is never pushed out by many
   addresses; per-address windows are bounded (4096, the oldest goes first), an IPv6 caller is counted by its /64, and
@@ -851,11 +880,19 @@ RouteResponse = { status /* 200–599 */, headers?, body?: string | Uint8Array |
   reason. A module holds at most 20 tokens, judged inside the store's serialized save (two mints at once cannot both
   take the last place). While the settings files are damaged and wait for the owner's save (`blocked()`), no token can
   be minted or revoked (409 `blocked`, checked again inside the serialized save): a token change never counts as the
-  owner's word that the files are right, so it never unblocks the store or starts anything. Modules mint, list and revoke their own through `host.routeTokens` (`mint(name, label)`,
+  owner's word that the files are right, so it never unblocks the store or starts anything. A mint or revoke that
+  waited behind another save while the vault was locked is refused as locked (503), checked inside the serialized
+  save, never acknowledged without effect. One canonical list of the stored records decides checking, listing, the
+  limit, mint and revoke (`keptTokens`): a record counts only if its id and details are what the wire allows, its
+  secret's hash is not an earlier record's, and it is within its module's 20, in a fixed order (when made, then id).
+  Any other record is ignored for checking and listing alike, with one Health issue (`route-tokens.ignored`) saying how
+  many, and a mint or revoke saves exactly the list after its change, so ignored records are dropped from the file
+  then and can never take a revoked token's place. Modules mint, list and revoke their own through `host.routeTokens` (`mint(name, label)`,
   `list`, `revoke(id)`); the owner does it on the module page, choosing the token's purpose (its name) when the
   module's routes accept more than one.
 - **Admin view** (`GET /api/module-routes[?module=<id>]`, admin token): each module's routes with guards and limits,
-  the last 20 calls of each (time, caller address, status, token label, why it was refused; memory only), and its
+  the last 20 calls of each (time, caller address, status, token label, why it was refused; memory only; every ending
+  is recorded once, a caller that went away before the answer as `499` "Cancelled"), and its
   tokens (also of a module that does not run, so a stopped module's tokens can be revoked without starting it), and
   `behindProxy`; `POST /api/module-routes/<id>/tokens { name, label }` mints (201, the secret once), `DELETE
   /api/module-routes/<id>/tokens/<tokenId>` revokes; a module that is not installed is 404 (a stopped one is fine).

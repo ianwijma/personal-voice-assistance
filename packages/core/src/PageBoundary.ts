@@ -69,7 +69,14 @@ export const TOO_LONG = "[hidden: too long to show]"
 
 const isOptionTag = Schema.is(OptionTag)
 
-const clip = (text: string, max: number) => (text.length <= max ? text : `${text.slice(0, Math.max(0, max - 1))}…`)
+/** Cut to `max` characters with "…", never through the middle of a character (a surrogate pair stays whole). */
+const clip = (text: string, max: number) => {
+  if (text.length <= max) return text
+  let n = Math.max(0, max - 1)
+  const c = n > 0 ? text.charCodeAt(n - 1) : 0
+  if (c >= 0xd800 && c <= 0xdbff) n--
+  return `${text.slice(0, n)}…`
+}
 
 interface ModuleValues {
   /** Value → the holders that were given it. */
@@ -184,7 +191,8 @@ export const makePageBoundary = (options: {
   const matcher = (moduleId: string): Matcher => {
     const m = of(moduleId)
     const current = [...options.current(moduleId)].filter((v): v is string => typeof v === "string" && v.length > 0)
-    const key = `${m.revision}\u0000${current.join("\u0000")}`
+    // A collision-free key: a value may itself contain any character (NUL included), so the list is serialized whole.
+    const key = JSON.stringify([m.revision, current])
     if (m.cache?.key === key) return m.cache.matcher
     const built = matcherOf([...m.held.keys(), ...current])
     m.cache = { key, matcher: built }

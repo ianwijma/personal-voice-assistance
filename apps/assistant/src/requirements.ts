@@ -184,6 +184,9 @@ export interface RequirementCheckerOptions {
   readonly distro?: Distro
 }
 
+/** How the owner updates the assistant (README "Getting started": a git checkout with pnpm), run in its directory. */
+export const UPDATE_FIX = { kind: "command" as const, label: "Update the assistant, then restart it", value: "git pull && pnpm install" }
+
 export const makeRequirementChecker = (options: RequirementCheckerOptions): RequirementChecker => {
   const prober = options.prober ?? execProber
   // A Map: a program named "constructor" or "__proto__" is an unknown program, never an inherited property.
@@ -211,7 +214,9 @@ export const makeRequirementChecker = (options: RequirementCheckerOptions): Requ
           out = { kind: "failed", message: error instanceof Error ? error.message : String(error) }
         }
         if (out.kind === "ran") {
-          const m = entry.probe.version?.exec(out.output)
+          // A fresh pattern per probe: a global or sticky one (`/g`, `/y`) keeps `lastIndex` between calls.
+          const pattern = entry.probe.version
+          const m = pattern === undefined ? undefined : new RegExp(pattern.source, pattern.flags.replace(/[gy]/g, "")).exec(out.output)
           const reported = m?.[1]
           // It ran: found when it exited cleanly or printed its version; the version only if it is strict semver.
           result = reported !== undefined || out.exitCode === 0
@@ -244,7 +249,8 @@ export const makeRequirementChecker = (options: RequirementCheckerOptions): Requ
         : p.why === "not-recognised"
         ? `${r.tool} did not report its version`
         : `${r.tool} could not be run${p.message !== undefined ? ` (${p.message})` : ""}`
-      const fix = p !== undefined && p.why === "unknown-program" ? { kind: "link" as const, label: "Update the assistant", value: "#settings/shared/updates" } : installFix(r.tool, entry, distro)
+      // A program this version does not know: a newer assistant may (there is no update page in the admin app).
+      const fix = p !== undefined && p.why === "unknown-program" ? UPDATE_FIX : installFix(r.tool, entry, distro)
       return { requirement: r, state: "missing", detail, fix }
     }
     const shown = p.version !== undefined ? `${r.tool} ${p.version}` : p.reported !== undefined ? `${r.tool} ${p.reported}` : `${r.tool} is installed`

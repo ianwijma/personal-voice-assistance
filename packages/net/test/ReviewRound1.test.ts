@@ -266,7 +266,7 @@ describe("finding 23: concurrent misses share one request", () => {
     expect((await c).value).toBe(3)
     expect(g.calls()).toBe(2)
   })
-  it("callers with different limits or connectors do not share", async () => {
+  it("callers with different limits do not share (different connectors: round 6)", async () => {
     const g = gate()
     const api = makeCachedJson({ fetch: g.fetch })
     const a = Effect.runPromise(api.getJson("http://x/a", { ttlMs: 1000, fetch: { maxBytes: 100 } }))

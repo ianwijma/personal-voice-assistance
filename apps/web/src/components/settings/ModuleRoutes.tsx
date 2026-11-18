@@ -30,7 +30,10 @@ export function ModuleRoutes({ module: m, api: given }: { readonly module: Modul
   const [purpose, setPurpose] = useState<string | undefined>(undefined)
   const [minted, setMinted] = useState<{ readonly label: string; readonly name: string; readonly secret: string } | undefined>(undefined)
   const [busy, setBusy] = useState(false)
-  const routes = m.routes ?? []
+  // The routes as the module info lists them; the admin route API lists them all (a module whose projection was
+  // too large for one message lists fewer there, `withinModuleFrame`), so its list is shown when it has more.
+  const listed = m.routes ?? []
+  const routes = view !== undefined && view.routes.length > listed.length ? view.routes : listed
   const tokens = view?.tokens ?? []
   // Purposes: the token names of the routes now, and of tokens already made (a stopped module has no routes).
   const tokenNames = [...new Set([...routes.flatMap((r) => (r.token !== undefined ? [r.token] : [])), ...tokens.map((t) => t.name)])].sort()

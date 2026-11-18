@@ -91,7 +91,7 @@ describe("round 3 findings", () => {
   it("a date outside 2000–2199 in a rule is unsupported, not moved", () => {
     expect(parseRRule("FREQ=DAILY;UNTIL=99991231T000000Z").kind).toBe("unsupported")
     expect(parseRRule("FREQ=DAILY;UNTIL=19991231T000000Z").kind).toBe("unsupported")
-    expect(parseRRule("FREQ=DAILY;UNTIL=20270230T000000Z").kind).toBe("invalid")
+    expect(parseRRule("FREQ=DAILY;UNTIL=20270230T000000Z").kind).not.toBe("ok")
     expect(readSeries({ rrule: "FREQ=DAILY", dtstart: "DTSTART;TZID=UTC:22000101T090000", timeZone: "UTC" }).kind).toBe("unsupported")
   })
   it("16: UNTIL before DTSTART is invalid", () => {

@@ -28,6 +28,11 @@ export interface ConnectResponse {
   readonly status: number
   /** Lower-case names; repeated headers joined with ", ". */
   readonly headers: Readonly<Record<string, string>>
+  /**
+   * The raw `Content-Type` field lines, one string per line, never joined (the Node connector fills it from the raw headers). Absent:
+   * the single value of `headers["content-type"]` if there is one, else no line.
+   */
+  readonly contentTypeLines?: ReadonlyArray<string>
   readonly body: AsyncIterable<Uint8Array>
 }
 /** Opens one connection to `address`, sends the request, returns status, headers and a body stream. Must honour `signal`. */
@@ -161,7 +166,11 @@ export const makeNodeConnector = (connectorOptions: NodeConnectorOptions = {}): 
       }
       const out: Record<string, string> = Object.create(null)
       for (const [k, v] of Object.entries(res.headers)) if (v !== undefined) out[k] = Array.isArray(v) ? v.join(", ") : v
-      resolve({ status: res.statusCode ?? 0, headers: out, body: res })
+      // Node keeps only the first of several Content-Type lines in `res.headers`; the guard must see all of them (as separate lines).
+      const typeLines: Array<string> = []
+      for (let i = 0; i + 1 < res.rawHeaders.length; i += 2) if (res.rawHeaders[i]!.toLowerCase() === "content-type") typeLines.push(res.rawHeaders[i + 1]!)
+      if (typeLines.length > 1) out["content-type"] = typeLines.join(", ") // for display only: the parser reads `contentTypeLines`
+      resolve({ status: res.statusCode ?? 0, headers: out, contentTypeLines: typeLines, body: res })
     })
     req.on("error", reject)
     req.end()
@@ -271,14 +280,89 @@ const conditionalHeaders: ReadonlySet<string> = new Set(["if-none-match", "if-mo
 
 // ---- response types and encodings ---------------------------------------------------------------------------------------------------
 
-const mediaTypePattern = /^[a-z0-9!#$&^_.+-]+\/[a-z0-9!#$&^_.+-]+$/
-
-/** "Text/HTML; charset=UTF-8" → "text/html"; "" when there is none or it is not a media type. */
-export const mediaTypeOf = (header: string | undefined): string => {
-  if (header === undefined) return ""
-  const essence = header.split(";")[0]!.trim().toLowerCase()
-  return mediaTypePattern.test(essence) ? essence : ""
+/** A parsed Content-Type: the media type in lower case and its parameters (names lower-cased, the first of a name wins, quoted values unescaped). */
+export interface ParsedContentType {
+  readonly type: string
+  readonly parameters: ReadonlyMap<string, string>
 }
+/** A Content-Type that is not read: why. */
+export interface ContentTypeRefusal {
+  readonly refused: string
+}
+
+const tokenChars = /^[!#$%&'*+.^_`|~0-9A-Za-z-]+/
+
+/**
+ * Read the `Content-Type` field lines of a response (each line its own string, never joined) by RFC 9110 §8.3.1:
+ * `type "/" subtype *( OWS ";" OWS name "=" ( token / quoted-string ) )`, quoted-pairs unescaped. More than one line, no line, and
+ * anything the grammar does not allow (an unterminated quote, a comma or other text after the media type or a parameter, a control
+ * character, an empty type, a parameter without a value) is a refusal; only a trailing `;` is tolerated. This is the one place the
+ * header is read.
+ */
+export const parseContentType = (values: ReadonlyArray<string>): ParsedContentType | ContentTypeRefusal => {
+  if (values.length === 0) return { refused: "no content type" }
+  if (values.length > 1) return { refused: "more than one Content-Type field" }
+  const text = values[0]!
+  for (let i = 0; i < text.length; i++) {
+    const c = text.charCodeAt(i)
+    if ((c < 0x20 && c !== 0x09) || c === 0x7f) return { refused: "a control character in the content type" }
+  }
+  let i = 0
+  const ows = () => { while (text[i] === " " || text[i] === "\t") i++ }
+  const token = (): string | undefined => {
+    const m = tokenChars.exec(text.slice(i))
+    if (m === null) return undefined
+    i += m[0].length
+    return m[0]
+  }
+  ows()
+  const main = token()
+  if (main === undefined || text[i] !== "/") return { refused: "not a media type" }
+  i++
+  const sub = token()
+  if (sub === undefined) return { refused: "not a media type" }
+  const parameters = new Map<string, string>()
+  for (;;) {
+    ows()
+    if (i >= text.length) break
+    if (text[i] !== ";") return { refused: "text after the media type that is not a parameter" }
+    i++
+    ows()
+    if (i >= text.length) break // a trailing ";"
+    const name = token()
+    if (name === undefined || text[i] !== "=") return { refused: "a parameter without a name or a value" }
+    i++
+    let value: string
+    if (text[i] === '"') {
+      i++
+      value = ""
+      for (;;) {
+        if (i >= text.length) return { refused: "an unterminated quoted string" }
+        const c = text[i++]!
+        if (c === '"') break
+        if (c === "\\") {
+          if (i >= text.length) return { refused: "an unterminated quoted string" }
+          value += text[i++]!
+        } else value += c
+      }
+    } else {
+      const t = token()
+      if (t === undefined) return { refused: "a parameter without a value" }
+      value = t
+    }
+    const key = name.toLowerCase()
+    if (!parameters.has(key)) parameters.set(key, value)
+  }
+  return { type: `${main}/${sub}`.toLowerCase(), parameters }
+}
+
+/** "Text/HTML; charset=UTF-8" → "text/html"; "" when there is none or it is not read (a thin wrapper over `parseContentType`). */
+export const mediaTypeOf = (header: string | undefined): string => {
+  const parsed = parseContentType(header === undefined ? [] : [header])
+  return "refused" in parsed ? "" : parsed.type
+}
+
+const mediaTypePattern = /^[a-z0-9!#$&^_.+-]+\/[a-z0-9!#$&^_.+-]+$/
 
 const validPolicy = (policy: ContentTypePolicy | undefined): boolean =>
   policy !== undefined && Array.isArray(policy.types) && policy.types.length > 0 &&
@@ -303,12 +387,12 @@ const encodingOf = (header: string | undefined): Encoding | undefined => {
   return undefined // another coding, or several ("gzip, br")
 }
 
-/** The charset of a Content-Type, if this machine's TextDecoder knows it. */
-const decoderFor = (header: string | undefined): InstanceType<typeof TextDecoder> => {
-  const m = /;\s*charset\s*=\s*"?([^";\s]+)"?/i.exec(header ?? "")
-  if (m !== null) {
+/** The decoder for the `charset` parameter of a parsed Content-Type: UTF-8 when it has none or one this machine does not know. */
+const decoderFor = (parsed: ParsedContentType | ContentTypeRefusal): InstanceType<typeof TextDecoder> => {
+  const label = "refused" in parsed ? undefined : parsed.parameters.get("charset")
+  if (label !== undefined) {
     try {
-      return new TextDecoder(m[1]!)
+      return new TextDecoder(label)
     } catch {
       // unknown label: UTF-8 below
     }
@@ -450,7 +534,9 @@ const decodeBody = async (encoding: Exclude<Encoding, "identity">, body: AsyncIt
     throw new NetFailure({ url, stage: "response", detail: `The ${encoding} body could not be decompressed: ${detail}` })
   }
   if (otherFailure !== undefined) throw otherFailure
-  // A single-stream encoding that stopped before the last byte it was given: the rest is not part of the stream.
+  // A single-stream encoding that stopped before the last byte it was given: the rest is not part of the stream. Gzip is exempt: its
+  // gunzip reads member after member and fails on a suffix that is not one, except that from a zero byte after the last member on it
+  // stops and ignores the rest, as `gzip` does with padding (README; review round 5, finding 2).
   if (encoding !== "gzip" && stream.bytesWritten < written) {
     throw refuse("content-encoding", url, `The ${encoding} body has ${written - stream.bytesWritten} bytes after the end of its stream`)
   }
@@ -513,11 +599,12 @@ const positive = (v: number | undefined, fallback: number): number | undefined =
  * finding 7). The attempt's signal follows the request's, so cancelling the request (the total deadline, the caller) still stops a
  * connection that has answered and whose body is being read.
  */
-const attempt = async (connector: Connector, request: Omit<ConnectRequest, "signal">, signal: AbortSignal, budgetMs: number): Promise<ConnectResponse> => {
+const attempt = async (connector: Connector, request: Omit<ConnectRequest, "signal">, signal: AbortSignal, budgetMs: number | undefined): Promise<ConnectResponse> => {
   const own = new AbortController()
   const follow = () => own.abort(signal.reason)
   signal.addEventListener("abort", follow, { once: true })
-  const timer = setTimeout(() => own.abort(new Error(`No answer from ${request.address} within ${Math.round(budgetMs)} ms`)), budgetMs)
+  // Without a budget of its own (the last address) only the request's deadline ends the attempt, so the caller gets a NetTimeout.
+  const timer = budgetMs === undefined ? undefined : setTimeout(() => own.abort(new Error(`No answer from ${request.address} within ${Math.round(budgetMs)} ms`)), budgetMs)
   try {
     const response = await raceAbort(Promise.resolve().then(() => connector({ ...request, signal: own.signal })), own.signal)
     clearTimeout(timer)
@@ -553,14 +640,15 @@ const run = async (input: string | URL, options: SafeFetchOptions, allowLan: boo
     if (signal.aborted) throw signal.reason
     const resolved = await resolveHop(url, allowLan, resolver, signal)
     if (resolved instanceof NetRefused || resolved instanceof NetFailure) throw resolved
-    // Connect to the addresses we checked, in order: each attempt gets an equal share of the time left (the last one all of it), and
-    // the next address is tried when an attempt fails or runs out of its share.
+    // Connect to the addresses we checked, in order: each attempt gets an equal share of the time left, and the next address is tried
+    // when an attempt fails or runs out of its share. The last address has no share of its own: it has all the time left, and a timer
+    // of its own would race the request's deadline, turning a timeout into a connect failure whenever it fired first.
     let response: ConnectResponse | undefined
     let lastError = "no address"
     for (let k = 0; k < resolved.addresses.length; k++) {
       if (signal.aborted) throw signal.reason
       const left = resolved.addresses.length - k
-      const budget = Math.max(1, (deadline - Date.now()) / left)
+      const budget = left === 1 ? undefined : Math.max(1, (deadline - Date.now()) / left)
       try {
         response = await attempt(connector, { url, address: resolved.addresses[k]!, method, headers }, signal, budget)
         break
@@ -599,11 +687,13 @@ const run = async (input: string | URL, options: SafeFetchOptions, allowLan: boo
       current = checked
       continue
     }
-    const contentType = mediaTypeOf(responseHeaders["content-type"])
+    const typeLines = response.contentTypeLines ?? (responseHeaders["content-type"] === undefined ? [] : [responseHeaders["content-type"]])
+    const parsedType = parseContentType(typeLines)
+    const contentType = "refused" in parsedType ? "" : parsedType.type
     const finish = (body: Uint8Array, encoding: Encoding, decoded: boolean): SafeResponse => {
       const shownHeaders: Record<string, string> = Object.create(null)
       for (const [k, v] of Object.entries(responseHeaders)) if (!(decoded && (k === "content-encoding" || k === "content-length"))) shownHeaders[k] = v
-      const decoder = decoderFor(responseHeaders["content-type"])
+      const decoder = decoderFor(parsedType)
       return { url: url.href, status: response!.status, headers: shownHeaders, body, encoding, contentType, redirects, text: () => decoder.decode(body) }
     }
     // HEAD, 204 and 304 have no body: nothing to limit or to type-check.
@@ -611,12 +701,12 @@ const run = async (input: string | URL, options: SafeFetchOptions, allowLan: boo
       closeBody(response.body)
       return finish(new Uint8Array(0), "identity", false)
     }
-    const typeOk = acceptsType(options.accept, contentType)
+    const typeOk = !("refused" in parsedType) && acceptsType(options.accept, contentType)
     if (!typeOk) {
       closeBody(response.body)
       // An error page of another type is not read; the status still reaches the caller.
       if (response.status < 200 || response.status > 299) return finish(new Uint8Array(0), "identity", false)
-      throw refuse("content-type", url.href, contentType === "" ? `The response has no content type; a ${options.accept.name} was expected` : `The response is ${contentType}, not a ${options.accept.name}`)
+      throw refuse("content-type", url.href, "refused" in parsedType ? `The response has ${parsedType.refused === "no content type" ? "no content type" : `a Content-Type that is not read (${parsedType.refused})`}; a ${options.accept.name} was expected` : `The response is ${contentType}, not a ${options.accept.name}`)
     }
     const encoding = encodingOf(responseHeaders["content-encoding"])
     if (encoding === undefined) {

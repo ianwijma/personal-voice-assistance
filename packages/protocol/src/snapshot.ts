@@ -101,6 +101,11 @@ export const ModuleInfo = Schema.Struct({
   status: Schema.optionalKey(StatusLine),
   /** Tools of the running instance (empty while it is not running). */
   tools: Schema.Array(ToolInfo),
+  /**
+   * Protocol 10: tools of the running instance not listed in `tools` (the admin view lists at most 100, and a
+   * module's tools count toward what its form may take); the page says "and N more". Absent = none left out.
+   */
+  toolsLeft: Schema.optionalKey(NonNegativeInt),
   settings: SettingsForm,
   /** Increases on every change to this module; a client keeps the highest it has seen. */
   revision: NonNegativeInt,
@@ -135,7 +140,14 @@ export const ModuleInfo = Schema.Struct({
    * Protocol 10: the HTTP routes its shared part declares (docs/UI-AND-MODULES.md §1.11), while it runs. Absent =
    * none. The recent calls and the tokens are read through the admin API (`GET /api/module-routes`).
    */
-  routes: Schema.optionalKey(Schema.Array(ModuleRouteInfo).check(Schema.isMaxLength(MAX_ROUTES_PER_MODULE)))
+  routes: Schema.optionalKey(Schema.Array(ModuleRouteInfo).check(Schema.isMaxLength(MAX_ROUTES_PER_MODULE))),
+  /**
+   * Protocol 10: `"follow"` on a module of `admin.snapshot` whose complete entry did not fit the snapshot's share of
+   * its frame: this entry carries only its identity, switch, state and short error (an empty form, no tools), and the
+   * complete entry follows at once, in its own `module.changed` of the same send. A page shows the module as loading
+   * until then, never makes a form of it, and keeps a complete entry it already has. Absent = complete.
+   */
+  details: Schema.optionalKey(Schema.Literal("follow"))
 })
 export type ModuleInfo = typeof ModuleInfo.Type
 

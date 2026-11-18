@@ -180,6 +180,12 @@ export interface PublishedRoute {
    * restart or a stop). The app runs the route's handler in it (`Effect.forkIn`), so no handler outlives its part.
    */
   readonly scope: Scope.Scope
+  /**
+   * Completes when the host's grace period for this part's calls is over (the module is stopping or restarting, or
+   * the host closes), and at once when the part is no longer the published one: the app answers 503 then, without
+   * waiting for the handler's cleanup (`ModuleSlots`). Evaluate it when the handler starts.
+   */
+  readonly stopped: Effect.Effect<void>
 }
 
 /** The parameters of `path` (segments after the module id) if `route` matches it, else `undefined`. */

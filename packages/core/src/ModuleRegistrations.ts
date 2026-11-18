@@ -21,6 +21,12 @@ import type { ModuleInstance } from "./ModuleDefinition.ts"
  *
  * A registration that points at module code (a handler, a route) is reached only through the table its `publish`
  * fills, so once a module is withdrawn its code is in no table.
+ *
+ * Registrars are host code (docs/MODULES-PLAN.md §3.5), not a boundary: they receive what the host has (the part's
+ * value or its instance as it started). A registration's `validate`, `publish` and `withdraw` write the registrar's
+ * own table and nothing else, must not throw, and must not read the host (`view`, `service`, `snapshot`, …) while
+ * they run: the host is in the middle of publishing or withdrawing the module then, and what such a read sees is not
+ * defined. A registrar that breaks this is a host defect (§3.5); the host reports a throw and goes on.
  */
 
 /** Where a part is in its life. Only a `live` part's registrations are published. */
@@ -38,7 +44,8 @@ export interface PartHandle {
   readonly scope: Scope.Scope
   /**
    * Add a registration of this part, during its start (`shared` or `start`): published with the module, or dropped if
-   * the module does not start. Refused once the part has started.
+   * the module does not start. Refused once the part's own `shared` / `start` has returned (while the module's other
+   * parts still start, and from a registration's callbacks, too).
    */
   readonly register: (registration: Registration) => RegisterResult
 }
@@ -73,5 +80,9 @@ export interface StartedPart {
   readonly instance?: ModuleInstance
 }
 
-/** A kind declared by what parts return: called once per started part. */
+/**
+ * A kind declared by what parts return: called once per started part. Host code: it and the callbacks of the
+ * registrations it returns write only their own table, never throw, and never read the host while they run (see the
+ * contract above).
+ */
 export type Registrar = (part: StartedPart) => ReadonlyArray<Registration>

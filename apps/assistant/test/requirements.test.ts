@@ -1,10 +1,14 @@
 // Module requirements and `pnpm start doctor` (docs/MODULES-PLAN.md §4 P1; module-definition §C.3–C.5), with fake
 // program entries and a fake prober: nothing is run on this machine. The real registry is empty in this version.
 import { describe, expect, it } from "@effect/vitest"
+import { vi } from "vitest"
 import { defineModule, type Issue as HealthIssue, isMissingProgramError, isModuleStopped, makeModuleHost, makeTool, type ModuleHostApi, readOnlyPersistence, type Requirement } from "@pva/core"
 import type { Assistant } from "@pva/protocol"
-import { Cause, Effect, Fiber, Schema } from "effect"
-import { formatDoctor, loadDoctorSettings, runDoctor } from "../src/doctor.ts"
+import { Cause, ConfigProvider, Effect, Fiber, Schema } from "effect"
+import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs"
+import { tmpdir } from "node:os"
+import { join } from "node:path"
+import { doctorCommand, formatDoctor, loadDoctorSettings, runDoctor } from "../src/doctor.ts"
 import {
   detectDistro,
   installFix,
@@ -57,7 +61,7 @@ describe("versions: strict semver or unknown", () => {
 })
 
 describe("the requirement checker", () => {
-  it.effect("probes each program once, concurrently, without a shell, on the fixed path with 5 s, and judges from the cache", () =>
+  it.effect("probes each program once with its version argument, the fixed path and a 5 s timeout option, and judges again from the cache", () =>
     Effect.gen(function*() {
       const { calls, prober } = fakeProber({
         ffmpeg: ran("ffmpeg 6.1.1 Copyright (c) 2000-2023"),
@@ -108,6 +112,27 @@ describe("the requirement checker", () => {
       expect((yield* judge("mpv 2025.01.15", ">=2025.1.15")).state).toBe("missing")
       expect(yield* judge("mpv 6.1")).toEqual({ requirement: { tool: "mpv", why: "Plays" }, state: "met", detail: "mpv 6.1" })
       expect((yield* judge("mpv 1.0.0", "about one")).detail).toMatch(/cannot be read/)
+    }))
+
+  // Review round 4 (p1-r4c findings 5, 7).
+  it.effect("a global or sticky version pattern judges the same on every probe; the unknown-program fix is a command, not a missing page", () =>
+    Effect.gen(function*() {
+      for (const flags of ["g", "y", "gy"]) {
+        const shared = new RegExp("x (\\S+)", flags)
+        const tools = new Map<string, ToolEntry>([["x", { probe: { argv: ["x", "--version"], version: shared }, packages: { debian: "x" } }], ["x2", { probe: { argv: ["x2", "--version"], version: shared }, packages: { debian: "x2" } }]])
+        const checker = makeRequirementChecker({ dataDir: "/d", prober: fakeProber({ x: ran("x 1.2.3"), x2: ran("x 1.2.3") }).prober, distro: "debian", tools })
+        const rs: ReadonlyArray<Requirement> = [{ tool: "x", version: ">=1", why: "y" }, { tool: "x2", version: ">=1", why: "y" }]
+        for (let i = 0; i < 3; i++) {
+          yield* checker.probe(rs, { force: true })
+          expect(checker.check(rs).map((st) => st.state), `flags ${flags}, probe ${i + 1}`).toEqual(["met", "met"])
+        }
+      }
+      const checker = makeRequirementChecker({ dataDir: "/d", prober: fakeProber({}).prober, distro: "debian" })
+      const r: Requirement = { tool: "nosuch", why: "x" }
+      yield* checker.probe([r])
+      const fix = checker.check([r])[0]!.fix
+      expect(fix?.kind).toBe("command")
+      expect(fix?.value).toBe("git pull && pnpm install")
     }))
 
   it.effect("the registry is empty; a program it does not know is missing, also a name like constructor or __proto__", () =>
@@ -173,7 +198,7 @@ const assistantWith = (modules: Assistant["modules"]): Assistant => ({ id: "jeff
 describe("doctor", () => {
   it.effect("prints one line per issue with its fix, says nothing about the machine, and exits 1 on an error", () =>
     Effect.gen(function*() {
-      const issues = yield* runDoctor({
+      const report = yield* runDoctor({
         catalog: [music, weather],
         env: {},
         dataDir: "/nonexistent/pva-data",
@@ -181,20 +206,23 @@ describe("doctor", () => {
         prober: fakeProber({}).prober,
         tools: TOOLS
       })
-      const { exitCode, lines } = formatDoctor(issues)
+      const { exitCode, lines } = formatDoctor(report.issues, report.modules)
       expect(exitCode).toBe(1)
       expect(lines).toEqual([
+        "module  music: cannot run here (yt-dlp is missing); requires yt-dlp missing (yt-dlp is missing); no health check.",
+        "module  weather: no requirements; health: 1 issue.",
         expect.stringMatching(/^error   music: yt-dlp is missing\. Music needs it: Resolves stream URLs\. → Install yt-dlp: /),
         "info    weather: Forecast quota at 80 %.",
         "1 error, 0 warnings, 1 note."
       ])
     }))
 
-  it.effect("a module no assistant has on is only a warning, and nothing to report exits 0", () =>
+  it.effect("an unmet requirement of a module no assistant has on is only a warning, and nothing to report exits 0", () =>
     Effect.gen(function*() {
       const unused = yield* runDoctor({ catalog: [music], env: {}, dataDir: "/nonexistent/pva-data", assistants: [assistantWith({})], prober: fakeProber({}).prober, tools: TOOLS })
-      const report = formatDoctor(unused)
+      const report = formatDoctor(unused.issues, unused.modules)
       expect(report.lines).toEqual([
+        "module  music: cannot run here (yt-dlp is missing); requires yt-dlp missing (yt-dlp is missing); no health check.",
         expect.stringMatching(/^warning music: yt-dlp is missing\. Music needs it: Resolves stream URLs\. \(No assistant has it on\.\) → Install yt-dlp: /),
         "0 errors, 1 warning, 0 notes."
       ])
@@ -228,6 +256,97 @@ describe("doctor", () => {
       const unreadable = yield* Effect.flip(loadDoctorSettings({ env: {}, dataDir: "/d", vaultPath: "/v.enc", catalog: [], openVault: async () => Promise.reject(Object.assign(new Error("EACCES: permission denied"), { code: "EACCES" })) }))
       expect(unreadable.message).toBe("The key vault at /v.enc could not be read: EACCES: permission denied")
     }))
+
+  // Review round 4 (p1-r4c finding 1): a missing installation is not "the defaults".
+  it.effect("a missing data directory, a missing settings file and a corrupt one are failures, and nothing is written", () =>
+    Effect.gen(function*() {
+      const openVaultNone = async () => ({ state: () => "none" }) as never
+      const root = mkdtempSync(join(tmpdir(), "pva-doctor-"))
+      const missingDir = yield* Effect.flip(loadDoctorSettings({ env: {}, dataDir: join(root, "typo"), vaultPath: "/v.enc", catalog: [], openVault: openVaultNone }))
+      expect(missingDir.message).toMatch(/^There is no data directory at .*typo: set PVA_DATA_DIR/)
+      const missingFile = yield* Effect.flip(loadDoctorSettings({ env: {}, dataDir: root, vaultPath: "/v.enc", catalog: [], openVault: openVaultNone }))
+      expect(missingFile.message).toMatch(/^There are no saved settings at .*settings\.json: set PVA_DATA_DIR/)
+      expect(readdirSync(root)).toEqual([])
+      expect(existsSync(join(root, "typo"))).toBe(false)
+      writeFileSync(join(root, "settings.json"), "{ not json")
+      const corrupt = yield* Effect.flip(loadDoctorSettings({ env: {}, dataDir: root, vaultPath: "/v.enc", catalog: [], openVault: openVaultNone }))
+      expect(corrupt.message).toMatch(/could not be read/)
+      expect(readdirSync(root)).toEqual(["settings.json"])
+      expect(readFileSync(join(root, "settings.json"), "utf8")).toBe("{ not json")
+      rmSync(root, { recursive: true, force: true })
+    }))
+
+  // Review round 5 (p1-r5c finding 7): the command itself ends with exit code 2 on a missing installation.
+  it.effect("doctor on a missing data directory says why and ends with exit code 2", () =>
+    Effect.gen(function*() {
+      const root = mkdtempSync(join(tmpdir(), "pva-doctor-"))
+      const out: Array<string> = []
+      const write = vi.spyOn(process.stdout, "write").mockImplementation((chunk: string | Uint8Array) => (out.push(String(chunk)), true))
+      const before = process.exitCode
+      try {
+        yield* doctorCommand.pipe(
+          Effect.provideService(ConfigProvider.ConfigProvider, ConfigProvider.fromEnvRecord({ PVA_DATA_DIR: join(root, "typo"), PVA_VAULT_PATH: join(root, "vault.enc") }))
+        )
+        expect(process.exitCode).toBe(2)
+      } finally {
+        process.exitCode = before
+        write.mockRestore()
+        rmSync(root, { recursive: true, force: true })
+      }
+      expect(out.join("")).toMatch(/^doctor: There is no data directory at .*typo: set PVA_DATA_DIR/)
+    }))
+
+  // Review round 5 (p1-r5a finding 4, p1-r5c finding 1): only the registry bounds a module's health issues.
+  it.effect("twenty warnings then an error from one module: the error is kept and doctor exits 1; modules over the bound: the true number left out", () =>
+    Effect.gen(function*() {
+      const reporting = (id: string, issues: ReadonlyArray<HealthIssue>) => defineModule({ id, name: id, description: "", health: () => Effect.succeed(issues), start: () => Effect.succeed({}) })
+      const late = reporting("late", [
+        ...Array.from({ length: 20 }, (_, i): HealthIssue => ({ id: `w${i}`, severity: i % 2 === 0 ? "warning" : "info", title: `Check ${i}`, detail: "" })),
+        { id: "e", severity: "error", title: "The shared dependency failed", detail: "" }
+      ])
+      const report = yield* runDoctor({ catalog: [late], env: {}, dataDir: "/nonexistent/pva-data", assistants: [assistantWith({})], prober: fakeProber({}).prober, tools: TOOLS })
+      const { exitCode, lines } = formatDoctor(report.issues, report.modules)
+      expect(exitCode).toBe(1)
+      expect(lines).toContain("module  late: no requirements; health: 21 issues.")
+      expect(lines).toContain("error   late: The shared dependency failed.")
+      const many = Array.from({ length: 6 }, (_, k) => reporting(`many${k}`, Array.from({ length: 150 }, (_, i): HealthIssue => ({ id: `e${i}`, severity: "error", title: `Error ${i}`, detail: "" }))))
+      const over = yield* runDoctor({ catalog: many, env: {}, dataDir: "/nonexistent/pva-data", assistants: [assistantWith({})], prober: fakeProber({}).prober, tools: TOOLS })
+      expect(over.issues.at(-1)?.title).toBe(`And ${6 * 150 - 99} more issues`)
+    }))
+
+  // Review round 4 (p1-r4c findings 3, 6): every module has its line, healthy and unchecked ones too; an issue says its device.
+  it.effect("a healthy module, an unchecked-network module and an unhealthy one each have a line; issues name their device", () =>
+    Effect.gen(function*() {
+      const healthy = defineModule({ id: "clock", name: "Clock", description: "", requires: [{ tool: "mpv", why: "Plays" }], health: () => Effect.succeed([]), start: () => Effect.succeed({}) })
+      const online = defineModule({ id: "news", name: "News", description: "", requires: [{ network: "internet", why: "Fetches" }], start: () => Effect.succeed({}) })
+      const speakers = defineModule({
+        id: "speakers",
+        name: "Speakers",
+        description: "",
+        health: () => Effect.succeed<ReadonlyArray<HealthIssue>>([
+          { id: "a", device: "d-kitchen", severity: "warning", title: "Speaker offline", detail: "" },
+          { id: "b", device: "d-hall", severity: "warning", title: "Speaker offline", detail: "" }
+        ]),
+        start: () => Effect.succeed({})
+      })
+      const report = yield* runDoctor({
+        catalog: [healthy, online, speakers],
+        env: {},
+        dataDir: "/nonexistent/pva-data",
+        assistants: [assistantWith({})],
+        prober: fakeProber({ mpv: ran("mpv 0.38.0") }).prober,
+        tools: TOOLS
+      })
+      const { exitCode, lines } = formatDoctor(report.issues, report.modules)
+      expect(exitCode).toBe(0)
+      expect(lines.slice(0, 3)).toEqual([
+        "module  clock: requires mpv met (mpv 0.38.0); healthy.",
+        "module  news: requires network (internet) not checked; no health check.",
+        "module  speakers: no requirements; health: 2 issues."
+      ])
+      expect(lines).toContain("warning speakers (device d-kitchen): Speaker offline.")
+      expect(lines).toContain("warning speakers (device d-hall): Speaker offline.")
+    }))
 })
 
 // Review round 1, finding 11: doctor judges by the assistants' demand, through `uses` too, starting nothing.
@@ -239,7 +358,7 @@ describe("doctor's severity follows the assistants' demand", () => {
 
   it.effect("a disabled-by-default capability an assistant has on, and a provider it reaches through `uses`, are errors", () =>
     Effect.gen(function*() {
-      const issues = yield* runDoctor({
+      const { issues } = yield* runDoctor({
         ...base,
         catalog: [offByDefault, provider, consumer],
         assistants: [assistantWith({ radio: { on: true, offTools: [] }, kitchen: { on: true, offTools: [] } })],
@@ -253,7 +372,7 @@ describe("doctor's severity follows the assistants' demand", () => {
 
   it.effect("with nobody using them, both are warnings and doctor exits 0", () =>
     Effect.gen(function*() {
-      const issues = yield* runDoctor({ ...base, catalog: [offByDefault, provider, consumer], assistants: [assistantWith({})] })
+      const { issues } = yield* runDoctor({ ...base, catalog: [offByDefault, provider, consumer], assistants: [assistantWith({})] })
       expect(issues.map((i) => i.severity)).toEqual(["warning", "warning"])
       expect(formatDoctor(issues).exitCode).toBe(0)
     }))
