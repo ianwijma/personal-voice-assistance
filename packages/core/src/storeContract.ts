@@ -17,6 +17,7 @@ import {
   type Collection,
   type CommittedChange,
   compareIndexed,
+  DEFAULT_LIST_LIMIT,
   DEFAULT_MAX_CHARS,
   defineCollection,
   type HouseholdStore,
@@ -275,9 +276,19 @@ export const householdStoreContract = (name: string, make: MakeStore) =>
           ["v14", -0.5]
         ]
         for (const [id, k] of values) yield* c.insert(k === undefined ? {} : { k }, { id })
-        const asc = (yield* c.list({ orderBy: { field: "k" } })).map((r) => r.id)
+        // Every page of a list in the index's order (`after` the last row of the previous page).
+        type Loose = typeof loose extends Collection<infer A> ? A : never
+        const listAll = (query: ListQuery<Loose>) =>
+          Effect.gen(function*() {
+            const out: Array<Row<Loose>> = []
+            for (let page = yield* c.list(query); ; page = yield* c.list({ ...query, after: page.at(-1)! })) {
+              out.push(...page)
+              if (page.length < (query.limit ?? Math.min(DEFAULT_LIST_LIMIT, maxListRows(loose)))) return out
+            }
+          })
+        const asc = (yield* listAll({ orderBy: { field: "k" } })).map((r) => r.id)
         assert.deepStrictEqual(asc, ["v11", "v14", "v09", "v08", "v12", "v07", "v06", "v02", "v05", "v04", "v03", "v13", "v01"])
-        const desc = (yield* c.list({ orderBy: { field: "k", direction: "desc" } })).map((r) => r.id)
+        const desc = (yield* listAll({ orderBy: { field: "k", direction: "desc" } })).map((r) => r.id)
         assert.deepStrictEqual(desc, [...asc].reverse())
         assert.deepStrictEqual((yield* c.list({ where: { k: true } })).map((r) => r.id).sort(), ["v08", "v12"])
         assert.deepStrictEqual((yield* c.list({ where: { k: "" } })).map((r) => r.id), ["v02"])
@@ -297,7 +308,7 @@ export const householdStoreContract = (name: string, make: MakeStore) =>
         assert.deepStrictEqual((yield* c.list({ where: { k: -0 } })).map((r) => r.id).sort(), ["v09", "zero"])
         assert.isTrue(Object.is((yield* c.get("zero"))!.value.k, 0))
         // Order of the exact numbers agrees with JavaScript's.
-        const ordered = (yield* c.list({ orderBy: { field: "k" }, limit: maxListRows(loose) })).filter((r) => r.id.startsWith("e")).map((r) => r.value.k as number)
+        const ordered = (yield* listAll({ orderBy: { field: "k" }, limit: maxListRows(loose) })).filter((r) => r.id.startsWith("e")).map((r) => r.value.k as number)
         assert.deepStrictEqual(ordered, [...exact].sort((a, b) => a - b))
       }).pipe(Effect.scoped))
 
@@ -367,17 +378,14 @@ export const householdStoreContract = (name: string, make: MakeStore) =>
         const kept = yield* kit.transaction((tx) => {
           const n = tx.collection(notes)
           n.insert({ text: "p" }, { id: "p" })
-          try {
-            n.insert({ text: "again" }, { id: "p" })
-          } catch (e) {
-            assert.strictEqual(tagOf(e), "StoreConflict")
-          }
+          const again = captureThrow(() => n.insert({ text: "again" }, { id: "p" }))
           n.insert({ text: "q" }, { id: "q" })
           tx.publish("stock.low", { n: 1 })
           tx.afterCommit(() => ran.push("after"))
-          return n.list().length
+          return { again, rows: n.list().length }
         })
-        assert.strictEqual(kept, 2)
+        assert.strictEqual(tagOf(kept.again), "StoreConflict")
+        assert.strictEqual(kept.rows, 2)
         assert.deepStrictEqual(heard.slice(3), ["insert:4", "insert:5", "kit.stock.low"])
         assert.deepStrictEqual(ran, ["after"])
         assert.strictEqual(yield* store.lastSeq, 5)
@@ -526,14 +534,19 @@ export const householdStoreContract = (name: string, make: MakeStore) =>
           { concurrency: "unbounded" }
         )
         for (const r of revs) for (let i = 1; i < r.length; i++) assert.strictEqual(r[i], r[0]! + i)
+        // What the transaction saw is captured inside and checked after it failed; the failure must be the deliberate
+        // one (an assertion failing inside would fail the transaction the same way).
+        const rollback = new Error("the deliberate rollback")
+        let seen: ReadonlyArray<string> = []
         const exit = yield* Effect.exit(kit.transaction((tx) => {
           tx.collection(notes).insert({ text: "outer" }, { id: "outer" })
           Effect.runSync(kit.transaction((inner) => inner.collection(notes).insert({ text: "inner" }, { id: "inner" })))
           Effect.runSync(c.insert({ text: "plain" }, { id: "plain" }))
-          assert.strictEqual(tx.collection(notes).list({ limit: maxListRows(notes) }).filter((r) => ["outer", "inner", "plain"].includes(r.id)).length, 3)
-          throw new Error("no")
+          seen = tx.collection(notes).list({ limit: maxListRows(notes) }).map((r) => r.id).filter((id) => ["outer", "inner", "plain"].includes(id))
+          throw rollback
         }))
-        assert.isTrue(Exit.isFailure(exit))
+        assert.deepStrictEqual([...seen].sort(), ["inner", "outer", "plain"])
+        assert.isTrue(Exit.isFailure(exit) && exit.cause.reasons.some((r) => r._tag === "Die" && r.defect === rollback))
         for (const id of ["outer", "inner", "plain"]) assert.strictEqual(yield* c.get(id), undefined)
         yield* store.prepare([KIT, { id: "other", storage: { collections: [notes] } }], [SCHEDULER])
         // The host's transaction: two modules' rows and a core service's job commit together, or not at all.

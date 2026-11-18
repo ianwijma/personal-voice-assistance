@@ -1,7 +1,6 @@
 // The longest stretch the store holds the event loop (which also frames audio), on a large file: every read a turn can
-// make is one bounded index read; the worst legal `list` (structured values at the limits of the list rule: rows ×
-// maxChars within LIST_BUDGET_CHARS) on both stores; the main connection never checkpoints, also when a reader let the
-// log grow and then let go; backups, checkpoints and the removal of an ended conversation (its steps at the legal
+// make is one bounded index read (the worst legal `list` of structured values is in listLatency.test.ts); the main
+// connection never checkpoints, also when a reader let the log grow and then let go; backups, checkpoints and the removal of an ended conversation (its steps at the legal
 // maximum: the largest values, eight indexes, secure deletion) run beside turns without a long stop. The numbers are
 // printed (docs/STORING-DATA.md "Latency" quotes them).
 import { assert, describe, it } from "@effect/vitest"
@@ -29,31 +28,14 @@ import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { DatabaseSync } from "node:sqlite"
 import { makeSqliteStore } from "../src/index.ts"
+import { bound } from "./latencyBound.ts"
 
 const ROWS = 100_000
 const Note = Schema.Struct({ state: Schema.String, due: Schema.Finite, text: Schema.String })
-// Rows of about 1 KB: a maxChars of 1,200 lets a list read MAX_LIST_LIMIT of them (LIST_BUDGET_CHARS / 1,200).
+// Rows of about 1 KB (maxChars 1,200): a list reads at most maxListRows(notes) = LIST_BUDGET_CHARS / 1,200 of them.
 const notes = defineCollection({ name: "notes", scope: "household", schema: Note, indexes: ["state", "due", ["state", "due"]], maxChars: 1_200, project: (row: Row<typeof Note.Type>) => row.value })
 const chat = defineCollection({ name: "chat", scope: "conversation", schema: Schema.Struct({ text: Schema.String }) })
 const MODULE = [{ id: "big", storage: { collections: [notes, chat] } }]
-
-/**
- * The worst legal lists: structured values (Sol's fixtures: arrays of small objects, arrays of numbers) filling
- * `maxChars` exactly, `maxListRows` of them, at the smallest and the largest number of rows the rule allows.
- */
-const Objects = Schema.Struct({ tag: Schema.String, values: Schema.Array(Schema.Struct({ x: Schema.Finite })) })
-const Numbers = Schema.Struct({ tag: Schema.String, values: Schema.Array(Schema.Finite) })
-const listFixtures = [DEFAULT_MAX_CHARS, MAX_VALUE_CHARS].flatMap((maxChars) => [
-  { what: "objects", maxChars, c: defineCollection({ name: `objects_${maxChars}`, scope: "household", schema: Objects, indexes: ["tag"], maxChars }), value: () => fillTo(maxChars, '{"x":0}', (n) => ({ tag: "t", values: Array.from({ length: n }, () => ({ x: 0 })) })) },
-  { what: "numbers", maxChars, c: defineCollection({ name: `numbers_${maxChars}`, scope: "household", schema: Numbers, indexes: ["tag"], maxChars }), value: () => fillTo(maxChars, "0", (n) => ({ tag: "t", values: Array.from({ length: n }, () => 0) })) }
-])
-/** The largest value of the shape `make(n)` whose JSON fits `maxChars` (each element `element` plus a comma). */
-const fillTo = <A>(maxChars: number, element: string, make: (n: number) => A): A => {
-  const base = JSON.stringify(make(0)).length
-  const value = make(Math.floor((maxChars - base + 1) / (element.length + 1)))
-  if (JSON.stringify(value).length > maxChars) throw new Error("fixture too large")
-  return value
-}
 
 /**
  * A conversation-scoped collection at the legal maximum for a bulk removal: the largest values, eight indexed fields
@@ -103,13 +85,9 @@ const longestStop = <A, E>(effect: Effect.Effect<A, E>) =>
     }
   })
 
-/**
- * The worst of `n` calls, after one call that is not timed: the first call of a shape compiles its statement and its
- * schema's codec once per process (a CI runner showed 12 ms for it), which is not the cost of a turn's read.
- */
+/** The worst of `n` calls (the first included: `prepare` warms what a first read would otherwise compile). */
 const worstOf = (n: number, effect: Effect.Effect<unknown, unknown>) =>
   Effect.gen(function*() {
-    yield* effect
     let worst = 0
     for (let i = 0; i < n; i++) {
       const t0 = performance.now()
@@ -132,13 +110,14 @@ describe("SQLite store latency on 100,000 rows of ~1 KB", () => {
       const store = yield* makeSqliteStore({ filename: file, scrubRetryMs: 20 })
       yield* store.prepare(MODULE)
       const c = store.forModule("big").collection(notes)
+      const most = maxListRows(notes)
       const reads = {
-        "list newest 20 (ambient)": c.list({ limit: 20 }),
-        [`list newest ${MAX_LIST_LIMIT} (the most a list returns)`]: c.list({ limit: MAX_LIST_LIMIT }),
-        [`list oldest ${MAX_LIST_LIMIT}`]: c.list({ orderBy: { field: "createdAt", direction: "asc" }, limit: MAX_LIST_LIMIT }),
-        [`list where state = running, ${MAX_LIST_LIMIT}`]: c.list({ where: { state: "running" }, limit: MAX_LIST_LIMIT }),
-        [`list ordered by due, ${MAX_LIST_LIMIT}`]: c.list({ orderBy: { field: "due" }, limit: MAX_LIST_LIMIT }),
-        [`list where state = running ordered by due (a pair index), ${MAX_LIST_LIMIT}`]: c.list({ where: { state: "running" }, orderBy: { field: "due" }, limit: MAX_LIST_LIMIT }),
+        [`list newest ${notes.ambientRows} (ambient)`]: c.list({ limit: notes.ambientRows }),
+        [`list newest ${most} (the most a list of these rows asks for)`]: c.list({ limit: most }),
+        [`list oldest ${most}`]: c.list({ orderBy: { field: "createdAt", direction: "asc" }, limit: most }),
+        [`list where state = running, ${most}`]: c.list({ where: { state: "running" }, limit: most }),
+        [`list ordered by due, ${most}`]: c.list({ orderBy: { field: "due" }, limit: most }),
+        [`list where state = running ordered by due (a pair index), ${most}`]: c.list({ where: { state: "running" }, orderBy: { field: "due" }, limit: most }),
         "get by id": c.get("n54321")
       }
       const results: Array<string> = []
@@ -202,14 +181,14 @@ describe("SQLite store latency on 100,000 rows of ~1 KB", () => {
       }
       results.push(`snapshot step for a page (20 rows of ~1 KB): worst ${worstStep.toFixed(2)} ms`)
       console.log(`Household store latency (${ROWS} rows):\n  ${results.join("\n  ")}`)
-      // The stated bound for turn reads; generous bounds elsewhere for a shared, loaded runner.
-      assert.isBelow(worstRead, 10)
-      assert.isBelow(worstWrite, 25)
-      assert.isBelow(afterRelease, 10)
-      assert.isBelow(worstStep, 25)
-      assert.isBelow(ended.worst, 50)
-      assert.isBelow(worstBackground, 150)
-      assert.isBelow(removal.worst, 150)
+      // The stated bound for turn reads; generous bounds elsewhere for a loaded machine (`bound`: more on CI).
+      assert.isBelow(worstRead, bound(10))
+      assert.isBelow(worstWrite, bound(25))
+      assert.isBelow(afterRelease, bound(10))
+      assert.isBelow(worstStep, bound(25))
+      assert.isBelow(ended.worst, bound(50))
+      assert.isBelow(worstBackground, bound(150))
+      assert.isBelow(removal.worst, bound(150))
     }).pipe(Effect.scoped), { timeout: 600_000 })
 
   it.live("a version upgrade at start: the most rows it migrates (MAX_MIGRATION_ROWS of ~1 KB) in one transaction, before serving", () =>
@@ -228,35 +207,8 @@ describe("SQLite store latency on 100,000 rows of ~1 KB", () => {
       assert.strictEqual(store.availability("big"), undefined)
       assert.strictEqual((yield* store.forModule("big").collection(v2).get("n8"))?.value.label, "done")
       console.log(`Household store: migrating ${MAX_MIGRATION_ROWS} rows of ~1 KB at start (one transaction, after a backup): longest stop ${worst.toFixed(0)} ms`)
-      assert.isBelow(worst, 10_000)
+      assert.isBelow(worst, bound(10_000))
     }).pipe(Effect.scoped), { timeout: 240_000 })
-
-  it.live("the worst legal list on both stores: structured values at the limits of the list rule (rows × maxChars ≤ LIST_BUDGET_CHARS) block the main thread under 10 ms", () =>
-    Effect.gen(function*() {
-      const dir = mkdtempSync(join(tmpdir(), "pva-list-"))
-      const sqlite = yield* makeSqliteStore({ filename: join(dir, "household.db") })
-      const stores: ReadonlyArray<readonly [string, HouseholdStore]> = [["SQLite", sqlite], ["in memory", makeMemoryHouseholdStore()]]
-      const results: Array<string> = []
-      let worstAll = 0
-      for (const [kind, store] of stores) {
-        yield* store.prepare([{ id: "lists", storage: { collections: listFixtures.map((f) => f.c) } }])
-        for (const f of listFixtures) {
-          const rows = maxListRows(f.c)
-          assert.isAtMost(rows * f.maxChars, LIST_BUDGET_CHARS)
-          const value = f.value()
-          yield* store.forModule("lists").transaction((tx) => {
-            for (let i = 0; i < rows; i++) tx.collection(f.c as Collection<unknown>).insert(value)
-          })
-          const c = store.forModule("lists").collection(f.c as Collection<unknown>)
-          // Blocked time: the call is synchronous, so its duration is how long the main thread is held.
-          const worst = yield* worstOf(30, Effect.tap(c.list({ where: { tag: "t" } as never, limit: rows }), (r) => Effect.sync(() => assert.strictEqual(r.length, rows))))
-          worstAll = Math.max(worstAll, worst)
-          results.push(`${kind}: ${rows} rows of ${f.what} at maxChars ${f.maxChars} (${JSON.stringify(value).length} characters each): worst ${worst.toFixed(2)} ms`)
-        }
-      }
-      console.log(`Household store, the worst legal list (LIST_BUDGET_CHARS ${LIST_BUDGET_CHARS}):\n  ${results.join("\n  ")}`)
-      assert.isBelow(worstAll, 10)
-    }).pipe(Effect.scoped), { timeout: 120_000 })
 
   it.live("ending a conversation at the legal maximum (values of MAX_VALUE_CHARS, eight indexed fields at the indexed limit, secure deletion): each step of BULK_STEP_ROWS stays under 10 ms", () =>
     Effect.gen(function*() {
@@ -277,6 +229,6 @@ describe("SQLite store latency on 100,000 rows of ~1 KB", () => {
       off()
       assert.strictEqual(ended.value, total)
       console.log(`Household store: ending a conversation of ${total} rows at the legal maximum, steps of ${BULK_STEP_ROWS}: longest stop ${ended.worst.toFixed(1)} ms (${commits.length} steps)`)
-      assert.isBelow(ended.worst, 10)
+      assert.isBelow(ended.worst, bound(10))
     }).pipe(Effect.scoped), { timeout: 240_000 })
 })

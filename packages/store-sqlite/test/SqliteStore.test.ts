@@ -2,7 +2,7 @@
 // connection), a lock held elsewhere, SQLite ending a transaction itself, read-only opening, and the quiet warning.
 import { assert, describe, it } from "@effect/vitest"
 import { defineCollection, MAX_VALUE_CHARS, type StoreError } from "@pva/core"
-import { Effect, Exit, Schema } from "effect"
+import { Effect, Exit, Fiber, Schema } from "effect"
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, statSync, utimesSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
@@ -27,6 +27,26 @@ describe("SQLite household store", () => {
       assert.match(errorOf(exit)!.message, /newer version of the assistant/)
       const issues = yield* householdIssues(join(file, ".."))
       assert.strictEqual(issues.find((i) => i.id === "core.household.open")?.severity, "error")
+    }))
+
+  it.effect("doctor: only a missing file is no database; a database whose directory cannot be searched is core.household.open, and doctor creates nothing and changes no mode", () =>
+    Effect.gen(function*() {
+      // Root searches any directory.
+      if (process.getuid?.() === 0) return
+      const dir = tmp()
+      assert.deepStrictEqual(yield* householdIssues(dir), [])
+      yield* Effect.scoped(makeSqliteStore({ filename: join(dir, "household.db") }))
+      const before = readdirSync(dir).sort()
+      chmodSync(dir, 0o600)
+      const issues = yield* Effect.ensuring(householdIssues(dir), Effect.sync(() => {
+        // Checked before access is restored: doctor changed no mode.
+        assert.strictEqual(statSync(dir).mode & 0o777, 0o600)
+        chmodSync(dir, 0o700)
+      }))
+      const open = issues.find((i) => i.id === "core.household.open")
+      assert.strictEqual(open?.severity, "error")
+      assert.match(open!.detail ?? "", /EACCES|permission denied/i)
+      assert.deepStrictEqual(readdirSync(dir).sort(), before)
     }))
 
   it.effect("a backup opens as a database; every backup older than 14 days goes; each is copied to the second directory", () =>
@@ -242,7 +262,50 @@ describe("SQLite household store: transactions the database ends, locks held els
       assert.strictEqual((yield* store.forModule("fill").collection(bigs).list()).length, 1)
     }).pipe(Effect.scoped))
 
-  it.live("a write lock held by another connection is a typed `busy` failure after a few short tries off the event loop; a lock released in time is waited for", () =>
+  it.live("a write made while the store's own checkpoint worker truncates a large log (it holds the write lock meanwhile) waits for it on timers and succeeds: no `busy` in ordinary operation", () =>
+    Effect.gen(function*() {
+      const dir = tmp()
+      const file = join(dir, "household.db")
+      // No periodic checkpoint: the log grows until the removal's truncating checkpoint.
+      const store = yield* makeSqliteStore({ filename: file, checkpointEveryMs: 3_600_000 })
+      yield* store.prepare([{ id: "shop", storage: { collections: [items] } }])
+      const c = store.forModule("shop").collection(items)
+      const text = "x".repeat(MAX_VALUE_CHARS - 20)
+      for (let k = 0; k < 10; k++) {
+        yield* store.forModule("shop").transaction((tx) => {
+          for (let i = 0; i < 100; i++) tx.collection(items).insert({ text })
+        })
+      }
+      const wal = statSync(`${file}-wal`).size
+      const victim = (yield* c.list({ limit: 1 }))[0]!
+      // The removal schedules the worker's truncating checkpoint of the whole log; writes go on meanwhile.
+      yield* c.remove(victim.id)
+      let settled = false
+      const scrub = yield* Effect.forkChild(Effect.andThen(store.scrubbed, Effect.sync(() => void (settled = true))))
+      const waits: Array<number> = []
+      let ticks = 0
+      const timer = setInterval(() => ticks++, 1)
+      // A write every 2 ms (a busy household, not a loop that would starve the checkpoint), at most 2,000 of them.
+      const failures: Array<unknown> = []
+      while (!settled && waits.length < 2_000) {
+        const t0 = performance.now()
+        const exit = yield* Effect.exit(c.insert({ text: "during the checkpoint" }))
+        waits.push(performance.now() - t0)
+        if (Exit.isFailure(exit)) failures.push(errorOf(exit))
+        yield* Effect.sleep(2)
+      }
+      clearInterval(timer)
+      assert.deepStrictEqual(failures, [], "every write during the checkpoint succeeds")
+      assert.isTrue(settled, "the truncating checkpoint settled while writes went on")
+      yield* Fiber.join(scrub)
+      const longest = Math.max(...waits)
+      console.log(`writes during the truncating checkpoint of a ${(wal / 1024 / 1024).toFixed(0)} MB log: ${waits.length}, all succeeded; the longest waited ${longest.toFixed(1)} ms`)
+      assert.isAbove(waits.length, 0)
+      // The event loop ran while a write waited for the lock.
+      assert.isAbove(ticks, 0)
+    }).pipe(Effect.scoped), 120_000)
+
+  it.live("a write lock held by another connection beyond the store's wait (about one second) is a typed `busy` failure, tried off the event loop; a lock released in time is waited for", () =>
     Effect.gen(function*() {
       const dir = tmp()
       const file = join(dir, "household.db")
@@ -258,11 +321,12 @@ describe("SQLite household store: transactions the database ends, locks held els
       const took = performance.now() - t0
       clearInterval(timer)
       assert.strictEqual(errorOf(busy)?.reason, "busy")
-      assert.isBelow(took, 1000)
+      assert.isAtLeast(took, 1000)
+      assert.isBelow(took, 3000)
       // The event loop ran meanwhile (the tries wait on timers, not in SQLite).
-      assert.isAbove(ticks, 5)
-      // Released while the store is trying: the write goes through.
-      setTimeout(() => other.exec("COMMIT"), 10)
+      assert.isAbove(ticks, 50)
+      // Released while the store is trying, after half a second: the write goes through.
+      setTimeout(() => other.exec("COMMIT"), 500)
       assert.strictEqual((yield* c.insert({ text: "after the lock" })).value.text, "after the lock")
       other.close()
     }).pipe(Effect.scoped))

@@ -14,7 +14,7 @@ import { TestClock } from "effect/testing"
 import { mkdtempSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
-import { makeSqliteStore } from "../src/index.ts"
+import { makeSqliteStore, type SqliteHouseholdStore } from "../src/index.ts"
 
 const Item = Schema.Struct({
   text: Schema.String,
@@ -287,7 +287,7 @@ const program = (seed: number, steps: number): ReadonlyArray<Step> => {
       case 13: {
         const st = pick(["scheduled", "done", "", 5])
         const direction = pick(["asc", "desc"] as const)
-        ops.push({ name: "core list", run: (s) => s.forCore("core.p").collection(jobs).list({ where: { state: st as never }, orderBy: { field: "due", direction }, limit: 20 }) })
+        ops.push({ name: "core list", run: (s) => s.forCore("core.p").collection(jobs).list({ where: { state: st as never }, orderBy: { field: "due", direction }, limit: maxListRows(jobs) }) })
         break
       }
       case 14: {
@@ -379,7 +379,17 @@ const kindOf = (o: unknown) => {
   return "ok" in x ? (Array.isArray(x.ok) && x.ok.length > 1 ? "ok:many" : "ok") : x.fail !== undefined ? `${x.fail}:${x.reason ?? ""}` : "die"
 }
 
-const compare = (seed: number, steps: number, sqlite: () => Effect.Effect<HouseholdStore, unknown, import("effect").Scope.Scope>) =>
+/**
+ * Wait until the SQLite store's scheduled scrubs (the worker's truncating checkpoint after a removal, which holds the
+ * write lock while it runs) have settled, so the next step is compared on semantics only, never on whether it met the
+ * worker. A truncation a reader prevented is retried on the Effect clock (the TestClock here): after a second of real
+ * time it is moved on (no reader holds a snapshot in these programs, so that does not happen).
+ */
+const realSleep = (ms: number) => Effect.promise(() => new Promise((resolve) => setTimeout(resolve, ms)))
+const settled = (s: SqliteHouseholdStore) =>
+  Effect.raceFirst(s.scrubbed, Effect.andThen(realSleep(1_000), Effect.forever(Effect.andThen(realSleep(5), TestClock.adjust(1_000)))))
+
+const compare = (seed: number, steps: number, sqlite: () => Effect.Effect<SqliteHouseholdStore, unknown, import("effect").Scope.Scope>) =>
   Effect.gen(function*() {
     const a = makeMemoryHouseholdStore()
     const b = yield* sqlite()
@@ -399,6 +409,7 @@ const compare = (seed: number, steps: number, sqlite: () => Effect.Effect<Househ
       if (o.name === "redeclare bump") version = Math.min(4, version + 1)
       const ra = outcome(yield* Effect.exit(o.run(a, worlds[0])))
       const rb = outcome(yield* Effect.exit(o.run(b, worlds[1])))
+      yield* settled(b)
       // Let what an async transaction function left run (it finds its handle dead in both).
       yield* Effect.promise(() => Promise.resolve())
       assert.deepStrictEqual(rb, ra, `seed ${seed}, step ${n} (${o.name}): answers differ: ${JSON.stringify(rb)} vs ${JSON.stringify(ra)}`)

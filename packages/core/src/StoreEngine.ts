@@ -44,6 +44,7 @@ import {
   type UndeclaredData,
   type WhereValue
 } from "./HouseholdStore.ts"
+import { observe, runHook } from "./storeHooks.ts"
 import { CurrentTurn, type TurnContext } from "./TurnContext.ts"
 
 /**
@@ -332,16 +333,7 @@ export const decodeStored = <A>(collection: Collection<A>, text: string, id: str
   return { value: decoded.value }
 }
 
-/** Observe a promise (or other thenable) nobody awaits, so a rejection is logged, never unhandled. */
-export const observe = (x: unknown, log: (line: string) => void, what: string): void => {
-  if ((typeof x === "object" || typeof x === "function") && x !== null && typeof (x as { then?: unknown }).then === "function") {
-    try {
-      ;(x as PromiseLike<unknown>).then(undefined, (e: unknown) => log(`${what} failed later (it is not awaited): ${messageOf(e)}`))
-    } catch {
-      // A thenable whose `then` throws has nothing more to observe.
-    }
-  }
-}
+export { observe }
 
 /**
  * A stored value of a collection at data version `from`, migrated to `to` one version at a time (a version without a
@@ -557,14 +549,30 @@ export type EngineStore = Omit<HouseholdStore, "info" | "backup"> & {
   readonly inTransaction: () => boolean
 }
 
-/** How often, and how long apart, a transaction whose beginning found the database locked is tried again. */
-const BUSY_TRIES = 25
-const BUSY_PAUSE_MS = 2
+/**
+ * A transaction whose beginning found the database locked is tried again after pauses on timers (never blocking the
+ * event loop) that double from 1 ms up to `BUSY_MAX_PAUSE_MS`, until `BUSY_BUDGET_MS` of pauses have passed: the
+ * store's own checkpoint worker holds the write lock while it truncates the log, and that must not reach a caller as
+ * `busy`. Only a lock held for longer (a second server, an external tool) is `busy` (docs/STORING-DATA.md).
+ */
+const BUSY_BUDGET_MS = 1_000
+const BUSY_MAX_PAUSE_MS = 100
+/** The pause before try `n + 1` after `n + 1` busy beginnings (`n` from 0), or `undefined` when the budget is spent. */
+const busyPauseMs = (n: number): number | undefined => {
+  let spent = 0
+  for (let i = 0; i < n; i++) spent += Math.min(BUSY_MAX_PAUSE_MS, 2 ** i)
+  return spent >= BUSY_BUDGET_MS ? undefined : Math.min(BUSY_MAX_PAUSE_MS, 2 ** n)
+}
 
 /** A pause on a real timer (not the Effect clock): the lock is held by another thread, whatever a test's clock says. */
 const pause = (ms: number) => Effect.promise(() => new Promise<void>((resolve) => setTimeout(resolve, ms)))
 /** Let the event loop run (timers, sockets) between two bounded steps. */
 const yieldToLoop = Effect.promise(() => new Promise<void>((resolve) => setImmediate(resolve)))
+/** After the `n`-th busy beginning (from 0): try `again` after a pause, or fail `busy` once the budget is spent. */
+const againAfterBusy = <X, E>(n: number, busy: BusyAtBegin, again: () => Effect.Effect<X, E>): Effect.Effect<X, E | StoreError> => {
+  const ms = busyPauseMs(n)
+  return ms === undefined ? Effect.fail(busy.error) : Effect.flatMap(pause(ms), again)
+}
 
 export const makeStoreEngine = (options: EngineOptions): EngineStore => {
   const { backend } = options
@@ -603,11 +611,7 @@ export const makeStoreEngine = (options: EngineOptions): EngineStore => {
           }
           fire(batch)
           batch = []
-          try {
-            observe(item.run(), log, "An after-commit callback")
-          } catch {
-            // An after-commit callback must not break the others.
-          }
+          runHook(item.run, log, "An after-commit callback")
         }
         fire(batch)
       }
@@ -622,11 +626,7 @@ export const makeStoreEngine = (options: EngineOptions): EngineStore => {
 
   const runUndo = (undo: ReadonlyArray<() => void>) => {
     for (let i = undo.length - 1; i >= 0; i--) {
-      try {
-        observe(undo[i]!(), log, "A rollback hook")
-      } catch {
-        // An undo hook must not stop the others.
-      }
+      runHook(undo[i]!, log, "A rollback hook")
     }
   }
 
@@ -737,7 +737,7 @@ export const makeStoreEngine = (options: EngineOptions): EngineStore => {
           try {
             return Effect.succeed(f({ turn, at }))
           } catch (e) {
-            if (e instanceof BusyAtBegin) return n + 1 < BUSY_TRIES ? Effect.flatMap(pause(BUSY_PAUSE_MS), () => attempt(n + 1)) : Effect.fail(e.error)
+            if (e instanceof BusyAtBegin) return againAfterBusy(n, e, () => attempt(n + 1))
             return isStoreFailure(e) ? Effect.fail(e) : Effect.die(e)
           }
         })
@@ -1169,7 +1169,7 @@ export const makeStoreEngine = (options: EngineOptions): EngineStore => {
             })
             return Effect.void
           } catch (e) {
-            if (e instanceof BusyAtBegin) return n + 1 < BUSY_TRIES ? Effect.flatMap(pause(BUSY_PAUSE_MS), () => attempt(n + 1)) : Effect.fail(e.error)
+            if (e instanceof BusyAtBegin) return againAfterBusy(n, e, () => attempt(n + 1))
             const message = messageOf(e)
             const where = backup !== undefined ? ` A backup from before is at ${backup}.` : ""
             log(`${owner}: preparing its data failed: ${message}`)
@@ -1181,12 +1181,34 @@ export const makeStoreEngine = (options: EngineOptions): EngineStore => {
       if (st.verdict === undefined) for (const d of st.collections.values()) d.present = true
     })
 
+  /**
+   * What a collection's first read would otherwise compile, done while preparing (before serving), so the first list
+   * after a start costs what later ones do: its JSON codec (one stored row decoded builds its decoder) and the
+   * backend's statements of a `get` and of its default list (newest first). Best effort: a read that fails here fails
+   * where it is made.
+   */
+  const warm = (owner: string, d: Declared) => {
+    try {
+      const scope = (d.c.scope === "household" ? { kind: "household" } : { kind: d.c.scope, id: "-" }) as ScopeRef
+      backend.read(owner, d.c.name, "-")
+      backend.list(owner, d.c.name, scope, checkQuery(d.c, { limit: 1 }))
+      const [doc] = backend.scan(owner, d.c.name, "", 1)
+      if (doc !== undefined) rowOf(d.c, doc)
+    } catch {
+      // Not warmed: the first read pays for it.
+    }
+  }
+
   const prepare = (modules: ReadonlyArray<StoredModule>, core: ReadonlyArray<CoreStorage> = []) =>
     Effect.gen(function*() {
       const counts = new Map<string, number>()
       for (const id of [...modules.map((m) => m.id), ...core.map((c) => c.owner)]) counts.set(id, (counts.get(id) ?? 0) + 1)
       for (const m of modules) yield* prepareOne(m.id, "module", m.storage, (counts.get(m.id) ?? 0) > 1)
       for (const c of core) yield* prepareOne(c.owner, "core", c.storage, (counts.get(c.owner) ?? 0) > 1)
+      for (const st of owners.values()) {
+        if (st.verdict !== undefined) continue
+        for (const d of st.collections.values()) if (d.present) warm(st.owner, d)
+      }
       let all: ReturnType<SyncBackend["allCollections"]> = []
       try {
         all = backend.allCollections()
@@ -1248,7 +1270,7 @@ export const makeStoreEngine = (options: EngineOptions): EngineStore => {
             try {
               return Effect.succeed(step(at))
             } catch (e) {
-              if (e instanceof BusyAtBegin) return tries + 1 < BUSY_TRIES ? Effect.flatMap(pause(BUSY_PAUSE_MS), () => attempt(tries + 1)) : Effect.fail(e.error)
+              if (e instanceof BusyAtBegin) return againAfterBusy(tries, e, () => attempt(tries + 1))
               return Effect.fail(e instanceof StoreError ? e : new StoreError({ reason: "failed", message: messageOf(e), cause: e }))
             }
           })
@@ -1303,7 +1325,14 @@ export const makeStoreEngine = (options: EngineOptions): EngineStore => {
       else release([item])
     },
     reader,
-    lastSeq: Effect.sync(() => backend.lastRev()),
+    // A backend failure is a StoreError, as for every other read.
+    lastSeq: Effect.suspend(() => {
+      try {
+        return Effect.succeed(guarded(() => backend.lastRev()))
+      } catch (e) {
+        return e instanceof StoreError ? Effect.fail(e) : Effect.die(e)
+      }
+    }),
     endConversation: (conversationId) => endConversations(conversationId),
     sweepConversations: endConversations(undefined),
     onCommit: (listener) => {
