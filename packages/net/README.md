@@ -31,11 +31,33 @@ Outgoing HTTP for URLs a model or a user chose, and for public APIs. No dependen
   A name with several addresses: they are tried in order, each attempt with an equal share of the time left (the last one all of
   it), so a black-holed first address does not use up the deadline; an attempt that runs out of its share is cancelled. `SafeResponse` has `contentType`, `encoding` and a `text()` that decodes by the `charset` parameter (UTF-8 when it has none or one this machine does not know). HEAD reads no body and is not
   limited by one.
-- There is no LAN option on `safeFetch`. `fetchOwnerConfiguredLan` is the separate function for endpoints the owner configured (Home
-  Assistant, a LAN SearXNG): it also allows private, unique-local and CGNAT addresses, local names and other ports; loopback,
-  link-local and multicast stay refused. Never pass it a URL a model chose.
+- There is no LAN option on `safeFetch`, and it is GET and HEAD only, in its type and at run time (a cast `POST`, `body`,
+  `typedLoopback` or `maxRequestBytes` is `NetRefused(options)`). `fetchOwnerConfiguredLan` is the separate function for endpoints
+  the owner configured (Home Assistant, a LAN SearXNG): it also allows private, unique-local and CGNAT addresses, local names and
+  other ports; loopback, link-local and multicast stay refused. Never pass it a URL a model chose.
+  - `method: "POST", body: { json }`: the helper serialises `json` inside its error boundary (a value `JSON.stringify` cannot write,
+    or a body that is not `{ json }`, is `NetRefused(body)`), refuses a body over `maxRequestBytes` (default 64 KiB, at most 128 KiB:
+    the longest main-thread stop measured for the largest legal body (128 KiB of ~12 000 small properties, the worst shape found) is under 5 ms: a 1 ms heartbeat's longest gap 4.5–5.0 ms over 3 × 20 calls, median 1.4–1.8 ms; at 256 KiB it was 5.6–6.3 ms) before any lookup or connection; nothing is read from what the serialiser throws (the
+    refusal's reason is constant); the one `timeoutMs` starts before serialising and is checked after it, and an aborted signal is
+    checked before it, and sets `Content-Type: application/json` and `Content-Length` itself (a caller's is
+    `NetRefused(header)`; the Node connector takes the length from the body whatever the headers say). A POST is sent once, to one
+    server: every 3xx answer (300–399, 304 included) is `NetRefused(post-redirect)`; it is never retried; it goes on to the
+    host's next address only when the connector rejected with `notSent: true` (`requestNotSent`): the Node connector says so for a
+    failure before its socket connected (refused, unreachable, cancelled while connecting). A POST's share of the time per address
+    ends when the connector calls `onConnect`; after that only the total limit applies. A failed POST may or may not have been
+    carried out. Everything else (addresses on every hop, headers, response types, `maxBytes`, `timeoutMs`, interruption) is as
+    for a GET.
+  - `typedLoopback: true`: loopback only when the URL is given as text and its host, as written before the URL parser normalises it,
+    is exactly a plain dotted quad `127.a.b.c` (decimal, no leading zeros), `[::1]` or `localhost` (ASCII, any case; connected as
+    `127.0.0.1`, then `::1`, without a lookup). Refused with the option or without it: integer, hex and octal addresses (`2130706433`,
+    `0x7f000001`, `0177.0.0.1`), short forms (`127.1`), a trailing dot (`127.0.0.1.`, `localhost.`), percent-escapes
+    (`%6cocalhost`), other Unicode letters (`ℓocalhost`), `x.localhost`, mapped or embedded IPv4 (`[::ffff:127.0.0.1]`,
+    `[::0.0.0.1]`), other spellings of `::1`, a `URL` object, a name that resolves to loopback, and a redirect to loopback.
+- Errors never show a received header's value (a refused Content-Type or Content-Encoding is named, not quoted; a refused redirect
+  names the URL that answered and the rule, not the target), nor a user name or password: a URL that does not parse is shown as
+  `(not a valid URL)` (`invalidUrlShown`).
 - Errors: `NetRefused` (`rule`: `scheme | credentials | port | host-name | address | redirect-limit | redirect-target | header |
-  content-type | content-encoding | options`, plus `address` and `addressClass`), `NetTooLarge`, `NetTimeout`, `NetAborted`,
+  content-type | content-encoding | options | body | post-redirect`, plus `address` and `addressClass`), `NetTooLarge`, `NetTimeout`, `NetAborted`,
   `NetFailure` (`stage`: `dns | connect | response`). The resolver and the connector are options, so tests need no network.
 - `makeCachedJson({ cache?, now?, fetch?, headers? }).getJson(url, { ttlMs, staleIfErrorMs?, headers?, fetch? })`: JSON GET (always
   the JSON preset) with TTL, `ETag` / `If-None-Match`, stale-if-error and an injectable clock. An entry remembers the URL its body
