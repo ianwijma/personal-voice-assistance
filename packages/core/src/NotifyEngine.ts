@@ -514,6 +514,7 @@ export const makeNotifyEngine = (options: NotifyEngineOptions): Effect.Effect<No
             const started = performance.now()
             const bys = heldOf(deviceId)
             if (bys.length === 0) return true
+            try {
             const device = deviceOf(deviceId)
             const page = reader().list({ where: { state: "open" }, orderBy: { field: "sentAt" }, limit: MAX_NOTIFY_PAGE, scope: HOUSEHOLD_SCOPE, ...(after !== undefined ? { after } : {}) })
             for (const row of page) {
@@ -523,10 +524,12 @@ export const makeNotifyEngine = (options: NotifyEngineOptions): Effect.Effect<No
             }
             read += page.length
             after = page[page.length - 1]
-            // What this step changed is told now, whatever a later step does.
-            reportRinging(deviceId)
             options.observe?.({ kind: "step", ms: performance.now() - started, rows: page.length, connections: bys.length })
             return page.length < MAX_NOTIFY_PAGE
+            } finally {
+              // What this step changed (the capacity clean-up too) is told now, also when a read in it failed.
+              reportRinging(deviceId)
+            }
           })
           if (last) break
           yield* Effect.yieldNow
@@ -537,8 +540,11 @@ export const makeNotifyEngine = (options: NotifyEngineOptions): Effect.Effect<No
           const device = deviceOf(deviceId)
           const ids = new Set<string>()
           for (const by of bys) for (const id of by.cards.keys()) if (!seen.has(id)) ids.add(id)
-          for (const id of ids) syncRow(deviceId, bys, id, readRow(id), device)
-          reportRinging(deviceId)
+          try {
+            for (const id of ids) syncRow(deviceId, bys, id, readRow(id), device)
+          } finally {
+            reportRinging(deviceId)
+          }
         })
       })
 
@@ -547,11 +553,16 @@ export const makeNotifyEngine = (options: NotifyEngineOptions): Effect.Effect<No
     const dirty = new Set<string>()
     /** Devices whose last pass failed: repeated at the next trigger and by the maintenance job. */
     const failed = new Set<string>()
+    /** Devices whose failed pass is being repeated: when it succeeds, the retry it planned is no longer needed. */
+    const retrying = new Set<string>()
     let all = false
     let working = false
     const wake = yield* Queue.sliding<void>(1)
     const kick = () => {
-      for (const id of failed) dirty.add(id)
+      for (const id of failed) {
+        dirty.add(id)
+        retrying.add(id)
+      }
       failed.clear()
       void Queue.offerUnsafe(wake, undefined)
     }
@@ -584,7 +595,11 @@ export const makeNotifyEngine = (options: NotifyEngineOptions): Effect.Effect<No
           if (next.done === true) continue
           dirty.delete(next.value)
           const exit = yield* Effect.exit(passDevice(next.value))
-          if (Exit.isFailure(exit)) {
+          if (Exit.isSuccess(exit)) {
+            // Failed work drained: plan again, so a retry job that is no longer needed goes.
+            if (retrying.delete(next.value)) requestPlan()
+          } else {
+            retrying.delete(next.value)
             failed.add(next.value)
             requestPlan()
             log(`Notifications: reconciling ${next.value} failed (${Cause.pretty(exit.cause).split("\n")[0]}); the next trigger or the maintenance job repeats it`)
@@ -669,7 +684,9 @@ export const makeNotifyEngine = (options: NotifyEngineOptions): Effect.Effect<No
       if (scheduled || scheduling) return
       scheduling = true
       fork(
-        jobs.schedule({ handler: HOURLY_HANDLER, key: HOURLY_HANDLER, cron: HOURLY_CRON, origin: {} }).pipe(
+        // In UTC, whatever the household's zone: it counts elapsed hours, so the night the clocks go back cannot put
+        // two hours between runs (module jobs keep the household's zone).
+        jobs.schedule({ handler: HOURLY_HANDLER, key: HOURLY_HANDLER, cron: HOURLY_CRON, timeZone: "UTC", origin: {} }).pipe(
           Effect.match({
             onSuccess: () => {
               scheduled = true
@@ -688,15 +705,19 @@ export const makeNotifyEngine = (options: NotifyEngineOptions): Effect.Effect<No
       )
     }
 
-    /** What the `due` job is set to, as far as this process knows (`undefined`: none). */
-    let plannedAt: number | undefined
+    /**
+     * What the `due` job is set to: a time, `undefined` (none: this process made it so), or `"unknown"` (at start, after
+     * a schedule or cancel that failed, at the hourly run): never taken as proof that no job is stored.
+     */
+    let plannedAt: number | undefined | "unknown" = "unknown"
     let planning = false
     let planAgain = false
     /**
-     * How the last maintenance run ended: `"done"` (within its bounds: what is still overdue failed, and is tried again
-     * a minute later rather than at once), `"more"` (it stopped at its bound: the rest runs at once), or `undefined`.
+     * How the last maintenance run ended, kept apart: `"succeeded"` (whatever is overdue when it plans became due since,
+     * or is the rest past its bound: planned for now) or `"failed"` (what is overdue is work that failed: a minute later,
+     * never a tight loop); `undefined` once planned.
      */
-    let lastRun: "done" | "more" | undefined
+    let lastRun: "succeeded" | "failed" | undefined
     const planIdle: Array<Deferred.Deferred<void>> = []
 
     /**
@@ -731,19 +752,23 @@ export const makeNotifyEngine = (options: NotifyEngineOptions): Effect.Effect<No
 
     /** Make the `due` job match `nextDue`: none, scheduled, or moved. Idempotent. */
     const planOnce: Effect.Effect<void, unknown> = Effect.gen(function*() {
+      const ran = lastRun
+      lastRun = undefined
       const now = yield* wallNow
       const next = yield* Effect.try(() => nextDue(now))
       if (next === undefined) {
+        // Nothing due: the stored job is made to match, also one this process never planned (a restart, a failed cancel).
         if (plannedAt !== undefined) {
+          plannedAt = "unknown"
           yield* jobs.cancel({ key: DUE_HANDLER })
           plannedAt = undefined
         }
         return
       }
-      const ran = lastRun
-      lastRun = undefined
-      const at = next > now ? next : ran === "done" ? now + RETRY_AFTER_MS : now
-      if (at === plannedAt || (plannedAt !== undefined && next <= now && plannedAt <= now + RETRY_AFTER_MS && ran === undefined)) return
+      const at = next > now ? next : ran === "failed" ? now + RETRY_AFTER_MS : now
+      const known = typeof plannedAt === "number" ? plannedAt : undefined
+      if (at === known || (known !== undefined && next <= now && known <= now + RETRY_AFTER_MS && ran === undefined)) return
+      plannedAt = "unknown"
       yield* jobs.schedule({ handler: DUE_HANDLER, key: DUE_HANDLER, at, origin: {} })
       plannedAt = at
     })
@@ -784,7 +809,6 @@ export const makeNotifyEngine = (options: NotifyEngineOptions): Effect.Effect<No
     /** The maintenance work: do not disturb's end, expiry and stale claims, retention, then every device reconciled. */
     const maintain: Effect.Effect<void, NotifyError> = Effect.gen(function*() {
       lastRun = undefined
-      let more = false
       const now = yield* wallNow
       // A failed read makes do not disturb unknown (on) and plans a retry; the rest of the work goes on.
       const dnd = yield* Effect.exit(readDnd)
@@ -798,7 +822,6 @@ export const makeNotifyEngine = (options: NotifyEngineOptions): Effect.Effect<No
         for (const row of page) if (row.value.expiresAt <= now || staleClaim(row.id, row.value.claim, now)) due.push(row.id)
         read += page.length
         if (page.length < MAX_NOTIFY_PAGE) break
-        if (read >= MAINTENANCE_ROWS) more = true
         after = page[page.length - 1]
         yield* Effect.yieldNow
       }
@@ -829,14 +852,13 @@ export const makeNotifyEngine = (options: NotifyEngineOptions): Effect.Effect<No
         })
         removed += gone.old
         if (!gone.more) break
-        if (removed >= MAINTENANCE_ROWS) more = true
         yield* Effect.yieldNow
       }
       enqueueAll()
-      lastRun = more ? "more" : "done"
+      lastRun = "succeeded"
     }).pipe(Effect.ensuring(Effect.sync(() => {
       // A run that failed is tried again a minute later (or by the hourly job), never in a tight loop.
-      if (lastRun === undefined) lastRun = "done"
+      if (lastRun === undefined) lastRun = "failed"
       requestPlan()
     })))
 
@@ -1365,7 +1387,7 @@ export const makeNotifyEngine = (options: NotifyEngineOptions): Effect.Effect<No
       timeoutMs: 50_000,
       run: () => Effect.suspend(() => {
         // The safety net does not trust what this process believes is planned.
-        plannedAt = undefined
+        plannedAt = "unknown"
         return maintain
       })
     }).pipe(Effect.orDie)
@@ -1466,7 +1488,7 @@ export const makeNotifyEngine = (options: NotifyEngineOptions): Effect.Effect<No
       },
       dnd: () => dndNow,
       maintenanceScheduled: () => scheduled,
-      plannedAt: () => plannedAt,
+      plannedAt: () => (typeof plannedAt === "number" ? plannedAt : undefined),
       planNow,
       maintainNow: maintain,
       busyAnswer: () => answer(false, "tooMany", "busy"),

@@ -282,6 +282,22 @@ describe("speech outside a reply", () => {
       assert.deepStrictEqual(yield* next.done, [{ deviceId: "kitchen-display", outcome: "stopped", why: "a reply" }])
     }))
 
+  it.effect("a6/r3-6: a disconnect ends an announcement waiting behind a reply (failed, the voice session ended) and retires that reply; the next session's queue moves on", () =>
+    Effect.gen(function*() {
+      const bell = makeBell()
+      const kit = yield* startTestModule(bell.definition)
+      yield* kit.notify.replying("kitchen-display", true)
+      const waiting = yield* bell.parts.speech!.say({ device: "kitchen-display" }, "Waits behind the reply")
+      yield* kit.advance(500)
+      yield* kit.notify.disconnect("kitchen-display")
+      assert.deepStrictEqual(yield* waiting.done, [{ deviceId: "kitchen-display", outcome: "failed", why: "the voice session ended" }])
+      yield* kit.notify.connect("kitchen-display")
+      const next = yield* bell.parts.speech!.say({ device: "kitchen-display" }, "On the new session")
+      yield* kit.advance(2_500)
+      assert.deepStrictEqual(yield* next.done, [{ deviceId: "kitchen-display", outcome: "spoken" }])
+      assert.deepStrictEqual(kit.notify.announced.map((a) => [a.text, a.outcome]), [["On the new session", "spoken"]])
+    }))
+
   it.effect("a8: stop stops every device's announcement in one step, without its caller waiting for any of them", () =>
     Effect.gen(function*() {
       const bell = makeBell()

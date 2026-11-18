@@ -555,9 +555,25 @@ export const startTestModule = (definition: ModuleDefinition<any>, options: Star
     /** The announcement being played on a device: its cut, by a reply or by the device's page going. */
     const playing = new Map<string, Deferred.Deferred<"reply" | "disconnected">>()
     const speechMs = options.speechMs ?? 2_000
+    /** Each connected device's voice session, as serve mode's: done when its page goes (`disconnect`). */
+    const sessions = new Map<string, Deferred.Deferred<void>>()
+    const sessionOf = (deviceId: string) => {
+      let d = sessions.get(deviceId)
+      if (d === undefined) {
+        d = Deferred.makeUnsafe<void>()
+        sessions.set(deviceId, d)
+      }
+      return d
+    }
     const speech: SpeechPort = {
-      speak: (deviceId, text, o) =>
-        Effect.gen(function*() {
+      // The call has its session's lifetime for its whole wait (behind a reply, for quiet): when the page goes, a
+      // waiting announcement fails as serve mode's does ("the voice session ended"); one already playing fails with
+      // the audio client's disconnect (below).
+      speak: (deviceId, text, o) => {
+        const session = sessionOf(deviceId)
+        let playingNow = false
+        const ended = Effect.andThen(Deferred.await(session), Effect.suspend(() => (playingNow ? Effect.never : Effect.fail(new Error("the voice session ended")))))
+        return Deferred.isDoneUnsafe(session) ? Effect.fail(new Error("the voice session ended")) : Effect.raceFirst(Effect.gen(function*() {
           for (;;) {
             const reply = replying.get(deviceId)
             if (reply !== undefined) {
@@ -574,6 +590,7 @@ export const startTestModule = (definition: ModuleDefinition<any>, options: Star
             announced.push(record)
             const cut = Deferred.makeUnsafe<"reply" | "disconnected">()
             playing.set(deviceId, cut)
+            playingNow = true
             const how = yield* Effect.raceFirst(Effect.as(Effect.sleep(speechMs), "played" as const), Deferred.await(cut)).pipe(
               Effect.onInterrupt(() => Effect.sync(() => void (record.outcome = "stopped"))),
               Effect.ensuring(Effect.sync(() => void (playing.get(deviceId) === cut && playing.delete(deviceId))))
@@ -590,7 +607,8 @@ export const startTestModule = (definition: ModuleDefinition<any>, options: Star
             record.outcome = "spoken"
             return "spoken" as const
           }
-        })
+        }), ended)
+      }
     }
     const notify = yield* makeNotifyEngine({
       store,
@@ -911,6 +929,8 @@ export const startTestModule = (definition: ModuleDefinition<any>, options: Star
         connect: (deviceId: string) =>
           Effect.suspend(() => {
             connectedNow.add(deviceId)
+            // A new session: announcements from now on wait in it, not in the one that ended.
+            if (sessions.get(deviceId) !== undefined && Deferred.isDoneUnsafe(sessions.get(deviceId)!)) sessions.delete(deviceId)
             notify.reconcile(deviceId)
             return settle
           }),
@@ -921,6 +941,10 @@ export const startTestModule = (definition: ModuleDefinition<any>, options: Star
             // spoken there fails with the audio client's disconnect.
             const cut = playing.get(deviceId)
             if (cut !== undefined) Deferred.doneUnsafe(cut, Effect.succeed("disconnected" as const))
+            // The session ends: a waiting announcement fails; the reply that was being spoken there is retired, so the
+            // next session does not wait for it.
+            Deferred.doneUnsafe(sessionOf(deviceId), Effect.void)
+            replying.delete(deviceId)
             notify.reconcile(deviceId)
             return settle
           }),
