@@ -42,6 +42,17 @@ const basic = async (reply: (text: string) => string = (t) => `You said: ${t}.`,
   return { stt, llm }
 }
 
+/** Wait (at most `ms`) until `check` holds; the assertion after it says what was expected. */
+const until = async (check: () => boolean, ms = 5_000) => {
+  for (const end = Date.now() + ms; !check() && Date.now() < end;) await sleep(10)
+}
+
+/** A page player's clock the test moves (`PlayerOptions.now`): the page is exactly where the test puts it. */
+const playerClock = () => {
+  const clock = { ms: 0 }
+  return { now: () => clock.ms, advance: (ms: number) => void (clock.ms += ms) }
+}
+
 /** Is `sub` a subsequence of `all`? */
 const inOrder = (all: ReadonlyArray<string>, sub: ReadonlyArray<string>) => {
   let i = 0
@@ -134,15 +145,16 @@ describe("serve: a voice turn", () => {
     expect(session).toEqual({ type: "session", role: "owner", ownerPresent: true, reason: "claimed" })
     await owner.waitFor("state", (m) => m.state === "listening")
     await owner.streamPcm(markedPcm(200), { realTime: false })
-    await sleep(50)
-    expect(stt.chunks.some((c) => c.length > 0 && c.every((b) => b === 0x11))).toBe(true)
+    const marked = () => stt.chunks.some((c) => c.length > 0 && c.every((b) => b === 0x11))
+    await until(marked)
+    expect(marked()).toBe(true)
 
     stt.emit(speechStarted, interim("what's the"), interim("what's the weather in Paris"), eagerEndOfTurn("What's the weather in Paris?"))
     await owner.waitFor("state", (m) => m.state === "hearing", { from })
     // The speculative turn has queued its first clause before it is promoted, so that clause's `assistant.text` goes
     // out with the promotion, before the reply starts. (Promoted before its first clause, the reply starts first: a
     // turn's reply starts at its promotion, its clauses as the model writes them.)
-    for (let i = 0; i < 500 && voiced.length === 0; i++) await sleep(10)
+    await until(() => voiced.length > 0)
     expect(voiced[0]).toBe("It's sunny in Paris,")
     stt.emit(endOfTurn("What's the weather in Paris?"))
     const end = await owner.waitFor("turn.end", () => true, { from, timeoutMs: 10_000 })
@@ -193,12 +205,13 @@ describe("serve: a voice turn", () => {
 describe("serve: interruptions", () => {
   it("barge-in: reply.stop, playback.stopped, turn.end interrupted; history keeps only what played", async () => {
     const { stt } = await basic(() => "First clause here. Second clause here. Third clause here.")
-    const owner = await connect()
+    const player = playerClock()
+    const owner = await connect({ player: { now: player.now } })
     await owner.hello()
     await owner.claim()
     stt.emit(endOfTurn("tell me"))
     await owner.waitFor("assistant.playing", (m) => m.clause === 0, { timeoutMs: 10_000 })
-    await sleep(150) // well inside the first 400 ms clause
+    player.advance(150) // well inside the first 400 ms clause, however long the machine takes
     stt.emit(speechStarted)
     await owner.waitFor("reply.stop")
     const end = await owner.waitFor("turn.end")
@@ -545,14 +558,17 @@ describe("serve: ownership", () => {
   it("takeover between a clause start and the next progress report: the old owner's final count still reaches history", async () => {
     const { stt } = await basic(() => "One long clause. Another long clause. And a third one.")
     // A reports playback.started and then nothing until asked (its next periodic report is far away).
-    const a = await connect({ player: { progressMs: 60_000 } })
+    const player = playerClock()
+    const a = await connect({ player: { progressMs: 60_000, now: player.now } })
     await a.hello()
     await a.claim()
     const b = await connect()
     await b.hello()
     stt.emit(endOfTurn("talk"))
-    await a.waitFor("assistant.playing", (m) => m.clause === 0, { timeoutMs: 10_000 })
-    await sleep(600) // the second 400 ms clause is now playing in A; the server has not been told
+    const playing = await a.waitFor("assistant.playing", (m) => m.clause === 0, { timeoutMs: 10_000 })
+    // A plays only what it has received: 600 ms of the reply (22,050 samples a second) first.
+    await until(() => (a.replySamples.get(playing.turnId) ?? 0) >= 0.6 * 22_050)
+    player.advance(600) // the second 400 ms clause is now playing in A; the server has not been told
     await b.claim()
     await a.waitFor("reply.stop")
     const end = await b.waitFor("turn.end", () => true, { from: 0 })
@@ -601,10 +617,11 @@ describe("serve: ownership", () => {
     await observer.hello()
     observer.send({ type: "mic.state", live: false })
     observer.send({ type: "audio.release" })
-    await sleep(50)
-    expect(observer.messages.filter((m) => m.type === "error").map((m) => (m as { error: { code: string } }).error.code)).toEqual(["not_owner"])
+    // A connection's messages are answered in order: once the answer to a later ping is here, so is every answer to
+    // the two before it.
     observer.send({ type: "ping", id: 7 })
     expect(await observer.waitFor("pong")).toEqual({ type: "pong", id: 7 })
+    expect(observer.messages.filter((m) => m.type === "error").map((m) => (m as { error: { code: string } }).error.code)).toEqual(["not_owner"])
   })
 })
 
@@ -612,12 +629,13 @@ describe("serve: provisional final counts (playback.stopped exact: false)", () =
   it("barge-in: a provisional count past the next clause, then the exact one: history holds what the exact count says", async () => {
     const { stt } = await basic(() => "First clause here. Second clause here. Third clause here.")
     // The page's first answer overstates (500 ms more than played: into the second clause); the exact one follows.
-    const owner = await connect({ player: { provisionalStop: { count: (played, rate) => played + Math.round(rate / 2), exactAfterMs: 80 } } })
+    const player = playerClock()
+    const owner = await connect({ player: { now: player.now, provisionalStop: { count: (played, rate) => played + Math.round(rate / 2), exactAfterMs: 80 } } })
     await owner.hello()
     await owner.claim()
     stt.emit(endOfTurn("tell me"))
     await owner.waitFor("assistant.playing", (m) => m.clause === 0, { timeoutMs: 10_000 })
-    await sleep(150)
+    player.advance(150) // inside the first clause
     stt.emit(speechStarted)
     await owner.waitFor("reply.stop")
     const end = await owner.waitFor("turn.end")
@@ -632,14 +650,17 @@ describe("serve: provisional final counts (playback.stopped exact: false)", () =
 
   it("takeover: a provisional count short of the second clause, then the exact one: the old owner's exact count reaches history", async () => {
     const { stt } = await basic(() => "One long clause. Another long clause. And a third one.")
-    const a = await connect({ player: { progressMs: 60_000, provisionalStop: { count: (_played, rate) => Math.round(rate / 10), exactAfterMs: 80 } } })
+    const player = playerClock()
+    const a = await connect({ player: { progressMs: 60_000, now: player.now, provisionalStop: { count: (_played, rate) => Math.round(rate / 10), exactAfterMs: 80 } } })
     await a.hello()
     await a.claim()
     const b = await connect()
     await b.hello()
     stt.emit(endOfTurn("talk"))
-    await a.waitFor("assistant.playing", (m) => m.clause === 0, { timeoutMs: 10_000 })
-    await sleep(600) // the second 400 ms clause is playing in A
+    const playing = await a.waitFor("assistant.playing", (m) => m.clause === 0, { timeoutMs: 10_000 })
+    // A plays only what it has received: 600 ms of the reply (22,050 samples a second) first.
+    await until(() => (a.replySamples.get(playing.turnId) ?? 0) >= 0.6 * 22_050)
+    player.advance(600) // the second 400 ms clause is playing in A
     await b.claim()
     await a.waitFor("reply.stop")
     const end = await b.waitFor("turn.end", () => true, { from: 0 })

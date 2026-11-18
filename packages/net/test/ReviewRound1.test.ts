@@ -212,9 +212,20 @@ describe("finding 1: the cache key includes the request headers", () => {
 describe("finding 23: concurrent misses share one request", () => {
   const gate = () => {
     const pending: Array<(r: SafeResponse) => void> = []
-    /** Resolved once a request is waiting for its answer (made in a fiber of its own: not at once on a busy machine). */
-    let markWaiting!: () => void
-    const waiting = new Promise<void>((resolve) => (markWaiting = resolve))
+    /** Requests waiting for their answer so far, and who waits for how many (`requests`). */
+    let made = 0
+    const watchers: Array<{ readonly n: number; readonly resolve: () => void }> = []
+    const markWaiting = () => {
+      made++
+      for (const w of watchers.splice(0)) if (made >= w.n) w.resolve(); else watchers.push(w)
+    }
+    /**
+     * Resolved once `n` requests in all are waiting for their answer. The cache makes a request in a fiber of its own, so
+     * on a busy machine not at once: a test acts on the request only after this.
+     */
+    const requests = (n: number) => new Promise<void>((resolve) => (made >= n ? resolve() : watchers.push({ n, resolve })))
+    /** Resolved once the latest request's signal has aborted. */
+    const aborted = () => new Promise<void>((resolve) => (signal?.aborted === true ? resolve() : signal?.addEventListener("abort", () => resolve(), { once: true })))
     let calls = 0
     let signal: AbortSignal | undefined
     const fetch = (_url: string, _o: SafeFetchOptions) => {
@@ -223,7 +234,7 @@ describe("finding 23: concurrent misses share one request", () => {
     }
     /** Answers every request still waiting. */
     const open = (r: SafeResponse) => { for (const p of pending.splice(0)) p(r) }
-    return { fetch, open, waiting, calls: () => calls, signal: () => signal }
+    return { fetch, open, waiting: requests(1), requests, aborted, calls: () => calls, signal: () => signal }
   }
   it("two callers, one request, both get the value", async () => {
     const g = gate()
@@ -243,7 +254,8 @@ describe("finding 23: concurrent misses share one request", () => {
     const aborted = Effect.runPromiseExit(api.getJson("http://x/a", { ttlMs: 1000, fetch: { signal: controller.signal } }))
     const interrupted = Effect.runFork(api.getJson("http://x/a", { ttlMs: 1000 }))
     const waiting = Effect.runPromise(api.getJson("http://x/a", { ttlMs: 1000 }))
-    await new Promise((r) => setTimeout(r, 5))
+    // The three share the request, which waits now.
+    await g.requests(1)
     controller.abort()
     const exit = await aborted
     expect(Exit.isFailure(exit) && exit.cause.reasons.some((r) => r._tag === "Fail" && r.error instanceof NetAborted)).toBe(true)
@@ -258,14 +270,15 @@ describe("finding 23: concurrent misses share one request", () => {
     const api = makeCachedJson({ fetch: g.fetch })
     const a = Effect.runFork(api.getJson("http://x/a", { ttlMs: 1000 }))
     const b = Effect.runFork(api.getJson("http://x/a", { ttlMs: 1000 }))
-    await new Promise((r) => setTimeout(r, 5))
+    await g.requests(1)
     await Effect.runPromise(Fiber.interrupt(a))
     expect(g.signal()?.aborted).toBe(false)
     await Effect.runPromise(Fiber.interrupt(b))
-    await new Promise((r) => setTimeout(r, 5))
+    // The last caller left: its request is cancelled (a request never cancelled leaves this waiting: the test fails).
+    await g.aborted()
     expect(g.signal()?.aborted).toBe(true)
     const c = Effect.runPromise(api.getJson("http://x/a", { ttlMs: 1000 }))
-    await new Promise((r) => setTimeout(r, 5))
+    await g.requests(2)
     g.open(json(200, "3"))
     expect((await c).value).toBe(3)
     expect(g.calls()).toBe(2)
@@ -275,7 +288,8 @@ describe("finding 23: concurrent misses share one request", () => {
     const api = makeCachedJson({ fetch: g.fetch })
     const a = Effect.runPromise(api.getJson("http://x/a", { ttlMs: 1000, fetch: { maxBytes: 100 } }))
     const b = Effect.runPromise(api.getJson("http://x/a", { ttlMs: 1000, fetch: { maxBytes: 200 } }))
-    await new Promise((r) => setTimeout(r, 5))
+    // Two requests wait (were the two shared, the second would never come and the test would fail on its time limit).
+    await g.requests(2)
     expect(g.calls()).toBe(2)
     g.open(json(200, "1"))
     await Promise.all([a, b])
