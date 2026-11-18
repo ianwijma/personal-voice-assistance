@@ -16,7 +16,7 @@ their data in the same collections, under an owner of their own. Every committed
 
 **Every call is synchronous on the main thread**, which also frames the browsers' audio. So nothing unbounded runs
 there, by construction, not by a timeout: a `list` is one index range read (a shape no index answers is refused) of at
-most `min(100, 120,000 / maxChars)` rows of values of at most the collection's `maxChars` (default 2,000, at most
+most `min(100, 25,000 / maxChars)` rows of values of at most the collection's `maxChars` (default 2,000, at most
 16,000), a `get` is one row, a write is one row, a transaction is one synchronous step; the main connection never
 checkpoints and never waits for a lock. Backups, checkpoints and the removal of an ended conversation run beside turns,
 on threads of their own or in bounded steps ("Latency" has the numbers).
@@ -37,7 +37,7 @@ export const timers = defineCollection({
   indexes: ["state", ["state", "dueAt"]],  // what `list` may filter or order on (see "Lists" and "Values"); never
                                   // updatedAt, createdAt, id, rev or scope (a row's own names: refused here)
   ambient: (rows: ReadonlyArray<Row<typeof Timer.Type>>, { now }) => [`Timers: ${rows.map(…).join(", ")}.`],
-  ambientRows: 10,                // newest rows per scope the lines are made from (1–20)
+  ambientRows: 10,                // newest rows per scope the lines are made from (1–20, at most maxListRows)
   project: (row, device) => ({ label: row.value.label, dueAt: row.value.dueAt })  // what voice pages may see
 })
 
@@ -90,8 +90,9 @@ yield* ctx.store.transaction((tx) => {                                          
   SQLite and in the in-memory store. The id of a row of a projected collection can reach every page that could see
   its scope (in a removal, "Pages"): do not put anything private in it.
 - **Lists.** Each shape is one index range, read in its own order, of at most `limit` rows: at most
-  `maxListRows(collection)`, which is `min(100, floor(120,000 / maxChars))` (60 for the default `maxChars`, 100 for
-  1,200 or less, 7 for 16,000; more is `invalid`); the default is 20, or that most when it is smaller. The shapes, and only these:
+  `maxListRows(collection)`, which is `min(100, floor(25,000 / maxChars))` (12 for the default `maxChars` of 2,000,
+  62 for 400, 100 for 250 or less, 1 for 16,000; more is `invalid`); the default is 20, or that most when it is
+  smaller. Read on with `after` (below). The shapes, and only these:
   - no `where`: ordered by `updatedAt` (the default, newest first), `createdAt` (newest first by default), or a field
     declared as an index of its own (ascending by default);
   - `where` on **one** field declared as an index of its own: ordered by `updatedAt` (default, newest first),
@@ -131,8 +132,12 @@ yield* ctx.store.transaction((tx) => {                                          
   fresh ones: changing an object after a call, or a row a call returned, changes nothing stored.
 - **Errors**: `StoreError` (`unavailable`, `read-only`, `invalid`, `busy`, `failed`), `StoreConflict`, `StoreNotFound`,
   `ScopeUnknown` (together `StoreFailure`). A module whose data is `unavailable` (see "Versions") gets `unavailable`
-  from every call, also through a handle it got earlier. `busy`: another connection held the database's write lock
-  longer than the store waits (about 50 ms, on a timer, never on the event loop); nothing was done; try again.
+  from every call, also through a handle it got earlier. `busy`: something held the database's write lock for longer
+  than the store waits; nothing was done; try again. A transaction whose beginning finds the lock taken is tried again
+  after pauses on timers (never blocking the event loop) that double from 1 ms up to 100 ms, for about one second in
+  all. That covers the store's own checkpoint worker, which holds the write lock while it truncates the log after a
+  removal, so a module does not see `busy` in ordinary operation: only when something holds the lock for that long
+  (a second server on the same file, an external tool).
 - **Actor.** Every row records who changed it last (`updatedBy`: a turn with its device and person, a job, the admin, a
   tap on a device, the module itself). Pass `{ actor }` from jobs and taps. An actor is checked before it is stored (a
   known kind with its fields as strings, a turn's id a finite number): anything else is `invalid`.
@@ -143,12 +148,26 @@ A row's value is a **JSON object** (its schema's JSON form): a schema that allow
 as the whole value is refused at write (`invalid`). At most the collection's `maxChars` characters of JSON (default
 2,000, at most 16,000; refused at write).
 
-**The work of a list is bounded by a product**: a list asks for at most `maxListRows` rows, so rows × `maxChars` is at
-most `LIST_BUDGET_CHARS` (120,000). The budget was chosen by measuring structured values, which cost far more to decode
-than a long string of the same length (Sol's fixtures: arrays of small objects `{ "x": 0 }`, arrays of numbers), at
-both ends of the rule (60 rows of 2,000 characters, 7 rows of 16,000), on both stores, so that the worst legal list
-holds the main thread under 10 ms with a margin of two ("Latency" has the numbers). Declare a larger `maxChars` only
-for a collection that needs it: its lists return fewer rows a page.
+**The work of a list is bounded by a product**: a list asks for at most `maxListRows` rows, `min(100,
+floor(LIST_BUDGET_CHARS / maxChars))`, so rows × `maxChars` is at most `LIST_BUDGET_CHARS`, which is **25,000**. At
+`maxChars` 400 a list asks for at most 62 rows, at the default 2,000 for 12, at the largest, 16,000, for 1; 100 rows
+(the cap) at 250 or less. The budget was measured with structured values filling `maxChars` exactly, which cost far
+more to decode than a long string of the same length, at the three ends of the rule (100 rows of 250 characters, 12 of
+2,000, 1 of 16,000), on both stores, the first list after a start and later ones, with exactly these schema shapes
+(each value `{ tag: string, values: [...] }` with `tag` indexed):
+
+- an array of small objects, `Struct({ x: Finite })`, each element `{ "x": 0 }`;
+- an array of numbers, `Finite`, each `0`;
+- an array of an untagged union of four struct shapes, `Union([Struct({ x: String }), Struct({ x: Boolean }),
+  Struct({ x: Null }), Struct({ x: Finite })])`, each element `{ "x": 0 }` (it matches only the last), the costliest;
+- an array of nested structs whose fields are all optional, literal unions among them, `Struct({ state:
+  optionalKey(Literals([4 strings])), n: optional(Finite), detail: optionalKey(Struct({ kind: optionalKey(Literals([3
+  strings])), on: optionalKey(Boolean) })) })`, each element `{}`.
+
+The worst of them holds the main thread under 5 ms, a margin of two under 10 ms ("Latency" has the numbers). A schema
+much costlier to decode than these (an untagged union whose values mostly match a late member and whose elements are
+tiny, for example) is its author's to keep small: declare a smaller `maxChars`. Declare a larger `maxChars` only for a
+collection that needs it: its lists return fewer rows a page, and `after` reads on.
 
 An **indexed field** holds a string (well-formed Unicode without NUL, at most 500 characters), a finite number or
 `true` / `false`, or is missing; anything else there (`null`, a list, an object, a lone surrogate, `NaN`) is refused at
@@ -352,9 +371,11 @@ anything a person would not want read by anyone on the home network out of devic
 
 Collections with `ambient` contribute lines to one host context provider, `Household`, in every turn's context: rows
 of the household, the turn's device, person, assistant and conversation (the newest `ambientRows`, default 10, at most
-20, per scope; each one bounded index read, synchronous). It returns within its budget by doing bounded work only: it
-checks the time before each collection and stops reading once 50 ms have passed (so the stretch is the budget plus one
-bounded read and one call at most), and stops at 600 characters (whole lines, catalog order). Behind the Home setting
+20 and `maxListRows`, per scope; each one bounded index read, synchronous). It returns within its budget by doing
+bounded work only: between two collections it yields to the scheduler, so the event loop (audio, sockets) is held for
+one collection's reads at a time, never for the whole batch; it checks the time before each collection and stops
+reading once 50 ms have passed (so the total is the budget plus one collection at most), and stops at 600 characters
+(whole lines, catalog order). Behind the Home setting
 "Household facts in every reply" (`HOME_AMBIENT_FACTS`: `off`, the default, `all`, `module-on`). Keep lines short and
 computed from the rows alone.
 
@@ -436,42 +457,54 @@ removal, the removed item is in no file the store manages, as long as the server
 
 ## Latency
 
+Measured on the development machine (a 16-thread AMD Ryzen 9 7945HX laptop with 32 GB of memory and an NVMe disk,
+shared with other agents), behind a lock so no other test ran at the same time. The bounds below are the ones the
+tests assert there; on CI (`process.env.CI`) the tests allow three times each bound, since shared runners are several
+times slower and noisy (`packages/store-sqlite/test/latencyBound.ts`: a CI run measured 19.6 ms for a list bounded by
+10 ms here).
+
 `packages/store-sqlite/test/latency.test.ts` on 100,000 rows of about 1 KB (one collection with two indexes and a
-pair, `maxChars` 1,200 so a list may take 100 of them), on the development machine (shared with other agents), the
-worst of 30 calls each after one call that is not timed (a shape's first call compiles its statement and its codec):
+pair, `maxChars` 1,200, so a list may take 20 of them), the worst of 30 calls each, the first after the store's start
+included (`prepare` warms each collection's codec and its default list's statement):
 
 | Call | Worst |
 |---|---|
-| `list` newest 20 (the ambient read) | 0.5 ms |
-| `list` of 100 rows (the most a list returns): newest / oldest / `where` / ordered by an index / `where` ordered by a pair | 1.6 / 2.1 / 2.2 / 1.3 / 1.3 ms |
-| `get` | 0.1 ms |
-| `update` of one row (its own transaction) | 1.8 ms |
-| a one-row write right after a reader let go of a log that grew while it held an old snapshot | 0.5 ms (the main connection makes no checkpoint) |
+| `list` newest 10 (the ambient read) | 1.0 ms |
+| `list` of 20 rows (the most a list of these rows asks for): newest / oldest / `where` / ordered by an index / `where` ordered by a pair | 0.4 / 0.6 / 0.7 / 0.6 / 0.7 ms |
+| `get` | 0.3 ms |
+| `update` of one row (its own transaction) | 1.3 ms |
+| a one-row write right after a reader let go of a log that grew while it held an old snapshot | 0.3 ms (the main connection makes no checkpoint) |
 | one snapshot step for a page (20 rows of about 1 KB, projected, frames built) | 1.2 ms |
 
-**The worst legal list** (the list rule at both ends, structured values filling `maxChars`; the call is synchronous,
-so its time is how long the main thread is held; `LIST_BUDGET_CHARS` 120,000). Three runs; the worst of each:
+**The worst legal list** (`packages/store-sqlite/test/listLatency.test.ts`: the shapes of "Values" at the three ends
+of the rule, `LIST_BUDGET_CHARS` 25,000; the call is synchronous, so its time is how long the main thread is held).
+"First" is the first list of a collection in a store that has just started on a file written before, in a process
+that has decoded none of these schemas (`prepare` warmed it); "then" the worst of the 30 calls after it. Three runs,
+the worst of each:
 
-| List | SQLite | In memory |
+| List | SQLite first / then | In memory first / then |
 |---|---|---|
-| 60 rows of arrays of `{ "x": 0 }`, 1,998 characters each (`maxChars` 2,000) | 4.6 ms | 4.0 ms |
-| 60 rows of arrays of numbers, 2,000 characters each | 4.1 ms | 3.9 ms |
-| 7 rows of arrays of `{ "x": 0 }`, 15,998 characters each (`maxChars` 16,000) | 3.1 ms | 2.7 ms |
-| 7 rows of arrays of numbers, 16,000 characters each | 4.9 ms | 2.9 ms |
+| 100 rows of 250 characters: objects / numbers | 2.6 / 2.5, 1.3 / 2.2 ms | 1.6 / 2.3, 0.7 / 1.4 ms |
+| 100 rows of 250 characters: the union of four / the optional fields | 4.4 / 4.0, 2.4 / 3.8 ms | 3.4 / 3.4, 2.0 / 3.5 ms |
+| 12 rows of 2,000 characters: objects / numbers | 0.7 / 1.5, 1.3 / 1.4 ms | 0.5 / 1.3, 0.6 / 1.5 ms |
+| 12 rows of 2,000 characters: the union of four / the optional fields | 3.5 / 3.5, 2.2 / 3.6 ms | 2.6 / 3.5, 1.8 / 3.5 ms |
+| 1 row of 16,000 characters: objects / numbers | 0.5 / 1.1, 0.5 / 1.2 ms | 0.3 / 1.3, 0.5 / 1.3 ms |
+| 1 row of 16,000 characters: the union of four / the optional fields | 2.3 / 2.9, 1.5 / 2.1 ms | 1.8 / 3.3, 1.3 / 2.1 ms |
 
-With a budget of 200,000 (100 and 12 rows) the same lists took up to 6.8 ms, and 150,000 up to 5.7 ms: over the
-margin of two, so the budget is 120,000. Long strings of the same size cost far less (Sol measured 0.8–4.4 ms for 100
-rows of 16,000 characters).
+The worst is 4.4 ms. With a budget of 30,000 single calls of the union reached 5.6–5.9 ms, and at 40,000 up to 8.6 ms:
+over the margin of two, so the budget is 25,000. Without the warming in `prepare`, the first union list after a start
+took 14.6 ms (at 30,000). Long strings of the same size cost far less.
 
 The longest stop of the event loop (a 1 ms timer) while the work ran, with a turn's read every 2 ms beside it:
 
 | Work | Longest stop |
 |---|---|
-| a backup (own connection, one step on SQLite's worker thread) | 5.6 ms |
-| a removal and the truncating checkpoint after it (worker thread), after a reader let the log grow | 2.4 ms |
-| ending a conversation of 3,000 rows of about 1 KB (steps of 10) | 1.9 ms |
-| ending a conversation at the legal maximum: values of 16,000 characters, eight indexed fields of 500 characters (sixteen indexes), secure deletion (steps of 10; 100 rows a step took 48 ms) | 4.3 ms |
-| migrating 20,000 rows of about 1 KB at start (one transaction; before the server serves) | 723 ms |
+| a backup (own connection, one step on SQLite's worker thread) | 2.7 ms |
+| a removal and the truncating checkpoint after it (worker thread), after a reader let the log grow | 1.6 ms |
+| ending a conversation of 3,000 rows of about 1 KB (steps of 10) | 1.8 ms |
+| ending a conversation at the legal maximum: values of 16,000 characters, eight indexed fields of 500 characters (sixteen indexes), secure deletion (steps of 10; 100 rows a step took 48 ms) | 3.4 ms |
+| ambient facts for two modules of 64 collections, each 12 rows of 2,000 characters (`ambientLatency.test.ts`; it yields between collections, and stops at its 50 ms budget) | 2.3 ms |
+| migrating 20,000 rows of about 1 KB at start (one transaction; before the server serves) | 700 ms |
 
 The doctor's quick check reads the whole file; it is not on a turn's path.
 
