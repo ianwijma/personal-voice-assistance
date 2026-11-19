@@ -48,7 +48,7 @@ describe("setting alarms", () => {
       assert.isTrue(jobs.every((j) => j.origin.deviceId === "kitchen-display"))
     }))
 
-  it.effect("repeating: the rule, and the first one; a time is needed; a time past or too far is refused", () =>
+  it.effect("repeating: the rule, and the first one; a time is needed; a time past is refused", () =>
     Effect.gen(function*() {
       const kit = yield* startTestModule(alarmsModule)
       assert.strictEqual(said(yield* kit.action("set", { when: "every weekday at 6:45" })), "Alarm set every weekday; the first one is tomorrow at quarter to seven in the morning.")

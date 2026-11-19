@@ -81,7 +81,8 @@ const KIND_WORDS = new Set(["timer", "timers", "alarm", "alarms", "wekker", "wek
 
 /**
  * A name as it is compared: lower case, without accents and punctuation, without a leading article and a trailing
- * "timer" / "alarm" / "wekker" ("the Pasta timer" and "pasta" are one name). Exact comparison only: no sound-alikes.
+ * "timer" / "alarm" / "wekker" ("the Pasta timer" and "pasta" are one name). If no words remain, use the supplied
+ * label itself, ignoring case. Exact comparison only: no sound-alikes.
  */
 export const nameKey = (text: string): string => {
   const words = text
@@ -94,7 +95,7 @@ export const nameKey = (text: string): string => {
     .filter((w) => w !== "")
   while (words.length > 0 && ARTICLES.has(words[0]!)) words.shift()
   while (words.length > 0 && KIND_WORDS.has(words.at(-1)!)) words.pop()
-  return words.join(" ")
+  return words.join(" ") || text.trim().toLowerCase()
 }
 
 /** "pasta" → "Pasta": a name at the start of a sentence. */
@@ -118,7 +119,12 @@ export const speakLeft = (ms: number, language: Language): string => {
 }
 
 /** A spoken list of at most `max` items, "and N more" past it. */
-export const listOf = (items: ReadonlyArray<string>, language: Language, max = 4): string => speakList(items.map((i) => cut(i, 200)), language, { max }) ?? items.join(", ")
+export const listOf = (items: ReadonlyArray<string>, language: Language, max = 3): string => {
+  const first = items.slice(0, max).map((i) => cut(i, 200))
+  const more = items.length - first.length
+  const list = more > 0 ? first.join(", ") : speakList(first, language) ?? first.join(", ")
+  return more > 0 ? `${list}${language === "nl" ? " en" : " and"} ${more} ${language === "nl" ? "meer" : "more"}` : list
+}
 
 /** One page read of a collection's list, for the bounded scan. */
 export type ListPage<A> = (q: { readonly limit: number; readonly after?: Row<A> }) => Effect.Effect<ReadonlyArray<Row<A>>, StoreFailure>
