@@ -38,7 +38,7 @@ Each reminder is one row, and everything it will still do is written in that row
    has one time; a repeat always has its next one; a series with an end (a count or an until) has none after its last.
 2. **A delivery under way**, at most one: the time it was due, how many tries have been made, when to try again.
 3. **A ring nobody has answered yet**, at most one: which time it was for, when it was delivered, and, if someone
-   snoozed it, until when.
+   snoozed it, until when; it retains the effective due time for display after redelivery.
 4. **Clean-up still owed**: a notification or card that should have gone but has not yet (see "When taking it down
    fails").
 5. **The next moment anything happens for it** (the soonest of the four above). The module keeps **exactly one
@@ -86,7 +86,13 @@ case a reminder that was already stopped can ring once more; it can never ring z
   the series goes on. **Done on a repeat that is not ringing skips its next time** ("Done: I'll skip the one today at
   eight. The next one is tomorrow at eight."); the series goes on after it. If cleanup from the answered ring is still owed, named Done retries that cleanup first. Cancel ends a repeat for good.
 - **Snooze** takes the notification and card down and rings the same time again after the setting's minutes (or a said
-  duration). The same button pressed again (the service may run a handler twice) does not push it further, even after redelivery; only the fresh delivery's own button can snooze it again.
+  duration). After redelivery its notification, due card and lists use the snooze deadline as the due time; the original
+  occurrence time remains its stable identity. The same button pressed again (the service may run a handler twice) does not push it further, even after redelivery; only the fresh delivery's own button can snooze it again.
+- An unnamed voice answer or a button answers one occurrence and the open notification selected for it. Admission is
+  checked again under the reminder lock: an answer selected before a successful Snooze cannot finish it or change that
+  snooze. A delivered newer attempt can be answered even when its ring write failed; accepting it also retires the older
+  ring. Answering the older occurrence preserves a newer occurrence's notification and card. When another delivery is
+  still pending, Done omits a next-date promise.
 - A ring nobody answers stays as "was due …" in the list. Its notification expires after 30 minutes (a `normal` card after
   a day). **A week after it was delivered**, the daily clean-up ends it: a one-off is then finished (lapsed); a repeat
   goes on.
@@ -124,8 +130,7 @@ cleanup and give a plain cancellation reply while the notification remains until
 
 Every reminder is `ring` unless the setting says otherwise; its notification expires after 30 minutes (a `normal` card
 after a day). The card on the screen is transient (5 minutes; a newer transient presentation on that screen ends it). Its key and its
-buttons carry the occurrence (`due:<id>:<time>`): a press on a card for an occurrence that is not the reminder's current
-ring answers "That one was already answered." and changes nothing; "skip the next occurrence" is only for the tool.
+buttons carry the occurrence (`due:<id>:<time>`): a press on a card is accepted only for the current ring or a delivered attempt, with its notification still open; any other press answers "That one was already answered." and changes nothing; "skip the next occurrence" is only for the tool.
 Changing the words of a reminder whose notification was stopped on the host but whose card is still on a screen withdraws
 that card (it does not ring again).
 
@@ -203,8 +208,8 @@ One collection, `reminders` (scope household; rows carry their owner), `storage.
 | `state` | `open` (a series, a delivery under way or a ring is left), `done`, `cancelled`, `lapsed` |
 | `dueAt` | the next time not yet handed to delivery; absent once a one-off was handed over or a series ended |
 | `owed` | a delivery under way: `{ at, from, attempts, tryAt }` (`from`: what the late rule counts from) |
-| `ring` | a delivered time not yet answered: `{ at, deliveredAt, snoozeUntil? }` |
-| `stop` | clean-up owed: `{ notes, card, attempts, tryAt }` (the times whose notifications are to go, the card) |
+| `ring` | a delivered time not yet answered: `{ at, deliveredAt, from?, snoozeUntil? }` (`from`: the effective due time after delivery) |
+| `stop` | clean-up owed: `{ notes, card, cardAt?, attempts, tryAt }` (the times whose notifications are to go; `cardAt` limits an answer's card cleanup to that occurrence) |
 | `stopFailed` | the clean-up's tries were used up: a ring or card may still be open and ends by itself when it expires |
 | `nextAt` | the next moment anything happens for it; its one job is planned for it |
 | `deviceId`, `assistantId`, `setBy` | where it is delivered, the assistant that heard it, whose turn set it |
@@ -247,7 +252,9 @@ snoozes at once leave one snooze and one job.
   stored. The delivery passes the owner to the notification service and the card carries `sensitivity: personal`, so
   each device is decided again when it would ring or show: a shared device whose default person changed since the
   reminder was set gets neither. A confirmation asks after the last wait and write, immediately before its sentence is
-  built; a list is built from the rows just read under the same answer.
+  built; a list is built from the rows just read under the same answer. Done and Snooze buttons check the pressing
+  device before accepting the answer. A refused answer keeps its refusal and notification; permission lost after a
+  successful Done reduces its confirmation to "Done." without the schedule.
 - Reading and matching look at the household's reminders and the **asking person's own** only; another person's are not
   read, not counted, not matched. Without a known person only the household's are read, and the answer says so. The
   person's own that the asking device may not be told are counted anonymously ("2 personal reminders are not read out
