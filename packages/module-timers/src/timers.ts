@@ -503,7 +503,7 @@ export const timersModule = defineModule({
       ) => [
         ...all.ringing.map((row) => ({ row, shown: "ringing" as Shown })),
         ...all.waiting.map((row) => ({ row, shown: "waiting" as Shown })),
-        ...[...all.active].sort((x, y) => leftOf(x.value, now) - leftOf(y.value, now)).map((row) => ({ row, shown: "active" as Shown })),
+        ...[...all.active].sort((x, y) => leftOf(x.value, now) - leftOf(y.value, now)).map((row) => ({ row, shown: (row.value.state === "running" && row.value.dueAt <= now ? "waiting" : "active") as Shown })),
         ...(forCancel ? all.cleanup.map((row) => ({ row, shown: "cleanup" as Shown })) : [])
       ]
 
@@ -725,6 +725,10 @@ export const timersModule = defineModule({
             if (t.kind !== "one") return notOne(t)
             const row = t.row
             const Name = capitalise(displayName(row.value, lang))
+            if (row.value.state === "running" && row.value.dueAt <= now) {
+              yield* commit(row, row.id, advance(row.value, now)).pipe(Effect.mapError(failure))
+              return say(texts, lang, "oneWaiting", { Name })
+            }
             if (t.shown !== "active") return say(texts, lang, t.shown === "waiting" ? "oneWaiting" : "notPausedRinging", { Name })
             if (row.value.state === "paused") {
               // Already paused: what is still owed for it (a countdown to take down) is done now.

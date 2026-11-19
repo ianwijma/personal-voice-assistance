@@ -314,7 +314,14 @@ it.effect("8: on-time daily alarms do bounded recurrence work below the main-thr
   yield* kit.action("set", { when: "every day at 10:01" })
   recurrence.stops.length = 0
   recurrence.limits.length = 0
-  for (let round = 0; round < 5; round++) yield* kit.advance(round === 0 ? MIN : DAY)
+  const delivered = new Set<string>()
+  for (let round = 0; round < 5; round++) {
+    yield* kit.advance(round === 0 ? MIN : DAY)
+    assert.strictEqual(ringing(kit).length, 1)
+    delivered.add(ringing(kit)[0]!.id)
+  }
+  assert.strictEqual(delivered.size, 5)
+  assert.isAbove(recurrence.stops.length, 0)
   console.log(`alarms: longest synchronous recurrence call over five on-time deliveries: ${Math.max(...recurrence.stops).toFixed(2)} ms; largest requested expansion: ${Math.max(1, ...recurrence.limits)}`)
   assert.isAtMost(Math.max(1, ...recurrence.limits), 2)
   assert.isBelow(Math.max(...recurrence.stops), bound(10))

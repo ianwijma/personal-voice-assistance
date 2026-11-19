@@ -262,7 +262,7 @@ export interface AlarmsOps {
   readonly cancel: (which: string | undefined, scope: Scope) => Effect.Effect<string, ActionError>
 }
 
-type Target = { readonly kind: "one"; readonly row: Row<Alarm>; readonly snoozed: boolean } | { readonly kind: "answer"; readonly say: string }
+type Target = { readonly kind: "one"; readonly row: Row<Alarm>; readonly snoozed: boolean; readonly ringing: boolean } | { readonly kind: "answer"; readonly say: string }
 
 export const alarmsModule = defineModule({
   apiVersion: 2,
@@ -505,7 +505,6 @@ export const alarmsModule = defineModule({
         return what
       }
 
-      const one = (row: Row<Alarm>, snoozed = false): Target => ({ kind: "one", row, snoozed })
       const answer = (text: string): Target => ({ kind: "answer", say: text })
 
       /**
@@ -528,6 +527,7 @@ export const alarmsModule = defineModule({
         Effect.gen(function*() {
           const lang = language()
           const read = yield* readLive(forCancel).pipe(Effect.mapError(unreadable))
+          const one = (row: Row<Alarm>, snoozed = false): Target => ({ kind: "one", row, snoozed, ringing: ringingNow(row, read.open) })
           const ask = (rows: ReadonlyArray<Row<Alarm>>, cutShort: boolean): Target =>
             answer(say(texts, lang, cutShort ? "whichCut" : "which", { count: rows.length, list: listOf(rows.map((r) => itemOf(r, here, read.open, now, lang)), lang) }))
           const key = which === undefined ? "" : nameKey(which)
@@ -546,8 +546,9 @@ export const alarmsModule = defineModule({
               const row = at[0]!
               const ring = row.value.ring
               // A delivered snooze selected only by its effective time is the occurrence to stop, not the next series day.
-              const snoozed = ring?.snoozedAt !== undefined && read.open.ids.has(ring.notification)
-                && timeText(localOf(ring.snoozedAt, row.value.timeZone).time) === timeText(time.value)
+              const snoozedAt = row.value.owed?.snoozed === true && ringingNow(row, read.open) ? row.value.owed.at
+                : ring?.snoozedAt !== undefined && read.open.ids.has(ring.notification) ? ring.snoozedAt : undefined
+              const snoozed = snoozedAt !== undefined && timeText(localOf(snoozedAt, row.value.timeZone).time) === timeText(time.value)
                 && row.value.next?.time !== timeText(time.value)
               return one(row, snoozed)
             }
@@ -646,7 +647,7 @@ export const alarmsModule = defineModule({
               const after = yield* Effect.flatMap(ended(row, now), (value) => change(row, value)).pipe(Effect.mapError(failure))
               return pendingSay(after, say(texts, lang, "cancelledRepeat", { rule }))
             }
-            if (t.snoozed || v.ring?.again !== undefined || v.owed !== undefined || v.withdraw !== undefined) {
+            if (t.snoozed || v.ring?.again !== undefined || (v.owed !== undefined && !t.ringing) || v.withdraw !== undefined) {
               // The current occurrence (including an owed snooze or its unfinished withdrawal) comes before the series.
               const occurrence = v.owed ?? v.ring ?? v.withdraw!
               const next = momentOf(v.next.date, v.next.time, now, z, lang)
