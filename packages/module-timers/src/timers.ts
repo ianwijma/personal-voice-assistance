@@ -13,7 +13,7 @@ import {
   type Row,
   Setting
 } from "@pva/core"
-import { speakDuration } from "@pva/language"
+import { parseDuration, speakDuration } from "@pva/language"
 import { homeLanguage, isLine, type Language, say, StoredText, Timers, TIMERS_LIMITS, TimersError, type TimerInfo, type TimersService } from "@pva/module-contracts"
 import { Clock, Effect, Schema, Semaphore } from "effect"
 import { randomUUID } from "node:crypto"
@@ -955,19 +955,28 @@ export const timersModule = defineModule({
         defineAction({
           id: "start",
           label: "Start a timer",
-          description: "Start a countdown timer of a duration, optionally with a name (\"pasta\"). It rings on this device; its countdown shows on the screens of this room.",
-          examples: ["set a timer for ten minutes", "set a pasta timer for 8 minutes", "zet een timer op tien minuten", "zet een eieren timer op zes minuten"],
+          description: "Start a countdown timer of a duration, optionally with a name. It rings on this device; its countdown shows on the screens of this room.",
+          examples: ["set a timer for ten minutes", "start a timer for 8 minutes", "zet een timer op tien minuten", "zet een timer op zes minuten"],
           params: {
             duration: Param.duration({ label: "Duration", minMs: TIMERS_LIMITS.minMs, maxMs: TIMERS_LIMITS.maxMs }),
             name: Param.text({ label: "Name", after: ["called", "named", "genaamd"], optional: true, maxWords: 3 }),
-            inlineName: Param.text({ label: "Named timer clause", after: ["a", "an", "een"], optional: true, maxWords: 64 })
+            inlineName: Param.text({ label: "Named timer clause", after: ["a", "an", "the", "een", "de"], optional: true, maxWords: 64 })
           },
           phrases: {
             en: ["set a timer for {duration}", "set a {name} timer for {duration}", "start a timer for {duration}", "start a {name} timer for {duration}", "timer for {duration}", "set the timer for {duration}"],
             nl: ["zet een timer op {duration}", "zet een timer van {duration}", "zet een timer voor {duration}", "timer van {duration}", "timer op {duration}", "zet een {name} timer op {duration}"]
           },
           risk: "change",
-          run: ({ duration, name, inlineName }) => Effect.map(ctx.shared.start({ durationMs: duration, name: name ?? inlineName?.match(/^(.+?)\s+timer\s+(?:for|op|van|voor)\s+/iu)?.[1] }), (s) => ({ say: s }))
+          run: ({ duration, name, inlineName }) => {
+            const lang = homeLanguage(ctx.host.view())
+            const clause = inlineName?.match(/^(?:(.+?)\s+)?timer\s+(?:for|op|van|voor)\s+(.+)$/iu)
+            const parsed = clause === undefined || clause === null ? undefined : parseDuration(clause[2]!, lang)
+            // Never discard a supplied clause's unknown name, suffix or mismatched duration.
+            if (inlineName !== undefined && (parsed?.kind !== "ok" || parsed.value !== duration || name !== undefined && nameKey(name) !== nameKey(clause![1] ?? ""))) {
+              return Effect.succeed({ say: say(texts, lang, "startTarget") })
+            }
+            return Effect.map(ctx.shared.start({ durationMs: duration, name: name ?? clause?.[1] }), (s) => ({ say: s }))
+          }
         }),
         defineAction({
           id: "list",
@@ -986,7 +995,7 @@ export const timersModule = defineModule({
           id: "adjust",
           label: "Change a timer's time",
           description: "Add time to a timer, or take time off it. A ringing timer given more time runs again for that long.",
-          examples: ["add five minutes to the pasta timer", "take a minute off the timer", "doe er vijf minuten bij"],
+          examples: ["add five minutes to the timer", "take a minute off the timer", "doe er vijf minuten bij"],
           params: {
             amount: Param.duration({ label: "Amount", minMs: 1_000, maxMs: TIMERS_LIMITS.maxMs }),
             change: Param.choice({ label: "Add or take off", options: [{ value: "add", label: "add", aliases: ["erbij"] }, { value: "remove", label: "take off", aliases: ["off", "subtract", "remove", "eraf", "minder"] }] }),
@@ -1017,7 +1026,7 @@ export const timersModule = defineModule({
           id: "cancel",
           label: "Cancel a timer",
           description: "Cancel a timer (a ringing one stops), or every timer when all is asked for.",
-          examples: ["cancel the timer", "cancel the eggs timer", "cancel all timers", "annuleer de timer"],
+          examples: ["cancel the timer", "cancel the named timer", "cancel all timers", "annuleer de timer"],
           params: {
             name: Param.text({ label: "Name", after: ["the", "my", "our", "de", "mijn", "onze", "called", "named", "genaamd"], optional: true, maxWords: 64 }),
             all: Param.boolean({ label: "All timers", question: "Does the speaker want every timer cancelled?" }),

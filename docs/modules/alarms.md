@@ -15,8 +15,8 @@ This page belongs to the module's pull request, which touches its package and th
 Alarms that ring on the device they were set on, either once ("wake me at seven", "tomorrow at 6:30") or repeating
 ("every weekday at quarter to seven", "elke werkdag om half zeven"). Up to 50 at once.
 
-**An alarm is not changed.** To move one, it is cancelled and set again (`alarms_cancel`, then `alarms_set`). The tool
-descriptions and the instructions say so, so the model does exactly that.
+**An alarm is not changed.** To move one, it is cancelled and set again (`alarms_cancel`, then `alarms_set`). The module
+instructions tell the model to cancel and set again.
 
 It is a separate module from `timers`, so an assistant can have one without the other.
 
@@ -195,7 +195,7 @@ Everything is local: no outside service, no network.
 
 ## Tools
 
-There are three typed actions, each with English and Dutch `examples`. The intent path runs them without the model, and
+There are three typed actions, each with English and Dutch `examples`. The intent path can run them directly, and
 the model is offered each as `alarms_<id>`. There are no phrase commands: the plan gives phrases to the timers only.
 `set` and `cancel` are `change`; `list` is a plain read. **Moving an alarm is `alarms_cancel` followed by
 `alarms_set`.**
@@ -211,6 +211,13 @@ The typed setting parameter keeps the date or repetition before the clock time: 
 before comparing a clock time, preserving punctuation such as the colon in “12:00”. A date-only cancellation
 such as “cancel tomorrow's alarm only” asks which alarm is meant and changes nothing; it cannot select today's
 sole alarm by dropping “tomorrow”.
+
+The direct path understands “wake me at seven” / “zet een wekker om half acht”, complete date/repetition clauses
+such as “set an alarm every weekday at noon”, and cancellation by clock time or a name after an article, possessive
+or alarm noun. “Named”, “called” and “genaamd” explicitly select a name, even a name such as Noon. Qualifiers before
+an alarm noun are retained; unsupported clauses such as “a weekday alarm at noon” ask instead of creating a one-off.
+Unresolved captured targets and dates ask or leave the whole request to the assistant's model. Actions receive only
+declared parameters, not the utterance, so they cannot inspect words extraction never supplied.
 
 Dutch: "zet een wekker om half acht" answers "Wekker gezet voor morgen om half acht 's ochtends.". A repeating one
 without a scope answers "Die wekker herhaalt elke werkdag. Alleen de volgende, of allemaal?".
