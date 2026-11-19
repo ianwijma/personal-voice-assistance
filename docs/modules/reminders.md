@@ -85,13 +85,17 @@ case a reminder that was already stopped can ring once more; it can never ring z
 - **Done and snooze** are the same four ways: the notification's buttons, the card's buttons, the typed actions and the
   tools. **Done on a one-off** finishes it (also before it is due). **Done on a repeat that is ringing** answers that ring;
   the series goes on. **Done on a repeat that is not ringing skips its next time** ("Done: I'll skip the one today at
-  eight. The next one is tomorrow at eight."); the series goes on after it. If cleanup from the answered ring is still owed, named Done retries that cleanup first. Cancel ends a repeat for good.
+  eight. The next one is tomorrow at eight."); the series goes on after it. If cleanup from the answered ring is still
+  owed, named Done retries that cleanup first. Cleanup left by a time edit is not an answer: Done finishes the
+  rescheduled one-off or skips the rescheduled repeat's next time. Cancel ends a repeat for good.
 - **Snooze** takes the notification and card down and rings the same time again after the setting's minutes (or a said
   duration). A snooze ending at or after the next regular occurrence is declined: choose a shorter snooze.
   An older ring cannot be snoozed while a newer occurrence is still recorded as owed; use Snooze on the newer notification once you see it, including when it is already on screen.
   After redelivery its notification, due card and lists use the snooze deadline as the due time; the original
   occurrence time remains its stable identity. The same button pressed again (the service may run a handler twice) does not push it further, even after redelivery; only the fresh delivery's own button can snooze it again.
-- An unnamed voice answer or a button answers one occurrence and the open notification selected for it. Admission is
+- A named answer chooses the newest attempted delivery whose notification is open, even if recording its ring failed;
+  it does not answer an older recorded ring instead. An unnamed voice answer or a button answers one occurrence and
+  the open notification selected for it. Admission is
   checked again under the reminder lock: an answer selected before a successful Snooze cannot finish it or change that
   snooze. A delivered newer attempt can be answered even when its ring write failed; accepting it also retires the older
   ring. Answering the older occurrence preserves a newer occurrence's notification and card. When another delivery is
