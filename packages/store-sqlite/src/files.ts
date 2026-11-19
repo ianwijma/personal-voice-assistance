@@ -115,7 +115,8 @@ export const copyDatabase = async (source: string, path: string): Promise<string
     await rename(part, path)
     await fsyncDir(dirname(path))
   } catch (e) {
-    await rm(part, { force: true }).catch(() => undefined)
+    // The temporary copy and what SQLite may have left beside it (a failed conversion leaves its log and index).
+    for (const f of [part, `${part}-wal`, `${part}-shm`, `${part}-journal`]) await rm(f, { force: true }).catch(() => undefined)
     throw e
   }
   return problem
@@ -143,10 +144,17 @@ export const copyFilePrivately = async (from: string, path: string): Promise<str
   return problem
 }
 
+/**
+ * Tests only (`@pva/store-sqlite/testing`): a pause inside the journal conversion of a backup's copy (the step that
+ * must not run on the main thread), and something to do to the copy just before it. Zero and none in the app.
+ */
+export const journalConversionHooks: { pauseMs: number; before: ((file: string) => void) | undefined } = { pauseMs: 0, before: undefined }
+
 /** Set a database file's journal mode to DELETE on a short-lived worker thread (the copy of a backup). */
 const toRollbackJournal = (file: string): Promise<void> =>
   new Promise<void>((resolve, reject) => {
-    const w = new Worker(JOURNAL_TO_DELETE, { eval: true, workerData: { file } })
+    journalConversionHooks.before?.(file)
+    const w = new Worker(JOURNAL_TO_DELETE, { eval: true, workerData: { file, pauseMs: journalConversionHooks.pauseMs } })
     let settled = false
     const done = (error?: Error) => {
       if (settled) return
@@ -189,13 +197,16 @@ const { DatabaseSync } = require("node:sqlite")
 try {
   const db = new DatabaseSync(workerData.file)
   try {
+    // Tests only: the step made slow (zero in the app).
+    if (workerData.pauseMs > 0) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, workerData.pauseMs)
     db.exec("PRAGMA journal_mode = DELETE")
   } finally {
     db.close()
   }
   parentPort.postMessage({ ok: true })
 } catch (e) {
-  parentPort.postMessage({ ok: false, error: String(e) })
+  // SQLite's message as it was when this ran on the main thread ("disk I/O error"), not "Error: disk I/O error".
+  parentPort.postMessage({ ok: false, error: e instanceof Error ? e.message : String(e) })
 }
 `
 
