@@ -6,10 +6,11 @@
 // with no device hear only whether things are fine. A shared device hears at most three problems by module name and
 // state, and how many devices are connected; only a private device hears the devices' names (a phone's name is
 // someone's). No error text, reason or detail of a module is ever passed on: they can hold addresses and names.
-import { ActionError, CurrentTurn, defineAction, defineModule, Devices, type HostView, makeTool } from "@pva/core"
+import { ActionError, CurrentTurn, defineAction, defineModule, Devices, type HostView, makeTool, type Presentation } from "@pva/core"
 import { defineTexts, homeLanguage, type Language, say } from "@pva/module-contracts"
 import { speakList } from "@pva/language"
 import { Effect, Schema } from "effect"
+import { cutFor, makeScreen, SCREEN } from "./screen.ts"
 
 export const texts = defineTexts({
   en: {
@@ -28,7 +29,9 @@ export const texts = defineTexts({
     devicesSome: "Connected devices: {names}.",
     devicesCount: "{count} devices are connected.",
     modulesRunning: "{count} modules are running.",
-    modulesOff: "{count} are switched off."
+    modulesOff: "{count} are switched off.",
+    issuesTitle: "Problems",
+    itemVault: "The key vault is locked."
   },
   nl: {
     fine: "Alles werkt.",
@@ -46,7 +49,9 @@ export const texts = defineTexts({
     devicesSome: "Verbonden apparaten: {names}.",
     devicesCount: "{count} apparaten zijn verbonden.",
     modulesRunning: "{count} modules draaien.",
-    modulesOff: "{count} staan uit."
+    modulesOff: "{count} staan uit.",
+    issuesTitle: "Problemen",
+    itemVault: "De sleutelkluis is op slot."
   }
 })
 
@@ -112,6 +117,47 @@ const report = (view: HostView, lang: Language, about: About, detail: Detail) =>
   }
 }
 
+const problemLine = (p: ReturnType<typeof problemsOf>[number], lang: Language): string =>
+  p.kind === "vault" ? say(texts, lang, "vaultLocked")
+    : p.kind === "engine" ? say(texts, lang, "engineState", { state: engineWords(p.state, lang) })
+    : say(texts, lang, p.state === "error" ? "moduleError" : "moduleUnavailable", { name: p.name ?? "" })
+
+/**
+ * One problem as a line of the list: the answer's own sentence, except that the vault's (a long one) is its short form,
+ * and a module's name is cut to fit the line, so no sentence is ever cut in the middle.
+ */
+const itemLine = (p: ReturnType<typeof problemsOf>[number], lang: Language): string => {
+  if (p.kind === "vault") return say(texts, lang, "itemVault")
+  if (p.kind === "module") {
+    const room = SCREEN.listItem - problemLine({ ...p, name: "" }, lang).length
+    return problemLine({ ...p, name: cutFor(p.name ?? "", Math.max(room, 8)) }, lang)
+  }
+  return problemLine(p, lang)
+}
+
+/**
+ * The issues the tool reports, as a list for a screen, or `undefined` when there is nothing to show: it shows exactly
+ * what the answer said to this device and nothing more (docs/modules/system-status.md). A device that is told only
+ * whether things are fine (public, unknown, no device), an answer about devices only and a house with no problem have
+ * no list. At most three problems, as the answer names them, then "And N more." when the count is more.
+ */
+export const issuesList = (view: HostView, lang: Language, about: About, detail: Detail): Presentation | undefined => {
+  if (detail === "none" || about === "devices") return undefined
+  const problems = problemsOf(view)
+  if (problems.length === 0) return undefined
+  const shown = problems.slice(0, MAX_PROBLEMS)
+  const items = shown.map((p, i) => ({ id: `p${i}`, text: itemLine(p, lang) }))
+  if (problems.length > shown.length) items.push({ id: "more", text: cutFor(say(texts, lang, "moreProblems", { count: problems.length - shown.length }), SCREEN.listItem) })
+  return {
+    kind: "list",
+    title: cutFor(say(texts, lang, "issuesTitle"), SCREEN.title),
+    style: "bullets",
+    items,
+    // What is said where nothing shows it: the answer's own words about the problems (one sentence per problem).
+    spoken: cutFor(items.map((i) => i.text).join(" "), SCREEN.spoken)
+  }
+}
+
 export const systemStatusModule = defineModule({
   apiVersion: 2,
   id: "system-status",
@@ -127,6 +173,14 @@ export const systemStatusModule = defineModule({
         const privacy = device?.place.privacy
         return (privacy === "private" ? "private" : privacy === "shared" ? "shared" : "none") as Detail
       })
+      const screen = makeScreen(ctx.present)
+      const answer = (about: About, detail: Detail) =>
+        Effect.gen(function*() {
+          const view = ctx.host.view()
+          const lang = homeLanguage(view)
+          yield* screen(issuesList(view, lang, about, detail))
+          return report(view, lang, about, detail)
+        })
       const tool = makeTool({
         name: "system_status",
         description:
@@ -140,7 +194,7 @@ export const systemStatusModule = defineModule({
         execute: ({ about }) =>
           Effect.gen(function*() {
             const detail = yield* mayDetail
-            return report(ctx.host.view(), homeLanguage(ctx.host.view()), about ?? "all", detail)
+            return yield* answer(about ?? "all", detail)
           })
       })
       const action = defineAction({
@@ -154,8 +208,7 @@ export const systemStatusModule = defineModule({
         run: () =>
           Effect.gen(function*() {
             const detail = yield* mayDetail
-            const view = ctx.host.view()
-            return { say: report(view, homeLanguage(view), "all", detail).spoken }
+            return { say: (yield* answer("all", detail)).spoken }
           }).pipe(Effect.mapError(() => new ActionError({ message: "" })))
       })
       return { tools: [tool], actions: [action], instructions: "For \"how is the server doing\" or \"is everything working\", use system_status." }
