@@ -1,5 +1,6 @@
 import type { ModuleDefinition, ModuleHost, Setting, SettingsSpec } from "@pva/core"
 import type { HostResult } from "@pva/core"
+import { RISK_POLICY_KEYS } from "@pva/protocol"
 import type { EnvEntry, EnvInfo, EnvKind, SettingsGroup, SettingsPatch, SettingValue } from "@pva/protocol"
 import { Effect } from "effect"
 import { type CommentOutResult, commentOutKeys, type EnvOrigin, type EnvView } from "../envView.ts"
@@ -301,10 +302,20 @@ export const makeEnvMover = (options: {
               continue
             }
           }
-          options.view.release(p.key)
-          const saved = yield* save(p, secret)
+          // Keep a risk override effective during its write. Other commits may publish the policy while it waits;
+          // a failed move must never expose the old underlying value, even temporarily.
+          const riskKey = Object.values(RISK_POLICY_KEYS).some((key) => key === p.key)
+          if (!riskKey) options.view.release(p.key)
+          const saved = yield* riskKey ? Effect.uninterruptible(Effect.gen(function*() {
+            const result = yield* save(p, secret)
+            if (result.ok) {
+              options.view.release(p.key)
+              options.sections.announceAll()
+            }
+            return result
+          })) : save(p, secret)
           if (!saved.ok) {
-            options.view.restore(p.key, p.text, p.origin)
+            if (!riskKey) options.view.restore(p.key, p.text, p.origin)
             problems.push(`${p.key}: ${saved.message}`)
             continue
           }
