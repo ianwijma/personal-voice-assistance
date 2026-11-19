@@ -124,7 +124,7 @@ export interface DeviceFacts {
    * P10: what a device can do with a presentation now, from one place (`devicePresentFrom`): its latest declaration
    * minus the owner's overrides (its own, else its type's). A page that never declared anything shows none.
    */
-  readonly presentOf: (deviceId: string, kind?: string) => DevicePresentOutputs
+  readonly presentOf: (deviceId: string, kind?: string, declaredKinds?: Readonly<Record<string, number>>) => DevicePresentOutputs
   /** Something live changed (a connection, a declaration, visibility): the next read rebuilds the list. */
   readonly changed: () => void
   readonly devices: DevicesService
@@ -244,12 +244,14 @@ export const makeDeviceFacts = (options: DeviceFactsOptions): DeviceFacts => {
       const declared = (options.latestOf ?? options.declaredOf)(deviceId) ?? file.devices[deviceId]?.declared
       return deviceOutputsFrom(settings, declared?.capabilities)
     },
-    presentOf: (deviceId, kind) => {
+    presentOf: (deviceId, kind, declaredKinds) => {
       const file = current().file
       const known = file.devices[deviceId] !== undefined
       const settings = deviceSettingsFrom(file, known ? deviceId : undefined, kind)
       const declared = (options.latestOf ?? options.declaredOf)(deviceId) ?? file.devices[deviceId]?.declared
-      return devicePresentFrom(settings, declared?.capabilities)
+      // P10 (G11): one connection's own kinds in place of the device's latest declaration; display and overrides as declared.
+      const caps = declared?.capabilities === undefined || declaredKinds === undefined ? declared?.capabilities : { ...declared.capabilities, present: { kinds: declaredKinds } }
+      return devicePresentFrom(settings, caps)
     },
     changed: () => {
       version++

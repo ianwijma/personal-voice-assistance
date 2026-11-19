@@ -764,6 +764,7 @@ export const startTestModule = (definition: ModuleDefinition<any>, options: Star
     }
     const present = yield* makePresentEngine({
       store,
+      scheduler: engine,
       devices: () => people.devices.list(),
       outputs: (d) => devicePresentFrom({ capabilities: { noDisplay: false, noSpeaker: false, excludeKinds: [] } }, declaredOf.get(d.id) ?? KIT_PAGE_CAPABILITIES),
       privacy: people.privacy,
@@ -1281,6 +1282,8 @@ export const startTestModule = (definition: ModuleDefinition<any>, options: Star
             Deferred.doneUnsafe(sessionOf(deviceId), Effect.void)
             replying.delete(deviceId)
             notify.reconcile(deviceId)
+            // As the real page: one that lost its connection shows nothing from the server until its next welcome.
+            presentPages.delete(deviceId)
             present.reconcile(deviceId)
             return settle
           }),

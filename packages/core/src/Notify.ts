@@ -260,11 +260,14 @@ export interface ModuleNotify {
 // ---------------------------------------------------------------------------------------------------------------------
 // Speech outside a reply
 
-/** Where an announcement is spoken: one device, a room's devices (by `place.room`), or every known device. */
-export type SpeechTarget = { readonly device: string } | { readonly room: string } | "everywhere"
+/**
+ * Where an announcement is spoken: one device, a room's devices (by `place.room`; `except`: all of them but that one, so a
+ * broadcast need not reach the device it was asked on), or every known device.
+ */
+export type SpeechTarget = { readonly device: string } | { readonly room: string; readonly except?: string } | "everywhere"
 
 export interface SpeechOptions {
-  /** A short chime first, made by the server and played with the announcement. Default false. */
+  /** A short chime first, made by the server and played with the announcement. Default false. With an empty text: the chime alone. */
   readonly cue?: boolean
   /** Personal content: whose (a Members id), checked by `Privacy.mayReveal` for each device when it is about to speak. */
   readonly owner?: string

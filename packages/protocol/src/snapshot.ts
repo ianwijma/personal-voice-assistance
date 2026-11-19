@@ -313,7 +313,9 @@ export const PhraseTraceInfo = Schema.Struct({
   /** The person the command ran for (a Members id). */
   person: Schema.optionalKey(Schema.String.check(Schema.isMaxLength(64))),
   /** How long the module's action ran. */
-  actionMs: Schema.optionalKey(Schema.Finite.check(Schema.isGreaterThanOrEqualTo(0)))
+  actionMs: Schema.optionalKey(Schema.Finite.check(Schema.isGreaterThanOrEqualTo(0))),
+  /** P10: the action also showed a presentation (its outcome carried one, handed to the Presenter). */
+  presented: Schema.optionalKey(Schema.Boolean)
 })
 export type PhraseTraceInfo = typeof PhraseTraceInfo.Type
 
