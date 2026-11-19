@@ -32,18 +32,17 @@ export const cutLine = (text: string, max: number): string => {
   return out.trimEnd()
 }
 
-/** The WMO weather codes of Open-Meteo as the closed set of icons; a code that is not known has no icon (no card). */
-export const iconOf = (code: number | null | undefined): Icon | undefined => {
-  if (code === null || code === undefined) return undefined
-  if (code === 0 || code === 1) return "sun"
-  if (code === 2) return "partly"
-  if (code === 3) return "cloud"
-  if (code === 45 || code === 48) return "fog"
-  if ((code >= 51 && code <= 57) || (code >= 61 && code <= 67) || (code >= 80 && code <= 82)) return "rain"
-  if ((code >= 71 && code <= 77) || code === 85 || code === 86) return "snow"
-  if (code === 95 || code === 96 || code === 99) return "storm"
-  return undefined
-}
+/**
+ * The weather codes this module words (`conditionsEn`/`conditionsNl`, the same keys) as the closed set of icons, each exactly:
+ * a code the module has no words for (52, 62, 7, 52.5) has no icon, so no card, whatever interval it lies in.
+ */
+const ICONS: ReadonlyMap<number, Icon> = new Map<number, Icon>([
+  [0, "sun"], [1, "sun"], [2, "partly"], [3, "cloud"], [45, "fog"], [48, "fog"],
+  ...[51, 53, 55, 56, 57, 61, 63, 65, 66, 67, 80, 81, 82].map((c): [number, Icon] => [c, "rain"]),
+  ...[71, 73, 75, 77, 85, 86].map((c): [number, Icon] => [c, "snow"]),
+  ...[95, 96, 99].map((c): [number, Icon] => [c, "storm"])
+])
+export const iconOf = (code: number | null | undefined): Icon | undefined => (code === null || code === undefined ? undefined : ICONS.get(code))
 
 const cap = (s: string) => s.charAt(0).toUpperCase() + s.slice(1)
 
@@ -73,10 +72,8 @@ export interface DayCardInput {
   readonly min: number
   readonly max: number
   readonly fahrenheit: boolean
-  /** The forecast sentence as spoken, without the coming hours: what the model says where nothing is shown. */
+  /** The complete answer as spoken (the hours and any note of what is only partly known included): what the model says where nothing is shown. */
   readonly spoken: string
-  /** The same sentence without the place, when the first is too long to be the spoken fallback. */
-  readonly spokenShort: string
 }
 
 /** The label of a day: "Today", "Tomorrow" or its weekday, in the household's language. */
@@ -90,8 +87,8 @@ const dayLabel = (input: DayCardInput): string => {
 
 /**
  * The presentation of a day's forecast, or `undefined` when the day cannot be shown as the answer said it (a weather code
- * that has no icon, values too long for the card, no sentence that fits the spoken bound): then the answer is the same
- * without a card. The place is the weather service's outside text, cut to one line at a code point boundary.
+ * that has no icon, values too long for the card, a complete answer that does not fit the spoken bound): then the answer is
+ * the same without a card. The place is the weather service's outside text, cut to one line at a code point boundary.
  */
 export const forecastCard = (input: DayCardInput): Presentation | undefined => {
   const icon = iconOf(input.code)
@@ -103,8 +100,9 @@ export const forecastCard = (input: DayCardInput): Presentation | undefined => {
   const place = cutLine(input.placeName, PLACE_MAX)
   const label = cutLine(dayLabel(input), LABEL_MAX)
   if (headline === undefined || high.length > VALUE_MAX || low.length > VALUE_MAX || place === "" || condition === "" || label === "") return undefined
-  const spoken = [input.spoken, input.spokenShort].find((s) => s.length <= SPOKEN_MAX)
-  if (spoken === undefined) return undefined
+  // The fallback is the whole answer that was asked for, or there is no card: a card never costs the answer.
+  const spoken = input.spoken
+  if (spoken.length > SPOKEN_MAX || spoken.length === 0) return undefined
   return {
     kind: "weather",
     place,

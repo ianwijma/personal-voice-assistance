@@ -154,15 +154,26 @@ export const copies = defineCollection({
 export const COPY_ID = "copy"
 
 /**
- * The collection the reminder was last sent for: **one row** (id `last`), so a collection is reminded once however often the
- * job runs (a retry, a restart, the owner changing the time after it was sent).
+ * What the reminder last sent, one row (id `last`): the collection it was for (`day`), what the calendar said of that day
+ * then (`sig`, a hash of the bins), and what became of it: `sent`, `owed` (the calendar changed and the card still has to be
+ * taken away: a failed withdrawal is tried again by the next refresh or the daily job) or `withdrawn`. The reminder is
+ * delivered at least once: the row is written after delivery, so a failure between the two can show a card a second time.
  */
 export const reminded = defineCollection({
   name: "reminded",
   scope: "household",
-  schema: Schema.Struct({ day: Schema.Int.check(Schema.isBetween({ minimum: 20_000_101, maximum: 21_001_231 })) }),
-  maxChars: 200
+  schema: Schema.Struct({
+    day: Schema.Int.check(Schema.isBetween({ minimum: 20_000_101, maximum: 21_001_231 })),
+    sig: Schema.String.check(Schema.isMaxLength(16), Schema.isPattern(/^[0-9a-f]{16}$/)),
+    state: Schema.Literals(["sent", "owed", "withdrawn"])
+  }),
+  maxChars: 300
 })
+export interface Receipt {
+  readonly day: number
+  readonly sig: string
+  readonly state: "sent" | "owed" | "withdrawn"
+}
 export const REMINDED_ID = "last"
 
 /** The reminder's job: a daily one at the owner's time, in the household's zone. */
@@ -178,12 +189,26 @@ const remindTimeOf = (value: unknown): { readonly hour: number; readonly minute:
   const match = typeof value === "string" ? /^(\d{2}):(\d{2})$/.exec(value) : null
   return match !== null && (REMIND_TIMES as ReadonlyArray<string>).includes(value as string) ? { hour: Number(match[1]), minute: Number(match[2]) } : undefined
 }
-/** The milliseconds left of the local day in `zone` (to the minute: the zones' clock changes are at night, after midnight). */
-const msToMidnight = (epochMs: number, zone: string): number => {
-  const parts = new Intl.DateTimeFormat("en-CA", { timeZone: zone, hour: "2-digit", minute: "2-digit", second: "2-digit", hourCycle: "h23" }).formatToParts(new Date(epochMs))
-  const get = (type: string) => Number(parts.find((p) => p.type === type)?.value)
-  return ((24 - get("hour")) * 3_600 - get("minute") * 60 - get("second")) * 1_000 - (epochMs % 1_000)
+/**
+ * The instant the next local calendar date begins in `zone`, after `epochMs`: found by the zone's own dates (a bisection on
+ * `dayIn`, which asks the zone's rules), never by adding the wall-clock hours that remain (a zone whose offset changes
+ * before its midnight has a day that is not 24 hours long).
+ */
+export const nextLocalMidnight = (epochMs: number, zone: string): number => {
+  const next = addDays(dayIn(epochMs, zone), 1)
+  let low = epochMs
+  let high = epochMs + 49 * 3_600_000
+  while (high - low > 1) {
+    const mid = low + Math.floor((high - low) / 2)
+    if (dayIn(mid, zone) >= next) high = mid
+    else low = mid
+  }
+  return high
 }
+
+/** What the calendar says of one day, as a short hash: the kinds and the calendar's own words of its collections. */
+const signatureOf = (entries: ReadonlyArray<Pick<Entry, "k" | "l">>): string =>
+  createHash("sha256").update(JSON.stringify(entries.map((e) => `${e.k}:${e.l ?? ""}`).sort())).digest("hex").slice(0, 16)
 
 /** A copy older than this is refreshed on a question first, and an answer from it says how old it is. */
 export const STALE_AFTER_MS = 48 * 3_600_000
@@ -431,6 +456,45 @@ export const binDayModule = (deps: NetDeps = {}) =>
         /** The stored copy, when it is the copy of `source`: one read by id. */
         const copyOf = (source: string) => Effect.map(store.get(COPY_ID), (row) => (row !== undefined && row.value.source === source ? row.value : undefined))
 
+        const remindStore = ctx.store.collection(reminded)
+        /** Write the receipt as the job (or, with no job, as the module). */
+        const writeReceipt = (value: Receipt, actor: Actor | undefined) =>
+          ctx.store.transaction((tx) => {
+            const c = tx.collection(reminded)
+            const options = actor !== undefined ? { actor } : {}
+            if (c.get(REMINDED_ID) === undefined) c.insert(value, { id: REMINDED_ID, ...options })
+            else c.update(REMINDED_ID, () => value, options)
+          })
+        /**
+         * Compare the reminder last sent with the calendar as it is now, and take it away when it stopped being true: its
+         * collection moved, was cancelled, has other bins or is past. A withdrawal that fails stays owed (the receipt says
+         * so) and is tried again by the next refresh or the daily job. Never fails: it is called after a refresh committed
+         * a changed calendar, at start and by the daily job.
+         */
+        const reconcile = (actor: Actor | undefined) =>
+          Effect.gen(function*() {
+            const row = yield* remindStore.get(REMINDED_ID)
+            if (row === undefined || row.value.state === "withdrawn") return
+            const r = row.value
+            if (r.state === "sent") {
+              const current = ctx.settingsFor(undefined)
+              const url = current?.icsUrl.trim() ?? ""
+              if (url === "" || explainLink(url) !== undefined) return
+              const copy = yield* copyOf(sourceOf(url, rulesOf(current?.names)))
+              if (copy === undefined) return
+              const zone = homeZone(ctx.host.view().home)
+              const today = dayIn(yield* Clock.currentTimeMillis, zone)
+              const there = upcomingOf(copy, zone, today).filter((e) => e.day === r.day)
+              // A day the copy cannot speak for (nothing there, and not complete through it) is not "cancelled".
+              const unknown = there.length === 0 && completeThrough(copy, zone) < r.day
+              const stillTrue = r.day > today && (unknown || signatureOf(there) === r.sig)
+              if (stillTrue) return
+            }
+            const resolved = yield* ctx.notify.resolve({ key: `bin-day:${r.day}` }, "calendar-changed").pipe(Effect.result)
+            const state = resolved._tag === "Success" ? "withdrawn" : "owed"
+            if (state !== r.state) yield* writeReceipt({ ...r, state }, actor)
+          }).pipe(Effect.ignore)
+
         /**
          * Fetch and read the calendar, then replace the copy in one write, only with a complete, valid list. Right before
          * it writes, inside the same transaction, it checks the module's link and names are still the ones it read (a
@@ -462,6 +526,8 @@ export const binDayModule = (deps: NetDeps = {}) =>
             }).pipe(Effect.mapError(() => new RefreshError({ reason: "unsaved" })))
             if (!written) return yield* new RefreshError({ reason: "superseded" })
             lastFailure = undefined
+            // A reminder sent from the old calendar is compared with this one.
+            yield* reconcile(actor)
             return copy
           })
 
@@ -494,27 +560,29 @@ export const binDayModule = (deps: NetDeps = {}) =>
 
         // The evening-before reminder: a job of the module's own (the notification service never sends later). A daily job at
         // the owner's time looks at the copy and sends, now, one `normal` notification to every screen for tomorrow's collection.
-        const remindStore = ctx.store.collection(reminded)
         yield* ctx.scheduler.handle("remind", {
           payload: Schema.Struct({}),
-          // Safe to run twice: the collection reminded last is recorded, and the notification has a key per collection.
+          // The reminder is delivered at least once: a run that fails between the delivery and its receipt is run again, finds
+          // no receipt, and sends under the same key (an open card with that key is not delivered again: `send` answers it).
           idempotent: true,
           timeoutMs: 30_000,
           run: (_payload, due) =>
             Effect.gen(function*() {
+              const job = yield* CurrentJob
+              const actor: Actor | undefined = job === undefined ? undefined : { kind: "job", jobId: job.jobId }
+              // A reminder from an earlier evening that is owed its withdrawal.
+              yield* reconcile(actor)
               const current = ctx.settingsFor(undefined)
               const url = current?.icsUrl.trim() ?? ""
-              if (current === undefined || remindTimeOf(current.remindAt) === undefined || url === "" || explainLink(url) !== undefined) return
+              const wanted = remindTimeOf(current?.remindAt)
+              if (current === undefined || wanted === undefined || url === "" || explainLink(url) !== undefined) return
               const now = yield* Clock.currentTimeMillis
               const zone = homeZone(ctx.host.view().home)
               // The evening the job was due for, and only while it is still that evening: after midnight "tomorrow" is another day.
               const evening = dayIn(due.dueAt, zone)
               if (due.lateMs > REMIND_LATE_MS || dayIn(now, zone) !== evening) return
               const collectionDay = addDays(evening, 1)
-              const rules = rulesOf(current.names)
-              const source = sourceOf(url, rules)
-              const job = yield* CurrentJob
-              const actor: Actor | undefined = job === undefined ? undefined : { kind: "job", jobId: job.jobId }
+              const source = sourceOf(url, rulesOf(current.names))
               let copy = yield* copyOf(source)
               // A copy too old to trust is refreshed first; when that fails nothing is sent (a reminder that says what is not
               // known is worse than none: the failed refresh is already a Health issue, and the next evening tries again).
@@ -522,7 +590,7 @@ export const binDayModule = (deps: NetDeps = {}) =>
                 const fresh = yield* refresh(8_000, actor).pipe(Effect.result)
                 if (fresh._tag === "Success") copy = fresh.success
               }
-              if (copy === undefined || now - copy.readAt >= STALE_AFTER_MS) return
+              if (copy === undefined) return
               const entries = upcomingOf(copy, zone, evening).filter((e) => e.day === collectionDay)
               if (entries.length === 0) return
               const last = yield* remindStore.get(REMINDED_ID)
@@ -532,21 +600,32 @@ export const binDayModule = (deps: NetDeps = {}) =>
               const said = say(texts, lang, names.length === 1 ? "remindOne" : "remindMany", { bins: binsPhrase(names, lang, 120) })
               // Only what is known: a copy that may miss collections (unreadable events, cut off) says so.
               const partial = copy.unreadable > 0 || completeThrough(copy, zone) < collectionDay
-              yield* ctx.notify.send({
+              const request = {
                 title: say(texts, lang, "remindTitle"),
-                text: `${said.charAt(0).toUpperCase()}${said.slice(1)}${partial ? ` ${say(texts, lang, "remindPartial")}` : ""}`,
+                text: `${said.charAt(0).toUpperCase()}${said.slice(1)}${partial ? ` ${say(texts, lang, "remindPartial")}` : ""}`
+              }
+              // Everything above waited on the store (and maybe the network): decide again, now, at the moment of sending, from
+              // the live settings, the clock and the zone, and send without waiting for anything else in between.
+              const live = ctx.settingsFor(undefined)
+              const liveWanted = remindTimeOf(live?.remindAt)
+              if (live === undefined || liveWanted === undefined || liveWanted.hour !== wanted.hour || liveWanted.minute !== wanted.minute) return
+              if (sourceOf(live.icsUrl.trim(), rulesOf(live.names)) !== source) return
+              const sendAt = yield* Clock.currentTimeMillis
+              const sendZone = homeZone(ctx.host.view().home)
+              if (sendAt - due.dueAt > REMIND_LATE_MS || dayIn(due.dueAt, sendZone) !== evening || dayIn(sendAt, sendZone) !== evening) return
+              if (sendAt - copy.readAt >= STALE_AFTER_MS) return
+              yield* ctx.notify.send({
+                ...request,
                 priority: "normal",
                 // A job has no device of its own: the whole house.
                 target: "everywhere",
                 key: `bin-day:${collectionDay}`,
-                // It is true until midnight; then "tomorrow" is today.
-                expiresInMs: Math.max(1_000, msToMidnight(now, zone))
+                // True until the next local date begins in the household's zone; then "tomorrow" is today.
+                expiresInMs: Math.max(1_000, nextLocalMidnight(sendAt, sendZone) - sendAt)
               })
-              yield* ctx.store.transaction((tx) => {
-                const c = tx.collection(reminded)
-                if (c.get(REMINDED_ID) === undefined) c.insert({ day: collectionDay }, { id: REMINDED_ID })
-                else c.update(REMINDED_ID, () => ({ day: collectionDay }))
-              })
+              yield* writeReceipt({ day: collectionDay, sig: signatureOf(entries), state: "sent" }, actor)
+              // The calendar may have changed while this ran: compare once more, now that the receipt exists.
+              yield* reconcile(actor)
             })
         }).pipe(Effect.orDie)
         const wanted = remindTimeOf(ctx.settings.remindAt)
@@ -560,6 +639,9 @@ export const binDayModule = (deps: NetDeps = {}) =>
           const same = live.some((j) => j.key === REMIND_JOB && j.cron === cron && typeof j.late === "object" && j.late.withinMs === REMIND_LATE_MS)
           if (!same) yield* ctx.scheduler.schedule({ handler: "remind", key: REMIND_JOB, cron, late: { withinMs: REMIND_LATE_MS } }).pipe(Effect.orDie)
         }
+
+        // At start: a reminder from before a restart is compared with the calendar as it is.
+        yield* reconcile(undefined)
 
         /**
          * The copy of this link and these names, refreshed first (within `ON_DEMAND_MS`) when there is none or it is older

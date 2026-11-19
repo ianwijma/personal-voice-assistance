@@ -254,8 +254,6 @@ export const makeWeatherExtras = (env: WeatherEnv) => {
           })
         )
       let spoken = sentence(looked.named ? ` in ${place.name}` : "")
-      /** The day's sentence alone, before the coming hours: what a card says when nothing can be shown. */
-      const first = spoken
       const hourly: Array<{ time: string; temperature: number; rainChance: number | null; condition: string }> = []
       let knownUntil: string | undefined
       if (hours !== undefined && dayKey(target) === dayKey(today)) {
@@ -297,8 +295,7 @@ export const makeWeatherExtras = (env: WeatherEnv) => {
         min: Math.round(min),
         max: Math.round(max),
         fahrenheit,
-        spoken: first,
-        spokenShort: sentence("")
+        spoken
       })
       const answer = {
         spoken,
