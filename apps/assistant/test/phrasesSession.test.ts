@@ -87,6 +87,8 @@ const session = async (o: {
   readonly stopReportMs?: number
   /** Extra actions in the module's set. */
   readonly actions?: ReadonlyArray<ReturnType<typeof registerActions>[number]>
+  /** A session without phrase commands (as before P7). */
+  readonly noPhrases?: boolean
 }) => {
   ran.length = 0
   const stt = controlledStt()
@@ -128,7 +130,7 @@ const session = async (o: {
     heard: { dir: mkdtempSync(join(tmpdir(), "pva-heard-")), enabled: () => false, maxFiles: () => 0, model: () => "", lostOnTheWay: () => 0 },
     log: () => undefined,
     onPhraseTrace: (t) => void phraseTraces.push(t),
-    phrases: {
+    ...(o.noPhrases === true ? {} : { phrases: {
       language: () => "en",
       commandsFor: (a) => (a === undefined ? hostCommandSet("en") : buildCommandSet("en", [...egg, ...(o.actions ?? [])])),
       ringing: o.ringing ?? (() => undefined),
@@ -152,7 +154,7 @@ const session = async (o: {
         pageText: (_m, t, max) => String(t).slice(0, max)
       },
       onOutcome: (outcome) => void outcomes.push(outcome)
-    }
+    } })
   }).pipe(Scope.provide(scope)))
   // The page, played by hand: playback starts 20 ms after a reply's first audio, and finishes a while after it ends.
   let starting: number | undefined
@@ -489,4 +491,114 @@ describe("review round 1 on the real voice session (the page's stop report comes
       await s.close()
     }
   })
+})
+
+describe("review round 2, b1: a pending settlement does not bring back a reply cancelled meanwhile (real voice session)", () => {
+  const reply = "A long original reply for this device. Another sentence with useful detail. Yet another sentence to finish."
+  let slowStarted = 0
+  /** A command that does not end the reply, whose action takes 1.2 s. */
+  const slow = registerActions("slow", [defineAction({
+    id: "wait",
+    label: "Wait",
+    description: "Takes a while.",
+    params: {},
+    phrases: { en: ["wait a moment"] },
+    risk: "change",
+    run: () => Effect.andThen(Effect.sync(() => void slowStarted++), Effect.as(Effect.sleep(1_200), { say: "Finished." }))
+  })])
+  const canned = (s: Awaited<ReturnType<typeof session>>) => s.messages.filter((m) => m.type === "turn.start" && m.userText === "").length
+  type Cancel = (s: Awaited<ReturnType<typeof session>>) => Promise<void>
+  const say = (text: string): Cancel => async (s) => {
+    const before = s.outcomes.length
+    s.stt.emit({ _tag: "SpeechStarted" }, { _tag: "Interim", text }, { _tag: "EndOfTurn", text })
+    await until(() => s.outcomes.length > before, 8_000)
+  }
+  const CANCELS: ReadonlyArray<readonly [string, Cancel, boolean]> = [
+    ["spoken never mind", say("hey jeff never mind"), true],
+    ["spoken stop (it selects the reply)", say("hey jeff stop"), false],
+    ["the page's Stop", async (s) => void s.voice.conversation.stop(), false],
+    ["SessionControl's cancelPending", async (s) => void (await run(s.voice.control.cancelPending)), true],
+    ["a new conversation of the reply's assistant", async (s) => void (await run(s.voice.conversation.newConversation())), false]
+  ]
+
+  for (const [name, cancel, windowClosed] of CANCELS) {
+    it(`${name} while the slow command runs: its own answer is said, the cancelled reply is not${windowClosed ? ", and no follow-up window opens" : ""}`, async () => {
+      slowStarted = 0
+      const s = await session({ withoutPhrase: "nobody", followUpSeconds: 5, stopReportMs: 200, reply, actions: slow })
+      try {
+        await run(s.voice.conversation.sendText("tell me something", true))
+        await until(() => s.voice.gate.audible(performance.now()))
+        s.stt.emit({ _tag: "SpeechStarted" }, { _tag: "Interim", text: "hey jeff wait" }, { _tag: "EndOfTurn", text: "hey jeff wait a moment" })
+        await until(() => slowStarted === 1, 4_000)
+        await sleep(300)
+        await cancel(s)
+        await until(() => s.outcomes.some((o) => o.did === "ran"), 8_000)
+        expect(s.outcomes.find((o) => o.did === "ran")!.said).toBe("Finished.")
+        expect(canned(s)).toBe(1)
+        // Its answer has finished playing (600 ms after its end); nothing more comes, and no window opened.
+        await sleep(1_500)
+        expect(canned(s)).toBe(1)
+        expect(s.messages.some((m) => m.type === "reply.start" && m.turnId > 0 && JSON.stringify(m).includes("original"))).toBe(false)
+        if (windowClosed) expect(s.voice.route.window(performance.now())).toBeUndefined()
+        // "repeat" still repeats the last reply when asked.
+        const before = s.outcomes.length
+        s.stt.emit({ _tag: "SpeechStarted" }, { _tag: "EndOfTurn", text: "hey jeff repeat" })
+        await until(() => s.outcomes.length > before, 8_000)
+        expect(s.outcomes.at(-1)!.did).toBe("repeated")
+      } finally {
+        await s.close()
+      }
+    })
+  }
+
+  for (const [name, cancel] of [CANCELS[0]!, CANCELS[2]!]) {
+    it(`${name} while the command's own answer plays: the answer is cut, the cancelled reply is not said`, async () => {
+      slowStarted = 0
+      const s = await session({ withoutPhrase: "nobody", followUpSeconds: 5, stopReportMs: 200, reply, actions: slow })
+      try {
+        await run(s.voice.conversation.sendText("tell me something", true))
+        await until(() => s.voice.gate.audible(performance.now()))
+        s.stt.emit({ _tag: "SpeechStarted" }, { _tag: "Interim", text: "hey jeff wait" }, { _tag: "EndOfTurn", text: "hey jeff wait a moment" })
+        await until(() => canned(s) === 1, 8_000)
+        await until(() => s.voice.gate.audible(performance.now()), 4_000)
+        await cancel(s)
+        await until(() => s.outcomes.some((o) => o.did === "ran"), 8_000)
+        await sleep(1_500)
+        expect(canned(s)).toBe(1)
+        expect(s.outcomes.find((o) => o.did === "ran")!.said ?? "").not.toContain("original")
+      } finally {
+        await s.close()
+      }
+    })
+  }
+})
+
+describe("review round 2, b2: an utterance stopped before its conversation opened it is no turn (real voice session)", () => {
+  /** Poll on every turn of the event loop: the stop comes as soon as the dispatcher has the speech start. */
+  const soon = async (check: () => boolean) => {
+    for (let i = 0; i < 100_000 && !check(); i++) await new Promise((r) => setImmediate(r))
+    if (!check()) throw new Error("timed out")
+  }
+  for (const noPhrases of [false, true]) {
+    it(`${noPhrases ? "without" : "with"} phrase commands: Stop right after the speech start is dispatched; its final makes no turn and calls no tool; the next utterance does`, async () => {
+      const s = await session({ noPhrases })
+      try {
+        for (let round = 0; round < 5; round++) {
+          s.stt.emit({ _tag: "SpeechStarted" }, { _tag: "Interim", text: "what time" })
+          await soon(() => s.voice.conversation.dispatcher.delivering() !== undefined)
+          s.voice.conversation.stop()
+          s.stt.emit({ _tag: "EndOfTurn", text: "what time is it" })
+          await sleep(150)
+        }
+        await sleep(400)
+        expect(s.userTurns()).toBe(0)
+        expect(s.sideEffects).toEqual([])
+        expect(await s.history()).toEqual([])
+        s.stt.emit({ _tag: "SpeechStarted" }, { _tag: "EndOfTurn", text: "what time is it" })
+        await until(() => s.userTurns() === 1, 6_000)
+      } finally {
+        await s.close()
+      }
+    })
+  }
 })

@@ -182,8 +182,12 @@ export interface NotifyEngine extends NotifyHook {
   readonly press: (request: PressRequest) => Effect.Effect<PressAnswer>
   /** P7: the notifications ringing on a device now (held with their cue by one of its connections), oldest first. */
   readonly ringingOn: (deviceId: string) => ReadonlyArray<RingingNotification>
-  /** P7: the host's "stop" for what rings on a device: each is resolved (`stop`). How many. */
-  readonly stopRinging: (deviceId: string) => Effect.Effect<number>
+  /**
+   * P7: the host's "stop" for what rings on a device: each is resolved (`stop`). How many. Fails (`busy` or `failed`)
+   * when a ring it found could not be stopped (the store failed, or another action of it was under way), after trying
+   * every one: a zero is "nothing rang any more", never a failure.
+   */
+  readonly stopRinging: (deviceId: string) => Effect.Effect<number, NotifyError>
   /** P7 and the page's Stop: stop the announcement being spoken (or about to be) on a device, at once. Whether there was one. */
   readonly stopSpeech: (deviceId: string) => Effect.Effect<boolean>
   /** P7: called (synchronously, never throwing into the engine) when what rings on a device changed. */
@@ -1473,10 +1477,14 @@ export const makeNotifyEngine = (options: NotifyEngineOptions): Effect.Effect<No
           const ids = engine.ringingOn(deviceId).map((r) => r.id)
           const work = Effect.gen(function*() {
             let n = 0
+            let failed: NotifyError | undefined
             for (const id of ids) {
               const a = yield* press({ notificationId: id, actionId: STOP_ACTION, deviceId })
               if (a.ok && a.code === undefined) n++
+              // `unknown`: it ended meanwhile (resolved elsewhere), so it no longer rings; `busy`, `failed`: it still does.
+              else if (a.code === "busy" || a.code === "failed") failed ??= new NotifyError({ reason: a.code, message: a.say })
             }
+            if (failed !== undefined) return yield* failed
             return n
           })
           return yield* Effect.forkIn(work, scope)

@@ -324,8 +324,10 @@ CurrentPrincipal: Context.Reference<Principal | undefined>       // the admitted
   (`apps/assistant/src/modules.ts`, `CliModules`).
 - **The execution gateway** (`packages/core/src/Gateway.ts`) is the one way to `Tool.execute` and `ActionDefinition.run`:
   `ToolRegistry.run` (core's tool loop, the Claude Code bridge), `ToolRegistry.runAction` (the intent agent) and
-  `host.actions.run`; later phrase commands, taps and routine steps (a notification's action handler, P9, is admitted
-  by `ExecutionGateway.principal` with the notification principal, as a job's handler is). Every tool and action the
+  `host.actions.run`, and phrase commands (P7: `runTaken` in `PhraseRunner.ts` calls `ExecutionGateway.action` as a
+  `phrase` turn of the device, with the risk policy and the 5 s limit); later taps and routine steps (a notification's
+  action handler, P9, is admitted by `ExecutionGateway.principal` with the notification principal, as a job's handler
+  is). Every tool and action the
   host publishes is **sealed**: its own `execute`/`run` only refuses, and the real one (inside the host's in-flight
   tracking) is reachable only from the gateway (`GatewayPrivate.ts`, not exported from the package); a generated
   action tool's `execute` refuses too. Sealing stops **accidental** direct calls; it is not a security boundary against
@@ -598,11 +600,14 @@ interface PartHandle { moduleId; moduleName; kind: "shared" | "instance"; id; st
 Only the worker publishes and withdraws, all of a module's registrations together. Services, contributions, tool names
 (and through them the snapshot's parts) are expressed this way. A later PR adds a kind in one place:
 
-- **declared by what a part returns** (P3's `SharedPart.routes`): one `Registrar` in the host's `registrars` list. For
-  routes: `claims` = the route paths, `validate` = `routeProblem` for each, `publish` puts `{ routes, scope: handle.scope
-  }` in the route table under the module id, `withdraw` removes it; `host.routes()` reads that table;
-- **made by module code while it starts** (P6's job handlers, P4's subscriptions, later phrase commands and
-  notification action handlers): the context member gets the part's `PartHandle` in `servicesFor(entry, part)` and
+- **declared by what a part returns** (P3's `SharedPart.routes`; P7's phrase commands, the `phrases` of the actions an
+  instance returns): one `Registrar` in the host's `registrars` list. For routes: `claims` = the route paths, `validate`
+  = `routeProblem` for each, `publish` puts `{ routes, scope: handle.scope }` in the route table under the module id,
+  `withdraw` removes it; `host.routes()` reads that table. For phrases (the built-in `phrase` registrar): `validate` =
+  `phraseProblems` over the instance's actions, nothing to publish (the phrases reach each assistant's set through the
+  snapshot, with the actions they run);
+- **made by module code while it starts** (P6's job handlers, P4's subscriptions, P9's notification action handlers,
+  `ctx.notify.handle`): the context member gets the part's `PartHandle` in `servicesFor(entry, part)` and
   calls `part.register(...)` during `shared` or `start`; the registration is published with the module. A call after
   the part has started is refused: there is no registration outside the worker.
 
@@ -934,7 +939,7 @@ NotificationCard = { id, title, text?, priority, show, sound, actions (stop firs
 // notification.action { requestId, id, actionId } (page → server) answered by result { say? }: additive within protocol 11
 NotifyHook (ModuleHostOptions.notify) = { forPart(part: PartHandle, runner: PartRunner): { notify; speech } }
 NotifyEngine  = NotifyHook & { reconcile(deviceId); reconcileAll(); press(PressRequest): Effect<PressAnswer>;
-                               ringingOn(deviceId): RingingNotification[]; stopRinging(deviceId): Effect<number>; stopSpeech(deviceId): Effect<boolean>;
+                               ringingOn(deviceId): RingingNotification[]; stopRinging(deviceId): Effect<number, NotifyError>; stopSpeech(deviceId): Effect<boolean>;
                                onRingingChanged(listener): () => void; dnd(): DndState & { known }; busyAnswer(): PressAnswer;
                                maintenanceScheduled(); plannedAt(); planNow; maintainNow; settled }
 PressRequest  = { notificationId, actionId, deviceId, connection?, person? }   PressAnswer = { ok, say, code?: "not_running" | "unknown" | "busy" | "failed" }
@@ -987,7 +992,8 @@ SpeechPort    = { speak(deviceId, text, { cue, gate: () => "go" | "wait" | NotDe
   voice session ended"); the device's next announcement uses the next session.
 - **Turn path**: only `send` (one synchronous transaction and an enqueue), `resolve` and `say` (decisions and an
   enqueue). Measured: docs/NOTIFICATIONS.md "Latency".
-- **P7 seams**: `ringingOn`, `onRingingChanged`, `stopRinging` (recorded in one step, finished by work the service owns),
+- **P7 seams**: `ringingOn`, `onRingingChanged`, `stopRinging` (recorded in one step, finished by work the service owns;
+  fails when a ring it found could not be stopped, after trying every one),
   `stopSpeech`, `press`, `busyAnswer` (P7 reads `ringingOn` at each final and calls `stopRinging`, `stopSpeech` and `press`; it does not use `onRingingChanged`: the window is read, never cached). **P10**: the card is drawn by
   `apps/web/src/components/NotificationCards.tsx`, outside the character; the ring cue loop is `apps/web/src/lib/audio/ringLoop.ts`.
 
@@ -999,14 +1005,19 @@ ActionDefinition.phrases?: { en?: string[]; nl?: string[] }      // words and {p
 ActionDefinition.endsReply?: boolean                            // run over a reply, the reply is not said again (default false)
 omittedParamValue(param)                                        // what a parameter not given receives, on every path (default, false, undefined)
 PHRASE_LIMITS = { phrasesPerAction: 8, actionsPerModule: 16, wordsPerPhrase: 8, charsPerPhrase: 80, slotsPerPhrase: 2,
-                  phrasesPerAssistant: 256, utteranceWords: 24, utteranceChars: 300, slotWords: 8, choiceOptions: 32, slotReads: 64 }
+                  phrasesPerAssistant: 256, utteranceWords: 24, utteranceChars: 300, slotWords: 8, choiceOptions: 32,
+                  choiceNames: 96, choiceNameChars: 40, slotReads: 64 }
+PhraseWork = { units };  PREPARE_STEP_WORK = 256               // preparation's work (a unit: one phrase or choice name normalised); a yield after 256
 PHRASE_ANSWER_CHARS = 300
 HostControl = "stop" | "never-mind" | "repeat" | "louder" | "quieter";  HOST_CONTROLS; HOST_CONTROL_PHRASES[lang][control]
 phraseWords(text): PhraseWord[]                                  // normalised words (composed = decomposed) with offsets into `text`
 phraseProblems(moduleId, actions): string[]                     // the registration check (a "phrase" registrar in the host)
 reservedFor(lang, phrase): HostControl | undefined
-SlotReader = choice (prepared keys, ≤ 32 options) | number | duration | text      // Param.dynamic and boolean are no slot
-compileActionPhrases(lang, action); assembleCommandSet(lang, modules, over); actionsByModule(actions)
+SlotReader = choice (prepared keys, ≤ 32 options, ≤ 96 names of ≤ 40 characters) | number | duration | text   // Param.dynamic and boolean are no slot
+// a choice's keys are made once per choice (by the param object) when a set is compiled; the check only counts and measures its names
+// a number or duration slot reads only when its one expression covers every non-space character of the slot (",5" at its start is the number's)
+actionPhraseTexts(lang, action); compileActionPhrase(lang, action, text, work); compileActionPhrases(lang, action, work?)
+assembleCommandSet(lang, modules, over); actionsByModule(actions)
 buildCommandSet(lang, actions: RegisteredAction[]): CommandSet  // all at once (the kit, tests); serve mode prepares ahead
 hostCommandSet(lang): CommandSet                                // the host's controls alone (no assistant; a set not ready)
 CommandSet = { language; phrases: CompiledPhrase[]; conflicts: PhraseConflict[] }   // CompiledPhrase.defaults: the omitted parameters
@@ -1029,13 +1040,14 @@ runTaken(taken, PhrasePorts): Effect<PhraseOutcome>             // the operation
 PhrasePorts = { deviceId; language(); notify(); session: PhraseSessionPort; volume(dir); playback(); room(); gateway(); turn(assistant);
                 isPublished(assistant, action); pageText; slot: CommandSlot; trace?(PhraseTrace) }
 PhraseSessionPort = { replyActive(); announcementActive(); stopReply; stopAnnouncement; cancelPending; lastReply(); interruptedReply: Effect<KeptReply | undefined>;
-                      answering(); say(assistant?, text): Effect<"done" | "cut"> }
+                      replyCancelled(); answering(); say(assistant?, text): Effect<"done" | "cut"> }   // replyCancelled: read after each wait (b1)
 CommandSlot = { take(); give() };  makeCommandSlot()            // one module action at a time per device; controls never busy
 KeptReply = { assistant; text };  keptReplyText(clauses);  MAX_KEPT_REPLY_CHARS = 2_000
-PhraseTrace = { by; name; turn?; tool?; risk?; refused?; actionMs?; totalMs; did; why? }
+PhraseTrace = { by; name; turn?; tool?; risk?; refused?; actionMs?; totalMs; did: PhraseDid | "interrupted"; why? }   // once, from a finaliser; identity first
 PhraseOutcome = { taken; did: "stopped-ring" | "pressed" | "stopped-announcement" | "stopped-reply" | "paused-media" | "cancelled" | "repeated" | "volume"
                   | "ran" | "nothing" | "refused" | "not-running" | "failed" | "busy"; said?; why? }
 ActionCallOptions.onDecision?({ risk?, refused? })              // Gateway.ts: the admission's outcome, for the trace
+NotifyEngine.stopRinging(deviceId): Effect<number, NotifyError>  // fails (busy, failed) when a ring it found could not be stopped
 RouteGate.cancelReply()                                         // "never mind": the reply playing counts no more, windows close
 SessionControl (ServiceKey "core.session-control") = { stopReply(deviceId); cancelPending(deviceId); repeatLast(deviceId); newConversation(deviceId) }
 DeviceControl (ServiceKey "core.device-control")   = { replyVolume(deviceId): number; changeReplyVolume(deviceId, "louder" | "quieter" | { to }): Effect<VolumeChange> }
@@ -1057,12 +1069,14 @@ TraceInfo.phrase?: PhraseTraceInfo = { by; name; did; why?; risk?; refused?; per
 - **A command is an action with phrases**, registered with the instance that returns it: published and withdrawn with the
   module through the snapshot, run through the execution gateway (admission, the risk policy, `ACTION_TIMEOUT_MS`) as a
   `phrase` turn. The host's `phrase` registrar (`ModuleHost.ts`, beside the routes) refuses a start whose phrases break a
-  bound, name no parameter, use a `Param.dynamic` or a choice of more than 32 options, or are the host's. An assistant's
+  bound, name no parameter, use a `Param.dynamic` or a choice of more than 32 options or 96 names (or a name over 40
+  characters), or are the host's; the check makes no lookup keys, so it is one short synchronous step. An assistant's
   set is built from the actions its turns are offered (`offeredActions`: its module and tool switches, the risk
-  policy's offers), **prepared ahead** in bounded steps whenever those change (`makePhraseSets`), keyed by what it
-  depends on; a final reads a ready set, or the host's controls alone.
+  policy's offers), **prepared ahead** in steps of bounded work whenever those change (`makePhraseSets`; a yield after
+  `PREPARE_STEP_WORK` units), keyed by what it depends on; a final reads a ready set, or the host's controls alone.
 - **One decision per utterance**, in `VoiceSession.onStt` at the utterance's final (`decideUtterance`): nothing for an
-  utterance cancelled before its final; the ringing window before the echo gate, then the gates once, then the
+  utterance cancelled before its final, whose final the session sends to the dispatcher with no words (with or without
+  phrases: a stop may reach the conversation before the speech start that opens the utterance there); the ringing window before the echo gate, then the gates once, then the
   after-wake match on the route gate's result. A taken utterance's final reaches the dispatcher with no words (never a
   turn, never in the history, no non-speculative tool); the run is forked in the session's scope after the final is
   dispatched. Not taken: the results are the gates' own, unchanged.
