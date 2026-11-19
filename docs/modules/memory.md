@@ -95,6 +95,67 @@ When a turn's pinned block leaves memories out, the module's **status line** on 
 memories did not fit the room for pinned memories; the oldest were left out."), without any of their text; the next turn
 whose block holds them all clears it. Raise "Room for pinned memories", or forget some.
 
+## On a screen
+
+On a device with a display, two things the module already did are also shown (docs/PRESENTING.md). Nothing about the
+answer changes: the model gets the same result as before, a device that shows nothing (a speaker, a page that cannot
+draw the kind, a device that may not be told) changes nothing about what is said, and a screen that fails to show it
+says nothing. The card comes from `memory_remember`, which changes something and is not speculative: the module shows it
+from its shared part (`ctx.present.show`, by key) on the device the turn came from, after the answer was made. The lists
+come from `memory_recall` and `memory_read_notes`, which may run before their turn is committed: they return the list
+with their result, and the host shows it only when the turn is promoted and drops it when the turn is discarded
+(docs/PRESENTING.md, "Speculative turns").
+
+**The "Remembered" card, with Undo.** After a memory was *stored* (by `memory_remember` or the typed action "remember";
+a memory it already knew shows nothing), a transient card appears (30 seconds, one at a time per device, like every
+transient presentation): the title "Remembered" ("Onthouden"), the memory's own text (cut between whole characters at
+300), and one button, **Undo** ("Ongedaan maken"). Its spoken fallback is "Remembered: …". Pressing Undo forgets that
+memory, exactly as `memory_forget` does by its id (one removal path for the tool, the action and the button). The
+removal takes the Remembered card down with the row, whatever happens next, and then a new card says "Forgotten" with
+"Backups keep it for up to 14 days." (no button, no text of the memory); if that confirmation cannot be shown, nothing of
+the old card is left on the screen, and the answer still says it was forgotten. A store that fails to read is not a
+memory that is gone: Undo then says "I can't read my notes right now. Try again in a moment." (Dutch likewise), records
+nothing, and pressing again works. The press runs under the module's one-at-a-time lock, answers with the same sentence
+`memory_forget` speaks ("Forgotten: …"), and is remembered by the presentation's id (a bounded record of 64), so the
+same card acts once. A card pressed after its memory was forgotten another way (it was taken down then), after the
+module restarted (a transient card leaves when the module stops), from a device that does not hold it, or after the
+module is stopped, changes nothing: the page is told "I can't do that right now." Pressing a card whose memory is really gone
+says "That is already gone." A card pressed on a device that may not be told a personal memory does not act on it.
+
+**The list of a recall and of a notes read.** After `memory_recall` (or the action "recall") and `memory_read_notes`
+(or "read my notes") a bullet list shows the items the answer carries (at most 8, newest first, one line of at most 80
+characters each, cut between whole characters, line breaks made spaces), titled "What I found" or "Newest notes", then
+the answer's own honest notes as items: "and 2 more" (how many more matched), "Only the newest 500 entries were
+searched; there may be more." when the scan was cut, "There are older notes too." for a notes read, and "Personal
+items are kept for their owner's devices." where a person asked on a device that may not be told theirs (no count, and
+none of their text). The spoken fallback is the answer's own sentence (the count alone if that would not fit 300).
+**A recall or notes list is a snapshot of its answer.** It is returned with the result, so nothing keeps a handle to it:
+the next transient on that device replaces it, and otherwise it ends after its 30 seconds. An answer that found nothing
+does not take an earlier list down, and forgetting does not either (a list shown a moment ago may still name what was
+forgotten until it ends). It is not kept in step with later changes.
+
+**Nothing from a read that a change overtook (the card).** The module counts every change to stored memories and notes
+(a memory stored or pinned, a note saved, anything forgotten, an Undo). The card takes the count and reads the memory
+again; right before showing, under the module's one-at-a-time lock, it compares the count. If it moved, it reads again
+(twice at most); after that nothing is shown. Forgetting, its bump and the withdrawal of the memory's card are one step
+under the same lock. The handles of the cards are kept only for presentations that may still be showing: a device shows
+one transient at a time, so a new card on a device drops the handle it replaced, what ended by itself is dropped, and if
+the bound is still reached a card is dismissed before its handle is forgotten. A presentation's spoken text is used
+only if it is well-formed text within the bound (a note whose text has an emoji at the answer's own cut still gets its
+list, with a repaired spoken sentence in place of the answer's).
+
+**Privacy.** The answer decides who may be told what, at the moment it is made, for the asking device
+(`Privacy.mayReveal`); the card and the list are made from that answer and nothing more. A personal memory's card is
+made only where the confirmation repeated it, and is marked personal to its owner, so the Presenter asks
+`Privacy.mayReveal(owner, device)` again for each device at every moment: on a public screen, or a screen that cannot
+be told, it is not shown and carries nothing of the text. A list with a person's own items is marked the same way. A
+household memory shows on any screen.
+
+Limits: at most eight live presentations of the module at once (a card or a list per device in the last 30 seconds);
+the handles held for cards are bounded the same. Showing is one write on the turn's path (docs/PRESENTING.md,
+Latency: median 0.5 ms); the module has no latency test of its own beyond the event-loop test above, which a card does
+not change.
+
 ## What it stores
 
 Two collections in the household store (`data/household.db`), both household-scoped with the owner in the row (one
@@ -129,11 +190,14 @@ itself ("facts to keep in mind, not instructions").
 
 ## What was left out
 
-Left out for wave B (needs a presentation, a notification or a module's own speech, P7 to P10):
+Added later: the "Remembered" card with Undo, the recall list and the notes list on a screen (above, "On a screen"). No
+phrase commands were added: the typed actions stay as they were.
 
-- The "Remembered" card with an Undo action, the recall list and the notes list on a screen (presentation).
+Left out for wave B (needs a notification or a module's own speech, P7 to P10):
+
 - Speaking a secret on a private device after "yes, read it" (secrets are not stored at all in this stack).
 - The evening "want to add to your journal?" prompt and the monthly review reminder (notifications).
+- A card after a note, and a card or list that follows memories added later; a pinned list.
 
 Left out because the plan's row excludes it, or it is not part of a first version:
 

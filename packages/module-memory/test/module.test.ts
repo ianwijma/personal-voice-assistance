@@ -4,11 +4,34 @@
 // pinned context and its budget; invalid settings. No network is involved: the module has none.
 import { assert, describe, it } from "@effect/vitest"
 import { type ActionDefinition, askFor, type Collection, CurrentTurn, extractText, makeToolRegistry, maxListRows, type ModuleHostApi, type Row, StoreError, type TextParam } from "@pva/core"
-import { checkModule, expectOffByDefault, type ModuleHarness, startTestModule } from "@pva/core/testing"
+import { checkModule, expectOffByDefault, type ModuleHarness, startTestModule as startKit } from "@pva/core/testing"
 import { Effect } from "effect"
 import { bound } from "../../store-sqlite/test/latencyBound.ts"
 import { catalog, DUPLICATE_ROWS, type Memory, memories, memoryModule, MAX_PINNED, type Note, notes, SCAN_ROWS, texts } from "../src/index.ts"
 import { looksSecret, MAX_QUERY_WORDS } from "../src/words.ts"
+
+/**
+ * The kit with one adaptation: a tool that returns a list with its result (`{ forModel, present }`) has the host's note
+ * "[Screen: …]" after its content, so the content and value are read here from what the tool returned for the model,
+ * unchanged. Everything else the kit does is as it is.
+ */
+const startTestModule: typeof startKit = (module, options) =>
+  Effect.map(startKit(module, options), (kit) => {
+    const tool = kit.tool
+    ;(kit as { tool: typeof kit.tool }).tool = (name, input, as) =>
+      Effect.map(tool(name, input, as), (r) => {
+        const m = /^([\s\S]*)\n\[Screen: [\s\S]*\]$/.exec(r.content)
+        if (m === null) return r
+        let value: unknown = m[1]
+        try {
+          value = JSON.parse(m[1]!)
+        } catch {
+          // plain text
+        }
+        return { ...r, content: m[1]!, value }
+      })
+    return kit
+  })
 
 const kitchen = { device: "kitchen-display" } // shared, default person Sam
 const robin = { device: "robins-phone" } // private, Robin's
