@@ -34,7 +34,8 @@ Some requests are a question or a refusal instead:
 
 - an ambiguous moment ("next Friday at 7") is a question;
 - a rule with no time ("every Monday") is a question;
-- a moment that has passed, or one more than a year ahead, is refused.
+- a moment that has passed, or one beyond the same local date and time next year, is refused (29 February clamps to
+  28 February when needed).
 
 The answer says the day and the time with its part of the day, so a mistake is heard: "Alarm set for tomorrow at seven
 o'clock in the morning.", or "Alarm set every weekday; the first one is tomorrow at quarter to seven in the morning.".
@@ -70,7 +71,8 @@ That job, every action, every button and the hourly sweep **reconcile** the row:
 
 - **An occurrence that is due becomes owed, and the series moves on in the same write**, whatever then becomes of the
   delivery. A busy notification service can delay a ring; it never loses the series.
-- A snooze that is due becomes the next owed ring.
+- A snooze that is due becomes the next owed ring, unless a newer series occurrence is already due; the latest due
+  instant wins.
 - The owed ring is sent.
 - Old rings are taken away.
 
@@ -103,13 +105,19 @@ planned after now, never in the past. A ring up to 15 minutes late rings, and sa
   sent beside the old card. The notification key is per occurrence (`alarm:<id>:<number>`).
 - **Snooze and Five more minutes** set the row's ring to ring again; the series is not moved.
 - **The buttons act only on the alarm's current ring.** A press of any other card is answered "That ring has ended."
-  and changes nothing. A press is done once per notification.
+  and changes nothing. A press is done once per notification; replaying it reports the committed time still left,
+  even when a different button was pressed. Reactivating a one-off obeys the 50-set limit and keeps its card on refusal.
 - **Stop** is the host's: the card, "stop", and "stop" without the wake phrase while it rings.
 
 **Delivery is at least once.** The order is: write the owed ring, send it under its key, write that it was sent. If the
-server fails between the send and that last write, the next reconcile records the ring when its card is still open.
+server fails between the send and that last write, the next reconcile within the delivery window records the ring when
+its card is still open.
 If **Stop was pressed in that moment, it sends it again: a ring can sound a second time, and it is never lost.** A cancel
 in that moment finds the card by its key and takes it away.
+
+If a delivery is first refused, a later send succeeds but its outcome write fails, and recovery happens beyond the
+delivery window, a missed card can appear while the ring card is still open and voice cancel cannot find it; the
+host's Stop still ends the ring card, or it expires after the ring setting's minutes.
 
 **Stop and a button pressed at the same moment.** When Stop and Snooze or Five more minutes are pressed for the same
 ring at the same moment, the card follows whichever the notification service recorded first. **The alarm may still
@@ -129,9 +137,11 @@ The ring goes only to its own device. The decision is made when answering, for t
 
 ### Snoozed and ringing alarms
 
-A snoozed alarm is part of its row: it is listed with when it rings again ("One alarm: tea, ringing again today at ten
-past ten in the morning."), and a ringing one is listed as ringing. Either can be cancelled by voice, also after a
-restart: "The snoozed alarm is cancelled.".
+A snoozed alarm is part of its row: it is listed with its nominal time and when it rings again ("One alarm: tea today
+at ten oh one in the morning, ringing again today at ten past ten in the morning."), and a ringing one is listed as
+ringing. Either can be cancelled by voice, also after a
+restart: "The snoozed alarm is cancelled.". Ringing, waiting and withdrawing one-offs keep their nominal time in the
+list and selection question, including on other devices; their labels stay on their own device.
 
 - From any device it can be cancelled by its time: the time it was set for, also when it rang late or next to a
   daylight-saving change.
@@ -144,7 +154,8 @@ Only the next one, or all of them?", and nothing changes (docs/MODULES-PLAN.md �
 
 - **"Only the next"** skips that occurrence ("… is skipped; the next one is Friday at quarter to seven in the
   morning."). When a snooze is still to ring, that snooze is the next ring: "The snoozed alarm is cancelled; the next
-  one is tomorrow at …".
+  one is tomorrow at …". An owed snooze is still matched by its snooze time, and cancelling again while its withdrawal
+  is unfinished finishes that withdrawal before skipping a later series occurrence.
 - **"All"** ends the series.
 
 ### Clean-up
@@ -254,7 +265,7 @@ nothing of them; the ringing card goes only to the alarm's device.
 
 - `requires`: nothing outside the process; `uses`: nothing.
 - **Core services**: the scheduler, the notification service, `Devices` (device names in answers).
-- **`@pva/language`**: `parseRecurrence`, `parseDateTime`, `parseTimeOfDay`, `nextOccurrence`, `occurrencesAfter`,
+- **`@pva/language`**: `parseRecurrence`, `parseDateTime`, `parseTimeOfDay`, `nextOccurrence`,
   `parseDtstart`, `describeRRule`, `speakMoment`, `speakTime`, `normalizeTimeZone`.
 
 ## What was left out

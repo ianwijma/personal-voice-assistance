@@ -58,7 +58,7 @@ own: a job can fail for good after its retries while the store is busy.
   makes it run again for five minutes, with its countdown.
 - **The buttons act only on the timer's current ring.** A press of any other card (an older one, or one whose sending
   could not be recorded yet) is answered "That ring has ended." and changes nothing. A press is done once per
-  notification: run again for the same card, it answers the same and changes nothing.
+  notification: run again for the same card, it reports the committed time still left and changes nothing.
 - **Stop** is the host's: on the card, as the spoken "stop", or "stop" without the wake phrase while it rings (the
   ringing window). The button labels can also be said while it rings ("snooze", "five more minutes").
 - A ring **stops by itself** after the ring setting's minutes.
@@ -70,11 +70,11 @@ busy, **stays owed** and is tried again every 30 seconds for as long as it would
 While it waits, the timer is listed as "done and waiting to ring". A restart keeps it.
 
 When a place comes free in time, it rings and says how late: "The 2 minutes timer ended two and a half minutes ago,
-while I couldn't ring.". A timer due while the server or the module was down rings as soon as the module runs again,
-and says how late.
+while I couldn't ring.". A timer due while the server or the module was down rings on restart if it is still inside
+its delivery window, and says how late.
 
-If no place comes free in its whole ring time, it is recorded as missed and the Health page says so. A module has no
-other way to raise a Health issue, so a job of its own (`trouble`) fails on purpose. That job is written in the same
+If its delivery window passes without a recorded ring, it is recorded as missed and the Health page says so. A module
+has no other way to raise a Health issue, so a job of its own (`trouble`) fails on purpose. That job is written in the same
 transaction that gives the ring up: if it cannot be written, the ring is not given up, and stays owed.
 
 ### Delivery is at least once
@@ -82,9 +82,13 @@ transaction that gives the ring up: if it cannot be written, the ring is not giv
 The order is: write the owed ring, send it under its key, write that it was sent. If the server fails between the send
 and that last write, the next reconcile finds the ring still owed:
 
-- if its notification is still open, the module only records it;
+- within the delivery window, if its notification is still open, the module only records it;
 - if nobody stopped it, it rings once;
 - if someone pressed **Stop in that moment, the ring can sound a second time.** A ring is never lost this way.
+
+If a delivery is first refused, a later send succeeds but its outcome write fails, and recovery happens beyond the
+delivery window, the timer can be reported missed while its card still rings and voice cancel cannot find it; the
+host's Stop still ends that card, or it expires after the ring setting's minutes.
 
 What would close this is below the module: see "Missing below".
 
@@ -106,8 +110,8 @@ the owed ring forgotten.
 
 ### Taking away and clean-up
 
-Taking a ring away and taking a countdown off the screen are owed work in the row. They are cleared only when they
-succeeded, and tried again a minute later by the job, also for a timer that is paused or ended and also after a
+Taking a ring away and taking a countdown off the screen are owed work in the row. Outside the combined-failure limits
+below, they are cleared only when they succeeded, and tried again a minute later by the job, also for a timer that is paused or ended and also after a
 restart. A ring is retried until it stops by itself; a countdown until it ends by itself, 10 minutes after its moment.
 After a restart the countdown is taken down by showing its key again (a countdown ending now) and dismissing that.
 
@@ -121,15 +125,21 @@ The sentences say what is true:
   now."). Lists of running timers do not show it.
 
 The countdown is recorded in the row as "may be on a screen" before it is shown. So a countdown whose showing could
-not be recorded (the store failed just after) is still known, and taken away by a cancel, also after a restart. A
-countdown that cannot be shown after three tries is left out (the timer still runs and rings); typically that is the
+not be recorded (the store failed just after) is still known, and taken away by a cancel, also after a restart, subject
+to the combined-failure limits below. A countdown that cannot be shown after three tries is left out (the timer still runs and rings); typically that is the
 Presenter's bound of 8 per module. An old countdown that could not be replaced after a change is taken down instead,
-so a screen never counts down to the wrong moment.
+subject to those same limits.
+
+Two combined-failure limits remain: if a countdown show succeeds but its outcome write fails and a retry after restart
+is refused, cancellation can forget the still-visible countdown; if dismissal keeps failing across a restart, a
+cleanup replacement can outlive the stored cleanup deadline and cancellation can report success while it stays visible,
+but both presentations end by their own lifetime (the original due time plus ten minutes, or ten minutes after the
+cleanup replacement was shown).
 
 ### Which timer is meant
 
 - **By name**: "the pasta timer", compared without case, accents, punctuation, a leading article and a trailing
-  "timer".
+  "timer"; when that leaves no words (such as "A"), the supplied label is matched exactly, ignoring case.
 - **With no name**: the only one there is (running, paused, snoozed, ringing or waiting to ring).
 - **Otherwise a question** that lists them: "There are 2 timers: eggs timer with 6 minutes left and pasta timer paused
   with 10 minutes left. Which one?". **Never the first of several.**
@@ -191,7 +201,8 @@ timer called …" sentence.
 "Stop" alone while it rings is the host's (its essential control and the ringing window), not a phrase of this module.
 
 - **Adjusting**: time taken off that would end it is refused, with what it has ("That would end it now: pasta timer has
-  only 2 minutes left.").
+  only 2 minutes left."). Once an adjustment and its job are committed, the answer confirms it; a later countdown
+  failure is retried by reconciliation and never asks the person to apply the same adjustment again.
 - **Refusals**, in both languages:
   - 50 timers already;
   - a name that runs already;
