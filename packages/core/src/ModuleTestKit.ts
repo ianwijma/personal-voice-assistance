@@ -1047,6 +1047,8 @@ export const startTestModule = (definition: ModuleDefinition<any>, options: Star
         return Effect.as(settle, outcome)
       })
 
+    let pendingPresses = 0
+    const pressesByDevice = new Map<string, number>()
     const harness = {
       host,
       moduleId: id,
@@ -1311,23 +1313,32 @@ export const startTestModule = (definition: ModuleDefinition<any>, options: Star
          */
         press: (presentationId: string, action: string, as: { readonly device?: string; readonly item?: string; readonly done?: boolean } = {}): Effect.Effect<PresentPressAnswer> => {
           const deviceId = as.device ?? deviceList[0]?.id ?? "kitchen-display"
-          return checked(
-            `after pressing ${action}`,
-            Effect.andThen(
-              Effect.andThen(
-                settle,
-                driven(`the press of ${action}`, present.press({
-                  presentationId,
-                  action,
-                  ...(as.item !== undefined ? { item: as.item } : {}),
-                  ...(as.done !== undefined ? { done: as.done } : {}),
-                  deviceId,
-                  connection: testConnectionOf(deviceId)
-                }))
-              ),
-              (a) => Effect.as(settle, a)
-            )
-          )
+          return Effect.suspend(() => {
+            const count = pressesByDevice.get(deviceId) ?? 0
+            if (count >= 4 || pendingPresses >= 16) return Effect.succeed(present.busyAnswer())
+            pressesByDevice.set(deviceId, count + 1)
+            pendingPresses++
+            return checked(`after pressing ${action}`, Effect.gen(function*() {
+              yield* settle
+              const revision = presentPages.get(deviceId)?.get(presentationId)?.revision ?? "missing"
+              const answer = yield* driven(`the press of ${action}`, present.press({
+                presentationId,
+                revision,
+                action,
+                ...(as.item !== undefined ? { item: as.item } : {}),
+                ...(as.done !== undefined ? { done: as.done } : {}),
+                deviceId,
+                connection: testConnectionOf(deviceId)
+              }))
+              yield* settle
+              return answer
+            })).pipe(Effect.ensuring(Effect.sync(() => {
+              pendingPresses--
+              const left = (pressesByDevice.get(deviceId) ?? 1) - 1
+              if (left === 0) pressesByDevice.delete(deviceId)
+              else pressesByDevice.set(deviceId, left)
+            })))
+          })
         },
         settle
       },

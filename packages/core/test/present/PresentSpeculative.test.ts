@@ -36,7 +36,7 @@ const llm = () =>
   })
 
 /** The conversation of the kitchen display's assistant over the world's registry, fed `events`, run to its end. */
-const converse = (world: World, events: Events) =>
+const converse = (world: World, events: Events, beforeDecision: Effect.Effect<void, unknown> = Effect.void) =>
   Effect.gen(function*() {
     const setup: TurnSetup = { system: "s", registry: world.host.snapshot().registry, turnContext: { assistantId: "jeff", deviceId: "kitchen-display" } }
     const model = llm()
@@ -49,6 +49,7 @@ const converse = (world: World, events: Events) =>
       const fiber = yield* Effect.forkChild(c.voice(scripted<ConversationInput>(events)))
       for (let i = 0; i < 40; i++) {
         yield* Effect.repeat(Effect.yieldNow, { times: 50 })
+        if (i === 4) yield* beforeDecision
         yield* TestClock.adjust(250)
       }
       yield* Fiber.join(fiber)
@@ -77,10 +78,19 @@ const setUp = (o: Parameters<typeof presentWorld>[1]) =>
 describe("R8: a speculative turn and the screen", () => {
   it.effect("way 1: a presentation returned by a speculative tool in a turn that is discarded is never shown and withdraws nothing", () =>
     Effect.gen(function*() {
-      const { world } = yield* setUp({})
-      world.toolResult({ forModel: "Here it is.", present: card("Speculative") })
-      const model = yield* converse(world, DISCARDED)
-      assert.isAtLeast(model.probe.requests.length, 2, "the tool ran while the turn was speculative")
+      let calls = 0
+      const { world } = yield* setUp({ toolRun: () => Effect.sync(() => {
+        calls++
+        return { forModel: "Here it is.", present: card("Speculative") }
+      }) })
+      const model = yield* converse(world, DISCARDED, Effect.gen(function*() {
+        assert.strictEqual(calls, 1, "a speculative tool completed before discard")
+        assert.strictEqual(showsOf(world, "Speculative"), 0)
+        assert.deepStrictEqual(titles(world), ["Earlier"])
+        assert.deepStrictEqual((yield* world.rows).map((r) => (r.value.content as { title?: string }).title), ["Earlier"])
+      }))
+      assert.strictEqual(calls, 1)
+      assert.isTrue(model.probe.requests.some((r) => r.messages.some((m) => m.role === "tool")), "the model received the speculative tool result")
       assert.strictEqual(showsOf(world, "Speculative"), 0)
       assert.deepStrictEqual(titles(world), ["Earlier"])
       assert.deepStrictEqual((yield* world.rows).map((r) => (r.value.content as { title?: string }).title), ["Earlier"])

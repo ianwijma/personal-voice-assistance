@@ -270,6 +270,7 @@ interface Held {
    * on the page, not on a row that replaced it under the same id.
    */
   readonly showId: string
+  readonly revision: string
   readonly owner: string | undefined
   readonly kind: PresentKindName
   readonly hash: string | undefined
@@ -390,7 +391,8 @@ export const noteOf = (devices: ReadonlyArray<ShownOn>, nameOf: (deviceId: strin
   const not = devices.filter((d) => !d.shown)
   const tail = `${extra.spoken !== undefined ? `${SPOKEN_PREFIX}${cut(extra.spoken, MAX_NOTE_SPOKEN_CHARS)}` : ""}${extra.image === true && shown.length > 0 ? IMAGE_SENTENCE : ""}`
   let head: string
-  if (shown.length === 0) head = `Not showing it: ${list(not.map((d) => `${quotedName(nameOf(d.deviceId))} ${WHY_WORDS[d.why ?? "offline"]}`))}.`
+  if (devices.length === 0) head = "Not showing it: there is no device to show it on."
+  else if (shown.length === 0) head = `Not showing it: ${list(not.map((d) => `${quotedName(nameOf(d.deviceId))} ${WHY_WORDS[d.why ?? "offline"]}`))}.`
   else if (not.length === 0) head = `Showing on ${list(shown)}.`
   else head = `Showing on ${list(shown)}; not on ${list(not.map((d) => `${quotedName(nameOf(d.deviceId))} (${WHY_WORDS[d.why ?? "offline"]})`))}.`
   return `${cut(head, MAX_NOTE_CHARS - tail.length)}${tail}`
@@ -590,6 +592,7 @@ export const makePresentEngine = (options: PresentEngineOptions): Effect.Effect<
         }
       return {
         id,
+        revision: `${v.showId}:${index.get(id)!.rev}`,
         lifetime: v.lifetime,
         shownAt: v.shownAt,
         serverNow: now,
@@ -674,7 +677,7 @@ export const makePresentEngine = (options: PresentEngineOptions): Effect.Effect<
             tokens.set(token, { connId: by.connId, id: c.id, hash })
           } else if (hash === undefined) forget(before)
           send(by, { type: before === undefined ? "present.show" : "present.update", presentation: wireOf(c.id, row.value, c.decision.interactive, now, token) })
-          by.items.set(c.id, { sig, hash, token: hash === undefined ? undefined : token, showId: e.showId, owner: e.owner, kind: e.kind })
+          by.items.set(c.id, { sig, hash, token: hash === undefined ? undefined : token, showId: e.showId, revision: `${e.showId}:${e.rev}`, owner: e.owner, kind: e.kind })
         }
       }
       options.observe?.({ kind: "step", ms: performance.now() - started, rows: read, connections: conns.length })
@@ -792,11 +795,13 @@ export const makePresentEngine = (options: PresentEngineOptions): Effect.Effect<
       for (const e of index.values()) if (e.id !== id && e.expiresAt > now && !ends(e)) every.set(e.id, e)
       for (const s of pending) if (s.entry.id !== id && s.entry.expiresAt > now && !ends(s.entry)) every.set(s.entry.id, s.entry)
       const all = [...every.values()]
+      // An id counts once globally, but keeps every pinned device it occupies until its move commits.
+      const occupied = [...index.values(), ...pending.map((s) => s.entry)].filter((e) => e.id !== id && e.expiresAt > now)
       if (all.length >= MAX_LIVE_TOTAL) return `${MAX_LIVE_TOTAL} presentations are live already`
       if (all.filter((e) => e.module === module).length >= MAX_LIVE_PER_MODULE) return `${module} has ${MAX_LIVE_PER_MODULE} live presentations already`
       if (lifetime === "pinned") {
         for (const d of devices) {
-          if (all.filter((e) => e.lifetime === "pinned" && applies(e.target, d)).length >= MAX_PINNED_PER_DEVICE) return `${quotedName(d.name)} shows ${MAX_PINNED_PER_DEVICE} pinned presentations already`
+          if (new Set(occupied.filter((e) => e.lifetime === "pinned" && applies(e.target, d)).map((e) => e.id)).size >= MAX_PINNED_PER_DEVICE) return `${quotedName(d.name)} shows ${MAX_PINNED_PER_DEVICE} pinned presentations already`
         }
       }
       return undefined
@@ -811,12 +816,12 @@ export const makePresentEngine = (options: PresentEngineOptions): Effect.Effect<
     /** What was decided for each device of the target now, and the note for the model (G5, G6). */
     /**
      * THE check before a presentation's `spoken` text goes into a note (review round 2, R2), on every path: household
-     * content always; personal content only when the asking device is known and the privacy rule lets it be shown that
+     * content only when the asking device is known; personal content also needs the privacy rule to allow that
      * person's things now. When that cannot be established, nothing of the content is forwarded.
      */
     const mayForward = (owner: string | undefined, asking: string | undefined): boolean => {
-      if (owner === undefined) return true
       if (asking === undefined || deviceOf(asking) === undefined) return false
+      if (owner === undefined) return true
       try {
         return options.privacy.mayReveal(owner, asking)
       } catch {
@@ -866,7 +871,7 @@ export const makePresentEngine = (options: PresentEngineOptions): Effect.Effect<
         p.update(id, (v) => ({ ...v, content: { ...content, ...("hash" in w.outcome ? { hash: w.outcome.hash } : { failed: w.outcome.refused }) } }), { expectRev: row.rev })
         return p.get(id)
       }, (row) => {
-        imageOutcomes.delete(id)
+        if (imageOutcomes.get(id)?.url === w.url) imageOutcomes.delete(id)
         if (row !== undefined && row !== "stale" && index.get(id)?.showId === row.value.showId) put(entryOf(row))
         // Written, or not wanted any more: whoever holds it (or would) is reconciled; a show that wants another address
         // fetches its own there.
@@ -890,8 +895,10 @@ export const makePresentEngine = (options: PresentEngineOptions): Effect.Effect<
         if ("refused" in outcome) log(`Presentations: an image was not kept (${outcome.refused})`)
         for (const waiter of ids) {
           const w = { url, outcome }
+          const showId = index.get(waiter)?.showId
+          const priorOutcome = imageOutcomes.get(waiter)
           const exit = yield* Effect.exit(writeImage(waiter, w))
-          if (Exit.isFailure(exit)) {
+          if (Exit.isFailure(exit) && index.get(waiter)?.showId === showId && imageOutcomes.get(waiter) === priorOutcome && (priorOutcome === undefined || priorOutcome.url === url)) {
             imageOutcomes.set(waiter, { ...w, retryAt: (yield* wallNow) + PRESENT_RETRY_MS })
             requestPlan()
             log("Presentations: an image's outcome could not be written; maintenance writes it again")
@@ -931,7 +938,6 @@ export const makePresentEngine = (options: PresentEngineOptions): Effect.Effect<
     let plannedAt: number | undefined | "unknown" = "unknown"
     let planning = false
     let planAgain = false
-    let lastRun: "succeeded" | "failed" | undefined
     const planIdle: Array<Deferred.Deferred<void>> = []
     /** When maintenance is next needed, from memory only: an end, a removal, failed work to repeat (a minute from now). */
     const nextDue = (now: number): number | undefined => {
@@ -947,8 +953,6 @@ export const makePresentEngine = (options: PresentEngineOptions): Effect.Effect<
       return next
     }
     const planOnce: Effect.Effect<void, unknown> = Effect.gen(function*() {
-      const ran = lastRun
-      lastRun = undefined
       const now = yield* wallNow
       const next = nextDue(now)
       if (next === undefined) {
@@ -959,7 +963,7 @@ export const makePresentEngine = (options: PresentEngineOptions): Effect.Effect<
         }
         return
       }
-      const at = next > now ? next : ran === "failed" ? now + PRESENT_RETRY_MS : now
+      const at = Math.max(next, now)
       const known = typeof plannedAt === "number" ? plannedAt : undefined
       if (at === known) return
       plannedAt = "unknown"
@@ -1001,47 +1005,44 @@ export const makePresentEngine = (options: PresentEngineOptions): Effect.Effect<
         const due = [...doomed].filter(([, d]) => d.at <= now)
         for (let i = 0; i < due.length; i += PRESENT_PAGE) {
           const page = due.slice(i, i + PRESENT_PAGE)
-          yield* tx((p) => {
+          const removed = yield* Effect.exit(tx((p) => {
             for (const [id, d] of page) {
               const row = p.get(id)
               if (row !== undefined && row.value.showId === d.showId) p.remove(id)
             }
           }, () => {
             for (const [id, d] of page) if (doomed.get(id)?.showId === d.showId) doomed.delete(id)
-          })
+          }))
+          if (Exit.isFailure(removed)) {
+            for (const [id, d] of page) if (doomed.get(id) === d) doomed.set(id, { ...d, at: now + PRESENT_RETRY_MS })
+            return yield* Effect.failCause(removed.cause)
+          }
           yield* Effect.yieldNow
         }
       })
 
     /** The maintenance work: the start-up read if it failed, ends, removals, accepted writes and image outcomes, failed passes. */
     const maintain: Effect.Effect<void> = Effect.gen(function*() {
-      lastRun = undefined
-      let failedSome = false
       if (!loaded) {
         yield* load
-        if (!loaded) failedSome = true
       }
       const now = yield* wallNow
       // Ended: no longer eligible from their end (a pass after it already left them out); removed now.
       for (const e of [...index.values()]) if (e.expiresAt <= now) doom(e, now)
       for (const s of [...pending]) if (s.entry.expiresAt <= now || !partOpen(s.entry.module, s.entry.part)) dropPending(s)
-      if (Exit.isFailure(yield* Effect.exit(removeDoomed(now)))) failedSome = true
+      yield* Effect.ignore(removeDoomed(now))
       for (const s of [...pending]) if (s.failed && (s.retryAt ?? 0) <= now && pending.includes(s)) yield* writePending(s)
-      if (pending.some((s) => s.failed)) failedSome = true
       for (const [id, w] of [...imageOutcomes]) {
         if (w.retryAt > now) continue
         if (Exit.isFailure(yield* Effect.exit(writeImage(id, w)))) {
           imageOutcomes.set(id, { ...w, retryAt: now + PRESENT_RETRY_MS })
-          failedSome = true
         }
       }
       if (failedPasses.size > 0) {
         for (const d of failedPasses.keys()) dirty.add(d)
         kick()
       }
-      lastRun = failedSome ? "failed" : "succeeded"
     }).pipe(Effect.ensuring(Effect.sync(() => {
-      if (lastRun === undefined) lastRun = "failed"
       ensureHourly()
       requestPlan()
     })))
@@ -1230,11 +1231,14 @@ export const makePresentEngine = (options: PresentEngineOptions): Effect.Effect<
         const out = yield* tx((p): Out => {
           // The clock is read, and the entry (its times and the key's id) derived, in the attempt that commits (R3).
           at = timeIn(clock, now)
+          if (!partOpen(moduleId, partId)) return { invalid: "the originating module part has stopped" }
+          const targetNow = resolveTarget(target, origin)
+          if (typeof targetNow === "string") return { invalid: targetNow }
           if (at - now >= lasts) return { late: true }
           const stale = presentationProblem(presentation, at)
           if (stale !== undefined) return { invalid: stale }
-          const e = newEntry(moduleId, partId, resolved, presentation, o, at)
-          return writeShow(p, e, (prior) => storedContentOf(presentation, prior), presentation.spoken, buttons, at)
+          const e = newEntry(moduleId, partId, targetNow, presentation, o, at)
+          return writeShow(p, e, () => storedContentOf(presentation), presentation.spoken, buttons, at)
         }, (w) => {
           if ("limit" in w || "invalid" in w || "late" in w) return
           afterShow(w, at)
@@ -1309,6 +1313,10 @@ export const makePresentEngine = (options: PresentEngineOptions): Effect.Effect<
         const e = index.get(id)
         if (e === undefined || e.module !== moduleId || e.showId !== showId) return false
         const now = yield* wallNow
+        if (e.expiresAt <= now) {
+          doom(e, now)
+          return false
+        }
         doom(e, now + PRESENT_PURGE_AFTER_MS)
         yield* Effect.ignore(tx((p) => {
           const row = p.get(id)
@@ -1336,10 +1344,12 @@ export const makePresentEngine = (options: PresentEngineOptions): Effect.Effect<
           const exit = yield* Effect.exit(tx((p): Written | "gone" | "ended" => {
             at = timeIn(clock, now)
             if (!pending.includes(s)) return "gone"
-            if (s.entry.expiresAt <= at) return "ended"
+            if (s.entry.expiresAt <= at || !partOpen(s.entry.module, s.entry.part)) return "ended"
+            if (s.content.kind === "timer" && (s.content.endsAt < at - 60_000 || s.content.endsAt > at + 24 * 3_600_000)) return "ended"
+            if (typeof resolveTarget(s.entry.target, undefined) === "string") return "gone"
             const current = index.get(s.entry.id)
             if (current !== undefined && current.showId !== s.entry.showId && current.shownAt > s.entry.shownAt) return "gone"
-            return writeShow(p, s.entry, (prior) => (s.content.kind === "image" && prior?.kind === "image" && prior.url === s.content.url ? { ...s.content, ...(prior.hash !== undefined ? { hash: prior.hash } : {}) } : s.content), s.spoken, s.buttons, at)
+            return writeShow(p, s.entry, () => s.content, s.spoken, s.buttons, at)
           }, (w) => {
             if (w === "gone" || w === "ended") {
               dropPending(s)
@@ -1390,7 +1400,7 @@ export const makePresentEngine = (options: PresentEngineOptions): Effect.Effect<
         const problem = requestProblem(moduleId, presentation, o, now)
         if (problem !== undefined) {
           log(`Presentations: a presentation of ${moduleId} was refused (${problem})`)
-          return withScreenNote(forModel, refusedNote(`the presentation was not valid (${problem.slice(0, 200)})`))
+          return withScreenNote(forModel, refusedNote("the presentation was not valid (check its fields and options)"))
         }
         // Every refusal below carries the fallback only when privacy allows it for the asking device (R2).
         const origin = yield* originDevice(principal)
@@ -1449,7 +1459,7 @@ export const makePresentEngine = (options: PresentEngineOptions): Effect.Effect<
           // A press runs only what the page holds (round 3): the show this connection holds must be the current show of
           // that presentation. A page still showing an older show (a replacement whose content could not be read yet) is
           // answered as for a presentation that is gone, and reconciled.
-          if (holder.by.items.get(request.presentationId)?.showId !== e.showId) {
+          if (holder.by.items.get(request.presentationId)?.revision !== request.revision || request.revision !== `${e.showId}:${e.rev}`) {
             enqueue(request.deviceId)
             return answer(false, "over", "unknown")
           }

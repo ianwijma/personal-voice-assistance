@@ -14,6 +14,7 @@ import {
   PRESENT_KIND_VERSIONS,
   type PresentDecision,
   PresentAction,
+  presentationProblem,
   PresentationWire,
   selectPresentations
 } from "../src/index.ts"
@@ -91,10 +92,11 @@ describe("the wire", () => {
   // (refused), every other field valid.
   it("present.action: each bound accepted at its maximum and refused one past it", () => {
     const decode = Schema.decodeUnknownSync(PresentAction)
-    const base = { type: "present.action", requestId: "r1", id: "p-1", action: "tick", item: "milk", done: true } as const
+    const base = { type: "present.action", requestId: "r1", id: "p-1", revision: "show-1:1", action: "tick", item: "milk", done: true } as const
     const bounds: ReadonlyArray<readonly [string, (n: number) => Record<string, unknown>, number]> = [
       ["requestId", (n) => ({ requestId: "r".repeat(n) }), 64],
       ["id", (n) => ({ id: "p".repeat(n) }), 64],
+      ["revision", (n) => ({ revision: "s".repeat(n) }), 96],
       ["action", (n) => ({ action: "a".repeat(n) }), 32],
       ["item", (n) => ({ item: "i".repeat(n) }), 40]
     ]
@@ -107,4 +109,14 @@ describe("the wire", () => {
     expect(() => decode({ ...base, id: "" })).toThrow()
     expect(() => decode({ ...base, item: "" })).toThrow()
   })
+})
+
+// a16: the module guide permits only five controls, even in multiline text and spoken fallback.
+it("refuses DEL and C1 controls in card text and spoken, while permitted whitespace stays valid", () => {
+  for (const field of ["text", "spoken"]) {
+    for (const control of ["\u007f", "\u0085", "\u009f"]) {
+      expect(presentationProblem({ kind: "card", title: "T", spoken: "S", [field]: `Before${control}After` }, 0)).toBeDefined()
+    }
+  }
+  expect(presentationProblem({ kind: "card", title: "T", text: "Before\t\n\r\b\fAfter", spoken: "S" }, 0)).toBeUndefined()
 })

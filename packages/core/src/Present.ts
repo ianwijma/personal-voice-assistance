@@ -291,6 +291,8 @@ export interface PresentHook {
 /** Where a press comes from (a page's tick or button; the kit). */
 export interface PresentPressRequest {
   readonly presentationId: string
+  /** The revision the pressing page actually displays. */
+  readonly revision: string
   readonly action: string
   readonly item?: string
   readonly done?: boolean
