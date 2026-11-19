@@ -80,9 +80,66 @@ Typed actions (they run without the language model; the model is also offered ea
 
 | Action (tool) | Risk | Says | Examples |
 |---|---|---|---|
-| `news.top` (`news_top`) | read | The newest stories (the headlines setting) as one spoken text, with a sentence when the read was cut or feeds could not be reached, and remembers them as the last list. | "what's the news", "geef me de koppen" |
+| `news.top` (`news_top`) | read | The newest stories (the headlines setting) as one spoken text, with a sentence when the read was cut or feeds could not be reached, and remembers them as the last list. Also a phrase command and a list on the screen (below). | "what's the news", "geef me de koppen" |
 | `news.unsubscribe` (`news_unsubscribe`) | change | As `feed_unsubscribe`. | "unsubscribe from NOS", "zeg NU.nl op" |
 | `news.feeds` (`news_feeds`) | read | "You follow A, B and three more." | "which news feeds do I follow", "welke nieuwsfeeds volg ik" |
+
+**Phrase command.** `news.top` is also a phrase command (docs/PHRASES.md): said after the wake phrase it runs the action
+without the language model. Nothing else of the module has phrases.
+
+| Language | Phrases |
+|---|---|
+| English | "what's the news", "what is the news", "give me the headlines" |
+| Dutch | "wat is het nieuws", "geef me de koppen", "wat zijn de nieuwskoppen" |
+
+Matching is exact on words (case, accents and punctuation do not count): "what's the news today", "the news" and "news"
+are not the command and go on to the assistant. The action's own sentences are reached through the phrase: no feeds,
+"I haven't fetched the news yet", "I couldn't reach your news feeds", nothing new.
+
+- **What a phrase may say.** A phrase answer is at most 300 characters (`PHRASE_ANSWER_CHARS`) and the host cuts what is
+  longer. So in a phrase turn (and only there) the action builds its answer inside that limit: whole headlines, in order,
+  with room kept for the honest notes (the read was cut short, feeds could not be reached) and, when not every selected
+  headline fits, one closing sentence: "There are three more; ask me for the headlines." ("Er zijn er nog drie; vraag me
+  om de koppen."). When not even one whole headline fits beside the notes, the first one is said with its title shortened
+  at a word. The list on the screen and what "the second one" refers to are exactly the headlines that were spoken.
+  Outside a phrase turn (the typed action, the model's `news_top`, the tools) the answer is exactly as it was: every
+  selected headline.
+- **Said once.** A repeat of one phrase invocation (the same assistant, conversation, turn, device and connection) is
+  answered with its first words and reads, remembers and shows nothing again; a new invocation acts again. The record is
+  one for the whole module, in `shared`, used by every assistant whatever its settings; a repeat runs nothing, and a new
+  invocation runs with its own assistant's settings. It holds the newest 64 finished phrase invocations, this run of the
+  module only. Calls that are not phrase turns (the model's, a routine's) are never remembered.
+
+**The list on the screen.** When `news.top` tells stories, it returns the headlines that were read out with its answer
+(`{ say, present }`; as the model's tool `news_top`, `{ forModel, present }`): a transient `list` titled "News"
+(docs/PRESENTING.md), shown on the screen of the device that asked once the turn is committed. A title and its source a
+line ("Storm hits the coast – BBC News"), at most 80 UTF-16 units a line, the source at most 24 of them and the title
+giving way first. The two notes the answer carries are lines of the list in a few words: "Older stories were not read."
+when the read was cut, and "1 of 3 feeds not reached." (or "Feeds not reached; these are the last headlines.") when feeds
+could not be reached. Nothing the answer did not say is on it. Text from feeds is plain text there: one line, no
+brackets, control or bidirectional characters, lone surrogates dropped and every valid character (also outside the
+basic plane: "𠮷野家") kept; cut at a code point boundary inside the unit bound (one function, `cutCodePoints`). Its
+`spoken` text, which the model says where the asking device shows nothing, is the answer's own sentences (in a phrase
+turn, the answer itself), whole, within 300 characters.
+
+- **Speculative turns.** `news_top` (generated from the read action `news.top`) and `news_headlines` are speculative
+  tools: the turn they run in may be discarded. `news_top` therefore only returns its list with the answer, and the host
+  shows it when the turn is promoted and drops it when the turn is discarded; `news_headlines` changes no screen at all.
+  The module calls nothing of `ctx.present` (`test/speculative.test.ts`, through the real model loop).
+- **A snapshot of the answer.** The module never touches a screen from inside a tool, and holds no handle: the list is
+  what the answer said when it said it. It ends by its own 30 seconds, or when the next presentation on that device
+  replaces it. It is **not** taken down when a feed it shows is unsubscribed, when a later answer finds nothing, or when
+  the model reads headlines of its own: it simply ends within 30 seconds. A later answer on the same device replaces it.
+- **Reconnecting and restarting.** A page that lost its connection clears what it showed; a list that is still within
+  its lifetime comes back when the page reconnects, with no new question, and a list that ended does not. A restart of
+  the module takes its transient lists off every page and nothing is brought back.
+- **Privacy.** The news is household data, so the list is a `household` presentation: the Presenter decides for each
+  device, at the moment of showing, and shows it on a shared, a private and a public screen alike, as the spoken answer is
+  the same on every device. A device without a display, one that is offline or one whose page cannot draw a list is
+  shown nothing, and that changes nothing about the answer. There is nothing personal in it to ask `Privacy.mayReveal` about.
+- **No buttons and no ticks**, so no press handler: the list is only to read.
+- Cost: showing is one enqueue after the answer. Over the largest cache (1,425 items, five headlines) the answer with its
+  list held the main thread at most 2.6 to 3.9 ms (`test/latency.test.ts`, three runs, bound 10 ms, 30 ms on CI).
 
 The action is called `top`, not `headlines`, because the host generates a tool `news_<action>` for every action and
 `news_headlines` is the tool above.
@@ -109,8 +166,8 @@ There are no secrets. Invalid values put the module down with the reason (the ad
 ## What it stores
 
 **Nothing in this module is about one person**: every row is household data, no row has an owner, and the module
-answers every device alike (a shared, a private and a public screen get the same news), so it asks `Privacy.mayReveal`
-about nothing. There are no person-scoped feeds or topics in this version. The module never stores secrets; a
+answers every device alike (a shared, a private and a public screen get the same news, and the same list on the screen), so
+it asks `Privacy.mayReveal` about nothing. There are no person-scoped feeds or topics in this version. The module never stores secrets; a
 subscription address with credentials in it is refused.
 
 | Collection | Scope | `maxChars` | Rows of one list page | Indexes | Holds |
@@ -165,12 +222,11 @@ Cut from the first version after review:
 - **Paywall detection.** The article tool says what it could read; when that is very little it says so and why it cannot
   tell more. It never claims a page is behind a paywall.
 
-Left out for wave B (they need a phrase command, a presentation, a notification or the module's own speech, which do
-not exist yet):
+Left out of the phrase command and presentation (the first piece of wave B, above, is in; these are not):
 
-- Phrase commands for "what's the news" and "unsubscribe from X" without the model (the typed actions above are matched
-  from their examples by the intent agent; the phrase command is the faster path of P7).
-- The headline `list` of cards, the story `card` with its QR hand-off, and the ticker (P10).
+- A phrase for "unsubscribe from X" (the typed action is matched from its examples by the intent agent; a name is text and
+  is resolved in the action), and phrases with a topic or a source.
+- The story `card` with its QR hand-off, and the ticker (P10).
 - Reading a long article aloud through a read-aloud engine, and "save for later" (`news_article` gives the text to the
   model instead).
 - Alert notifications (P9), and a spoken notice outside a reply that feeds could not be reached.

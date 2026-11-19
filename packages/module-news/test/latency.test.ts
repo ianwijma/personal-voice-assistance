@@ -6,7 +6,7 @@ import { assert, describe, it } from "@effect/vitest"
 import { Effect } from "effect"
 import { bound } from "../../store-sqlite/test/latencyBound.ts"
 import { ARTICLE_CHARS, ARTICLE_MAX_BYTES, CUT_MARKER, FEED_MAX_BYTES, feeds, items, MAX_ENTRIES, MAX_FEEDS, SCAN_ITEMS, texts } from "../src/index.ts"
-import { advanceIdle, ARS, BBC, GUARDIAN, NOW, refreshed, rss, startNews, value, xml } from "./helpers.ts"
+import { advanceIdle, ARS, BBC, GUARDIAN, type Kit, NOW, refreshed, rss, startNews, value, xml } from "./helpers.ts"
 
 /** Starts a 1 ms heartbeat; `stop` answers the longest gap between two beats, in ms. */
 const heartbeat = () =>
@@ -60,6 +60,26 @@ const bigArticle = (): string => {
   return shell(paragraph.repeat(Math.floor((ARTICLE_MAX_BYTES - 1_000) / paragraph.length)))
 }
 
+/** The largest cache: sixty feeds with a full answer each (MAX_ENTRIES), titles at their longest and all different. */
+const fillCache = (kit: Kit) =>
+  Effect.gen(function*() {
+    const store = kit.moduleStore()
+    const now = yield* kit.now
+    const ids: Array<string> = []
+    yield* store.transaction((tx) => {
+      for (let f = 0; f < MAX_FEEDS - 3; f++) ids.push(tx.collection(feeds).insert({ url: `https://f${f}.example.org/rss`, label: `Feed ${f}`, topics: ["general"], starter: false, lastFetchedAt: now, lastOkAt: now, lastItemAt: now, failures: 0 }).id)
+    })
+    yield* store.transaction((tx) => {
+      for (const [f, feedId] of ids.entries()) {
+        for (let n = 0; n < MAX_ENTRIES; n++) {
+          const title = `${f}-${n} ${"word ".repeat(40)}`.slice(0, 159)
+          tx.collection(items).insert({ feedId, title, summary: "s".repeat(240), url: `https://f${f}.example.org/${n}`, published: now - (f * MAX_ENTRIES + n) * 1_000 })
+        }
+      }
+    })
+    return ids
+  })
+
 describe("@pva/module-news: the main thread is never held long", () => {
   it.effect("subscribing to a feed of 1 MB: parsed in a worker, the newest entries kept, the main thread held under 10 ms", () =>
     Effect.gen(function*() {
@@ -103,21 +123,7 @@ describe("@pva/module-news: the main thread is never held long", () => {
     Effect.gen(function*() {
       const { kit } = yield* startNews(quiet)
       yield* refreshed(kit)
-      const store = kit.moduleStore()
-      const now = yield* kit.now
-      // Sixty feeds with a full answer each (MAX_ENTRIES), titles at their longest and all different.
-      const ids: Array<string> = []
-      yield* store.transaction((tx) => {
-        for (let f = 0; f < MAX_FEEDS - 3; f++) ids.push(tx.collection(feeds).insert({ url: `https://f${f}.example.org/rss`, label: `Feed ${f}`, topics: ["general"], starter: false, lastFetchedAt: now, lastOkAt: now, lastItemAt: now, failures: 0 }).id)
-      })
-      yield* store.transaction((tx) => {
-        for (const [f, feedId] of ids.entries()) {
-          for (let n = 0; n < MAX_ENTRIES; n++) {
-            const title = `${f}-${n} ${"word ".repeat(40)}`.slice(0, 159)
-            tx.collection(items).insert({ feedId, title, summary: "s".repeat(240), url: `https://f${f}.example.org/${n}`, published: now - (f * MAX_ENTRIES + n) * 1_000 })
-          }
-        }
-      })
+      const ids = yield* fillCache(kit)
       // Warm: the first list of a collection.
       yield* kit.tool("news_headlines", {})
       const { result, longest } = yield* measured(kit.tool("news_headlines", { max: 5 }))
@@ -125,6 +131,28 @@ describe("@pva/module-news: the main thread is never held long", () => {
       const h = value(result)
       assert.strictEqual(h.stories.length, 5)
       assert.strictEqual(h.cut, texts.en.cut.replace("{count}", String(SCAN_ITEMS)))
+      assert.isBelow(longest, bound(10))
+    }))
+
+  it.effect("the phrase \"what's the news\" over the largest cache: the answer and its list on the screen, the main thread held under 10 ms", () =>
+    Effect.gen(function*() {
+      const { kit } = yield* startNews(quiet, { settings: { headlines: 5 } })
+      yield* refreshed(kit)
+      const ids = yield* fillCache(kit)
+      // Warm: the first list of a collection, the first presentation.
+      yield* kit.phrases.say("what's the news", { device: "kitchen-display" })
+      yield* kit.present.settle
+      const { result, longest } = yield* measured(Effect.gen(function*() {
+        const said = yield* kit.phrases.say("what's the news", { device: "kitchen-display" })
+        yield* kit.present.settle
+        return said
+      }))
+      console.log(`news latency: the phrase with its list over ${ids.length * MAX_ENTRIES} cached items, longest main-thread stop ${longest.toFixed(2)} ms`)
+      assert.isTrue(result.taken)
+      const [shown] = kit.present.shown("kitchen-display")
+      // The phrase says whole headlines within what a phrase may say (the titles here are at their longest): one, and the cut note.
+      assert.strictEqual(shown?.content.kind === "list" ? shown.content.items.length : 0, 2)
+      assert.isAtMost(kit.phrases.spoken.at(-1)!.text.length, 300)
       assert.isBelow(longest, bound(10))
     }))
 

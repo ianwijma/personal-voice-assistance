@@ -117,3 +117,29 @@ export const cleanArticle = (raw: string, max: number): { readonly text: string;
 /** A title as two equal stories compare it: lower case, no accents, no punctuation, single spaces. */
 export const titleKey = (title: string): string =>
   title.normalize("NFKD").replace(/[̀-ͯ]/g, "").toLowerCase().replace(/[^\p{L}\p{N}]+/gu, " ").trim()
+
+/** Characters a screen line never keeps; the surrogate range is a lone surrogate only (the `u` flag reads a valid pair as one character). */
+const SCREEN_CONTROLS = /[\u0000-\u001f\u007f-\u009f\u2028\u2029\u200e\u200f\u202a-\u202e\u2066-\u2069\ud800-\udfff]/gu
+
+/**
+ * `text` as one line of plain text for a screen: control, line-separator and bidirectional characters, lone surrogates
+ * and brackets become a space, runs of space become one; valid characters outside the basic plane stay. Text from a feed
+ * is bounded and never markup there.
+ */
+export const oneLine = (text: string): string => text.replace(SCREEN_CONTROLS, " ").replace(/[<>]/g, " ").replace(/\s+/g, " ").trim()
+
+/**
+ * `text` of at most `max` UTF-16 code units (what the presentation protocol counts): cut at a code point boundary (never
+ * inside a surrogate pair), at a word when one lies in the second half, with "…" counted in the `max`. The one cut every
+ * text of a presentation goes through.
+ */
+export const cutCodePoints = (text: string, max: number): string => {
+  if (text.length <= max) return text
+  let head = ""
+  for (const point of text) {
+    if (head.length + point.length > max - 1) break
+    head += point
+  }
+  const space = head.lastIndexOf(" ")
+  return `${(space > max / 2 ? head.slice(0, space) : head).trimEnd()}…`
+}
