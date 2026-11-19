@@ -33,7 +33,8 @@ describe("measuring what this browser can do", () => {
     expect(measureCapabilities(env())).toEqual({
       v: 1,
       display: { class: "standard", widthPx: 1024, heightPx: 768, dpr: 2, touch: "coarse", colour: true },
-      present: { kinds: {} },
+      // P10: the page draws every kind of the first version.
+      present: { kinds: { card: 1, list: 1, timer: 1, image: 1, weather: 1 } },
       speaker: { media: ["speech", "audio"] },
       microphone: { farField: false }
     })
@@ -436,10 +437,12 @@ describe("Devices › a device: Place and What it can do", () => {
     expect(saveButton()).toBeEnabled()
   })
 
-  it("with no device that declared a kind and none the protocol knows yet: \"none yet\"", () => {
+  it("with no device that declared a kind: the kinds the protocol knows (P10's five) are offered", () => {
     const { declared: _never, ...undeclared } = exampleDevice
     setup("type", undeclared)
-    expect(screen.getByTestId("caps-kinds-none")).toHaveTextContent("None yet")
+    expect(screen.queryByTestId("caps-kinds-none")).toBeNull()
+    const section = screen.getByTestId("section-capabilities")
+    for (const k of ["card", "image", "list", "timer", "weather"]) expect(within(section).getByRole("switch", { name: `Show ${k}` })).toHaveAttribute("aria-checked", "true")
     expect(kindsFor({ known: [], declared: [], excluded: [] })).toEqual([])
     expect(kindsFor({ known: ["list"], declared: [{ declared: { capabilities: { v: 1, present: { kinds: { card: 1 } } } } }], excluded: ["timer"] })).toEqual(["card", "list", "timer"])
   })

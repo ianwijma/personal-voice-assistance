@@ -33,7 +33,8 @@ export function Stage() {
         data-visual-state={v.state}
         className={cx(
           // The line stays at the same height in every state; what is under it flows downward.
-          "absolute inset-0 flex flex-col items-center overflow-y-auto overflow-x-hidden pb-32 [overflow-anchor:none] transition-transform duration-[320ms] ease-out",
+          // P10: the bottom keeps the presentation stage's height clear too (`--pva-present-h`), so captions scroll above it.
+          "absolute inset-0 flex flex-col items-center overflow-y-auto overflow-x-hidden pb-[calc(8rem+var(--pva-present-h,0px))] [overflow-anchor:none] transition-transform duration-[320ms] ease-out",
           // Top padding and the visualiser's height scale with the height (globals.css `stage-pad` / `stage-vis`).
           "stage-pad",
           v.chatOpen && "lg:max-[1439px]:-translate-x-[200px]"

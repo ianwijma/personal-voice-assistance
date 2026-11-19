@@ -208,6 +208,42 @@ describe("the mock, through its handlers, as the server", { timeout: 30_000 }, (
     for (const p of [one, two, again, a]) p.ws.close()
   })
 
+  it("P10 presentations as the server: shown where the shared decision allows (a page that declares the kinds), again after a hello; a transient replaces a transient; a tick from the holder updates every page; refused elsewhere and while the handler is down", async () => {
+    const http = url.replace(/^ws/, "http").replace(/\/ws$/, "")
+    const screen = { v: 1, display: { class: "standard", widthPx: 800, heightPx: 600, dpr: 1, touch: "coarse", colour: true }, present: { kinds: { card: 1, list: 1, timer: 1, image: 1, weather: 1 } } }
+    const one = await Peer.open({ device: { id: "d-mock-present1", kind: "web-voice", name: "One", capabilities: screen } as never })
+    const old = await Peer.open({ device: { id: "d-mock-present2", kind: "web-voice", name: "Old", capabilities: { v: 1, display: screen.display } } as never })
+    const post = (path: string, body: unknown) => fetch(`${http}${path}`, { method: "POST", body: JSON.stringify(body) }).then((r) => r.json() as Promise<{ id?: string }>)
+    const list = await post("/mock/present", { lifetime: "pinned", content: { kind: "list", title: "Shopping", style: "checklist", items: [{ id: "milk", text: "Milk", done: false }] }, buttons: [{ id: "clear", label: "Clear" }] })
+    const shown = await one.waitFor("present.show", (m) => m.presentation.id === list.id)
+    expect(shown.presentation.interactive).toBe(true)
+    expect(shown.presentation.texts.region).toBe("On screen")
+    await new Promise((r) => setTimeout(r, 200))
+    expect(old.messages.some((m) => m.type.startsWith("present."))).toBe(false)
+    // A transient one, then another: one at a time.
+    const t1 = await post("/mock/present", { content: { kind: "card", title: "First", facts: [] } })
+    await one.waitFor("present.show", (m) => m.presentation.id === t1.id)
+    const t2 = await post("/mock/present", { content: { kind: "card", title: "Second", facts: [] } })
+    await one.waitFor("present.dismiss", (m) => m.id === t1.id)
+    await one.waitFor("present.show", (m) => m.presentation.id === t2.id)
+    // A page that says hello gets the pinned one and the live transient again.
+    const again = await Peer.open({ device: { id: "d-mock-present1", kind: "web-voice", name: "One", capabilities: screen } as never })
+    await again.waitFor("present.show", (m) => m.presentation.id === list.id)
+    await again.waitFor("present.show", (m) => m.presentation.id === t2.id)
+    // A tick from a holder: every page of the device gets the update. From a page that does not hold it: refused.
+    const ticked = await one.request({ type: "present.action", id: list.id, action: "tick", item: "milk", done: true })
+    expect([ticked.ok, ticked.say]).toEqual([true, "Done."])
+    await again.waitFor("present.update", (m) => m.presentation.id === list.id && m.presentation.content.kind === "list" && m.presentation.content.items[0]!.done)
+    expect((await old.request({ type: "present.action", id: list.id, action: "clear" })).ok).toBe(false)
+    const down = await post("/mock/present", { lifetime: "pinned", content: { kind: "card", title: "Down", facts: [] }, buttons: [{ id: "go", label: "Go" }], handlerDown: true })
+    await one.waitFor("present.show", (m) => m.presentation.id === down.id)
+    const refused = await one.request({ type: "present.action", id: down.id, action: "go" })
+    expect([refused.ok, refused.error?.code, refused.say]).toEqual([false, "not_running", "I can't do that right now."])
+    await post("/mock/present/dismiss", { id: list.id })
+    await one.waitFor("present.dismiss", (m) => m.id === list.id)
+    for (const p of [one, old, again]) p.ws.close()
+  })
+
   it("b13/b14: the mock decides delivery per device with the real decision function (also on hello), and never reuses an id", async () => {
     const http = url.replace(/^ws/, "http").replace(/\/ws$/, "")
     const post = (path: string, body: unknown) => fetch(`${http}${path}`, { method: "POST", body: JSON.stringify(body) })
