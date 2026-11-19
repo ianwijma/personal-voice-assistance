@@ -2,12 +2,12 @@
 // the saved values) through serve mode's decoder, and decide every call with the same function.
 import { assert, it } from "@effect/vitest"
 import { CurrentTurnTrace, defineModule, makeTool, makeTurnTrace, readOnlyPersistence, ToolError } from "@pva/core"
-import { ConfigProvider, Effect, Schema } from "effect"
+import { Config, ConfigProvider, Effect, Schema } from "effect"
 import { mkdtempSync, readFileSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { it as test, expect } from "vitest"
-import { withCliSettings } from "../src/cliSettings.ts"
+import { loadCliSettings, withCliSettings } from "../src/cliSettings.ts"
 import { makeSections } from "../src/serve/sections.ts"
 import { openStore } from "./support/store.ts"
 import { startCliModules } from "../src/modules.ts"
@@ -89,4 +89,22 @@ test.each([
   expect(result.content).toBe(language === "nl"
     ? "Niet uitgevoerd: het zou een bericht sturen namens de eigenaar, en dat staat dit huishouden niet toe."
     : "Not run: it would send a message in the owner's name, which this household does not allow.")
+})
+
+
+test.each([
+  { RISK_READ: " deny ", RISK_MONEY: "allow" },
+  { RISK_READ: "invalid", RISK_CHANGE: " confirm ", RISK_MESSAGE: "allow", RISK_SECURITY: "allow" },
+  {}
+])("the no-store CLI provider resolves risk values just like a readable store: %j", async (env) => {
+  const dir = mkdtempSync(join(tmpdir(), "pva-cli-risk-fallback-"))
+  const options = { env, dataDir: dir, vaultPath: join(dir, "vault.enc") }
+  const readable = await Effect.runPromise(loadCliSettings(options))
+  writeFileSync(join(dir, "settings.json"), JSON.stringify({ version: 999 }))
+  const fallback = await Effect.runPromise(loadCliSettings(options))
+  expect(readable.settings.store).toBeDefined()
+  expect(fallback.settings.store).toBeUndefined()
+  const keys = ["RISK_READ", "RISK_CHANGE", "RISK_MESSAGE", "RISK_MONEY", "RISK_SECURITY"]
+  const read = (provider: ConfigProvider.ConfigProvider) => Effect.runPromise(Effect.all(keys.map((key) => Config.String(key).pipe(Config.withDefault("missing")))).pipe(Effect.provideService(ConfigProvider.ConfigProvider, provider)))
+  expect(await read(fallback.configProvider)).toEqual(await read(readable.configProvider))
 })

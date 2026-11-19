@@ -10,7 +10,7 @@ import type { ModuleDefinition } from "@pva/core"
 import type { Assistant, RiskLanguage } from "@pva/protocol"
 import { ConfigProvider, Context, Effect } from "effect"
 import * as readline from "node:readline"
-import { effectiveRiskLanguage } from "./serve/riskPolicy.ts"
+import { effectiveRiskLanguage, effectiveRiskPolicy, riskPolicyValues } from "./serve/riskPolicy.ts"
 import { makeSections } from "./serve/sections.ts"
 import { loadSettingsStore, type SettingsStore } from "./serve/SettingsStore.ts"
 import { openVault, type Vault } from "./serve/Vault.ts"
@@ -62,7 +62,7 @@ export const loadCliSettings = (options: LoadCliOptions): Effect.Effect<{ readon
     const fromEnv = (): ConfigProvider.ConfigProvider => {
       const record: Record<string, string> = {}
       for (const [k, v] of Object.entries(options.env)) if (v !== undefined && v !== "") record[k] = v
-      return ConfigProvider.fromEnvRecord(record)
+      return ConfigProvider.fromEnvRecord({ ...record, ...riskPolicyValues(effectiveRiskPolicy({ stored: {}, env: options.env })) })
     }
     const vault = yield* Effect.tryPromise(() => (options.openVault ?? ((path) => openVault({ path })))(options.vaultPath)).pipe(
       Effect.catchCause((cause) => Effect.as(Effect.logWarning(`Could not open the key vault at ${options.vaultPath}`, cause), undefined))
