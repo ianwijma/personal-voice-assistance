@@ -221,7 +221,12 @@ knows (days, clock words, numbers or relations such as before/after/until/by/fro
 cannot cancel by name alone: the whole selector must read as a day or time, otherwise the module asks, naming the
 local name candidates and their times, and cancels nothing. For example, “before noon” asks whether Before Noon at
 13:15 is the name or whether the person means alarms before noon; “named Before Noon” selects the name explicitly.
-Names with no temporal word keep their usual behavior.
+Words of order or position (ordinals, last/next/previous, earliest/latest/soonest/newest/oldest/other,
+also in Dutch) follow the same rule: if they also match a name, the module asks with the local candidates and
+cancels nothing; without a name match, unsupported ordering asks too. “Cancel the first alarm” therefore asks
+when First Alarm is a name, while “named First Alarm” selects it explicitly. When the selector exactly matches
+one name and contains no word of time, day, relation or order, that alarm is the one meant, whatever else its name
+could be taken for.
 
 The direct path understands “wake me at seven” / “zet een wekker om half acht”, complete date/repetition clauses
 such as “set an alarm every weekday at noon”, and cancellation by clock time or a name after an article, possessive

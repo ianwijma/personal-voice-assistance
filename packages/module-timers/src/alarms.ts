@@ -121,16 +121,17 @@ const MORE_MINUTES = 5
 
 const timeWords = (time: ClockTime, language: Language): string => speakTime(time, language, { style: "12h", period: true }) ?? timeText(time)
 
-/** Probe the reader's vocabulary in minimal date/clock contexts, not a second list of day/time spellings.
+/** Probe the reader's vocabulary in minimal date/clock contexts, plus order/position words.
  * Called only for a matching name (at most NAME_CHARS), never once per alarm in a scan.
  */
 const hasTemporalWord = (text: string, lang: Language, options: DateOptions): boolean =>
   (text.match(/[\p{L}\p{N}]+(?:['’][\p{L}]+)*/gu) ?? []).some((word) =>
     /\p{N}/u.test(word)
     || /^(?:before|after|until|by|from|between|this|next|coming|at|on|in|past|to|of|and|half|quarter|oh|o'clock|oclock|voor|na|tot|tegen|vanaf|van|tussen|deze|dit|volgende|komende|aanstaande|op|om|over|en|kwart)$/iu.test(word)
-    || parseNumber(word, lang).kind !== "not-understood"
-    || parseNumber(`${lang === "nl" ? "een" : "one"} ${word}`, lang).kind !== "not-understood"
-    || [word, `1 ${word}`, `7 ${word}`, `${lang === "nl" ? "morgen" : "tomorrow"} ${word}`, `${lang === "nl" ? "over" : "in"} 1 ${word}`, ...(lang === "nl" ? [`7 's ${word}`] : [])]
+    || /^(?:last|next|previous|earliest|latest|soonest|newest|oldest|other|laatste|volgende|vorige|vroegste|spoedigste|snelste|nieuwste|oudste|ander|andere|eerstvolgende)$/iu.test(word)
+    || [word, lang === "nl" ? word.replace(/(?:ste|de)$/iu, "") : word.replace(/ieth$/iu, "y").replace(/th$/iu, "")]
+      .some((part) => parseNumber(part, lang).kind !== "not-understood" || parseNumber(`${lang === "nl" ? "een" : "one"} ${part}`, lang).kind !== "not-understood")
+    || [word, `${lang === "nl" ? "de" : "the"} ${word}`, `1 ${word}`, `7 ${word}`, `${lang === "nl" ? "morgen" : "tomorrow"} ${word}`, `${lang === "nl" ? "over" : "in"} 1 ${word}`, ...(lang === "nl" ? [`7 's ${word}`] : [])]
       .some((part) => parseDateTime(part, lang, options).kind !== "not-understood")
     || parseRecurrence(word, lang, options).kind !== "not-understood"
     || parseRecurrence(`${lang === "nl" ? "elke" : "every"} ${word}`, lang, options).kind !== "not-understood")
