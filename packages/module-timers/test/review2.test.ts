@@ -267,7 +267,7 @@ describe("finding 9 (U6): cancelling again finishes the clean-up", () => {
       assert.strictEqual(said(yield* kit.action("list", {})), "No alarms are set.")
       hooks.resolveFail = undefined
       assert.strictEqual(said(yield* kit.action("cancel", { which: "tea" })), "The alarm's ring is stopped now.")
-      assert.strictEqual(said(yield* kit.action("cancel", { which: "tea" }, hall)), "I don't know an alarm called tea here.")
+      assert.strictEqual(said(yield* kit.action("cancel", { which: "tea" }, hall)), "Which alarm do you mean? Say its clock time and date, or say \"named\" followed by its name.")
       assert.strictEqual(said(yield* kit.action("cancel", { which: "10:02" }, hall)), "The alarm's ring is stopped now.")
       yield* kit.notify.settle
       assert.deepStrictEqual(ringing(kit), [])

@@ -547,6 +547,7 @@ export const alarmsModule = defineModule({
           const named = /^(?:(?:alarm|wekker)\s+)?(?:called|named|genaamd)\s+/iu.test(which ?? "")
           const clock = !named && /^(?:(?:alarm|wekker)\s+)?(?:at|om)\s+/iu.test(which ?? "")
           which = which?.replace(/^(?:(?:alarm|wekker)\s+)?(?:called|named|genaamd)\s+/iu, "")
+          const implicitName = which?.trim().toLowerCase()
           if (!named) which = which?.replace(/^(?:alarm|wekker)\s+(?:at|om)\s+/iu, "").replace(/\s+(?:alarm|wekker)$/iu, "")
           if (!named && /^(?:alarm|wekker)$/iu.test(which ?? "")) which = undefined
           const key = which === undefined ? "" : nameKey(which)
@@ -555,10 +556,11 @@ export const alarmsModule = defineModule({
             if (read.rows.length === 0) return read.cut ? yield* Effect.fail(unreadable()) : answer(say(texts, lang, "none"))
             return ask(read.rows, read.cut)
           }
-          // A day is a date selector first, even when a local alarm has that name.
-          if (!named && /^(?:today|tonight|tomorrow|monday|tuesday|wednesday|thursday|friday|saturday|sunday|vandaag|vanavond|vannacht|morgen|maandag|dinsdag|woensdag|donderdag|vrijdag|zaterdag|zondag)$/iu.test(key)) return answer(say(texts, lang, "dateTarget"))
+          const time = named ? undefined : parseTimeOfDay(which, lang, { band: ALARM_BAND })
+          // Dates take precedence over names; unsupported calendar spans ask as well.
+          if (!named && time?.kind !== "ok" && (parseDateTime(which, lang, { now, timeZone: zone(), band: ALARM_BAND }).kind !== "not-understood"
+            || /\b(?:days?|weeks?|weekends?|months?|years?|dag|dagen|weken|weekenden|maand|maanden|jaar|jaren)\b/iu.test(which))) return answer(say(texts, lang, "dateTarget"))
           // A time request matches times, even when a local name has the same words.
-          const time = named ? undefined : parseTimeOfDay(which!, lang, { band: ALARM_BAND })
           if (time?.kind === "ok") {
             const at = read.rows.filter((r) => timesOf(r, read.open, now).some((t) => t.hour === time.value.hour && t.minute === time.value.minute))
             if (at.length === 1) {
@@ -576,10 +578,10 @@ export const alarmsModule = defineModule({
             return read.cut ? yield* Effect.fail(unreadable()) : answer(say(texts, lang, "noTimeMatch", { time: words }))
           }
           if (clock) return answer(say(texts, lang, "whenAmbiguous"))
-          const byName = read.rows.filter((r) => r.value.deviceId === here && r.value.name !== undefined && nameKey(r.value.name) === key)
+          const byName = read.rows.filter((r) => r.value.deviceId === here && r.value.name !== undefined && (named ? nameKey(r.value.name) === key : r.value.name.trim().toLowerCase() === implicitName))
           if (byName.length === 1) return one(byName[0]!)
           if (byName.length > 1) return ask(byName, false)
-          return read.cut ? yield* Effect.fail(unreadable()) : answer(say(texts, lang, "unknown", { name: cut(which!, NAME_CHARS) }))
+          return read.cut ? yield* Effect.fail(unreadable()) : answer(say(texts, lang, "dateTarget"))
         })
 
       /** Whether a ring of the row is still to be taken away. */

@@ -210,9 +210,13 @@ The typed setting parameter keeps the date or repetition before the clock time: 
 “every weekday at noon” reach the date and recurrence parsers intact. Cancellation strips an optional alarm noun
 before comparing a clock time, preserving punctuation such as the colon in “12:00”. A date-only cancellation
 such as “cancel tomorrow's alarm only” asks which alarm is meant and changes nothing; it cannot select today's
-sole alarm by dropping “tomorrow”. Day words (today, tonight, tomorrow and weekdays, also in Dutch) are read as
-dates before names. If a day word is also an alarm's name, the module asks and cancels nothing; say “named Tomorrow”
-(or “genaamd Morgen”) to select that name explicitly. An unparsed explicit clock also asks instead of matching a name.
+sole alarm by dropping “tomorrow”. Every day or date the module's date reader understands, also in Dutch, takes
+precedence over names; calendar spans such as “this weekend” and “next week” ask too. These selectors ask and cancel
+nothing, even when an alarm has that name; say “named This Weekend” (or “genaamd Dit Weekend”) to select the name
+explicitly. An unparsed explicit clock also asks. An implicit name must match the complete captured selector,
+ignoring case and surrounding whitespace; a leftover alarm noun or unknown qualifier asks instead of falling back
+to a shorter name or the only alarm. For example, “half past noon alarm” cannot select an alarm named Half Past Noon.
+A recognized clock such as “at 12:30” still selects by time.
 
 The direct path understands “wake me at seven” / “zet een wekker om half acht”, complete date/repetition clauses
 such as “set an alarm every weekday at noon”, and cancellation by clock time or a name after an article, possessive

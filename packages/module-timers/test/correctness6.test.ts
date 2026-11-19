@@ -143,7 +143,7 @@ it.effect("2: a non-time name stays local to its device", () => Effect.gen(funct
   yield* kit.action("set", { when: "11:55", name: "Tea" })
   const elsewhere = yield* kit.action("cancel", { which: "Tea" }, hall)
   assert.isTrue(elsewhere.ok)
-  assert.strictEqual(elsewhere.say, "I don't know an alarm called Tea here.")
+  assert.strictEqual(elsewhere.say, "Which alarm do you mean? Say its clock time and date, or say \"named\" followed by its name.")
   const local = yield* kit.action("cancel", { which: "Tea" })
   assert.isTrue(local.ok)
   assert.include(local.say!, "cancelled")

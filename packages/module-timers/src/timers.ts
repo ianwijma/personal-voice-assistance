@@ -971,7 +971,7 @@ export const timersModule = defineModule({
             const lang = homeLanguage(ctx.host.view())
             const clause = inlineName?.match(/^(?:(.+?)\s+)?timer\s+(?:for|op|van|voor)\s+(.+)$/iu)
             const parsed = clause === undefined || clause === null ? undefined : parseDuration(clause[2]!, lang)
-            if (/^(?:repeating|recurring|daily|weekly|herhalende?|terugkerende?|dagelijkse?|wekelijkse?)$/iu.test((name ?? clause?.[1] ?? "").trim())) return Effect.succeed({ say: say(texts, lang, "noRepeat") })
+            if (/\b(?:repeating|recurring|every|daily|weekly|monthly|herhalend[es]?|terugkerend[es]?|elk[es]?|iedere?|dagelijks[es]?|wekelijks[es]?|maandelijks[es]?)\b/iu.test(`${name ?? ""} ${clause?.[1] ?? ""}`)) return Effect.succeed({ say: say(texts, lang, "noRepeat") })
             // Never discard a supplied clause's unknown name, suffix or mismatched duration.
             if (inlineName !== undefined && (parsed?.kind !== "ok" || parsed.value !== duration || name !== undefined && nameKey(name) !== nameKey(clause![1] ?? ""))) {
               return Effect.succeed({ say: say(texts, lang, "startTarget") })

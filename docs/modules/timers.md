@@ -205,8 +205,10 @@ The direct path understands the phrase table below, targets after an article, po
 and additions/subtractions with a duration and direction. A captured start clause must contain a complete name (if
 present), timer noun and matching duration; unknown text asks instead of starting an unnamed timer. Bare named
 adjustments/cancellations and other wording can be handed to the assistant's model when extraction cannot resolve
-them. A modifier such as “repeating”, “recurring”, “herhalende” or “terugkerende” before “timer” is not a name:
-the answer says timers do not repeat and suggests a repeating alarm; no timer is created. Actions receive declared
+them. Any repetition word anywhere in a prospective timer name (including “repeating”, “recurring”, “every”,
+“daily”, “weekly”, “monthly” and their Dutch forms) refuses the request: the answer says timers do not repeat and
+suggests a repeating alarm; no timer is created. This also covers named requests such as “repeating tea timer”
+and “terugkerende thee timer”. Actions receive declared
 parameters, not the utterance, so they cannot inspect words extraction never supplied.
 
 **Phrase commands.** Start and list names take at most three words; cancel names take at most 64 words, subject to

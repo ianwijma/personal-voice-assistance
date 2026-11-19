@@ -69,7 +69,9 @@ it.effect("3: supplied empty-normalization timer names never select an unrelated
 it.effect("3: supplied empty-normalization alarm names respect exact names and device privacy", () => Effect.gen(function*() {
   const kit = yield* startTestModule(alarmsModule)
   yield* kit.action("set", { when: "10:01", name: "bread" })
-  assert.include(said(yield* kit.action("cancel", { which: "A" }, hall)), "don't know")
+  const unknown = said(yield* kit.action("cancel", { which: "A" }, hall))
+  assert.include(unknown, "?")
+  assert.notInclude(unknown, "bread")
   yield* kit.action("set", { when: "10:02", name: "A" })
   assert.include(said(yield* kit.action("cancel", { which: "A" })), "cancelled")
   assert.strictEqual((yield* alarmRows(kit)).find((r) => r.value.name === "bread")?.value.phase, "set")

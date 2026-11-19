@@ -87,7 +87,7 @@ describe("an alarm's name only on its own device", () => {
         assert.notInclude(answer!, "pills")
       }
       // Its name does not find it elsewhere (that would tell the name is there); its time does.
-      assert.strictEqual(said(yield* kit.action("cancel", { which: "pills", scope: "all" }, { device: "kitchen-display" })), "I don't know an alarm called pills here.")
+      assert.strictEqual(said(yield* kit.action("cancel", { which: "pills", scope: "all" }, { device: "kitchen-display" })), "Which alarm do you mean? Say its clock time and date, or say \"named\" followed by its name.")
       assert.strictEqual(said(yield* kit.action("cancel", { which: "quarter to seven", scope: "all" }, { device: "kitchen-display" })), "The alarm every weekday is cancelled.")
       // It rang nowhere and is gone.
       assert.deepStrictEqual(yield* setRows(kit), [])

@@ -74,7 +74,15 @@ describe("finding 1: ten rings open and one more", () => {
       yield* kit.action("set", { when: "every day at 10:02", name: "daily" })
       yield* kit.advance(3 * MIN)
       assert.strictEqual(ringing(kit).length, 10)
-      const daily = (yield* alarmRows(kit)).find((r) => r.value.name === "daily")!
+      // There are eleven rows: include them all, and wait boundedly for the daily row.
+      let daily: Row<Alarm> | undefined
+      for (let attempt = 0; attempt < 100 && daily === undefined; attempt++) {
+        const first = yield* alarmRows(kit)
+        daily = first.find((r) => r.value.name === "daily")
+        if (daily === undefined && first.length === 10) daily = (yield* kit.moduleStore().collection(alarms).list({ orderBy: { field: "createdAt", direction: "asc" }, after: first.at(-1)!, limit: 10 })).find((r) => r.value.name === "daily")
+        if (daily === undefined) yield* Effect.promise(() => new Promise<void>((resolve) => setImmediate(resolve)))
+      }
+      assert.ok(daily, "daily alarm row must be written within 100 attempts")
       // The series is planned for tomorrow already, with today's ring owed.
       assert.strictEqual(daily.value.next?.at, at(19, 10, 2))
       assert.strictEqual(daily.value.owed?.at, at(18, 10, 2))
