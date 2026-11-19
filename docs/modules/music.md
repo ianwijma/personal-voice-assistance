@@ -38,7 +38,9 @@ without a leading "the", "de" or "het"):
 3. with **Use Home Assistant areas** on (the default): the Home Assistant area of that name or alias, and the media
    players in it. One is the room's player; of several, the one Music Assistant serves (an entity with Music
    Assistant's `mass_player_type` attribute) when exactly one is; otherwise it asks which, and never picks the first;
-4. every exposed media player whose name or alias is the text: one is it; several, a question.
+4. every exposed media player whose name or alias is the text: one is it; several, a question counting all of them.
+   The Music Assistant preference of step 3 is only among an area's players: two players of one name are asked about,
+   whichever serves them.
 
 A question names at most three players and says how many there are ("Kitchen has 101 players, among them A, B and C.
 Which one?"). Every area and every player is searched (none is left out), in steps (see "Bounds"). A name it does not
@@ -71,11 +73,17 @@ its host can open as that file, and anything else as a name for Music Assistant'
 
 - The answer says what was asked for and that Music Assistant picks the closest match: the call returns nothing about
   what was found.
-- **Refused, with a sentence**, before anything is sent: a text with `://` or a backslash anywhere; one starting with
-  `/`, `.` or `~` or a drive prefix (`C:`); one ending in a file extension (`.mp3`, `.flac`, `.m3u8`: a dot and 2 to 5
-  letters or digits); one that is only digits ("Which artist is 1989 by?" for a song or an album, and then "Taylor
-  Swift - 1989" is sent; "I can't look up a name that is only a number." for the other kinds). The same checks apply to
-  the artist and to the combined text. A slash inside a name (AC/DC) is allowed.
+- **Refused, with a sentence**, before anything is sent:
+  - a text with `://` or a backslash anywhere, or starting with `/`, `.` or `~` or a drive prefix (`C:`): "I play
+    music by its name; I can't play an address or a file.";
+  - a text ending like a file name (a dot and 2 to 5 letters or digits: `.mp3`, `.m3u8`; also a real name such as
+    "will.i.am" or "Love.exe"): "This connection can't safely look up a name of that form, so I can't play it.";
+  - a title that is only digits: "Which artist is 1989 by?" for a song or an album (with the artist, "Taylor Swift -
+    1989" is sent), and "I can't look up a name that is only a number." for the other kinds.
+
+  The artist and the combined "Artist - Title" are checked against the first two rules (address and name form) and the
+  200-character bound; an artist of digits only is not refused, because the combined text is not only digits ("311 -
+  Amber"). A slash inside a name (AC/DC) is allowed.
 - **What this does not prove**: that no text can reach the integration's file branch. A relative path without an
   extension that Home Assistant's host can read ("music/song") is not excluded. Only a name-only lookup would exclude
   it (missing below).
@@ -95,12 +103,15 @@ module stopped during the request; … may still do it." Each call waits at most
 contract's bound), inside the action's 5 s. The smart-home module off: "The Home Assistant module is off." Every
 sentence is in English and Dutch.
 
-**The same invocation acts once.** Every play, transport and volume request runs through one bounded record in the
-module's shared part, keyed by the invocation's identity (the turn's assistant, conversation, turn id, device and
-source, the operation and its input): a repeat of the same invocation, at once or later, sends nothing and gets the
-first outcome (a failure too); a run cut short (interrupted, a defect) keeps nothing, so a retry runs. The last 256 are
-kept. Two phrases are two turns and act twice; the same tool called twice with the same input in one model turn acts
-once.
+**A phrase invocation acts once.** A play, transport or volume request that came in as a phrase command runs through
+one bounded record in the module's shared part, keyed by the phrase turn's identity (assistant, conversation, turn id,
+device) with the operation and its input: a repeat of the same invocation, at once or later, sends nothing and gets the
+first outcome (a failure too). A run cut short (interrupted, a defect) before its call to Home Assistant went out keeps
+nothing, so its replay runs; cut short after the call went out, it may have happened, so the record stays and a replay
+sends nothing and says "I may already have done that. If not, say it again." A new utterance is a new identity and
+acts. The last 256 are kept. **A call made by the model is never held back or answered from the record**: the gateway
+gives a tool or an action no per-call id, and a turn plus an input is not an invocation, so "skip two songs" as two
+`music_next` calls skips twice, and two "up" calls step twice (missing below).
 
 **Outside content.** Player names (cut to 60 characters), titles, artists and albums (cut to 100) come from Home
 Assistant: line breaks, control and direction characters are flattened to a space, and what the model reads carries a
@@ -138,6 +149,10 @@ announcement and a reply). "Louder" and "quieter" are the host's too and change 
 
 **`Playback`** (provided; packages/core/src/Playback.ts), exactly its two operations:
 
+- **One deadline**: each operation has `PLAYBACK_LIMITS.callTimeoutMs` (3 s) from entry. Resolving the room spends from
+  it (measured in real time), and the call to Home Assistant gets only what is left; when resolving used it all up the
+  answer is `timeout` with nothing sent. After the call went out, running out of time is `timeout` too (it may still
+  have happened).
 - `pause(room)`: resolves the room as above; pauses the player and answers `true` when its cached state is `playing` or
   `buffering`; `false` when it is anything else, and when no state has arrived yet or the smart-home module is off
   before anything is sent (nothing is done). Once the pause was sent, a failure is never `false`: a failed call or the
@@ -163,7 +178,7 @@ and areas are off, since no room can then have a player.
 
 ## What it stores
 
-Nothing: no collections, no jobs, no events, no player state, no volume. In memory only: the outcome of the last 256
+Nothing: no collections, no jobs, no events, no player state, no volume. In memory only: the outcome of the last 256 phrase
 invocations (above), and the compared form of each area's and player's names, per object of the provider's cache (a
 poll that brings a new object is compared afresh). Nothing personal is kept anywhere.
 
@@ -183,7 +198,9 @@ the contract allows (500 areas and 5,000 media players, each with 20 aliases of 
 new objects (nothing remembered helps), for a name that matches nothing, the last player by name, and a name all
 5,000 carry: longest stop of the main thread 3.5 to 6.0 ms (bound 10 ms), the whole answer 1.3 to 1.4 s (development
 machine, three runs each). That is the contract's limit, not a household: with a few dozen players it is milliseconds.
-At that limit, a `Playback.pause` that must search everything can use half of its 3 s.
+At that limit a `Playback` operation that must search everything spends 1.3 to 1.4 s of its 3 s budget resolving, and
+the call to Home Assistant gets only the rest (about 1.6 s); a provider slower than that is `timeout` (test:
+latency.test.ts, "Playback has one 3 s budget from entry").
 
 ## What was left out
 
@@ -213,6 +230,9 @@ Left out because something is **missing below** (the smallest change that would 
   establishes it, so it is always `unknown_level` (the contract allows that). A fresh read of one entity in the
   `HomeAssistant` contract (`refresh(entityId)`, one state read within its time limit) would lift it. No consumer uses
   `by` yet; the host's "louder" changes the reply volume.
+- **A per-call identity for tool and action handlers**: the model's tool-call id (`ToolCall.id`) is dropped before the
+  gateway (`ToolRegistry`), and an action's `run` gets only its parameters. Handed to the handler and kept across a
+  genuine replay, it would let a model call be held to once like a phrase. Until then model calls always run.
 - **The age of a reading in seconds**: the `HomeAssistant` contract has no time of the last poll. A `lastPolledAt()`
   (or a per-entity read time) would let "what is playing" say "20 seconds ago" instead of "up to about a minute ago".
 
