@@ -43,7 +43,7 @@ export type Ring = typeof Ring.Type
 export const Stop = Schema.Struct({
   notes: Schema.Array(Epoch).check(Schema.isMaxLength(STOP_NOTES)),
   card: Schema.Boolean,
-  /** When present, only the card of this occurrence is owed cleanup. */
+  /** Cleanup from an answer to this occurrence; only its card is taken down. Kept until its notifications are gone too. */
   cardAt: Schema.optionalKey(Epoch),
   attempts: Count,
   tryAt: Epoch

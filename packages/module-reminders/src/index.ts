@@ -356,7 +356,7 @@ export const remindersModule = defineModule({
           }
           if (left.length === 0 && !card) return yield* write(row, (v) => without(v, "stop"), { actor, housekeeping: true })
           // An active host claim is not a failed cleanup try. Keep its verification durable without resolving it inline.
-          if (why === "") return yield* write(row, (v) => ({ ...v, stop: { notes: left, card: false, attempts: s.attempts, tryAt: now + STOP_RETRY_MS } }), { actor, housekeeping: true })
+          if (why === "") return yield* write(row, (v) => ({ ...v, stop: { ...s, notes: left, card: false, tryAt: now + STOP_RETRY_MS } }), { actor, housekeeping: true })
           const attempts = s.attempts + 1
           if (attempts >= MAX_STOP_TRIES) {
             return yield* write(row, (v) => ({ ...without(v, "stop"), stopFailed: true }), {
@@ -364,7 +364,7 @@ export const remindersModule = defineModule({
               report: `A reminder's ring or card could not be taken down after ${attempts} tries (${why}); it ends by itself when it expires. Reminder ${row.id}.`
             })
           }
-          return yield* write(row, (v) => ({ ...v, stop: { notes: left, card, ...(card && s.cardAt !== undefined ? { cardAt: s.cardAt } : {}), attempts, tryAt: now + STOP_RETRY_MS * 2 ** (attempts - 1) } }), { actor, housekeeping: true })
+          return yield* write(row, (v) => ({ ...v, stop: { notes: left, card, ...(s.cardAt !== undefined ? { cardAt: s.cardAt } : {}), attempts, tryAt: now + STOP_RETRY_MS * 2 ** (attempts - 1) } }), { actor, housekeeping: true })
         })
 
       /** An occurrence that is due moves from the series to `owed`, and the series advances, in one write. */
@@ -659,9 +659,11 @@ export const remindersModule = defineModule({
           const subject = by.turn ?? (actor?.kind === "ui" ? actor.deviceId : undefined)
           const allowed = () => mayReveal(entry.value.owner, subject)
           if (!allowed()) return reply(say(texts, l, "unreadableHere"), true)
-          // Capture this before reconciliation can finish a runnable cleanup and erase its evidence.
-          const cleanupOnly = by.at === undefined && entry.value.ring === undefined && entry.value.owed === undefined && entry.value.stop !== undefined
-          let row = yield* reconcileLocked(id, { actor, send: false, ...deferred, ...(cleanupOnly ? { forceStop: true } : {}) })
+          // Only occurrence-scoped answer cleanup is a repeated answer; a time edit leaves unscoped cleanup.
+          // Capture this before reconciliation can finish the cleanup and erase its evidence.
+          const cleanupPending = by.at === undefined && entry.value.ring === undefined && entry.value.owed === undefined && entry.value.stop !== undefined
+          const cleanupOnly = cleanupPending && entry.value.stop?.cardAt !== undefined
+          let row = yield* reconcileLocked(id, { actor, send: false, ...deferred, ...(cleanupPending ? { forceStop: true } : {}) })
           if (row === undefined) return reply(say(texts, l, "gone"))
           const now = yield* Clock.currentTimeMillis
           const r: Reminder = row.value
@@ -687,11 +689,13 @@ export const remindersModule = defineModule({
             const open = yield* ctx.notify.list()
             if (!open.some((n) => n.id === noteId && n.key === noteKey(id, by.at!)) || (r.ring?.at === by.at && r.ring.snoozeUntil !== undefined)) return reply(say(texts, l, "answeredAlready"))
           }
+          // A send can succeed before its ring write fails. A named answer belongs to that newer open notification.
+          const openAttempt = by.at === undefined && r.owed !== undefined && r.owed.attempts > 0 && r.owed.at > (r.ring?.at ?? -1) && (yield* isOpen(id, r.owed.at))
           // The notification lookup can wait too: check immediately before accepting the mutation.
           if (!allowed()) return reply(say(texts, l, "unreadableHere"), true)
           const current = by.at !== undefined
             ? (by.at === r.ring?.at || (by.at === r.owed?.at && r.owed.attempts > 0) ? by.at : undefined)
-            : r.ring?.at ?? r.owed?.at
+            : openAttempt ? r.owed!.at : r.ring?.at ?? r.owed?.at
           // A successfully delivered newer attempt supersedes the old ring even if recording the new ring failed.
           const older = current === r.owed?.at && r.ring !== undefined && r.ring.at !== current ? r.ring.at : undefined
           const notes = current === undefined ? [] : [current, ...(older === undefined ? [] : [older])]
