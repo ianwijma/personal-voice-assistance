@@ -2,7 +2,7 @@ import { Context, Effect, Layer, Schema, SchemaAST as AST } from "effect"
 import { type ActionError, type ActionOutcome, actionToolName, type RegisteredAction } from "./Actions.ts"
 import type { ToolCall, ToolResult, ToolSpec } from "./Domain.ts"
 import { type ActionCallOptions, defaultGateway, type ExecutionGateway, prepareTool } from "./Gateway.ts"
-import { registerRegistryGateway } from "./GatewayPrivate.ts"
+import { carryRegistryGateway, registerRegistryGateway } from "./GatewayPrivate.ts"
 import type { AssistantModule, ContextProvider, Tool } from "./Module.ts"
 
 /**
@@ -103,6 +103,8 @@ export const registryWith = (
   const out = { ...base, ...patch }
   Object.defineProperty(out, "specs", { get: () => base.specs, enumerable: true, configurable: true })
   if (base.actions !== undefined) Object.defineProperty(out, "actions", { get: () => base.actions, enumerable: true, configurable: true })
+  // H6: the private association with its gateway goes with it (the confirmed path looks it up by the registry).
+  carryRegistryGateway(base, out)
   return ToolRegistry.of(out)
 }
 
