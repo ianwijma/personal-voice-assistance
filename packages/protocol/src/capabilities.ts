@@ -223,6 +223,12 @@ export const DevicePlace = Schema.Struct({
   /** Nothing that nobody here asked for is spoken in this room (the delivery policy, P9). */
   quietRoom: Schema.Boolean,
   /**
+   * P7 (docs/MODULES-PLAN.md §2 row 4, "while ringing"): while a notification rings on the device, "stop" and the ringing
+   * notification's buttons are accepted without the wake phrase (the host's `ringing` window, docs/PHRASES.md). Absent
+   * means on (the default); `false` switches it off. Optional, so an older peer ignores it and needs no new version.
+   */
+  ringingWithoutWake: Schema.optionalKey(Schema.Boolean),
+  /**
    * Whose data a turn here means (docs/MODULES-PLAN.md §2 row 1, row 7): the one link between a device and a person.
    * It selects; it never grants access. `null`: nobody's (household data).
    */
@@ -245,6 +251,9 @@ export const roomOf = (place: Pick<DevicePlace, "room">): string | undefined => 
   const room = place.room.trim()
   return room === "" ? undefined : room
 }
+
+/** Whether the device accepts "stop" and a ringing notification's buttons without the wake phrase while it rings (default on). */
+export const ringingWithoutWake = (place: Pick<DevicePlace, "ringingWithoutWake"> | undefined): boolean => place?.ringingWithoutWake !== false
 
 /** Rooms are compared without case and surrounding space. */
 export const sameRoom = (a: string | undefined, b: string | undefined): boolean =>

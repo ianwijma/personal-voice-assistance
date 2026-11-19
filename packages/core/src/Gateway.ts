@@ -202,6 +202,26 @@ export interface ActionCallOptions extends GatewayCallOptions {
    * runs: a change of the assistant's choices meanwhile refuses it. A failure here refuses the call.
    */
   readonly holdUntil?: Effect.Effect<void, ActionError>
+  /**
+   * P7 (a phrase command's execution trace): told the admission's outcome once it is decided, before the action runs:
+   * the class the call was judged as (absent when it was refused before its risk was judged) and the refusal, if any.
+   * Must not throw (a throw is ignored). P10: told once more, `presented: true`, when the action's outcome carried a
+   * presentation and it was handed to the Presenter.
+   */
+  readonly onDecision?: (decision: ActionDecisionNote) => void
+}
+
+/**
+ * What an action call's observer is told (`ActionCallOptions.onDecision`): the class it was judged as, the refusal's
+ * reason, and (P8) the risk policy's decision when one was taken (`outcome`, `by`; absent for a call refused before the
+ * decision or with no policy).
+ */
+export interface ActionDecisionNote {
+  readonly risk?: ToolRisk
+  readonly refused?: string
+  readonly presented?: true
+  readonly outcome?: RiskDecision["outcome"]
+  readonly by?: RiskDecision["by"]
 }
 
 export interface ExecutionGateway {
@@ -250,6 +270,15 @@ export interface ExecutionGateway {
 }
 
 const decoders = new WeakMap<Tool, (u: unknown) => Effect.Effect<unknown, Schema.SchemaError>>()
+
+/** Tell an action call's observer the admission's outcome; an observer that throws changes nothing. */
+const tellDecision = (options: ActionCallOptions, decision: ActionDecisionNote) => {
+  try {
+    options.onDecision?.(decision)
+  } catch {
+    // An observer must not change the call.
+  }
+}
 
 /**
  * The tool's input decoder (the JSON Schema sent to the model describes the canonical JSON form), made once per tool.
@@ -478,8 +507,8 @@ export const makeExecutionGateway = (options: GatewayOptions = {}): ExecutionGat
   const admitCall = (
     call: Omit<GatewayCall, "risk">,
     meta: ToolMetadata & { readonly speculative?: boolean | undefined }
-  ): Effect.Effect<{ readonly refusal: Refusal | undefined; readonly record: GatewayDecisionRecord | undefined }> =>
-    Effect.suspend(() => {
+  ): Effect.Effect<{ readonly refusal: Refusal | undefined; readonly record: GatewayDecisionRecord | undefined; readonly risk?: ToolRisk }> =>
+    Effect.suspend((): Effect.Effect<{ readonly refusal: Refusal | undefined; readonly record: GatewayDecisionRecord | undefined; readonly risk?: ToolRisk }> => {
       const problem = accessProblem(call)
       // Refused before the decision: nothing is recorded for it.
       if (problem !== undefined) return Effect.succeed({ refusal: { reason: problem, prefix: NOT_RUN }, record: undefined })
@@ -516,10 +545,11 @@ export const makeExecutionGateway = (options: GatewayOptions = {}): ExecutionGat
       const judged = risk
       return Effect.flatMap(decide(call, declared, judged), (decided) => {
         const refusal = decided === undefined ? undefined : refusalOf(decided.decision)
-        if (refusal !== undefined) return Effect.succeed({ refusal, record: decided?.record })
+        if (refusal !== undefined) return Effect.succeed({ refusal, record: decided?.record, risk: judged })
         return Effect.map(runHooks({ ...call, risk: judged }), (decision) => ({
           refusal: decision._tag === "Allow" ? undefined : { reason: decision.reason, prefix: NOT_RUN },
-          record: decided?.record
+          record: decided?.record,
+          risk: judged
         }))
       })
     })
@@ -543,6 +573,13 @@ export const makeExecutionGateway = (options: GatewayOptions = {}): ExecutionGat
     if (record !== undefined) (record as { withheld?: boolean }).withheld = true
     return riskWithheld(languageNow())
   }
+
+  /** What an action call's observer is told about an admission. */
+  const decisionNote = (a: { readonly refusal: Refusal | undefined; readonly record: GatewayDecisionRecord | undefined; readonly risk?: ToolRisk }): ActionDecisionNote => ({
+    ...(a.risk !== undefined ? { risk: a.risk } : {}),
+    ...(a.refusal !== undefined ? { refused: a.refusal.reason } : {}),
+    ...(a.record !== undefined ? { outcome: a.record.outcome, by: a.record.by } : {})
+  })
 
   const resolve = (explicit: Principal | undefined): Effect.Effect<Resolved> => (explicit !== undefined ? Effect.succeed(explicit) : principalNow)
 
@@ -603,26 +640,37 @@ export const makeExecutionGateway = (options: GatewayOptions = {}): ExecutionGat
     Effect.gen(function*() {
       const def = registered.definition
       const principal = yield* resolve(actionOptions.principal)
-      if ("refused" in principal) return yield* refusedAction(principal.refused)
-      if (!confirmed && needsYes(registered)) return yield* refusedAction(CONFIRMATION_OFF)
+      if ("refused" in principal) {
+        tellDecision(actionOptions, { refused: principal.refused })
+        return yield* refusedAction(principal.refused)
+      }
+      if (!confirmed && needsYes(registered)) {
+        tellDecision(actionOptions, { refused: CONFIRMATION_OFF })
+        return yield* refusedAction(CONFIRMATION_OFF)
+      }
       const call = callOf(
         { kind: "action", moduleId: registered.moduleId, name: actionToolName(registered.moduleId, def.id), input: values, confirmed, action: registered },
         def,
         principal
       )
       const first = yield* admitCall(call, def)
+      tellDecision(actionOptions, decisionNote(first))
       if (first.refusal !== undefined) return yield* refusedAction(first.refusal)
       if (actionOptions.onAdmitted !== undefined) yield* actionOptions.onAdmitted
       if (actionOptions.holdUntil !== undefined) {
         yield* actionOptions.holdUntil
         // Decided again on the policy of now, just before it runs (a change saved meanwhile refuses it).
         const again = yield* admitCall(call, def)
-        if (again.refusal !== undefined) return yield* refusedAction(again.refusal)
+        if (again.refusal !== undefined) {
+          tellDecision(actionOptions, decisionNote(again))
+          return yield* refusedAction(again.refusal)
+        }
       }
       const outcome = yield* asPrincipal(principal, Effect.suspend(() => actionRunnerOf(registered)(values)))
       // P10: an outcome's presentation goes to the Presenter (the intent agent speaks `say`; the note is for a model).
       if (outcome?.present === undefined) return outcome
       yield* split(registered.moduleId, principal, { forModel: outcome.say ?? "", present: outcome.present, ...(outcome.show !== undefined ? { show: outcome.show } : {}) })
+      tellDecision(actionOptions, { presented: true })
       const { present: _p, show: _s, ...rest } = outcome
       return rest
     })

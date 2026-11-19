@@ -131,7 +131,9 @@ describe("the scheduler in serve mode", () => {
     // P9: the notification service's hourly safety net is listed too, under its core owner (its one-shot `due` job is
     // there only while something is due; nothing is here).
     expect(listed.filter((j) => j.module === "core.notify").map((j) => [j.handler, j.state, j.cron])).toEqual([["hourly", "scheduled", "0 * * * *"]])
-    const all = listed.filter((j) => j.module !== "core.notify")
+    // P10: and the Presenter's, under its own core owner (its `due` job only while something is due: nothing is here).
+    expect(listed.filter((j) => j.module === "core.present").map((j) => [j.handler, j.state, j.cron])).toEqual([["hourly", "scheduled", "0 * * * *"]])
+    const all = listed.filter((j) => j.module !== "core.notify" && j.module !== "core.present")
     expect(all).toHaveLength(LATER + 6)
     // Live first, by due time, then the finished ones; no payload on the wire.
     const states = all.map((j) => j.state)

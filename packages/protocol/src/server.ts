@@ -23,6 +23,7 @@ import { HealthInfo } from "./health.ts"
 import { HouseholdEventMessage, HouseholdGapMessage, HouseholdSnapshotMessage } from "./household.ts"
 import { NotificationResolvedMessage, NotificationRingMessage } from "./notifications.ts"
 import { PresentDismissMessage, PresentShowMessage, PresentUpdateMessage } from "./presentation.ts"
+import { OutputVolumeMessage } from "./volume.ts"
 import { FieldActionResult } from "./settings.ts"
 
 /**
@@ -451,6 +452,7 @@ export const ServerMessage = Schema.Union([
   HouseholdGapMessage,
   NotificationRingMessage,
   NotificationResolvedMessage,
+  OutputVolumeMessage,
   PresentShowMessage,
   PresentUpdateMessage,
   PresentDismissMessage

@@ -106,6 +106,20 @@ export const registryWith = (
   return ToolRegistry.of(out)
 }
 
+/**
+ * The actions a registry of `modules` offers (`ToolRegistry.actions`), without building one: those of its generated
+ * action tools and its intent-only actions that the gateway offers (the risk policy allows a class), in module order.
+ * P7's phrase sets read an assistant's actions with it, by the same rule as its turns.
+ */
+export const offeredActions = (modules: ReadonlyArray<AssistantModule>, gateway: ExecutionGateway = defaultGateway): Array<RegisteredAction> => {
+  const out: Array<RegisteredAction> = []
+  for (const module of modules) {
+    for (const tool of module.tools ?? []) if (tool.action !== undefined && gateway.offers(tool.action.definition)) out.push(tool.action)
+    out.push(...(module.intentActions ?? []).filter((a) => gateway.offers(a.definition)))
+  }
+  return out
+}
+
 /** A registry of `modules`' tools; each tool belongs to the module whose `name` lists it (the module host names parts by module id). */
 export const makeToolRegistry = (modules: ReadonlyArray<AssistantModule>, options: ToolRegistryOptions = {}): ToolRegistry["Service"] => {
   const gateway = options.gateway ?? defaultGateway

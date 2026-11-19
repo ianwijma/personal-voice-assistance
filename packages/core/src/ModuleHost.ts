@@ -36,6 +36,7 @@ import {
   type RegisteredAction,
   registerActions
 } from "./Actions.ts"
+import { phraseProblems } from "./Phrases.ts"
 import type { Agent } from "./Agent.ts"
 import { buildDecisionPlan, type DecisionProvider } from "./Decision.ts"
 import { ToolError } from "./Errors.ts"
@@ -1732,6 +1733,24 @@ export const makeModuleHost = Effect.fnUntraced(function*(options: ModuleHostOpt
         kind: "tool",
         claims: inst.tools.map((t) => t.name),
         clash: (claim, owner) => `Tool name "${claim}" is already used by module ${owner}`,
+        publish: () => {},
+        withdraw: () => {}
+      }]
+    },
+    // P7: an instance's phrase commands (`ActionDefinition.phrases`), checked before the module is published (a phrase
+    // outside the bounds, of a host control or naming no parameter refuses the start, naming it; docs/PHRASES.md). They
+    // reach each assistant's set through the snapshot, with the actions they run (published and withdrawn with them);
+    // duplicates between modules are judged per assistant (`buildCommandSet`), never refused here.
+    ({ handle, instance }) => {
+      const inst = instance === undefined ? undefined : instanceByPart.get(handle.id)
+      if (inst === undefined || !inst.actions.some((a) => a.definition.phrases !== undefined)) return []
+      const declared = inst.actions.map((a) => ({ id: a.definition.id, params: a.definition.params as ActionParams, ...(a.definition.phrases !== undefined ? { phrases: a.definition.phrases } : {}) }))
+      return [{
+        kind: "phrase",
+        validate: () => {
+          const problems = phraseProblems(handle.moduleId, declared)
+          return problems.length === 0 ? undefined : `Phrase commands refused: ${problems.slice(0, 4).join("; ")}${problems.length > 4 ? `; and ${problems.length - 4} more` : ""}`
+        },
         publish: () => {},
         withdraw: () => {}
       }]

@@ -33,7 +33,7 @@ ctx.notify.list({ after?, limit? }?): Effect<Notification[], NotifyError>       
 ctx.notify.handle(name, { run(press) => Effect<{ say?, keepOpen? } | void> }): Effect<void, NotifyError>   // in shared
 ctx.notify.dnd.get / .set({ until? }?) / .clear: Effect<DndState, NotifyError>           // { on, until? }
 ctx.speech.say(target, text, { cue?, owner? }?): Effect<SpeechHandle, SpeechError>
-SpeechTarget = { device } | { room } | "everywhere"
+SpeechTarget = { device } | { room, except? } | "everywhere"     // except: a device of the room left out
 SpeechHandle = { id, deliveries: [{ deviceId, queued, why? }], done: Effect<[{ deviceId, outcome, why? }], SpeechError>, stop: Effect<void> }
 ```
 
@@ -47,7 +47,8 @@ SpeechHandle = { id, deliveries: [{ deviceId, queued, why? }], done: Effect<[{ d
 
   A job scheduled inside a press handler does not take the press's device by itself (the scheduler takes a turn's or a
   job's origin): pass `origin: { deviceId: press.deviceId }` (docs/MODULES.md's kettle does).
-- **Target**: `origin` (the default: the device of the turn, the job or the press the call runs for) or `everywhere`
+- **Target**: `origin` (the default: the device of the turn, the job or the press the call runs for, a press on a
+  presentation included: the device it was pressed on) or `everywhere`
   (every known device). A call with no origin device (code in `shared`, a job made for nobody) that asks for `origin` is
   refused `invalid`.
 - **Priority**: `normal` (a silent card) or `ring` (the card and the page's ring cue, until it is resolved). Nothing may
@@ -90,7 +91,7 @@ SpeechHandle = { id, deliveries: [{ deviceId, queued, why? }], done: Effect<[{ d
 | a module action under way | one per notification (a claim on the row). A claim of a run alive in this process is never released or taken over because the wall clock moved: the run's own limit (5 s, monotonic) ends it. A claim no run here holds (its outcome could not be written, or after a restart) is released by maintenance 15 s after it was taken by the wall clock (`CLAIM_RELEASE_MS`), or at once when it is dated in the future (the clock went back) | "That is being handled already." |
 | a handler's run | 5 s (`NOTIFY_ACTION_TIMEOUT_MS`) | it fails: "That didn't work.", nothing changes |
 | a handler's answer | `say` cut to 300 at the page boundary | cut |
-| an announcement | 1 to 300 UTF-16 units, the same characters as a text | `invalid` |
+| an announcement | 1 to 300 UTF-16 units, the same characters as a text; or empty with `cue: true` (the chime alone) | `invalid` |
 | announcements on one device | 8 (`MAX_SPEECH_QUEUE`), waiting, waiting for quiet or being spoken | that device is not queued (`why: "busy"`) |
 | module actions from pages | the hub's bounded admission (4 per connection, 16 in all, pending at once); `stop` is outside it | `busy`, with the service's sentence in the household's language ("Too much at once; try again in a moment.") |
 
@@ -190,13 +191,19 @@ speaker and no display gets the cue and no card.
   (another device, another tab) is answered **"That is being handled already."** While the run is alive in this
   process its claim is never released or taken over, whatever the wall clock does (it is moved forwards or back);
   the claim's wall time on the row is only for a claim found with no run alive.
-- The handler runs as a call in flight of the module's part, with the press's notification principal
-  (`CurrentPrincipal` `notification`: the notification and the device it was pressed on), admitted by the execution
-  gateway first (and decided by the household's risk policy on the handler's declared `risk`, inferred `change`: a
-  refusal answers with the policy's sentence and `code: "refused"`, docs/MODULES.md §4; `stop` is the host's and needs
-  no handler), within 5 s. It answers `{ say?, keepOpen? }`: `say` is shown on the card (cut to 300 at the page
-  boundary; default "Done."); unless `keepOpen`, the notification is then resolved with the action as its outcome. A
-  handler that fails or times out changes nothing ("That didn't work.").
+- **What a press is**: the module's registered handler, run as a call in flight of the module's part with the press's
+  notification principal (`CurrentPrincipal` `notification`: the notification and the device it was pressed on), after
+  the holder, decision and claim checks, within 5 s. **It is not a tool call**: the assistant's module and tool switches
+  do not apply to it. **Under the household's risk policy (P8) it is a call of its own**: the execution gateway admits
+  it by its principal and then decides it with the same function as every tool call, on the handler's declared `risk`
+  (`NotifyActionHandler.risk`: a class, or a function of the press with the classes it can return; absent: `change`).
+  A refusal answers the press with the policy's spoken sentence in the household's language and `code: "refused"`, and
+  the handler does not run; the decision is recorded like every other (`onDecision`, the kit's `riskDecisions()`).
+  `stop` is the host's own and is never refused. Whatever the handler calls through the gateway is decided there too.
+  It answers `{ say?, keepOpen? }`: `say` is shown on the card (cut to 300 at the page boundary; default "Done.");
+  unless `keepOpen`, the notification is then resolved with the action as its outcome. A handler that fails or times
+  out answers "That didn't work." and the notification stays open; what the handler committed before that stays (there
+  is no rollback of a handler's own effects).
 - **After a store failure the handler may run again**: the outcome is written with a few retries; if it still cannot be
   written the answer is the failure sentence, the claim stays until maintenance releases it (15 s after it was taken,
   planned by `plan()`), and a later press runs the handler again for the same notification. **Handlers are idempotent
@@ -205,8 +212,11 @@ speaker and no display gets the cue and no card.
 ## Speech
 
 - `say` decides each device of the target now (the table) and queues the announcement on those that pass; `deliveries`
-  says which and why not. A room is matched by `place.room` (case and surrounding spaces ignored). A target with no
-  device is `no-device`. The module's text passes the page boundary before it is spoken.
+  says which and why not. A room is matched by `place.room` (case and surrounding spaces ignored); `{ room, except }`
+  leaves one device of it out (a broadcast that should not reach the device it was asked on); `except` is refused
+  beside anything but a room. A target with no device is `no-device`. The module's text passes the page boundary before
+  it is spoken. An empty text with `cue: true` is the chime alone (nothing is synthesised); an empty text without a cue
+  is refused `invalid`.
 - One queue per device. The voice is made ready first (the answering assistant's `TurnSetup.tts`); then it waits until
   nothing is spoken or heard there (no play holds the output, no turn is in flight, no utterance is open in the
   recogniser, addressed or not, and the state is not hearing, thinking or speaking); then, in the same step as it takes
@@ -253,13 +263,14 @@ speaker and no display gets the cue and no card.
 
 ## What P7 and P10 build on
 
-- P7 (`ringing` window, the spoken "stop"): `engine.ringingOn(deviceId)` (what rings there, with its actions),
+- P7 (`ringing` window, the spoken "stop"; built: [PHRASES.md](PHRASES.md)): `engine.ringingOn(deviceId)` (what rings there, with its actions),
   `engine.onRingingChanged(listener)` (open and close the window: called whenever what rings on a device differs from
   what it last told: at the end of every step of a pass that can change what a page holds, also a step that failed
   part-way (the clean-up at a page's bound and the held-but-unseen tail included), and when a closed page's cards are
   dropped), `engine.stopRinging(deviceId)` (what rings there is recorded in one step and each ring stopped
   through the same admission as a press, in work the service owns: a caller that is interrupted leaves none of it
-  undone; it answers how many it stopped), `engine.stopSpeech(deviceId)`, `engine.press(…)` for a ringing phrase of an
+  undone; it answers how many it stopped, and fails, busy or failed, when one it found could not be stopped: a zero is
+  "nothing rang any more", never a failure), `engine.stopSpeech(deviceId)`, `engine.press(…)` for a ringing phrase of an
   action, and `engine.busyAnswer()` (the refusal of a press over an admission bound, in the household's language).
 - P10: the card's data is `NotificationCard` on the wire; the presentation stage draws `NotificationCards.tsx` first.
 

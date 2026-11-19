@@ -328,7 +328,8 @@ export const createAssistantClient = (options: { readonly frontend?: FrontendRol
       replyEnd: (turnId) => audio.replyEnd(turnId),
       replyStop: (turnId) => audio.replyStop(turnId, true),
       socketLost: () => audio.replyStop(undefined, false),
-      running: () => audio.running
+      running: () => audio.running,
+      replyVolume: (volume) => audio.setReplyVolume(volume)
     },
     // continuation(none): the connection's hooks run synchronously on each message, on the present state.
     hooks: {

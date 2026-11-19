@@ -299,6 +299,26 @@ export type TraceConfig = typeof TraceConfig.Type
  * One turn's latency trace. Marks are milliseconds relative to end of turn
  * (negative: done early by a promoted speculative turn), as in the CLI's latency line.
  */
+/** What took an utterance and what it came to (`TraceInfo.phrase`). */
+export const PhraseTraceInfo = Schema.Struct({
+  by: Schema.Literals(["ringing", "control", "command"]),
+  /** The control, the action (`<module>.<action>`), or the ringing match ("stop", or the action id). */
+  name: Schema.String.check(Schema.isMaxLength(120)),
+  /** The outcome (`PhraseDid`: "ran", "stopped-ring", "refused", "failed", …). */
+  did: Schema.String.check(Schema.isMaxLength(40)),
+  why: Schema.optionalKey(Schema.String.check(Schema.isMaxLength(300))),
+  /** The class the execution gateway judged a command's call as, and its refusal. */
+  risk: Schema.optionalKey(Schema.String.check(Schema.isMaxLength(20))),
+  refused: Schema.optionalKey(Schema.String.check(Schema.isMaxLength(300))),
+  /** The person the command ran for (a Members id). */
+  person: Schema.optionalKey(Schema.String.check(Schema.isMaxLength(64))),
+  /** How long the module's action ran. */
+  actionMs: Schema.optionalKey(Schema.Finite.check(Schema.isGreaterThanOrEqualTo(0))),
+  /** P10: the action also showed a presentation (its outcome carried one, handed to the Presenter). */
+  presented: Schema.optionalKey(Schema.Boolean)
+})
+export type PhraseTraceInfo = typeof PhraseTraceInfo.Type
+
 export const TraceInfo = Schema.Struct({
   turnId: TurnId,
   mode: TurnSource,
@@ -333,7 +353,12 @@ export const TraceInfo = Schema.Struct({
   /** Protocol 7: who chose the assistant. */
   route: Schema.optionalKey(TraceRoute),
   /** Protocol 7: a snapshot of the latency-relevant configuration at that turn. */
-  config: Schema.optionalKey(TraceConfig)
+  config: Schema.optionalKey(TraceConfig),
+  /**
+   * P7, additive within 11 (docs/PHRASES.md "Traces"): present on the execution trace of a taken utterance (a phrase
+   * command, a host control, the ringing window), which is no conversation turn; an older page ignores the key.
+   */
+  phrase: Schema.optionalKey(PhraseTraceInfo)
 })
 export type TraceInfo = typeof TraceInfo.Type
 

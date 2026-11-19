@@ -163,6 +163,8 @@ export interface VoiceConnection {
   readonly id: string
   readonly deviceId: string | undefined
   readonly send: (message: ServerMessage) => void
+  /** What this connection's own page declared last (its hello, then `device.caps`); P10 sends it only the kinds in it. */
+  readonly declared?: () => DeviceCapabilities | undefined
 }
 
 /** What the hub tells the household push (docs/STORING-DATA.md "Pages"). */
@@ -209,6 +211,11 @@ export interface HubOptions {
    * Stop reaches the announcement being spoken (`stopSpeech`). Absent: none of it.
    */
   readonly notify?: Pick<NotifyEngine, "reconcile" | "press" | "stopSpeech" | "busyAnswer">
+  /**
+   * P7: a device's reply volume when it is not the default (`DeviceControl`), sent as `output.volume` to each of its
+   * voice connections right after its `welcome`. Absent, or `undefined` for the device: nothing is sent.
+   */
+  readonly replyVolume?: (deviceId: string) => number | undefined
   /**
    * P10: the Presenter (docs/PRESENTING.md). The device is reconciled at the same moments as for notifications (a hello
    * once its record is written, a close, a changed declaration); a tick or a button is `present.action`, through the
@@ -306,6 +313,8 @@ interface Client {
    * replaces one that arrived later on another tab.
    */
   capsPending: { capabilities?: { readonly value: DeviceCapabilities; readonly seq: number }; live?: DeviceLiveState } | undefined
+  /** P10: what this connection's own page declared last (its hello, then each `device.caps` as it arrives). */
+  ownCaps?: DeviceCapabilities | undefined
   capsTimer: ReturnType<typeof setTimeout> | undefined
   capsHandledAt: number
   /**
@@ -926,6 +935,7 @@ export const makeSessionHub = (options: HubOptions): SessionHub => {
     // A device of a kind this server does not know is treated like no device (the browser defaults).
     if (message.frontend === "voice" && message.device !== undefined && deviceTypeOf(message.device.kind) !== undefined) {
       client.device = message.device
+      client.ownCaps = message.device.capabilities
     }
     if (message.frontend === "voice") client.sessionKey = client.device?.id ?? message.clientId
     // P5: only `hello` and `device.caps` declare, each with its number of arrival, taken now; the record is written in
@@ -978,6 +988,11 @@ export const makeSessionHub = (options: HubOptions): SessionHub => {
       snapshot: first
     })
     if (client.adminToken !== undefined) sendAdminSnapshot(client)
+    // P7: the device's reply volume when it is not the default (the page set its gain back to the default at welcome).
+    if (client.role === "voice" && client.device !== undefined) {
+      const volume = options.replyVolume?.(client.device.id)
+      if (volume !== undefined) send(client, { type: "output.volume", volume })
+    }
     const firstOfDevice = client.device !== undefined && ![...clients].some((c) => c !== client && c.helloed && !c.closed && c.device?.id === client.device!.id)
     client.helloed = true
     if (client.device !== undefined) deviceChanged()
@@ -986,7 +1001,8 @@ export const makeSessionHub = (options: HubOptions): SessionHub => {
       client.voice = {
         id: client.connection.id,
         deviceId: device?.id,
-        send: (m) => send(client, m)
+        send: (m) => send(client, m),
+        declared: () => client.ownCaps
       }
       if (firstOfDevice) options.household.deviceConnected(device!.id)
       // A device the server already knows starts at once; a new one when its registration is written.
@@ -1373,7 +1389,12 @@ export const makeSessionHub = (options: HubOptions): SessionHub => {
         if (message.capabilities === undefined && message.live === undefined) return
         const pending = client.capsPending ?? {}
         // Numbered on arrival: coalescing below keeps the number (a later declaration on another tab wins).
-        if (message.capabilities !== undefined) pending.capabilities = { value: message.capabilities, seq: arrival }
+        if (message.capabilities !== undefined) {
+          pending.capabilities = { value: message.capabilities, seq: arrival }
+          // P10: this page's own kinds, at once (the device's declaration follows, coalesced).
+          client.ownCaps = message.capabilities
+          options.present?.reconcile(client.device.id)
+        }
         if (message.live !== undefined) pending.live = message.live
         client.capsPending = pending
         if (client.capsTimer !== undefined) return

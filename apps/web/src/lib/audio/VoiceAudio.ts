@@ -166,6 +166,9 @@ const refusedReason = (e: unknown) =>
 type SinkContext = AudioContext & { setSinkId?: (id: string) => Promise<void> }
 type SinkElement = HTMLAudioElement & { setSinkId?: (id: string) => Promise<void> }
 
+/** The gain the page applies for an `output.volume` level: clamped to 0..1. */
+export const replyGain = (volume: number): number => Math.min(1, Math.max(0, volume))
+
 export class VoiceAudio {
   private ctx: AudioContext | undefined
   private mic: MediaStream | undefined
@@ -177,6 +180,13 @@ export class VoiceAudio {
   /** When this session's players failed (`performance.now()`), within `PLAYER_FAILURE_WINDOW_MS`: see `playerFailed`. */
   private playerFailures: Array<number> = []
   private analyser: AnalyserNode | undefined
+  /**
+   * P7: the reply volume (`output.volume`): a gain node after the analyser, so the visualiser's tap sees the reply as
+   * it was made and only what reaches the speaker is scaled. Every sound of the player passes it (replies,
+   * announcements, the page's wake and ring cues). Kept across sessions: a new graph starts at the level in force.
+   */
+  private volume: GainNode | undefined
+  private replyVolume = 1
   private streamDest: MediaStreamAudioDestinationNode | undefined
   private element: SinkElement | undefined
   private outputPath: OutputPath = "direct"
@@ -363,6 +373,9 @@ export class VoiceAudio {
       // tap reports when read (on the main thread); the audio passes through unchanged.
       this.analyser.fftSize = analyserSize(ctx.sampleRate)
       this.analyser.smoothingTimeConstant = 0.5
+      this.volume = ctx.createGain()
+      this.volume.gain.value = this.replyVolume
+      this.analyser.connect(this.volume)
       this.createPlayer(ctx, SharedCounter.available(), ROUTE_REASONS.notIsolated)
       this.routeOutput()
       levels.outAnalyser = this.analyser
@@ -539,15 +552,15 @@ export class VoiceAudio {
 
   private routeOutput() {
     const ctx = this.ctx
-    const analyser = this.analyser
-    if (ctx === undefined || analyser === undefined) return
-    analyser.disconnect()
+    const output = this.volume ?? this.analyser
+    if (ctx === undefined || output === undefined) return
+    output.disconnect()
     if (this.outputPath === "direct") {
-      analyser.connect(ctx.destination)
+      output.connect(ctx.destination)
       if (this.element !== undefined) this.element.srcObject = null
     } else {
       this.streamDest ??= ctx.createMediaStreamDestination()
-      analyser.connect(this.streamDest)
+      output.connect(this.streamDest)
       this.unlockElement()
       const el = this.element!
       el.srcObject = this.streamDest.stream
@@ -796,6 +809,28 @@ export class VoiceAudio {
 
   // ---- Reply playback (messages keep socket order: one port) ----
 
+  /**
+   * P7: the reply output's gain, 0 to 1 (`output.volume`; anything else is clamped, a value that is not a number
+   * ignored). Applied at once with a 30 ms ramp (no click); without a running graph it is kept for the next one.
+   */
+  setReplyVolume(volume: number) {
+    if (!Number.isFinite(volume)) return
+    this.replyVolume = replyGain(volume)
+    const node = this.volume
+    const ctx = this.ctx
+    if (node === undefined || ctx === undefined) return
+    try {
+      node.gain.setTargetAtTime(this.replyVolume, ctx.currentTime, 0.01)
+    } catch {
+      node.gain.value = this.replyVolume
+    }
+  }
+
+  /** The reply output's gain now (tests, diagnostics). */
+  replyGain(): number {
+    return this.replyVolume
+  }
+
   replyStart(turnId: number, sampleRate: number) {
     this.link?.replyStart(turnId, sampleRate)
   }
@@ -886,6 +921,7 @@ export class VoiceAudio {
     this.capture = undefined
     this.player = undefined
     this.analyser = undefined
+    this.volume = undefined
     this.micSource = undefined
     this.streamDest = undefined
     try {

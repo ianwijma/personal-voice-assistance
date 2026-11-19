@@ -133,10 +133,13 @@ import { makeVoiceSessions, type VoiceSessions } from "./VoiceSessions.ts"
 import { makeRoutingService, ROUTING_KEYS } from "./routing.ts"
 import { openServeHousehold } from "./household.ts"
 import { makeHouseholdPush } from "./HouseholdPush.ts"
-import { Devices, hostEvent, makeIssueRegistry, oneLine, People, Privacy, withContextProvider } from "@pva/core"
+import { DeviceControl, Devices, hostEvent, makeIssueRegistry, oneLine, People, phraseLanguageOf, Privacy, SessionControl, withContextProvider } from "@pva/core"
+import { ringingWithoutWake } from "@pva/protocol"
+import { makeReplyVolumes, makeServePhrases } from "./phraseCommands.ts"
 import { openServeScheduler } from "./scheduler.ts"
 import { boundaryChanged, makeDeviceFacts, membersRemoved } from "./deviceFacts.ts"
 import { makeMediaCache } from "./media.ts"
+import type { SafeFetchOptions } from "@pva/net"
 import { effectiveMembersOf, makeMembersGate, makePeopleService, MEMBERS_ENV_REFUSED, MEMBERS_KEY, MEMBERS_SECTION_ID } from "./people.ts"
 import { householdBackupIssues, runMaintenance } from "@pva/store-sqlite"
 import { type KdfParams, openVault, type Vault, VaultPathConfig } from "./Vault.ts"
@@ -254,6 +257,8 @@ export interface ServeOptions {
   readonly minuteMs?: number
   readonly helloTimeoutMs?: number
   readonly pingIntervalMs?: number
+  /** P10, tests: where the image cache's fetches go (a resolver and a connector standing in for the network). */
+  readonly mediaFetch?: Pick<SafeFetchOptions, "resolver" | "connector">
   /** Tests: called before each file step of a settings save (to hold one save while another request comes in). */
   readonly settingsBeforeStep?: (step: SaveStep) => void | Promise<void>
 }
@@ -446,19 +451,25 @@ export const startServe = (options: ServeOptions): Effect.Effect<ServeHandle, Ht
       language: () => notifyLanguageOf(sections.value("HOME_LANGUAGE")),
       log: logInfo
     })
+    // P7: each device's reply volume (`DeviceControl`, `output.volume` to its voice connections; memory only).
+    const replyVolumes = makeReplyVolumes((deviceId, message) => {
+      for (const c of hub?.voiceConnections() ?? []) if (c.deviceId === deviceId) c.send(message)
+    })
     // P10: the Presenter (docs/PRESENTING.md) on the same store, made before the module host it gives `ctx.present` and the
     // gateway's split to. Pages (the hub), the image cache, the gateway and the page boundary are bound once they exist;
     // nothing is shown before a page says hello.
-    const media = yield* makeMediaCache({ dir: join(options.dataDir, "media"), log: logInfo })
+    const media = yield* makeMediaCache({ dir: join(options.dataDir, "media"), log: logInfo, ...(options.mediaFetch !== undefined ? { fetchOptions: options.mediaFetch } : {}) })
     const present = yield* makePresentEngine({
       store: household.store,
+      scheduler,
       devices: () => deviceFacts.devices.list(),
       // One place for what a device can show: its declaration minus its overrides (`devicePresentFrom`).
-      outputs: (d) => deviceFacts.presentOf(d.id, d.kind),
+      outputs: (d, declared) => deviceFacts.presentOf(d.id, d.kind, declared),
       privacy: deviceFacts.privacy,
       outlet: () =>
         hub === undefined ? undefined : {
-          connections: (deviceId) => hub!.voiceConnections().filter((c) => c.deviceId === deviceId).map((c) => ({ id: c.id, send: c.send }))
+          // Each connection is sent only the kinds its own page declared (an older tab beside a newer one gets none).
+          connections: (deviceId) => hub!.voiceConnections().filter((c) => c.deviceId === deviceId).map((c) => ({ id: c.id, send: c.send, kinds: () => c.declared?.()?.present?.kinds }))
         },
       media: () => media,
       issues,
@@ -470,7 +481,23 @@ export const startServe = (options: ServeOptions): Effect.Effect<ServeHandle, Ht
     // Capabilities run for the assistants that switch them on (`moduleDemand`, below; read from startEnabled on).
     const host = yield* makeModuleHost({
       // P5: the core's own services for modules (`host.service`).
-      coreServices: [People.of(people), Privacy.of(deviceFacts.privacy), Devices.of(deviceFacts.devices)],
+      // P7: session and device control (docs/PHRASES.md), late-bound to the voice sessions and the hub.
+      coreServices: [
+        People.of(people),
+        Privacy.of(deviceFacts.privacy),
+        Devices.of(deviceFacts.devices),
+        SessionControl.of({
+          stopReply: (deviceId) => Effect.suspend(() => sessionsRef?.get(deviceId)?.control.stopReply ?? Effect.succeed(false)),
+          cancelPending: (deviceId) => Effect.suspend(() => sessionsRef?.get(deviceId)?.control.cancelPending ?? Effect.succeed(false)),
+          repeatLast: (deviceId) => Effect.suspend(() => sessionsRef?.get(deviceId)?.control.repeatLast ?? Effect.succeed(false)),
+          newConversation: (deviceId) =>
+            Effect.suspend(() => {
+              const session = sessionsRef?.get(deviceId)
+              return session === undefined ? Effect.succeed(undefined) : Effect.map(session.conversation.newConversation(), (info) => info.id)
+            })
+        }),
+        DeviceControl.of(replyVolumes.service)
+      ],
       routeTokens,
       issues,
       scheduler,
@@ -667,15 +694,17 @@ export const startServe = (options: ServeOptions): Effect.Effect<ServeHandle, Ht
      * effective settings; the others always pass), the tools it has not switched off, and their instructions. The
      * whole snapshot when nothing is left out.
      */
-    const modulesFor = (snapshot: ModuleSnapshot, assistant: Assistant) => {
-      const own = snapshot.assistantParts.get(assistant.id) ?? snapshot.parts
-      const parts = own.flatMap((part) => {
+    /** The parts an assistant's turns get: the modules it has on (capabilities), without the tools it switched off. */
+    const partsFor = (snapshot: ModuleSnapshot, assistant: Assistant) =>
+      (snapshot.assistantParts.get(assistant.id) ?? snapshot.parts).flatMap((part) => {
         if (!isCapability(part.moduleId)) return [part]
         const choice = assistant.modules[part.moduleId]
         if (choice === undefined || !choice.on) return []
         if (choice.offTools.length === 0) return [part]
         return [{ ...part, module: withoutOffTools(part.module, choice.offTools) }]
       })
+    const modulesFor = (snapshot: ModuleSnapshot, assistant: Assistant) => {
+      const parts = partsFor(snapshot, assistant)
       /** The modules it has on that run (capabilities; for the turn's configuration snapshot). */
       const modules = parts.reduce((n, p) => (isCapability(p.moduleId) && p.unavailable !== true ? n + 1 : n), 0)
       const same = parts.length === snapshot.parts.length && parts.every((p, i) => p === snapshot.parts[i])
@@ -687,6 +716,24 @@ export const startServe = (options: ServeOptions): Effect.Effect<ServeHandle, Ht
         modules
       }
     }
+
+    // P7: phrase commands (docs/PHRASES.md): each switched-on assistant's set, prepared ahead of use whenever the modules,
+    // an assistant's choices or the language change (a final only reads a ready set); the Health page names what a set
+    // leaves out (after each preparation, and at every check).
+    const servePhrases = yield* makeServePhrases({
+      host,
+      assistants: assistantsNow,
+      partsOf: partsFor,
+      language: () => phraseLanguageOf(sections.value("HOME_LANGUAGE")),
+      notify,
+      ringingAllowed: (deviceId) => ringingWithoutWake(deviceSettingsOf(deviceId).place),
+      room: (deviceId) => deviceFacts.originOf(deviceId).room,
+      volume: replyVolumes.service,
+      log: (line) => runFork(Effect.logInfo(line))
+    })
+    // A settings save may change an assistant's choices or the household's language: prepare again (cheap when nothing changed).
+    const stopPhraseWatch = store.onCommitted(() => servePhrases.changed())
+    yield* Effect.addFinalizer(() => Effect.sync(stopPhraseWatch))
 
     /** The household's ambient facts in every turn's context (`HOME_AMBIENT_FACTS`, read at each turn). */
     const ambientFacts = household.ambient({
@@ -1457,11 +1504,18 @@ export const startServe = (options: ServeOptions): Effect.Effect<ServeHandle, Ht
             // Admin's Diagnostics › Latency grows live (admin connections get no `turn.*`; ADMIN_ONLY).
             hub?.broadcast({ type: "trace", key, ...(device !== undefined ? { deviceId: device.id } : {}), trace })
           },
+          // P7 (E7): a taken utterance's execution trace, in admin's latency list (no turn, no history, no turn.ended event).
+          onPhraseTrace: (trace) => {
+            sessions.addTrace(trace)
+            hub?.broadcast({ type: "trace", key, ...(device !== undefined ? { deviceId: device.id } : {}), trace })
+          },
           minuteMs,
           conversationEnded: (conversationId) =>
             run(household.store.endConversation(conversationId).pipe(Effect.asVoid, Effect.catch((e) => Effect.logWarning(`Conversation data not deleted: ${e.message}`)))),
           ...(reserved !== undefined ? { reservedConversations: reserved } : {}),
           ...(options.stallMs !== undefined ? { stallMs: options.stallMs } : {}),
+          // P7: phrase commands, the host's essential controls and the ringing window.
+          phrases: servePhrases.forDevice(device?.id),
           heard: {
             dir: recordings,
             enabled: () => sections.value("RECORD_HEARD_AUDIO") === true,
@@ -1513,7 +1567,11 @@ export const startServe = (options: ServeOptions): Effect.Effect<ServeHandle, Ht
       catalog,
       fork: run,
       // The household's cheap checks (backup age, directories, the log's size); its quick check is `pnpm start doctor`'s.
-      ...(household.sqlite !== undefined ? { checks: { "household-checks": householdBackupIssues(household.sqlite) } } : {})
+      checks: {
+        // P7: what each assistant's phrase set leaves out (duplicates, modules past the bound).
+        phrases: Effect.sync(() => servePhrases.sets.issues()),
+        ...(household.sqlite !== undefined ? { "household-checks": householdBackupIssues(household.sqlite) } : {})
+      }
     })
     const push = makeHouseholdPush({
       feed: household.feed,
@@ -1533,6 +1591,8 @@ export const startServe = (options: ServeOptions): Effect.Effect<ServeHandle, Ht
     hub = makeSessionHub({
       household: push.hooks,
       notify,
+      // P7: a voice page of a device whose reply volume is not the default is told it after its welcome.
+      replyVolume: replyVolumes.levelOf,
       present,
       onDeviceChange: deviceFacts.changed,
       speakerAllowed: deviceFacts.speakerAllowed,
@@ -1774,8 +1834,8 @@ export const startServe = (options: ServeOptions): Effect.Effect<ServeHandle, Ht
       crossOriginIsolation: options.crossOriginIsolation ?? true,
       hub: hubNow,
       api: (req, res) => (isModuleRoutePath(req.url) ? moduleRouter.handle(req, res) : api(req, res)),
-      // P10: `/media/<hash>`, only for an image a page holds now.
-      media: (req, res) => media.serve(req, res, present.holdsHash),
+      // P10: `/media/<token>`, a page's own address of an image it holds now.
+      media: (req, res) => media.serve(req, res, present.mediaFor),
       ...(options.pingIntervalMs !== undefined ? { pingIntervalMs: options.pingIntervalMs } : {})
     })
 

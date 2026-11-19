@@ -55,7 +55,9 @@
  * Control endpoints (for tests): GET /mock/log (client messages and microphone stats), POST /mock/reset,
  * POST /mock/turn (run the scripted voice turn now), POST /mock/send {"messages": [ServerMessage…]} (broadcast),
  * POST /mock/notify {"title", "ring"?, "deviceId"?, "actions"?, "handlerDown"?} (P9: a notification card, delivered as the
- * server does, again after each hello while open), POST /mock/notify/resolve {"id"},
+ * server does, again after each hello while open), POST /mock/notify/resolve {"id"}, POST /mock/volume {"deviceId",
+ * "direction" | "to"} (P7: the device's reply volume as a spoken "louder"/"quieter" changes it, `output.volume` to its
+ * voice pages now and after each welcome while it is not the default),
  * POST /mock/present {"content", "deviceId"?, "lifetime"?, "seconds"?, "buttons"?, "handler"?, "handlerDown"?} (P10: a
  * presentation shown as the server does: the shared decision and selection, again after each hello while live),
  * POST /mock/present/dismiss {"id"},
@@ -159,7 +161,7 @@ import { createModelPickersMock } from "./modelPickers.ts"
 import { createModuleRoutesMock, DEMO_DEFINITION_ACTIONS, demoHomeAction, demoHomeModule, TokenRefusal } from "./demoHome.ts"
 import { createScheduledJobsMock, MockSchedulerError } from "./scheduledJobs.ts"
 import { DEFAULT_RISK_POLICY, FIXED_REASON, FIXED_RISK_CLASSES, RISK_POLICY_KEYS, riskPageTexts, riskPolicyValueProblem } from "@pva/protocol"
-import { boundaryKey, checkDietList, checkMembersValue, cleanDeviceName, type Condition, decideDelivery, decidePresentation, deviceOutputsFrom, devicePresentFrom, type FieldError, MAX_PINNED_PER_DEVICE, PRESENT_KIND_VERSIONS, type PresentContent, type PresentKindName, selectPresentations, speakerAllowedFrom } from "@pva/protocol"
+import { boundaryKey, changeReplyVolume, checkDietList, checkMembersValue, cleanDeviceName, type Condition, decideDelivery, decidePresentation, type DeviceCapabilities, deviceOutputsFrom, devicePresentFrom, type FieldError, MAX_PINNED_PER_DEVICE, NO_REPLY_VOLUMES, PRESENT_KIND_VERSIONS, type Presentation, presentationProblem, type PresentKindName, presentLifetime, presentWireContent, type ReplyVolumes, selectPresentations, type ShowOptions, showOptionsProblem, speakerAllowedFrom } from "@pva/protocol"
 
 const PORT = Number(process.env.MOCK_PORT ?? 8787)
 const HOST = process.env.MOCK_HOST ?? "127.0.0.1"
@@ -945,6 +947,8 @@ interface Conn {
   testerUntil?: number | undefined
   /** Protocol 6: the device the tester follows; undefined = the most recently active session. */
   testerDevice?: string | undefined
+  /** P10: what this connection's own page declared last (its hello, then `device.caps`): it is sent only those kinds. */
+  ownCaps?: DeviceCapabilities | undefined
   /** Protocol 11: the page's live state (`device.caps.live`). */
   visible?: boolean
   lastInteractionAt?: number
@@ -1500,11 +1504,16 @@ const MOCK_NOTIFY_TEXTS = {
   nl: { cantNow: "Dat kan ik nu niet doen.", done: "Klaar.", region: "Meldingen", startAudio: "Zet het geluid aan om het te horen." }
 } as const
 const mockNotifyTexts = () => (String(valueOf("HOME_LANGUAGE") ?? "").toLowerCase().startsWith("nl") ? MOCK_NOTIFY_TEXTS.nl : MOCK_NOTIFY_TEXTS.en)
+/** The reply volumes, in the server's one state machine (`changeReplyVolume`, `@pva/protocol`): the same steps, cap and drops. */
+let mockVolumes: ReplyVolumes = NO_REPLY_VOLUMES
 const resetState = () => {
+  mockVolumes = NO_REPLY_VOLUMES
   mockNotifications.clear()
   mockHeld.clear()
+  for (const p of mockPresentations.values()) clearTimeout(p.timer)
   mockPresentations.clear()
   mockPresentHeld.clear()
+  mockMediaTokens.clear()
   for (const t of scriptTimers) clearTimeout(t)
   scriptTimers = []
   for (const v of voiceSessions.values()) {
@@ -1591,6 +1600,22 @@ const notificationsAfterWelcome = (c: Conn) => {
   if (c.deviceId === undefined) return reconcileMock(c)
   for (const x of notifyConns(c.deviceId)) reconcileMock(x)
 }
+
+// ---- P7: the reply volume, as the real server keeps it (docs/PHRASES.md "Louder and quieter")
+
+/** After a voice page's welcome: its device's level when it is not the default (the page went back to the default). */
+const volumeAfterWelcome = (c: Conn) => {
+  if (c.frontend !== "voice" || c.deviceId === undefined) return
+  const level = mockVolumes.get(c.deviceId)
+  if (level !== undefined) sendTo(c, { type: "output.volume", volume: level })
+}
+/** One "louder" / "quieter" or a level for a device, as the server changes it: every send of the transition goes out in this step. */
+const changeMockVolume = (deviceId: string, change: "louder" | "quieter" | { readonly to: number }) => {
+  const t = changeReplyVolume(mockVolumes, deviceId, change)
+  mockVolumes = t.volumes
+  for (const send of t.sends) for (const c of notifyConns(send.deviceId)) sendTo(c, { type: "output.volume", volume: send.volume })
+  return t.change
+}
 const resolveMockNotification = (id: string, outcome: string) => {
   const n = mockNotifications.get(id)
   if (n === undefined) return false
@@ -1600,76 +1625,118 @@ const resolveMockNotification = (id: string, outcome: string) => {
 }
 // ---- P10: presentations, as the real server shows them (docs/PRESENTING.md)
 
-/** Live presentations: the content as sent, its device (absent: every device), lifetime, end, and whether its handler is down. */
+/** Live presentations: what the module showed (checked by the shared checks), its device (absent: every device), its lifetime. */
 const mockPresentations = new Map<string, {
-  content: PresentContent
+  presentation: Presentation
   readonly deviceId?: string
   readonly lifetime: "transient" | "pinned"
   readonly shownAt: number
   readonly endsAt: number
-  readonly buttons: ReadonlyArray<{ readonly id: string; readonly label: string }>
-  readonly handler: boolean
   readonly handlerDown: boolean
+  readonly timer: ReturnType<typeof setTimeout>
 }>()
-/** What each voice connection holds of them (fingerprints), per connection as the server keeps it; gone with the connection. */
-const mockPresentHeld = new Map<string, Map<string, string>>()
+/** What each voice connection holds of them, per connection as the server keeps it (with its image addresses); gone with it. */
+const mockPresentHeld = new Map<string, Map<string, { readonly fp: string; readonly token: string | undefined }>>()
+/** Image addresses: token → the connection and presentation it was made for (as the server's `mediaFor`). */
+const mockMediaTokens = new Map<string, { readonly connId: string; readonly id: string }>()
 let mockPresentSeq = 0
 const mockPresentIds = new Set<string>()
+/** The mock's one image (a 1 × 1 PNG): every image presentation shows it, built in, bounded. */
+const MOCK_IMAGE = Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==", "base64")
 /** The Presenter's own words, in the saved household language (as `PresentTexts` in packages/core: the test compares the two). */
 const MOCK_PRESENT_TEXTS = {
   en: { region: "On screen", loading: "Loading the image…", imageMissing: "The image is not available.", timerDone: "Done", credit: "Image:", high: "High", low: "Low", done: "Done.", cantNow: "I can't do that right now." },
   nl: { region: "Op het scherm", loading: "De afbeelding wordt geladen…", imageMissing: "De afbeelding is niet beschikbaar.", timerDone: "Klaar", credit: "Afbeelding:", high: "Hoog", low: "Laag", done: "Klaar.", cantNow: "Dat kan ik nu niet doen." }
 } as const
 const mockPresentTexts = () => (String(valueOf("HOME_LANGUAGE") ?? "").toLowerCase().startsWith("nl") ? MOCK_PRESENT_TEXTS.nl : MOCK_PRESENT_TEXTS.en)
-/** The shared decision for one presentation on a device now (the mock has no personal content). */
-const decidePresentMock = (deviceId: string, kind: PresentKindName) => {
-  const outputs = devicePresentFrom(assistantsMock.deviceFields(deviceId).settings, devices.get(deviceId)?.declared?.capabilities)
+/** The shared decision for one presentation for one connection now, with the kinds its own page declared (as the server). */
+const decidePresentMock = (c: Conn, kind: PresentKindName) => {
+  const record = devices.get(c.deviceId!)?.declared?.capabilities
+  const caps = record === undefined ? undefined : { ...record, present: { kinds: c.ownCaps?.present?.kinds ?? {} } }
+  const outputs = devicePresentFrom(assistantsMock.deviceFields(c.deviceId!).settings, caps)
   return decidePresentation({ kind, personal: false, mayReveal: true, device: { connected: true, ...outputs } })
 }
+/** A presentation's end, as the server's: gone at its end, its pages reconciled. */
+const endMockPresentation = (id: string) => {
+  const p = mockPresentations.get(id)
+  if (p === undefined) return false
+  clearTimeout(p.timer)
+  mockPresentations.delete(id)
+  reconcilePresentEverywhere()
+  return true
+}
+const pruneEndedMock = () => {
+  const now = Date.now()
+  for (const [id, p] of [...mockPresentations]) if (p.endsAt <= now) endMockPresentation(id)
+}
+const newMockToken = () => randomBytes(24).toString("base64url")
 /**
- * The server's reconciliation for one connection: what applies to its device now, decided with the shared function,
- * what the device shows of it (`selectPresentations`), and the connection made to hold exactly that.
+ * The server's reconciliation for one connection: what applies to its device now, decided with the shared function and
+ * that connection's own kinds, what it shows of it (`selectPresentations`), withdrawals first.
  */
 const reconcilePresentMock = (c: Conn) => {
   if (c.frontend !== "voice" || c.deviceId === undefined || !c.welcomed || !conns.has(c)) return
   const deviceId = c.deviceId
-  const held = mockPresentHeld.get(c.id) ?? new Map<string, string>()
+  const held = mockPresentHeld.get(c.id) ?? new Map<string, { readonly fp: string; readonly token: string | undefined }>()
   mockPresentHeld.set(c.id, held)
   const now = Date.now()
   const chosen = selectPresentations([...mockPresentations].filter(([, p]) => p.endsAt > now && (p.deviceId === undefined || p.deviceId === deviceId)).map(([id, p]) => ({
     id,
     lifetime: p.lifetime,
     shownAt: p.shownAt,
-    decision: decidePresentMock(deviceId, p.content.kind)
+    decision: decidePresentMock(c, p.presentation.kind)
   })))
   const want = new Set(chosen.map((x) => x.id))
-  for (const id of [...held.keys()]) {
+  for (const [id, h] of [...held]) {
     if (want.has(id)) continue
     held.delete(id)
+    if (h.token !== undefined) mockMediaTokens.delete(h.token)
     sendTo(c, { type: "present.dismiss", id })
   }
   const texts = mockPresentTexts()
   for (const x of chosen) {
     const p = mockPresentations.get(x.id)!
+    const before = held.get(x.id)
+    const token = p.presentation.kind === "image" ? before?.token ?? newMockToken() : undefined
+    if (token !== undefined) mockMediaTokens.set(token, { connId: c.id, id: x.id })
     const wire = {
       id: x.id,
       lifetime: p.lifetime,
       shownAt: p.shownAt,
-      v: PRESENT_KIND_VERSIONS[p.content.kind],
-      content: p.content,
-      buttons: p.buttons,
-      interactive: x.decision.interactive && p.handler,
+      v: PRESENT_KIND_VERSIONS[p.presentation.kind],
+      content: presentWireContent(p.presentation, token === undefined ? undefined : { state: "ready", token }),
+      buttons: (p.presentation.buttons ?? []).map((b) => ({ id: b.id, label: b.label })),
+      interactive: x.decision.interactive && p.presentation.handler !== undefined,
       texts: { region: texts.region, loading: texts.loading, imageMissing: texts.imageMissing, timerDone: texts.timerDone, credit: texts.credit, high: texts.high, low: texts.low }
     }
     const fp = JSON.stringify(wire)
-    const before = held.get(x.id)
-    if (before === fp) continue
+    if (before?.fp === fp) continue
     sendTo(c, { type: before === undefined ? "present.show" : "present.update", presentation: { ...wire, serverNow: Date.now() } })
-    held.set(x.id, fp)
+    held.set(x.id, { fp, token })
   }
 }
 const reconcilePresentEverywhere = () => {
   for (const c of notifyConns(undefined)) reconcilePresentMock(c)
+}
+/** `GET /media/<token>`, as the server's: only a token made for an open connection that holds that image; the same headers. */
+const serveMockMedia = (path: string, res: ServerResponse) => {
+  const t = mockMediaTokens.get(path.slice("/media/".length))
+  const c = t === undefined ? undefined : [...conns].find((x) => x.id === t.connId)
+  if (t === undefined || c === undefined || mockPresentHeld.get(c.id)?.has(t.id) !== true) {
+    res.writeHead(404, { "Content-Type": "text/plain; charset=utf-8", "X-Content-Type-Options": "nosniff", "Cache-Control": "no-store" })
+    return res.end("Not found")
+  }
+  res.writeHead(200, {
+    "Content-Type": "image/png",
+    "Content-Length": String(MOCK_IMAGE.length),
+    "X-Content-Type-Options": "nosniff",
+    "Content-Security-Policy": "default-src 'none'; sandbox",
+    "Content-Disposition": "inline; filename=\"image.png\"",
+    "Cross-Origin-Resource-Policy": "same-origin",
+    "Referrer-Policy": "no-referrer",
+    "Cache-Control": "private, no-store"
+  })
+  return res.end(MOCK_IMAGE)
 }
 
 /** Messages that carry admin data: only admin connections get them (protocol 5). */
@@ -2585,6 +2652,8 @@ const onClientMessage = (c: Conn, m: ClientMessage) => {
         if (removed) endChangedSessions(boundariesBefore, true)
       }
       result(c, m.requestId, true)
+      // P10, as the server: every saved settings change decides every device's presentations again (the language too).
+      reconcilePresentEverywhere()
       const needsReload = Object.keys({ ...patch.values, ...patch.secrets }).some((k) => section.form.fields.find((f) => f.key === k)?.apply === "reload")
       const path = `${section.group ?? "general"}/${section.page?.id ?? section.id}`
       if (needsReload && (!engine.reloadPending || !(engine.reloadPendingFor ?? []).includes(path))) {
@@ -2864,27 +2933,29 @@ const onClientMessage = (c: Conn, m: ClientMessage) => {
       return sendTo(c, { type: "result", requestId: m.requestId, ok: true, say: texts.done })
     }
     case "present.action": {
-      // P10, as the real server: only from a connection that holds it, while the decision lets it be pressed there; a tick
-      // of an item it has (the mock acts as the module: it ticks the item and shows the change); a button it has; its
-      // handler down ("handlerDown": true) answers "I can't do that right now".
+      // P10, as the real server: only from a connection that holds it, while the decision (with its own kinds) lets it be
+      // pressed there; a tick of an item it has (the mock acts as the module: it ticks the item and shows the change); a
+      // button it has; its handler down ("handlerDown": true) answers "I can't do that right now".
       if (c.frontend !== "voice" || c.deviceId === undefined) return result(c, m.requestId, false, { code: "bad_message", message: "A presentation is answered from a voice page of its device" })
+      pruneEndedMock()
       const p = mockPresentations.get(m.id)
       const texts = mockPresentTexts()
       const cant = (code: "bad_message" | "not_running") => sendTo(c, { type: "result", requestId: m.requestId, ok: false, error: { code, message: texts.cantNow }, say: texts.cantNow })
-      if (mockPresentHeld.get(c.id)?.has(m.id) !== true || p === undefined || p.endsAt <= Date.now()) return cant("bad_message")
-      const d = decidePresentMock(c.deviceId, p.content.kind)
-      if (!d.show || !d.interactive || !p.handler) {
-        for (const x of notifyConns(c.deviceId)) reconcilePresentMock(x)
+      if (mockPresentHeld.get(c.id)?.has(m.id) !== true || p === undefined) return cant("bad_message")
+      const d = decidePresentMock(c, p.presentation.kind)
+      if (!d.show || !d.interactive || p.presentation.handler === undefined) {
+        reconcilePresentMock(c)
         return cant("bad_message")
       }
       if (m.action === "tick") {
-        if (p.content.kind !== "list" || p.content.style !== "checklist" || m.done === undefined || !p.content.items.some((i) => i.id === m.item)) return cant("bad_message")
+        const list = p.presentation
+        if (list.kind !== "list" || list.style !== "checklist" || m.done === undefined || !list.items.some((i) => i.id === m.item)) return cant("bad_message")
         if (p.handlerDown) return cant("not_running")
-        p.content = { ...p.content, items: p.content.items.map((i) => (i.id === m.item ? { ...i, done: m.done! } : i)) }
+        p.presentation = { ...list, items: list.items.map((i) => (i.id === m.item ? { ...i, done: m.done! } : i)) }
         reconcilePresentEverywhere()
         return sendTo(c, { type: "result", requestId: m.requestId, ok: true, say: texts.done })
       }
-      if (!p.buttons.some((b) => b.id === m.action)) return cant("bad_message")
+      if (!(p.presentation.buttons ?? []).some((b) => b.id === m.action)) return cant("bad_message")
       if (p.handlerDown) return cant("not_running")
       return sendTo(c, { type: "result", requestId: m.requestId, ok: true, say: texts.done })
     }
@@ -2893,6 +2964,10 @@ const onClientMessage = (c: Conn, m: ClientMessage) => {
       if (c.frontend !== "voice" || c.deviceId === undefined) return
       const record = devices.get(c.deviceId)
       if (m.capabilities !== undefined && record !== undefined) devices.set(c.deviceId, { ...record, declared: { capabilities: m.capabilities, seenAt: Date.now() } })
+      if (m.capabilities !== undefined) {
+        c.ownCaps = m.capabilities
+        for (const x of notifyConns(c.deviceId)) reconcilePresentMock(x)
+      }
       if (m.live !== undefined) {
         c.visible = m.live.visible
         if (m.live.lastInteractionAt !== undefined) c.lastInteractionAt = m.live.lastInteractionAt
@@ -2902,7 +2977,6 @@ const onClientMessage = (c: Conn, m: ClientMessage) => {
       if (m.capabilities !== undefined) {
         pushSetups()
         for (const x of notifyConns(c.deviceId)) reconcileMock(x)
-        for (const x of notifyConns(c.deviceId)) reconcilePresentMock(x)
       }
       return
     }
@@ -2959,6 +3033,7 @@ wss.on("connection", (ws: WebSocket) => {
           ? { id: m.device.id, kind: m.device.kind, name: cleanDeviceName(m.device.name), firstSeen: now, lastSeen: now, ...declared }
           : { ...known, lastSeen: now, ...declared })
         c.deviceId = m.device.id
+        c.ownCaps = m.device.capabilities
       }
       c.welcomed = true
       const v = sessionFor(c)
@@ -2995,6 +3070,7 @@ wss.on("connection", (ws: WebSocket) => {
         }
       })
       if (isAdminConn(c)) sendAdminSnapshot(c)
+      volumeAfterWelcome(c)
       notificationsAfterWelcome(c)
       // P10: every page of the device, as the server (a hello may have changed what it declared).
       if (c.deviceId === undefined) reconcilePresentMock(c)
@@ -3011,6 +3087,7 @@ wss.on("connection", (ws: WebSocket) => {
   ws.on("close", () => {
     conns.delete(c)
     mockHeld.delete(c.id)
+    for (const h of mockPresentHeld.get(c.id)?.values() ?? []) if (h.token !== undefined) mockMediaTokens.delete(h.token)
     mockPresentHeld.delete(c.id)
     log(c.id, "closed")
     if (c.deviceId !== undefined) for (const x of notifyConns(c.deviceId)) reconcilePresentMock(x)
@@ -3434,6 +3511,7 @@ const http = createServer((req, res) => {
         connections: conns.size
       })
     }
+    if (url.pathname.startsWith("/media/") && (req.method === "GET" || req.method === "HEAD")) return serveMockMedia(url.pathname, res)
     if (req.method !== "POST") return json(res, 404, { error: "not found" })
     const body = await readBody(req)
     const payload = body === "" ? {} : (JSON.parse(body) as Record<string, unknown>)
@@ -3562,6 +3640,16 @@ const http = createServer((req, res) => {
         for (const x of v !== undefined ? [v] : [...voiceSessions.values()]) setState(x, state)
         return json(res, 200, { ok: true })
       }
+      case "/mock/volume": {
+        // P7: {"deviceId", "direction": "louder" | "quieter"} or {"deviceId", "to": 0..1}: the device's reply volume,
+        // as the server changes it for a spoken "louder" or "quieter" (the mock has no recogniser), sent to its voice pages.
+        if (typeof payload.deviceId !== "string") return json(res, 400, { error: "deviceId is required" })
+        const change = payload.direction === "louder" || payload.direction === "quieter"
+          ? payload.direction
+          : typeof payload.to === "number" ? { to: payload.to } : undefined
+        if (change === undefined) return json(res, 400, { error: "direction (louder, quieter) or to (0..1) is required" })
+        return json(res, 200, changeMockVolume(payload.deviceId, change))
+      }
       case "/mock/notify": {
         // P9: a notification delivered as the server would: {"id"?, "title", "text"?, "ring"?, "silent"?, "deviceId"?
         // (absent: everywhere), "actions"? [{ id, label }], "handlerDown"?}. Sent to the voice pages of its device now
@@ -3587,45 +3675,41 @@ const http = createServer((req, res) => {
         return json(res, 200, { id })
       }
       case "/mock/present": {
-        // P10: a presentation shown as the server would: {"id"?, "content": PresentContent, "deviceId"? (absent: every
-        // device), "lifetime"? ("transient" | "pinned"), "seconds"? (how long it lasts; default 30, pinned 4 hours),
-        // "buttons"? [{ id, label }], "handler"? (ticks and buttons pressable; default true), "handlerDown"?}. A transient
-        // one ends the earlier transient ones of the same devices, as the server does; an id is never used twice.
+        // P10: a presentation shown as the server would: {"id"?, "presentation": what a module passes to show, "options"?
+        // { lifetime?, expiresInMs?, key? }, "deviceId"? (absent: every device), "handlerDown"?}. Checked by the shared
+        // checks before anything changes (a refused one consumes no id and replaces nothing); its lifetime and end by the
+        // shared helper; at its end it is removed. A transient one ends the earlier transient ones of the same devices;
+        // an id is never used twice; an image shows the mock's built-in picture, through `/media/<token>`.
+        pruneEndedMock()
+        const now = Date.now()
+        const presentation = payload.presentation as Presentation | undefined
+        const options = payload.options as ShowOptions | undefined
+        const problem = presentationProblem(presentation, now) ?? showOptionsProblem(options, (presentation as { kind?: PresentKindName } | undefined)?.kind)
+        if (problem !== undefined) return json(res, 400, { error: problem })
         if (typeof payload.id === "string" && mockPresentIds.has(payload.id)) return json(res, 409, { error: "that id was used already" })
+        const deviceId = typeof payload.deviceId === "string" ? payload.deviceId : undefined
+        const { lifetime, expiresAt } = presentLifetime(presentation!, options, now)
+        const overlaps = (other: { readonly deviceId?: string }) => deviceId === undefined || other.deviceId === undefined || other.deviceId === deviceId
+        if (lifetime === "pinned" && [...mockPresentations.values()].filter((p) => p.lifetime === "pinned" && overlaps(p)).length >= MAX_PINNED_PER_DEVICE) return json(res, 409, { error: "limit" })
         let id = typeof payload.id === "string" ? payload.id : `p-mock-${++mockPresentSeq}`
         while (typeof payload.id !== "string" && mockPresentIds.has(id)) id = `p-mock-${++mockPresentSeq}`
-        const content = payload.content as PresentContent | undefined
-        if (content === undefined || typeof content !== "object" || !(content.kind in PRESENT_KIND_VERSIONS)) return json(res, 400, { error: "content?" })
-        const lifetime = payload.lifetime === "pinned" ? "pinned" : "transient"
-        const deviceId = typeof payload.deviceId === "string" ? payload.deviceId : undefined
-        if (lifetime === "pinned") {
-          const pinnedThere = [...mockPresentations.values()].filter((p) => p.lifetime === "pinned" && (deviceId === undefined || p.deviceId === undefined || p.deviceId === deviceId)).length
-          if (pinnedThere >= MAX_PINNED_PER_DEVICE) return json(res, 409, { error: "limit" })
-        }
         mockPresentIds.add(id)
-        if (lifetime === "transient") {
-          for (const [other, p] of mockPresentations) if (p.lifetime === "transient" && (deviceId === undefined || p.deviceId === undefined || p.deviceId === deviceId)) mockPresentations.delete(other)
-        }
-        const seconds = typeof payload.seconds === "number" && payload.seconds > 0 ? payload.seconds : lifetime === "pinned" ? 4 * 3600 : 30
+        if (lifetime === "transient") for (const [other, p] of [...mockPresentations]) if (p.lifetime === "transient" && overlaps(p)) endMockPresentation(other)
         mockPresentations.set(id, {
-          content,
+          presentation: presentation!,
           ...(deviceId !== undefined ? { deviceId } : {}),
           lifetime,
-          shownAt: Date.now(),
-          endsAt: Date.now() + seconds * 1000,
-          buttons: Array.isArray(payload.buttons) ? (payload.buttons as Array<{ id: string; label: string }>).slice(0, 3) : [],
-          handler: payload.handler !== false,
-          handlerDown: payload.handlerDown === true
+          shownAt: now,
+          endsAt: expiresAt,
+          handlerDown: payload.handlerDown === true,
+          timer: setTimeout(() => endMockPresentation(id), Math.max(0, expiresAt - now))
         })
-        after(seconds * 1000 + 50, reconcilePresentEverywhere)
         reconcilePresentEverywhere()
-        return json(res, 200, { id })
+        return json(res, 200, { id, lifetime, expiresAt })
       }
       case "/mock/present/dismiss": {
         const id = typeof payload.id === "string" ? payload.id : ""
-        const gone = mockPresentations.delete(id)
-        reconcilePresentEverywhere()
-        return json(res, 200, { dismissed: gone })
+        return json(res, 200, { dismissed: endMockPresentation(id) })
       }
       case "/mock/notify/held": {
         // The bookkeeping (tests): how many connections the mock keeps what they hold for, and how many are open.

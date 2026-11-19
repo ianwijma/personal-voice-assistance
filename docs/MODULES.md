@@ -5,13 +5,13 @@ for their module and their module's research document (`docs/research/modules/<n
 what a module is, the rules the preparation stack (P1 to P6) settled, and how to test a module so that it keeps them.
 Where this page and a research document disagree, the plan and this page win.
 
-> **Wave A: what does not exist yet.** You are writing on the scaffold (P11), before P7. **Phrase commands do not
-> exist.** Notifications, ringing and a module's own speech (`ctx.notify`, `ctx.speech`) exist in a first version since
-> P9 (§16, [NOTIFICATIONS.md](NOTIFICATIONS.md)), and presentations (a card, a list with ticks, a timer, an image, the
-> weather: `ctx.present`, or `{ forModel, present }` from a tool) since P10 (§16, [PRESENTING.md](PRESENTING.md)).
-> Where your row in the plan's §5.1 names a phrase command, that part waits for wave B: build the rest, and list the part
-> under "Left out" on your page and in your pull request. A presentation your first version names is one small PR after
-> yours, unless your PR is written on top of P10. Also later, for everyone: connections
+> **Wave A: what does not exist yet.** You are writing on the scaffold (P11). Notifications, ringing and a module's own
+> speech (`ctx.notify`, `ctx.speech`) exist in a first version since P9 (§16, [NOTIFICATIONS.md](NOTIFICATIONS.md));
+> phrase commands after the wake phrase, the host's essential controls and the ringing window since P7 (§16 "Phrase
+> commands", [PHRASES.md](PHRASES.md)); and presentations (a card, a list with ticks, a timer, an image, the weather:
+> `ctx.present`, or `{ forModel, present }` from a tool) since P10 (§16, [PRESENTING.md](PRESENTING.md)). A
+> presentation your first version names is one small PR after yours, unless your PR is written on top of P10. Not yet,
+> for everyone: connections
 > and OAuth, CalDAV, an MCP client, and any outgoing HTTP but `GET` and `HEAD` (§12). The plan's "Order from here" (§4)
 > has the waves.
 
@@ -973,10 +973,12 @@ rely on, with every bound and id.
 | `Lists` | service: the household's shopping list | lists | kitchen | `lists.ts` |
 | `Timers` | service: start a timer | timers (wave B) | routines; kitchen later | `timers.ts` |
 | `HomeAssistant` | service (a transport) | home-assistant (smart-home) | music (wave B), presence | `homeAssistant.ts` |
-| `Playback` | service: pause, volume | music (wave B) | the host's "stop" and volume (P7) | `playback.ts` |
+| `Playback` | service: pause, volume | music (wave B) | the host's "stop" (P7; volume later) | `playback.ts` (defined in `@pva/core` since P7, re-exported) |
 | `BriefingSections` | contribution | weather, bin-day, calendar, news; reminders later | briefing | `briefing.ts` |
 
-The core's own are `People`, `Privacy`, `Devices` in `@pva/core` (later `SessionControl`, `DeviceControl`). The
+The core's own are `People`, `Privacy`, `Devices`, and since P7 `SessionControl` (stop the reply, cancel what is pending,
+repeat the last reply, a new conversation) and `DeviceControl` (the reply volume), in `@pva/core` ([PHRASES.md](PHRASES.md)
+"Session and device control"); each call names the device it acts on (a tool passes its turn's `deviceId`). The
 calendar module keeps its own provider interface (ICS) inside its package: no other module provides a calendar in
 this wave.
 
@@ -1351,8 +1353,8 @@ module's own socket ([NOTIFICATIONS.md](NOTIFICATIONS.md) has the calls, the bou
   as the press (its device is the origin of what it sends; a job it schedules needs `origin: { deviceId }`), answers
   `{ say?, keepOpen? }`, and **is idempotent by notification id**: after a store failure it may run again for the same
   notification.
-- **`ctx.speech.say(target, text, { cue? })`**: one line on a device, a room's devices or everywhere, after whatever is
-  being said there. Inside a turn, never wait for its `done` (it fails `in-turn`); return the spoken answer as the
+- **`ctx.speech.say(target, text, { cue? })`**: one line on a device, a room's devices (`{ room, except? }`: all but one
+  device) or everywhere, after whatever is being said there; an empty text with `cue: true` is the chime alone. Inside a turn, never wait for its `done` (it fails `in-turn`); return the spoken answer as the
   tool's result as before.
 - `ctx.notify.dnd` reads and sets do not disturb for the house. Nothing may send above `ring`.
 
@@ -1455,9 +1457,10 @@ What a module shows on a device's screen goes through the Presenter, never a mod
 ([PRESENTING.md](PRESENTING.md) has the kinds, their bounds, the decision and what is left out):
 
 - **From a tool or an action**, return `{ forModel, present, show? }`: the model gets `forModel` with a note of what the
-  server did ("Shown on "Kitchen display".", or "Not shown: … has no display; say it instead."), and the presentation
-  goes to the device the call came from in one enqueue (nothing else on the turn's path). An action returns
-  `{ say, present }`. A presentation that is not valid or passes a bound is not shown and the note says why.
+  server decided ("Showing on "Kitchen display".", or "Not showing it: … has no display. Say this instead: <your
+  `spoken`>"), and the presentation goes to the device the call came from in one enqueue (nothing else on the turn's
+  path); once accepted it is written, retried if the store refuses, until it is or no longer applies. An action returns
+  `{ say, present }`. A presentation that is not valid or passes a bound is not accepted and the note says why.
 - **From other code** (a job, a press handler), `ctx.present.show(target, presentation, options?)` answers a handle
   with `update` and `dismiss` (they die with `ModuleStopped` once the part has closed); `target` is `"origin"`, a
   `{ device }` or a `{ room }`.
@@ -1469,8 +1472,11 @@ What a module shows on a device's screen goes through the Presenter, never a mod
   A transient one goes when the part that made it stops; a pinned one is stored and stays.
 - **Ticks and buttons reach a press handler registered in `shared`** with `ctx.present.handle(name, { run })`, like
   notification action handlers: claimed first (one press at a time), as the press (its device is the origin), within
-  5 s; while your module is down they answer "I can't do that right now". The handler shows the change; the press
-  itself changes nothing.
+  5 s; while your module is down they answer "I can't do that right now". A press is not a tool call, but the risk
+  policy decides it (§4: the handler's `risk`, absent `change`; a refusal answers with the policy's sentence and the
+  handler does not run; what the handler calls through the gateway is decided there too), and what the handler committed before
+  a failure or its time limit stays. The handler shows the change; the press itself changes nothing. A handle acts only
+  on its own show: after the same key is shown again, its `update` answers `undefined` and its `dismiss` `false`.
 
 <!-- region: packages/module-contracts/test/kit/presentExample.test.ts#present-module -->
 ```ts
@@ -1549,7 +1555,7 @@ Its test, through the kit's `present` handles (what each page holds, a press as 
 const kit = yield* startTestModule(errandsModule)
 const shown = yield* kit.tool("errands_show", {}, { device: "kitchen-display" })
 // The model gets what the tool returned for it, and the note of what the server did.
-assert.strictEqual(shown.content, "{\"open\":[\"Bread\",\"Stamps\"]}\n[Screen: Shown on \"Kitchen display\".]")
+assert.strictEqual(shown.content, "{\"open\":[\"Bread\",\"Stamps\"]}\n[Screen: Showing on \"Kitchen display\".]")
 yield* kit.present.settle
 const [list] = kit.present.shown("kitchen-display")
 assert.strictEqual(list?.content.kind, "list")
@@ -1574,6 +1580,83 @@ tab, line feed, carriage return, backspace and form feed. Where a value must be 
 route's field), check that separately: `isLine(text, n)` from `@pva/module-contracts`, the core's own one-line rule
 (`NOT_ONE_LINE`: no control character, C0, DEL or C1, no line or paragraph separator, no bidirectional control) with a
 bound and no lone surrogates, as a filter on the schema (the reference module's `pinboard_pin` text) or in code.
+
+### Phrase commands (P7)
+
+An action can be said **without the language model**: give it `phrases` per language, words and `{param}` slots
+([PHRASES.md](PHRASES.md) has the rules, the bounds and what is left out). After the wake phrase (or in a follow-up
+window, or on a device whose assistant answers without a phrase), an utterance that is one of the phrases of the
+household's language runs the action through the gateway as a `phrase` turn of that device, and its `say` is spoken as
+a canned reply: the utterance never becomes a turn and nothing of it enters the history. Words are matched exactly (case,
+accents and punctuation aside); a slot is a number, a duration, a fixed choice (at most 32 options and 96 names of at most 40 characters) or text, read from the
+characters said by its parameter's own parser, and one that does not read means no match (a parameter whose options
+come from a callback cannot be a slot: take it as text and resolve it in `run`). A parameter the phrase leaves out gets
+its default, as on every path. The longest phrase wins. The host's essential controls ("stop", "never mind", "repeat", "louder", "quieter", with their
+variants, in both languages) are reserved: a phrase of yours that is one of them refuses your module's start, like any
+phrase outside the bounds (8 a language, 8 words, 2 slots with a word between them, every required parameter a slot).
+Two modules with the same phrase for one assistant are both left out for it and named on the Health page.
+
+<!-- region: packages/module-contracts/test/kit/phraseExample.test.ts#phrase-module -->
+```ts
+const lampTexts = defineTexts({
+  en: { on: "The {room} lamp is on.", off: "The {room} lamp is off." },
+  nl: { on: "De lamp in de {room} is aan.", off: "De lamp in de {room} is uit." }
+})
+const rooms = [{ value: "kitchen", label: "kitchen", aliases: ["keuken"] }, { value: "hall", label: "hall", aliases: ["gang"] }]
+
+export const lampModule = defineModule({
+  apiVersion: 2,
+  id: "lamp",
+  name: "Lamp",
+  description: "Switches a room's lamp.",
+  enabledByDefault: false,
+  start: (ctx) =>
+    Effect.succeed({
+      actions: [defineAction({
+        id: "switch",
+        label: "Switch a lamp",
+        description: "Switch the lamp in a room on or off.",
+        examples: ["kitchen lamp on", "lamp uit in de keuken"],
+        params: {
+          // A slot reads a fixed choice (at most 32 options, prepared when the set is built), a number, a duration or text;
+          // never a list the module fills while it runs (take such a name as text and resolve it in `run`).
+          room: Param.choice({ label: "Room", options: rooms }),
+          to: Param.choice({ label: "On or off", options: [{ value: "on", label: "on", aliases: ["aan"] }, { value: "off", label: "off", aliases: ["uit"] }] })
+        },
+        // Said after the wake phrase (or in a follow-up window), these run the action with no model call. Words are
+        // matched exactly; each slot is read by its parameter's parser (a room by value, name or alias, on/off by label).
+        phrases: { en: ["{room} lamp {to}", "turn the {room} lamp {to}"], nl: ["lamp {to} in de {room}"] },
+        risk: "change",
+        run: ({ room, to }) =>
+          Effect.succeed({ say: say(lampTexts, homeLanguage(ctx.host.view()), to, { room: rooms.find((r) => r.value === room)?.label ?? room }) })
+      })]
+    })
+})
+```
+
+Its test, through the kit's `phrases` handle (the real decision, matcher and gateway):
+
+<!-- region: packages/module-contracts/test/kit/phraseExample.test.ts#phrase-test -->
+```ts
+const kit = yield* startTestModule(lampModule)
+// As the recogniser's final after "hey Jeff": the kit decides as serve mode does, and runs it through the gateway.
+const said = yield* kit.phrases.say("Turn the kitchen lamp on.", { device: "kitchen-display" })
+assert.isTrue(said.taken)
+assert.deepStrictEqual(kit.phrases.spoken.map((s) => s.text), ["The kitchen lamp is on."])
+// Words that are not one of its phrases are not taken: they go on to the assistant as a turn.
+assert.deepStrictEqual(yield* kit.phrases.say("is the kitchen lamp on?"), { taken: false })
+// The host's controls are there for every assistant, whatever modules it has.
+const louder = yield* kit.phrases.say("louder")
+assert.isTrue(louder.taken && louder.by === "control")
+```
+
+- **Keep the answer short** (300 characters at most are spoken) and return within 5 s; start anything longer in `shared`.
+- **Over a reply**: a phrase said while a reply plays cuts it off; after your answer the reply is said again, unless the
+  action is declared `endsReply: true`.
+- **Ringing**: while one of your notifications rings, its buttons' labels are accepted without the wake phrase (the
+  ringing window): label a button with what people will say ("Snooze").
+- **While your module is down** its phrases are in nobody's set: they go on to the assistant as before. Withdrawn
+  between the decision and the run: "I can't do that right now.", and nothing ran.
 
 ## 17. Testing: the kit and checkModule
 
@@ -1603,6 +1686,7 @@ values), `startAt`, `started`. It returns handles:
 | `info()`, `issues()`, `checkHealth`, `toolNames(as?)` | the admin page's view of it, its Health issues (health run now), the tools the turn's model is sent: as serve mode offers them, without the tools and action tools the assistant switched off and those the risk policy refuses |
 | `riskPolicy()`, `setRiskPolicy(p)`, `riskDecisions()` | P8: the household's risk policy now (start with `household.risk`), a save of another (through serve mode's decoder: `money` and `security` stay refused; it applies to the next call and list), every decision so far on every path (§4) |
 | `expectNoSecrets(...values)` | fails when the value of a secret given to the kit is in any string of the `values` you pass (tool results, action outcomes, spoken lines, **the rows your test read**), decoded: every key and string, and a string that is JSON parsed and walked too, so an escaped secret is found; it also looks at every event and the admin page. It reads no collection itself: pass it the rows your module wrote |
+| `phrases` | P7: `say(text, { device, assistant, wake?, interrupting?, interruptedBy?, cancelled? })` as the recogniser's final after the wake phrase (or without it, where only the ringing window can take it), `decide` / `run` (Effects: a test may change something between them), `spoken`, `answered`, `traces`, `replied`, `volume`, `volumeSends`, `commandsFor` (an Effect: the set once prepared), `sessionCalls`; the module also gets the kit's `SessionControl` and `DeviceControl` ([PHRASES.md](PHRASES.md) "Testing") |
 | `notify` | P9: the real notification service: `all`, `messages` (what each page was sent), `decisions` (where it would go, and why not), `press(id, action, { device })`, `announced`, `replying(device, on)`, `connect` / `disconnect`, `dnd()`, `settle`, `engine` ([NOTIFICATIONS.md](NOTIFICATIONS.md) "Testing") |
 | `moduleStore()`, `store`, `events`, `people`, `schedulerUses` | the module's store, the household store, every event on the bus, the household's core services, what the kit saw of the scheduler |
 
@@ -1784,9 +1868,12 @@ check` behind the shared lock (`flock /workspace/build-cache/ian/pva-heavy.lock 
 
 - Its own package (§19) under `packages/module-<pkg>/` (source, tests, `package.json`).
 - **Its own pages, `docs/modules/<id>.md`** (one per module id), filled in under the stub's headings: what it does, its
-  tools, settings, what it stores, what it needs, and what was left out. **In wave A, "Left out" lists every part of
-  the plan's row that needs a phrase command or a presentation (P7, P10): they do not exist yet, and come with wave
-  B.** Notifications and a module's speech exist since P9 (§16). This replaces the plan's "own section in `docs/MODULES.md`", so twenty pull
+  tools, settings, what it stores, what it needs, and what was left out. Notifications and a module's speech exist
+  since P9, phrase commands (`phrases` on an action), the host's controls and the ringing window since P7 (§16,
+  [PHRASES.md](PHRASES.md)), and presentations since P10 (§16, [PRESENTING.md](PRESENTING.md)): build those parts of
+  your row now, within their first version (a slot is a number, a duration, a fixed choice or text; a presentation is
+  one of the five kinds). **"Left out" lists every part of your row that needs what is not there yet** (the list at the
+  top of this page). This replaces the plan's "own section in `docs/MODULES.md`", so twenty pull
   requests never edit the same file.
 - `pnpm-lock.yaml`, only when it adds a dependency the scaffold did not foresee; the description names it.
 - **Nothing else.** The scaffold has created the package, registered it in the catalogue, added the dependencies of
