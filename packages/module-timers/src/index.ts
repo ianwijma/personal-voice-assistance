@@ -1,35 +1,15 @@
-import { defineModule, type ModuleDefinition } from "@pva/core"
-import { Effect } from "effect"
+import type { ModuleDefinition } from "@pva/core"
+import { alarmsModule } from "./alarms.ts"
+import { timersModule } from "./timers.ts"
 
 /**
- * Named countdown timers that ring on the device that set them.
- *
- * A stub of the scaffold (docs/MODULES-PLAN.md §4 P11; §5.1 row 2, wave B): off by default, no tools yet.
- * Its own pull request writes it. What it is to do: docs/modules/timers.md and docs/research/modules/timers-and-alarms.md.
+ * Timers and alarms (docs/modules/timers.md, docs/modules/alarms.md): two modules in one package, so an assistant can
+ * have one without the other. Both keep household data in their own collection, ring through the notification service
+ * with one scheduler job per timer or alarm, and say every sentence in English and Dutch.
  */
-export const timersModule = defineModule({
-  apiVersion: 2,
-  id: "timers",
-  name: "Timers",
-  description: "Named countdown timers that ring on the device that set them.",
-  enabledByDefault: false,
-  start: () => Effect.succeed({})
-})
-
-/**
- * One-off and repeating alarms that ring on the device they were set for.
- *
- * A stub of the scaffold (docs/MODULES-PLAN.md §4 P11; §5.1 row 2, wave B): off by default, no tools yet.
- * Its own pull request writes it. What it is to do: docs/modules/alarms.md and docs/research/modules/timers-and-alarms.md.
- */
-export const alarmsModule = defineModule({
-  apiVersion: 2,
-  id: "alarms",
-  name: "Alarms",
-  description: "One-off and repeating alarms that ring on the device they were set for.",
-  enabledByDefault: false,
-  start: () => Effect.succeed({})
-})
+export { ALARM_BAND, type Alarm, alarms, alarmsModule, type AlarmsOps, DELIVER_WITHIN_MS, MAX_ALARMS } from "./alarms.ts"
+export { type Timer, timers, timersModule, type TimersOps } from "./timers.ts"
+export { alarmTexts, timerTexts } from "./texts.ts"
 
 /**
  * What the app runs from this package (`apps/assistant/src/modules.ts` lists it once, so this package's pull request
