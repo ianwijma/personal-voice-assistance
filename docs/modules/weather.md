@@ -24,6 +24,31 @@ today's forecast); the local-info pull request adds, in `weather.ts` and `weathe
   for today, a summary of the next hours.
 - **A briefing section**, `weather` (the day, and first any rain that starts in the next two hours, which makes it a `lead`).
 
+**The `weather` presentation.** A forecast of a day (`weather_forecast`, and the typed action `weather.tomorrow`, which is the
+same answer) is also shown as a card on the device that asked, when it can show it (docs/PRESENTING.md, the `weather` kind),
+and the answer the model reads is unchanged (the host adds "[Screen: Showing on …]" or "[Screen: Not showing it: … Say this
+instead: …]" after it). The card says what the answer said and nothing more:
+
+- **place**: the service's place name, cut to one line of at most 40 characters at a code point boundary (an emoji is never
+  split); outside text, shown as text and never as markup.
+- **now** (the kind's headline, which for a forecast is the day, not the moment): the day's range ("8 – 13°", "46 – 55 °F"),
+  the condition in words ("Light rain", "Lichte regen") and an icon from the closed set, chosen from the weather code
+  (clear or mainly clear: `sun`; partly cloudy: `partly`; overcast: `cloud`; fog: `fog`; drizzle, rain, showers: `rain`; snow:
+  `snow`; thunderstorm: `storm`). A weather code with no icon gives the answer **without a card** rather than a guessed icon.
+- **days**: one row, the asked day ("Today", "Tomorrow" or its weekday, in the household's language), its high and low
+  and the same icon.
+- The chance of rain, the wind and the coming hours (`hours`) have no field in the kind and stay in the spoken answer;
+  the card never shows what the answer did not say.
+- **spoken**: the day's sentence without the hours ("Tomorrow: light rain, 8 to 13 degrees, 70 percent chance of rain, wind up
+  to 35 km/h."), which stands on its own for a device that cannot show the card. A rain answer (`weather_rain_soon`) and a
+  failed or refused forecast show nothing and change nothing on the screen.
+- **Transient**, the host's default: it stays 30 seconds and is replaced by the next thing shown on that device; it is
+  withdrawn when it ends, and a page that was away does not get it back. A restart ends it with the module's part.
+- **Privacy**: weather is the household's, so the presentation has no owner (`sensitivity: household`): the host decides
+  for the device that would show it, at the moment of showing, and the shared, private and public devices of the
+  household all show it to whoever asked there; a device with no display shows nothing and is told so.
+- No buttons and no ticks, so no press handler.
+
 **Only what the service really covered.** The service is asked for epoch timestamps (`timeformat=unixtime`) and the
 place's IANA zone, so every quarter-hour and hour is an instant, worded in the place's own zone (right across the changes
 of daylight saving time). A rain answer uses the quarter-hours from the one now is in, each following the last exactly,
@@ -56,9 +81,9 @@ No personal content: weather is the household's, and every device is told the sa
 |---|---|---|---|
 | `weather` / `weather.today` | read | `place?` | unchanged |
 | `weather_rain_soon` | read (speculative) | `place?`, `minutes?` (30 to 120, default 120) | "Dry until about quarter past eleven, then moderate rain." / "No rain expected for the next 1 hour 55 minutes. I only know until noon." |
-| `weather_forecast` | read (speculative) | `place?`, `day?` (today, tomorrow, weekday, date), `hours?` (1 to 24, today) | "Tomorrow: light rain, 8 to 13 degrees, 70 percent chance of rain, wind up to 35 km/h." |
+| `weather_forecast` | read (speculative) | `place?`, `day?` (today, tomorrow, weekday, date), `hours?` (1 to 24, today) | "Tomorrow: light rain, 8 to 13 degrees, 70 percent chance of rain, wind up to 35 km/h." (and the card above) |
 | `weather.rain_soon` (action) | read | none (home) | "gaat het het komende uur regenen", "will it rain in the next hour" |
-| `weather.tomorrow` (action) | read | none (home) | "wat voor weer wordt het morgen", "what's the weather tomorrow" |
+| `weather.tomorrow` (action) | read | none (home) | "wat voor weer wordt het morgen", "what's the weather tomorrow" (and the card above) |
 
 The actions are for the typed path (no model) and are not also offered as tools; they use home only, because a place word after
 "in" would take "the next hour" for a place. Every sentence is in English and Dutch: the household's language for tools and
@@ -90,9 +115,9 @@ not read, or that they have no rain data, rather than a wrong answer.
 
 ## What was left out
 
-Left out because it waits for **wave B** (no presentations, notifications or module speech yet): the `weather` presentation
-(a forecast card, the rain bar chart), "tell me when it starts raining" as a notification,
-and the ambient fact on screens.
+Left out for later: "tell me when it starts raining" as a notification, the ambient fact on screens, a card for the rain
+(the `weather` kind has no field for rain, and the forecast card does not carry the chance of rain), and a card for the
+coming hours or for several days (the card is the one asked day).
 
 **Weather warnings: left out.** They need a warning source whose answers have been checked against the live service and a
 way to match a place to its region by code. (A first version read MeteoAlarm's feed, unverified, and matched places to
