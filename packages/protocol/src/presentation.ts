@@ -73,6 +73,10 @@ export const MAX_SPOKEN_CHARS = 300
 export const PRESENTATION_ID = /^[A-Za-z0-9_-]{1,64}$/
 /** Pinned presentations a device shows at most (and that may be pinned for one device; `limit` past it). */
 export const MAX_PINNED_PER_DEVICE = 8
+/** Live presentations of all modules together at most; one more is refused `limit` (the server and the web mock). */
+export const MAX_LIVE_TOTAL = 32
+/** Live presentations of one module at most (transient and pinned); one more is refused `limit`. */
+export const MAX_LIVE_PER_MODULE = 8
 /** The most a page is ever sent at once: its pinned ones and one transient. */
 export const MAX_PRESENTATIONS_PER_PAGE = MAX_PINNED_PER_DEVICE + 1
 /** A content hash as the server's image cache keeps it (SHA-256, lower-case hex). Never sent to a page. */

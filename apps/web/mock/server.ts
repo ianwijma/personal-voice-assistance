@@ -58,8 +58,9 @@
  * server does, again after each hello while open), POST /mock/notify/resolve {"id"}, POST /mock/volume {"deviceId",
  * "direction" | "to"} (P7: the device's reply volume as a spoken "louder"/"quieter" changes it, `output.volume` to its
  * voice pages now and after each welcome while it is not the default),
- * POST /mock/present {"content", "deviceId"?, "lifetime"?, "seconds"?, "buttons"?, "handler"?, "handlerDown"?} (P10: a
- * presentation shown as the server does: the shared decision and selection, again after each hello while live),
+ * POST /mock/present {"presentation", "options"? (lifetime, expiresInMs), "id"?, "deviceId"?, "handlerDown"?} (P10: a
+ * presentation shown as the server does: the shared checks, bounds, decision and selection, again after each hello while
+ * live; household content only and no `key`: refused with a 400 that says the mock does not model them),
  * POST /mock/present/dismiss {"id"},
  * POST /mock/drop (terminate every socket), POST /mock/offline {"ms": 3000} (drop and refuse connections for a while),
  * POST /mock/admin/end {"reason": "idle" | "expired"} (end every admin session), POST /mock/wake {"phrase", "armed"}
@@ -101,6 +102,7 @@
  * recogniser downloads as the Models page's jobs); POST /mock/models/state {"provider", "state"} forces a state.
  */
 import { randomBytes } from "node:crypto"
+import { Schema } from "effect"
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http"
 import {
   hearerOf,
@@ -160,7 +162,7 @@ import { encodeWav, MOCK_PROVIDERS } from "./voices.ts"
 import { createModelPickersMock } from "./modelPickers.ts"
 import { createModuleRoutesMock, DEMO_DEFINITION_ACTIONS, demoHomeAction, demoHomeModule, TokenRefusal } from "./demoHome.ts"
 import { createScheduledJobsMock, MockSchedulerError } from "./scheduledJobs.ts"
-import { boundaryKey, changeReplyVolume, checkDietList, checkMembersValue, cleanDeviceName, type Condition, decideDelivery, decidePresentation, type DeviceCapabilities, deviceOutputsFrom, devicePresentFrom, type FieldError, MAX_PINNED_PER_DEVICE, NO_REPLY_VOLUMES, PRESENT_KIND_VERSIONS, type Presentation, presentationProblem, type PresentKindName, presentLifetime, presentWireContent, type ReplyVolumes, selectPresentations, type ShowOptions, showOptionsProblem, speakerAllowedFrom } from "@pva/protocol"
+import { boundaryKey, changeReplyVolume, checkDietList, checkMembersValue, cleanDeviceName, type Condition, decideDelivery, decidePresentation, type DeviceCapabilities, deviceOutputsFrom, devicePresentFrom, type FieldError, MAX_LIVE_PER_MODULE, MAX_LIVE_TOTAL, MAX_PINNED_PER_DEVICE, NO_REPLY_VOLUMES, PRESENT_KIND_VERSIONS, type Presentation, PRESENTATION_ID, PresentationWire, presentationProblem, type PresentKindName, presentLifetime, presentWireContent, type ReplyVolumes, selectPresentations, type ShowOptions, showOptionsProblem, speakerAllowedFrom } from "@pva/protocol"
 
 const PORT = Number(process.env.MOCK_PORT ?? 8787)
 const HOST = process.env.MOCK_HOST ?? "127.0.0.1"
@@ -1608,6 +1610,29 @@ const decidePresentMock = (c: Conn, kind: PresentKindName) => {
   const outputs = devicePresentFrom(assistantsMock.deviceFields(c.deviceId!).settings, caps)
   return decidePresentation({ kind, personal: false, mayReveal: true, device: { connected: true, ...outputs } })
 }
+/** What a page is sent of a presentation (without `serverNow`), as the server's `wireOf`. */
+const mockWire = (id: string, p: { readonly presentation: Presentation; readonly lifetime: "transient" | "pinned"; readonly shownAt: number }, token: string | undefined, interactive: boolean) => {
+  const texts = mockPresentTexts()
+  return {
+    id,
+    lifetime: p.lifetime,
+    shownAt: p.shownAt,
+    v: PRESENT_KIND_VERSIONS[p.presentation.kind],
+    content: presentWireContent(p.presentation, token === undefined ? undefined : { state: "ready", token }),
+    buttons: (p.presentation.buttons ?? []).map((b) => ({ id: b.id, label: b.label })),
+    interactive: interactive && p.presentation.handler !== undefined,
+    texts: { region: texts.region, loading: texts.loading, imageMissing: texts.imageMissing, timerDone: texts.timerDone, credit: texts.credit, high: texts.high, low: texts.low }
+  }
+}
+const isPresentationWire = Schema.is(PresentationWire)
+/** The request fields of `POST /mock/present`; anything else is refused. */
+const MOCK_PRESENT_FIELDS: ReadonlyArray<string> = ["id", "presentation", "options", "deviceId", "handlerDown"]
+/**
+ * What the mock does not model, refused with a 400 rather than done differently (review round 2, R7; docs/PRESENTING.md
+ * "The web mock"): it has no privacy model, so only household presentations; it has no keyed replacement, so no `key`.
+ */
+const MOCK_PRESENT_NO_PRIVACY = "the mock shows household presentations only (it has no privacy model): leave sensitivity out or say household"
+const MOCK_PRESENT_NO_KEY = "the mock does not replace by key: leave options.key out (dismiss and show again)"
 /** A presentation's end, as the server's: gone at its end, its pages reconciled. */
 const endMockPresentation = (id: string) => {
   const p = mockPresentations.get(id)
@@ -1645,22 +1670,12 @@ const reconcilePresentMock = (c: Conn) => {
     if (h.token !== undefined) mockMediaTokens.delete(h.token)
     sendTo(c, { type: "present.dismiss", id })
   }
-  const texts = mockPresentTexts()
   for (const x of chosen) {
     const p = mockPresentations.get(x.id)!
     const before = held.get(x.id)
     const token = p.presentation.kind === "image" ? before?.token ?? newMockToken() : undefined
     if (token !== undefined) mockMediaTokens.set(token, { connId: c.id, id: x.id })
-    const wire = {
-      id: x.id,
-      lifetime: p.lifetime,
-      shownAt: p.shownAt,
-      v: PRESENT_KIND_VERSIONS[p.presentation.kind],
-      content: presentWireContent(p.presentation, token === undefined ? undefined : { state: "ready", token }),
-      buttons: (p.presentation.buttons ?? []).map((b) => ({ id: b.id, label: b.label })),
-      interactive: x.decision.interactive && p.presentation.handler !== undefined,
-      texts: { region: texts.region, loading: texts.loading, imageMissing: texts.imageMissing, timerDone: texts.timerDone, credit: texts.credit, high: texts.high, low: texts.low }
-    }
+    const wire = mockWire(x.id, p, token, x.decision.interactive)
     const fp = JSON.stringify(wire)
     if (before?.fp === fp) continue
     sendTo(c, { type: before === undefined ? "present.show" : "present.update", presentation: { ...wire, serverNow: Date.now() } })
@@ -3621,17 +3636,33 @@ const http = createServer((req, res) => {
         // checks before anything changes (a refused one consumes no id and replaces nothing); its lifetime and end by the
         // shared helper; at its end it is removed. A transient one ends the earlier transient ones of the same devices;
         // an id is never used twice; an image shows the mock's built-in picture, through `/media/<token>`.
+        // Review round 2 (R7): the whole request is checked before any id is consumed or anything changes; what the mock
+        // does not model is refused; admission uses the server's own live bounds (the mock is one module).
         pruneEndedMock()
         const now = Date.now()
+        const extra = Object.keys(payload).find((k) => !MOCK_PRESENT_FIELDS.includes(k))
+        if (extra !== undefined) return json(res, 400, { error: `unknown field ${extra}` })
+        if (payload.id !== undefined && (typeof payload.id !== "string" || !PRESENTATION_ID.test(payload.id))) return json(res, 400, { error: `id must match ${PRESENTATION_ID}` })
+        if (payload.deviceId !== undefined && (typeof payload.deviceId !== "string" || !devices.has(payload.deviceId))) return json(res, 400, { error: "deviceId names no device the mock knows" })
+        if (payload.handlerDown !== undefined && typeof payload.handlerDown !== "boolean") return json(res, 400, { error: "handlerDown is true or false" })
         const presentation = payload.presentation as Presentation | undefined
         const options = payload.options as ShowOptions | undefined
         const problem = presentationProblem(presentation, now) ?? showOptionsProblem(options, (presentation as { kind?: PresentKindName } | undefined)?.kind)
         if (problem !== undefined) return json(res, 400, { error: problem })
+        if (presentation!.sensitivity !== undefined && presentation!.sensitivity !== "household") return json(res, 400, { error: MOCK_PRESENT_NO_PRIVACY })
+        if (options?.key !== undefined) return json(res, 400, { error: MOCK_PRESENT_NO_KEY })
         if (typeof payload.id === "string" && mockPresentIds.has(payload.id)) return json(res, 409, { error: "that id was used already" })
         const deviceId = typeof payload.deviceId === "string" ? payload.deviceId : undefined
         const { lifetime, expiresAt } = presentLifetime(presentation!, options, now)
         const overlaps = (other: { readonly deviceId?: string }) => deviceId === undefined || other.deviceId === undefined || other.deviceId === deviceId
-        if (lifetime === "pinned" && [...mockPresentations.values()].filter((p) => p.lifetime === "pinned" && overlaps(p)).length >= MAX_PINNED_PER_DEVICE) return json(res, 409, { error: "limit" })
+        // As the server: the transients this one would end do not count against it.
+        const counted = [...mockPresentations.values()].filter((p) => p.endsAt > now && !(lifetime === "transient" && p.lifetime === "transient" && overlaps(p)))
+        if (counted.length >= MAX_LIVE_PER_MODULE || counted.length >= MAX_LIVE_TOTAL) return json(res, 409, { error: "limit" })
+        if (lifetime === "pinned" && counted.filter((p) => p.lifetime === "pinned" && overlaps(p)).length >= MAX_PINNED_PER_DEVICE) return json(res, 409, { error: "limit" })
+        // What a page would be sent of it decodes as the protocol says (an image with a token of the right form).
+        const sampleId = typeof payload.id === "string" ? payload.id : "p-mock-check"
+        const sample = { ...mockWire(sampleId, { presentation: presentation!, lifetime, shownAt: now }, presentation!.kind === "image" ? "t".repeat(32) : undefined, true), serverNow: now }
+        if (!isPresentationWire(sample)) return json(res, 400, { error: "the presentation does not make a valid page message" })
         let id = typeof payload.id === "string" ? payload.id : `p-mock-${++mockPresentSeq}`
         while (typeof payload.id !== "string" && mockPresentIds.has(id)) id = `p-mock-${++mockPresentSeq}`
         mockPresentIds.add(id)
