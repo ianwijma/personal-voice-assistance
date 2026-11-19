@@ -1,5 +1,6 @@
 // What the module tests share: the offline network (no test reaches the network).
 import { makeOfflineNet } from "@pva/core/testing"
+import { CurrentTurnCommit, type TurnCommit } from "@pva/core"
 import { Effect } from "effect"
 
 export const netWith = (fixtures: Parameters<typeof makeOfflineNet>[0]) => {
@@ -49,4 +50,24 @@ export const counting = <M extends { readonly start: (...args: Array<any>) => an
       }))
   } as M
   return { module: wrapped, executions: (name: string) => counts.get(name) ?? 0 }
+}
+
+/**
+ * A turn that is not committed yet (a speculative one): calls made inside `within` are in it. `promote` runs what was
+ * held for the commit; a discarded turn simply never calls it. (`Conversation` provides this for a turn's calls.)
+ */
+export const speculativeTurn = () => {
+  let committed = false
+  const held: Array<() => void> = []
+  const commit: TurnCommit = {
+    committed: () => committed,
+    whenCommitted: (f) => (committed ? f() : void held.push(f))
+  }
+  return {
+    within: <A, E, R>(effect: Effect.Effect<A, E, R>) => Effect.provideService(effect, CurrentTurnCommit, commit),
+    promote: Effect.sync(() => {
+      committed = true
+      for (const f of held.splice(0)) f()
+    })
+  }
 }

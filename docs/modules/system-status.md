@@ -50,7 +50,7 @@ cut to fit an item (80 characters) at a code point boundary, so no sentence is c
 - **Returned with the answer, never shown from inside the tool.** The tool answers `{ forModel, present }` and the action
   `{ say, present }`, with `forModel` and `say` exactly what they were. The module shows and withdraws nothing itself and
   keeps no handle: a tool may run before its turn is committed, and the Presenter shows what a speculative tool returned
-  only once the turn is promoted.
+  only once the turn is promoted (a discarded turn shows nothing).
 - **Only where the detailed answer may stay.** Whether a device is told details depends on its kind *when it is asked*; a
   list could later be in front of a device that became public. So the list is **personal to the person asking** (the
   turn's known person: the device's default person, the voice or the chosen speaker), and the Presenter decides it again

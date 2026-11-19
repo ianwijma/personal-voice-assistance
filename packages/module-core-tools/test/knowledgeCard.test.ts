@@ -5,7 +5,7 @@ import { startTestModule } from "@pva/core/testing"
 import { Effect } from "effect"
 import { bound } from "../../store-sqlite/test/latencyBound.ts"
 import { cardOf, makeKnowledge } from "../src/knowledge.ts"
-import { counting, netWith } from "./support.ts"
+import { counting, netWith, speculativeTurn } from "./support.ts"
 
 vi.setConfig({ testTimeout: 30_000 })
 
@@ -126,6 +126,31 @@ describe("knowledge: the card", () => {
       assert.include(b.content, "[Screen")
       yield* k.present.settle
       assert.strictEqual(k.present.shown("kitchen-display").length, 1)
+    }))
+
+  it.effect("a lookup in a turn that is discarded shows nothing and withdraws nothing; in a turn that is promoted it is shown once", () =>
+    Effect.gen(function*() {
+      const k = yield* start()
+      yield* k.tool("lookup", { query: "Eiffel Tower" }, asking("kitchen-display"))
+      yield* k.present.settle
+      const [earlier] = k.present.shown("kitchen-display")
+      // The turn is speculative, the tool runs and answers, and the turn is discarded: nothing reaches the screen.
+      const discarded = speculativeTurn()
+      const r = yield* discarded.within(k.tool("lookup", { query: "Boundary" }, asking("kitchen-display")))
+      assert.isTrue(r.ok)
+      yield* k.present.settle
+      assert.deepStrictEqual(k.present.shown("kitchen-display").map((c) => c.id), [earlier!.id])
+      // The same, promoted: shown once, replacing the earlier card.
+      const promoted = speculativeTurn()
+      yield* promoted.within(k.tool("lookup", { query: "Boundary" }, asking("kitchen-display")))
+      yield* k.present.settle
+      assert.deepStrictEqual(k.present.shown("kitchen-display").map((c) => c.id), [earlier!.id])
+      yield* promoted.promote
+      yield* k.present.settle
+      const now = k.present.shown("kitchen-display")
+      assert.strictEqual(now.length, 1)
+      assert.notStrictEqual(now[0]!.id, earlier!.id)
+      assert.strictEqual((now[0]!.content as { title: string }).title, "Boundary")
     }))
 
   it.effect("the card ends by itself, and with the module", () =>

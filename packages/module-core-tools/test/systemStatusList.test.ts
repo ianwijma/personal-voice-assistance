@@ -6,7 +6,7 @@ import { startTestModule } from "@pva/core/testing"
 import { Effect } from "effect"
 import { bound } from "../../store-sqlite/test/latencyBound.ts"
 import { cutFor } from "../src/screen.ts"
-import { counting } from "./support.ts"
+import { counting, speculativeTurn } from "./support.ts"
 import { issuesList, systemStatusModule } from "../src/systemStatus.ts"
 
 vi.setConfig({ testTimeout: 30_000 })
@@ -180,6 +180,29 @@ describe("system-status: the issues list", () => {
       assert.strictEqual(counted.executions("system_status"), 3)
       assert.include(c.content, "Weather has stopped with an error")
       assert.include(c.content, "[Screen: Showing on")
+    }))
+
+  it.effect("a status question in a turn that is discarded shows nothing and withdraws nothing; in a turn that is promoted its list is shown once", () =>
+    Effect.gen(function*() {
+      state.trouble = true
+      const s = yield* startTestModule(variable, { household })
+      yield* s.tool("system_status", { about: "modules" }, asking("kitchen-display"))
+      yield* s.present.settle
+      const [earlier] = s.present.shown("kitchen-display")
+      const discarded = speculativeTurn()
+      const r = yield* discarded.within(s.tool("system_status", {}, asking("kitchen-display")))
+      assert.isTrue(r.ok)
+      yield* s.present.settle
+      assert.deepStrictEqual(s.present.shown("kitchen-display").map((c) => c.id), [earlier!.id])
+      const promoted = speculativeTurn()
+      yield* promoted.within(s.tool("system_status", {}, asking("kitchen-display")))
+      yield* s.present.settle
+      assert.deepStrictEqual(s.present.shown("kitchen-display").map((c) => c.id), [earlier!.id])
+      yield* promoted.promote
+      yield* s.present.settle
+      const now = s.present.shown("kitchen-display")
+      assert.strictEqual(now.length, 1)
+      assert.notStrictEqual(now[0]!.id, earlier!.id)
     }))
 
   it.effect("a stopped module's list is withdrawn with it", () =>
