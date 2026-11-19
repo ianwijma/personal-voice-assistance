@@ -158,6 +158,7 @@ import { encodeWav, MOCK_PROVIDERS } from "./voices.ts"
 import { createModelPickersMock } from "./modelPickers.ts"
 import { createModuleRoutesMock, DEMO_DEFINITION_ACTIONS, demoHomeAction, demoHomeModule, TokenRefusal } from "./demoHome.ts"
 import { createScheduledJobsMock, MockSchedulerError } from "./scheduledJobs.ts"
+import { DEFAULT_RISK_POLICY, FIXED_REASON, FIXED_RISK_CLASSES, RISK_POLICY_KEYS, riskPageTexts, riskPolicyValueProblem } from "@pva/protocol"
 import { boundaryKey, checkDietList, checkMembersValue, cleanDeviceName, type Condition, decideDelivery, decidePresentation, deviceOutputsFrom, devicePresentFrom, type FieldError, MAX_PINNED_PER_DEVICE, PRESENT_KIND_VERSIONS, type PresentContent, type PresentKindName, selectPresentations, speakerAllowedFrom } from "@pva/protocol"
 
 const PORT = Number(process.env.MOCK_PORT ?? 8787)
@@ -667,6 +668,53 @@ const initialSections = (): Array<SettingsSection> => [
         HOUSEHOLD_DIET_DIETS: [],
         HOUSEHOLD_DIET_DISLIKES: []
       },
+      secrets: {},
+      errors: []
+    },
+    revision: 1
+  },
+  {
+    // P8: the household's risk policy, as the server declares it (`riskSection` in sectionDefinitions.ts): money and
+    // security fixed at Refuse (locked with the reason). Saves are checked with the server's own `riskPolicyValueProblem`.
+    id: "risk",
+    title: "Risk policy",
+    group: "modules",
+    page: { id: "risk", title: "Risk policy", description: "What the assistant may do on its own, for every assistant on every device. A refused call is not run; the assistant says why." },
+    order: 7,
+    protected: true,
+    form: {
+      fields: [
+        ...(["read", "change", "message"] as const).map((cls) => ({
+          type: "choice" as const,
+          key: RISK_POLICY_KEYS[cls],
+          label: riskPageTexts("en").classes[cls],
+          description: cls === "read"
+            ? "Lookups that change nothing: the weather, what is on a list, the time."
+            : cls === "change"
+            ? "Lights, timers, lists, reminders, speaking or ringing on the house's own devices."
+            : "Mail, chat or a call to people outside the house, or anything in your name on an outside channel. No module sends one yet.",
+          apply: "live" as const,
+          default: DEFAULT_RISK_POLICY[cls],
+          options: [
+            { value: "allow", label: riskPageTexts("en").outcomes.allow, description: "The assistant does it." },
+            { value: "confirm", label: riskPageTexts("en").outcomes.confirm, description: "Refused, saying it needs your confirmation: the assistant cannot ask for it yet." },
+            { value: "deny", label: riskPageTexts("en").outcomes.deny, description: "Refused, saying this household does not allow it." }
+          ],
+          source: "default" as const
+        })),
+        ...FIXED_RISK_CLASSES.map((cls) => ({
+          type: "choice" as const,
+          key: RISK_POLICY_KEYS[cls],
+          label: riskPageTexts("en").classes[cls],
+          description: cls === "money" ? "Purchases and payments." : "Unlocking, disarming, opening a garage door or a gate.",
+          apply: "live" as const,
+          default: "deny",
+          options: [{ value: "deny", label: riskPageTexts("en").outcomes.deny }],
+          locked: { reason: FIXED_REASON },
+          source: "default" as const
+        }))
+      ],
+      values: { RISK_READ: "allow", RISK_CHANGE: "allow", RISK_MESSAGE: "confirm", RISK_MONEY: "deny", RISK_SECURITY: "deny" },
       secrets: {},
       errors: []
     },
@@ -2473,11 +2521,22 @@ const onClientMessage = (c: Conn, m: ClientMessage) => {
       if (i === -1) return result(c, m.requestId, false, { code: "unknown_section", message: `No section ${m.sectionId}.` })
       const section = sections[i]!
       if (refuseLocked(c, m.requestId, section.protected)) return
+      // P8: the risk policy as the server checks it (`riskPolicyValueProblem`, the same function): a settable class takes
+      // one of the three outcomes, money and security only Refuse (or back to the default), and those two are never
+      // written.
+      if (section.id === "risk") {
+        const problems = Object.entries(m.patch.values).flatMap(([k, v]) => {
+          const problem = riskPolicyValueProblem(k, v)
+          return problem === undefined ? [] : [{ key: k, message: problem }]
+        })
+        if (problems.length > 0) return result(c, m.requestId, false, { code: "invalid_settings", message: problems[0]!.message, fieldErrors: problems })
+      }
+      const fixedKey = (k: string) => section.id === "risk" && FIXED_RISK_CLASSES.some((cls) => RISK_POLICY_KEYS[cls] === k)
       // Fields hidden after the patch (visibleWhen) are neither validated nor saved, as on the real server.
       const after = (key: string) => (Object.hasOwn(m.patch.values, key) && m.patch.values[key] !== null ? m.patch.values[key] : valueOf(key))
       const shown = (key: string) => holds(section.form.fields.find((f) => f.key === key)?.visibleWhen, after)
       const patch: SettingsPatch = {
-        values: Object.fromEntries(Object.entries(m.patch.values).filter(([k]) => shown(k))),
+        values: Object.fromEntries(Object.entries(m.patch.values).filter(([k]) => shown(k) && !fixedKey(k))),
         secrets: Object.fromEntries(Object.entries(m.patch.secrets).filter(([k]) => shown(k)))
       }
       const errors = validate(section.form, patch)

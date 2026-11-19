@@ -149,6 +149,7 @@ export interface SharedPageDef {
 export const SHARED_PAGES: ReadonlyArray<SharedPageDef> = [
   { id: "home", title: "Home", description: "Where the house is. Modules and every assistant's prompt use these." },
   { id: "members", title: "Members", description: "The people who live here, and what they eat. A device's default person says whose data a turn there means." },
+  { id: "risk", title: "Risk policy", description: "What the assistant may do on its own, for every assistant on every device. A refused call is not run; the assistant says why." },
   { id: "modules", title: "Modules", description: "The shared settings of each module. Every assistant with the module switched on uses them, unless it has its own." },
   { id: "accounts", title: "Language model accounts", description: "The language models this house can use. Each assistant picks one account and a model." },
   { id: "routing", title: "Routing", description: "Who a sentence is for, when no wake phrase was said. Used only on devices that let TypeSafe decide." },
@@ -225,7 +226,7 @@ export const buildSettingsTree = (input: TreeInput): ReadonlyArray<NavGroup> => 
     }
     const origin = `${s.group ?? "general"}/${s.page?.id ?? s.id}`
     // The fields go where their key says, else with their section's own page (a section a newer server adds).
-    const own = s.group === "voices" || s.id === "voice-providers" ? "providers" : s.id === "home" ? "home" : s.id === "members" ? "members" : s.id === "routing" ? "routing" : undefined
+    const own = s.group === "voices" || s.id === "voice-providers" ? "providers" : s.id === "home" ? "home" : s.id === "members" ? "members" : s.id === "risk" ? "risk" : s.id === "routing" ? "routing" : undefined
     const placed = new Map<string, Array<SettingField>>()
     for (const f of s.form.fields) {
       if (isAssistantOwned(f.key)) continue
