@@ -24,10 +24,24 @@ not, and why, from what the service decided for each device (`SpeechHandle.deliv
 - **A card.** The message is also put on the screens in the target, as a transient `card` (30 seconds) titled
   "Announcement" (or "Announcement for the room") with the message and a "From" line naming the device that asked.
   A card goes to a screen where the message is queued, and to a screen that cannot speak it (a display with no
-  speaker); never to a device that is not connected, nor under do not disturb (nothing is said and nothing is shown
-  then). A device's card is replaced in place by the next broadcast (one `key` per device), and at most 8 cards are
-  made per broadcast, the most the Presenter lets one module hold live. Whatever was not shown is said in the answer.
-  A setting turns cards off.
+  speaker); never to a device that is not connected. **Do not disturb is read again immediately before each card is
+  started**: while it is on, no card is started on any device (and the answer counts the screens that got none).
+  A card that was already showing when do not disturb came on stays until its 30 seconds end, and a page that
+  reconnects within them is given it again by the Presenter (the module does not manage the card after showing it). A
+  device's card is replaced in place by the next broadcast (one `key` per device). At most 8 cards are made per
+  broadcast, the most the Presenter lets one module hold live; **screens beyond the eight are counted and said**, as
+  are refusals. A setting turns cards off.
+- **Who asked is left out and named.** The origin is the device of whoever made the call: a turn's device, a job's origin
+  device, a press's device. It is left out of the announcement and named in the card's "From". With no origin device at
+  all (a job made in the module's own start, say) it refuses with a sentence: it cannot know whom to leave out.
+- **One broadcast at a time.** One semaphore in the module's shared part holds the whole bounded operation (the speech
+  calls and the cards), for tools and actions alike, so two broadcasts at once are in the same order in sound and on
+  screen (an older card never replaces a newer one).
+- **Answers fit 300 characters** (`ANSWER_MAX`: a phrase command's answer is cut there by the page boundary, and the tools
+  are held to the same bound). At most two devices are named per group (announced, not announced with their reason,
+  shown), the rest as a count with the reasons, and when that is still too long names go and counts remain; no group is
+  dropped. Names are cut at a code point boundary with the ellipsis inside the budget; questions about rooms are held
+  to the same bound.
 - **A room is text.** The name is matched against the rooms of the devices the house knows: spelling, case, accents,
   apostrophes and a leading "the"/"de"/"het" are ignored; an exact name wins ("Kitchen" over "Kitchen annex"); else the
   rooms whose words contain the spoken words (or the other way round: "kids room" for "Kids' room upstairs"). **No
@@ -50,7 +64,7 @@ refused here as needing a confirmation the assistant cannot ask for yet.
 
 | Tool | Parameters | Answers (`spoken`) | Example phrases |
 |---|---|---|---|
-| `broadcast_send` (`change`, quick) | `message` (one line, ≤ 200), `room?` (text, ≤ 40) | "Announcing on Hall screen, Kids tablet and three more. Not announced on Attic node (not connected) and Garage screen (cannot speak). Also showing it on Garage screen." | "tell everyone dinner is ready"; "tell the kids' room it's lights out"; "zeg tegen de keuken dat ik eraan kom" |
+| `broadcast_send` (`change`, quick) | `message` (one line, ≤ 200), `room?` (text, ≤ 40) | "Announcing on Hall screen, Kids tablet and 3 more. Not announced on Attic node (not connected) and Garage screen (cannot speak). Also showing it on Garage screen." | "tell everyone dinner is ready"; "tell the kids' room it's lights out"; "zeg tegen de keuken dat ik eraan kom" |
 | `broadcast_chime` (`change`, quick) | `room?` | the same, for the chime | "ring the dinner bell"; "bel de gong in de studeerkamer" |
 
 Other answers: "I don't know a room called Garden. The rooms are …"; "Which room do you mean: Guest bedroom and Master
@@ -66,21 +80,22 @@ the model is not told otherwise. No card is shown for a chime.
 ### Typed actions and phrase commands (no model)
 
 Both actions have `phrases`, so after the wake phrase (or in a follow-up window) the words run them without the
-language model ([PHRASES.md](../PHRASES.md)); the answer is a canned reply on the device that asked. A message is a text
-slot, so **at most eight words** this way (a longer one goes to the assistant, which calls the tool); the room is a text
-slot too, **resolved in the action** with the same "I don't know a room called …" and "Which room do you mean …?"
-sentences as the tool (a room cannot be a choice: the rooms are not known when the module starts).
+language model ([PHRASES.md](../PHRASES.md)); the answer is a canned reply on the device that asked. **A phrase never
+widens the audience: phrase commands exist only for the whole house, and only where the words say "everyone".** There is
+no unrestricted "announce …" phrase and no room-directed one; those utterances ("announce in the study that dinner is
+ready", "tell the kitchen that …", "omroepen in de keuken dat …", "ring the dinner bell") are not taken and go to the
+assistant, whose `broadcast_send` call names the room. A message is a text slot, so at most eight words this way.
+The actions have no room parameter. Even then the action refuses a message that opens with a destination word
+("tell everyone in the study that …": "That sounds meant for one room, so I did not announce it to everyone.").
 
 | Action | Parameters | Phrases (English) | Phrases (Dutch) |
 |---|---|---|---|
-| `broadcast.send` | `message`, `room?` (text) | "tell everyone dinner is ready", "tell everyone that …", "announce …", "announce that …", "tell the kitchen that …", "announce in the kitchen that …" | "zeg tegen iedereen het eten is klaar", "zeg tegen iedereen dat …", "omroepen …", "zeg tegen de keuken dat …", "omroepen in de keuken dat …" |
-| `broadcast.chime` | `room?` (text) | "ring the dinner bell", "sound the chime", "ring the bell in the kitchen" | "bel de gong", "luid de bel", "bel de gong in de keuken" |
+| `broadcast.send` | `message` | "tell everyone dinner is ready", "tell everyone that …", "announce to everyone …", "announce to everyone that …" | "zeg tegen iedereen het eten is klaar", "zeg tegen iedereen dat …", "omroepen voor iedereen …", "omroepen voor iedereen dat …" |
+| `broadcast.chime` | none | "ring the bell for everyone", "sound the chime for everyone" | "bel de gong voor iedereen", "luid de bel voor iedereen" |
 
-The words of a phrase are the message as said, never reworded: after "that"/"dat" the message starts, so "zeg tegen
-iedereen dat het eten klaar is" announces "het eten klaar is". The longest phrase wins ("announce in the kitchen that
-…" over "announce …"). Both are `change`, not offered to the model as tools of their own (`offerAsTool: false`: the two
-tools above are the model's). An action's text is checked like the tool's (one line, at most 200 characters, else "I
-announce one line of at most 200 characters."). They return `{ say }` with the same sentences as the tools.
+After "that"/"dat" the message starts, so "zeg tegen iedereen dat het eten klaar is" announces "het eten klaar is". Both
+are `change`, not offered to the model as tools of their own (`offerAsTool: false`). An action's text is checked like
+the tool's (one line, at most 200 characters). They return `{ say }` with the same sentences as the tools.
 
 ## Settings
 
@@ -108,10 +123,12 @@ Off by default; with it off nothing changes for anyone.
 
 ## Latency and bounds
 
-A broadcast reads the device list once (a cached snapshot), matches a room by words over the devices' rooms, and makes
-one `speech.say` (a synchronous enqueue, a fraction of a millisecond) per device, at most 64, and one `present.show`
-per screen, at most 8. Nothing waits for an announcement, nothing touches the store or the network, and nothing
-runs through `offThread`.
+A broadcast reads the device list once (a cached snapshot), matches a room by words over the devices' rooms, makes one
+`speech.say` per device (a synchronous enqueue in the notification service), at most 64, and one `present.show` per
+screen, at most 8: each of those is the core's one synchronous store transaction and an enqueue (PRESENTING.md, way 2),
+which may be refused (`busy`, `limit`) and is then said. The module itself has no collection, no job and makes no
+network call, and nothing runs through `offThread`. The announcement is never waited for. No latency number is claimed
+for a whole broadcast: it has no module-level measurement; the numbers of the two services are on their pages.
 
 ## What was left out
 
@@ -125,6 +142,9 @@ Because the preparation parts' first versions do not have it:
   house, a device that cannot speak and a device that is not connected.
 - **A message of more than eight words as a phrase command** ([PHRASES.md](../PHRASES.md): a text slot is at most
   eight words): it goes to the assistant, which calls `broadcast_send`.
+- **Phrase commands for one room**: left out on purpose (a phrase never widens the audience, above).
+- **Do not disturb for a card already showing**, and a card after a reconnect while do not disturb is on: the
+  Presenter has no do-not-disturb rule, so this module only declines to start cards under it.
 - **The chime alone** (above).
 
 By the plan's row: the speaker's own voice, voice messages, scheduled broadcasts and phones.
@@ -133,7 +153,7 @@ By the plan's row: the speaker's own voice, voice messages, scheduled broadcasts
 
 - Whether a broadcast to a room means the *devices in the room* or the *room's other devices*: the latter (the asking
   device is excluded in both the room and "everyone").
-- Whether do not disturb should keep a *silent card* from appearing: the conservative reading, it does (no card where
-  the announcement was held back by do not disturb or the device is offline); a display that merely cannot speak still
-  gets the card, since that is what it is for.
+- Whether do not disturb should keep a *silent card* from appearing: the conservative reading, no card is *started*
+  while it is on (read again before each card); one already showing stays until its 30 seconds end. A display that
+  merely cannot speak still gets the card, since that is what it is for.
 - `SpeechHandle.deliveries` says "queued", not "will be heard": the answer is worded as queued.

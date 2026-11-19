@@ -26,9 +26,9 @@ const HOUSE: ReadonlyArray<TestDevice> = [
 const withNotify = (parts: { notify?: ModuleNotify }): typeof broadcastModule => ({
   ...broadcastModule,
   shared: (ctx) =>
-    Effect.sync(() => {
+    Effect.map(broadcastModule.shared!(ctx), (shared) => {
       parts.notify = ctx.notify
-      return { value: undefined }
+      return shared
     })
 })
 
@@ -52,7 +52,7 @@ describe("broadcast", () => {
       // The answer says where it was queued and where it was not: the garage screen cannot speak, the attic is offline.
       assert.strictEqual(
         said(r),
-        "Announcing on Hall screen, Kids tablet and three more. Not announced on Attic node (not connected) and Garage screen (cannot speak). Also showing it on Garage screen, Hall screen and three more."
+        "Announcing on Hall screen, Kids tablet and 3 more. Not announced on Attic node (not connected) and Garage screen (cannot speak). Also showing it on Garage screen, Hall screen and 3 more."
       )
       yield* kit.present.settle
       // The card is on the screens that got it (and on the garage screen that cannot speak it), not on the asking device.
@@ -136,7 +136,7 @@ describe("broadcast", () => {
       const r = yield* kit.tool("broadcast_send", { message: "Dinner is ready" }, { device: "kitchen-display" })
       yield* kit.present.settle
       // The garage screen cannot speak (that is its reason, not do not disturb), so a card goes there alone.
-      assert.strictEqual(said(r), "Nothing was announced: Attic node (not connected), Garage screen (do not disturb) and five more.")
+      assert.strictEqual(said(r), "Nothing was announced: Attic node (not connected), Garage screen (do not disturb) and 5 more (5 do not disturb).")
       assert.deepStrictEqual(kit.notify.announced, [])
       assert.deepStrictEqual(kit.present.shown("study-tablet"), [])
       // Only do not disturb, everywhere it could have spoken: said so in one sentence.
@@ -280,45 +280,60 @@ describe("broadcast", () => {
       assert.strictEqual(said(yield* gone.tool("broadcast_send", { message: "Dinner" }, { device: "kitchen-display" })), "Nothing was announced: Study tablet (failed).")
     }))
 
-  it.effect("phrase commands: said after the wake phrase they run without the model; the room is text, resolved in the action", () =>
+  it.effect("phrase commands are for the whole house only, where the words say everyone; a room or any destination is no phrase", () =>
     Effect.gen(function*() {
       const kit = yield* startTestModule(broadcastModule, { household: { devices: HOUSE } })
       const everyone = yield* kit.phrases.say("Tell everyone that dinner is ready", { device: "kitchen-display" })
       assert.isTrue(everyone.taken)
+      yield* kit.phrases.say("announce to everyone the film starts", { device: "kitchen-display" })
       yield* kit.advance(5_000)
-      assert.isTrue(kit.notify.announced.every((a) => a.text === "dinner is ready"))
+      assert.deepStrictEqual([...new Set(kit.notify.announced.map((a) => a.text))].sort(), ["dinner is ready", "the film starts"])
       assert.notInclude(where(kit), "kitchen-display")
       assert.strictEqual(kit.phrases.spoken.at(-1)?.text.startsWith("Announcing on"), true)
-      // A room, taken as text and found among the rooms; the longest phrase wins ("announce in the … that …").
-      yield* kit.phrases.say("announce in the Kids' room that lights out", { device: "kitchen-display" })
+      // The chime for everyone.
+      yield* kit.phrases.say("ring the bell for everyone", { device: "kitchen-display" })
       yield* kit.advance(5_000)
-      assert.deepStrictEqual(kit.notify.announced.filter((a) => a.text === "lights out").map((a) => a.deviceId), ["kids-tablet"])
-      // A room nobody has: its own sentence, nothing announced.
-      const before = kit.notify.announced.length
-      yield* kit.phrases.say("tell the garden that hello", { device: "kitchen-display" })
-      assert.strictEqual(kit.phrases.spoken.at(-1)?.text.startsWith("I don't know a room called garden."), true)
+      assert.isTrue(kit.notify.announced.some((a) => a.text === "Attention."))
+      // Neighbours that name a destination, or none, are not taken: they go to the assistant, whose tool names the room.
+      const sent = kit.notify.announced.length
+      for (const words of [
+        "announce in Study that dinner is ready",
+        "announce in the study that dinner is ready",
+        "announce to the Study that dinner is ready",
+        "announce dinner is ready",
+        "announce that dinner is ready",
+        "tell the kitchen that dinner is ready",
+        "tell Study dinner is ready",
+        "ring the dinner bell",
+        "ring the bell in the study"
+      ]) assert.deepStrictEqual(yield* kit.phrases.say(words, { device: "kitchen-display" }), { taken: false }, words)
       yield* kit.advance(5_000)
-      assert.strictEqual(kit.notify.announced.length, before)
-      // The chime, with and without a room.
-      yield* kit.phrases.say("ring the dinner bell", { device: "kitchen-display" })
-      yield* kit.phrases.say("ring the bell in the study", { device: "kitchen-display" })
+      assert.strictEqual(kit.notify.announced.length, sent)
+      // "tell everyone in the study …" is taken by the phrase, but the action does not read it as a message for everyone.
+      const said = yield* kit.phrases.say("tell everyone in the study that dinner is ready", { device: "kitchen-display" })
+      assert.isTrue(said.taken)
+      assert.strictEqual(kit.phrases.spoken.at(-1)?.text, "That sounds meant for one room, so I did not announce it to everyone. Ask the assistant to tell that room.")
       yield* kit.advance(5_000)
-      assert.deepStrictEqual(kit.notify.announced.filter((a) => a.text === "Attention.").map((a) => a.deviceId).filter((d) => d === "study-tablet").length, 2)
-      // Words that are not a phrase of it are not taken.
-      assert.deepStrictEqual(yield* kit.phrases.say("what is the weather", { device: "kitchen-display" }), { taken: false })
+      assert.strictEqual(kit.notify.announced.length, sent)
     }))
 
-  it.effect("phrase commands in Dutch", () =>
+  it.effect("phrase commands in Dutch: the whole house only", () =>
     Effect.gen(function*() {
       const kit = yield* startTestModule(broadcastModule, { household: { devices: HOUSE, home: { HOME_LANGUAGE: "nl-NL" } } })
       yield* kit.phrases.say("zeg tegen iedereen dat het eten klaar is", { device: "kitchen-display" })
-      yield* kit.phrases.say("zeg tegen de Study dat het eten klaar is", { device: "kitchen-display" })
-      yield* kit.phrases.say("zeg tegen de tuin dat het eten klaar is", { device: "kitchen-display" })
-      yield* kit.phrases.say("bel de gong", { device: "kitchen-display" })
+      yield* kit.phrases.say("omroepen voor iedereen het eten is klaar", { device: "kitchen-display" })
+      yield* kit.phrases.say("bel de gong voor iedereen", { device: "kitchen-display" })
       yield* kit.advance(5_000)
-      assert.strictEqual(kit.phrases.spoken[2]?.text.startsWith("Ik ken geen kamer die tuin heet."), true)
-      assert.include(kit.notify.announced.map((a) => a.text), "het eten klaar is")
-      assert.include(kit.notify.announced.map((a) => a.text), "Aandacht.")
+      const texts = new Set(kit.notify.announced.map((a) => a.text))
+      assert.deepStrictEqual([...texts].sort(), ["Aandacht.", "het eten is klaar", "het eten klaar is"])
+      const sent = kit.notify.announced.length
+      for (const words of ["omroepen in Study dat eten klaar", "omroepen het eten is klaar", "zeg tegen de keuken dat ik eraan kom", "omroepen in de studeerkamer dat eten klaar is", "bel de gong", "bel de gong in de keuken"]) {
+        assert.deepStrictEqual(yield* kit.phrases.say(words, { device: "kitchen-display" }), { taken: false }, words)
+      }
+      yield* kit.phrases.say("zeg tegen iedereen in de keuken dat het eten klaar is", { device: "kitchen-display" })
+      assert.strictEqual(kit.phrases.spoken.at(-1)?.text, "Dat klinkt bedoeld voor één kamer, dus ik heb het niet aan iedereen omgeroepen. Vraag de assistent het die kamer te zeggen.")
+      yield* kit.advance(5_000)
+      assert.strictEqual(kit.notify.announced.length, sent)
       // The action's own words are checked too: a line over the bound is refused with a sentence, nothing announced.
       const long = yield* kit.action("send", { message: "y".repeat(201) }, { device: "kitchen-display" })
       assert.deepStrictEqual(long, { ok: true, say: "Ik roep één regel van hooguit 200 tekens om." })
@@ -331,7 +346,7 @@ describe("broadcast", () => {
       const all = yield* kit.tool("broadcast_send", { message: "Het eten is klaar" }, { device: "kitchen-display" })
       assert.strictEqual(
         said(all),
-        "Ik roep het om op Hall screen, Kids tablet en nog drie. Niet omgeroepen op Attic node (niet verbonden) en Garage screen (kan niet praten). Ik toon het ook op Garage screen, Hall screen en nog drie."
+        "Ik roep het om op Hall screen, Kids tablet en 3 meer. Niet omgeroepen op Attic node (niet verbonden) en Garage screen (kan niet praten). Ik toon het ook op Garage screen, Hall screen en 3 meer."
       )
       yield* kit.present.settle
       const [card] = kit.present.shown("study-tablet")
