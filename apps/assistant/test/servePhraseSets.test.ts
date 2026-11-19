@@ -54,9 +54,9 @@ describe("serve mode's phrase sets (E3)", () => {
       // Twelve equal assistant objects (an environment override makes a fresh one each time): the same set, nothing compiled.
       for (let i = 0; i < 12; i++) {
         assistant = { ...withEnvironment({ ...exampleAssistant, id: "assistant" }, { env: { SYSTEM_PROMPT: `Prompt ${i}` } } as never).assistant, on: true }
-        const t = performance.now()
+        // The same object back and nothing compiled (asserted below) is the claim; a wall-clock limit here measured the CI
+        // machine's load, not this code.
         expect(phrases.commandsFor("assistant")).toBe(set)
-        expect(performance.now() - t).toBeLessThan(5)
       }
       await Effect.runPromise(phrases.sets.settled)
       expect(phrases.sets.stats().compiled).toBe(1)
