@@ -32,50 +32,60 @@ const removeDevice = (kit: Kit, id: string) => {
   devices.list = () => all().filter((d) => d.id !== id)
 }
 
+/** The lists module with its `shared` context changed by `wrap` (the fault injections below; loosely typed on purpose). */
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+const withShared = (wrap: (ctx: any) => any, after: (value: unknown) => void = () => {}) =>
+  ({
+    ...listsModule,
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    shared: (ctx: any) => listsModule.shared!(wrap(ctx)).pipe(Effect.tap((r) => Effect.sync(() => after(r.value))))
+  }) as typeof listsModule
+
+/** When the host ends a device's checklist (its live presentation's `expiresAt`). */
+const endOn = (kit: Kit, device: string) =>
+  kit.present.engine.live().find((p) => p.module === "lists" && "device" in p.target && p.target.device === device)?.expiresAt
+
 /** The module with its pin removals refused while `refuse.on` (inside the transaction, as a busy store would). */
-const refusingRemovals = (refuse: { on: boolean }) => ({
-  ...listsModule,
-  shared: (ctx: Parameters<typeof listsModule.shared>[0]) =>
-    listsModule.shared({
-      ...ctx,
-      store: {
-        ...ctx.store,
-        transaction: (body: (tx: StoreTx) => never) =>
-          ctx.store.transaction((tx) =>
-            body({
-              ...tx,
-              collection: (c) => {
-                const h = tx.collection(c)
-                return c.name !== "pins" ? h : { ...h, remove: (...args: Parameters<typeof h.remove>) => {
+const refusingRemovals = (refuse: { on: boolean }) =>
+  withShared((ctx) => ({
+    ...ctx,
+    store: {
+      ...ctx.store,
+      transaction: (body: (tx: StoreTx) => unknown) =>
+        ctx.store.transaction((tx: StoreTx) =>
+          body({
+            ...tx,
+            collection: (c) => {
+              const h = tx.collection(c)
+              return c.name !== "pins" ? h : {
+                ...h,
+                remove: (...args: Parameters<typeof h.remove>) => {
                   if (refuse.on) throw new StoreError({ reason: "busy", message: "injected busy pin removal" })
                   return h.remove(...args)
-                } }
+                }
               }
-            } as StoreTx) as never
-          )
-      } as typeof ctx.store
-    })
-}) as typeof listsModule
+            }
+          })
+        )
+    }
+  }))
 
 /** The module whose next `present.show` is refused `busy` once per `fail.count`. */
-const refusingShows = (fail: { count: number }) => ({
-  ...listsModule,
-  shared: (ctx: Parameters<typeof listsModule.shared>[0]) =>
-    listsModule.shared({
-      ...ctx,
-      present: {
-        ...ctx.present,
-        show: (...args: Parameters<typeof ctx.present.show>) =>
-          Effect.suspend(() => {
-            if (fail.count > 0) {
-              fail.count--
-              return Effect.fail(new PresentError({ reason: "busy", message: "injected busy show" }))
-            }
-            return ctx.present.show(...args)
-          })
-      }
-    })
-}) as typeof listsModule
+const refusingShows = (fail: { count: number }) =>
+  withShared((ctx) => ({
+    ...ctx,
+    present: {
+      ...ctx.present,
+      show: (...args: ReadonlyArray<unknown>) =>
+        Effect.suspend(() => {
+          if (fail.count > 0) {
+            fail.count--
+            return Effect.fail(new PresentError({ reason: "busy", message: "injected busy show" }))
+          }
+          return ctx.present.show(...args)
+        })
+    }
+  }))
 
 describe("one pin per device, found by its id (finding 1)", () => {
   it.effect("removals that fail leave at most one row per device, which says 'remove me' and is removed by its next try; hide answers stay true", () =>
@@ -194,22 +204,18 @@ describe("a tick answers what was committed (finding 5)", () => {
     Effect.gen(function*() {
       const busy = { on: false }
       let engine: { setStatus: (...args: Array<never>) => Effect.Effect<unknown, unknown> } | undefined
-      const observed = {
-        ...listsModule,
-        shared: (ctx: Parameters<typeof listsModule.shared>[0]) =>
-          listsModule.shared({
-            ...ctx,
-            store: {
-              ...ctx.store,
-              collection: (c) => {
-                const h = ctx.store.collection(c)
-                if (c.name !== "pins") return h
-                const fail = <A>(read: Effect.Effect<A, StoreError>) => Effect.suspend(() => (busy.on ? Effect.fail(new StoreError({ reason: "busy", message: "injected busy pin read" })) : read))
-                return { ...h, get: (...a: Parameters<typeof h.get>) => fail(h.get(...a)), list: (...a: Parameters<typeof h.list>) => fail(h.list(...a)) }
-              }
-            } as typeof ctx.store
-          }).pipe(Effect.tap((r) => Effect.sync(() => void (engine = r.value as never))))
-      } as typeof listsModule
+      const observed = withShared((ctx) => ({
+        ...ctx,
+        store: {
+          ...ctx.store,
+          collection: (c: { readonly name: string }) => {
+            const h = ctx.store.collection(c)
+            if (c.name !== "pins") return h
+            const fail = <A, E>(read: Effect.Effect<A, E>): Effect.Effect<A, E | StoreError> => Effect.suspend((): Effect.Effect<A, E | StoreError> => (busy.on ? Effect.fail(new StoreError({ reason: "busy", message: "injected busy pin read" })) : read))
+            return { ...h, get: (...a: ReadonlyArray<unknown>) => fail(h.get(...a)), list: (...a: ReadonlyArray<unknown>) => fail(h.list(...a)) }
+          }
+        }
+      }), (value) => void (engine = value as never))
       const kit = yield* startTestModule(observed, { household: HOUSEHOLD })
       yield* kit.action("add", { items: "milk and eggs" })
       yield* kit.action("show", {}, { device: "kitchen-display" })
@@ -221,7 +227,7 @@ describe("a tick answers what was committed (finding 5)", () => {
       const r = yield* kit.present.press(shown.id, "tick", { device: "kitchen-display", item: egg.id, done: true })
       assert.deepStrictEqual(r, { ok: true, say: "Ticked off eggs on the shopping list." })
       busy.on = false
-      assert.strictEqual((yield* kit.action("read", { show: "done" })).say, "Ticked off on the shopping list: eggs.")
+      assert.deepStrictEqual(yield* kit.action("read", { show: "done" }), { ok: true, say: "Ticked off on the shopping list: eggs." })
       yield* kit.advance(retryIn(1))
       assert.deepStrictEqual(textsOn(kit, "kitchen-display"), ["milk"])
       // A status write that fails is still refused as before: nothing was committed.
@@ -239,17 +245,17 @@ describe("the end stays where it was put (finding 6)", () => {
       yield* kit.action("show", {}, { device: "kitchen-display" })
       yield* kit.present.settle
       const until = (yield* pinRows(kit))[0]!.value.until
-      const ends = kit.present.shown("kitchen-display")[0]!.expiresAt
+      const ends = endOn(kit, "kitchen-display")
       yield* kit.advance(6 * 3_600_000)
       yield* kit.restart
       yield* kit.present.settle
       assert.strictEqual((yield* pinRows(kit))[0]!.value.until, until)
-      assert.strictEqual(kit.present.shown("kitchen-display")[0]!.expiresAt, ends)
+      assert.strictEqual(endOn(kit, "kitchen-display"), ends)
       // Restarted again with less than the host's minimum left: left to end, not shown again for longer.
       yield* kit.advance(until - 2_000 - (yield* Clock.currentTimeMillis))
       yield* kit.restart
       yield* kit.present.settle
-      assert.strictEqual(kit.present.shown("kitchen-display")[0]?.expiresAt, ends)
+      assert.strictEqual(endOn(kit, "kitchen-display"), ends)
       yield* kit.advance(3_000)
       assert.deepStrictEqual(kit.present.shown("kitchen-display"), [])
       assert.deepStrictEqual(yield* pinRows(kit), [])
