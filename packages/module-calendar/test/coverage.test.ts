@@ -5,7 +5,7 @@
 import { assert, describe, it } from "@effect/vitest"
 import { BriefingSections } from "@pva/module-contracts"
 import { Effect } from "effect"
-import { advanceAndRefresh, AMS, calendar, ics, sayOf, served, startCalendar } from "./fixtures.ts"
+import { advanceAndRefresh, AMS, calendar, ics, sayOf, served, startCalendar, answerOf } from "./fixtures.ts"
 import { vi } from "vitest"
 
 // Several test households are started per test here: on a loaded CI machine one test can pass the default 5 s.
@@ -48,19 +48,19 @@ describe("calendar: every answer says what it covers", () => {
       yield* advanceAndRefresh(kit, 30 * 60_000) // the refresh at 10:07 fails; it is 10:30
       const every = [STALE, NOT_READ, INCOMPLETE]
 
-      const agenda = (yield* kit.tool("calendar_agenda", {}, hall)).value as Record<string, unknown>
+      const agenda = (yield* answerOf(kit, "calendar_agenda", {}, hall)).value as Record<string, unknown>
       assert.deepStrictEqual([agenda.stale, agenda.notRead, agenda.incomplete, agenda.withheld, agenda.continues], [STALE, NOT_READ, INCOMPLETE, WITHHELD, CONTINUES])
-      const week = (yield* kit.tool("calendar_agenda", { days: 3 }, hall)).value
+      const week = (yield* answerOf(kit, "calendar_agenda", { days: 3 }, hall)).value
       for (const s of [...every, WITHHELD, CONTINUES]) assert.include(text(week), s, "agenda, three days")
 
       // Next: the dentist, past Robin's twelve o'clock (withheld here).
-      const next = (yield* kit.tool("calendar_next", {}, hall)).value as Record<string, unknown>
+      const next = (yield* answerOf(kit, "calendar_next", {}, hall)).value as Record<string, unknown>
       assert.deepStrictEqual((next.next as { title: string }).title, "Dentist")
       assert.deepStrictEqual([next.stale, next.notRead, next.incomplete, next.withheld], [STALE, NOT_READ, INCOMPLETE, WITHHELD])
-      const course = (yield* kit.tool("calendar_next", { match: "course" }, hall)).value as Record<string, unknown>
+      const course = (yield* answerOf(kit, "calendar_next", { match: "course" }, hall)).value as Record<string, unknown>
       assert.deepStrictEqual(course.next, { title: "Course", when: "today, all day until after Tuesday the nineteenth of January 2027", calendar: "Family" })
       for (const s of [...every, CONTINUES, "Personal calendars are not searched here."]) assert.include(text(course), s, "next with words")
-      const none = (yield* kit.tool("calendar_next", { match: "opera" }, hall)).value
+      const none = (yield* answerOf(kit, "calendar_next", { match: "opera" }, hall)).value
       for (const s of every) assert.include(text(none), s, "next, nothing found")
 
       const found = (yield* kit.tool("calendar_find", { text: "course" }, hall)).value as { notes: string }
@@ -106,7 +106,7 @@ describe("calendar: every answer says what it covers", () => {
     Effect.gen(function*() {
       const crowded = ics(Array.from({ length: 205 }, (_, i) => ({ uid: `c${i}`, summary: `Slot ${i}`, start: "20261118T110000", end: "20261118T111000", tz: AMS })))
       const { kit } = yield* startCalendar({ "https://cal.example.org/c.ics": served(crowded) }, { settings: { calendars: [calendar("Slots", "https://cal.example.org/c.ics")] } })
-      assert.include(text((yield* kit.tool("calendar_agenda", {})).value), CUT)
+      assert.include(text((yield* answerOf(kit, "calendar_agenda", {})).value), CUT)
       assert.include(text((yield* kit.tool("calendar_free", {})).value), CUT)
       assert.include(sayOf(yield* kit.action("today")), CUT)
       const [section] = yield* kit.contributions(BriefingSections, hall)
@@ -115,13 +115,13 @@ describe("calendar: every answer says what it covers", () => {
       // "Next" from now: today's events that have not ended are more than it reads, so it cannot name the earliest. It
       // says so, with no number and no "nothing", and offers today's agenda (deciding review, finding 8).
       const unsure = "There are too many events around now for me to tell which comes next; ask me what is on today instead."
-      assert.deepStrictEqual((yield* kit.tool("calendar_next", {})).value, { spoken: unsure })
-      assert.deepStrictEqual((yield* kit.tool("calendar_next", { match: "talk" })).value, { spoken: unsure })
+      assert.deepStrictEqual((yield* answerOf(kit, "calendar_next", {})).value, { spoken: unsure })
+      assert.deepStrictEqual((yield* answerOf(kit, "calendar_next", { match: "talk" })).value, { spoken: unsure })
       assert.deepStrictEqual(yield* kit.action("next_event"), { ok: true, say: unsure })
       assert.deepStrictEqual(yield* kit.action("when_is", { match: "slot" }), { ok: true, say: unsure })
       const nl = yield* startCalendar({ "https://cal.example.org/c.ics": served(crowded) }, { settings: { calendars: [calendar("Slots", "https://cal.example.org/c.ics")] }, household: { home: { HOME_LANGUAGE: "nl-NL", HOME_TIME_ZONE: AMS } } })
       const onzeker = "Er zijn rond nu te veel afspraken om te zeggen welke de volgende is; vraag me liever wat er vandaag in de agenda staat."
-      assert.deepStrictEqual((yield* nl.kit.tool("calendar_next", {})).value, { spoken: onzeker })
+      assert.deepStrictEqual((yield* answerOf(nl.kit, "calendar_next", {})).value, { spoken: onzeker })
       assert.deepStrictEqual(yield* nl.kit.action("next_event"), { ok: true, say: onzeker })
     }), 60_000)
 })

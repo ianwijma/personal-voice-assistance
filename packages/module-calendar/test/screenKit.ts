@@ -1,17 +1,19 @@
-// The module started with its presentations recorded (what it asked to show, and for whom) beside what the kit's pages hold.
-import { type ModulePresent, type Presentation, type PresentTarget } from "@pva/core"
+// The module started with what its tools and actions return to be shown recorded (the structured result: the
+// presentation, with `spoken` and its sensitivity), beside what the kit's pages hold.
+import { isPresentResult, type Presentation } from "@pva/core"
 import { makeOfflineNet, type OfflineFixtures, startTestModule, type TestHouseholdInput } from "@pva/core/testing"
 import { Effect } from "effect"
 import { calendarModuleWith } from "../src/index.ts"
 import { advanceAndRefresh } from "./fixtures.ts"
 
-/** What `start` is given: the host's part context of a version 2 module. */
-export type Started = Parameters<NonNullable<ReturnType<typeof calendarModuleWith>["start"]>>[0] & { readonly present: ModulePresent }
-
 export interface Asked {
-  readonly target: PresentTarget
   readonly presentation: Presentation
+  /** What the tool returned for the model, or what the action said. */
+  readonly answer: unknown
 }
+
+type Definition = ReturnType<typeof calendarModuleWith>
+export type Started = Parameters<NonNullable<Definition["start"]>>[0]
 
 export const startShown = (
   fixtures: OfflineFixtures,
@@ -25,19 +27,28 @@ export const startShown = (
     const net = makeOfflineNet(fixtures)
     const base = calendarModuleWith({ resolver: net.resolver, connector: net.connector })
     const asked: Array<Asked> = []
-    const recording = (present: ModulePresent): ModulePresent => ({
-      ...present,
-      show: (target, presentation, o) => {
-        asked.push({ target, presentation })
-        return present.show(target, presentation, o)
-      }
-    })
-    const definition = { ...base, start: (ctx: Started) => base.start!({ ...ctx, present: recording(ctx.present) } as never) } as typeof base
+    let started: { readonly tools: ReadonlyArray<{ readonly name: string; readonly speculative?: boolean }>; readonly actions: ReadonlyArray<{ readonly id: string; readonly speculative?: boolean }> } = { tools: [], actions: [] }
+    const record = (value: unknown, answer: (v: unknown) => unknown) => {
+      if (isPresentResult(value)) asked.push({ presentation: value.present, answer: answer(value) })
+      else if (typeof value === "object" && value !== null && "present" in value) asked.push({ presentation: (value as { present: Presentation }).present, answer: (value as { say?: unknown }).say })
+    }
+    const definition = {
+      ...base,
+      start: (ctx: Started) =>
+        Effect.map(base.start!(ctx), (s) => {
+          started = { tools: s.tools ?? [], actions: s.actions ?? [] }
+          return s
+        }).pipe(Effect.map((started) => ({
+          ...started,
+          tools: (started.tools ?? []).map((t) => ({ ...t, execute: (input: never) => Effect.tap(t.execute(input), (v) => Effect.sync(() => record(v, (r) => (r as { forModel: unknown }).forModel))) })),
+          actions: (started.actions ?? []).map((a) => ({ ...a, run: (values: never) => Effect.tap(a.run(values), (v) => Effect.sync(() => record(v, () => undefined))) }))
+        })))
+    } as unknown as Definition
     const kit = yield* startTestModule(definition, {
       ...(options.settings !== undefined ? { settings: options.settings } : {}),
       ...(options.household !== undefined ? { household: options.household } : {}),
       ...(options.startAt !== undefined ? { startAt: options.startAt } : {})
     })
     yield* advanceAndRefresh(kit, 0)
-    return { kit, asked }
+    return { kit, asked, started: () => started }
   })

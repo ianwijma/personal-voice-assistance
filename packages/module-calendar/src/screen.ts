@@ -1,6 +1,6 @@
-import { CurrentTurn, type ModulePresent, type Presentation, presentationProblem, type PresentHandle, type Row } from "@pva/core"
+import { type Presentation, type Row } from "@pva/core"
+import { numberToWords, speakList, speakNumber } from "@pva/language"
 import { say } from "@pva/module-contracts"
-import { Clock, Effect } from "effect"
 import type { View } from "./read.ts"
 import type { Occurrence } from "./store.ts"
 import { cutPoints, oneLine } from "./text.ts"
@@ -15,8 +15,10 @@ import { addDays, type LocalDate } from "./time.ts"
  * - **The same decision as the answer.** Only rows the asking turn may see are built into it: a title only of an event
  *   shown in full, "Robin is busy from two to three" only where the answer reduces, a count only for what is withheld.
  *   A presentation holding events of a member is marked `personal` for that member, so the Presenter asks
- *   `Privacy.mayReveal` for the device again at every moment it would show it. A list holds the events of one member
- *   at most (the first one the answer shows); the events of another are counted on it, never listed.
+ *   `Privacy.mayReveal` for the device again at every moment it would show it; an answer about one person's calendar
+ *   is that person's also when it holds no event. A list holds the events of one member at most (the first one the
+ *   answer shows); the events of another, and every event the answer reduced to busy time, are only counted on it
+ *   ("2 events of others are not shown here."), never named: a screen has no reduced form.
  * - **The same notes.** What `coverage` says beside an answer (stale, read in part, not read, cut, withheld, goes on
  *   after the last day) is on the presentation as short lines, built from `coverage` itself (`View.screenNotes`).
  * - **Bounds.** Whole lines are budgeted before anything is rendered (events first, then busy times, an honest "and 4
@@ -48,7 +50,10 @@ export interface AgendaScreen {
   /** The events listed by the answer, then its busy times, in the answer's order. */
   readonly lines: ReadonlyArray<AgendaLine>
   /** Events and busy times the answer only counted ("more", "moreBusy"). */
-  readonly counted: number
+  readonly more: number
+  readonly moreBusy: number
+  /** Whose calendar the request was about (a Members id), when it named one person: the presentation is theirs even with no event. */
+  readonly owner?: string
   readonly cut: boolean
   readonly withheld: number
   /** What the answer says when it holds nothing ("Today: nothing on the calendar."), the same sentence. */
@@ -96,43 +101,51 @@ const fitSpoken = (sentence: (items: number) => string, itemsMax: number, itemsM
 export const agendaPresentation = (v: View, a: AgendaScreen): Presentation => {
   const lang = v.m.lang
   const many = a.count > 1
-  // One member's events at most: the first one a shown event has; another's are only counted.
-  const owner = a.lines.find((l) => l.how === "show" && l.row.value.owner !== undefined)?.row.value.owner
-  const listed = a.lines.filter((l) => l.how === "reduce" || l.row.value.owner === undefined || l.row.value.owner === owner)
-  const others = a.lines.filter((l) => l.how === "show" && l.row.value.owner !== undefined && l.row.value.owner !== owner).length
+  // One member's events at most: the request's person, else the first one a shown event has; another's are only counted.
+  const owner = a.owner ?? a.lines.find((l) => l.how === "show" && l.row.value.owner !== undefined)?.row.value.owner
+  const shown = a.lines.filter((l) => l.how === "show")
+  const kept = shown.filter((l) => l.row.value.owner === undefined || l.row.value.owner === owner)
+  // Never named: another member's events, and every busy time the answer reduced (a screen has no reduced form).
+  const others = shown.length - kept.length + (a.lines.length - shown.length) + a.moreBusy
   const lineText = (l: AgendaLine): string => {
-    const day = many ? v.dayWords(l.day) : undefined
-    const body = (titleMax: number) => {
-      const r = l.row
-      if (l.how === "show") return v.item(l.day, r, titleMax, true)
-      const red = v.reduced(l.day, r)
-      return say(texts, lang, "screenBusy", { name: cutPoints(oneLine(red.busy), 30, true), when: say(texts, lang, "busyFromTo", { from: red.from, to: red.to }) })
-    }
     const build = (titleMax: number) => {
-      const t = oneLine(body(titleMax))
-      return day === undefined ? t : say(texts, lang, "screenDayItem", { day, item: t })
+      const t = oneLine(v.item(l.day, l.row, titleMax, true))
+      return many ? say(texts, lang, "screenDayItem", { day: v.dayWords(l.day), item: t }) : t
     }
     return fitItem(build, l.row.value.title.length)
   }
-  const texts80 = listed.map(lineText)
+  const eventTexts = kept.map(lineText)
   const notes = [...v.screenNotes(a.covered, { cut: a.cut, withheld: a.withheld, ...(a.continuesAfter !== undefined ? { continuesAfter: a.continuesAfter } : {}) })]
-  if (others > 0) notes.push(say(texts, lang, "screenOthers", { count: others }))
+  if (others > 0) notes.push(say(texts, lang, others === 1 ? "screenOthersOne" : "screenOthers", { count: others }))
   const noteLines = notes.map((n) => cutPoints(n, ITEM_CHARS, true))
-  const total = texts80.length + a.counted
+  // Events the list holds or counts: what it shows, plus what the answer only counted. The filtered ones are separate.
+  const total = eventTexts.length + a.more
   const when = many ? `${v.dayWords(a.first)} – ${v.dayWords(addDays(a.first, a.count - 1))}` : v.dayWords(a.first)
   const Day = when.length === 0 ? when : when[0]!.toUpperCase() + when.slice(1)
-  const title = cutPoints(oneLine(total === 0 ? a.nothing : Day), TITLE_CHARS, true)
+  const title = cutPoints(oneLine(total === 0 && a.nothing !== "" ? a.nothing : Day), TITLE_CHARS, true)
 
-  // Whole lines before rendering: the notes keep their places, the events share the rest with "and N more".
+  // Whole lines before rendering: the notes keep their places, the events share the rest with "and N more", which is
+  // the total minus what is actually shown.
   const slots = Math.max(1, LIST_ITEMS - noteLines.length)
   const moreLine = (count: number) => say(texts, lang, a.cut ? "screenMoreAtLeast" : "screenMore", { count })
-  const content: Array<string> = total <= slots ? [...texts80, ...(a.counted > 0 ? [moreLine(a.counted)] : [])] : [...texts80.slice(0, slots - 1), moreLine(total - (slots - 1))]
+  const showing = total <= slots ? eventTexts.length : Math.min(eventTexts.length, slots - 1)
+  const content: Array<string> = [...eventTexts.slice(0, showing), ...(total > showing ? [moreLine(total - showing)] : [])]
   const items = [...content, ...noteLines].slice(0, LIST_ITEMS).map((text, i) => ({ id: `${i < content.length ? "e" : "n"}${i + 1}`, text }))
 
-  const sentence = (n: number) => say(texts, lang, "dayList", { Day, list: v.listOf(texts80.slice(0, n), total, n) })
+  // The spoken fallback is a sentence: "Today: A.", "Today: A and B.", "Today: A, B and 3 more.", "Today: nothing ...".
+  const remainderWords = (r: number) => say(texts, lang, "nMore", { count: r <= 20 ? (numberToWords(r, lang) ?? String(r)) : (speakNumber(r, lang) ?? String(r)) })
+  const sentence = (n: number): string => {
+    const parts = [...eventTexts.slice(0, n), ...(total - n > 0 ? [remainderWords(total - n)] : [])]
+    // Never a bound below two for the language's list: one part is said as it is.
+    const list = parts.length === 1 ? parts[0]! : (speakList(parts, lang, { max: Math.max(2, parts.length) }) ?? parts.join(", "))
+    return say(texts, lang, "dayList", { Day, list })
+  }
+  const moreNotes = say(texts, lang, "screenMoreNotes")
   const spoken = total === 0
-    ? [a.nothing, ...budgetNotes(notes, SPOKEN_CHARS - a.nothing.length - 1, say(texts, lang, "screenMoreNotes"), 1)].join(" ")
-    : fitSpoken(sentence, Math.min(SPOKEN_ITEMS, texts80.length), Math.min(2, texts80.length), notes, say(texts, lang, "screenMoreNotes"), say(texts, lang, a.cut ? "screenCountAtLeast" : "screenCount", { Day, count: total }))
+    ? [a.nothing !== "" ? a.nothing : say(texts, lang, "screenNothingToShow", { Day }), ...budgetNotes(notes, SPOKEN_CHARS - 80, moreNotes, 1)].join(" ")
+    : eventTexts.length === 0
+    ? [say(texts, lang, a.cut ? "screenCountAtLeast" : "screenCount", { Day, count: total }), ...budgetNotes(notes, SPOKEN_CHARS - 80, moreNotes, 1)].join(" ")
+    : fitSpoken(sentence, Math.min(SPOKEN_ITEMS, eventTexts.length), 1, notes, moreNotes, say(texts, lang, a.cut ? "screenCountAtLeast" : "screenCount", { Day, count: total }))
   return {
     kind: "list",
     title,
@@ -152,6 +165,10 @@ export interface NextScreen {
   /** What the answer says when there is no event. */
   readonly noneSentence?: string
   readonly notes: ReadonlyArray<string>
+  /** With the place and the calendar as facts (the tool's answer has them); without: the title and when, as the action says it. */
+  readonly detail: boolean
+  /** Whose calendar the request was about: the card is theirs also when there is no event. */
+  readonly owner?: string
 }
 
 /** The card for the next appointment. */
@@ -170,7 +187,8 @@ export const nextPresentation = (v: View, a: NextScreen): Presentation => {
       title: say(texts, lang, "screenNextTitle"),
       text: [sentence, ...notes].join("\n"),
       spoken: cutPoints(spokenNotes(sentence), SPOKEN_CHARS),
-      facts: []
+      facts: [],
+      ...(a.owner !== undefined ? { sensitivity: { personal: a.owner } } : {})
     }
   }
   const r = a.row
@@ -179,8 +197,8 @@ export const nextPresentation = (v: View, a: NextScreen): Presentation => {
   const when = a.when!.length <= FACT_VALUE_CHARS ? a.when! : a.whenShort!
   const facts = [
     { label: say(texts, lang, "screenWhen"), value: cutPoints(oneLine(when), FACT_VALUE_CHARS, true) },
-    ...(val.location !== undefined && oneLine(val.location) !== "" ? [{ label: say(texts, lang, "screenWhere"), value: cutPoints(oneLine(val.location), FACT_VALUE_CHARS, true) }] : []),
-    { label: say(texts, lang, "screenCalendar"), value: cutPoints(oneLine(v.calendarOf(r)), FACT_VALUE_CHARS, true) }
+    ...(a.detail && val.location !== undefined && oneLine(val.location) !== "" ? [{ label: say(texts, lang, "screenWhere"), value: cutPoints(oneLine(val.location), FACT_VALUE_CHARS, true) }] : []),
+    ...(a.detail ? [{ label: say(texts, lang, "screenCalendar"), value: cutPoints(oneLine(v.calendarOf(r)), FACT_VALUE_CHARS, true) }] : [])
   ]
   const head = say(texts, lang, "nextIs", { title: cutPoints(oneLine(v.titleOf(r, 120)), 80, true), when: a.when! })
   return {
@@ -189,46 +207,6 @@ export const nextPresentation = (v: View, a: NextScreen): Presentation => {
     ...(notes.length > 0 ? { text: notes.join("\n") } : {}),
     facts,
     spoken: cutPoints(spokenNotes(head.length <= SPOKEN_CHARS - 60 ? head : say(texts, lang, "nextIs", { title, when: a.whenShort! })), SPOKEN_CHARS),
-    ...(val.owner !== undefined ? { sensitivity: { personal: val.owner } } : {})
-  }
-}
-
-// ---------------------------------------------------------------------------------------------------------------------
-// Showing, and taking down when the calendars change
-
-/**
- * The presentations of this run that are on a screen, the newest of each device (a device shows one transient at a time,
- * so an older one of the same device is gone already). Kept in `shared`, so a refresh that changes what the calendars say
- * takes them down; bounded by `MAX_DEVICES`. After a restart there are none: no transient presentation survives one.
- */
-const MAX_DEVICES = 64
-
-export interface Screen {
-  /** Show `presentation` on the device the turn came from; a screen that cannot show it changes nothing. */
-  readonly show: (present: ModulePresent, presentation: Presentation) => Effect.Effect<void>
-  /** Take down everything shown by this module (the calendars changed). */
-  readonly dismissAll: Effect.Effect<void>
-}
-
-export const makeScreen = (): Screen => {
-  const live = new Map<string, PresentHandle>()
-  return {
-    show: (present, presentation) =>
-      Effect.gen(function*() {
-        const turn = yield* CurrentTurn
-        if (turn?.deviceId === undefined) return
-        const now = yield* Clock.currentTimeMillis
-        // Never a presentation the Presenter would refuse; what is shown is what the checks allow.
-        if (presentationProblem(presentation, now) !== undefined) return
-        const handle = yield* present.show("origin", presentation)
-        live.delete(turn.deviceId)
-        live.set(turn.deviceId, handle)
-        while (live.size > MAX_DEVICES) live.delete(live.keys().next().value!)
-      }).pipe(Effect.catchTag("PresentError", () => Effect.void)),
-    dismissAll: Effect.gen(function*() {
-      const handles = [...live.values()]
-      live.clear()
-      for (const h of handles) yield* h.dismiss.pipe(Effect.catchCause(() => Effect.void))
-    })
+    ...(a.owner ?? val.owner) !== undefined ? { sensitivity: { personal: (a.owner ?? val.owner)! } } : {}
   }
 }

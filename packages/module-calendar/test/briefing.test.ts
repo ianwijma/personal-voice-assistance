@@ -3,7 +3,7 @@ import { assert, describe, it } from "@effect/vitest"
 import type { TestHouseholdInput } from "@pva/core/testing"
 import { BRIEFING_LIMITS, type BriefingRequest, type BriefingSectionResult, BriefingSections } from "@pva/module-contracts"
 import { Effect, Exit } from "effect"
-import { advanceAndRefresh, allFixtures, AMS, calendar, everyone, ics, served, startCalendar } from "./fixtures.ts"
+import { advanceAndRefresh, allFixtures, AMS, calendar, everyone, ics, served, startCalendar, answerOf } from "./fixtures.ts"
 import { vi } from "vitest"
 
 // Several test households are started per test here: on a loaded CI machine one test can pass the default 5 s.
@@ -122,7 +122,7 @@ describe("calendar: the briefing section", () => {
       })
       const r = yield* (yield* sectionOf(kit, "hall-screen"))()
       assert.deepStrictEqual(sentencesOf(r), ["Today: nothing on the calendar.", "There are more events than I read; this is the first part."])
-      assert.deepStrictEqual((yield* kit.tool("calendar_agenda", { who: "household" }, { device: "hall-screen" })).value, {
+      assert.deepStrictEqual((yield* answerOf(kit, "calendar_agenda", { who: "household" }, { device: "hall-screen" })).value, {
         spoken: "Today: nothing on the calendar. There are more events than I read; this is the first part."
       })
     }))

@@ -23,8 +23,7 @@ import {
   refreshed,
   served,
   sleepReal,
-  startCalendar
-} from "./fixtures.ts"
+  startCalendar, answerOf } from "./fixtures.ts"
 import { vi } from "vitest"
 
 // These tests expand whole calendars (and some start real workers): on a slow two-core CI runner one of them can take
@@ -145,7 +144,7 @@ describe("calendar: the refresh job", () => {
       const job = (yield* kit.jobs).find((j) => j.key === "refresh")!
       assert.strictEqual(job.state, "scheduled")
       assert.strictEqual(job.lastError, "Could not read: Family (unreachable)")
-      const today = yield* kit.tool("calendar_agenda", {})
+      const today = yield* answerOf(kit, "calendar_agenda", {})
       assert.strictEqual((today.value as { stale?: string }).stale, "Family could not be refreshed since today at ten o'clock; this is what I had then.")
       assert.strictEqual((today.value as { events: Array<unknown> }).events.length, 3)
       assert.deepStrictEqual(yield* kit.action("tomorrow"), { ok: true, say: "Tomorrow: Bins out, all day. Family could not be refreshed since today at ten o'clock; this is what I had then." })
@@ -153,7 +152,7 @@ describe("calendar: the refresh job", () => {
       down = false
       yield* advanceAndRefresh(kit, 3_600_000)
       assert.isUndefined((yield* kit.moduleStore().collection(sources).list({}))[0]!.value.error)
-      assert.isUndefined(((yield* kit.tool("calendar_agenda", {})).value as { stale?: string }).stale)
+      assert.isUndefined(((yield* answerOf(kit, "calendar_agenda", {})).value as { stale?: string }).stale)
     }))
 
   it.effect("a slow server: the fetch's time limit ends the request, and the calendar is marked unreachable", () =>
@@ -167,7 +166,7 @@ describe("calendar: the refresh job", () => {
         yield* sleepReal(20)
       }
       assert.strictEqual((yield* kit.moduleStore().collection(sources).list({}))[0]?.value.error, "unreachable")
-      assert.deepStrictEqual((yield* kit.tool("calendar_agenda", {})).value, { spoken: "The calendars have not been read yet. Try again in a minute." })
+      assert.deepStrictEqual((yield* answerOf(kit, "calendar_agenda", {})).value, { spoken: "The calendars have not been read yet. Try again in a minute." })
     }))
 
   it.effect("rubbish: a web page, JSON, text that is no calendar, a server error and a file too large are each a reason of their own", () =>
@@ -185,7 +184,7 @@ describe("calendar: the refresh job", () => {
       const states = new Map((yield* kit.moduleStore().collection(sources).list({})).map((s) => [s.value.name, s.value.error ?? "ok"]))
       assert.deepStrictEqual(Object.fromEntries(states), { page: "not-calendar", data: "not-calendar", text: "not-calendar", error: "status", huge: "too-large", ok: "ok" })
       // The good calendar is read; what the others said is never stored or repeated; the others are named as not read.
-      const today = yield* kit.tool("calendar_agenda", {})
+      const today = yield* answerOf(kit, "calendar_agenda", {})
       assert.strictEqual((today.value as { events: Array<unknown> }).events.length, 3)
       assert.strictEqual((today.value as { notRead?: string }).notRead, "page, data, text and two more has not been read yet, so its events are not in this.")
       assert.notInclude(today.content, "Log in")
@@ -205,7 +204,7 @@ describe("calendar: the refresh job", () => {
         const state = (yield* stateOf(kit))!
         assert.strictEqual(state.error, "not-calendar")
         assert.strictEqual(state.okAt, okAt)
-        const today = (yield* kit.tool("calendar_agenda", {})).value as { events: Array<{ title: string }>; stale?: string }
+        const today = (yield* answerOf(kit, "calendar_agenda", {})).value as { events: Array<{ title: string }>; stale?: string }
         assert.deepStrictEqual(today.events.map((e) => e.title), ["Dentist"])
         assert.include(today.stale!, "Family could not be refreshed since today at ten o'clock")
       }
@@ -220,19 +219,19 @@ describe("calendar: the refresh job", () => {
       let body = partial
       const { kit } = yield* startCalendar({ "https://cal.example.org/family.ics": () => served(body) }, familyOnly)
       assert.strictEqual((yield* stateOf(kit))!.unreadable, 1)
-      const friday = (yield* kit.tool("calendar_agenda", { day: "Friday" })).value as { events: Array<unknown>; incomplete?: string }
+      const friday = (yield* answerOf(kit, "calendar_agenda", { day: "Friday" })).value as { events: Array<unknown>; incomplete?: string }
       assert.strictEqual(friday.incomplete, "Family could be read only in part: 1 events could not be read.")
       assert.deepStrictEqual(yield* kit.action("today"), { ok: true, say: "Today: nothing on the calendar. Family could be read only in part: 1 events could not be read." })
       // 3,100 events: more occurrences than a calendar keeps. Not the first 3,000 as if they were all: a failed refresh.
       body = ics(Array.from({ length: 3_100 }, (_, i) => ({ uid: `e${i}`, summary: `E${i}`, start: i < 3_000 ? "20261119T100000Z" : "20261120T100000Z", end: i < 3_000 ? "20261119T101000Z" : "20261120T101000Z" })))
       yield* advanceAndRefresh(kit, 3_600_000)
       assert.strictEqual((yield* stateOf(kit))!.error, "too-many")
-      const after = (yield* kit.tool("calendar_agenda", { day: "Friday" })).value as { events: Array<{ title: string }>; stale?: string }
+      const after = (yield* answerOf(kit, "calendar_agenda", { day: "Friday" })).value as { events: Array<{ title: string }>; stale?: string }
       assert.deepStrictEqual(after.events.map((e) => e.title), ["Dentist"])
       assert.include(after.stale!, "could not be refreshed since")
       // Never read whole: nothing is said to be on it, or free.
       const first = yield* startCalendar({ "https://cal.example.org/family.ics": served(body) }, familyOnly)
-      assert.deepStrictEqual((yield* first.kit.tool("calendar_agenda", { day: "Friday" })).value, { spoken: "The calendars have not been read yet. Try again in a minute." })
+      assert.deepStrictEqual((yield* answerOf(first.kit, "calendar_agenda", { day: "Friday" })).value, { spoken: "The calendars have not been read yet. Try again in a minute." })
       assert.deepStrictEqual((yield* first.kit.tool("calendar_free", { day: "Friday" })).value, { spoken: "The calendars have not been read yet. Try again in a minute." })
     }))
 
@@ -245,15 +244,15 @@ describe("calendar: the refresh job", () => {
       ])
       const { kit } = yield* startCalendar({ "https://cal.example.org/family.ics": served(body) }, familyOnly)
       for (const day of ["2026-12-01", "2026-12-02", "2026-12-10", "2026-12-14"]) {
-        assert.include(eventsOf((yield* kit.tool("calendar_agenda", { day })).value), "Trip", day)
+        assert.include(eventsOf((yield* answerOf(kit, "calendar_agenda", { day })).value), "Trip", day)
       }
-      assert.notInclude(eventsOf((yield* kit.tool("calendar_agenda", { day: "2026-12-15" })).value), "Trip")
-      const today = (yield* kit.tool("calendar_agenda", {})).value as { events: Array<unknown> }
+      assert.notInclude(eventsOf((yield* answerOf(kit, "calendar_agenda", { day: "2026-12-15" })).value), "Trip")
+      const today = (yield* answerOf(kit, "calendar_agenda", {})).value as { events: Array<unknown> }
       assert.deepStrictEqual(today.events, [
         { title: "Exhibition", allDay: true, from: "Sunday the first of November 2026", to: "Tuesday", calendar: "Family" },
         { title: "Trip", allDay: true, from: "today", to: "Monday the fourteenth of December", calendar: "Family" }
       ])
-      const later = (yield* kit.tool("calendar_agenda", { day: "2027-01-19" })).value as { events: Array<unknown>; continues?: string }
+      const later = (yield* answerOf(kit, "calendar_agenda", { day: "2027-01-19" })).value as { events: Array<unknown>; continues?: string }
       assert.deepStrictEqual(later.events, [{ title: "Course", allDay: true, from: "Tuesday the first of December", continuesAfter: "Tuesday the nineteenth of January 2027", calendar: "Family" }])
       assert.strictEqual(later.continues, "Some of these go on after Tuesday the nineteenth of January 2027, the last day I have.")
       assert.strictEqual((yield* allRows(kit)).filter((r) => r.value.title === "Trip").length, 27)
@@ -281,10 +280,10 @@ describe("calendar: the refresh job", () => {
       yield* until(() => held)
       assert.isAbove(control.insertedRows, base)
       // The new row is written, not published: the answer is the last generation's, whole.
-      assert.deepStrictEqual(eventsOf((yield* kit.tool("calendar_agenda", {})).value), ["Dentist two o'clock"])
+      assert.deepStrictEqual(eventsOf((yield* answerOf(kit, "calendar_agenda", {})).value), ["Dentist two o'clock"])
       release()
       yield* refreshed(kit)
-      assert.deepStrictEqual(eventsOf((yield* kit.tool("calendar_agenda", {})).value), ["Dentist four o'clock"])
+      assert.deepStrictEqual(eventsOf((yield* answerOf(kit, "calendar_agenda", {})).value), ["Dentist four o'clock"])
       const rows = yield* allRows(kit)
       const state = (yield* stateOf(kit))!
       assert.deepStrictEqual(rows.map((r) => r.value.batch), [batchOf("Family", state.gen!)])
@@ -314,7 +313,7 @@ describe("calendar: the refresh job", () => {
       const state = (yield* stateOf(kit))!
       assert.strictEqual(state.error, "store")
       assert.isDefined(state.writing)
-      const today = (yield* kit.tool("calendar_agenda", {})).value as { events: Array<{ title: string; time: string }>; stale?: string }
+      const today = (yield* answerOf(kit, "calendar_agenda", {})).value as { events: Array<{ title: string; time: string }>; stale?: string }
       assert.deepStrictEqual(eventsOf(today), ["Dentist two o'clock"])
       assert.include(today.stale!, "could not be refreshed")
       assert.strictEqual((yield* kit.jobs).find((j) => j.key === "refresh")?.lastError, "Could not read: Family (store)")
@@ -324,7 +323,7 @@ describe("calendar: the refresh job", () => {
       assert.isUndefined(after.error)
       assert.isUndefined(after.writing)
       assert.deepStrictEqual((yield* allRows(kit)).map((r) => r.value.batch), [batchOf("Family", after.gen!)])
-      assert.deepStrictEqual(eventsOf((yield* kit.tool("calendar_agenda", {})).value), ["Dentist four o'clock"])
+      assert.deepStrictEqual(eventsOf((yield* answerOf(kit, "calendar_agenda", {})).value), ["Dentist four o'clock"])
     }))
 
   it.effect("finding 26: a restart between writing a generation and publishing it; the refresh after the restart cleans up and publishes", () =>
@@ -348,7 +347,7 @@ describe("calendar: the refresh job", () => {
       assert.isDefined(written.writing)
       assert.notStrictEqual(written.writing, written.gen)
       // Between writing and publishing: the old generation is the answer, the new one is in the store unseen.
-      assert.deepStrictEqual(eventsOf((yield* kit.tool("calendar_agenda", {})).value), ["Dentist two o'clock"])
+      assert.deepStrictEqual(eventsOf((yield* answerOf(kit, "calendar_agenda", {})).value), ["Dentist two o'clock"])
       assert.strictEqual(new Set((yield* allRows(kit)).map((r) => r.value.batch)).size, 2)
       yield* kit.restart
       yield* advanceAndRefresh(kit, 0)
@@ -356,7 +355,7 @@ describe("calendar: the refresh job", () => {
       const state = (yield* stateOf(kit))!
       assert.isUndefined(state.writing)
       assert.deepStrictEqual((yield* allRows(kit)).map((r) => r.value.batch), [batchOf("Family", state.gen!)])
-      assert.deepStrictEqual(eventsOf((yield* kit.tool("calendar_agenda", {})).value), ["Dentist four o'clock"])
+      assert.deepStrictEqual(eventsOf((yield* answerOf(kit, "calendar_agenda", {})).value), ["Dentist four o'clock"])
     }), 60_000)
 
   it.effect("finding 19: a conditional request only against a generation of the same link, owner and zone; on a new day read whole again", () =>
@@ -377,7 +376,7 @@ describe("calendar: the refresh job", () => {
       yield* kit.configure({ calendars: [calendar("Family", "https://cal.example.org/family.ics", "Sam")] })
       yield* advanceAndRefresh(kit, 0)
       assert.strictEqual(seen.at(-1), undefined)
-      const sam = (yield* kit.tool("calendar_agenda", { who: "me" }, { device: "kitchen-display" })).value as { events: Array<unknown>; owner?: string }
+      const sam = (yield* answerOf(kit, "calendar_agenda", { who: "me" }, { device: "kitchen-display" })).value as { events: Array<unknown>; owner?: string }
       assert.strictEqual(sam.events.length, 3)
       assert.strictEqual(sam.owner, "p-sam")
       // The address changes: read whole too.
@@ -401,13 +400,13 @@ describe("calendar: the refresh job", () => {
       const connector: typeof net.connector = (req) => (down ? Promise.reject(Object.assign(new Error("connect ECONNREFUSED"), { code: "ECONNREFUSED" })) : net.connector(req))
       const kit = yield* startTestModule(calendarModuleWith({ resolver: net.resolver, connector }), { settings: familyOnly.settings })
       yield* advanceAndRefresh(kit, 0)
-      assert.strictEqual(eventsOf((yield* kit.tool("calendar_agenda", {}, { device: "hall-screen" })).value).length, 3)
+      assert.strictEqual(eventsOf((yield* answerOf(kit, "calendar_agenda", {}, { device: "hall-screen" })).value).length, 3)
       // The family calendar becomes Sam's while its server is down: nothing of it is read out as the household's.
       down = true
       yield* kit.configure({ calendars: [calendar("Family", "https://cal.example.org/family.ics", "Sam")] })
       yield* advanceAndRefresh(kit, 0)
       for (const device of ["hall-screen", "robins-phone", "kitchen-display"]) {
-        const r = yield* kit.tool("calendar_agenda", {}, { device })
+        const r = yield* answerOf(kit, "calendar_agenda", {}, { device })
         assert.deepStrictEqual(r.value, { spoken: "The calendars have not been read yet. Try again in a minute." }, device)
       }
       // No ambient line holds the calendar: the module declares none.
@@ -429,7 +428,7 @@ describe("calendar: the refresh job", () => {
         [secret]: () => (failing ? { status: 500, ...served(`<html>${secret} is not here</html>`) } : served(echo, { etag: `"${secret}"` }))
       }, { settings, secrets: { privateLink1: secret } })
       assert.deepStrictEqual(yield* kit.checkHealth, [])
-      const today = yield* kit.tool("calendar_agenda", {}, { device: "robins-phone" })
+      const today = yield* answerOf(kit, "calendar_agenda", {}, { device: "robins-phone" })
       assert.deepStrictEqual(eventsOf(today.value), ["an event two o'clock", "an event six o'clock"])
       const said = yield* kit.action("today", {}, { device: "robins-phone" })
       failing = true
@@ -478,11 +477,11 @@ describe("calendar: the refresh job", () => {
           }
         }, { settings, secrets: { privateLink1: secret } })
         const phone = { device: "robins-phone" }
-        const today = yield* kit.tool("calendar_agenda", {}, phone)
+        const today = yield* answerOf(kit, "calendar_agenda", {}, phone)
         assert.deepStrictEqual(eventsOf(today.value), ["an event two o'clock", "an event four o'clock"], secret)
         const said = yield* kit.action("today", {}, phone)
         assert.deepStrictEqual(said, { ok: true, say: "Today: an event at two o'clock and an event at four o'clock." }, secret)
-        const next = yield* kit.tool("calendar_next", {}, phone)
+        const next = yield* answerOf(kit, "calendar_next", {}, phone)
         const rows = yield* allRows(kit)
         const states = yield* kit.moduleStore().collection(sources).list({})
         assert.isUndefined(states[0]?.value.etag, secret)
@@ -518,7 +517,7 @@ describe("calendar: the refresh job", () => {
         assert.isFalse(result.ok, JSON.stringify(calendars))
       }
       // The saved settings are unchanged, and the module still answers.
-      assert.strictEqual(((yield* kit.tool("calendar_agenda", {})).value as { events: Array<unknown> }).events.length, 3)
+      assert.strictEqual(((yield* answerOf(kit, "calendar_agenda", {})).value as { events: Array<unknown> }).events.length, 3)
       // A webcal:// address is read as https://.
       const webcal = yield* startCalendar(allFixtures, { settings: { calendars: [calendar("Family", "webcal://cal.example.org/family.ics")] } })
       assert.strictEqual(webcal.net.requests[0]?.url, "https://cal.example.org/family.ics")
@@ -555,7 +554,7 @@ describe("calendar: the reading task as the reworked offThread wants it", () => 
   /** The last good generation is still the answer, and it says it could not be refreshed. */
   const keptLast = (kit: Effect.Success<ReturnType<typeof startCalendar>>["kit"]) =>
     Effect.gen(function*() {
-      const today = (yield* kit.tool("calendar_agenda", {})).value as { stale?: string }
+      const today = (yield* answerOf(kit, "calendar_agenda", {})).value as { stale?: string }
       assert.deepStrictEqual(eventsOf(today), ["Dentist two o'clock"])
       assert.include(today.stale!, "could not be refreshed")
       const state = (yield* stateOf(kit))!
@@ -572,7 +571,7 @@ describe("calendar: the reading task as the reworked offThread wants it", () => 
       assert.strictEqual(state.rows, 1_000)
       assert.strictEqual((yield* allRows(kit)).length, 1_000)
       // A day reads at most 200 rows, and says so.
-      const tomorrow = (yield* kit.tool("calendar_agenda", { day: "tomorrow" })).value as { more: number; cut?: string }
+      const tomorrow = (yield* answerOf(kit, "calendar_agenda", { day: "tomorrow" })).value as { more: number; cut?: string }
       assert.strictEqual(tomorrow.more, 200 - 12)
       assert.isDefined(tomorrow.cut)
     }), 60_000)
@@ -596,7 +595,7 @@ describe("calendar: the reading task as the reworked offThread wants it", () => 
       // Tried again at the next refresh, with the slots free: read.
       yield* advanceAndRefresh(kit, 3_600_000)
       assert.isUndefined((yield* stateOf(kit))!.error)
-      assert.deepStrictEqual(eventsOf((yield* kit.tool("calendar_agenda", {})).value), ["Dentist four o'clock"])
+      assert.deepStrictEqual(eventsOf((yield* answerOf(kit, "calendar_agenda", {})).value), ["Dentist four o'clock"])
     }), 60_000)
 
   it.effect("input: a call the helper refuses for its input fails the refresh and keeps the last generation", () =>

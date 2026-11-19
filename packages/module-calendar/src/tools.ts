@@ -1,4 +1,4 @@
-import { ActionError, CurrentTurn, defineAction, makeTool, Param, type Presentation, type Row, type Sensitivity, ToolError } from "@pva/core"
+import { ActionError, CurrentTurn, defineAction, isPresentResult, makeTool, Param, type Presentation, type Row, type Sensitivity, ToolError } from "@pva/core"
 import { speakList } from "@pva/language"
 import { isLine, say, StoredText } from "@pva/module-contracts"
 import { Effect, Schema } from "effect"
@@ -33,7 +33,9 @@ const WHO = line(60, "Whose calendar: \"me\" (the person asking), \"household\",
 
 /** Whose personal content a result holds: the first owner of a personal event it shows (household otherwise). */
 const sensitivity = (result: unknown): Sensitivity => {
-  const owner = (result as { readonly owner?: unknown } | undefined)?.owner
+  // A result that asks to show something carries the answer as `forModel`.
+  const answer = isPresentResult(result) ? result.forModel : result
+  const owner = (answer as { readonly owner?: unknown } | undefined)?.owner
   return typeof owner === "string" ? { kind: "personal", owner } : { kind: "household" }
 }
 
@@ -57,15 +59,12 @@ const spokenWith = (first: string, notes: Notes): Spoken => ({ spoken: [first, .
 /** The answer of "next": an event shown, one reduced to busy time, none, or a question; with its notes. */
 type NextAnswer =
   | { readonly kind: "spoken"; readonly spoken: Spoken }
-  | { readonly kind: "shown"; readonly v: View; readonly r: Row<Occurrence>; readonly notes: Notes; readonly screen: ReadonlyArray<string> }
+  | { readonly kind: "shown"; readonly v: View; readonly r: Row<Occurrence>; readonly notes: Notes; readonly screen: ReadonlyArray<string>; readonly owner?: string }
   | { readonly kind: "reduced"; readonly v: View; readonly r: Row<Occurrence>; readonly notes: Notes; readonly screen: ReadonlyArray<string> }
   /** None found: `cut` when the scan stopped short; `through`, the last day it read whole (none: not even today). */
-  | { readonly kind: "none"; readonly v: View; readonly cut: boolean; readonly through?: LocalDate; readonly notes: Notes; readonly screen: ReadonlyArray<string> }
+  | { readonly kind: "none"; readonly v: View; readonly cut: boolean; readonly through?: LocalDate; readonly notes: Notes; readonly screen: ReadonlyArray<string>; readonly owner?: string }
 
-/** What shows a presentation on the device the turn came from (a screen that cannot show it changes nothing). */
-export type ShowOnScreen = (presentation: Presentation) => Effect.Effect<void>
-
-export const makeTools = (reader: Reader, show: ShowOnScreen = () => Effect.void) => {
+export const makeTools = (reader: Reader) => {
   const failedTool = () => Effect.map(reader.moment(undefined), (m) => new ToolError({ message: say(texts, m.lang, "unreadable") }))
   const asToolError = <A, E, R>(e: Effect.Effect<A, E, R>) => e.pipe(Effect.catch(() => Effect.flatMap(failedTool(), Effect.fail)))
 
@@ -133,29 +132,29 @@ export const makeTools = (reader: Reader, show: ShowOnScreen = () => Effect.void
       }
       const extra = { cut: reads.some((r) => r.cut), withheld: withheld.size, ...(continuesAfter !== undefined ? { continuesAfter } : {}) }
       const notes = v.coverage(covered, extra)
-      // What the answer says, on the screen of the device that asked: events first, then busy times; an empty answer shows
-      // as an empty list, so a list of an earlier answer does not stay.
-      const onScreenNow = (nothing: string) =>
-        show(agendaPresentation(v, {
+      // What the answer says, as a list for the screen of the device that asked, returned with the answer: shown only
+      // when the turn is promoted (never from inside this run). An answer with nothing in it is an empty list.
+      const listOf = (nothing: string): Presentation =>
+        agendaPresentation(v, {
           first,
           count,
-          lines: [...onScreen.filter((l) => l.how === "show"), ...onScreen.filter((l) => l.how === "reduce")],
-          counted: more + moreBusy,
+          lines: onScreen,
+          more,
+          moreBusy,
           cut: extra.cut,
           withheld: extra.withheld,
           nothing,
           covered,
+          ...(who.kind === "person" ? { owner: who.id } : {}),
           ...(continuesAfter !== undefined ? { continuesAfter } : {})
-        }))
+        })
       if (days.length === 0 && busy.length === 0) {
         const when = count === 1 ? v.dayWords(first) : `${v.dayWords(first)} – ${v.dayWords(addDays(first, count - 1))}`
         const nothing = who.kind === "person" ? say(texts, m.lang, "nothingOnFor", { name: who.name, Day: capital(when) }) : say(texts, m.lang, "nothingOn", { Day: capital(when) })
-        yield* onScreenNow(nothing)
-        return spokenWith(nothing, notes)
+        return { forModel: spokenWith(nothing, notes), present: listOf(nothing) }
       }
-      yield* onScreenNow("")
       const owner = ownerAmong(shownRows)
-      return {
+      const answer = {
         ...(count === 1 ? { day: v.dayWords(first), events: days[0]?.events ?? [] } : { days }),
         ...(busy.length > 0 ? { busy } : {}),
         ...(more > 0 ? { more } : {}),
@@ -164,6 +163,7 @@ export const makeTools = (reader: Reader, show: ShowOnScreen = () => Effect.void
         untrusted: say(texts, m.lang, "untrusted"),
         ...(owner !== undefined ? { owner } : {})
       }
+      return { forModel: answer, present: listOf("") }
     })
 
   /** The first event from now (or, with `match`, the first that matches and has not ended), with its notes. */
@@ -233,20 +233,21 @@ export const makeTools = (reader: Reader, show: ShowOnScreen = () => Effect.void
       const pre = v.precheck(covered)
       if (pre !== undefined) return { kind: "spoken", spoken: pre } as NextAnswer
       const found = decideNext(v, rows, who, input.match)
+      const owner = who.kind === "person" ? { owner: who.id } : {}
       const notSearched = input.match !== undefined && v.unsearched(covered)
       // Read only in part where it stopped: an unread event may come first, so no event is called the next one.
       if (scan.cut) {
-        return { kind: "none", v, cut: true, ...(scan.through !== undefined ? { through: scan.through } : {}), notes: v.coverage(covered, { withheld: found.withheld, notSearched }), screen: v.screenNotes(covered, { withheld: found.withheld }) } as NextAnswer
+        return { kind: "none", v, cut: true, ...(scan.through !== undefined ? { through: scan.through } : {}), notes: v.coverage(covered, { withheld: found.withheld, notSearched }), screen: v.screenNotes(covered, { withheld: found.withheld }), ...owner } as NextAnswer
       }
       if (found.hit === undefined) {
         // Stopped at an event that is not one now (it changed while reading): the read was not complete either.
         const cut = scan.cut || scan.stopped
-        return { kind: "none", v, cut, notes: v.coverage(covered, { withheld: found.withheld, notSearched }), screen: v.screenNotes(covered, { withheld: found.withheld }) } as NextAnswer
+        return { kind: "none", v, cut, notes: v.coverage(covered, { withheld: found.withheld, notSearched }), screen: v.screenNotes(covered, { withheld: found.withheld }), ...owner } as NextAnswer
       }
       const beyond = v.beyondDay(found.hit)
       const notes = v.coverage(covered, { withheld: found.withheld, notSearched, ...(beyond !== undefined ? { continuesAfter: beyond } : {}) })
       const screen = v.screenNotes(covered, { withheld: found.withheld, ...(beyond !== undefined ? { continuesAfter: beyond } : {}) })
-      return { kind: found.reduced ? "reduced" : "shown", v, r: found.hit, notes, screen } as NextAnswer
+      return { kind: found.reduced ? "reduced" : "shown", v, r: found.hit, notes, screen, ...owner } as NextAnswer
     })
 
   /** When the next event is, as a phrase: its start, and its end when that is on another day or after the days kept. */
@@ -282,34 +283,36 @@ export const makeTools = (reader: Reader, show: ShowOnScreen = () => Effect.void
 
   /**
    * The card for "my next appointment": the asking person's own next event ("me", no words), or that there is none,
-   * with the answer's notes. Never for an event reduced to busy time, a question or a refusal (nothing of them is shown).
+   * with the answer's notes, marked as that person's. `detail`: with the place and the calendar (the tool's answer
+   * has them; the action's sentence does not, so its card has the title and when only). Never for a busy time, a
+   * question or a refusal (nothing of them is shown).
    */
-  const cardOf = (a: NextAnswer, input: { readonly match?: string; readonly who?: string }): Presentation | undefined => {
+  const cardOf = (a: NextAnswer, input: { readonly match?: string; readonly who?: string }, detail: boolean): Presentation | undefined => {
     if (!isMe(input.who) || input.match !== undefined) return undefined
-    if (a.kind === "shown") return nextPresentation(a.v, { row: a.r, when: nextWhen(a.v, a.r), whenShort: nextStart(a.v, a.r), notes: a.screen })
-    if (a.kind === "none") return nextPresentation(a.v, { noneSentence: noneSentence(a, input.match), notes: a.screen })
+    if (a.kind === "shown") return nextPresentation(a.v, { row: a.r, when: nextWhen(a.v, a.r), whenShort: nextStart(a.v, a.r), notes: a.screen, detail, ...(a.owner !== undefined ? { owner: a.owner } : {}) })
+    if (a.kind === "none") return nextPresentation(a.v, { noneSentence: noneSentence(a, input.match), notes: a.screen, detail, ...(a.owner !== undefined ? { owner: a.owner } : {}) })
     return undefined
-  }
-  const showCard = (a: NextAnswer, input: { readonly match?: string; readonly who?: string }) => {
-    const card = cardOf(a, input)
-    return card === undefined ? Effect.void : show(card)
   }
 
   const nextResult = (input: { readonly match?: string; readonly who?: string }) =>
-    Effect.tap(nextAnswer(input), (a) => showCard(a, input)).pipe(Effect.map((a) => {
+    Effect.map(nextAnswer(input), (a) => {
       if (a.kind === "spoken") return a.spoken
       const lang = a.v.m.lang
-      if (a.kind === "none") return spokenWith(noneSentence(a, input.match), a.notes)
+      const withCard = (forModel: unknown) => {
+        const present = cardOf(a, input, true)
+        return present === undefined ? forModel : { forModel, present }
+      }
+      if (a.kind === "none") return withCard(spokenWith(noneSentence(a, input.match), a.notes))
       const d = dateOf(a.r.value.start, a.v.m.zone)
       if (a.kind === "reduced") return { busy: { day: a.v.dayWords(d), ...a.v.reduced(d, a.r) }, ...a.notes }
       const val = a.r.value
-      return {
+      return withCard({
         next: { title: a.v.titleOf(a.r), when: nextWhen(a.v, a.r), calendar: a.v.calendarOf(a.r), ...(val.location !== undefined ? { place: val.location } : {}) },
         ...a.notes,
         untrusted: say(texts, lang, "untrusted"),
         ...(val.owner !== undefined ? { owner: val.owner } : {})
-      }
-    }))
+      })
+    })
 
   const find = (input: { readonly text: string; readonly who?: string }) =>
     Effect.gen(function*() {
@@ -520,9 +523,21 @@ export const makeTools = (reader: Reader, show: ShowOnScreen = () => Effect.void
 
   const failedAction = () => Effect.map(reader.moment(undefined), (m) => new ActionError({ message: say(texts, m.lang, "unreadable") }))
   const asAction = (e: Effect.Effect<string, unknown>) => e.pipe(Effect.map((s) => ({ say: s })), Effect.catch(() => Effect.flatMap(failedAction(), Effect.fail)))
+  /** As `asAction`, with the presentation the answer asks for returned beside the sentence (`{ say, present }`). */
+  const asPresenting = (e: Effect.Effect<{ readonly say: string; readonly present?: Presentation }, unknown>) =>
+    e.pipe(Effect.map((o) => (o.present === undefined ? { say: o.say } : { say: o.say, present: o.present })), Effect.catch(() => Effect.flatMap(failedAction(), Effect.fail)))
 
-  const nextSentence = (input: { readonly match?: string; readonly who?: string }) =>
-    Effect.tap(nextAnswer(input), (a) => showCard(a, input)).pipe(Effect.map((a) => {
+  /** The sentence of a next-event answer, and the card for "my next appointment" where the answer has one. */
+  const nextOutcome = (input: { readonly match?: string; readonly who?: string }) =>
+    Effect.map(nextAnswer(input), (a) => {
+      const present = cardOf(a, input, false)
+      return { say: sentenceOfNext(a, input), ...(present !== undefined ? { present } : {}) }
+    })
+
+  const nextSentence = (input: { readonly match?: string; readonly who?: string }) => Effect.map(nextAnswer(input), (a) => sentenceOfNext(a, input))
+
+  const sentenceOfNext = (a: NextAnswer, input: { readonly match?: string; readonly who?: string }): string =>
+    ((): string => {
       if (a.kind === "spoken") return a.spoken.spoken
       const lang = a.v.m.lang
       if (a.kind === "none") return spokenWith(noneSentence(a, input.match), a.notes).spoken
@@ -532,7 +547,7 @@ export const makeTools = (reader: Reader, show: ShowOnScreen = () => Effect.void
         return spokenWith(say(texts, lang, "busy", { name: red.busy, when: `${a.v.dayWords(d)} ${say(texts, lang, "busyFromTo", { from: red.from, to: red.to })}` }), a.notes).spoken
       }
       return spokenWith(say(texts, lang, "nextIs", { title: a.v.titleOf(a.r), when: nextWhen(a.v, a.r) }), a.notes).spoken
-    }))
+    })()
 
   const actions = [
     defineAction({
@@ -573,7 +588,7 @@ export const makeTools = (reader: Reader, show: ShowOnScreen = () => Effect.void
       params: {},
       speculative: true,
       offerAsTool: false,
-      run: () => asAction(nextSentence({ who: "me" }))
+      run: () => asPresenting(nextOutcome({ who: "me" }))
     }),
     defineAction({
       id: "when_is",
