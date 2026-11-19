@@ -775,15 +775,19 @@ export const makePresentEngine = (options: PresentEngineOptions): Effect.Effect<
       return [...index.values()].filter((e) => e.id !== except && e.lifetime === "transient" && devices.some((d) => applies(e.target, d)))
     }
 
-    /** What was decided for each device of the target now, and the note for the model. */
-    const outcomeOf = (e: Pick<Entry, "id" | "kind" | "owner" | "target">): ShowOutcome => {
+    /**
+     * What was decided for each device of the target now, and the note for the model; an image not fetched yet says that
+     * it may be shown without the image (the fetch's outcome is not known when the call answers).
+     */
+    const outcomeOf = (e: Pick<Entry, "id" | "kind" | "owner" | "target">, imagePending = false): ShowOutcome => {
       const devices = targetDevices(e.target)
       const shownOn: Array<ShownOn> = devices.map((d) => {
         const decision = decide(e, d, connectionsOf(d.id).length > 0)
         return decision.show ? { deviceId: d.id, shown: true } : { deviceId: d.id, shown: false, why: decision.why }
       })
       const names = new Map(devices.map((d) => [d.id, d.name] as const))
-      return { devices: shownOn, note: noteOf(shownOn, (id) => names.get(id) ?? id) }
+      const note = noteOf(shownOn, (id) => names.get(id) ?? id)
+      return { devices: shownOn, note: imagePending && shownOn.some((d) => d.shown) ? `${note} The image is being fetched; if it cannot be, it shows without it.` : note }
     }
 
     // ---- Images: fetched once by the cache, off the turn's path, the outcome written on the row
@@ -942,7 +946,7 @@ export const makePresentEngine = (options: PresentEngineOptions): Effect.Effect<
           if (!("limit" in w)) afterShow(e, w.removed, w.content, before)
         })
         if ("limit" in out) return yield* new PresentError({ reason: "limit", message: out.limit })
-        return handleOf(moduleId, e, outcomeOf(e))
+        return handleOf(moduleId, e, outcomeOf(e, out.content.kind === "image" && out.content.hash === undefined && out.content.failed === undefined))
       })
 
     const handleOf = (moduleId: string, e: Entry, outcome: ShowOutcome): PresentHandle => ({
@@ -1052,7 +1056,7 @@ export const makePresentEngine = (options: PresentEngineOptions): Effect.Effect<
         const e = newEntry(moduleId, part, { device: origin }, presentation, o, now)
         const bound = boundProblem(moduleId, e.lifetime, e.target, e.key !== undefined ? byKey.get(keyOf(moduleId, e.key)) ?? e.id : e.id, now)
         if (bound !== undefined) return not(`too much is on screen (${bound})`)
-        const outcome = outcomeOf(e)
+        const outcome = outcomeOf(e, presentation.kind === "image")
         // One enqueue: the writer stores it and reconciliation shows it, off the turn's path.
         const s: PendingShow = { entry: e, content: storedContentOf(presentation), spoken: presentation.spoken, buttons: (presentation.buttons ?? []).map((b) => ({ id: b.id, label: b.label })) }
         pending.push(s)

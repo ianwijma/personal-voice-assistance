@@ -155,7 +155,9 @@ allows, oldest first, at most 8, and the newest transient the decision allows.
 
 `/media/<hash>` is the only way an image reaches a page. When an image presentation is stored, the Presenter asks the
 image cache, off the turn's path, to fetch its address; the row first says `loading`, then holds the content hash, or why
-not (`failed`: shown without the image, with the server's sentence). The cache fetches once through `safeFetch` (public
+not (`failed`: shown without the image, with the server's sentence). The note for the model says so when the call
+answers ("… The image is being fetched; if it cannot be, it shows without it."): the fetch's outcome is not known then,
+and telling a later turn about it (`present.status`) is left out. The cache fetches once through `safeFetch` (public
 addresses only, redirects checked again; never the owner-configured helper, for anything a model or a page supplies) with
 its own image policy, checks the type the response says and the bytes it is against each other, and its size, keeps it
 as `data/media/<sha256>.<ext>` (directory `0700`, files `0600`, written through a temporary file and one `rename`) for a

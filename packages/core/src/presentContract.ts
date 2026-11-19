@@ -453,7 +453,7 @@ export const presentContract = (name: string, open: OpenPresentStore) =>
         assert.deepStrictEqual(world.shownOn("kitchen-tablet").map((p) => p.id), [second.id])
         assert.isTrue(world.firstTab("kitchen-display")!.messages.some((m) => m.type === "present.dismiss" && m.id === first.id))
         // The first is marked ended in the same transaction (an update) and removed ten seconds later, off the caller's path.
-        assert.deepStrictEqual((yield* world.rows).map((r) => [r.id, r.value.ended === true]), [[first.id, true], [second.id, false]])
+        assert.deepStrictEqual(new Map((yield* world.rows).map((r) => [r.id, r.value.ended === true])), new Map([[first.id, true], [second.id, false]]))
         yield* world.advance(10 * SECOND)
         assert.deepStrictEqual((yield* world.rows).map((r) => r.id), [second.id])
       }))
@@ -699,6 +699,7 @@ export const presentContract = (name: string, open: OpenPresentStore) =>
         const { world } = yield* start({ media: (url) => Effect.sync(() => (fetched.push(url), url.endsWith("/no.png") ? { refused: "type" as const } : { hash })) })
         const image = (url: string): Presentation => ({ kind: "image", url, alt: "A heron", credit: "Wikimedia Commons, CC BY-SA", spoken: "A heron." })
         const h = yield* world.showOn("kitchen-display", image("https://example.org/heron.png"), { lifetime: "pinned", key: "pic" })
+        assert.strictEqual(h.outcome.note, "Shown on \"Kitchen display\". The image is being fetched; if it cannot be, it shows without it.")
         const tab = world.firstTab("kitchen-display")!
         const shows = tab.messages.filter((m) => m.type !== "present.dismiss").map((m) => (m.presentation.content as { image: unknown }).image)
         assert.deepStrictEqual(shows, [{ state: "loading" }, { state: "ready", hash }])
