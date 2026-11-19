@@ -4,7 +4,7 @@
 // the policy's sentence in the household's language; a personal result is withheld where the asking device may not
 // reveal it.
 import { CurrentTurn, defineModule, makeTool, type ModulePresent } from "@pva/core"
-import { PRESENT_KIND_VERSIONS, type ServerMessage } from "@pva/protocol"
+import { PRESENT_KIND_VERSIONS } from "@pva/protocol"
 import { Effect, Schema } from "effect"
 import { afterEach, describe, expect, it, vi } from "vitest"
 import { ScriptedClient, sleep } from "./support/scriptedClient.ts"
@@ -109,10 +109,9 @@ describe("the risk policy in serve mode", () => {
     const a = await page("risk-kitchen-0002")
     await sleep(200)
     const h = await run(present!.show({ device: a.device.id }, { kind: "card", title: "Lamp", text: "Press", spoken: "A lamp.", handler: "lamp", buttons: [{ id: "on", label: "On" }] }, { lifetime: "pinned" }))
-    const holds = () => a.messages.some((m: ServerMessage) => m.type === "present.show" && m.presentation.id === h.id)
-    await until(holds)
+    const shown = await a.waitFor("present.show", (message) => message.presentation.id === h.id, { from: 0 })
     const press = async (id: string) => {
-      a.send({ type: "present.action", requestId: id, id: h.id, action: "on" })
+      a.send({ type: "present.action", requestId: id, id: h.id, revision: shown.presentation.revision, action: "on" })
       return a.waitFor("result", (m) => m.requestId === id, { from: 0 })
     }
     expect(await press("p1")).toMatchObject({ ok: true, say: "Lamp on." })
