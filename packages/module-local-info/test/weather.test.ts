@@ -26,9 +26,29 @@ const world = (over: ForecastOptions & { forecastBody?: unknown } = {}): Spec =>
   [GEOCODE]: geocoding(),
   [FORECAST]: { body: over.forecastBody ?? forecast(over), headers: json }
 })
+/**
+ * A forecast with a card gives the model its answer and then the note of what the screen did ("[Screen: …]", from the host:
+ * docs/PRESENTING.md). These tests are about the answer, so their `tool` hands back the answer as before; what the screen
+ * did is tested in weatherPresent.test.ts.
+ */
+const withoutScreenNote = <R extends { readonly content: string; readonly value: unknown }>(r: R): R => {
+  const at = r.content.lastIndexOf("\n[Screen: ")
+  if (at < 0) return r
+  const content = r.content.slice(0, at)
+  let value: unknown = content
+  try {
+    value = JSON.parse(content)
+  } catch {
+    // Plain text.
+  }
+  return { ...r, content, value }
+}
 const on = (spec: Spec, options: Parameters<typeof startTestModule>[1] = {}) => {
   const net = makeOfflineNet(spec)
-  return Effect.map(startTestModule(weatherModule({ resolver: net.resolver, connector: net.connector }), options), (kit) => ({ kit, net }))
+  return Effect.map(startTestModule(weatherModule({ resolver: net.resolver, connector: net.connector }), options), (made) => {
+    const kit = { ...made, tool: ((...args: Parameters<typeof made.tool>) => Effect.map(made.tool(...args), withoutScreenNote)) as typeof made.tool }
+    return { kit, net }
+  })
 }
 const dutch = { home: { HOME_LANGUAGE: "nl-NL", HOME_TIME_ZONE: "Europe/Amsterdam", HOME_LOCATION: "Utrecht" } }
 type Said = { spoken: string } & Record<string, unknown>

@@ -2,6 +2,7 @@ import { ActionError, CurrentTurn, defineAction, type HostView, makeTool, ToolEr
 import { type BriefingRequest, BriefingSectionError, type BriefingSection, type BriefingSectionResult, homeLanguage, type Language, say } from "@pva/module-contracts"
 import { speakDate, speakDuration, speakNumber, speakTime } from "@pva/language"
 import { Clock, Data, Effect, Schema } from "effect"
+import { forecastCard } from "./card.ts"
 import { type Forecast, type Place, type WeatherClient, WeatherError } from "./client.ts"
 import { coverage, type Period, periodsOf, QUARTER_MS } from "./rain.ts"
 import { conditionsEn, conditionsNl, texts } from "./words.ts"
@@ -239,18 +240,20 @@ export const makeWeatherExtras = (env: WeatherEnv) => {
       const words = lang === "nl" ? conditionsNl : conditionsEn
       const condition = words[code ?? -1] ?? (lang === "nl" ? "onbekend weer" : "unknown conditions")
       const degrees = say(texts, lang, fahrenheit ? "degreesF" : "degrees")
-      let spoken = cap(
-        say(texts, lang, "forecast", {
-          day: speakDate(target, lang, today) ?? isoOf(target),
-          where: looked.named ? ` in ${place.name}` : "",
-          condition,
-          min: num(min, lang),
-          max: num(max, lang),
-          degrees,
-          rain: rain !== undefined && rain >= 30 ? say(texts, lang, "rainChance", { n: num(rain, lang) }) : "",
-          wind: windy ? say(texts, lang, "windUpTo", { n: num(wind!, lang), unit }) : ""
-        })
-      )
+      const sentence = (where: string) =>
+        cap(
+          say(texts, lang, "forecast", {
+            day: speakDate(target, lang, today) ?? isoOf(target),
+            where,
+            condition,
+            min: num(min, lang),
+            max: num(max, lang),
+            degrees,
+            rain: rain !== undefined && rain >= 30 ? say(texts, lang, "rainChance", { n: num(rain, lang) }) : "",
+            wind: windy ? say(texts, lang, "windUpTo", { n: num(wind!, lang), unit }) : ""
+          })
+        )
+      let spoken = sentence(looked.named ? ` in ${place.name}` : "")
       const hourly: Array<{ time: string; temperature: number; rainChance: number | null; condition: string }> = []
       let knownUntil: string | undefined
       if (hours !== undefined && dayKey(target) === dayKey(today)) {
@@ -281,7 +284,20 @@ export const makeWeatherExtras = (env: WeatherEnv) => {
           }
         }
       }
-      return {
+      // The same day as a card, from the same numbers the sentence used; the hours and the chance of rain stay in the words.
+      const card = forecastCard({
+        lang,
+        placeName: place.name,
+        date: target,
+        daysFromToday: Math.round((Date.UTC(target.year, target.month - 1, target.day) - Date.UTC(today.year, today.month - 1, today.day)) / 86_400_000),
+        code: code ?? undefined,
+        condition,
+        min: Math.round(min),
+        max: Math.round(max),
+        fahrenheit,
+        spoken
+      })
+      const answer = {
         spoken,
         place: place.name,
         date: isoOf(target),
@@ -295,9 +311,10 @@ export const makeWeatherExtras = (env: WeatherEnv) => {
         ...(knownUntil !== undefined ? { knownUntil } : {}),
         untrusted: UNTRUSTED
       } satisfies Answer
+      return { answer, card }
     })
 
-  const forecastDay = (named: string | undefined, day: string | undefined, hours: number | undefined, ask: Ask, budgetMs: number): Effect.Effect<Answer, unknown> =>
+  const forecastDay = (named: string | undefined, day: string | undefined, hours: number | undefined, ask: Ask, budgetMs: number) =>
     within(budgetMs, (left) => Effect.flatMap(lookup(named, ask, left), (looked) => forecastSentence(looked, ask, day, hours)))
 
   // ----- tools and actions ---------------------------------------------------------------------------------------------------------
@@ -337,7 +354,12 @@ export const makeWeatherExtras = (env: WeatherEnv) => {
     }),
     speculative: true,
     latency: "quick",
-    execute: ({ place, day, hours }) => Effect.flatMap(askNow, ({ ask, budget }) => forecastDay(place, day, hours, ask, budget)).pipe(Effect.mapError(toolError))
+    // The model gets the answer as before; the card goes to the device that asked, when it can show it (docs/PRESENTING.md).
+    execute: ({ place, day, hours }) =>
+      Effect.flatMap(askNow, ({ ask, budget }) => forecastDay(place, day, hours, ask, budget)).pipe(
+        Effect.map(({ answer, card }) => (card === undefined ? answer : { forModel: answer, present: card })),
+        Effect.mapError(toolError)
+      )
   })
 
   const rainAction = defineAction({
@@ -358,7 +380,11 @@ export const makeWeatherExtras = (env: WeatherEnv) => {
     params: {},
     speculative: true,
     offerAsTool: false,
-    run: () => Effect.flatMap(askNow, ({ ask, budget }) => forecastDay(undefined, "tomorrow", undefined, ask, budget)).pipe(Effect.map((a) => ({ say: a.spoken })), Effect.mapError(actionError))
+    run: () =>
+      Effect.flatMap(askNow, ({ ask, budget }) => forecastDay(undefined, "tomorrow", undefined, ask, budget)).pipe(
+        Effect.map(({ answer, card }) => (card === undefined ? { say: answer.spoken } : { say: answer.spoken, present: card })),
+        Effect.mapError(actionError)
+      )
   })
 
   // ----- the briefing ----------------------------------------------------------------------------------------------------------------
@@ -382,7 +408,7 @@ export const makeWeatherExtras = (env: WeatherEnv) => {
               sentences.push(r.spoken)
               priority = "lead"
             }
-            sentences.push((yield* forecastSentence(looked, ask, "today", undefined)).spoken)
+            sentences.push((yield* forecastSentence(looked, ask, "today", undefined)).answer.spoken)
             return { _tag: "section", sentences: sentences.slice(0, request.maxSentences), priority, withheld: 0 } as const
           }))
       }).pipe(Effect.mapError((e) => new BriefingSectionError({ reason: "unavailable", detail: e instanceof WeatherError ? e.reason : "failed" })))

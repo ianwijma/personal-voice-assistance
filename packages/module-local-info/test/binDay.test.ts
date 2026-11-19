@@ -21,20 +21,47 @@ type Said = { spoken: string; items: Array<{ bin: string; date: string; when: st
 type Kit = Effect.Success<ReturnType<typeof startTestModule>>
 const copyIn = (kit: Kit) => kit.moduleStore().collection(copies).get(COPY_ID)
 const spoken = (kit: Kit, input: Record<string, unknown> = {}) => kit.tool("bin_next", input).pipe(Effect.map((r) => (r.value as Said).spoken))
+type Job = Effect.Success<Kit["jobs"]>[number]
+/** What a job's row says of its progress: it changes when a run starts, fails, ends or plans the next occurrence. */
+const progress = (j: Job) => JSON.stringify([j.state, j.dueAt, j.attempt, j.lastError, j.failedAt, j.finishedAt, j.rev])
+const snapshot = (kit: Kit) => Effect.map(kit.jobs, (jobs) => jobs.filter((j) => j.module === "bin-day"))
 /**
- * Wait, in real time, until no job of the module is running: a job's handler reads the calendar in a worker thread, which
- * the test clock does not move, so `runJob` and `advance` return while it still runs.
+ * Wait, in real time, for the outcome of the jobs the clock just made due: their row has moved past what it was before the
+ * call (a run has begun and ended, or failed) and none is running. A job's handler reads the calendar in a worker thread,
+ * which the test clock does not move, so `runJob` and `advance` return while a job has not begun or still runs; "none is
+ * running" alone is also true before the job starts, and the Health issue of a failed job follows its row (and goes the same way)
+ * a moment later. No fixed sleeps and no raised limit: the loop is capped as before.
  */
-const settle = (kit: Kit) =>
+const settle = (kit: Kit, before: ReadonlyArray<Job> = []) =>
   Effect.gen(function*() {
+    const now = yield* kit.now
     for (let i = 0; i < 600; i++) {
-      if (!(yield* kit.jobs).some((j) => j.module === "bin-day" && j.state === "running")) return
+      const jobs = yield* snapshot(kit)
+      const waiting = before.filter((b) => b.state === "scheduled" && b.dueAt <= now).some((b) => {
+        const j = jobs.find((x) => x.id === b.id)
+        return j !== undefined && progress(j) === progress(b)
+      })
+      // The Health issue of a failed job follows its row a moment later (and goes the same way): its outcome is its issue too.
+      const failing = jobs.filter((j) => j.failedAt !== undefined && (j.state === "scheduled" || j.state === "failed")).map((j) => `core.scheduler.failed.${j.id}`).sort()
+      const raised = kit.issues().map((i) => i.id).filter((id) => id.startsWith("core.scheduler.failed.")).sort()
+      if (!waiting && !jobs.some((j) => j.state === "running") && JSON.stringify(failing) === JSON.stringify(raised)) return
       yield* Effect.promise(() => new Promise((resolve) => setTimeout(resolve, 20)))
     }
     assert.fail("a refresh job did not finish")
   })
-const runJob = (kit: Kit, id: string) => Effect.andThen(Effect.exit(kit.runJob(id)), settle(kit))
-const advance = (kit: Kit, ms: number) => Effect.andThen(kit.advance(ms), settle(kit))
+const runJob = (kit: Kit, id: string) =>
+  Effect.gen(function*() {
+    const before = yield* snapshot(kit)
+    const exit = yield* Effect.exit(kit.runJob(id))
+    yield* settle(kit, before)
+    return exit
+  })
+const advance = (kit: Kit, ms: number) =>
+  Effect.gen(function*() {
+    const before = yield* snapshot(kit)
+    yield* kit.advance(ms)
+    yield* settle(kit, before)
+  })
 /** A calendar served while `up` says so, else 503. */
 const switchable = (body: () => string = () => householdCalendar) => {
   const state = { up: true }

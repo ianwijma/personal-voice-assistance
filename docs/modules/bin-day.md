@@ -8,7 +8,7 @@ Which bin goes out next, from the collection calendar's ICS link.
 - How to write it: [docs/MODULES.md](../MODULES.md)
 
 This page belongs to the module's pull request, which touches its package and this file and nothing else
-(docs/MODULES.md, "What a module pull request may touch").
+(docs/MODULES.md, "What a module pull request may touch"); the reminder was added afterwards by the follow-up pull request.
 
 ## What it does
 
@@ -51,6 +51,50 @@ from a copy that is less than two days old and complete through tomorrow; otherw
 briefing words that), and a sentence from a copy older than two days says how old it is ("…, from my copy of the calendar
 from 6 days ago."). With no copy at all the section is unavailable.
 
+**The reminder the evening before.** With "Remind me the evening before" set to a time (every half hour from 16:00 to 22:00;
+the default is off), the module sends a silent card to every screen at that time: "Bin day tomorrow. The paper bin goes
+out tomorrow." (several bins: "The paper bin and the green bin (GFT) go out tomorrow."; Dutch: "Morgen is het afvaldag. De
+papiercontainer gaat morgen aan de weg."). It is a **job of the module's own** (`remind-daily`, a daily job at that time in
+the household's zone): the notification service never sends later, so the job looks at the stored copy and sends a
+`normal` notification to `everywhere` (a job has no device of its own) at that moment. Exactly what it does:
+
+- **Delivered at least once, and once when nothing fails.** The job sends under the key `bin-day:<date>` and then writes a
+  receipt (one row, `reminded`: the collection, what the calendar said of it, and what became of the card). With the
+  receipt written, running the job again for the same evening (a retry, a restart, the owner moving the time later, the
+  person having stopped the card) sends nothing more. If the run fails **between the delivery and the receipt**, the retry
+  finds no receipt: if the card with that key is still open, it only writes the receipt (the open card is not delivered
+  again); if the card was dismissed meanwhile, it is delivered again, so after such a failure a dismissed reminder can
+  appear a second time, and none is ever lost. The next collection is reminded the next time it is the evening before. An
+  evening before a day with no collection says nothing.
+- **Taken away when it stops being true.** After every refresh that committed a calendar, at start and in each daily run,
+  the receipt is compared with the calendar as it is now: a reminder whose collection moved, was cancelled, has other bins
+  or is past is resolved with `ctx.notify.resolve({ key })` (outcome `calendar-changed`) and the receipt says `withdrawn`.
+  A day the copy cannot speak for (nothing there, and not complete through it) is not taken for cancelled. A withdrawal
+  that fails stays `owed` in the receipt and is tried again by the next refresh, start or daily run. A collection that moved
+  is reminded on its own evening.
+- **Decided at the moment of sending.** Immediately before the notification is sent the job reads again the live settings
+  (reminder off, another time, another link or names end the run), the clock and the zone (still the same evening, still
+  inside the late rule, the copy still fresh enough) and whether its own job row is still the running one (a job called off
+  or replaced while it ran is not interrupted: the link and names are in the job's payload, so a change replaces it). The
+  expiry is computed from that instant.
+- **Surviving an outage, within the late rule.** The job's late rule is three hours (`late: { withinMs }`): found up to
+  three hours after its time it still runs and sends; found later, it is missed and nothing is sent. It is also only sent
+  **the same evening**: found after midnight (a reminder at 22:00, found at 00:30), "tomorrow" would be another day, so
+  nothing is sent. A restart does not replace the live job (that would lose an occurrence due while it was down).
+- **Not from a copy too old to trust.** With no copy, or one older than two days, the job refreshes it first (up to 8 s,
+  as the nightly refresh does). If that fails it **sends nothing** and does not fail: a reminder that cannot say what is
+  known is worse than none, the failed nightly refresh is already a Health issue, and the next evening tries again. Nothing
+  is sent that says "no bin": with no collection tomorrow in a copy it trusts, the job is silent. A copy that may be
+  incomplete (events it could not read, or cut off before tomorrow) still reminds of the bins it knows and adds "The
+  calendar may not be complete."
+- **True until midnight.** The card ends when the next local date begins in the household's zone (`expiresInMs`, found with
+  the zone's own dates, not by adding the remaining wall-clock hours: a zone whose offset changes before midnight, such as
+  America/Nuuk on 28 March or America/Santiago on 4 April, has a day that is not 24 hours long); after that "tomorrow" is today. The names of the bins
+  are the calendar's outside text: one line each, at most eight and "and N more", the whole text at most 200 characters.
+- **Privacy.** The reminder is the household's (a collection calendar has no owner): every device that can show a card gets
+  it, whatever its privacy (a device with no display is not given it; nothing rings, it is `normal`). The notification
+  has no buttons, so there is no press handler.
+
 **Privacy.** The module stores nothing personal: a collection calendar is the household's, so it has no owner, and every
 kind of device (private, shared, public) is told the same. The calendar's titles are outside text: they reach the model only
 as bin names, cut to one line of at most 60 characters, at most eight in an answer ("…and 52 more"), and the result says
@@ -88,6 +132,7 @@ writes nothing.
 |---|---|---|
 | Calendar link (ICS) | text, at most 500 characters | `https://`, `http://` or `webcal://`; no user name or password in it; checked as typed (the answer never quotes the link) |
 | Bin names | records (at most 12): *words in the calendar title*, *call it* | the owner's own names, read before the built-in words |
+| Remind me the evening before | choice: Don't remind me (default), or 16:00 to 22:00 in steps of half an hour | the reminder above; needs the calendar link |
 | Check the calendar link | button | the **Test** button above |
 
 Health (`bin-day.no-calendar`, info: no link yet; `bin-day.bad-link`, warning: not a web address) looks at the settings
@@ -95,11 +140,12 @@ only: no network, no store. A failed nightly refresh shows as a Health issue thr
 
 ## What it stores
 
-One collection in the household scope, data version 1.
+Two collections in the household scope, data version 1.
 
 | Collection | `maxChars` | Indexes | What |
 |---|---|---|---|
 | `copy` | 13,000 | none | **one row**, id `copy`: the link and names it was read from (a 16-character hash), when it was read, whether the calendar had more collections than were kept (`cut`), how many events could not be read, and the next 60 collections (`entries`): a calendar date (`d`, 20261119) for an all-day collection or an instant (`t`, epoch ms) for a timed one, the kind (gft, paper, plastic, rest, glass, other) and, for a name the owner gave or a title the module does not know, a `label` (one line, at most 60 characters). It is read by id. |
+| `reminded` | 300 | none | **one row**, id `last`: the receipt of the reminder last sent: the collection (`day`, 20261119), a 16-character hash of what the calendar said of it (`sig`) and its `state` (`sent`, `owed`, `withdrawn`). It is written by the daily job (as the job: its actor is the job's) after the delivery. |
 
 The copy is replaced **in one write, only after a refresh produced a complete, valid list**: there is never a half-written
 copy, a failed refresh (unreachable, unreadable, too large, too slow) leaves the last good copy exactly as it was, and a
@@ -107,7 +153,9 @@ first fetch that fails writes nothing. A change of link or names makes the copy 
 is judged by its hash), and the next refresh replaces it. Right before it writes, in the same transaction, a refresh
 checks the module's link and names are still the ones it read, and never replaces a newer copy of the same link.
 
-**Scheduled.** `refresh-daily`: a system job, cron `0 3 * * *`, handler `refresh` (idempotent, up to 30 s, the scheduler's
+**Scheduled.** `remind-daily`: only while the reminder is set, cron `M H * * *` for the owner's time in the household's zone,
+handler `remind` (idempotent, up to 30 s), late rule `{ withinMs: 3 hours }`, payload `{ source }` (the hash of the link
+and names), no origin; it is replaced when the time, the link or the names change and called off when the setting goes back to off (a restart keeps the live one). `refresh-daily`: a system job, cron `0 3 * * *`, handler `refresh` (idempotent, up to 30 s, the scheduler's
 default retries). `refresh-start`: once, two seconds after the module starts with a link, only when the copy is older than six
 hours. A refresh fetches through `safeFetch` (accepts calendar types, at most 256 KiB, 8 s), reads the calendar off the
 main thread (above), and writes the copy as the job (`{ kind: "job", jobId }`); a refresh on a question writes as that
@@ -117,7 +165,8 @@ answering.
 
 ## What it needs
 
-`requires: internet` (the calendar is fetched from the link) and a `health`. It uses no other module's service. It
+`requires: internet` (the calendar is fetched from the link) and a `health`. It uses no other module's service; the reminder
+sends through the host's notification service (`ctx.notify.send`, target `everywhere`). It
 **provides** a `BriefingSections` contribution (`bin-day`), which only the briefing module consumes. Outside service: the
 owner's calendar link (any public address; an address on the home network is refused by `safeFetch`). The User-Agent is the
 product token only, plus the owner's contact (Home › API contact) when the owner set one. `offThread` (`@pva/core`) and
@@ -125,12 +174,24 @@ product token only, plus the owner's contact (Home › API contact) when the own
 
 ## What was left out
 
-Left out because it waits for **wave B** (docs/MODULES.md: no notifications, phrase commands, presentations or module speech
-yet): the reminder the evening before ("the paper bin goes out tomorrow") as a notification, a spoken announcement on a
-device, and the ambient fact ("bin tomorrow: paper") on screens.
+Not now: a spoken announcement of the reminder on a device, the ambient fact ("bin tomorrow: paper") on screens, a reminder
+a person can snooze (the card has no buttons), a reminder on the day of the collection or at another distance than the
+evening before, and a corrected reminder after a calendar change (the old card is taken away; a moved collection is reminded
+on its own evening).
 
 Left out for the first version, as the plan's row says: reading the schedule from a Home Assistant sensor
 (`waste_collection_schedule`), a manual "every other Tuesday" rule, and the municipality scrapers. A moved instance with
 `RANGE=THISANDFUTURE` (it moves every later instance too) is not expanded: that series is counted as unreadable. The Test
 button reads dates in this machine's time zone (a button gets the module's settings only, not Home). Times are read in
 the household's time zone (Home › Time zone, else this machine's).
+
+## Review
+
+Round 1 of the review of the reminder (pull request #128) changed: the delivery guarantee (at least once, said above), the
+withdrawal of a reminder that stopped being true, the decision at the moment of sending, the zone's own midnight and the
+job as the actor of the receipt writes.
+
+**Missing below** (what would make the reminder exactly once, and was not built here): the notification service remembering a
+key for a while after its notification was resolved, or an atomic delivery-with-receipt. Today a notification key
+deduplicates only an open notification, so a dismissed card can be delivered again after a failure between the delivery and
+the receipt.
