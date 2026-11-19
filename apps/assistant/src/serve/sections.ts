@@ -1,9 +1,10 @@
 import { applySettingsPatch, type HostResult, parseVoiceKey, resolveSettings, runSettingsChecks, type SettingsSources } from "@pva/core"
-import type { FieldError, SettingsPatch, SettingsSection, SettingValue } from "@pva/protocol"
+import { DEFAULT_RISK_POLICY, type FieldError, type RiskPolicy, type SettingsPatch, type SettingsSection, type SettingValue } from "@pva/protocol"
 import * as SherpaStt from "@pva/stt-sherpa"
 import * as SherpaTts from "@pva/tts-sherpa"
 import { ConfigProvider, Effect, Semaphore } from "effect"
 import { type ModelDirs, type SectionDefinition, sectionDefinitions, sectionPath } from "./sectionDefinitions.ts"
+import { effectiveRiskPolicy, riskPolicyValues } from "./riskPolicy.ts"
 import type { SettingsStore } from "./SettingsStore.ts"
 
 /**
@@ -54,6 +55,13 @@ export interface Sections {
   readonly announceAll: () => void
   /** Where the recogniser's and the voices' models are (environment > saved > `<repo>/models`). */
   readonly modelDirs: () => ModelDirs
+  /**
+   * P8 (review round 1, H1): the household's effective risk policy, a field read of an in-memory record. It is published
+   * by `effectiveRiskPolicy` when the sections are made, inside every committed save (in the same uninterruptible step
+   * as the write, before the save is answered) and by `announceAll` (the environment changed); reading it never builds
+   * a section definition, touches the file system or waits.
+   */
+  readonly riskPolicy: () => RiskPolicy
 }
 
 /**
@@ -124,6 +132,11 @@ export const makeSections = (
   } = {}
 ): Sections => {
   const revisions = new Map<string, number>()
+  /** P8: the effective risk policy, published off the call path (`riskPolicy`). The defaults until the first publication. */
+  let riskRecord: RiskPolicy = DEFAULT_RISK_POLICY
+  const publishRisk = () => {
+    riskRecord = effectiveRiskPolicy({ stored: store.settings().assistant, env })
+  }
   const listeners = new Set<(section: SettingsSection) => void>()
   const origin = {
     ...(options.envOrigin !== undefined ? { envOrigin: options.envOrigin } : {}),
@@ -323,6 +336,8 @@ export const makeSections = (
             : JSON.stringify(stored[key]) !== JSON.stringify(patched.stored[key])
         })
         values = undefined
+        // P8: the policy every call reads, published with the commit (this step cannot be interrupted).
+        publishRisk()
         // This section, and every other one whose form changed (visibility, warnings), gets a new revision.
         const next = current()
         const changed = next.sections.filter((s, i) =>
@@ -335,6 +350,8 @@ export const makeSections = (
     return options.around === undefined ? save : options.around(id, save)
   }
 
+  publishRisk()
+
   return {
     list: () => current().sections,
     value: (key) => effective().get(key) as SettingValue | undefined,
@@ -345,6 +362,9 @@ export const makeSections = (
       const { stored, secrets } = saved()
       for (const [key, value] of Object.entries(stored)) values[key] = encode(value)
       for (const [key, value] of Object.entries(secrets)) values[key] = value
+      // P8: the policy's keys as the canonical reader resolves them (a saved value of the wrong type is its default,
+      // never the string it would encode to); the environment's own value still comes first.
+      for (const [key, value] of Object.entries(riskPolicyValues(riskRecord))) values[key] = value
       return ConfigProvider.orElse(ConfigProvider.fromEnvRecord(nonEmptyEnv()), ConfigProvider.fromEnvRecord(values))
     },
     subscribe: (listener) => {
@@ -353,9 +373,11 @@ export const makeSections = (
     },
     announceAll: () => {
       values = undefined
+      publishRisk()
       for (const d of sectionDefinitions(modelDirs())) revisions.set(d.id, (revisions.get(d.id) ?? 0) + 1)
       announce(current().sections)
     },
-    modelDirs
+    modelDirs,
+    riskPolicy: () => riskRecord
   }
 }
