@@ -322,12 +322,12 @@ export const alarmsModule = defineModule({
           return { ...base, ring: { n: owed.n, notification: sent.success.notification.id, at: now, until: sent.success.notification.expiresAt } }
         })
 
-      const withdrawRings = (v: Alarm, now: number): Effect.Effect<Alarm> =>
+      const withdrawRings = (v: Alarm, now: number, force = false): Effect.Effect<Alarm> =>
         Effect.gen(function*() {
           if (v.withdraw.length === 0) return v
           const kept: Array<typeof Withdraw.Type> = []
           for (const w of v.withdraw) {
-            if (w.retryAt > now) {
+            if (w.retryAt > now && !force) {
               kept.push(w)
               continue
             }
@@ -343,7 +343,7 @@ export const alarmsModule = defineModule({
        * ring is recorded before it is sent; then it is sent, old rings are withdrawn, and the outcome is written with the
        * next plan. Fails only when the store does.
        */
-      const reconcile = (id: string, actor?: Actor) =>
+      const reconcile = (id: string, actor?: Actor, force = false, own = false) =>
         Effect.gen(function*() {
           const now = yield* Clock.currentTimeMillis
           let row = yield* store.get(id)
@@ -351,13 +351,15 @@ export const alarmsModule = defineModule({
           const first = advance(row.value, now)
           if (first !== row.value) row = yield* commit(row, id, first, actor)
           let v = row.value
-          if (v.owed !== undefined && v.owed.retryAt <= now) v = yield* deliver(id, v, now)
-          v = yield* withdrawRings(v, now)
+          // A ring is sent only by the row's own job, whose origin is the row's device (where `target: "origin"` rings);
+          // anything else that finds a ring owed leaves it to that job, planned for now.
+          if (own && v.owed !== undefined && v.owed.retryAt <= now) v = yield* deliver(id, v, now)
+          v = yield* withdrawRings(v, now, force)
           if (v !== row.value || nextAtOf(v) !== (row.value.pending ? row.value.nextAt : undefined)) row = yield* commit(row, id, v, actor)
           return row
         })
 
-      const change = (row: Row<Alarm>, value: Alarm, actor?: Actor) => Effect.andThen(commit(row, row.id, value, actor), () => reconcile(row.id, actor))
+      const change = (row: Row<Alarm>, value: Alarm, actor?: Actor) => Effect.andThen(commit(row, row.id, value, actor), () => reconcile(row.id, actor, true))
 
       // -- reading ---------------------------------------------------------------------------------------------------------
 
@@ -529,7 +531,7 @@ export const alarmsModule = defineModule({
               const leftover = (yield* readPending.pipe(Effect.mapError(unreadable))).rows.filter((r) => r.value.phase === "ended" && ringLeft(r))
               if (which === undefined && leftover.length > 0) {
                 let still = false
-                for (const row of leftover) still ||= ringLeft(yield* reconcile(row.id).pipe(Effect.mapError(failure)))
+                for (const row of leftover) still ||= ringLeft(yield* reconcile(row.id, undefined, true).pipe(Effect.mapError(failure)))
                 return say(texts, lang, still ? "ringPending" : "finished")
               }
               return t.say
@@ -640,7 +642,7 @@ export const alarmsModule = defineModule({
         idempotent: true,
         retries: 5,
         timeoutMs: 15_000,
-        run: ({ id }) => Effect.asVoid(locked(reconcile(id)))
+        run: ({ id }) => Effect.asVoid(locked(reconcile(id, undefined, false, true)))
       }).pipe(Effect.orDie)
 
       yield* ctx.scheduler.handle("sweep", {
@@ -652,16 +654,15 @@ export const alarmsModule = defineModule({
             const now = yield* Clock.currentTimeMillis
             const pending = yield* readPending
             for (const row of pending.rows) {
-              if (row.value.nextAt <= now) yield* locked(reconcile(row.id))
-              else {
-                const live = yield* ctx.scheduler.list({ key: `alarm:${row.id}` })
-                if (live.length === 0) {
-                  yield* locked(Effect.gen(function*() {
-                    const fresh = yield* store.get(row.id)
-                    if (fresh !== undefined) yield* commit(fresh, row.id, fresh.value)
-                  }))
-                }
-              }
+              // A row whose job was lost (it failed for good, a plan was lost) gets it planned again; an overdue one has
+              // its clean-up done now (a ring that is owed is left to its own job, which sends it on the row's device).
+              const live = yield* ctx.scheduler.list({ key: `alarm:${row.id}` })
+              if (live.length === 0) {
+                yield* locked(Effect.gen(function*() {
+                  const fresh = yield* store.get(row.id)
+                  if (fresh !== undefined && fresh.value.pending) yield* commit(fresh, row.id, fresh.value)
+                }))
+              } else if (row.value.nextAt <= now) yield* locked(reconcile(row.id, undefined, true))
               yield* Effect.yieldNow
             }
             const job = yield* CurrentJob

@@ -347,12 +347,12 @@ export const timersModule = defineModule({
         })
 
       /** Withdraw the rings owed a withdrawal (a failure is tried again a minute later, until the ring stops by itself). */
-      const withdrawRings = (v: Timer, now: number): Effect.Effect<Timer> =>
+      const withdrawRings = (v: Timer, now: number, force = false): Effect.Effect<Timer> =>
         Effect.gen(function*() {
           if (v.withdraw.length === 0) return v
           const kept: Array<typeof Withdraw.Type> = []
           for (const w of v.withdraw) {
-            if (w.retryAt > now) {
+            if (w.retryAt > now && !force) {
               kept.push(w)
               continue
             }
@@ -363,9 +363,9 @@ export const timersModule = defineModule({
         })
 
       /** Make the screen match the state: show or replace the countdown, or take it down. */
-      const syncScreen = (id: string, v: Timer, now: number): Effect.Effect<Timer> =>
+      const syncScreen = (id: string, v: Timer, now: number, force = false): Effect.Effect<Timer> =>
         Effect.gen(function*() {
-          if (!screenOwed(v) || (v.screenRetryAt ?? 0) > now) return v
+          if (!screenOwed(v) || ((v.screenRetryAt ?? 0) > now && !force)) return v
           const want = wantedScreen(v)
           const { screenTries: _t, screenRetryAt: _r, ...base } = v
           const tries = (v.screenTries ?? 0) + 1
@@ -390,7 +390,7 @@ export const timersModule = defineModule({
        * then the ring is sent, old rings withdrawn and the countdown matched, and the outcome written with the next plan.
        * Fails only when the store does (the job is then run again).
        */
-      const reconcile = (id: string, actor?: Actor) =>
+      const reconcile = (id: string, actor?: Actor, force = false, own = false) =>
         Effect.gen(function*() {
           const now = yield* Clock.currentTimeMillis
           let row = yield* store.get(id)
@@ -398,9 +398,11 @@ export const timersModule = defineModule({
           const first = advance(row.value, now)
           if (first !== row.value) row = yield* commit(row, id, first, actor)
           let v = row.value
-          if (v.owed !== undefined && v.owed.retryAt <= now) v = yield* deliver(id, v, now)
-          v = yield* withdrawRings(v, now)
-          v = yield* syncScreen(id, v, now)
+          // A ring is sent only by the row's own job, whose origin is the row's device (where `target: "origin"` rings);
+          // anything else that finds a ring owed leaves it to that job, planned for now.
+          if (own && v.owed !== undefined && v.owed.retryAt <= now) v = yield* deliver(id, v, now)
+          v = yield* withdrawRings(v, now, force)
+          v = yield* syncScreen(id, v, now, force)
           if (v !== row.value || nextAtOf(v, now) !== (row.value.pending ? row.value.nextAt : undefined)) row = yield* commit(row, id, v, actor)
           return row
         })
@@ -530,7 +532,7 @@ export const timersModule = defineModule({
         }))
 
       /** A change of a timer, then everything owed after it done at once. Inside the lock. */
-      const change = (row: Row<Timer>, value: Timer, actor?: Actor) => Effect.andThen(commit(row, row.id, value, actor), () => reconcile(row.id, actor))
+      const change = (row: Row<Timer>, value: Timer, actor?: Actor) => Effect.andThen(commit(row, row.id, value, actor), () => reconcile(row.id, actor, true))
 
       /** A timer that came due given more time (`ms`): it runs again; its ring is withdrawn, or kept when it was this ring's own button. */
       const rearmed = (v: Timer, now: number, ms: number, options: { readonly snoozed: boolean; readonly pressed?: string }): Timer => {
@@ -633,7 +635,7 @@ export const timersModule = defineModule({
             if (t.shown !== "active") return say(texts, lang, "notPausedRinging", { Name })
             if (row.value.state === "paused") {
               // Already paused: what is still owed for it (a countdown to take down) is done now.
-              const after = yield* reconcile(row.id).pipe(Effect.mapError(failure))
+              const after = yield* reconcile(row.id, undefined, true).pipe(Effect.mapError(failure))
               const left = speakLeft(leftOf(row.value, now), lang)
               return say(texts, lang, leftovers(after).screen ? "pausedScreenPending" : "alreadyPaused", { Name, left })
             }
@@ -673,7 +675,7 @@ export const timersModule = defineModule({
               yield* commitAll(values).pipe(Effect.mapError(failure))
               let pending = false
               for (const row of rows) {
-                const after = yield* reconcile(row.id).pipe(Effect.mapError(failure))
+                const after = yield* reconcile(row.id, undefined, true).pipe(Effect.mapError(failure))
                 const l = leftovers(after)
                 pending ||= l.ring || l.screen
               }
@@ -688,7 +690,7 @@ export const timersModule = defineModule({
                 if (leftover.length > 0) {
                   let still = false
                   for (const row of leftover) {
-                    const after = yield* reconcile(row.id).pipe(Effect.mapError(failure))
+                    const after = yield* reconcile(row.id, undefined, true).pipe(Effect.mapError(failure))
                     const l = leftovers(after)
                     still ||= l.ring || l.screen
                   }
@@ -716,7 +718,7 @@ export const timersModule = defineModule({
         idempotent: true,
         retries: 5,
         timeoutMs: 15_000,
-        run: ({ id }) => Effect.asVoid(locked(reconcile(id)))
+        run: ({ id }) => Effect.asVoid(locked(reconcile(id, undefined, false, true)))
       }).pipe(Effect.orDie)
 
       // The hourly sweep (and once at start): reconciles every row with something overdue, plans the job of every row with
@@ -731,16 +733,15 @@ export const timersModule = defineModule({
             const now = yield* Clock.currentTimeMillis
             const pending = yield* readPending
             for (const row of pending.rows) {
-              if (row.value.nextAt <= now) yield* locked(reconcile(row.id))
-              else {
-                const live = yield* ctx.scheduler.list({ key: `timer:${row.id}` })
-                if (live.length === 0) {
-                  yield* locked(Effect.gen(function*() {
-                    const fresh = yield* store.get(row.id)
-                    if (fresh !== undefined) yield* commit(fresh, row.id, fresh.value)
-                  }))
-                }
-              }
+              // A row whose job was lost (it failed for good, a plan was lost) gets it planned again; an overdue one has
+              // its clean-up done now (a ring that is owed is left to its own job, which sends it on the row's device).
+              const live = yield* ctx.scheduler.list({ key: `timer:${row.id}` })
+              if (live.length === 0) {
+                yield* locked(Effect.gen(function*() {
+                  const fresh = yield* store.get(row.id)
+                  if (fresh !== undefined && fresh.value.pending) yield* commit(fresh, row.id, fresh.value)
+                }))
+              } else if (row.value.nextAt <= now) yield* locked(reconcile(row.id, undefined, true))
               yield* Effect.yieldNow
             }
             const job = yield* CurrentJob

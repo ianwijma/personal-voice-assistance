@@ -11,6 +11,8 @@ export interface Hooks {
   txFail?: { times: number; readonly failure: StoreFailure } | undefined
   /** After the next successful send, the next transaction fails once with this (the write after the send). */
   failAfterSend?: StoreFailure | undefined
+  /** After the next successful send, every write fails with this until the test clears `writesFail`. */
+  blockAfterSend?: StoreFailure | undefined
   /** The `n`-th row write inside the next transaction throws this: it rolls back after a write. */
   throwAtWrite?: { readonly n: number; readonly failure: StoreFailure } | undefined
   /** The next transaction waits for this to be completed first. */
@@ -126,6 +128,10 @@ export const hooked = <M extends ModuleDefinition<any>>(definition: M, hooks: Ho
             if (hooks.sendFail !== undefined) return Effect.fail(hooks.sendFail)
             return Effect.tap(ctx.notify.send(request), () =>
               Effect.sync(() => {
+                if (hooks.blockAfterSend !== undefined) {
+                  hooks.writesFail = hooks.blockAfterSend
+                  hooks.blockAfterSend = undefined
+                }
                 if (hooks.failAfterSend !== undefined) {
                   hooks.txFail = { times: 1, failure: hooks.failAfterSend }
                   hooks.failAfterSend = undefined
