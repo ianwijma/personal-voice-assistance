@@ -89,6 +89,25 @@ describe("finding 1: ten rings open and one more", () => {
     }))
 })
 
+describe("finding 1: an alarm refused past its late rule", () => {
+  it.effect("is not rung; the missed card is sent; if that is refused too, the Health page says so; the series goes on", () =>
+    Effect.gen(function*() {
+      const hooks = makeHooks()
+      const kit = yield* alarmKit(hooks)
+      yield* kit.action("set", { when: "every day at 10:01" })
+      hooks.sendFail = limitFailure()
+      yield* kit.advance(MIN + 16 * MIN)
+      const row = (yield* alarmRows(kit))[0]!
+      assert.isUndefined(row.value.owed)
+      assert.strictEqual(row.value.next?.at, at(19, 10, 1))
+      assert.isTrue((yield* kit.jobs).some((j) => j.handler === "trouble" && j.state === "failed"))
+      assert.isTrue((yield* kit.checkHealth).some((i) => JSON.stringify(i).includes("could not ring")))
+      hooks.sendFail = undefined
+      yield* kit.advance(at(19, 10, 1) - (yield* kit.now))
+      assert.strictEqual(ringing(kit).length, 1)
+    }))
+})
+
 describe("finding 1 (its fix): an owed ring is sent only on the timer's own device", () => {
   it.effect("while a ring is refused, other devices' requests do not send it to them; it rings on its device once it can", () =>
     Effect.gen(function*() {
