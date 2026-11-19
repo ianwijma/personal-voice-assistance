@@ -15,6 +15,9 @@ This page belongs to the module's pull request, which touches its package and th
 Alarms that ring on the device they were set on, either once ("wake me at seven", "tomorrow at 6:30") or repeating
 ("every weekday at quarter to seven", "elke werkdag om half zeven"). Up to 50 at once.
 
+**An alarm is not changed.** To move one, it is cancelled and set again (`alarms_cancel`, then `alarms_set`). The tool
+descriptions and the instructions say so, so the model does exactly that.
+
 It is a separate module from `timers`, so an assistant can have one without the other.
 
 ### When
@@ -49,14 +52,15 @@ An alarm is one row. It holds:
 - **its next occurrence not yet handed to delivery** (`next`), kept as the **nominal local date and time**, with the
   instant derived from them.
 
-Keeping the nominal date matters: in Nuuk, "every Saturday at 11:30 pm" falls in the spring gap on 28 March 2026, and
-its instant is Sunday 00:30. Its date is still Saturday, so "only the next one at 10 pm" means Saturday 22:00.
+Keeping the nominal date and time matters: in Nuuk, "every Saturday at 11:30 pm" falls in the spring gap on 28 March
+2026, and its instant is Sunday 00:30. It is still Saturday's 23:30 alarm: it is said, matched and skipped as that.
 
 The same row holds what is owed for the alarm:
 
 - **a ring that is due and not sent yet** (`owed`: the occurrence, the tries, the next try);
-- **the last ring** (`ring`: its notification and, after Snooze or Five more minutes, the instant it rings again);
-- **rings still to be taken away.**
+- **the last ring** (`ring`: its notification, the nominal date and time of the occurrence it is for, and, after Snooze
+  or Five more minutes, the instant it rings again);
+- **at most one ring still to be taken away.**
 
 An alarm is **set** while something is still to ring: an occurrence, an owed ring or a snooze. Otherwise it has
 **ended**. `nextAt` is the next moment anything happens for the row, and the row has **exactly one scheduler job** (key
@@ -79,9 +83,13 @@ A ring that cannot be sent within **15 minutes** of its time is not rung. The se
 notification service may have refused it all that time (it allows ten open notifications per module). Until then it is
 tried again every 30 seconds.
 
-Instead of the ring, a **silent card on its device** says it was missed. The card is worded from the day it is told:
-"The alarm for Wednesday the eighteenth of November 2026 at ten oh one in the morning could not ring: I wasn't running
-then.". If even that card cannot be sent, the Health page says so: a job of the module (`trouble`) fails on purpose.
+Instead of the ring, a **silent card on its device** says it was missed. It names no cause, since the module does not
+know it, and it is worded from the day it is told: "The alarm for Wednesday the eighteenth of November 2026 at ten oh
+one in the morning could not ring." ("De wekker voor … kon niet afgaan.").
+
+If even that card cannot be sent, the Health page says so: a job of the module (`trouble`) fails on purpose. That job
+is written in the same transaction that gives the ring up; if neither the card nor the job can be made, the ring is not
+given up and stays owed.
 
 After an outage of several occurrences, the latest one is the one counted (missed or rung). The next one is always
 planned after now, never in the past. A ring up to 15 minutes late rings, and says how late.
@@ -90,8 +98,9 @@ planned after now, never in the past. A ring up to 15 minutes late rings, and sa
 
 - A `ring` notification on the alarm's device, titled with its name there ("Pills alarm"), with **Snooze** (the snooze
   setting's minutes, 9 by default) and **Five more minutes** beside the host's **Stop**.
-- **The notification key is per occurrence** (`alarm:<id>:<number>`). A new ring first takes the alarm's older card
-  away.
+- **One ring per alarm at a time.** Before a new ring is sent (a snooze, Five more minutes, the next occurrence), the
+  previous card is resolved. While that cannot be done, the new ring waits as owed and is tried again; it is never
+  sent beside the old card. The notification key is per occurrence (`alarm:<id>:<number>`).
 - **Snooze and Five more minutes** set the row's ring to ring again; the series is not moved.
 - **The buttons act only on the alarm's current ring.** A press of any other card is answered "That ring has ended."
   and changes nothing. A press is done once per notification.
@@ -102,10 +111,10 @@ server fails between the send and that last write, the next reconcile records th
 If **Stop was pressed in that moment, it sends it again: a ring can sound a second time, and it is never lost.** A cancel
 in that moment finds the card by its key and takes it away.
 
-**Stop while a press is under way.** A Snooze or Five-more-minutes press writes its change, then looks at its card once
-more. If something else ended the card meanwhile, the press takes the snooze back and answers "The ring was stopped,
-so it will not ring again now.". **A Stop in the instant between that look and the notification service recording the
-press can lose to the press.** "Missing below" on the timers page says what would close both limits.
+**Stop and a button pressed at the same moment.** When Stop and Snooze or Five more minutes are pressed for the same
+ring at the same moment, the card follows whichever the notification service recorded first. **The alarm may still
+ring again once**; saying "stop" or "cancel the alarm" again ends it. "Missing below" on the timers page says what
+would close both limits.
 
 ### An alarm's name is shown and spoken only on the device it rings on
 
@@ -121,21 +130,22 @@ The ring goes only to its own device. The decision is made when answering, for t
 ### Snoozed and ringing alarms
 
 A snoozed alarm is part of its row: it is listed with when it rings again ("One alarm: tea, ringing again today at ten
-past ten in the morning."), and a ringing one is listed as ringing. Either can be cancelled by voice from any device,
-by its time, or by its name on its own device, also after a restart: "The snoozed alarm is cancelled.".
+past ten in the morning."), and a ringing one is listed as ringing. Either can be cancelled by voice, also after a
+restart: "The snoozed alarm is cancelled.".
+
+- From any device it can be cancelled by its time: the time it was set for, also when it rang late or next to a
+  daylight-saving change.
+- On its own device it can also be cancelled by its name.
 
 ### Only the next, or all
 
-Cancelling or changing a repeating alarm must say which. Without it the answer is the question "That alarm repeats
-every weekday. Only the next one, or all of them?", and nothing changes (docs/MODULES-PLAN.md §2 row 6).
+Cancelling a repeating alarm must say which. Without it the answer is the question "That alarm repeats every weekday.
+Only the next one, or all of them?", and nothing changes (docs/MODULES-PLAN.md §2 row 6).
 
 - **"Only the next"** skips that occurrence ("… is skipped; the next one is Friday at quarter to seven in the
   morning."). When a snooze is still to ring, that snooze is the next ring: "The snoozed alarm is cancelled; the next
   one is tomorrow at …".
-- **Changing only the next** makes a one-off alarm of the same name, on that occurrence's nominal day at the new time,
-  and skips the occurrence.
-- **"All"** ends the series, or moves every occurrence to the new time: `DTSTART` moves to the next occurrence's
-  nominal day at the new time, and the next ring is the first occurrence after now.
+- **"All"** ends the series.
 
 ### Clean-up
 
@@ -143,12 +153,17 @@ Taking a ring away is owed work in the row. It is cleared only when it succeeded
 job, also after a restart, until the ring stops by itself. The sentence is true:
 
 - "The alarm is cancelled; its ring is still being stopped, and I keep trying." while that is so;
-- a second "cancel the alarm" finishes it: "The alarm's ring is stopped now.".
+- **cancelling again finishes it**: "The alarm's ring is stopped now.". Such an alarm can be cancelled again as the
+  only one, by its time from any device, or by its name on its own device. Lists of alarms do not show it.
+
+Cancelling, and a new occurrence that replaces an owed ring, let go of the alarm's ring in one way. A ring whose sending
+could not be recorded yet is first looked for among the open notifications by its key, and taken away; only then is
+the owed ring forgotten.
 
 ### Which alarm
 
 - by name, on its own device;
-- or by its time ("6:45": its next occurrence, its snooze or its owed ring);
+- or by its time ("6:45": its next occurrence, its snooze, or the time its owed or ringing occurrence was set for);
 - or the only one there is;
 - otherwise a question that lists them. Never the first of several.
 
@@ -161,16 +176,16 @@ Everything is local: no outside service, no network.
 
 ## Tools
 
-There are four typed actions, each with English and Dutch `examples`. The intent path runs them without the model, and
+There are three typed actions, each with English and Dutch `examples`. The intent path runs them without the model, and
 the model is offered each as `alarms_<id>`. There are no phrase commands: the plan gives phrases to the timers only.
-`set`, `cancel` and `change` are `change`; `list` is a plain read.
+`set` and `cancel` are `change`; `list` is a plain read. **Moving an alarm is `alarms_cancel` followed by
+`alarms_set`.**
 
 | Tool | Parameters | Example | Answer |
 |---|---|---|---|
 | `alarms_set` | `when` (text, as said), `name?` | "wake me at seven" | "Alarm set for tomorrow at seven o'clock in the morning." |
 | `alarms_list` | none | "which alarms are set" | "2 alarms: tomorrow at quarter to seven in the morning, every weekday and tomorrow at nine o'clock in the morning." |
 | `alarms_cancel` | `which?` (a name or a time), `scope?` (`next`, `all`) | "cancel tomorrow's alarm only" | "The alarm for tomorrow at quarter to seven in the morning is skipped; the next one is Friday at quarter to seven in the morning." |
-| `alarms_change` | `to` (text), `which?`, `scope?` | "move the weekday alarm to 7:15, all of them" | "The alarm now rings every weekday; the next one is tomorrow at quarter past seven in the morning." |
 
 Dutch: "zet een wekker om half acht" answers "Wekker gezet voor morgen om half acht 's ochtends.". A repeating one
 without a scope answers "Die wekker herhaalt elke werkdag. Alleen de volgende, of allemaal?".
@@ -184,10 +199,9 @@ without a scope answers "Die wekker herhaalt elke werkdag. Alleen de volgende, o
   - a name that is not one line of at most 60 characters;
   - 50 alarms already;
   - no device (a routine step without a turn);
-  - a new time not understood;
   - the store busy or failing.
-- **Instructions** (stable): alarms ring on the device they are set on; pass a scope only when the person said "only
-  the next" or "all".
+- **Instructions** (stable): alarms ring on the device they are set on; an alarm is not changed (to move one, cancel it
+  and set it again); pass a scope only when the person said "only the next" or "all".
 
 ## Settings
 
@@ -202,7 +216,7 @@ No secrets, no addresses. A value outside its bounds keeps the module from runni
 
 **One collection, `alarms`**, household scope.
 
-- `maxChars` is 2,300: the worst legal row is about 2,200 characters of JSON, so one list reads at most 10 rows. The
+- `maxChars` is 2,300: the worst legal row fits it (`checkModule` computes it), so one list reads at most 10 rows. The
   module asks for pages of 10.
 - **Indexes**: `phase`, `[phase, endedAt]` and `[pending, nextAt]`.
 - **A row**:
@@ -212,8 +226,8 @@ No secrets, no addresses. A value outside its bounds keeps the module from runni
   - `next` (nominal date, nominal time, instant);
   - the occurrence count;
   - the owed ring;
-  - the last ring and its snooze;
-  - up to three rings to take away;
+  - the last ring (with the nominal date and time of its occurrence) and its snooze;
+  - at most one ring to take away;
   - `phase`, `pending`, `nextAt`, and when it ended.
 
 **Reads**:
@@ -231,8 +245,8 @@ nothing of them; the ringing card goes only to the alarm's device.
 
 **Jobs**:
 
-- one `due` per row with something to come, with the alarm's device as its origin (also when it is changed from
-  another device);
+- one `due` per row with something to come, with the alarm's device as its origin (also when it is cancelled or skipped
+  from another device);
 - `sweep`, hourly and once at start;
 - `trouble`, a one-off that fails on purpose when even a missed card could not be sent.
 
@@ -241,7 +255,7 @@ nothing of them; the ringing card goes only to the alarm's device.
 - `requires`: nothing outside the process; `uses`: nothing.
 - **Core services**: the scheduler, the notification service, `Devices` (device names in answers).
 - **`@pva/language`**: `parseRecurrence`, `parseDateTime`, `parseTimeOfDay`, `nextOccurrence`, `occurrencesAfter`,
-  `formatDtstart`, `parseDtstart`, `describeRRule`, `speakMoment`, `speakTime`, `normalizeTimeZone`.
+  `parseDtstart`, `describeRRule`, `speakMoment`, `speakTime`, `normalizeTimeZone`.
 
 ## What was left out
 
@@ -274,7 +288,7 @@ Review round 1's findings for alarms:
 - a series lost when a ring was refused (1);
 - a ring sent but not recorded (2);
 - a press whose outcome was lost (3);
-- Stop during a press (4);
+- Stop during a press (4; its check was replaced by a stated limit in round 2);
 - a ring withdrawal that failed (5);
 - snoozed alarms missing from list and cancel (7);
 - the nominal date lost in a gap (8);
@@ -285,3 +299,18 @@ Review round 1's findings for alarms:
 
 These are fixed by the same one-row, one-job design as the timers. Each has its test in
 `packages/module-timers/test/review1.test.ts`.
+
+Review round 2 (the deciding review) found 13 blocking problems; for alarms:
+
+- **Changing alarms is cut** (an alarm is cancelled and set again). Three findings went with it: a change of "only the
+  next" that could commit half, a superseded owed occurrence that still rang, and a snooze that "only the next"
+  missed.
+- **The check a press made after its write is gone**, and the Stop limit is stated instead (above).
+- **One ring per alarm at a time.** The previous card is resolved before a new one is sent.
+- **One way to let go of an owed or ringing occurrence.** It first looks for a sent but unrecorded card by its key.
+- **A ring remembers the time it was set for**, and is cancelled by that time.
+- **Cancelling again finishes owed clean-up.**
+- **The Health report is written with the giving-up.**
+- **The missed card names no cause.**
+
+Each has its test in `packages/module-timers/test/review2.test.ts`; the cut is pinned in `alarms.test.ts`.

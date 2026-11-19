@@ -30,8 +30,9 @@ Running and paused timers are listed and count toward the 50. Beside the state, 
 **owed** for the timer:
 
 - a ring that is due and not sent yet;
-- rings of it still to be taken away (an older card, a ring that was cancelled);
-- the countdown on screen that should match the state: shown while it runs, gone otherwise.
+- **at most one** ring of it still to be taken away (its previous card, or a ring that was cancelled);
+- a countdown that **may be on a screen**: written in the row before it is shown, and kept until it is known to be
+  gone. The countdown should match the state: shown while it runs, gone otherwise.
 
 `nextAt` is the next moment anything happens for the row. The row has **exactly one scheduler job**, key `timer:<id>`,
 planned for that moment in the same transaction as every write to the row.
@@ -49,8 +50,10 @@ own: a job can fail for good after its retries while the store is busy.
 
 - **When its moment comes**, the job sends a `ring` notification on the timer's device: "Pasta timer is done", "The 10
   minutes timer has ended.". The card has **Snooze** and **Five more minutes** beside the host's **Stop**.
-- **The notification key is per ring** (`timer:<id>:<ring number>`). A later ring is never swallowed by an earlier card
-  that is still open, and a new ring first takes the timer's older card away.
+- **One ring per timer at a time.** A timer never has two cards of its own open.
+  - Before a new ring is sent (after Snooze, after Five more minutes, at the next moment), the previous card is resolved.
+  - While that cannot be done, the new ring waits as owed and is tried again: it is not sent beside the old card.
+  - The notification key is per ring (`timer:<id>:<ring number>`), so a later ring is never swallowed by an earlier card.
 - **Snooze** makes the timer run again for the snooze setting's minutes, without a countdown. **Five more minutes**
   makes it run again for five minutes, with its countdown.
 - **The buttons act only on the timer's current ring.** A press of any other card (an older one, or one whose sending
@@ -67,9 +70,12 @@ busy, **stays owed** and is tried again every 30 seconds for as long as it would
 While it waits, the timer is listed as "done and waiting to ring". A restart keeps it.
 
 When a place comes free in time, it rings and says how late: "The 2 minutes timer ended two and a half minutes ago,
-while I couldn't ring.". If no place comes free in its whole ring time, it is recorded as missed and the Health page
-says so. A module has no other way to raise a Health issue, so a job of its own (`trouble`) fails on purpose. A timer
-due while the server or the module was down rings as soon as the module runs again, and says how late.
+while I couldn't ring.". A timer due while the server or the module was down rings as soon as the module runs again,
+and says how late.
+
+If no place comes free in its whole ring time, it is recorded as missed and the Health page says so. A module has no
+other way to raise a Health issue, so a job of its own (`trouble`) fails on purpose. That job is written in the same
+transaction that gives the ring up: if it cannot be written, the ring is not given up, and stays owed.
 
 ### Delivery is at least once
 
@@ -82,21 +88,21 @@ and that last write, the next reconcile finds the ring still owed:
 
 What would close this is below the module: see "Missing below".
 
-### Stop while a button press is under way
+### Stop and a button pressed at the same moment
 
-A Snooze or Five-more-minutes press writes its change, then looks at its card once more. If something else ended the
-card meanwhile (the host's Stop), the press takes its change back: the same as a cancel, so no ring and no countdown
-remain. It answers "The ring was stopped, so pasta timer will not ring again.".
-
-What remains is the instant between that last look and the notification service recording the press: **a Stop in that
-instant can lose to the press**, and the timer then runs again. What would close this is below the module.
+When Stop and Snooze or Five more minutes are pressed for the same ring at the same moment, the card follows whichever
+the notification service recorded first. **The timer may still ring again once.** Saying "stop" or "cancel the timer"
+again ends it. What would close this is below the module (see "Missing below").
 
 ### What a change does while it rings
 
 - **More time** ("add two minutes"): the timer runs again for that long, and its ring is taken away.
-- **Cancel** ("stop the timer", "cancel the pasta timer"): the ring is taken away. A ring that was sent but whose send
-  could not be recorded yet is found among the open notifications by its key and taken away too.
+- **Cancel** ("stop the timer", "cancel the pasta timer"): the ring is taken away.
 - **Pause or resume** of a ringing timer: refused, with a pointer to "stop".
+
+Cancel, more time, pause and a button all let go of the timer's current ring in one way. A ring whose sending could not
+be recorded yet is first looked for among the open notifications by its key. It is taken away too, and only then is
+the owed ring forgotten.
 
 ### Taking away and clean-up
 
@@ -110,10 +116,13 @@ The sentences say what is true:
 - "Pasta timer cancelled." only when its ring is gone;
 - otherwise "Pasta timer cancelled; its ring is still being stopped, and I keep trying.", or the same for the
   countdown;
-- a second "cancel the timer" finishes such a clean-up ("Pasta timer is stopped now.") instead of answering that
-  nothing runs.
+- **cancelling again finishes the clean-up**: such a timer can be cancelled again by its name ("cancel the pasta
+  timer"), or as the only one, or by "cancel all timers", and the clean-up is tried at once ("Pasta timer is stopped
+  now."). Lists of running timers do not show it.
 
-A countdown that cannot be shown after three tries is left out (the timer still runs and rings). Typically that is the
+The countdown is recorded in the row as "may be on a screen" before it is shown. So a countdown whose showing could
+not be recorded (the store failed just after) is still known, and taken away by a cancel, also after a restart. A
+countdown that cannot be shown after three tries is left out (the timer still runs and rings); typically that is the
 Presenter's bound of 8 per module. An old countdown that could not be replaced after a change is taken down instead,
 so a screen never counts down to the wrong moment.
 
@@ -141,6 +150,8 @@ inside it. A cancel said while the ring job is sending waits for it, and then st
   - `start({ durationMs, label?, ringOn? })` rings on `ringOn.deviceId`, else on the call's device (the turn's, else
     the job's);
   - it has the contract's bounds and errors (`invalid`, `no_device`, `unknown_device`, `limit`, `busy`, `failed`);
+  - **a start that was committed is a success**: what happens to the countdown afterwards is owed work, never an
+    error, and `busy` and `failed` mean nothing was started (the voice start the same);
   - a call made under a job is written as that job.
 - **The ambient line** comes with the Home setting "Household facts in every reply", which is off by default:
   - it reads like "Timers running (most recently changed): pasta timer with 6 minutes 10 seconds left, eggs timer
@@ -204,7 +215,7 @@ No secrets, no addresses. A value outside its bounds keeps the module from runni
 
 **One collection, `timers`**, household scope.
 
-- `maxChars` is 1,900: the worst legal row is about 1,750 characters of JSON, so one list reads at most 13 rows. The
+- `maxChars` is 1,900: the worst legal row fits it (`checkModule` computes it), so one list reads at most 13 rows. The
   module asks for pages of 12.
 - **Indexes**:
   - `phase`: the active timers, by `createdAt`;
@@ -217,8 +228,8 @@ No secrets, no addresses. A value outside its bounds keeps the module from runni
   - the ring number;
   - the owed ring (occurrence, tries, next try);
   - the last ring (its notification, when it was sent, when it stops, the press already done for it);
-  - up to three rings to take away;
-  - the countdown on screen and its retries;
+  - at most one ring to take away;
+  - the countdown that may be on a screen (and whether it is known to be shown), with its retries;
   - `pending` and `nextAt`, and when it ended.
 
 **Reads**:
@@ -290,10 +301,10 @@ These are below the module. The notification service and the Presenter are not c
   sending was not recorded can sound again after a Stop (delivery at least once, above).
   - Smallest change: remember a module's key for a while (the ring time) after its notification was resolved, and
     answer a send under it with that notification.
-- **The end of a notification, as seen by its action handler.** A Stop in the instant between a press's last look and
-  the service recording the press's outcome can lose to the press.
-  - Smallest change: tell the handler, or fail its outcome, when its notification was ended before the outcome was
-    recorded. The module would then take its change back.
+- **The end of a notification, as seen by its action handler.** When Stop and a button are pressed for the same ring at
+  the same moment, the timer may ring again once (above).
+  - Smallest change: tell the handler that its notification was ended before its outcome was recorded (or fail that
+    outcome). The module would then not keep its follow-up.
 - **Dismissing a pinned presentation by its key.** After a restart the module replaces the countdown by its key and
   dismisses that.
   - Smallest change: `ctx.present.dismiss({ key })` for the module's own presentations.
@@ -340,3 +351,21 @@ The module now keeps one row state with one job, reconciled by one function. On 
   failures.
 
 `packages/module-timers/test/review1.test.ts` has one test or more per finding.
+
+Review round 2 (the deciding review) found 13 blocking problems, mostly where two features met a failure at the same
+moment. Two of those meeting points were removed instead of patched:
+
+- alarms are no longer changed (see the alarms page);
+- the check a press made after its write, and the take-back that hung on it, are gone: the Stop limit is stated above
+  instead.
+
+The rest were fixed where they were:
+
+- a timer has one ring at a time: the previous card is resolved before a new one is sent;
+- one function lets go of the current ring and first looks for a sent but unrecorded card by its key;
+- cancelling again finishes owed clean-up;
+- a committed start is a success;
+- a countdown is recorded before it is shown;
+- the Health report of a missed ring is written in the transaction that gives the ring up.
+
+`packages/module-timers/test/review2.test.ts` has one test or more per finding.
