@@ -297,6 +297,7 @@ interface PublishedHandler {
 /** A show from a tool's result, accepted and waiting for the writer (it holds its place in the bounds meanwhile). */
 interface PendingShow {
   readonly entry: Omit<Entry, "rev">
+  readonly priorShows: ReadonlySet<string>
   readonly content: StoredContent
   readonly spoken: string
   readonly buttons: ReadonlyArray<{ readonly id: string; readonly label: string }>
@@ -1379,7 +1380,7 @@ export const makePresentEngine = (options: PresentEngineOptions): Effect.Effect<
             // A room move while this write waited can create overlap with a newer show (R1). Recheck it in the
             // committing attempt, before this older accepted transient can end that show on every room screen.
             if (s.entry.lifetime === "transient" && overlapping(s.entry.target, s.entry.id).some((e) =>
-              e.expiresAt > at && (e.shownAt > s.entry.shownAt || (e.shownAt === s.entry.shownAt && e.id > s.entry.id)))) return "gone"
+              e.expiresAt > at && (e.shownAt > s.entry.shownAt || (e.shownAt === s.entry.shownAt && !s.priorShows.has(e.showId))))) return "gone"
             return writeShow(p, s.entry, () => s.content, s.spoken, s.buttons, at)
           }, (w) => {
             if (w === "gone" || w === "ended") {
@@ -1449,7 +1450,7 @@ export const makePresentEngine = (options: PresentEngineOptions): Effect.Effect<
         const accept = (accepted: Omit<Entry, "rev">) => {
           retireSupersededBy(accepted)
           if (accepted.key !== undefined) pendingKeys.set(keyOf(moduleId, accepted.key), accepted.id)
-          const s: PendingShow = { entry: accepted, content: storedContentOf(presentation), spoken: presentation.spoken, buttons: (presentation.buttons ?? []).map((b) => ({ id: b.id, label: b.label })), failed: false }
+          const s: PendingShow = { entry: accepted, priorShows: new Set([...index.values()].filter((entry) => entry.shownAt === accepted.shownAt).map((entry) => entry.showId)), content: storedContentOf(presentation), spoken: presentation.spoken, buttons: (presentation.buttons ?? []).map((b) => ({ id: b.id, label: b.label })), failed: false }
           pending.push(s)
           work.push(s)
           void Queue.offerUnsafe(workWake, undefined)

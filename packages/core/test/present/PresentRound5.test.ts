@@ -14,8 +14,21 @@ const yields = Effect.repeat(Effect.yieldNow, { times: 100 })
 const card = (title: string) => ({ kind: "card" as const, title, spoken: title })
 
 describe("presentation round 5", () => {
-  for (const retry of [false, true]) for (const move of [false, true]) {
-    it.effect(`a1: an older accepted transient cannot end a newer room card (retry=${retry}, move=${move})`, () => Effect.gen(function*() {
+  it.effect("a1: a later transient replaces an earlier one at the same instant regardless of random id order", () => Effect.gen(function*() {
+    let sequence = 100
+    const w = yield* presentWorld(yield* presentPrepared(makeMemoryHouseholdStore()), {
+      newId: () => `p-${String(--sequence).padStart(32, "0")}`
+    })
+    yield* w.settle
+    for (const title of ["Earlier", "Later"]) {
+      yield* w.toolOn("kitchen-display", { forModel: "OK", present: card(title) })
+      yield* w.settle
+      assert.deepStrictEqual(w.shownOn("kitchen-display").map((shown) => shown.content.kind === "card" ? shown.content.title : ""), [title])
+    }
+  }))
+
+  for (const retry of [false, true]) for (const move of [false, true]) for (const sameTime of [false, true]) {
+    it.effect(`a1: an older accepted transient cannot end a newer room card (retry=${retry}, move=${move}, sameTime=${sameTime})`, () => Effect.gen(function*() {
       const f = presentFaultyStore(yield* presentPrepared(makeMemoryHouseholdStore()))
       const devices = PRESENT_DEVICES.map((d) => ({ ...d, place: { ...d.place } }))
       const tablet = devices[0]!, office = devices[1]!
@@ -27,7 +40,7 @@ describe("presentation round 5", () => {
       else f.gate.wait = gate
       yield* w.toolOn(tablet.id, { forModel: "OK", present: card("Earlier tablet") })
       yield* yields
-      yield* TestClock.adjust(retry ? 25 : 2500)
+      if (!sameTime) yield* TestClock.adjust(retry ? 25 : 2500)
       const newer = yield* w.board().show({ room: "Office" }, card("Later office"))
       yield* yields
       if (move) tablet.room = tablet.place.room = "Office"

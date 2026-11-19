@@ -175,6 +175,7 @@ export const presentWorld = (
     /** Keep no record of messages and decisions (the latency test). */
     readonly unrecorded?: boolean
     readonly observe?: Parameters<typeof makePresentEngine>[0]["observe"]
+    readonly newId?: () => string
     /** What the Presenter is given as its scheduler (a test injects refusals); default the real one. */
     readonly wrapScheduler?: (scheduler: SchedulerEngine) => SchedulerEngine
     /** The modules' tool is `speculative: true` (it may run before its turn is committed). */
@@ -224,6 +225,7 @@ export const presentWorld = (
         }),
         ...(o.media !== undefined ? { media: () => ({ fetch: o.media! }) } : {}),
         ...(o.observe !== undefined ? { observe: o.observe } : {}),
+        ...(o.newId !== undefined ? { newId: o.newId } : {}),
         gateway: () => hostRef?.gateway,
         pageText: (m, text, max) => hostRef?.pageText(m, text, max) ?? String(text).slice(0, max),
         language: () => "en",
