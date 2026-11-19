@@ -805,6 +805,9 @@ importers:
       '@pva/module-contracts':
         specifier: workspace:*
         version: link:../module-contracts
+      '@pva/net':
+        specifier: workspace:*
+        version: link:../net
       effect:
         specifier: 'catalog:'
         version: 4.1.4

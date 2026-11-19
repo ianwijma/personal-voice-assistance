@@ -1,0 +1,211 @@
+import { speakList, speakNumber } from "@pva/language"
+import { defineTexts, type Language, say } from "@pva/module-contracts"
+
+/**
+ * Every sentence the module speaks, failures, questions and refusals included, in English and Dutch with the same
+ * placeholders (docs/MODULES.md §16). Fragments (`whatArea`, `kindLights`, …) are filled into the sentences in the
+ * household's language, so a sentence never mixes the two. Numbers and lists are worded by `@pva/language`
+ * (`numberOf`, `listOf` below).
+ */
+export const texts = defineTexts({
+  en: {
+    unreachable: "I couldn't reach Home Assistant.",
+    unconfirmed: "I sent it to Home Assistant but couldn't confirm that it happened; it may or may not have.",
+    timeoutRead: "Home Assistant didn't answer in time.",
+    unauthorized: "Home Assistant refused my access token; a new one can be set on the module's page.",
+    forbidden: "Home Assistant refused: the token's user must be an administrator.",
+    restarting: "Home Assistant is restarting. Try again in a minute.",
+    failed: "Home Assistant reported an error.",
+    invalid: "Home Assistant sent an answer I can't read.",
+    notLoaded: "I haven't been able to read the house from Home Assistant yet.",
+    whichRoom: "Which room? I don't know which room this device is in.",
+    roomUnknown: "I don't know a room called {room} in Home Assistant. Which room do you mean?",
+    whichOne: "{name} is more than one thing in Home Assistant: {options}. Which one do you mean?",
+    nothingThere: "There are no {things} in {area} that I may use.",
+    nothingAtAll: "Home Assistant has no {things} that I may use.",
+    allIncomplete: "Your house has more devices than I can read, so I can't reach all the {things}. Which room do you mean?",
+    unreadThere: "I couldn't read every device in your house, so I can't tell whether there are {things} in {area}.",
+    unreadAll: "I couldn't read every device in your house, so I can't tell whether there are {things}.",
+    unknownTargetPartial: "I don't know {name} among the devices I could read; your house has more than I can read.",
+    brightnessUnsupported: "{names} can't be dimmed, so I haven't changed anything.",
+    brightnessUnsupportedMany: "{names} can't be dimmed, so I haven't changed anything.",
+    unknownTarget: "I don't know {name} in Home Assistant.",
+    unavailableOne: "{names} is unavailable in Home Assistant, so I haven't changed anything.",
+    unavailableMany: "{names} are unavailable in Home Assistant, so I haven't changed anything.",
+    turnedOn: "I've turned on {what}.",
+    turnedOff: "I've turned off {what}.",
+    brightness: "I've set {what} to {level} percent.",
+    temperature: "I've set {what} to {temperature} degrees.",
+    temperatureNow: "I've set {what} to {temperature} degrees; it's {current} degrees now.",
+    temperatureUnsupported: "{names} can't be set to a temperature, so I haven't changed anything.",
+    temperatureUnsupportedMany: "{names} can't be set to a temperature, so I haven't changed anything.",
+    unitUnknown: "I couldn't read which temperature unit Home Assistant uses, so I haven't changed anything.",
+    mode: "I've set {what} to {mode}.",
+    modeUnsupported: "{names} can't be set to {mode}, so I haven't changed anything.",
+    modeUnsupportedMany: "{names} can't be set to {mode}, so I haven't changed anything.",
+    opening: "I'm opening {what}.",
+    closing: "I'm closing {what}.",
+    stopping: "I've stopped {what}.",
+    position: "I'm setting {what} to {position} percent open.",
+    positionUnsupported: "{names} can't be set to a position, so I haven't changed anything; say open or close.",
+    positionUnsupportedMany: "{names} can't be set to a position, so I haven't changed anything; say open or close.",
+    started: "I've started {name}.",
+    sceneNoList: "I don't start {name}: Home Assistant doesn't say what it sets.",
+    sceneUnsafe: "I don't start {name}: it sets something I don't change by voice, such as a lock, an alarm or a garage door.",
+    lightsAllOff: "All the lights are off.",
+    lightsAllOffKnown: "All the lights I can read are off; your house has more than I can read.",
+    lightsAllOn: "All the lights are on.",
+    lightsOneOn: "{names} is on.",
+    lightsSomeOn: "{names} are on.",
+    lightsNoneOn: "None of the lights I could read is on.",
+    lightsUnreadOne: "One light could not be read.",
+    lightsUnreadMany: "{count} lights could not be read.",
+    houseIncomplete: "Your house has more than I can read, so there may be more.",
+    climateItem: "{name} is {current} degrees, set to {target}",
+    climateItemCurrent: "{name} is {current} degrees",
+    climateItemTarget: "{name} is set to {target} degrees",
+    climateItemOff: "{name} is off, at {current} degrees",
+    climateItemUnknown: "{name} has no temperature I can read",
+    noTemperatureIn: "There's no temperature reading in {area}.",
+    statusLine: "{items}.",
+    lockLocked: "{name} is locked",
+    lockUnlocked: "{name} is unlocked",
+    lockOther: "{name} is {state}",
+    coverOpen: "{name} is open",
+    coverClosed: "{name} is closed",
+    alarmDisarmed: "{name} is disarmed",
+    alarmArmed: "{name} is armed",
+    more: "{count} more",
+    whatArea: "the {things} in {area}",
+    whatAreaKnown: "the {things} I know of in {area}",
+    whatAll: "all the {things}",
+    kindLights: "lights",
+    kindSwitches: "switches",
+    kindClimate: "heating",
+    kindThermostats: "thermostats",
+    kindCovers: "blinds",
+    kindTemperature: "thermostats or temperature sensors",
+    kindLocks: "locks, alarms or garage doors",
+    modeHeat: "heating",
+    modeCool: "cooling",
+    modeAuto: "automatic",
+    modeOff: "off",
+    almostZero: "almost zero",
+    roomless: "Without a room",
+    refused: "I'm not allowed to do that through Home Assistant."
+  },
+  nl: {
+    unreachable: "Ik kon Home Assistant niet bereiken.",
+    unconfirmed: "Ik heb het naar Home Assistant gestuurd, maar kon niet nagaan of het gebeurd is; misschien wel, misschien niet.",
+    timeoutRead: "Home Assistant antwoordde niet op tijd.",
+    unauthorized: "Home Assistant weigerde mijn toegangssleutel; op de pagina van de module kan een nieuwe worden ingesteld.",
+    forbidden: "Home Assistant weigerde: de gebruiker van de sleutel moet beheerder zijn.",
+    restarting: "Home Assistant start opnieuw op. Probeer het over een minuut nog eens.",
+    failed: "Home Assistant meldde een fout.",
+    invalid: "Home Assistant stuurde een antwoord dat ik niet kan lezen.",
+    notLoaded: "Ik heb het huis nog niet uit Home Assistant kunnen lezen.",
+    whichRoom: "Welke kamer? Ik weet niet in welke kamer dit apparaat staat.",
+    roomUnknown: "Ik ken geen kamer {room} in Home Assistant. Welke kamer bedoel je?",
+    whichOne: "{name} is meer dan één ding in Home Assistant: {options}. Welke bedoel je?",
+    nothingThere: "Er zijn geen {things} in {area} die ik mag gebruiken.",
+    nothingAtAll: "Home Assistant heeft geen {things} die ik mag gebruiken.",
+    allIncomplete: "Je huis heeft meer apparaten dan ik kan lezen, dus ik kan niet bij alle {things}. Welke kamer bedoel je?",
+    unreadThere: "Ik kon niet elk apparaat in je huis lezen, dus ik weet niet of er {things} in {area} zijn.",
+    unreadAll: "Ik kon niet elk apparaat in je huis lezen, dus ik weet niet of er {things} zijn.",
+    unknownTargetPartial: "Ik ken {name} niet onder de apparaten die ik kon lezen; je huis heeft er meer dan ik kan lezen.",
+    brightnessUnsupported: "{names} kan niet worden gedimd, dus ik heb niets veranderd.",
+    brightnessUnsupportedMany: "{names} kunnen niet worden gedimd, dus ik heb niets veranderd.",
+    unknownTarget: "Ik ken {name} niet in Home Assistant.",
+    unavailableOne: "{names} is niet beschikbaar in Home Assistant, dus ik heb niets veranderd.",
+    unavailableMany: "{names} zijn niet beschikbaar in Home Assistant, dus ik heb niets veranderd.",
+    turnedOn: "Ik heb {what} aangezet.",
+    turnedOff: "Ik heb {what} uitgezet.",
+    brightness: "Ik heb {what} op {level} procent gezet.",
+    temperature: "Ik heb {what} op {temperature} graden gezet.",
+    temperatureNow: "Ik heb {what} op {temperature} graden gezet; het is nu {current} graden.",
+    temperatureUnsupported: "{names} kan niet op een temperatuur worden gezet, dus ik heb niets veranderd.",
+    temperatureUnsupportedMany: "{names} kunnen niet op een temperatuur worden gezet, dus ik heb niets veranderd.",
+    unitUnknown: "Ik kon niet lezen welke temperatuureenheid Home Assistant gebruikt, dus ik heb niets veranderd.",
+    mode: "Ik heb {what} op {mode} gezet.",
+    modeUnsupported: "{names} kan niet op {mode} worden gezet, dus ik heb niets veranderd.",
+    modeUnsupportedMany: "{names} kunnen niet op {mode} worden gezet, dus ik heb niets veranderd.",
+    opening: "Ik doe {what} open.",
+    closing: "Ik doe {what} dicht.",
+    stopping: "Ik heb {what} stilgezet.",
+    position: "Ik zet {what} op {position} procent open.",
+    positionUnsupported: "{names} kan niet op een stand worden gezet, dus ik heb niets veranderd; zeg open of dicht.",
+    positionUnsupportedMany: "{names} kunnen niet op een stand worden gezet, dus ik heb niets veranderd; zeg open of dicht.",
+    started: "Ik heb {name} gestart.",
+    sceneNoList: "Ik start {name} niet: Home Assistant zegt niet wat het instelt.",
+    sceneUnsafe: "Ik start {name} niet: het stelt iets in dat ik niet met spraak verander, zoals een slot, een alarm of een garagedeur.",
+    lightsAllOff: "Alle lampen zijn uit.",
+    lightsAllOffKnown: "Alle lampen die ik kan lezen zijn uit; je huis heeft er meer dan ik kan lezen.",
+    lightsAllOn: "Alle lampen zijn aan.",
+    lightsOneOn: "{names} is aan.",
+    lightsSomeOn: "{names} zijn aan.",
+    lightsNoneOn: "Geen van de lampen die ik kon lezen is aan.",
+    lightsUnreadOne: "Eén lamp kon ik niet lezen.",
+    lightsUnreadMany: "{count} lampen kon ik niet lezen.",
+    houseIncomplete: "Je huis heeft meer dan ik kan lezen, dus er kunnen er meer zijn.",
+    climateItem: "{name} is {current} graden, ingesteld op {target}",
+    climateItemCurrent: "{name} is {current} graden",
+    climateItemTarget: "{name} staat op {target} graden",
+    climateItemOff: "{name} staat uit, op {current} graden",
+    climateItemUnknown: "{name} heeft geen temperatuur die ik kan lezen",
+    noTemperatureIn: "Er is geen temperatuur te lezen in {area}.",
+    statusLine: "{items}.",
+    lockLocked: "{name} is op slot",
+    lockUnlocked: "{name} is niet op slot",
+    lockOther: "{name} is {state}",
+    coverOpen: "{name} is open",
+    coverClosed: "{name} is dicht",
+    alarmDisarmed: "{name} is uitgeschakeld",
+    alarmArmed: "{name} is ingeschakeld",
+    more: "nog {count}",
+    whatArea: "de {things} in {area}",
+    whatAreaKnown: "de {things} die ik ken in {area}",
+    whatAll: "alle {things}",
+    kindLights: "lampen",
+    kindSwitches: "schakelaars",
+    kindClimate: "verwarming",
+    kindThermostats: "thermostaten",
+    kindCovers: "zonwering",
+    kindTemperature: "thermostaten of temperatuursensoren",
+    kindLocks: "sloten, alarmen of garagedeuren",
+    modeHeat: "verwarmen",
+    modeCool: "koelen",
+    modeAuto: "automatisch",
+    modeOff: "uit",
+    almostZero: "bijna nul",
+    roomless: "Zonder kamer",
+    refused: "Dat mag ik niet via Home Assistant doen."
+  }
+})
+
+export type TextKey = keyof typeof texts.en
+export type { Language }
+
+/** The same with its first letter in upper case: a sentence that starts with a filled-in fragment ("the lights in …"). */
+export const sentence = (language: Language, key: TextKey, values: Readonly<Record<string, string | number>> = {}): string => {
+  const text = say(texts, language, key, values)
+  return text.length === 0 ? text : text[0]!.toUpperCase() + text.slice(1)
+}
+
+/**
+ * A number as `@pva/language` says it (digits, the language's decimal mark, at most two decimals). A number it
+ * cannot say: "almost zero" for one that is not zero but rounds to it, `undefined` for one that is not finite or is
+ * too large to say (the caller says it has no value it can read, never a wrong one).
+ */
+export const numberOf = (language: Language, n: number): string | undefined => {
+  const said = speakNumber(n, language)
+  if (said !== undefined) return said
+  return Number.isFinite(n) && Math.abs(n) < 0.005 ? say(texts, language, "almostZero") : undefined
+}
+
+/** "A, B and C" / "A, B en C" by `speakList`; more than `max`: "A, B and 3 more" / "A, B en nog 3". */
+export const listOf = (language: Language, items: ReadonlyArray<string>, max = 4): string => {
+  const usable = items.filter((s) => s.trim() !== "")
+  if (usable.length === 0) return ""
+  const shown = usable.length <= max ? usable : [...usable.slice(0, max - 1), say(texts, language, "more", { count: speakNumber(usable.length - (max - 1), language) ?? String(usable.length - (max - 1)) })]
+  return speakList(shown, language, { max: Math.max(2, shown.length) }) ?? shown.join(", ")
+}
