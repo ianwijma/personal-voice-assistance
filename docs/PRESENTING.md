@@ -253,10 +253,18 @@ transient the decision allows.
   an address is not fetched again while it is in this run's bounded in-memory index of addresses (1,024; not kept across
   a restart); the same bytes from two addresses are one file; one fetch is shared by every asker of an address under way;
   what has expired is dealt with before new bytes are matched against it (an expired copy is a new admission); a file is
-  never served after its day, and is removed by the next hourly sweep or before a write that needs its room. A file whose
-  removal fails (anything but "not there") is never served again, stays counted against the bounds, and is removed at
-  the next sweep or write. The files **survive a restart**: the directory is read back at start, and an interrupted
-  write, a foreign file, an expired or an over-bound file is removed.
+  never served after its day, and is removed by the next hourly sweep or before a write that needs its room.
+- **The directory is the truth** (review round 2, R6). An **inventory** reads the directory as it is, removes temporary
+  files (an interrupted write), foreign files and what is past its age, then, oldest first, what is over the bounds, and
+  rebuilds the counts and bytes from what is really there. It runs at start, and after any fault every minute (and before
+  the next admission) until it succeeds. **Any file operation of the cache that fails** (a write, setting its time, the
+  rename, a removal, reading an entry or the directory, reading a file to serve it) makes the cache **not sure**: nothing
+  new is admitted (a fetch is refused `unavailable`, so the image shows without its picture) and Health says "The image
+  cache could not be read or cleaned", until an inventory has read every entry, removed what it had to and what remains
+  is inside 256 files and 64 MiB. An unreadable entry is never taken as absent. There is no list of files to remove
+  later: a file is removed by an inventory that sees it expired at that moment, so a copy admitted since is never
+  removed by an old retry. While it is not sure, an image already kept is still served if its file can be read. The
+  files **survive a restart**: what the inventory at start keeps is served for the rest of its day.
 - **The response headers**, exactly: `Content-Type` (the kept type), `Content-Length`, `X-Content-Type-Options:
   nosniff`, `Content-Security-Policy: default-src 'none'; sandbox`, `Content-Disposition: inline; filename="image.<ext>"`,
   `Cross-Origin-Resource-Policy: same-origin`, `Referrer-Policy: no-referrer`, `Cache-Control: private, no-store`. A 404
