@@ -262,7 +262,7 @@ export interface AlarmsOps {
   readonly cancel: (which: string | undefined, scope: Scope) => Effect.Effect<string, ActionError>
 }
 
-type Target = { readonly kind: "one"; readonly row: Row<Alarm> } | { readonly kind: "answer"; readonly say: string }
+type Target = { readonly kind: "one"; readonly row: Row<Alarm>; readonly snoozed: boolean } | { readonly kind: "answer"; readonly say: string }
 
 export const alarmsModule = defineModule({
   apiVersion: 2,
@@ -324,6 +324,14 @@ export const alarmsModule = defineModule({
           const lang = language()
           const later = (x: Alarm) => ({ value: { ...x, owed: { ...owed, attempts: owed.attempts + 1, retryAt: now + RETRY_RING_MS } }, jobs: [] })
           if (now - owed.at > DELIVER_WITHIN_MS) {
+            // The send may have succeeded just before the deadline and lost its outcome write. Recover that open ring.
+            const open = yield* Effect.result(ctx.notify.list())
+            if (open._tag === "Failure") return later(v)
+            const sent = open.success.find((n) => n.key === `alarm:${id}:${owed.n}`)
+            if (sent !== undefined) {
+              const ring = { n: owed.n, notification: sent.id, date: owed.date, time: owed.time, at: sent.sentAt, until: sent.expiresAt, ...(owed.snoozed === true ? { snoozedAt: owed.at } : {}) }
+              return { value: { ...withoutKey(v, "owed"), ring }, jobs: [] }
+            }
             const due = localOf(owed.at, v.timeZone)
             const date = owed.snoozed === true ? dateText(due.date) : owed.date
             const time = owed.snoozed === true ? timeText(due.time) : owed.time
@@ -497,18 +505,18 @@ export const alarmsModule = defineModule({
         return what
       }
 
-      const one = (row: Row<Alarm>): Target => ({ kind: "one", row })
+      const one = (row: Row<Alarm>, snoozed = false): Target => ({ kind: "one", row, snoozed })
       const answer = (text: string): Target => ({ kind: "answer", say: text })
 
       /**
        * The times an alarm is known by: its next occurrence, its snooze, and the nominal time of the occurrence its owed ring,
        * its ring or its ring being taken away is for (finding 8: the time it was set for, not when the ring was sent).
        */
-      const timesOf = (v: Alarm): Array<ClockTime> => [
+      const timesOf = (v: Alarm, open: Open): Array<ClockTime> => [
         ...(v.next !== undefined ? [timeOf(v.next.time)] : []),
         ...(v.ring?.again !== undefined ? [localOf(v.ring.again, v.timeZone).time] : []),
         ...(v.owed !== undefined ? [timeOf(v.owed.time), ...(v.owed.snoozed === true ? [localOf(v.owed.at, v.timeZone).time] : [])] : []),
-        ...(v.ring !== undefined ? [timeOf(v.ring.time), ...(v.ring.snoozedAt !== undefined ? [localOf(v.ring.snoozedAt, v.timeZone).time] : [])] : []),
+        ...(v.ring !== undefined ? [timeOf(v.ring.time), ...(v.ring.snoozedAt !== undefined && open.ids.has(v.ring.notification) ? [localOf(v.ring.snoozedAt, v.timeZone).time] : [])] : []),
         ...(v.withdraw !== undefined ? [timeOf(v.withdraw.time), ...(v.withdraw.at !== undefined ? [localOf(v.withdraw.at, v.timeZone).time] : [])] : [])
       ]
 
@@ -533,8 +541,16 @@ export const alarmsModule = defineModule({
           if (byName.length > 1) return ask(byName, false)
           const time = parseTimeOfDay(which!, lang, { band: ALARM_BAND })
           if (time.kind === "ok") {
-            const at = read.rows.filter((r) => timesOf(r.value).some((t) => t.hour === time.value.hour && t.minute === time.value.minute))
-            if (at.length === 1) return one(at[0]!)
+            const at = read.rows.filter((r) => timesOf(r.value, read.open).some((t) => t.hour === time.value.hour && t.minute === time.value.minute))
+            if (at.length === 1) {
+              const row = at[0]!
+              const ring = row.value.ring
+              // A delivered snooze selected only by its effective time is the occurrence to stop, not the next series day.
+              const snoozed = ring?.snoozedAt !== undefined && read.open.ids.has(ring.notification)
+                && timeText(localOf(ring.snoozedAt, row.value.timeZone).time) === timeText(time.value)
+                && row.value.next?.time !== timeText(time.value)
+              return one(row, snoozed)
+            }
             if (at.length > 1) return ask(at, false)
             const words = timeWords({ hour: time.value.hour, minute: time.value.minute }, lang)
             return read.cut ? yield* Effect.fail(unreadable()) : answer(say(texts, lang, "noTimeMatch", { time: words }))
@@ -630,13 +646,13 @@ export const alarmsModule = defineModule({
               const after = yield* Effect.flatMap(ended(row, now), (value) => change(row, value)).pipe(Effect.mapError(failure))
               return pendingSay(after, say(texts, lang, "cancelledRepeat", { rule }))
             }
-            if (v.ring?.again !== undefined || v.owed !== undefined || v.withdraw !== undefined) {
+            if (t.snoozed || v.ring?.again !== undefined || v.owed !== undefined || v.withdraw !== undefined) {
               // The current occurrence (including an owed snooze or its unfinished withdrawal) comes before the series.
               const occurrence = v.owed ?? v.ring ?? v.withdraw!
               const next = momentOf(v.next.date, v.next.time, now, z, lang)
               const moment = momentOf(occurrence.date, occurrence.time, now, z, lang)
               const cleanup = v.withdraw !== undefined && v.owed === undefined && v.ring?.again === undefined
-              const snoozed = v.ring?.again !== undefined || v.owed?.snoozed === true
+              const snoozed = t.snoozed || v.ring?.again !== undefined || v.owed?.snoozed === true
               const after = yield* Effect.flatMap(letGo(row.id, v, now), (value) => change(row, value)).pipe(Effect.mapError(failure))
               return say(texts, lang, ringLeft(after) ? (snoozed ? "cancelledAgainPendingNext" : "occurrencePendingNext") : cleanup ? "cleanupNext" : snoozed ? "cancelledAgainNext" : "occurrenceCancelledNext", { moment, next })
             }

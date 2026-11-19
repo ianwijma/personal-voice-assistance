@@ -352,6 +352,11 @@ export const timersModule = defineModule({
           const owed = v.owed!
           const later = (x: Timer) => ({ value: { ...x, owed: { ...owed, attempts: owed.attempts + 1, retryAt: now + RETRY_RING_MS } }, jobs: [] })
           if (now - owed.at >= ringMs()) {
+            // The send may have succeeded just before the deadline and lost its outcome write. Recover that open ring.
+            const open = yield* Effect.result(ctx.notify.list())
+            if (open._tag === "Failure") return later(v)
+            const sent = open.success.find((n) => n.key === `timer:${id}:${owed.n}`)
+            if (sent !== undefined) return { value: { ...withoutKey(v, "owed"), ring: { n: owed.n, notification: sent.id, at: sent.sentAt, until: sent.expiresAt } }, jobs: [] }
             const report = yield* Effect.result(ctx.scheduler.prepare({
               handler: "trouble",
               key: `trouble:${id}:${owed.n}`,

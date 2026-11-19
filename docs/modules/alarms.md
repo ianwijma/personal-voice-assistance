@@ -110,14 +110,13 @@ planned after now, never in the past. A ring up to 15 minutes late rings, and sa
 - **Stop** is the host's: the card, "stop", and "stop" without the wake phrase while it rings.
 
 **Delivery is at least once.** The order is: write the owed ring, send it under its key, write that it was sent. If the
-server fails between the send and that last write, the next reconcile within the delivery window records the ring when
-its card is still open.
+server fails between the send and that last write, the next reconcile records the ring when its card is still open,
+even beyond the delivery window, keeping the existing expiry. If the open-card lookup fails, delivery stays owed.
 If **Stop was pressed in that moment, it sends it again: a ring can sound a second time, and it is never lost.** A cancel
 in that moment finds the card by its key and takes it away.
 
-If a delivery is first refused, a later send succeeds but its outcome write fails, and recovery happens beyond the
-delivery window, a missed card can appear while the ring card is still open and voice cancel cannot find it; the
-host's Stop still ends the ring card, or it expires after the ring setting's minutes.
+An open ring recovered after a lost outcome write remains available to voice cancellation and is not reported missed.
+This also covers a refused first send followed by a successful retry whose outcome write failed across the deadline.
 
 **Stop and a button pressed at the same moment.** When Stop and Snooze or Five more minutes are pressed for the same
 ring at the same moment, the card follows whichever the notification service recorded first. **The alarm may still
@@ -145,6 +144,8 @@ alarms still being withdrawn appear only in cancellation choices. Their labels s
 
 - From any device it can be cancelled by its time: the time it was set for, also when it rang late or next to a
   daylight-saving change.
+- A pending snooze, an open snooze ring and its unfinished withdrawal also match the snooze time. Once that ring has
+  stopped, its former snooze time no longer selects the series.
 - On its own device it can also be cancelled by its name.
 
 ### Only the next, or all
@@ -155,7 +156,9 @@ Only the next one, or all of them?", and nothing changes (docs/MODULES-PLAN.md �
 - **"Only the next"** skips that occurrence ("… is skipped; the next one is Friday at quarter to seven in the
   morning."). When a snooze is still to ring, that snooze is the next ring: "The snoozed alarm is cancelled; the next
   one is tomorrow at …". An owed snooze is still matched by its snooze time, and cancelling again while its withdrawal
-  is unfinished finishes that withdrawal before skipping a later series occurrence.
+  is unfinished finishes that withdrawal before skipping a later series occurrence. Selecting an open snooze by its
+  snooze time stops that ring and keeps tomorrow's regular occurrence; selecting the regular time still skips the next
+  series occurrence.
 - **"All"** ends the series.
 
 ### Clean-up
