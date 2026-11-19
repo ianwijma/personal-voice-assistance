@@ -272,9 +272,10 @@ describe("speech outside a reply", () => {
       assert.isUndefined(kit.people.deviceOfConnection(connection))
       const offline = yield* kit.tool("bell_ring", { title: "Offline turn" }, { device: "kitchen-display" })
       assert.deepStrictEqual([offline.ok, offline.content], [false, 'Not run: the request did not come from the device "kitchen-display".'])
-      // Back again: the connection is the device's, tools run, and a reply still cuts as before (stopped, a reply).
+      // Back again: only the fresh connection is the device's; tools run, and a reply still cuts as before.
       yield* kit.notify.connect("kitchen-display")
-      assert.strictEqual(kit.people.deviceOfConnection(connection), "kitchen-display")
+      assert.isUndefined(kit.people.deviceOfConnection(connection))
+      assert.strictEqual(kit.people.deviceOfConnection(kit.turn({ device: "kitchen-display" }).connection!), "kitchen-display")
       assert.isTrue((yield* kit.tool("bell_ring", { title: "Online turn" }, { device: "kitchen-display" })).ok)
       const next = yield* bell.parts.speech!.say({ device: "kitchen-display" }, "Again")
       yield* kit.advance(100)

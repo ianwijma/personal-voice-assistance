@@ -23,7 +23,8 @@ each voice connection holds equal to what it should hold now (each presentation 
 with `Privacy.mayReveal` asked for that device and the kinds that connection's own page draws), withdrawing first, and
 it is the only thing that sends `present.show`, `present.update` and `present.dismiss`. The model is told what the
 server decided ("Showing on "Kitchen display".", "Not showing it: "Office speaker" has no display. Say this instead: …"),
-never what the eye saw. A tick or a button is admitted only from a page that holds the presentation and may press it
+never what the eye saw. A tick or a button is admitted only for the displayed revision from a page that holds the
+presentation and may press it
 there; it is claimed and reaches the press handler the module registered in `shared`. An image reaches a page only as an
 address of that page's own, `/media/<token>`.
 
@@ -77,16 +78,16 @@ ctx.present.handle(name, { run: (press) => Effect<{ say? } | void> })   // in sh
 | every device of the target shows it | `Showing on "A".` (`"A" and "B"`, `"A", "B" and "C"`) |
 | some do | `Showing on "A"; not on "B" (has no display).` |
 | none does | `Not showing it: "A" has no display.` |
-| not accepted (way 1) | `Not showing it: <why>.` (`the presentation was not valid (…)`, `too much is on screen (…)`, `this module cannot show things (…)`, `the screen's data is still being read`, `there is no device to show it on`, `this tool belongs to no module`) |
+| not accepted (way 1) | `Not showing it: <why>.` (`the presentation was not valid (check its fields and options)`, `too much is on screen (…)`, `this module cannot show things (…)`, `the screen's data is still being read`, `there is no device to show it on`, `this tool belongs to no module`) |
 | and when the asking device does not show it for a reason other than privacy (no display, a kind its page cannot draw, offline, or not accepted for a bound, a stopping module or the start-up read), and the privacy rule allows the content on the asking device | ` Say this instead: <the presentation's spoken text>` (at most 300 characters, through the module's page boundary) |
 | and while its image is still to be fetched, when it is shown somewhere | ` Its image is being fetched; if that fails it shows without it.` |
 
 The reasons are: `is not connected`, `may not show this person's things`, `has no display`, `cannot show this kind of
 thing`. After a privacy refusal the note carries nothing of the content. **Privacy comes first** (review round 2): one
-check decides, on every path, whether the spoken text may go into a note: household content always; personal content
-only when the asking device is known and `Privacy.mayReveal(owner, device)` says yes now. An offline asking device, a
+check decides, on every path, whether the spoken text may go into a note: the asking device must be known; personal content
+also requires that `Privacy.mayReveal(owner, device)` says yes now. An offline asking device, a
 refusal for a bound, a stopping module or the start-up read never forward personal content the asking device could not
-be shown; no device, an invalid presentation or a tool of no module never forward anything. Device names are quoted and cut
+be shown; no device, an invalid presentation or a tool of no module never forward anything. An empty target gives `Not showing it: there is no device to show it on.` Device names are quoted and cut
 (`quotedName`). The whole note is at most 600 characters (`MAX_NOTE_CHARS`): the device part is cut first.
 
 ## The kinds and their bounds
@@ -111,7 +112,7 @@ ticks are pressable only with one). Anything outside these is refused `invalid` 
 |---|---|---|
 | live presentations in all | 32 (`MAX_LIVE_TOTAL`), accepted ones not written yet included | `limit` |
 | live presentations of one module | 8 (`MAX_LIVE_PER_MODULE`), transient and pinned, accepted ones included | `limit` |
-| pinned presentations on one device | 8 (`MAX_PINNED_PER_DEVICE`): counted over the target's devices now | `limit` |
+| pinned presentations on one device | 8 (`MAX_PINNED_PER_DEVICE`): each id reserves its committed and pending target devices until a move commits | `limit` |
 | transient presentations on one device | one at a time: a newer one ends the transient ones it would share a device with (of any module); those, written or accepted, do not count against it | (they end) |
 | a key | `[A-Za-z0-9_.:@/-]{1,64}`, one per module, **one stable id** across accepted and written shows: showing it again replaces it in place (the same id, `present.update`); two accepted shows of one key count once | `invalid` |
 | a page | at most 9 (`MAX_PRESENTATIONS_PER_PAGE`: 8 pinned and 1 transient) | the selection never sends more |
@@ -132,6 +133,8 @@ rows.
 ## Lifetimes, ownership and what happens when
 
 - **Transient** (the default; a timer defaults to pinned): a device shows one at a time, the newest. It ends by itself.
+  An accepted transient whose write waited rechecks current room membership and show order inside its committing
+  transaction; if it now overlaps a newer live transient, the older pending show is dropped.
 - **Pinned**: several per device, each shown until it is dismissed or ends; a page that reconnects is given them again.
 - **A presentation belongs to the module part that made it** (a tool's presentation to the module's newest open part).
   When that part's scope closes (its module stopped, after its calls in flight had their grace period) its **transient**
@@ -161,6 +164,12 @@ rows.
   when a newer show of the same key is accepted or committed, and, for a transient, when a newer transient on one of its
   devices is; it is never written after the newer one, and what waits is checked again against the current show of its
   id in the attempt that writes it.
+- **Clock-change limit**: if the server's wall clock is set back between a committed show and an accepted replacement of
+  its key, the writer can drop the accepted replacement as older, leaving the previous show until it expires or another
+  show replaces it.
+- **Repeated-write-failure limit**: if an accepted write fails repeatedly and its retry fails again after a newer show
+  retired it, Health can retain "A presentation could not be shown yet" until another accepted write settles or the
+  server restarts.
 - **Start-up reads everything**: the whole collection, a page (5 rows) at a time with a yield between, the rows to remove
   noted as it goes. Until it has read to the end nothing is shown or withdrawn, a show is refused `busy` and a tool's
   presentation is not accepted (the note says so); a read that fails is tried again a minute later (Health:
@@ -224,7 +233,8 @@ transient the decision allows.
 - **Admission** (synchronous, against this moment): the connection holds the presentation, it is live, the decision lets
   it be pressed there, and the press is a tick of an item a checklist has (with `done`) or a button it has. Knowing an id
   is not enough; another device's page gets "I can't do that right now." **A press runs only what the page holds**
-  (round 3): the show the connection holds must be the current show of that presentation; a page still showing an older
+  (round 3, strengthened in this review): the press echoes the displayed `revision` (show id and stored revision), which
+  must match both what the connection holds and the current revision; a page still showing an older
   show (a keyed replacement whose content could not be read yet) is answered as for a presentation that is gone, nothing
   is claimed or run, and the page is reconciled.
 - **The claim**: one press at a time per presentation, in memory, before any module code runs; a second gets "That is
@@ -242,7 +252,7 @@ transient the decision allows.
   handler's own effects). The press itself changes nothing on the page: the handler shows the change (`update`, or the
   same key again), which reconciliation sends. A handler may send a notification to `"origin"`: the device it was
   pressed on.
-- The page sends `present.action` `{ id, action: "tick", item, done }` or `{ id, action: <button id> }`; it goes
+- The page sends `present.action` `{ id, revision, action: "tick", item, done }` or `{ id, revision, action: <button id> }`; it goes
   through the hub's bounded admission like every other request.
 
 ## Images
@@ -257,9 +267,13 @@ transient the decision allows.
   device of its target would show it. The row says `loading` until the outcome is written (the content hash, or why
   not: shown without the image, with the server's sentence); an outcome whose write fails is written again a minute
   later; an image left loading by a restart is fetched again when a page is to show it. None stays loading. A fetch
-  belongs to its address: a key shown again with the same address while it is fetched gets that fetch's outcome; a
-  key shown again with another address fetches its own, and an outcome not yet written for an older address does not
-  hold it back (review round 2).
+  is shared by address only while it is in flight: a key shown again with the same address during the fetch gets its
+  outcome. A completion claims a showing only while it still wants that address; replacing or updating it to a
+  different address discards the older address's completion, even if the handle returns to that address before its
+  write finishes. Each write and cleanup checks ownership of that specific completed outcome. Completed outcomes
+  awaiting a store retry belong to that showing; a fresh showing resolves its own address off the turn path, so it
+  cannot inherit an older showing's refusal or reuse an expired file. A content update of the same show keeps its
+  resolved image.
 - **The cache** fetches through `safeFetch` (public addresses only, redirects checked again; never the owner-configured
   helper, for anything a model or a page supplies) with its own image policy, checks the type the response says and the
   bytes it is against each other, and its size, keeps it as `data/media/<sha256>.<ext>` (directory `0700`, files `0600`,
@@ -269,17 +283,25 @@ transient the decision allows.
   what has expired is dealt with before new bytes are matched against it (an expired copy is a new admission); a file is
   never served after its day, and is removed by the next hourly sweep or before a write that needs its room.
 - **The directory is the truth** (review round 2, R6). An **inventory** reads the directory as it is, removes temporary
-  files (an interrupted write), foreign files and what is past its age, then, oldest first, what is over the bounds, and
-  rebuilds the counts and bytes from what is really there. It runs at start, and after any fault every minute (and before
+  files (an interrupted write), foreign files, invalid image signatures or digests, duplicate suffixes and what is past
+  its age, then, oldest first, what is over the bounds, and
+  rebuilds the counts and bytes from surviving physical files. Non-regular entries, including dangling links, are removed
+  without following them; an empty directory is removed nonrecursively, while a nonempty or unremovable directory
+  keeps admission closed until it can be cleaned. Directory iteration and file reads, stats and removals are
+  asynchronous, one entry at a time, with a yield between entries; only one inventory runs, and admission stays
+  closed until it completes. It runs at start, and after any fault every minute (and before
   the next admission) until it succeeds. **Any file operation of the cache that fails** (a write, setting its time, the
   rename, a removal, reading an entry or the directory, reading a file to serve it) makes the cache **not sure**: nothing
   new is admitted (a fetch is refused `unavailable`, so the image shows without its picture) and Health says "The image
   cache could not be read or cleaned", until an inventory has read every entry, removed what it had to and what remains
   is inside 256 files and 64 MiB. An unreadable entry is never taken as absent. There is no list of files to remove
   later: a file is removed by an inventory that sees it expired at that moment, so a copy admitted since is never
-  removed by an old retry. While it is not sure, an image already kept is still served if its file can be read: a read
-  that fails while serving keeps the entry (the cache becomes not sure, and the inventory decides), and a read that works
-  again serves it again at once (round 3). *Known gap* (round 3): while the cache is not sure, a request is still
+  removed by an old retry. Writes and GET/HEAD reads are asynchronous too; admissions serialize their capacity checks
+  with disk mutations, retire unrelated entries that expired while waiting, and recheck the fault generation before
+  publishing a new hash or address. A read rechecks the page's token, current verified entry and expiry before sending
+  bytes, including when inventory rebuilt its metadata during the read. While it is not sure, an image already kept is still served if its bytes match its kept size, signature and digest. A read that throws
+  keeps the retryable entry; a successful read proving corruption invalidates its address hits and closes admission until
+  inventory repairs it. A later valid read of a retained entry serves it again at once (round 3). *Known gap* (round 3): while the cache is not sure, a request is still
   fetched from the network before it is refused `unavailable` (the refusal comes after the response). The
   files **survive a restart**: what the inventory at start keeps is served for the rest of its day.
 - **The response headers**, exactly: `Content-Type` (the kept type), `Content-Length`, `X-Content-Type-Options:
@@ -295,12 +317,18 @@ transient the decision allows.
   `focus` are as before (docs/CHARACTERS.md §2.7); the stage only adds its height to the bottom padding of the page's
   scroll area, so captions scroll clear of it.
 - P9's **notification cards are drawn first in the stage**, with their wire messages and behaviour unchanged; then the
-  presentations, a transient one first, then the pinned ones oldest first.
+  presentations, a transient one first, then the pinned ones oldest first. While narrow-screen chat is modal, ordinary
+  presentations are hidden and inert; notification cards move inside the chat dialog so keyboard focus can reach ring
+  Stop. Pending actions and the last reply stay with the held notification across that move and are cleared when it
+  is withdrawn. In chat, the notification region can shrink and scroll so the composer stays within the panel, including
+  with a six-line draft and the phone keyboard open. Desktop chat leaves presentations visible and notification cards
+  in the stage. Settings and Help hide the entire stage until they close, without clearing the held presentations.
 - One renderer per kind. Every text of a presentation passed the server's page boundary (`ModuleHost.pageText`) and is
   put on the page as text, never as markup; long text, button labels and weather values wrap. **Every word the host
   shows** (the region's name, "Loading the image…", "The image is not available.", the timer's "Done", "Image:", "High",
   "Low", and every answer to a press) **comes from the server in the household's language** (`PresentationWire.texts`,
-  English and Dutch).
+  English and Dutch). If a press has no server answer, the page uses the presentation's localized `texts.failed`,
+  including on a transport timeout or rejection. Older servers may omit it, in which case no fallback is shown.
 - **A page without its server shows nothing from it** (review round 1, G10): when the connection is lost the page clears
   its presentations (the notification cards follow their own rule from P9); after the next welcome the server sends what
   applies now. It also empties them at every welcome and when its session ends, and keeps every presentation it is sent
@@ -328,7 +356,9 @@ transient the decision allows.
   personal content ("the mock shows household presentations only (it has no privacy model): …"; it has no privacy
   model) and `options.key` ("the mock does not replace by key: …"; it has no keyed replacement). Both were refused
   because refusing is smaller than implementing them through the shared functions; test those against the kit
-  (`startTestModule`), which runs the real Presenter.
+  (`startTestModule`), which runs the real Presenter. If the mock process's wall clock is set back, a presentation's
+  timeout can dismiss it before its advertised `expiresAt`; the presentation is then gone and a fresh show starts a new
+  lifetime.
 
 ## Testing
 
@@ -336,7 +366,12 @@ transient the decision allows.
 `shown(device)` (what that device's page holds now), `messages` (what each page was sent), `decisions` (every decision:
 which device, and why not), `press(id, action, { device, item?, done? })` (as that device's page; the clock is driven
 while the handler runs), and `engine` (`live`, `held`, `maintainNow`, `planNow`, `plannedAt`, `loaded`).
-`kit.notify.connect` / `disconnect` reconcile it too; a page that disconnects shows nothing, as the real page. A kit
+`kit.notify.connect` / `disconnect` reconcile it too; a page that disconnects shows nothing, as the real page.
+Each reconnect gets a fresh connection ID for delivery and press-principal lookup, so hello restores live pins even
+when close reconciliation has not run yet. Reconnect starts four fresh press slots; old requests release their
+original connection’s slots, and all connections share the sixteen-slot global bound (notification Stop remains
+exempt). Press helpers and helpers that synthesize a turn resolve the current connection when their Effect starts,
+then keep it fixed through settlement; explicitly supplied turn contexts are used as given. A kit
 device without `capabilities` declares this build's voice page on a tablet (`KIT_PAGE_CAPABILITIES`: a display with
 touch, every kind, a speaker, a microphone), so it is decided as serve mode decides for this build's page; give
 `capabilities` to model a speaker or an older page. `StartTestModuleOptions.media` gives the kit a fake image cache
@@ -347,19 +382,19 @@ capabilities.
 
 ## Latency
 
-Measured on the development machine by `packages/store-sqlite/test/presentLatency.test.ts` (the latency step; asserted
+Measured for this review on the development machine with `CI=1` by `packages/store-sqlite/test/presentLatency.test.ts` (the latency step; asserted
 with the shared `bound()`), on SQLite on a file at the stated maximum: every text at its bound with the costliest
 characters (the worst legal checklist), every message encoded as the hub encodes a frame, through the host's real page
 boundary.
 
 | What | Number |
 |---|---|
-| end of turn → first audio (`TurnTrace`, the real `Conversation`, a tool round through the host's registry and gateway, zero-delay synthesis and output, the model's tokens 5 ms after each request; median of 80 turns × 4 counterbalanced runs; 31 other presentations live, 8 pinned on the turn's device) | without a presentation 10.82 ms (p95 11.24); with the worst legal presentation in the tool's result 11.07 ms (p95 11.88) |
-| `show` as a tool calls it (200 calls, a transient replacing the last) | median 0.48 ms, p95 0.63 ms, worst 0.86 ms; longest main-thread stop across the whole workload 1.99 ms |
-| a page saying hello with 9 presentations | longest main-thread stop 1.01 ms |
-| reconciling every device with real fan-out (64 devices in one room, 8 pinned and 1 transient room-wide, 64 fresh pages: 576 frames, 1.99 MiB encoded) | longest main-thread stop 1.50 ms |
+| end of turn → first audio (`TurnTrace`, the real `Conversation`, a tool round through the host's registry and gateway, zero-delay synthesis and output, the model's tokens 5 ms after each request; median of 80 turns × 4 counterbalanced runs; 31 other presentations live, 8 pinned on the turn's device) | without a presentation 10.695 ms (p95 11.683); with the worst legal presentation in the tool's result 11.202 ms (p95 12.234) |
+| `show` as a tool calls it (200 calls, a transient replacing the last) | median 0.503 ms, p95 0.587 ms, worst 0.776 ms; longest main-thread stop across the whole workload 1.66 ms |
+| a page saying hello with 9 presentations | longest main-thread stop 0.79 ms |
+| reconciling every device with real fan-out (64 devices in one room, 8 pinned and 1 transient room-wide, 64 fresh pages: 576 frames, 2.03 MiB encoded) | longest main-thread stop 1.62 ms |
 
-So a tool's presentation at the stated maximum moved the turn's first audio by a median 0.25 ms, not zero: the turn
+So a tool's presentation at the stated maximum moved the turn's first audio by a median 0.507 ms, not zero: the turn
 itself pays the validation, the decision and the note (way 1), and the writer and the reconciliation of the turn's device
 run on the same thread while the model thinks. The test asserts the difference stays under 2 ms and the longest stops
 under 10 ms.

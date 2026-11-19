@@ -122,6 +122,7 @@ import {
   WAKE_TEST_MAX_MS,
   WEB_VOICE_KIND,
   decodeClientMessage,
+  deviceTypeOf,
   decodeMicFrame,
   encodeReplyFrame,
   encodeServerMessage,
@@ -1638,6 +1639,7 @@ const resolveMockNotification = (id: string, outcome: string) => {
 /** Live presentations: what the module showed (checked by the shared checks), its device (absent: every device), its lifetime. */
 const mockPresentations = new Map<string, {
   presentation: Presentation
+  revision: string
   readonly deviceId?: string
   readonly lifetime: "transient" | "pinned"
   readonly shownAt: number
@@ -1646,7 +1648,7 @@ const mockPresentations = new Map<string, {
   readonly timer: ReturnType<typeof setTimeout>
 }>()
 /** What each voice connection holds of them, per connection as the server keeps it (with its image addresses); gone with it. */
-const mockPresentHeld = new Map<string, Map<string, { readonly fp: string; readonly token: string | undefined }>>()
+const mockPresentHeld = new Map<string, Map<string, { readonly fp: string; readonly revision: string; readonly token: string | undefined }>>()
 /** Image addresses: token → the connection and presentation it was made for (as the server's `mediaFor`). */
 const mockMediaTokens = new Map<string, { readonly connId: string; readonly id: string }>()
 let mockPresentSeq = 0
@@ -1655,8 +1657,8 @@ const mockPresentIds = new Set<string>()
 const MOCK_IMAGE = Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==", "base64")
 /** The Presenter's own words, in the saved household language (as `PresentTexts` in packages/core: the test compares the two). */
 const MOCK_PRESENT_TEXTS = {
-  en: { region: "On screen", loading: "Loading the image…", imageMissing: "The image is not available.", timerDone: "Done", credit: "Image:", high: "High", low: "Low", done: "Done.", cantNow: "I can't do that right now." },
-  nl: { region: "Op het scherm", loading: "De afbeelding wordt geladen…", imageMissing: "De afbeelding is niet beschikbaar.", timerDone: "Klaar", credit: "Afbeelding:", high: "Hoog", low: "Laag", done: "Klaar.", cantNow: "Dat kan ik nu niet doen." }
+  en: { region: "On screen", loading: "Loading the image…", imageMissing: "The image is not available.", timerDone: "Done", credit: "Image:", high: "High", low: "Low", done: "Done.", failed: "That didn't work.", cantNow: "I can't do that right now." },
+  nl: { region: "Op het scherm", loading: "De afbeelding wordt geladen…", imageMissing: "De afbeelding is niet beschikbaar.", timerDone: "Klaar", credit: "Afbeelding:", high: "Hoog", low: "Laag", done: "Klaar.", failed: "Dat lukte niet.", cantNow: "Dat kan ik nu niet doen." }
 } as const
 const mockPresentTexts = () => (String(valueOf("HOME_LANGUAGE") ?? "").toLowerCase().startsWith("nl") ? MOCK_PRESENT_TEXTS.nl : MOCK_PRESENT_TEXTS.en)
 /** The shared decision for one presentation for one connection now, with the kinds its own page declared (as the server). */
@@ -1667,17 +1669,18 @@ const decidePresentMock = (c: Conn, kind: PresentKindName) => {
   return decidePresentation({ kind, personal: false, mayReveal: true, device: { connected: true, ...outputs } })
 }
 /** What a page is sent of a presentation (without `serverNow`), as the server's `wireOf`. */
-const mockWire = (id: string, p: { readonly presentation: Presentation; readonly lifetime: "transient" | "pinned"; readonly shownAt: number }, token: string | undefined, interactive: boolean) => {
+const mockWire = (id: string, p: { readonly presentation: Presentation; readonly revision: string; readonly lifetime: "transient" | "pinned"; readonly shownAt: number }, token: string | undefined, interactive: boolean) => {
   const texts = mockPresentTexts()
   return {
     id,
+    revision: p.revision,
     lifetime: p.lifetime,
     shownAt: p.shownAt,
     v: PRESENT_KIND_VERSIONS[p.presentation.kind],
     content: presentWireContent(p.presentation, token === undefined ? undefined : { state: "ready", token }),
     buttons: (p.presentation.buttons ?? []).map((b) => ({ id: b.id, label: b.label })),
     interactive: interactive && p.presentation.handler !== undefined,
-    texts: { region: texts.region, loading: texts.loading, imageMissing: texts.imageMissing, timerDone: texts.timerDone, credit: texts.credit, high: texts.high, low: texts.low }
+    texts: { region: texts.region, loading: texts.loading, imageMissing: texts.imageMissing, failed: texts.failed, timerDone: texts.timerDone, credit: texts.credit, high: texts.high, low: texts.low }
   }
 }
 const isPresentationWire = Schema.is(PresentationWire)
@@ -1710,11 +1713,12 @@ const newMockToken = () => randomBytes(24).toString("base64url")
 const reconcilePresentMock = (c: Conn) => {
   if (c.frontend !== "voice" || c.deviceId === undefined || !c.welcomed || !conns.has(c)) return
   const deviceId = c.deviceId
-  const held = mockPresentHeld.get(c.id) ?? new Map<string, { readonly fp: string; readonly token: string | undefined }>()
+  const held = mockPresentHeld.get(c.id) ?? new Map<string, { readonly fp: string; readonly revision: string; readonly token: string | undefined }>()
   mockPresentHeld.set(c.id, held)
   const now = Date.now()
   const chosen = selectPresentations([...mockPresentations].filter(([, p]) => p.endsAt > now && (p.deviceId === undefined || p.deviceId === deviceId)).map(([id, p]) => ({
     id,
+    revision: p.revision,
     lifetime: p.lifetime,
     shownAt: p.shownAt,
     decision: decidePresentMock(c, p.presentation.kind)
@@ -1735,7 +1739,7 @@ const reconcilePresentMock = (c: Conn) => {
     const fp = JSON.stringify(wire)
     if (before?.fp === fp) continue
     sendTo(c, { type: before === undefined ? "present.show" : "present.update", presentation: { ...wire, serverNow: Date.now() } })
-    held.set(x.id, { fp, token })
+    held.set(x.id, { fp, token, revision: p.revision })
   }
 }
 const reconcilePresentEverywhere = () => {
@@ -2964,7 +2968,7 @@ const onClientMessage = (c: Conn, m: ClientMessage) => {
       const p = mockPresentations.get(m.id)
       const texts = mockPresentTexts()
       const cant = (code: "bad_message" | "not_running") => sendTo(c, { type: "result", requestId: m.requestId, ok: false, error: { code, message: texts.cantNow }, say: texts.cantNow })
-      if (mockPresentHeld.get(c.id)?.has(m.id) !== true || p === undefined) return cant("bad_message")
+      if (p === undefined || mockPresentHeld.get(c.id)?.get(m.id)?.revision !== m.revision || p.revision !== m.revision) return cant("bad_message")
       const d = decidePresentMock(c, p.presentation.kind)
       if (!d.show || !d.interactive || p.presentation.handler === undefined) {
         reconcilePresentMock(c)
@@ -2976,6 +2980,7 @@ const onClientMessage = (c: Conn, m: ClientMessage) => {
         if (p.handlerDown) return cant("not_running")
         const refusedTick = mockPressRefusal()
         if (refusedTick !== undefined) return sendTo(c, { type: "result", requestId: m.requestId, ok: false, error: { code: "bad_message", message: refusedTick }, say: refusedTick })
+        p.revision = newMockToken()
         p.presentation = { ...list, items: list.items.map((i) => (i.id === m.item ? { ...i, done: m.done! } : i)) }
         reconcilePresentEverywhere()
         return sendTo(c, { type: "result", requestId: m.requestId, ok: true, say: texts.done })
@@ -3052,7 +3057,7 @@ wss.on("connection", (ws: WebSocket) => {
       c.frontend = m.frontend
       const tokenSent = m.frontend === "admin" ? m.adminToken : undefined
       if (tokenSent !== undefined && sessions.has(tokenSent)) c.session = tokenSent
-      if (m.frontend === "voice" && m.device !== undefined) {
+      if (m.frontend === "voice" && m.device !== undefined && deviceTypeOf(m.device.kind) !== undefined) {
         const now = Date.now()
         const known = devices.get(m.device.id)
         const declared = m.device.capabilities !== undefined ? { declared: { capabilities: m.device.capabilities, seenAt: now } } : {}
@@ -3511,7 +3516,8 @@ const handleApi = async (req: IncomingMessage, res: ServerResponse, url: URL) =>
 const readBody = (req: IncomingMessage) =>
   new Promise<string>((resolve) => {
     let body = ""
-    req.on("data", (d: Buffer) => (body += d.toString("utf8")))
+    req.setEncoding("utf8")
+    req.on("data", (d: string) => (body += d))
     req.on("end", () => resolve(body))
   })
 
@@ -3709,6 +3715,7 @@ const http = createServer((req, res) => {
         // an id is never used twice; an image shows the mock's built-in picture, through `/media/<token>`.
         // Review round 2 (R7): the whole request is checked before any id is consumed or anything changes; what the mock
         // does not model is refused; admission uses the server's own live bounds (the mock is one module).
+        if (typeof payload !== "object" || payload === null || Array.isArray(payload)) return json(res, 400, { error: "a presentation request is an object" })
         pruneEndedMock()
         const now = Date.now()
         const extra = Object.keys(payload).find((k) => !MOCK_PRESENT_FIELDS.includes(k))
@@ -3732,7 +3739,7 @@ const http = createServer((req, res) => {
         if (lifetime === "pinned" && counted.filter((p) => p.lifetime === "pinned" && overlaps(p)).length >= MAX_PINNED_PER_DEVICE) return json(res, 409, { error: "limit" })
         // What a page would be sent of it decodes as the protocol says (an image with a token of the right form).
         const sampleId = typeof payload.id === "string" ? payload.id : "p-mock-check"
-        const sample = { ...mockWire(sampleId, { presentation: presentation!, lifetime, shownAt: now }, presentation!.kind === "image" ? "t".repeat(32) : undefined, true), serverNow: now }
+        const sample = { ...mockWire(sampleId, { presentation: presentation!, revision: "check", lifetime, shownAt: now }, presentation!.kind === "image" ? "t".repeat(32) : undefined, true), serverNow: now }
         if (!isPresentationWire(sample)) return json(res, 400, { error: "the presentation does not make a valid page message" })
         let id = typeof payload.id === "string" ? payload.id : `p-mock-${++mockPresentSeq}`
         while (typeof payload.id !== "string" && mockPresentIds.has(id)) id = `p-mock-${++mockPresentSeq}`
@@ -3740,6 +3747,7 @@ const http = createServer((req, res) => {
         if (lifetime === "transient") for (const [other, p] of [...mockPresentations]) if (p.lifetime === "transient" && overlaps(p)) endMockPresentation(other)
         mockPresentations.set(id, {
           presentation: presentation!,
+          revision: newMockToken(),
           ...(deviceId !== undefined ? { deviceId } : {}),
           lifetime,
           shownAt: now,

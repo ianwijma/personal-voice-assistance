@@ -1476,7 +1476,8 @@ What a module shows on a device's screen goes through the Presenter, never a mod
   server decided ("Showing on "Kitchen display".", or "Not showing it: … has no display. Say this instead: <your
   `spoken`>"), and the presentation goes to the device the call came from in one enqueue (nothing else on the turn's
   path); once accepted it is written, retried if the store refuses, until it is or no longer applies. An action returns
-  `{ say, present }`. A presentation that is not valid or passes a bound is not accepted and the note says why.
+  `{ say, present }`. A presentation that is not valid or passes a bound is not accepted; validation notes name no
+  rejected values, and a spoken fallback requires a known asking device and the privacy rule's permission.
 - **Speculative tools** (R8): a tool that may run speculatively returns its presentation with its result and never calls
   `ctx.present.show` or dismisses in its run. Its result's presentation is held until the turn is committed (dropped if
   the turn is discarded); a `show` made from inside a turn that is not committed yet is refused `uncommitted`, and
@@ -1491,7 +1492,8 @@ What a module shows on a device's screen goes through the Presenter, never a mod
   after a reconnect, until dismissed or its end). A `key` makes it one per module: showing the key again replaces it.
   A transient one goes when the part that made it stops; a pinned one is stored and stays.
 - **Ticks and buttons reach a press handler registered in `shared`** with `ctx.present.handle(name, { run })`, like
-  notification action handlers: claimed first (one press at a time), as the press (its device is the origin), within
+  notification action handlers: a press must echo the revision the page displays, checked against both its held content
+  and the current showing; claimed first (one press at a time), as the press (its device is the origin), within
   5 s; while your module is down they answer "I can't do that right now". A press is not a tool call, but the risk
   policy decides it (§4: the handler's `risk`, absent `change`; a refusal answers with the policy's sentence and the
   handler does not run; what the handler calls through the gateway is decided there too), and what the handler committed before

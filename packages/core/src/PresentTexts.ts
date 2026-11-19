@@ -46,7 +46,7 @@ export const presentText = (language: NotifyLanguage, key: PresentTextKey): stri
 /** The stage's own words for a page. */
 export const presentPageTexts = (language: NotifyLanguage): PresentPageTexts => {
   const t = TEXTS[language]
-  return { region: t.region, loading: t.loading, imageMissing: t.imageMissing, timerDone: t.timerDone, credit: t.credit, high: t.high, low: t.low }
+  return { region: t.region, loading: t.loading, imageMissing: t.imageMissing, failed: t.failed, timerDone: t.timerDone, credit: t.credit, high: t.high, low: t.low }
 }
 
 /** Both tables, for the test that compares their keys. */

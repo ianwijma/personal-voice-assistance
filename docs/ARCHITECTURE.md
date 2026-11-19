@@ -1085,7 +1085,7 @@ decidePresentation({ kind, personal, mayReveal, device: { connected, display, ki
 selectPresentations(candidates): what a device shows (pinned ≤ 8 oldest first, the newest transient)
 devicePresentFrom(settings, declared): DevicePresentOutputs = { display, kinds, touch }   // declaration minus overrides
 // present.show / present.update { presentation: PresentationWire }, present.dismiss { id } (server → voice connection),
-// present.action { requestId, id, action, item?, done? } (page → server) answered by result { say? }: additive within protocol 11
+// present.action { requestId, id, revision, action, item?, done? } (page → server) answered by result { say? }: additive within protocol 11
 PresentHook (ModuleHostOptions.present) = { forPart(part, runner): ModulePresent; fromResult(moduleId, principal, value) }
 PresentEngine = PresentHook & { reconcile(deviceId); reconcileAll(); press(PresentPressRequest): Effect<PresentPressAnswer>;
                                 mediaFor(token): hash | undefined; busyAnswer(); live(); held(deviceId); maintainNow; planNow;
@@ -1107,7 +1107,7 @@ ActionCallOptions.onDecision(ActionDecisionNote = { risk?, refused?, presented?,
   (`@pva/core/present-contract`, the contract suite and its world: several tabs with their own kinds, a fault-injecting
   store with a busy gate), `apps/assistant/src/serve/media.ts` (the image cache and `/media/<token>`).
 - **The index is the truth of what is eligible** (review round 1): the live presentations without their content (show
-  id, rev, module, key, part, lifetime, target, owner, kind, handler, times), loaded at start by a scan of the whole
+  id, rev, module, key, part, lifetime, target, owner, kind, desired image URL, handler, times), loaded at start by a scan of the whole
   collection in bounded steps with yields ("loaded" only at its end; until then nothing is shown or withdrawn and shows
   are refused `busy`), and changed only from what a committed transaction wrote (the entry is derived from the committed
   row). An end, a dismissal, a replacement and a stopped part take a presentation out of it at once and reconcile its
@@ -1137,7 +1137,9 @@ ActionCallOptions.onDecision(ActionDecisionNote = { risk?, refused?, presented?,
 - **Parts**: `forPart` records the part as open and adds a finaliser to its scope; when it closes, its transient
   presentations leave the index at once (their rows removed by maintenance) and its accepted shows not written yet are
   dropped. A tool's `{ forModel, present }` belongs to the module's newest open part.
-- **Presses**: admitted only for a connection that holds the presentation and while the decision (with that page's
+- **Presses**: the displayed `revision` (show id and stored revision) is echoed by a press and must match both the
+  holder and the current entry; admitted only for a connection that holds the presentation and while the decision (with
+  that page's
   kinds) makes it interactive there; claimed in memory (one per presentation); the handler runs through
   `PartRunner.inFlight` with the presentation principal, admitted by `ExecutionGateway.handler` first (P8: the
   principal, then the risk policy on the handler's declared `risk`, inferred `change`, recorded; a refusal answers

@@ -7,6 +7,7 @@ import type { ConnectRequest, ConnectResponse } from "@pva/net"
 import { Deferred, Effect, Exit, Fiber, Scope } from "effect"
 import { createHash } from "node:crypto"
 import { chmodSync, mkdtempSync, readdirSync, statSync, utimesSync, writeFileSync } from "node:fs"
+import { opendir, readFile, stat, unlink } from "node:fs/promises"
 import type http from "node:http"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
@@ -57,26 +58,22 @@ const open = (w: World, dir = mkdtempSync(join(tmpdir(), "pva-media-")), limits?
     return { cache, dir, close: Scope.close(scope, Exit.void) }
   })
 
-/** A request and a response that record what the route answers. */
 /** A page's address token, and a resolver that answers `hash` for it alone (the Presenter's `mediaFor`). */
 const TOKEN = "T".repeat(32)
 const only = (hash: string) => (token: string) => (token === TOKEN ? hash : undefined)
-const serveOnce = (cache: Effect.Success<ReturnType<typeof open>>["cache"], path: string, resolve: (token: string) => string | undefined, method = "GET") => {
-  const out: { status?: number; headers?: Record<string, string>; body?: Buffer | undefined } = {}
-  const res = {
-    writeHead(status: number, headers: Record<string, string>) {
-      out.status = status
-      out.headers = headers
-      return res
-    },
-    end(body?: Buffer | string) {
-      out.body = typeof body === "string" ? Buffer.from(body) : body
-      return res
+/** A request and a response that record what the asynchronous route answers. */
+const serveOnce = async (cache: Effect.Success<ReturnType<typeof open>>["cache"], path: string, resolve: (token: string) => string | undefined, method = "GET") => {
+  const out: { status?: number; headers?: Record<string, string>; body?: Buffer | string | undefined } = {}
+  await new Promise<void>((done) => {
+    const res = {
+      writeHead(status: number, headers: Record<string, string>) { out.status = status; out.headers = headers; return res },
+      end(body?: Buffer | string) { out.body = body; done(); return res }
     }
-  }
-  cache.serve({ method, url: path } as http.IncomingMessage, res as unknown as http.ServerResponse, resolve)
+    cache.serve({ method, url: path } as http.IncomingMessage, res as unknown as http.ServerResponse, resolve)
+  })
   return out
 }
+
 
 const run = <A, E>(e: Effect.Effect<A, E>) => Effect.runPromise(e)
 
@@ -100,7 +97,7 @@ describe("the image cache (/media)", () => {
     expect(readdirSync(dir)).toEqual([`${hash}.png`])
     expect(statSync(join(dir, `${hash}.png`)).mode & 0o777).toBe(0o600)
     // Served to the page whose own address names it, with the headers of an inert image kept out of every cache.
-    const ok = serveOnce(cache, `/media/${TOKEN}`, only(hash))
+    const ok = (await serveOnce(cache, `/media/${TOKEN}`, only(hash)))
     expect(ok.status).toBe(200)
     expect(ok.headers).toEqual({
       "Content-Type": "image/png",
@@ -113,13 +110,13 @@ describe("the image cache (/media)", () => {
       "Cache-Control": "private, no-store"
     })
     expect([...ok.body!]).toEqual([...PNG])
-    expect(serveOnce(cache, `/media/${TOKEN}`, only(hash), "HEAD").body).toBeUndefined()
+    expect((await serveOnce(cache, `/media/${TOKEN}`, only(hash), "HEAD")).body).toBeUndefined()
     // The content hash is not an address; a token no page holds, one that names nothing kept, anything else: 404.
-    expect(serveOnce(cache, `/media/${hash}`, () => hash).status).toBe(404)
-    expect(serveOnce(cache, `/media/${TOKEN}`, () => undefined).status).toBe(404)
-    expect(serveOnce(cache, `/media/${TOKEN}`, () => "b".repeat(64)).status).toBe(404)
-    expect(serveOnce(cache, "/media/../settings.json", () => hash).status).toBe(404)
-    expect(serveOnce(cache, `/media/${TOKEN}`, only(hash), "POST").status).toBe(405)
+    expect((await serveOnce(cache, `/media/${hash}`, () => hash)).status).toBe(404)
+    expect((await serveOnce(cache, `/media/${TOKEN}`, () => undefined)).status).toBe(404)
+    expect((await serveOnce(cache, `/media/${TOKEN}`, () => "b".repeat(64))).status).toBe(404)
+    expect((await serveOnce(cache, "/media/../settings.json", () => hash)).status).toBe(404)
+    expect((await serveOnce(cache, `/media/${TOKEN}`, only(hash), "POST")).status).toBe(405)
     await run(close)
   })
 
@@ -189,11 +186,11 @@ describe("the image cache (/media)", () => {
     // A restart: the directory is read back; served without fetching again.
     const second = await run(open(w, first.dir))
     expect(second.cache.stats().files).toBe(1)
-    expect(serveOnce(second.cache, `/media/${TOKEN}`, only(hash)).status).toBe(200)
+    expect((await serveOnce(second.cache, `/media/${TOKEN}`, only(hash))).status).toBe(200)
     // A day later: not served, and gone from the directory.
     w.clock.now += MEDIA_KEEP_MS
-    expect(serveOnce(second.cache, `/media/${TOKEN}`, only(hash)).status).toBe(404)
-    second.cache.sweep()
+    expect((await serveOnce(second.cache, `/media/${TOKEN}`, only(hash))).status).toBe(404)
+    await second.cache.sweep()
     expect(readdirSync(first.dir)).toEqual([])
     await run(second.close)
   })
@@ -212,7 +209,7 @@ describe("the image cache (/media)", () => {
     const again = await run(open(w, first.dir))
     expect(readdirSync(first.dir).sort()).toEqual([`${hash}.png`])
     expect(again.cache.stats()).toMatchObject({ files: 1, sure: true })
-    expect(serveOnce(again.cache, `/media/${TOKEN}`, only(hash)).status).toBe(200)
+    expect((await serveOnce(again.cache, `/media/${TOKEN}`, only(hash))).status).toBe(200)
     await run(again.close)
   })
 
@@ -224,6 +221,17 @@ describe("the image cache (/media)", () => {
       if (fail.has(op) && String(path).startsWith(dir)) throw Object.assign(new Error(`injected ${op} failure`), { code: "EIO" })
     }
     const fs: Partial<MediaFs> = {
+      opendir: async (p, o) => (eio("opendir", p), opendir(p, o)),
+      stat: async (p) => {
+        if (fail.has("stat") && String(p).startsWith(dir)) {
+          unreadable ??= String(p)
+          if (unreadable === String(p)) throw Object.assign(new Error("injected stat failure"), { code: "EIO" })
+        }
+        return stat(p)
+      },
+      readFile: async (p) => (eio("readFile", p), readFile(p)),
+      utimes: async (p, a, m) => (eio("utimes", p), (await import("node:fs/promises")).utimes(p, a, m)),
+      unlink: async (p) => (eio("unlink", p), unlink(p)),
       readdirSync: (p) => (eio("readdirSync", p), realReaddir(p)),
       statSync: (p) => {
         // A stat fault hits one entry only (the first it meets), like one unreadable file.
@@ -254,7 +262,8 @@ describe("the image cache (/media)", () => {
     expect("hash" in (await run(cache.fetch("https://img.example/0.png")))).toBe(true)
     w.clock.now += MEDIA_KEEP_MS + 1
     f.fail.add("unlinkSync")
-    cache.sweep()
+    f.fail.add("unlink")
+    await cache.sweep()
     expect(cache.stats()).toMatchObject({ files: 0, sure: false })
     // Not sure: refused, and the disk holds one file.
     expect(await run(cache.fetch("https://img.example/1.png"))).toEqual({ refused: "unavailable" })
@@ -276,7 +285,7 @@ describe("the image cache (/media)", () => {
     w.clock.now += MEDIA_KEEP_MS + 1
     // No sweep between: the expired copy is dealt with before the new bytes are matched against it.
     expect(await run(cache.fetch("https://img.example/other.png"))).toEqual({ hash })
-    expect(serveOnce(cache, `/media/${TOKEN}`, only(hash)).status).toBe(200)
+    expect((await serveOnce(cache, `/media/${TOKEN}`, only(hash))).status).toBe(200)
     expect(await run(cache.fetch("https://img.example/heron.png"))).toEqual({ hash })
     expect(w.requests.filter((r) => r === "img.example/heron.png")).toHaveLength(2)
     await run(close)
@@ -290,8 +299,9 @@ describe("the image cache (/media)", () => {
     const f = faulty(dir)
     const issues = makeIssueRegistry()
     const { cache, close } = await run(open(w, dir, { files: 2 }, { fs: f.fs, issues }))
-    f.fail.add("utimesSync")
+    f.fail.add("utimes")
     f.fail.add("unlinkSync")
+    f.fail.add("unlink")
     const outcomes = []
     for (let i = 0; i < 33; i++) outcomes.push(await run(cache.fetch(`https://img.example/${i}.png`)))
     // The first write fails (its temporary file stays); every later one is refused while the cache is not sure.
@@ -301,13 +311,13 @@ describe("the image cache (/media)", () => {
     expect(onDisk(dir).files).toBe(1)
     expect(issues.all().map((i) => i.id)).toEqual(["media.cache"])
     f.fail.clear()
-    cache.sweep()
+    await cache.sweep()
     expect(onDisk(dir).files).toBe(0)
     expect(cache.stats()).toMatchObject({ files: 0, bytes: 0, sure: true })
     expect(issues.all()).toEqual([])
     const { hash } = (await run(cache.fetch("https://img.example/39.png"))) as { hash: string }
     expect(onDisk(dir).names).toEqual([`${hash}.png`])
-    expect(serveOnce(cache, `/media/${TOKEN}`, only(hash)).status).toBe(200)
+    expect((await serveOnce(cache, `/media/${TOKEN}`, only(hash))).status).toBe(200)
     await run(close)
   })
 
@@ -324,7 +334,7 @@ describe("the image cache (/media)", () => {
       return name
     })
     const f = faulty(dir)
-    f.fail.add("statSync")
+    f.fail.add("stat")
     const { cache, close } = await run(open(w, dir, { files: 2 }, { fs: f.fs }))
     expect(cache.stats()).toMatchObject({ files: 1, sure: false })
     // The one it could not read is not taken as absent: nothing new is admitted.
@@ -345,14 +355,14 @@ describe("the image cache (/media)", () => {
     const { hash } = (await run(first.cache.fetch("https://img.example/heron.png"))) as { hash: string }
     await run(first.close)
     const f = faulty(first.dir)
-    f.fail.add("readdirSync")
+    f.fail.add("opendir")
     const second = await run(open(w, first.dir, undefined, { fs: f.fs }))
     expect(second.cache.stats()).toMatchObject({ files: 0, sure: false })
     expect(await run(second.cache.fetch("https://img.example/heron.png"))).toEqual({ refused: "unavailable" })
     f.fail.clear()
-    second.cache.sweep()
+    await second.cache.sweep()
     expect(second.cache.stats()).toMatchObject({ files: 1, sure: true })
-    expect(serveOnce(second.cache, `/media/${TOKEN}`, only(hash)).status).toBe(200)
+    expect((await serveOnce(second.cache, `/media/${TOKEN}`, only(hash))).status).toBe(200)
     await run(second.close)
   })
 
@@ -366,17 +376,18 @@ describe("the image cache (/media)", () => {
     const { hash } = (await run(cache.fetch("https://img.example/heron.png"))) as { hash: string }
     w.clock.now += MEDIA_KEEP_MS + 1
     f.fail.add("unlinkSync")
+    f.fail.add("unlink")
     // The expired copy cannot be removed: the same bytes from another address are not admitted on top of it.
     expect(await run(cache.fetch("https://img.example/other.png"))).toEqual({ refused: "unavailable" })
-    expect(serveOnce(cache, `/media/${TOKEN}`, only(hash)).status).toBe(404)
+    expect((await serveOnce(cache, `/media/${TOKEN}`, only(hash))).status).toBe(404)
     f.fail.clear()
     // The next admission takes the inventory: the expired file goes, the same bytes are a new file, served.
     expect(await run(cache.fetch("https://img.example/other.png"))).toEqual({ hash })
-    cache.sweep()
-    cache.sweep()
+    await cache.sweep()
+    await cache.sweep()
     expect(onDisk(dir).names).toEqual([`${hash}.png`])
     expect(cache.stats()).toMatchObject({ files: 1, sure: true })
-    expect(serveOnce(cache, `/media/${TOKEN}`, only(hash)).status).toBe(200)
+    expect((await serveOnce(cache, `/media/${TOKEN}`, only(hash))).status).toBe(200)
     await run(close)
   })
   it("round 3: a failed read while serving a held image keeps it: the cache is not sure, and a read that works again serves it again without an inventory", async () => {
@@ -386,18 +397,386 @@ describe("the image cache (/media)", () => {
     const f = faulty(dir)
     const { cache, close } = await run(open(w, dir, undefined, { fs: f.fs }))
     const { hash } = (await run(cache.fetch("https://img.example/heron.png"))) as { hash: string }
-    expect(serveOnce(cache, `/media/${TOKEN}`, only(hash)).status).toBe(200)
-    f.fail.add("readFileSync")
-    expect(serveOnce(cache, `/media/${TOKEN}`, only(hash)).status).toBe(404)
+    expect((await serveOnce(cache, `/media/${TOKEN}`, only(hash))).status).toBe(200)
+    f.fail.add("readFile")
+    expect((await serveOnce(cache, `/media/${TOKEN}`, only(hash))).status).toBe(404)
     expect(cache.stats()).toMatchObject({ files: 1, sure: false })
     f.fail.clear()
     // No inventory in between: still held, and readable again.
     expect(cache.stats().sure).toBe(false)
-    const again = serveOnce(cache, `/media/${TOKEN}`, only(hash))
+    const again = (await serveOnce(cache, `/media/${TOKEN}`, only(hash)))
     expect(again.status).toBe(200)
     expect(again.body).toEqual(Buffer.from(PNG))
-    cache.sweep()
+    await cache.sweep()
     expect(cache.stats()).toMatchObject({ files: 1, sure: true })
     await run(close)
   })
+})
+
+it("b2: recovery inventories asynchronously while unrelated work progresses, keeping admission closed", async () => {
+  const w = world()
+  const dir = mkdtempSync(join(tmpdir(), "pva-media-inventory-"))
+  for (let i = 0; i < 32; i++) {
+    const body = Buffer.from([...PNG, i])
+    const name = `${createHash("sha256").update(body).digest("hex")}.png`
+    writeFileSync(join(dir, name), body)
+    utimesSync(join(dir, name), w.clock.now / 1000, w.clock.now / 1000)
+  }
+  let broken = false
+  let recovering = false
+  let syncStats = 0
+  const sleeper = new Int32Array(new SharedArrayBuffer(4))
+  const { cache, close } = await run(open(w, dir, undefined, { fs: {
+    statSync: (p: string) => {
+      if (recovering) { syncStats++; Atomics.wait(sleeper, 0, 0, 1) }
+      return realStat(p)
+    },
+    readFile: async (p: string) => {
+      if (broken) throw Object.assign(new Error("EIO"), { code: "EIO" })
+      return readFile(p)
+    }
+  } }))
+  try {
+    const name = readdirSync(dir)[0]!
+    broken = true
+    expect((await serveOnce(cache, `/media/${TOKEN}`, only(name.slice(0, 64)))).status).toBe(404)
+    broken = false
+    recovering = true
+    let heartbeat = false
+    let previous = performance.now()
+    let longest = 0
+    const beat = () => {
+      const t = performance.now()
+      longest = Math.max(longest, t - previous)
+      previous = t
+      heartbeat = true
+    }
+    const pulse = setInterval(beat, 1)
+    const immediate = setImmediate(beat)
+    try {
+      const recovery = cache.sweep()
+      expect(cache.stats().sure).toBe(false)
+      await recovery
+      expect(heartbeat).toBe(true)
+      expect(syncStats).toBe(0)
+      expect(cache.stats()).toMatchObject({ files: 32, sure: true })
+      console.log(`media recovery longest event-loop gap: ${longest.toFixed(2)} ms`)
+      expect(longest).toBeLessThan(10)
+    } finally { clearInterval(pulse); clearImmediate(immediate) }
+  } finally { await run(close) }
+})
+
+it("b3: restart inventory removes duplicate suffixes, truncated bytes and wrong digests before counting physical files", async () => {
+  const w = world()
+  const dir = mkdtempSync(join(tmpdir(), "pva-media-restored-"))
+  let first = ""
+  for (let i = 0; i < 255; i++) {
+    const body = Buffer.from([...PNG, i])
+    const hash = createHash("sha256").update(body).digest("hex")
+    if (i === 0) first = hash
+    const path = join(dir, `${hash}.png`)
+    writeFileSync(path, body)
+    utimesSync(path, w.clock.now / 1000, w.clock.now / 1000)
+  }
+  const duplicate = join(dir, `${first}.jpg`)
+  writeFileSync(duplicate, Buffer.from([...PNG, 0]))
+  utimesSync(duplicate, w.clock.now / 1000, w.clock.now / 1000)
+  const wrong = join(dir, `${"a".repeat(64)}.png`)
+  writeFileSync(wrong, PNG)
+  utimesSync(wrong, w.clock.now / 1000, w.clock.now / 1000)
+  const truncated = join(dir, `${"b".repeat(64)}.png`)
+  writeFileSync(truncated, Buffer.alloc(0))
+  utimesSync(truncated, w.clock.now / 1000, w.clock.now / 1000)
+  w.routes.set("img.example/new.png", () => reply(200, Uint8Array.from([...PNG, 255]), { "content-type": "image/png" }))
+  const { cache, close } = await run(open(w, dir))
+  try {
+    expect(readdirSync(dir)).toHaveLength(255)
+    expect((await serveOnce(cache, `/media/${TOKEN}`, only("b".repeat(64)))).status).toBe(404)
+    expect(cache.stats()).toMatchObject({ files: 255, sure: true })
+    expect("hash" in await run(cache.fetch("https://img.example/new.png"))).toBe(true)
+    expect(readdirSync(dir)).toHaveLength(256)
+  } finally { await run(close) }
+})
+
+it("a6: a fresh keyed image resolves a real cache after its file's day and serves a ready image again", async () => {
+  const { presentPrepared, presentWorld } = await import("@pva/core/present-contract")
+  const { makeMemoryHouseholdStore } = await import("@pva/core/testing")
+  await run(Effect.scoped(Effect.gen(function*() {
+    const w = world()
+    w.routes.set("img.example/heron.png", () => reply(200, PNG, { "content-type": "image/png" }))
+    const { cache, close } = yield* open(w)
+    yield* Effect.addFinalizer(() => close)
+    const presenter = yield* presentWorld(yield* presentPrepared(makeMemoryHouseholdStore()), { media: (url) => cache.fetch(url) })
+    const image = { kind: "image", url: "https://img.example/heron.png", alt: "A", credit: "C", spoken: "A" } as const
+    const showFresh = Effect.gen(function*() {
+      const h = yield* presenter.showOn("kitchen-display", image, { key: "photo", lifetime: "pinned", expiresInMs: MEDIA_KEEP_MS })
+      for (let i = 0; i < 1_000; i++) {
+        yield* presenter.settle
+        const content = presenter.shownOn("kitchen-display")[0]?.content
+        if (content?.kind === "image" && content.image.state === "ready") {
+          const token = content.image.token
+          const response = yield* Effect.promise(() => serveOnce(cache, `/media/${token}`, presenter.present.mediaFor))
+          expect(response.status).toBe(200)
+          return h
+        }
+        yield* Effect.promise(() => new Promise<void>((resolve) => setImmediate(resolve)))
+      }
+      throw new Error("the fresh image did not resolve")
+    })
+    yield* showFresh
+    w.clock.now += 23 * 3_600_000
+    yield* showFresh
+    w.clock.now += 3_600_001
+    yield* showFresh
+    expect(w.requests).toHaveLength(2)
+  })))
+})
+
+it("r2 b1: slow successful writes and GET/HEAD reads yield, and reads recheck authorization and expiry", async () => {
+  const { writeFile, utimes, rename } = await import("node:fs/promises")
+  const w = world()
+  w.routes.set("img.example/slow.png", () => reply(200, PNG, { "content-type": "image/png" }))
+  let writing = false
+  let reading = false
+  let progressed = false
+  let syncOps = 0
+  let readAction = () => undefined as void
+  const delay = () => new Promise<void>((resolve) => setTimeout(resolve, 25))
+  const { cache, close } = await run(open(w, undefined, undefined, { fs: {
+    writeFile: async (...args: Parameters<typeof writeFile>) => { writing = true; await delay(); await writeFile(...args); writing = false },
+    utimes, rename,
+    readFile: async (path) => { reading = true; await delay(); readAction(); const body = await readFile(path); reading = false; return body },
+    writeFileSync: (...args) => { syncOps++; return writeFileSync(...args) },
+    readFileSync: (path) => { syncOps++; return realReadFile(path) }
+  } }))
+  try {
+    const beat = setInterval(() => { if (writing || reading) progressed = true }, 1)
+    try {
+      const result = await run(cache.fetch("https://img.example/slow.png")) as { hash: string }
+      expect(progressed).toBe(true)
+      expect(syncOps).toBe(0)
+      for (const method of ["GET", "HEAD"]) {
+        progressed = false
+        expect((await serveOnce(cache, `/media/${TOKEN}`, only(result.hash), method)).status).toBe(200)
+        expect(progressed).toBe(true)
+      }
+      let held = true
+      readAction = () => { held = false }
+      expect((await serveOnce(cache, `/media/${TOKEN}`, () => held ? result.hash : undefined)).status).toBe(404)
+      readAction = () => { w.clock.now += MEDIA_KEEP_MS }
+      expect((await serveOnce(cache, `/media/${TOKEN}`, only(result.hash))).status).toBe(404)
+      expect(syncOps).toBe(0)
+    } finally { clearInterval(beat) }
+  } finally { await run(close) }
+})
+
+it("r2 b2: admission rechecks expiry after joining an older slow sweep", async () => {
+  const w = world()
+  const older = Uint8Array.from([...PNG, 1])
+  w.routes.set("img.example/older.png", () => reply(200, older, { "content-type": "image/png" }))
+  w.routes.set("img.example/target.png", () => reply(200, PNG, { "content-type": "image/png" }))
+  let release = () => undefined as void
+  let entered = () => undefined as void
+  const blocked = new Promise<void>((resolve) => { release = resolve })
+  const started = new Promise<void>((resolve) => { entered = resolve })
+  let arm = false
+  const oldHash = createHash("sha256").update(older).digest("hex")
+  const { cache, close } = await run(open(w, undefined, undefined, { fs: { unlink: async (path) => {
+    if (arm && path.endsWith(`${oldHash}.png`)) { entered(); await blocked }
+    await unlink(path)
+  } } }))
+  try {
+    await run(cache.fetch("https://img.example/older.png"))
+    w.clock.now += 1_000
+    const target = await run(cache.fetch("https://img.example/target.png")) as { hash: string }
+    w.clock.now += MEDIA_KEEP_MS - 1_000
+    arm = true
+    const sweeping = cache.sweep()
+    await started
+    w.clock.now += 1_001
+    w.routes.set("img.example/fresh.png", () => reply(200, PNG, { "content-type": "image/png" }))
+    const fetching = run(cache.fetch("https://img.example/fresh.png"))
+    release()
+    await sweeping
+    expect(await fetching).toEqual(target)
+    expect((await serveOnce(cache, `/media/${TOKEN}`, only(target.hash))).status).toBe(200)
+  } finally { release(); await run(close) }
+})
+
+it("r2 b3: inventory removes dangling links and closes admission if that removal fails", async () => {
+  const { symlinkSync } = await import("node:fs")
+  for (const fail of [false, true]) {
+    const w = world()
+    const dir = mkdtempSync(join(tmpdir(), "pva-media-link-"))
+    for (let i = 0; i < 255; i++) {
+      const body = Buffer.from([...PNG, i])
+      const path = join(dir, `${createHash("sha256").update(body).digest("hex")}.png`)
+      writeFileSync(path, body)
+      utimesSync(path, w.clock.now / 1000, w.clock.now / 1000)
+    }
+    const link = join(dir, `${"0".repeat(64)}.png`)
+    symlinkSync("missing-entry", link)
+    let blocked = fail
+    const { cache, close } = await run(open(w, dir, undefined, { fs: { unlink: async (path) => {
+      if (blocked && path === link) throw Object.assign(new Error("injected unlink"), { code: "EIO" })
+      await unlink(path)
+    } } }))
+    try {
+      expect(cache.stats().sure).toBe(!fail)
+      expect(readdirSync(dir)).toHaveLength(fail ? 256 : 255)
+      w.routes.set("img.example/new.png", () => reply(200, Uint8Array.from([...PNG, 255]), { "content-type": "image/png" }))
+      if (fail) expect(await run(cache.fetch("https://img.example/new.png"))).toEqual({ refused: "unavailable" })
+      blocked = false
+      await cache.sweep()
+      expect("hash" in await run(cache.fetch("https://img.example/new.png"))).toBe(true)
+      expect(readdirSync(dir)).toHaveLength(256)
+    } finally { await run(close) }
+  }
+})
+
+it("r2 b4: a successfully read but corrupted live image is refused, invalidated and recovered", async () => {
+  const w = world()
+  w.routes.set("img.example/live.png", () => reply(200, PNG, { "content-type": "image/png" }))
+  const { cache, dir, close } = await run(open(w))
+  try {
+    const { hash } = await run(cache.fetch("https://img.example/live.png")) as { hash: string }
+    // Same-length corruption also has to be caught: signature and size alone are insufficient.
+    for (const corrupt of [Buffer.alloc(0), Buffer.from([...PNG.slice(0, -1), 99])]) {
+      writeFileSync(join(dir, `${hash}.png`), corrupt)
+      expect((await serveOnce(cache, `/media/${TOKEN}`, only(hash))).status).toBe(404)
+      expect(cache.stats().sure).toBe(false)
+      expect(await run(cache.fetch("https://img.example/live.png"))).toEqual({ hash })
+      expect((await serveOnce(cache, `/media/${TOKEN}`, only(hash))).status).toBe(200)
+    }
+    expect(w.requests).toHaveLength(3)
+  } finally { await run(close) }
+})
+
+const mediaGate = () => {
+  let resolve: () => void = () => undefined
+  const promise = new Promise<void>((done) => { resolve = done })
+  return { promise, resolve }
+}
+
+it.each([false, true])("r3 b2: inventory removes an empty foreign directory and safely refuses a nonempty one (%s)", async (nonempty) => {
+  const { mkdir, rm, writeFile } = await import("node:fs/promises")
+  const w = world(), dir = mkdtempSync(join(tmpdir(), "pva-media-directory-"))
+  const foreign = join(dir, "old-cache")
+  await mkdir(foreign)
+  if (nonempty) await writeFile(join(foreign, "foreign.txt"), "Keep this")
+  w.routes.set("img.example/new.png", () => reply(200, PNG, { "content-type": "image/png" }))
+  const { cache, close } = await run(open(w, dir))
+  try {
+    expect(cache.stats().sure).toBe(!nonempty)
+    if (nonempty) {
+      expect(await run(cache.fetch("https://img.example/new.png"))).toEqual({ refused: "unavailable" })
+      expect(await readFile(join(foreign, "foreign.txt"), "utf8")).toBe("Keep this")
+      await unlink(join(foreign, "foreign.txt"))
+      await cache.sweep()
+    }
+    expect("hash" in await run(cache.fetch("https://img.example/new.png"))).toBe(true)
+    expect(readdirSync(dir)).toHaveLength(1)
+    expect(cache.stats()).toMatchObject({ files: 1, sure: true })
+  } finally { await run(close); await rm(dir, { recursive: true, force: true }) }
+})
+
+it.each(["GET", "HEAD"])("r3 b3: inventory during a valid held %s does not turn recovery into a missing image", async (method) => {
+  const w = world()
+  w.routes.set("img.example/held.png", () => reply(200, PNG, { "content-type": "image/png" }))
+  const begun = mediaGate(), resume = mediaGate()
+  let failRead = false, delayRead = false
+  const { cache, close } = await run(open(w, undefined, undefined, { fs: { readFile: async (path) => {
+    if (failRead) { failRead = false; throw Object.assign(new Error("injected read"), { code: "EIO" }) }
+    const body = await readFile(path)
+    if (delayRead) { delayRead = false; begun.resolve(); await resume.promise }
+    return body
+  } } }))
+  try {
+    const { hash } = await run(cache.fetch("https://img.example/held.png")) as { hash: string }
+    failRead = true
+    expect((await serveOnce(cache, `/media/${TOKEN}`, only(hash))).status).toBe(404)
+    delayRead = true
+    const retry = serveOnce(cache, `/media/${TOKEN}`, only(hash), method)
+    await begun.promise
+    await cache.sweep()
+    expect(cache.stats().sure).toBe(true)
+    resume.resolve()
+    const response = await retry
+    expect(response.status).toBe(200)
+    expect(response.body).toEqual(method === "HEAD" ? undefined : Buffer.from(PNG))
+    expect((await serveOnce(cache, `/media/${TOKEN}`, only(hash))).status).toBe(200)
+  } finally { resume.resolve(); await run(close) }
+})
+
+it("r3 b4: a held read fault during an image write closes admission until inventory accounts for the renamed file", async () => {
+  const { writeFile } = await import("node:fs/promises")
+  const w = world(), issues = makeIssueRegistry()
+  w.routes.set("img.example/held.png", () => reply(200, PNG, { "content-type": "image/png" }))
+  w.routes.set("img.example/new.png", () => reply(200, Uint8Array.from([...PNG, 1]), { "content-type": "image/png" }))
+  const begun = mediaGate(), resume = mediaGate()
+  let failRead = false, delayWrite = false
+  const { cache, dir, close } = await run(open(w, undefined, undefined, { issues, fs: {
+    readFile: async (path) => {
+      if (failRead) { failRead = false; throw Object.assign(new Error("injected read"), { code: "EIO" }) }
+      return readFile(path)
+    },
+    writeFile: async (path, body, options) => {
+      if (delayWrite) { delayWrite = false; begun.resolve(); await resume.promise }
+      await writeFile(path, body, options)
+    }
+  } }))
+  try {
+    const { hash } = await run(cache.fetch("https://img.example/held.png")) as { hash: string }
+    delayWrite = true
+    const pending = run(cache.fetch("https://img.example/new.png"))
+    await begun.promise
+    failRead = true
+    expect((await serveOnce(cache, `/media/${TOKEN}`, only(hash))).status).toBe(404)
+    resume.resolve()
+    expect(await pending).toEqual({ refused: "unavailable" })
+    expect(cache.stats()).toMatchObject({ files: 1, sure: false })
+    expect(readdirSync(dir)).toHaveLength(2)
+    expect(issues.all().map((i) => i.id)).toEqual(["media.cache"])
+    expect((await serveOnce(cache, `/media/${TOKEN}`, only(hash))).status).toBe(200)
+    await cache.sweep()
+    expect(cache.stats()).toMatchObject({ files: 2, sure: true })
+    expect(issues.all()).toEqual([])
+    expect("hash" in await run(cache.fetch("https://img.example/new.png"))).toBe(true)
+  } finally { resume.resolve(); await run(close) }
+})
+
+it("r3 b5: admission retires unrelated bytes that expired naturally while a sweep was waiting", async () => {
+  const { performance: monotonic } = await import("node:perf_hooks")
+  const w = world(), begun = mediaGate(), resume = mediaGate()
+  let delayRemoval = false
+  const old = Uint8Array.from([...PNG, 1]), next = Uint8Array.from([...PNG, 2, 3])
+  const oldHash = createHash("sha256").update(old).digest("hex")
+  w.routes.set("img.example/old.png", () => reply(200, old, { "content-type": "image/png" }))
+  w.routes.set("img.example/held.png", () => reply(200, PNG, { "content-type": "image/png" }))
+  w.routes.set("img.example/new.png", () => reply(200, next, { "content-type": "image/png" }))
+  const { cache, close } = await run(open(w, undefined, { bytes: old.length + PNG.length }, { fs: { unlink: async (path) => {
+    if (delayRemoval && path.endsWith(`${oldHash}.png`)) { begun.resolve(); await resume.promise }
+    await unlink(path)
+  } } }))
+  try {
+    await run(cache.fetch("https://img.example/old.png"))
+    // Seed the second image so its day ends a little after the sweep starts.
+    w.clock.now += 100
+    await run(cache.fetch("https://img.example/held.png"))
+    w.clock.now += MEDIA_KEEP_MS - 100
+    // From here the wall clock runs forward normally; no correction is injected.
+    const at = w.clock.now, start = monotonic.now()
+    Object.defineProperty(w.clock, "now", { get: () => at + monotonic.now() - start })
+    delayRemoval = true
+    const sweeping = cache.sweep()
+    await begun.promise
+    await new Promise<void>((resolve) => setTimeout(resolve, 110))
+    const pending = run(cache.fetch("https://img.example/new.png"))
+    resume.resolve()
+    await sweeping
+    const result = await pending
+    expect("hash" in result).toBe(true)
+    expect(cache.stats()).toMatchObject({ files: 1, bytes: next.length, sure: true })
+    if ("hash" in result) expect((await serveOnce(cache, `/media/${TOKEN}`, only(result.hash))).status).toBe(200)
+  } finally { resume.resolve(); await run(close) }
 })
