@@ -8,6 +8,9 @@ import { defineTexts } from "@pva/module-contracts"
 export const texts = defineTexts({
   en: {
     shoppingList: "the shopping list",
+    genericList: "the list",
+    titleList: "List",
+    listGone: "That list is gone.",
     todoList: "the to-do list",
     namedList: "the {name} list",
     namedListPlain: "the {name}",
@@ -89,6 +92,9 @@ export const texts = defineTexts({
   },
   nl: {
     shoppingList: "de boodschappenlijst",
+    genericList: "de lijst",
+    titleList: "Lijst",
+    listGone: "Die lijst bestaat niet meer.",
     todoList: "de takenlijst",
     namedList: "de lijst {name}",
     namedListPlain: "de {name}",

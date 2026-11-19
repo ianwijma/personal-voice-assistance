@@ -63,7 +63,7 @@ export type Shown =
 
 /** A list's name as a title: the default lists' names in the household's language, a named list's own. */
 const titleOf = (list: string, row: ListRow | undefined, l: Language) =>
-  list === SHOPPING ? say(texts, l, "titleShopping") : list === TODO ? say(texts, l, "titleTodo") : row?.name ?? list
+  list === SHOPPING ? say(texts, l, "titleShopping") : list === TODO ? say(texts, l, "titleTodo") : row?.name ?? say(texts, l, "titleList")
 
 const speakOf = (things: ReadonlyArray<string>, lang: Language, max: number) => speakList(things.slice(0, 100), lang, { max: Math.max(2, max) }) ?? things.slice(0, max).join(", ")
 
@@ -111,7 +111,7 @@ export const makeChecklists = (ctx: {
     const lang = () => homeLanguage(ctx.host.view())
     const pinStore = engine.rawStore.collection(pins)
     /** This run's handle of each device's checklist (a restart forgets them; the host keeps what is pinned). */
-    const handles = new Map<string, { readonly handle: PresentHandle; readonly shown: string; readonly until: number }>()
+    const handles = new Map<string, { readonly handle: PresentHandle; readonly shown: string; readonly until: number; readonly closing?: boolean }>()
     /** Devices whose checklist this run took down while its row is still there (the row is removed next). */
     const dismissed = new Set<string>()
 
@@ -230,7 +230,7 @@ export const makeChecklists = (ctx: {
           title: cutAt(titleOf(pin.list, listRow?.value, l), TITLE_CHARS),
           style: "checklist",
           items: [],
-          spoken: speak(l, "finalSpoken", { list: engine.phraseOf(pin.list, l) }),
+          spoken: listRow === undefined && pin.list !== SHOPPING && pin.list !== TODO ? speak(l, "listGone") : speak(l, "finalSpoken", { list: engine.phraseOf(pin.list, l) }),
           handler: HANDLER
         }
         // A device that is not the household's any more is refused (`invalid`): nothing more can be done for it here.
@@ -240,8 +240,9 @@ export const makeChecklists = (ctx: {
     /** An accepted show can still be stored by the host when this page cannot draw it. Keep its handle until closed. */
     const oweUnsupportedDismissal = (pin: Pin, handle: PresentHandle) =>
       Effect.gen(function*() {
-        yield* write({ device: pin.device, list: pin.list, key: pin.key, until: pin.until, ...(pin.shown !== undefined ? { shown: pin.shown } : {}), owed: "dismiss" })
-        handles.set(pin.device, { handle, shown: pin.shown ?? "", until: pin.until })
+        // Retain the close intent with the handle before writing: a failed write must never retry this as a show.
+        handles.set(pin.device, { handle, shown: pin.shown ?? "", until: pin.until, closing: true })
+        yield* Effect.exit(write({ device: pin.device, list: pin.list, key: pin.key, until: pin.until, ...(pin.shown !== undefined ? { shown: pin.shown } : {}), owed: "dismiss" }))
       })
 
     /**
@@ -270,7 +271,7 @@ export const makeChecklists = (ctx: {
         const pin = row.value
         if (pin.owed === "remove" || dismissed.has(device)) return yield* removeRow(row, now, true)
         const l = lang()
-        const content = pin.owed === "dismiss" || removedDevice(device) ? undefined : yield* build(pin.list, l, readItemsFor(undefined))
+        const content = pin.owed === "dismiss" || handles.get(device)?.closing === true || removedDevice(device) ? undefined : yield* build(pin.list, l, readItemsFor(undefined))
         const built = cancelled(row, content?.cancelledThrough) ? undefined : content
         now = yield* Clock.currentTimeMillis
         if (built === undefined || now >= pin.until) {

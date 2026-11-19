@@ -3,7 +3,7 @@ import { homeLanguage, isLine, type Language, Lists, LISTS_LIMITS, say, StoredTe
 import { speakList } from "@pva/language"
 import { Clock, Effect, Schema } from "effect"
 import { type Item, items, listPhrase, lists, MAX_CLEAR, MAX_LIVE_LISTS, MAX_OPEN, MAX_PER_REQUEST, NAME_CHARS, normalise, type Quantity, SHOPPING, TODO, pins, undo, undoIdOf } from "./data.ts"
-import { type Checklists, HANDLER, makeChecklists } from "./checklist.ts"
+import { type Checklists, HANDLER, makeChecklists, oneLine } from "./checklist.ts"
 import { type Engine, isRefusal, listChoice, makeEngine, speak } from "./engine.ts"
 import { type SaidItem, sayItem, type SplitMode, splitItems, takeListSuffix } from "./parse.ts"
 import { makeListsService } from "./service.ts"
@@ -61,7 +61,7 @@ export const settings = {
 // ---------------------------------------------------------------------------------------------------------------------
 // Shared helpers
 
-const lineText = (max: number, what: string) => StoredText(max).check(Schema.makeFilter((t: string) => (isLine(t, max) && t.trim() !== "") || `${what}: one line of 1 to ${max} characters`))
+const lineText = (max: number, what: string) => StoredText(max).check(Schema.makeFilter((t: string) => (isLine(t, max) && oneLine(t) !== "") || `${what}: one line of 1 to ${max} characters`))
 
 /** The conversation's undo row, or none outside a turn (a job, a routine step run by a job). */
 const undoKey = Effect.map(CurrentTurn, (turn) => (turn === undefined ? undefined : undoIdOf(turn.conversationId)))
@@ -157,7 +157,7 @@ export const listsModule = defineModule({
         const split = splitItems(text, l, mode)
         switch (split.kind) {
           case "ok":
-            return split.items
+            return split.items.some((item) => oneLine(item.text) === "") ? speak(l, "nothingSaid") : split.items
           case "empty":
             return speak(l, "nothingSaid")
           case "too-many":
@@ -394,7 +394,7 @@ export const listsModule = defineModule({
               case "no-device":
                 return yield* Effect.fail(actionError(speak(l, "noDevice")))
               case "gone":
-                return yield* Effect.fail(actionError(speak(l, "unknownList", { name: phrase, items: listOf(engine.listNames(l), l, 8) })))
+                return yield* Effect.fail(actionError(speak(l, "listGone")))
               case "limit":
                 return yield* Effect.fail(actionError(speak(l, "screenCapacity")))
               case "failed":
@@ -427,6 +427,7 @@ export const listsModule = defineModule({
             const target = chosen(list).list
             const phrase = target === undefined ? "" : engine.phraseOf(target, l)
             const r = yield* checklists.hide(target).pipe(Effect.mapError((e) => actionError(storeSentence(l, e, false))))
+            if ("list" in r && r.list !== SHOPPING && r.list !== TODO && !engine.cached().some((row) => row.id === r.list && row.value.deletedAt === undefined)) return { say: speak(l, "listGone") }
             switch (r.kind) {
               case "no-device":
                 return yield* Effect.fail(actionError(speak(l, "noDevice")))

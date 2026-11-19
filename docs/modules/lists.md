@@ -143,9 +143,9 @@ assistant, whose tools take them as before.
 "Show the shopping list" puts the list's **open items on the screen of the device that asked**, as a `list`
 presentation in the `checklist` style, one tickable line per item (the item's text with its amount, one line of at most
 80 characters; at most 12 items, the oldest first as read out; the title is the list's name, with "(+3 more)" when
-more are open than are shown, so what is not shown is counted and never hidden). An item whose text becomes empty
-when control and direction characters are removed is shown and read in the fallback as "unnamed item" / "naamloos item";
-it keeps its item ID, tick and place in the count:
+more are open than are shown, so what is not shown is counted and never hidden). An item name that becomes empty
+under those text rules is refused when added or renamed, including through `Lists.addItem`; an amount does not
+stand in for a name:
 
 - **When it is shown.** `lists_show` (or "show the shopping list", "toon de boodschappenlijst", "zet de takenlijst op
   het scherm", and the model's tool). It is **pinned**: it stays until closed or until the host ends it, 24 hours (its
@@ -163,7 +163,9 @@ it keeps its item ID, tick and place in the count:
   says "This device can't show it." and then the read-out sentence of the list ("The shopping list has 3 things: …",
   which is also the presentation's spoken fallback). Its accepted presentation (including any earlier checklist
   replaced under its key) is dismissed; the handle and dismissal work stay in the pin until that succeeds, then the pin
-  is removed. A failed dismissal is retried by reconciliation and can also be closed with `lists_hide`. The spoken
+  is removed. If saving dismissal work fails, the accepted handle closes the presentation and reconciliation removes
+  the remaining row; the answer still gives the readout. A failed dismissal is retried by reconciliation and can also
+  be closed with `lists_hide`. The spoken
   sentence is at most 300 characters: it uses whole item names, within `readItems`, and counts the items left out;
   the separate 80-character visual limit does not shorten speech. If no whole item fits, the sentence says how many were not read out. The model's tool says the same.
 - **Privacy.** A list is household data, read out on shared, private and public devices alike, so its presentation is
@@ -208,7 +210,9 @@ it keeps its item ID, tick and place in the count:
   without one, whatever list it is ("Closed what I showed on this screen."). The list itself is not changed. The close is
   first recorded in the row, then done; if the host is busy it is tried again until done, and the answer says "I'll
   take the shopping list off this screen as soon as I can." A close is a close until the checklist's actual end, also
-  in its last seconds.
+  in its last seconds. If the list is gone (for example its creation was undone), the answer says "That list is gone."
+  / "Die lijst bestaat niet meer."; a closing card uses a generic localized title and the same sentence. A list's internal
+  id is never used as its display name or spoken name.
 - **A restart** keeps the pins and the screens (the host keeps pinned presentations). When the module starts it
   reconciles every pin (a page of 16 at a time): what changed while it was stopped is shown, and an unchanged checklist
   is shown again with **what remains of its end**, so this run has its handle; a restart never moves the end. With less

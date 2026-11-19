@@ -257,7 +257,7 @@ export const makeEngine = (rawStore: ModuleStore) => {
         const label = listPhrase(id, row, lang).replace(/^(the|de) /, "")
         return { value: id, label, aliases: DEFAULT_ALIASES[id]! }
       }
-      const name = row?.name ?? id
+      const name = row?.name ?? say(texts, lang, "titleList")
       return { value: id, label: name, aliases: [`${name} list`, `${name}lijst`, `lijst ${name}`] }
     })
     if (!mine) return plain

@@ -251,7 +251,8 @@ export const matchOf = (list: string, text: string, status: ItemStatus) => `${cr
 export const listPhrase = (id: string, row: ListRow | undefined, lang: Language): string => {
   if (id === SHOPPING) return say(texts, lang, "shoppingList")
   if (id === TODO) return say(texts, lang, "todoList")
-  const name = row?.name ?? id
+  if (row?.name === undefined) return say(texts, lang, "genericList")
+  const name = row.name
   if (lang === "en" && /\blist$/i.test(name)) return say(texts, lang, "namedListPlain", { name })
   if (lang === "nl" && /lijst(je)?$/i.test(name)) return say(texts, lang, "namedListPlain", { name })
   return say(texts, lang, "namedList", { name })
