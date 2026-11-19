@@ -122,6 +122,10 @@ basic plane: "𠮷野家") kept; cut at a code point boundary inside the unit bo
 `spoken` text, which the model says where the asking device shows nothing, is the answer's own sentences (in a phrase
 turn, the answer itself), whole, within 300 characters.
 
+- **Speculative turns.** `news_top` (generated from the read action `news.top`) and `news_headlines` are speculative
+  tools: the turn they run in may be discarded. `news_top` therefore only returns its list with the answer, and the host
+  shows it when the turn is promoted and drops it when the turn is discarded; `news_headlines` changes no screen at all.
+  The module calls nothing of `ctx.present` (`test/speculative.test.ts`, through the real model loop).
 - **A snapshot of the answer.** The module never touches a screen from inside a tool, and holds no handle: the list is
   what the answer said when it said it. It ends by its own 30 seconds, or when the next presentation on that device
   replaces it. It is **not** taken down when a feed it shows is unsubscribed, when a later answer finds nothing, or when
