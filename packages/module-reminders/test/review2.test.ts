@@ -3,7 +3,7 @@ import { assert, describe, it, vi } from "@effect/vitest"
 import { startTestModule } from "@pva/core/testing"
 import { Deferred, Effect, Fiber } from "effect"
 import { holdsSecret, MAX_STOP_TRIES, remindersModule } from "../src/index.ts"
-import { allRows, assertJob, DAY, faulty, H, jobOf, MIN, nofaults, openNotes, ring, SAM, spoken, theRow } from "./helpers.ts"
+import { type Kit, allRows, assertJob, DAY, faulty, H, jobOf, MIN, nofaults, openNotes, ring, SAM, spoken, theRow } from "./helpers.ts"
 
 vi.setConfig({ testTimeout: 60_000 })
 
@@ -11,7 +11,7 @@ const press = (faults: ReturnType<typeof nofaults>, card: { readonly id: string 
   faults.handlers["present:reminders"].run({ presentationId: card.id, key, deviceId: SAM, action }) as Effect.Effect<{ readonly say: string }>
 
 /** A daily reminder set on the kitchen display that has rung once: its id and the occurrence. */
-const dailyRung = (kit: any, text = "call mum") =>
+const dailyRung = (kit: Kit, text = "call mum") =>
   Effect.gen(function*() {
     yield* kit.tool("reminders_set", { text, when: "every day at 8 pm", scope: "household" }, { device: SAM })
     const row = yield* theRow(kit)
@@ -23,8 +23,8 @@ const dailyRung = (kit: any, text = "call mum") =>
 
 describe("finding 1: privacy is asked at the moment of answering", () => {
   const sequences = [
-    ["reminders_set", (kit: any) => kit.tool("reminders_set", { text: "private appointment", when: "in an hour", scope: "me" }, { device: SAM }).pipe(Effect.map((r: any) => r.value.spoken as string))],
-    ["remind_in", (kit: any) => kit.action("remind_in", { delay: "an hour", text: "private appointment" }, { device: SAM }).pipe(Effect.map((r: any) => r.say as string))]
+    ["reminders_set", (kit: Kit) => kit.tool("reminders_set", { text: "private appointment", when: "in an hour", scope: "me" }, { device: SAM }).pipe(Effect.map((r: any) => r.value.spoken as string))],
+    ["remind_in", (kit: Kit) => kit.action("remind_in", { delay: "an hour", text: "private appointment" }, { device: SAM }).pipe(Effect.map((r: any) => r.say as string))]
   ] as const
   for (const [name, start] of sequences) {
     it.effect(`${name}: the device's person changes while the creation waits for the lock: the confirmation does not tell the words`, () =>
