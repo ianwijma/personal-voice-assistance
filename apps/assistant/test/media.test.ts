@@ -5,7 +5,7 @@
 // resolver and connector stand behind the real safeFetch.
 import type { ConnectRequest, ConnectResponse } from "@pva/net"
 import { Deferred, Effect, Exit, Fiber, Scope } from "effect"
-import { mkdtempSync, readdirSync, statSync } from "node:fs"
+import { chmodSync, mkdtempSync, readdirSync, statSync, utimesSync, writeFileSync } from "node:fs"
 import type http from "node:http"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
@@ -54,7 +54,10 @@ const open = (w: World, dir = mkdtempSync(join(tmpdir(), "pva-media-")), limits?
   })
 
 /** A request and a response that record what the route answers. */
-const serveOnce = (cache: Effect.Success<ReturnType<typeof open>>["cache"], path: string, mayServe: (hash: string) => boolean, method = "GET") => {
+/** A page's address token, and a resolver that answers `hash` for it alone (the Presenter's `mediaFor`). */
+const TOKEN = "T".repeat(32)
+const only = (hash: string) => (token: string) => (token === TOKEN ? hash : undefined)
+const serveOnce = (cache: Effect.Success<ReturnType<typeof open>>["cache"], path: string, resolve: (token: string) => string | undefined, method = "GET") => {
   const out: { status?: number; headers?: Record<string, string>; body?: Buffer | undefined } = {}
   const res = {
     writeHead(status: number, headers: Record<string, string>) {
@@ -67,7 +70,7 @@ const serveOnce = (cache: Effect.Success<ReturnType<typeof open>>["cache"], path
       return res
     }
   }
-  cache.serve({ method, url: path } as http.IncomingMessage, res as unknown as http.ServerResponse, mayServe)
+  cache.serve({ method, url: path } as http.IncomingMessage, res as unknown as http.ServerResponse, resolve)
   return out
 }
 
@@ -92,25 +95,27 @@ describe("the image cache (/media)", () => {
     expect(statSync(dir).mode & 0o777).toBe(0o700)
     expect(readdirSync(dir)).toEqual([`${hash}.png`])
     expect(statSync(join(dir, `${hash}.png`)).mode & 0o777).toBe(0o600)
-    // Served while a page holds it, with the headers of an inert image.
-    const ok = serveOnce(cache, `/media/${hash}`, (h) => h === hash)
+    // Served to the page whose own address names it, with the headers of an inert image kept out of every cache.
+    const ok = serveOnce(cache, `/media/${TOKEN}`, only(hash))
     expect(ok.status).toBe(200)
-    expect(ok.headers).toMatchObject({
+    expect(ok.headers).toEqual({
       "Content-Type": "image/png",
+      "Content-Length": String(PNG.length),
       "X-Content-Type-Options": "nosniff",
       "Content-Security-Policy": "default-src 'none'; sandbox",
       "Content-Disposition": "inline; filename=\"image.png\"",
       "Cross-Origin-Resource-Policy": "same-origin",
-      "Referrer-Policy": "no-referrer"
+      "Referrer-Policy": "no-referrer",
+      "Cache-Control": "private, no-store"
     })
-    expect(ok.headers?.["Cache-Control"]).toMatch(/^private, max-age=\d+, immutable$/)
     expect([...ok.body!]).toEqual([...PNG])
-    expect(serveOnce(cache, `/media/${hash}`, () => true, "HEAD").body).toBeUndefined()
-    // A hash no page holds (or was never told), a hash it does not keep, anything that is not a hash: 404.
-    expect(serveOnce(cache, `/media/${hash}`, () => false).status).toBe(404)
-    expect(serveOnce(cache, `/media/${"b".repeat(64)}`, () => true).status).toBe(404)
-    expect(serveOnce(cache, "/media/../settings.json", () => true).status).toBe(404)
-    expect(serveOnce(cache, `/media/${hash}`, () => true, "POST").status).toBe(405)
+    expect(serveOnce(cache, `/media/${TOKEN}`, only(hash), "HEAD").body).toBeUndefined()
+    // The content hash is not an address; a token no page holds, one that names nothing kept, anything else: 404.
+    expect(serveOnce(cache, `/media/${hash}`, () => hash).status).toBe(404)
+    expect(serveOnce(cache, `/media/${TOKEN}`, () => undefined).status).toBe(404)
+    expect(serveOnce(cache, `/media/${TOKEN}`, () => "b".repeat(64)).status).toBe(404)
+    expect(serveOnce(cache, "/media/../settings.json", () => hash).status).toBe(404)
+    expect(serveOnce(cache, `/media/${TOKEN}`, only(hash), "POST").status).toBe(405)
     await run(close)
   })
 
@@ -180,16 +185,68 @@ describe("the image cache (/media)", () => {
     // A restart: the directory is read back; served without fetching again.
     const second = await run(open(w, first.dir))
     expect(second.cache.stats().files).toBe(1)
-    expect(serveOnce(second.cache, `/media/${hash}`, () => true).status).toBe(200)
+    expect(serveOnce(second.cache, `/media/${TOKEN}`, only(hash)).status).toBe(200)
     // A day later: not served, and gone from the directory.
     w.clock.now += MEDIA_KEEP_MS
-    expect(serveOnce(second.cache, `/media/${hash}`, () => true).status).toBe(404)
+    expect(serveOnce(second.cache, `/media/${TOKEN}`, only(hash)).status).toBe(404)
     second.cache.sweep()
     expect(readdirSync(first.dir)).toEqual([])
     await run(second.close)
-    // A file left by an interrupted write, or one that is not the cache's, is removed at start.
-    const third = await run(open(w, first.dir))
-    expect(third.cache.stats().files).toBe(0)
-    await run(third.close)
+  })
+
+  it("b16: at start, real debris (an interrupted write, a foreign file, an expired image) is removed and a valid unexpired image kept", async () => {
+    const w = world()
+    w.routes.set("img.example/heron.png", () => reply(200, PNG, { "content-type": "image/png" }))
+    const first = await run(open(w))
+    const { hash } = (await run(first.cache.fetch("https://img.example/heron.png"))) as { hash: string }
+    await run(first.close)
+    writeFileSync(join(first.dir, ".tmp-0123456789abcdef"), "half a file")
+    writeFileSync(join(first.dir, "notes.txt"), "not the cache's")
+    const old = `${"9".repeat(64)}.png`
+    writeFileSync(join(first.dir, old), PNG)
+    utimesSync(join(first.dir, old), (w.clock.now - MEDIA_KEEP_MS - 1) / 1000, (w.clock.now - MEDIA_KEEP_MS - 1) / 1000)
+    const again = await run(open(w, first.dir))
+    expect(readdirSync(first.dir).sort()).toEqual([`${hash}.png`])
+    expect(again.cache.stats()).toMatchObject({ files: 1, stale: 0 })
+    expect(serveOnce(again.cache, `/media/${TOKEN}`, only(hash)).status).toBe(200)
+    await run(again.close)
+  })
+
+  it("b4: a file whose removal fails stays counted against the bounds and is removed later; the disk never holds more than the bound", async () => {
+    const w = world()
+    for (let i = 0; i < 2; i++) w.routes.set(`img.example/${i}.png`, () => reply(200, Uint8Array.from([...PNG, i]), { "content-type": "image/png" }))
+    const { cache, dir, close } = await run(open(w, undefined, { files: 1 }))
+    expect("hash" in (await run(cache.fetch("https://img.example/0.png")))).toBe(true)
+    w.clock.now += MEDIA_KEEP_MS + 1
+    chmodSync(dir, 0o500)
+    try {
+      cache.sweep()
+      expect(cache.stats()).toMatchObject({ files: 0, stale: 1 })
+      // Its place is not free yet: refused full, and the disk holds one file.
+      expect(await run(cache.fetch("https://img.example/1.png"))).toEqual({ refused: "full" })
+    } finally {
+      chmodSync(dir, 0o700)
+    }
+    expect(readdirSync(dir)).toHaveLength(1)
+    // The removal is tried again before the next write: then there is room.
+    expect("hash" in (await run(cache.fetch("https://img.example/1.png")))).toBe(true)
+    expect(readdirSync(dir)).toHaveLength(1)
+    expect(cache.stats()).toMatchObject({ files: 1, stale: 0 })
+    await run(close)
+  })
+
+  it("b5: the same bytes fetched again after their day are a new admission, served again", async () => {
+    const w = world()
+    w.routes.set("img.example/heron.png", () => reply(200, PNG, { "content-type": "image/png" }))
+    w.routes.set("img.example/other.png", () => reply(200, PNG, { "content-type": "image/png" }))
+    const { cache, close } = await run(open(w))
+    const { hash } = (await run(cache.fetch("https://img.example/heron.png"))) as { hash: string }
+    w.clock.now += MEDIA_KEEP_MS + 1
+    // No sweep between: the expired copy is dealt with before the new bytes are matched against it.
+    expect(await run(cache.fetch("https://img.example/other.png"))).toEqual({ hash })
+    expect(serveOnce(cache, `/media/${TOKEN}`, only(hash)).status).toBe(200)
+    expect(await run(cache.fetch("https://img.example/heron.png"))).toEqual({ hash })
+    expect(w.requests.filter((r) => r === "img.example/heron.png")).toHaveLength(2)
+    await run(close)
   })
 })

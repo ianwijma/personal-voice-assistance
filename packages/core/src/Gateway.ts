@@ -155,9 +155,10 @@ export interface ActionCallOptions extends GatewayCallOptions {
   /**
    * P7 (a phrase command's execution trace): told the admission's outcome once it is decided, before the action runs:
    * the class the call was judged as (absent when it was refused before its risk was judged) and the refusal, if any.
-   * Must not throw (a throw is ignored).
+   * Must not throw (a throw is ignored). P10: told once more, `presented: true`, when the action's outcome carried a
+   * presentation and it was handed to the Presenter.
    */
-  readonly onDecision?: (decision: { readonly risk?: ToolRisk; readonly refused?: string }) => void
+  readonly onDecision?: (decision: { readonly risk?: ToolRisk; readonly refused?: string; readonly presented?: true }) => void
 }
 
 export interface ExecutionGateway {
@@ -191,7 +192,7 @@ export interface ExecutionGateway {
 const decoders = new WeakMap<Tool, (u: unknown) => Effect.Effect<unknown, Schema.SchemaError>>()
 
 /** Tell an action call's observer the admission's outcome; an observer that throws changes nothing. */
-const tellDecision = (options: ActionCallOptions, decision: { readonly risk?: ToolRisk; readonly refused?: string }) => {
+const tellDecision = (options: ActionCallOptions, decision: { readonly risk?: ToolRisk; readonly refused?: string; readonly presented?: true }) => {
   try {
     options.onDecision?.(decision)
   } catch {
@@ -474,6 +475,7 @@ export const makeExecutionGateway = (options: GatewayOptions = {}): ExecutionGat
       // P10: an outcome's presentation goes to the Presenter (the intent agent speaks `say`; the note is for a model).
       if (outcome?.present === undefined) return outcome
       yield* split(registered.moduleId, principal, { forModel: outcome.say ?? "", present: outcome.present, ...(outcome.show !== undefined ? { show: outcome.show } : {}) })
+      tellDecision(actionOptions, { presented: true })
       const { present: _p, show: _s, ...rest } = outcome
       return rest
     })

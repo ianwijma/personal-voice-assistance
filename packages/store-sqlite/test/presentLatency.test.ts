@@ -10,8 +10,8 @@
 // - `show` as a tool calls it (one transaction and an enqueue), and the longest main-thread stop of a 1 ms timer while a
 //   page says hello with nine presentations and while every device is reconciled, asserted with `bound(10)`.
 import { assert, describe, it } from "@effect/vitest"
-import { Conversation, type ConversationEvent, CurrentTurn, MAX_LIVE_PER_MODULE, MAX_LIVE_TOTAL, type Presentation, presentStorage, type Trace, TurnTrace } from "@pva/core"
-import { presentWorld } from "@pva/core/present-contract"
+import { Conversation, type ConversationEvent, CurrentTurn, MAX_LIVE_PER_MODULE, MAX_LIVE_TOTAL, type Presentation, type Trace, TurnTrace } from "@pva/core"
+import { presentPrepared, presentWorld } from "@pva/core/present-contract"
 import { contractDevice } from "@pva/core/notify-contract"
 import { done, endOfTurn, makeMarkerTts, makeRecordingAudioOutput, makeScriptedLlm, sleep, speechStarted, textDelta, toolCall } from "@pva/core/testing"
 import { encodeServerMessage, MAX_PINNED_PER_DEVICE } from "@pva/protocol"
@@ -59,7 +59,7 @@ const longestStop = <A, E>(effect: Effect.Effect<A, E>) =>
 const loaded = (leave: number, frames: { n: number; bytes: number }) =>
   Effect.gen(function*() {
     const store = yield* makeSqliteStore({ filename: join(latencyDir("pva-present"), "household.db") })
-    yield* store.prepare([], [presentStorage])
+    yield* presentPrepared(store)
     const world = yield* presentWorld(store, {
       modules: MODULES,
       devices: DEVICES,
@@ -150,33 +150,63 @@ describe("presentation latency on SQLite at the stated maximum", () => {
       expect(m(withP, "audible")).toBeLessThan(m(without, "audible") + bound(2))
     }), 240_000)
 
-  it.live("show as a tool calls it is short; a page's hello with nine presentations and reconciling every device hold the main thread under the bound", () =>
+  it.live("show as a tool calls it, a page's hello with nine presentations and reconciling every device with real fan-out hold the main thread under the bound", () =>
     Effect.scoped(Effect.gen(function*() {
       const frames = { n: 0, bytes: 0 }
       const world = yield* loaded(1, frames)
-      // `show` as a tool calls it, at the bound: the transaction and the enqueue (a transient: it replaces the last).
+      // `show` as a tool calls it, at the bound: the transaction and the enqueue (a transient: it replaces the last);
+      // the longest stop across the whole workload is asserted (review round 1, a14), the median too.
       const shows: Array<number> = []
-      for (let i = 0; i < 200; i++) {
-        const t = performance.now()
-        yield* world.board().show("origin", WORST(2000 + i)).pipe(Effect.provideService(CurrentTurn, turnOn(DEVICES[0]!.id)))
-        shows.push(performance.now() - t)
-        yield* world.settle
-      }
+      const showing = yield* longestStop(Effect.gen(function*() {
+        for (let i = 0; i < 200; i++) {
+          const t = performance.now()
+          yield* world.board().show("origin", WORST(2000 + i)).pipe(Effect.provideService(CurrentTurn, turnOn(DEVICES[0]!.id)))
+          shows.push(performance.now() - t)
+          yield* world.settle
+        }
+      }))
       // A page of the turn's device says hello: nine presentations (eight pinned and the transient) in one step.
       const hello = yield* longestStop(Effect.andThen(world.open(DEVICES[0]!.id), world.settle))
-      // Every device reconciled at once (a settings commit): 64 devices, each one step, yielding between them.
-      const before = frames.n
-      const all = yield* longestStop(Effect.andThen(Effect.sync(() => world.present.reconcileAll()), world.settle))
-      // A fresh page on every device, then every device reconciled: what is sent to all of them.
-      for (const d of DEVICES.slice(1)) yield* world.open(d.id)
-      const fresh = frames.n - before
       console.log(
-        `show as a tool calls it (200 calls): median ${median(shows).toFixed(3)} ms, p95 ${p95(shows).toFixed(3)} ms, worst ${Math.max(...shows).toFixed(3)} ms; ` +
-          `a page's hello with 9 presentations: longest stop ${hello.worst.toFixed(2)} ms; reconciling every device: longest stop ${all.worst.toFixed(2)} ms; ` +
-          `${fresh} frames to fresh pages, ${(frames.bytes / 1024 / 1024).toFixed(2)} MiB encoded in all`
+        `show as a tool calls it (200 calls): median ${median(shows).toFixed(3)} ms, p95 ${p95(shows).toFixed(3)} ms, worst ${Math.max(...shows).toFixed(3)} ms, ` +
+          `longest main-thread stop across them ${showing.worst.toFixed(2)} ms; a page's hello with 9 presentations: longest stop ${hello.worst.toFixed(2)} ms`
       )
+      assert.isBelow(showing.worst, bound(10))
       assert.isBelow(hello.worst, bound(10))
-      assert.isBelow(all.worst, bound(10))
       assert.isBelow(median(shows), bound(2))
+    })), 240_000)
+
+  it.live("reconciling every device with real fan-out at the bounds: 64 devices in one room, each page holding 9 of the worst legal presentations", () =>
+    Effect.scoped(Effect.gen(function*() {
+      const frames = { n: 0, bytes: 0 }
+      const house = DEVICES.map((d) => ({ ...d, room: "House", place: { ...d.place, room: "House" } }))
+      const store = yield* makeSqliteStore({ filename: join(latencyDir("pva-present-fan"), "household.db") })
+      yield* presentPrepared(store)
+      const world = yield* presentWorld(store, { modules: MODULES, devices: house, unrecorded: true, outlet: (_d, m) => {
+        frames.n++
+        frames.bytes += encodeServerMessage(m).length
+      } })
+      yield* world.settle
+      // Eight pinned and one transient, each to the whole room: every page's bound.
+      for (let i = 0; i < MAX_PINNED_PER_DEVICE; i++) {
+        yield* world.board(MODULES[i % MODULES.length]).show({ room: "House" }, WORST(i), { lifetime: "pinned", expiresInMs: 3_600_000 }).pipe(Effect.provideService(CurrentTurn, turnOn(house[0]!.id)))
+      }
+      yield* world.board().show({ room: "House" }, WORST(99)).pipe(Effect.provideService(CurrentTurn, turnOn(house[0]!.id)))
+      yield* world.settle
+      // A fresh page on every device at once (the server restarted under open pages), reconciled together.
+      const tabs = world.tabs as Map<string, { id: string; deviceId: string; messages: Array<unknown>; declares: boolean }>
+      for (const [id] of [...tabs]) tabs.delete(id)
+      world.present.reconcileAll()
+      yield* world.settle
+      for (const d of house) tabs.set(`fresh-${d.id}`, { id: `fresh-${d.id}`, deviceId: d.id, messages: [], declares: false })
+      const before = frames.n
+      const bytes = frames.bytes
+      const all = yield* longestStop(Effect.andThen(Effect.sync(() => world.present.reconcileAll()), world.settle))
+      const sent = frames.n - before
+      console.log(
+        `reconciling every device with fan-out: ${sent} frames (${((frames.bytes - bytes) / 1024 / 1024).toFixed(2)} MiB encoded) to 64 fresh pages; longest main-thread stop ${all.worst.toFixed(2)} ms`
+      )
+      expect(sent).toBe(64 * (MAX_PINNED_PER_DEVICE + 1))
+      assert.isBelow(all.worst, bound(10))
     })), 240_000)
 })

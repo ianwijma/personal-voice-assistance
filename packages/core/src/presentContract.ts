@@ -24,6 +24,7 @@ import { contractDevice } from "./notifyContract.ts"
 import {
   MAX_LIVE_PER_MODULE,
   MAX_LIVE_TOTAL,
+  MAX_NOTE_CHARS,
   type ModulePresent,
   type Presentation,
   PRESENT_DEFAULT_EXPIRY_MS,
@@ -37,8 +38,10 @@ import {
   type PresentResult,
   type StoredPresentation
 } from "./Present.ts"
-import { makePresentEngine, type MediaOutcome, type PresentDecisionRecord, type PresentMessage } from "./PresentEngine.ts"
+import { IMAGE_SENTENCE, makePresentEngine, type MediaOutcome, type PresentDecisionRecord, type PresentMessage, SPOKEN_PREFIX } from "./PresentEngine.ts"
 import { makePrivacy, type PrivacyPlace } from "./Privacy.ts"
+import { makeSchedulerEngine } from "./SchedulerEngine.ts"
+import { schedulerStorage } from "./SchedulerJobs.ts"
 import { CurrentTurn, makeConnectionRef, type TurnContext } from "./TurnContext.ts"
 
 /** A store for one case; `reopen` closes it and opens the same data again (in memory: the same store). */
@@ -93,11 +96,14 @@ const boardModule = (
   })
 
 /** The store with the service's collection prepared. */
-const prepared = (store: HouseholdStore) => Effect.as(store.prepare([], [presentStorage]), store)
+export const presentPrepared = (store: HouseholdStore) => Effect.as(store.prepare([], [schedulerStorage, presentStorage]), store)
+const prepared = presentPrepared
 
 /** A store whose synchronous reads of `presentations` fail while `faults.reads` is above 0 (each failure counts it down). */
 export const presentFaultyStore = (inner: HouseholdStore) => {
   const faults = { reads: 0, writes: 0, failed: 0 }
+  /** A wait before the service's next transaction begins (as a busy store's retry wait is), taken by that transaction. */
+  const gate: { wait: Deferred.Deferred<void> | undefined } = { wait: undefined }
   const fault = (k: "reads" | "writes") => {
     if (faults[k] <= 0) return
     faults[k]--
@@ -114,13 +120,19 @@ export const presentFaultyStore = (inner: HouseholdStore) => {
     if (owner !== PRESENT_OWNER) return own
     return {
       ...own,
-      transaction: (f) => own.transaction((tx) => {
-        fault("writes")
-        return f(tx)
-      })
+      transaction: (f) =>
+        Effect.suspend(() => {
+          const run = own.transaction((tx) => {
+            fault("writes")
+            return f(tx)
+          })
+          const wait = gate.wait
+          gate.wait = undefined
+          return wait === undefined ? run : Effect.andThen(Deferred.await(wait), run)
+        })
     }
   }
-  return { store: { ...inner, reader, forCore } satisfies HouseholdStore, faults }
+  return { store: { ...inner, reader, forCore } satisfies HouseholdStore, faults, gate }
 }
 
 /** One page (tab) of a device in the world. */
@@ -128,6 +140,9 @@ interface Tab {
   readonly id: string
   readonly deviceId: string
   readonly messages: Array<PresentMessage>
+  /** The kinds this tab's own page declared (G11); absent: the device's outputs alone decide. */
+  kinds?: Readonly<Record<string, number>> | undefined
+  readonly declares: boolean
 }
 
 /** The server's parts on `store`, in a scope of their own (closing it is a server stop). */
@@ -165,10 +180,17 @@ export const presentWorld = (
     const ids = o.modules ?? ["board"]
     let hostRef: { readonly gateway: import("./Gateway.ts").ExecutionGateway; readonly pageText: (m: string, t: unknown, max: number) => string } | undefined
     const made = yield* Scope.provide(scope)(Effect.gen(function*() {
+      const scheduler = yield* makeSchedulerEngine({ store, issues, retryBaseMs: SECOND, outcomeRetryMs: [100, 200], gateway: () => hostRef?.gateway })
       const present = yield* makePresentEngine({
         store,
+        scheduler,
+        writeRetryMs: [100, 200],
         devices: () => devices,
-        outputs: (d) => outputs.get(d.id) ?? SCREEN,
+        // A connection's own kinds stand in for the device's declaration; the owner's exclusions (the map's kinds) still apply.
+        outputs: (d, declared) => {
+          const base = outputs.get(d.id) ?? SCREEN
+          return declared === undefined ? base : { ...base, kinds: Object.fromEntries(Object.entries(declared).filter(([k]) => base.kinds[k] !== undefined)) }
+        },
         privacy: makePrivacy((id) => places.get(id), (id) => MEMBERS.has(id)),
         outlet: () => ({
           connections: (deviceId) =>
@@ -177,7 +199,8 @@ export const presentWorld = (
               send: (message: PresentMessage) => {
                 if (o.unrecorded !== true) t.messages.push(message)
                 o.outlet?.(deviceId, message)
-              }
+              },
+              ...(t.declares ? { kinds: () => t.kinds } : {})
             }))
         }),
         ...(o.media !== undefined ? { media: () => ({ fetch: o.media! }) } : {}),
@@ -198,10 +221,13 @@ export const presentWorld = (
       })
       hostRef = host
       yield* host.startEnabled
-      return { present, host }
+      return { present, host, scheduler }
     }))
     const settle = Effect.gen(function*() {
-      for (let i = 0; i < 3; i++) yield* made.present.settled
+      for (let i = 0; i < 3; i++) {
+        yield* made.scheduler.settled
+        yield* made.present.settled
+      }
     })
     const advance = (ms: number) => Effect.andThen(Effect.andThen(settle, TestClock.adjust(ms)), settle)
     const board = (id = ids[0]!) => held.get(id)!
@@ -225,9 +251,10 @@ export const presentWorld = (
         after = page[page.length - 1]
       }
     })
-    const open = (deviceId: string) =>
+    /** Open a page of the device; `kinds`: what its own page declares (absent: the device's outputs decide). */
+    const open = (deviceId: string, o2: { readonly kinds?: Readonly<Record<string, number>> | undefined } = {}) =>
       Effect.gen(function*() {
-        const tab: Tab = { id: `tab-${++tabSeq}`, deviceId, messages: [] }
+        const tab: Tab = { id: `tab-${++tabSeq}`, deviceId, messages: [], declares: "kinds" in o2, kinds: o2.kinds }
         tabs.set(tab.id, tab)
         made.present.reconcile(deviceId)
         yield* settle
@@ -239,7 +266,7 @@ export const presentWorld = (
         made.present.reconcile(tab.deviceId)
         return settle
       })
-    for (const id of o.connected ?? devices.map((d) => d.id)) tabs.set(`tab-${++tabSeq}`, { id: `tab-${tabSeq}`, deviceId: id, messages: [] })
+    for (const id of o.connected ?? devices.map((d) => d.id)) tabs.set(`tab-${++tabSeq}`, { id: `tab-${tabSeq}`, deviceId: id, messages: [], declares: false })
     // The pages that are open at the start say hello.
     made.present.reconcileAll()
     const tabsOf = (deviceId: string) => [...tabs.values()].filter((t) => t.deviceId === deviceId)
@@ -309,6 +336,7 @@ export const worstPresentationRow = (): StoredPresentation => {
     target: { room: t(80) },
     owner: "p".repeat(40),
     content: { kind: "list", title: t(60), style: "checklist", items: Array.from({ length: 12 }, (_, i) => ({ id: `${i}`.padEnd(40, "x"), text: t(80), done: false })) },
+    showId: "s".repeat(64),
     spoken: t(300),
     buttons: Array.from({ length: 3 }, (_, i) => ({ id: `b${i}`.padEnd(32, "x"), label: t(20) })),
     handler: "h".repeat(64),
@@ -335,7 +363,7 @@ export const presentContract = (name: string, open: OpenPresentStore) =>
       Effect.gen(function*() {
         const { world } = yield* start()
         const h = yield* world.showOn("kitchen-display", card())
-        assert.deepStrictEqual(h.outcome, { devices: [{ deviceId: "kitchen-display", shown: true }], note: "Shown on \"Kitchen display\"." })
+        assert.deepStrictEqual(h.outcome, { devices: [{ deviceId: "kitchen-display", shown: true }], note: "Showing on \"Kitchen display\"." })
         const [p] = world.shownOn("kitchen-display")
         assert.strictEqual(p?.id, h.id)
         assert.deepStrictEqual(p?.content, { kind: "card", title: "Bins out", text: "Paper tonight", facts: [] })
@@ -351,11 +379,12 @@ export const presentContract = (name: string, open: OpenPresentStore) =>
         const { world } = yield* start()
         const out = yield* world.toolOn("kitchen-display", { forModel: { items: 2 }, present: checklist() })
         assert.isFalse(out.isError)
-        assert.strictEqual(out.content, "{\"items\":2}\n[Screen: Shown on \"Kitchen display\".]")
+        assert.strictEqual(out.content, "{\"items\":2}\n[Screen: Showing on \"Kitchen display\".]")
         yield* world.settle
         assert.deepStrictEqual(world.shownOn("kitchen-display").map((p) => p.content.kind), ["list"])
         const none = yield* world.toolOn("office-speaker", { forModel: "Two things.", present: checklist() })
-        assert.strictEqual(none.content, "Two things.\n[Screen: Not shown: \"Office speaker\" has no display; say it instead.]")
+        // G6: nothing shown on the asking device for a reason other than privacy: the note carries the spoken fallback.
+        assert.strictEqual(none.content, "Two things.\n[Screen: Not showing it: \"Office speaker\" has no display. Say this instead: Milk and eggs.]")
         const plain = yield* world.toolOn("kitchen-display", { forModel: "x", other: 1 })
         assert.strictEqual(plain.content, "{\"forModel\":\"x\",\"other\":1}")
       }))
@@ -364,10 +393,10 @@ export const presentContract = (name: string, open: OpenPresentStore) =>
       Effect.gen(function*() {
         const { world } = yield* start()
         const bad = yield* world.toolOn("kitchen-display", { forModel: "x", present: { kind: "card", title: "", spoken: "s" } })
-        assert.match(bad.content, /\[Screen: Not shown: the presentation was not valid \(title must be text\); say it instead\.\]$/)
+        assert.match(bad.content, /\[Screen: Not showing it: the presentation was not valid \(title must be text\)\.\]$/)
         for (let i = 0; i < MAX_LIVE_PER_MODULE; i++) yield* world.showOn("kitchen-display", card(`C${i}`), { lifetime: "pinned", expiresInMs: HOUR }, "board", { room: "Kitchen" }).pipe(Effect.ignore)
         const over = yield* world.toolOn("kitchen-display", { forModel: "x", present: card() })
-        assert.match(over.content, /Not shown: too much is on screen/)
+        assert.match(over.content, /Not showing it: too much is on screen \(.*\)\. Say this instead: Bins out\.\]$/)
       }))
 
     it.effect("every bound of a presentation is refused invalid", () =>
@@ -548,6 +577,8 @@ export const presentContract = (name: string, open: OpenPresentStore) =>
         yield* world.settle
         assert.deepStrictEqual(world.shownOn("robins-phone"), [])
         assert.deepStrictEqual(world.shownOn("kitchen-display").map((p) => p.id), [pinned.id])
+        // Its row is removed by maintenance, ten seconds later.
+        yield* world.advance(10 * SECOND)
         assert.deepStrictEqual((yield* world.rows).map((r) => r.id), [pinned.id])
         const exit = yield* Effect.exit(transient.dismiss)
         assert.isTrue(Exit.isFailure(exit) && isModuleStopped(Cause.squash(exit.cause)))
@@ -568,7 +599,8 @@ export const presentContract = (name: string, open: OpenPresentStore) =>
         assert.deepStrictEqual(onPhone.outcome.devices, [{ deviceId: "robins-phone", shown: true }])
         const onHall = yield* world.showOn("hall-screen", card("Dentist", robin))
         assert.deepStrictEqual(onHall.outcome.devices, [{ deviceId: "hall-screen", shown: false, why: "private" }])
-        assert.strictEqual(onHall.outcome.note, "Not shown: \"Hall screen\" may not show this person's things; say it instead.")
+        // After a privacy refusal the note carries nothing of the content (G6).
+        assert.strictEqual(onHall.outcome.note, "Not showing it: \"Hall screen\" may not show this person's things.")
         assert.deepStrictEqual(world.shownOn("hall-screen"), [])
         // The phone becomes shared with someone else as its default person: withdrawn from the page, not just not sent again.
         world.places.set("robins-phone", { privacy: "shared", defaultPerson: "p-sam" })
@@ -692,25 +724,298 @@ export const presentContract = (name: string, open: OpenPresentStore) =>
 
     // ---- Images
 
-    it.effect("an image is fetched once, off the turn's path: shown loading, then with its hash; a refusal shows it without the image", () =>
+    it.effect("an image is fetched once some page is to show it, off the turn's path: loading, then this page's own address; a refusal shows it without the image", () =>
       Effect.gen(function*() {
         const fetched: Array<string> = []
         const hash = "a".repeat(64)
         const { world } = yield* start({ media: (url) => Effect.sync(() => (fetched.push(url), url.endsWith("/no.png") ? { refused: "type" as const } : { hash })) })
         const image = (url: string): Presentation => ({ kind: "image", url, alt: "A heron", credit: "Wikimedia Commons, CC BY-SA", spoken: "A heron." })
+        const second = yield* world.open("kitchen-display")
         const h = yield* world.showOn("kitchen-display", image("https://example.org/heron.png"), { lifetime: "pinned", key: "pic" })
-        assert.strictEqual(h.outcome.note, "Shown on \"Kitchen display\". The image is being fetched; if it cannot be, it shows without it.")
+        assert.strictEqual(h.outcome.note, "Showing on \"Kitchen display\". Its image is being fetched; if that fails it shows without it.")
         const tab = world.firstTab("kitchen-display")!
-        const shows = tab.messages.filter((m) => m.type !== "present.dismiss").map((m) => (m.presentation.content as { image: unknown }).image)
-        assert.deepStrictEqual(shows, [{ state: "loading" }, { state: "ready", hash }])
-        assert.isTrue(world.present.holdsHash(hash))
-        // The same key and address again keeps what was fetched.
-        yield* world.showOn("kitchen-display", image("https://example.org/heron.png"), { lifetime: "pinned", key: "pic" })
+        const shows = tab.messages.filter((m) => m.type !== "present.dismiss").map((m) => (m.presentation.content as { image: { state: string; token?: string } }).image)
+        assert.deepStrictEqual(shows.map((x) => x.state), ["loading", "ready"])
+        // G9: each page is given an address of its own, never the hash; each serves only for its own connection.
+        const mine = shows[1]!.token!
+        const theirs = (world.holds(second).get(h.id)!.content as { image: { token?: string } }).image.token!
+        assert.match(mine, /^[A-Za-z0-9_-]{32}$/)
+        assert.notStrictEqual(mine, theirs)
+        assert.isFalse(JSON.stringify(tab.messages).includes(hash))
+        assert.strictEqual(world.present.mediaFor(mine), hash)
+        assert.strictEqual(world.present.mediaFor(theirs), hash)
+        assert.isUndefined(world.present.mediaFor("b".repeat(32)))
+        // A page that goes: its address stops working at once.
+        yield* world.close(second)
+        assert.isUndefined(world.present.mediaFor(theirs))
+        // The same key and address again keeps what was fetched; the earlier handle no longer acts on it (another show).
+        const again = yield* world.showOn("kitchen-display", image("https://example.org/heron.png"), { lifetime: "pinned", key: "pic" })
         assert.deepStrictEqual(fetched, ["https://example.org/heron.png"])
+        assert.isFalse(yield* h.dismiss)
         yield* world.showOn("robins-phone", image("https://example.org/no.png"))
         assert.deepStrictEqual((world.shownOn("robins-phone")[0]?.content as { image: unknown }).image, { state: "failed" })
-        assert.isTrue(yield* h.dismiss)
+        assert.isTrue(yield* again.dismiss)
         yield* world.settle
-        assert.isFalse(world.present.holdsHash(hash))
+        assert.isUndefined(world.present.mediaFor(mine))
+      }))
+
+    // ---- Review round 1: eligibility at once, removal following; reconciliation that withdraws first; writes derived
+    // inside their transaction; the whole collection at start; accepted work done or reported
+
+    const faultyStart = () =>
+      Effect.gen(function*() {
+        const opened = yield* open()
+        const faulty = presentFaultyStore(yield* prepared(opened.store))
+        const world = yield* presentWorld(faulty.store, { media: () => Effect.succeed({ hash: "c".repeat(64) }) })
+        yield* world.settle
+        return { opened, faulty, world }
+      })
+
+    it.effect("a1: personal content no longer allowed is withdrawn even when the read of another item fails in that pass", () =>
+      Effect.gen(function*() {
+        const { faulty, world } = yield* faultyStart()
+        const mine = yield* world.showOn("robins-phone", card("Dentist", { sensitivity: { personal: "p-robin" } } as Partial<Presentation>), { lifetime: "pinned" })
+        const other = yield* world.showOn("robins-phone", card("Bins"), { lifetime: "pinned" })
+        // The household card is changed (its content must be read again) while permission for the personal one is revoked.
+        yield* other.update(card("Bins, changed"))
+        world.places.set("robins-phone", { privacy: "shared", defaultPerson: "p-sam" })
+        faulty.faults.reads = 5
+        world.present.reconcile("robins-phone")
+        yield* world.settle
+        assert.deepStrictEqual(world.shownOn("robins-phone").map((p) => p.id), [other.id])
+        assert.isTrue(world.firstTab("robins-phone")!.messages.some((m) => m.type === "present.dismiss" && m.id === mine.id))
+      }))
+
+    it.effect("a2: an update that waited on a busy store does not overwrite the replacement shown meanwhile under the same key", () =>
+      Effect.gen(function*() {
+        const { faulty, world } = yield* faultyStart()
+        const h = yield* world.showOn("kitchen-display", card("Old"), { lifetime: "pinned", key: "same" })
+        const wait = yield* Deferred.make<void>()
+        faulty.gate.wait = wait
+        const updating = yield* Effect.forkChild(h.update(card("Old update")).pipe(Effect.provideService(CurrentTurn, turnOn("kitchen-display"))))
+        yield* Effect.yieldNow
+        // Meanwhile the module shows the same key as a list on another device.
+        const replaced = yield* world.showOn("robins-phone", checklist(), { lifetime: "pinned", key: "same" })
+        yield* Deferred.succeed(wait, undefined)
+        assert.isUndefined(yield* Fiber.join(updating))
+        yield* world.settle
+        assert.strictEqual(replaced.id, h.id)
+        const [row] = yield* world.rows
+        assert.strictEqual(row?.value.content.kind, "list")
+        assert.deepStrictEqual(row?.value.target, { device: "robins-phone" })
+        assert.deepStrictEqual(world.present.live().map((v) => [v.kind, v.target]), [["list", { device: "robins-phone" }]])
+        assert.deepStrictEqual(world.shownOn("kitchen-display"), [])
+        assert.strictEqual(world.shownOn("robins-phone")[0]?.content.kind, "list")
+      }))
+
+    it.effect("a3: start-up reads the whole collection: a live pinned row behind many ended rows is shown after a restart", () =>
+      Effect.gen(function*() {
+        const { world, opened } = yield* start()
+        for (let i = 0; i < 145; i++) {
+          yield* world.showOn("kitchen-display", card(`T${i}`))
+          yield* TestClock.adjust(1)
+        }
+        const pinned = yield* world.showOn("kitchen-display", card("Pinned"), { lifetime: "pinned" })
+        assert.isAbove((yield* world.rows).length, 130)
+        yield* world.stop
+        const store = yield* prepared(yield* opened.reopen)
+        const next = yield* presentWorld(store)
+        yield* next.settle
+        assert.isTrue(next.present.loaded())
+        assert.deepStrictEqual(next.shownOn("kitchen-display").map((p) => p.id), [pinned.id])
+        assert.deepStrictEqual((yield* next.rows).map((r) => r.id), [pinned.id])
+      }))
+
+    it.effect("a4: two accepted results for a new key share one stable id: one presentation, the later content", () =>
+      Effect.gen(function*() {
+        const { world } = yield* start()
+        const first = { forModel: "1", present: card("First"), show: { lifetime: "pinned" as const, key: "same" } }
+        const second = { forModel: "2", present: card("Second"), show: { lifetime: "pinned" as const, key: "same" } }
+        yield* world.toolOn("kitchen-display", first)
+        yield* world.toolOn("kitchen-display", second)
+        yield* world.settle
+        assert.strictEqual((yield* world.rows).length, 1)
+        assert.deepStrictEqual(world.shownOn("kitchen-display").map((p) => (p.content as { title: string }).title), ["Second"])
+      }))
+
+    it.effect("a5: a stopped part's transient and an ended one leave the pages at once although the store refuses their removal; removal follows when it can", () =>
+      Effect.gen(function*() {
+        const { faulty, world } = yield* faultyStart()
+        yield* world.showOn("robins-phone", card("Stops"), { expiresInMs: 5 * MINUTE })
+        yield* world.showOn("hall-screen", card("Ends"), { expiresInMs: 3 * SECOND })
+        faulty.faults.writes = 100
+        yield* world.advance(3 * SECOND)
+        assert.deepStrictEqual(world.shownOn("hall-screen"), [])
+        yield* world.host.disable("board")
+        yield* world.settle
+        assert.deepStrictEqual(world.shownOn("robins-phone"), [])
+        assert.strictEqual((yield* world.rows).length, 2)
+        faulty.faults.writes = 0
+        yield* world.advance(MINUTE)
+        assert.deepStrictEqual(yield* world.rows, [])
+      }))
+
+    it.effect("a6: an accepted result whose write fails is written again until it can be, and then shown (the note said \"Showing on\")", () =>
+      Effect.gen(function*() {
+        const { faulty, world } = yield* faultyStart()
+        faulty.faults.writes = 10
+        const out = yield* world.toolOn("kitchen-display", { forModel: "Result", present: card(), show: { lifetime: "pinned" } })
+        assert.strictEqual(out.content, "Result\n[Screen: Showing on \"Kitchen display\".]")
+        yield* world.advance(5 * SECOND)
+        assert.deepStrictEqual(world.shownOn("kitchen-display"), [])
+        assert.isTrue(world.issues.all().some((i) => i.id === "core.present.write"))
+        faulty.faults.writes = 0
+        yield* world.advance(MINUTE)
+        assert.deepStrictEqual(world.shownOn("kitchen-display").map((p) => (p.content as { title: string }).title), ["Bins out"])
+        assert.isFalse(world.issues.all().some((i) => i.id === "core.present.write"))
+      }))
+
+    it.effect("a6: an accepted transient that could not be written before its end is dropped, not shown late", () =>
+      Effect.gen(function*() {
+        const { faulty, world } = yield* faultyStart()
+        faulty.faults.writes = 1_000
+        yield* world.toolOn("kitchen-display", { forModel: "x", present: card(), show: { expiresInMs: 3 * SECOND } })
+        yield* world.advance(MINUTE)
+        faulty.faults.writes = 0
+        yield* world.advance(MINUTE)
+        assert.deepStrictEqual(world.shownOn("kitchen-display"), [])
+        assert.deepStrictEqual(yield* world.rows, [])
+      }))
+
+    it.effect("a7: an image whose outcome could not be written is written again", () =>
+      Effect.gen(function*() {
+        const opened = yield* open()
+        const faulty = presentFaultyStore(yield* prepared(opened.store))
+        let fetches = 0
+        const gate = yield* Deferred.make<void>()
+        const world = yield* presentWorld(faulty.store, { media: () => Effect.as(Effect.andThen(Effect.sync(() => fetches++), Deferred.await(gate)), { hash: "d".repeat(64) }) })
+        yield* world.settle
+        const image: Presentation = { kind: "image", url: "https://example.org/a.png", alt: "A", credit: "C", spoken: "A." }
+        const h = yield* world.showOn("kitchen-display", image, { lifetime: "pinned" })
+        assert.strictEqual(fetches, 1)
+        // The fetch completes while the store refuses the outcome's write.
+        faulty.faults.writes = 1
+        yield* Deferred.succeed(gate, undefined)
+        yield* world.settle
+        assert.strictEqual((world.shownOn("kitchen-display")[0]!.content as { image: { state: string } }).image.state, "loading")
+        yield* world.advance(MINUTE)
+        assert.strictEqual((world.shownOn("kitchen-display")[0]!.content as { image: { state: string } }).image.state, "ready")
+        assert.strictEqual(fetches, 1)
+        void h
+      }))
+
+    it.effect("a7: an image row left loading by a restart is fetched again and resolved", () =>
+      Effect.gen(function*() {
+        const { world, opened } = yield* start({ media: () => Effect.never })
+        yield* world.showOn("kitchen-display", { kind: "image", url: "https://example.org/a.png", alt: "A", credit: "C", spoken: "A." }, { lifetime: "pinned" })
+        yield* world.stop
+        const store = yield* prepared(yield* opened.reopen)
+        let fetches = 0
+        const next = yield* presentWorld(store, { media: () => Effect.sync(() => (fetches++, { refused: "fetch" as const })) })
+        yield* next.settle
+        assert.strictEqual(fetches, 1)
+        assert.deepStrictEqual((next.shownOn("kitchen-display")[0]!.content as { image: unknown }).image, { state: "failed" })
+      }))
+
+    it.effect("an image is not fetched while no device of its target would show it; it is when one does", () =>
+      Effect.gen(function*() {
+        let fetches = 0
+        const { world } = yield* start({ connected: ["kitchen-display"], media: () => Effect.sync(() => (fetches++, { hash: "f".repeat(64) })) })
+        const image: Presentation = { kind: "image", url: "https://example.org/a.png", alt: "A", credit: "C", spoken: "A." }
+        const offline = yield* world.showOn("hall-screen", image, { lifetime: "pinned" }, "board", { device: "hall-screen" })
+        assert.deepStrictEqual(offline.outcome.devices, [{ deviceId: "hall-screen", shown: false, why: "offline" }])
+        yield* world.showOn("office-speaker", image, { lifetime: "pinned" }, "board", { device: "office-speaker" })
+        yield* world.settle
+        assert.strictEqual(fetches, 0)
+        yield* world.open("hall-screen")
+        assert.strictEqual(fetches, 1)
+        assert.strictEqual((world.shownOn("hall-screen")[0]!.content as { image: { state: string } }).image.state, "ready")
+      }))
+
+    it.effect("a10: queued transients for one device that replace one another are counted once", () =>
+      Effect.gen(function*() {
+        const { world } = yield* start()
+        for (let i = 0; i < MAX_LIVE_PER_MODULE - 1; i++) yield* world.showOn("robins-phone", card(`P${i}`), { lifetime: "pinned" }, "board", { device: "robins-phone" })
+        const one = yield* world.toolOn("kitchen-display", { forModel: "1", present: card("One") })
+        const two = yield* world.toolOn("kitchen-display", { forModel: "2", present: card("Two") })
+        assert.match(one.content, /Showing on/)
+        assert.match(two.content, /Showing on/)
+        yield* world.settle
+        assert.deepStrictEqual(world.shownOn("kitchen-display").map((p) => (p.content as { title: string }).title), ["Two"])
+      }))
+
+    it.effect("a11: removal of ended rows that fails is tried again until it succeeds", () =>
+      Effect.gen(function*() {
+        const { faulty, world } = yield* faultyStart()
+        const h = yield* world.showOn("kitchen-display", card(), { lifetime: "pinned" })
+        assert.isTrue(yield* h.dismiss)
+        faulty.faults.writes = 1
+        yield* world.advance(10 * SECOND)
+        assert.strictEqual((yield* world.rows).length, 1)
+        yield* world.advance(2 * MINUTE)
+        assert.deepStrictEqual(yield* world.rows, [])
+      }))
+
+    it.effect("a12: the whole note stays within its maximum, image sentence and spoken fallback included", () =>
+      Effect.gen(function*() {
+        const long = (i: number) => contractDevice(`room-device-${String(i).padStart(2, "0")}`, `${"N".repeat(38)}${i}`, "Lounge", "shared", null)
+        const devices = [...Array.from({ length: 12 }, (_, i) => long(i)), contractDevice("speaker-in-lounge", "S".repeat(40), "Lounge", "shared", null)]
+        const opened = yield* open()
+        const store = yield* prepared(opened.store)
+        const outputs = new Map(devices.map((d, i) => [d.id, i % 2 === 0 && i < 12 ? SCREEN : SPEAKER] as const))
+        const world = yield* presentWorld(store, { devices, outputs })
+        yield* world.settle
+        const h = yield* world.showOn("speaker-in-lounge", { kind: "image", url: "https://example.org/a.png", alt: "A", credit: "C", spoken: "\"".repeat(300) }, { lifetime: "pinned" }, "board", { room: "Lounge" })
+        assert.isAtMost(h.outcome.note.length, MAX_NOTE_CHARS)
+        assert.isTrue(h.outcome.note.endsWith(IMAGE_SENTENCE))
+        assert.include(h.outcome.note, SPOKEN_PREFIX)
+      }))
+
+    it.effect("G11: what a connection is sent is limited to the kinds its own page declared: an older tab beside a newer one gets none", () =>
+      Effect.gen(function*() {
+        const { world } = yield* start({ connected: [] })
+        const old = yield* world.open("kitchen-display", { kinds: undefined })
+        const modern = yield* world.open("kitchen-display", { kinds: { ...PRESENT_KIND_VERSIONS } })
+        const cardsOnly = yield* world.open("kitchen-display", { kinds: { card: 1 } })
+        yield* world.showOn("kitchen-display", checklist(), { lifetime: "pinned" })
+        yield* world.showOn("kitchen-display", card(), { lifetime: "pinned" })
+        assert.deepStrictEqual(old.messages, [])
+        assert.deepStrictEqual([...world.holds(modern).values()].map((p) => p.content.kind).sort(), ["card", "list"])
+        assert.deepStrictEqual([...world.holds(cardsOnly).values()].map((p) => p.content.kind), ["card"])
+        // A press from a tab that was not sent it is refused.
+        const list = [...world.holds(modern).values()].find((p) => p.content.kind === "list")!
+        assert.strictEqual((yield* world.pressOn("kitchen-display", list.id, "clear", {}, old)).code, "unknown")
+      }))
+
+    it.effect("until everything stored has been read nothing is claimed: a show is refused busy, a page is sent nothing", () =>
+      Effect.gen(function*() {
+        const opened = yield* open()
+        const faulty = presentFaultyStore(yield* prepared(opened.store))
+        const world = yield* presentWorld(faulty.store)
+        yield* world.settle
+        const h = yield* world.showOn("kitchen-display", card(), { lifetime: "pinned" })
+        yield* world.stop
+        // The start-up read fails: not loaded; shows are refused; pages are sent nothing; a minute later it is read.
+        const reads = faulty.store.forCore
+        let failing = true
+        const broken: HouseholdStore = {
+          ...faulty.store,
+          forCore: (owner) => {
+            const c = reads(owner)
+            return owner !== PRESENT_OWNER ? c : { ...c, collection: ((col: never) => {
+              const handle = c.collection(col)
+              return { ...handle, list: (q: never) => (failing ? Effect.fail(new StoreError({ reason: "failed", message: "injected" })) : handle.list(q)) }
+            }) as never }
+          }
+        }
+        const next = yield* presentWorld(broken)
+        yield* next.settle
+        assert.isFalse(next.present.loaded())
+        assert.strictEqual(reasonOf(yield* Effect.exit(next.showOn("kitchen-display", card("Later")))), "busy")
+        assert.deepStrictEqual(next.firstTab("kitchen-display")!.messages, [])
+        failing = false
+        yield* next.advance(MINUTE)
+        assert.isTrue(next.present.loaded())
+        assert.deepStrictEqual(next.shownOn("kitchen-display").map((p) => p.id), [h.id])
       }))
   })

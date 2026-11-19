@@ -121,7 +121,7 @@ function PresentationCard({ p }: { readonly p: HeldPresentation }) {
                 data-action={b.id}
                 disabled={!p.interactive || pending.has(b.id)}
                 onClick={() => press(b.id, { action: b.id })}
-                className="inline-flex min-h-11 items-center rounded-md border border-line bg-surface px-4 text-[14px] text-ink hover:bg-surface-2 disabled:opacity-50"
+                className="inline-flex min-h-11 max-w-full items-center whitespace-normal rounded-md border border-line bg-surface px-4 py-1 text-left text-[14px] text-ink [overflow-wrap:anywhere] hover:bg-surface-2 disabled:opacity-50"
               >
                 {b.label}
               </button>
@@ -186,12 +186,12 @@ function Content(props: { readonly p: HeldPresentation; readonly pending: Readon
         </div>
       )
     case "timer":
-      return <TimerView label={c.label} endsAt={c.endsAt} clockOffset={props.p.clockOffset} done={props.p.texts.timerDone} />
+      return <TimerView label={c.label} endsAt={c.endsAt} serverNow={props.p.serverNow} receivedMono={props.p.receivedMono} done={props.p.texts.timerDone} />
     case "image":
       return (
         <figure className="flex flex-col gap-1">
           {c.image.state === "ready"
-            ? <img src={`/media/${c.image.hash}`} alt={c.alt} decoding="async" className="max-h-[32dvh] w-full rounded-md object-contain" />
+            ? <ReadyImage key={c.image.token} token={c.image.token} alt={c.alt} missing={props.p.texts.imageMissing} />
             : <p className="text-[14px] text-ink-faint" data-testid="image-state">{c.image.state === "loading" ? props.p.texts.loading : props.p.texts.imageMissing}</p>}
           <figcaption className="text-[13px] text-ink-muted">
             {c.caption !== undefined ? <span className="block [overflow-wrap:anywhere]">{c.caption}</span> : null}
@@ -205,14 +205,14 @@ function Content(props: { readonly p: HeldPresentation; readonly pending: Readon
           <h2 className="text-[15px] font-medium [overflow-wrap:anywhere]">{c.place}</h2>
           <div className="mt-1 flex items-center gap-3">
             <WeatherSymbol icon={c.now.icon} size={36} />
-            <span className="text-[28px] leading-none tabular-nums">{c.now.temperature}</span>
+            <span className="min-w-0 text-[28px] leading-none tabular-nums [overflow-wrap:anywhere]">{c.now.temperature}</span>
             <span className="min-w-0 text-[14px] text-ink-muted [overflow-wrap:anywhere]">{c.now.condition}</span>
           </div>
           {c.days.length > 0
             ? (
-              <ul className="mt-2 grid grid-cols-[repeat(auto-fit,minmax(56px,1fr))] gap-2 text-center text-[13px]">
+              <ul className="mt-2 grid grid-cols-[repeat(auto-fit,minmax(48px,1fr))] gap-2 text-center text-[13px]">
                 {c.days.map((d, i) => (
-                  <li key={i} className="flex flex-col items-center gap-0.5">
+                  <li key={i} className="flex min-w-0 flex-col items-center gap-0.5 [overflow-wrap:anywhere]">
                     <span className="text-ink-faint [overflow-wrap:anywhere]">{d.label}</span>
                     <WeatherSymbol icon={d.icon} size={22} />
                     <span className="tabular-nums"><span className="sr-only">{props.p.texts.high} </span>{d.high}</span>
@@ -227,15 +227,23 @@ function Content(props: { readonly p: HeldPresentation; readonly pending: Readon
   }
 }
 
+/** This page's own image address; one the browser could not load shows the server's sentence for a missing image. */
+function ReadyImage(props: { readonly token: string; readonly alt: string; readonly missing: string }) {
+  const [failed, setFailed] = useState(false)
+  if (failed) return <p className="text-[14px] text-ink-faint" data-testid="image-state">{props.missing}</p>
+  return <img src={`/media/${props.token}`} alt={props.alt} decoding="async" onError={() => setFailed(true)} className="max-h-[32dvh] w-full rounded-md object-contain" />
+}
+
 /** A countdown to the server's instant, on this page's clock corrected by the offset taken when it arrived. */
-function TimerView(props: { readonly label: string; readonly endsAt: number; readonly clockOffset: number; readonly done: string }) {
-  const [now, setNow] = useState(() => pageClock.now())
-  const left = remainingMs(props.endsAt, props.clockOffset, now)
+function TimerView(props: { readonly label: string; readonly endsAt: number; readonly serverNow: number; readonly receivedMono: number; readonly done: string }) {
+  const [mono, setMono] = useState(() => pageClock.mono())
+  const left = remainingMs(props.endsAt, props.serverNow, props.receivedMono, mono)
+  // Ticks on the monotonic clock until it is over by that clock (a jump of the wall clock neither ends nor freezes it).
   useEffect(() => {
     if (left <= 0) return
-    const t = setInterval(() => setNow(pageClock.now()), 250)
+    const t = setInterval(() => setMono(pageClock.mono()), 250)
     return () => clearInterval(t)
-  }, [left <= 0])
+  }, [left <= 0, props.receivedMono])
   return (
     <div className="flex items-baseline justify-between gap-3">
       <h2 className="min-w-0 text-[15px] font-medium [overflow-wrap:anywhere]">{props.label}</h2>
