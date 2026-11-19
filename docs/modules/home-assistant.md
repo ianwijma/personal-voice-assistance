@@ -205,7 +205,7 @@ for the status questions.
 - **The list is the answer's snapshot.** It names exactly the devices the sentence names, in its order (the house's), with
   the same shortened names (40 characters), the same "and 12 more" and the same notes. It is not updated when the house
   changes; it ends by its lifetime (30 seconds) or when the next presentation on that device replaces it. Nothing in the
-  module follows the house or keeps a handle, and the status questions never touch a screen. With nothing named (nothing
+  module follows the house or keeps a handle, and the status questions (`lights_status`, `climate_status`, `locks_status`, `home_state`, which may run before their turn is committed) never touch a screen. The action is not speculative, and its list travels with its result: it is shown when the turn is promoted and dropped when the turn is discarded. With nothing named (nothing
   on, or only a count would fit) no list is shown.
 - **Only what is known.** "On in Living room: Ceiling." A device that is unavailable or unknown is counted, never called
   off ("2 devices could not be read."); nothing on is "Nothing is on in Living room." only when every device was read, else
