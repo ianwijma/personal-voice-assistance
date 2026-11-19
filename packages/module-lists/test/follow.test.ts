@@ -399,6 +399,7 @@ describe("the checklist", () => {
       assert.isFalse(refused.ok)
       assert.strictEqual(refused.message, "There isn't room to show this list right now; close something on a screen first.")
       assert.deepStrictEqual(kit.present.shown("screen-9"), [])
+      yield* kit.present.settle // Refusal rollback is worker work.
       assert.strictEqual((yield* kit.moduleStore().collection(pins).list({})).length, 8)
     }))
 })

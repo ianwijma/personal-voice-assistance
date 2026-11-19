@@ -333,6 +333,7 @@ describe("correctness review round 1", () => {
       const response = yield* kit.action("show", {})
       assert.isFalse(response.ok)
       assert.strictEqual("message" in response ? response.message : undefined, language === "en" ? "There isn't room to show this list right now; close something on a screen first." : "Er is nu geen ruimte om deze lijst te tonen; sluit eerst iets op een scherm.")
+      yield* kit.present.settle
       assert.deepStrictEqual(yield* rows(kit), [])
     }))
   }
@@ -373,8 +374,7 @@ describe("correctness review round 2", () => {
       if (operation === "refused replacement") {
         refuse = true
         assert.isFalse((yield* kit.action("show", {})).ok)
-        // Rewriting the old row must not turn its cancelled intent into a newer live pin.
-        assert.strictEqual((yield* rows(kit))[0]!.value.owed, "dismiss")
+        // Rollback is worker work: after releasing its lookup below, the cancelled old pin must stay down.
       } else {
         assert.deepStrictEqual(yield* kit.present.press(card.id, "tick", { item: id, done: true }), { ok: true, say: operation === "press without undo" ? "That isn't on the list any more." : "That list isn't shown here any more." })
       }
@@ -803,4 +803,153 @@ describe("correctness review round 5", () => {
       assert.strictEqual(kit.present.engine.live().length, supported ? 1 : 0)
     }))
   }
+})
+
+describe("correctness review round 6", () => {
+  for (const replacement of [false, true]) {
+    it.effect(`1: a refused ${replacement ? "replacement" : "first show"} answers while rollback is held and never retries the refused list`, () => Effect.gen(function*() {
+      const entered = yield* Deferred.make<void>()
+      const release = yield* Deferred.make<void>()
+      let refuse = false
+      let refused = false
+      let held = false
+      const kit = yield* startTestModule(wrap((ctx) => ({ ...ctx,
+        present: { ...ctx.present, show: (...a: ReadonlyArray<unknown>) => Effect.suspend(() => {
+          if (!refuse) return ctx.present.show(...a)
+          refuse = false
+          refused = true
+          return Effect.fail(new PresentError({ reason: "limit", message: "capacity refusal" }))
+        }) },
+        store: { ...ctx.store, transaction: (body: (tx: StoreTx) => unknown) => Effect.suspend(() => {
+          if (!refused || held) return ctx.store.transaction(body)
+          held = true
+          return Effect.andThen(Deferred.succeed(entered, undefined), Effect.andThen(Deferred.await(release), ctx.store.transaction(body)))
+        }) }
+      })))
+      yield* kit.action("add", { items: "milk" })
+      yield* kit.tool("lists_create", { name: "camping", items: "tent" })
+      if (replacement) {
+        yield* kit.action("show", {})
+        yield* kit.present.settle
+      }
+      refuse = true
+      const pending = yield* Effect.forkScoped(kit.action("show", replacement ? { list: "camping" } : {}))
+      yield* Deferred.await(entered)
+      yield* TestClock.adjust(5_001)
+      const answer = yield* Fiber.join(pending)
+      yield* Deferred.succeed(release, undefined)
+      yield* kit.present.settle
+      yield* kit.action("add", { items: "eggs" })
+      yield* kit.advance(65_000)
+      assert.deepStrictEqual(answer, { ok: false, code: "failed", message: "There isn't room to show this list right now; close something on a screen first." })
+      assert.deepStrictEqual(screen(kit), replacement ? ["milk", "eggs"] : undefined)
+      assert.deepStrictEqual((yield* rows(kit)).map((r) => r.value.list), replacement ? ["shopping"] : [])
+      if (replacement) assert.deepStrictEqual(yield* kit.action("hide", { list: "shopping" }), { ok: true, say: "Closed the shopping list on this screen." })
+    }))
+  }
+
+  for (const path of ["initial", "refresh"] as const) {
+    it.effect(`2: ${path} unsupported dismissal is durable before the screen closes and survives restart before row removal`, () => Effect.gen(function*() {
+      const entered = yield* Deferred.make<void>()
+      const release = yield* Deferred.make<void>()
+      const kinds: Record<string, number> = { ...KIT_PAGE_CAPABILITIES.present!.kinds }
+      const capabilities = { ...structuredClone(KIT_PAGE_CAPABILITIES), present: { ...KIT_PAGE_CAPABILITIES.present!, kinds } }
+      const support = kinds.list!
+      let dismissed = false
+      let held = false
+      const kit = yield* startTestModule(wrap((ctx) => ({ ...ctx,
+        present: { ...ctx.present, show: (...a: ReadonlyArray<unknown>) => ctx.present.show(...a).pipe(Effect.map((h: { dismiss: Effect.Effect<boolean, PresentError> }) => ({ ...h,
+          dismiss: h.dismiss.pipe(Effect.tap((down) => Effect.sync(() => { if (down) dismissed = true })))
+        }))) },
+        store: { ...ctx.store, transaction: (body: (tx: StoreTx) => unknown) => Effect.suspend(() => {
+          if (!dismissed || held) return ctx.store.transaction(body)
+          held = true
+          return Effect.andThen(Deferred.succeed(entered, undefined), Effect.andThen(Deferred.await(release), ctx.store.transaction(body)))
+        }) }
+      })), { household: { devices: [{ id: "kitchen-display", name: "Kitchen", capabilities }] } })
+      yield* kit.action("add", { items: "milk" })
+      if (path === "refresh") {
+        yield* kit.action("show", {})
+        yield* kit.present.settle
+      }
+      delete kinds.list
+      if (path === "initial") yield* kit.action("show", {})
+      else yield* kit.action("add", { items: "eggs" })
+      yield* Deferred.await(entered)
+      const owed = (yield* rows(kit))[0]!.value.owed
+      const live = kit.present.engine.live().length
+      yield* kit.stop
+      kinds.list = support
+      yield* kit.notify.disconnect("kitchen-display")
+      yield* kit.notify.connect("kitchen-display")
+      yield* kit.start
+      yield* Deferred.succeed(release, undefined)
+      yield* kit.advance(65_000)
+      assert.strictEqual(live, 0)
+      assert.strictEqual(owed, "dismiss")
+      assert.isUndefined(screen(kit))
+      assert.deepStrictEqual(yield* rows(kit), [])
+    }))
+  }
+
+  it.effect("3: a false handle dismissal answers before the worker reads the fallback title", () => Effect.gen(function*() {
+    const entered = yield* Deferred.make<void>()
+    const release = yield* Deferred.make<void>()
+    let answered = false
+    let held = false
+    const kit = yield* startTestModule(wrap((ctx) => ({ ...ctx,
+      present: { ...ctx.present, show: (...a: ReadonlyArray<unknown>) => ctx.present.show(...a).pipe(Effect.map((h: { dismiss: unknown }) => ({ ...h,
+        dismiss: Effect.sync(() => { answered = true; return false })
+      }))) },
+      store: { ...ctx.store, collection: (c: { name: string }) => {
+        const h = ctx.store.collection(c)
+        return c.name !== "lists" ? h : { ...h, get: (...a: ReadonlyArray<unknown>) => Effect.suspend(() => {
+          if (!answered || held) return h.get(...a)
+          held = true
+          return Effect.andThen(Deferred.succeed(entered, undefined), Effect.andThen(Deferred.await(release), h.get(...a)))
+        }) }
+      } }
+    })))
+    yield* kit.action("show", {})
+    yield* kit.present.settle
+    const pending = yield* Effect.forkScoped(kit.action("hide", {}))
+    yield* Deferred.await(entered)
+    yield* TestClock.adjust(5_001)
+    const answer = yield* Fiber.join(pending)
+    yield* Deferred.succeed(release, undefined)
+    yield* kit.advance(65_000)
+    assert.deepStrictEqual(answer, { ok: true, say: "I'll take the shopping list off this screen as soon as I can." })
+    assert.isUndefined(screen(kit))
+    assert.deepStrictEqual(yield* rows(kit), [])
+  }))
+
+  it.effect("3: hide answers confirmed closure while row removal is held", () => Effect.gen(function*() {
+    const entered = yield* Deferred.make<void>()
+    const release = yield* Deferred.make<void>()
+    let dismissed = false
+    let held = false
+    const kit = yield* startTestModule(wrap((ctx) => ({ ...ctx,
+      present: { ...ctx.present, show: (...a: ReadonlyArray<unknown>) => ctx.present.show(...a).pipe(Effect.map((h: { dismiss: Effect.Effect<boolean, PresentError> }) => ({ ...h,
+        dismiss: h.dismiss.pipe(Effect.tap((down) => Effect.sync(() => { if (down) dismissed = true })))
+      }))) },
+      store: { ...ctx.store, transaction: (body: (tx: StoreTx) => unknown) => Effect.suspend(() => {
+        if (!dismissed || held) return ctx.store.transaction(body)
+        held = true
+        return Effect.andThen(Deferred.succeed(entered, undefined), Effect.andThen(Deferred.await(release), ctx.store.transaction(body)))
+      }) }
+    })))
+    yield* kit.action("show", {})
+    yield* kit.present.settle
+    const pending = yield* Effect.forkScoped(kit.action("hide", {}))
+    yield* Deferred.await(entered)
+    const owed = (yield* rows(kit))[0]!.value.owed
+    yield* TestClock.adjust(5_001)
+    const answer = yield* Fiber.join(pending)
+    yield* Deferred.succeed(release, undefined)
+    yield* kit.advance(65_000)
+    assert.deepStrictEqual(answer, { ok: true, say: "Closed what I showed on this screen." })
+    assert.strictEqual(owed, "dismiss")
+    assert.isUndefined(screen(kit))
+    assert.deepStrictEqual(yield* rows(kit), [])
+  }))
 })

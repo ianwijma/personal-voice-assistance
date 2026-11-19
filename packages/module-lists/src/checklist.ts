@@ -114,6 +114,11 @@ export const makeChecklists = (ctx: {
     const handles = new Map<string, { readonly handle: PresentHandle; readonly shown: string; readonly until: number; readonly closing?: boolean }>()
     /** Devices whose checklist this run took down while its row is still there (the row is removed next). */
     const dismissed = new Set<string>()
+    /** Presenter refusals leave the old screen in place. The worker rolls back the recorded show intent. */
+    const refused = new Map<string, Row<Pin> | undefined>()
+    const readPin = (device: string) => Effect.suspend(() => refused.has(device)
+      ? Effect.succeed(refused.get(device))
+      : pinStore.get(pinIdOf(device)))
 
     const readItemsFor = (assistantId: string | undefined) => ctx.settingsFor(assistantId)?.readItems ?? 5
 
@@ -242,7 +247,7 @@ export const makeChecklists = (ctx: {
       Effect.gen(function*() {
         // Retain the close intent with the handle before writing: a failed write must never retry this as a show.
         handles.set(pin.device, { handle, shown: pin.shown ?? "", until: pin.until, closing: true })
-        yield* Effect.exit(write({ device: pin.device, list: pin.list, key: pin.key, until: pin.until, ...(pin.shown !== undefined ? { shown: pin.shown } : {}), owed: "dismiss" }))
+        yield* write({ device: pin.device, list: pin.list, key: pin.key, until: pin.until, ...(pin.shown !== undefined ? { shown: pin.shown } : {}), owed: "dismiss" })
       })
 
     /**
@@ -262,6 +267,20 @@ export const makeChecklists = (ctx: {
     const reconcileLocked = (device: string): Effect.Effect<Reconciled, StoreFailure> =>
       Effect.gen(function*() {
         let now = yield* Clock.currentTimeMillis
+        if (refused.has(device)) {
+          const before = refused.get(device)
+          yield* engine.rawStore.transaction((tx) => {
+            const c = tx.collection(pins)
+            const id = pinIdOf(device)
+            if (before === undefined) c.remove(id)
+            else {
+              const list = tx.collection(lists).get(before.value.list)
+              // The original revision, not the rollback's newer one, decides whether deletion cancelled this pin.
+              c.update(id, () => cancelled(before, list?.value.pinsCancelledThrough) ? { ...before.value, owed: "dismiss" } : before.value)
+            }
+            tx.afterCommit(() => refused.delete(device))
+          })
+        }
         const row = yield* pinStore.get(pinIdOf(device))
         if (row === undefined) {
           handles.delete(device)
@@ -275,6 +294,10 @@ export const makeChecklists = (ctx: {
         const built = cancelled(row, content?.cancelledThrough) ? undefined : content
         now = yield* Clock.currentTimeMillis
         if (built === undefined || now >= pin.until) {
+          if ((handles.has(device) || now < pin.until) && pin.owed !== "dismiss") {
+            yield* write({ ...pin, owed: "dismiss" })
+            return yield* reconcileLocked(device)
+          }
           if ((handles.has(device) || now < pin.until) && !(yield* takeDown(pin, l))) return { next: yield* owe(row, "dismiss", now), down: false }
           dismissed.add(device)
           handles.delete(device)
@@ -424,7 +447,7 @@ export const makeChecklists = (ctx: {
     const press = (p: PresentPress): Effect.Effect<{ readonly say: string }, StoreFailure> =>
       Effect.gen(function*() {
         const l = lang()
-        const row = yield* pinStore.get(pinIdOf(p.deviceId))
+        const row = yield* readPin(p.deviceId)
         const pin = row?.value
         if (row === undefined || pin === undefined || pin.key !== p.key || pin.owed === "dismiss" || pin.owed === "remove" || p.item === undefined) return { say: speak(l, "pinGone") }
         const list = yield* engine.listStore.get(pin.list)
@@ -463,7 +486,7 @@ export const makeChecklists = (ctx: {
           if (device === undefined) return { kind: "no-device" } as const
           const now = yield* Clock.currentTimeMillis
           const l = lang()
-          const before = yield* pinStore.get(pinIdOf(device))
+          const before = yield* readPin(device)
           const built = yield* build(list, l, readItems)
           if (built === undefined) return { kind: "gone" } as const
           const key = pinKeyOf(device)
@@ -475,6 +498,7 @@ export const makeChecklists = (ctx: {
           const previousHandle = handles.get(device)
           const wasDismissed = dismissed.has(device)
           const kept = yield* Effect.exit(write(recorded, () => {
+            refused.delete(device)
             handles.delete(device)
             dismissed.delete(device)
           }))
@@ -482,26 +506,11 @@ export const makeChecklists = (ctx: {
           const r = yield* put(device, key, built, until)
           if (r.kind === "ended") return { kind: "failed" } as const
           if (r.kind === "error") {
-            // Refused, so the screen is as it was: the row goes back to what it was (none: removed), or is tried again later.
-            const back = yield* Effect.exit(engine.rawStore.transaction((tx) => {
-              const c = tx.collection(pins)
-              const id = pinIdOf(device)
-              if (before === undefined) c.remove(id)
-              else {
-                const list = tx.collection(lists).get(before.value.list)
-                // Compare the old revision before restoring: the write's newer revision must not revive cancelled intent.
-                c.update(id, () => cancelled(before, list?.value.pinsCancelledThrough) ? { ...before.value, owed: "dismiss" } : before.value)
-              }
-              tx.afterCommit(() => {
-                if (previousHandle !== undefined) handles.set(device, previousHandle)
-                if (wasDismissed) dismissed.add(device)
-                ask(device)
-              })
-            }))
-            if (Exit.isFailure(back)) {
-              due.set(device, now + retryIn(1))
-              poke()
-            }
+            // The screen is unchanged. Keep its logical pin/handle now; the worker alone awaits rollback.
+            refused.set(device, before)
+            if (previousHandle !== undefined) handles.set(device, previousHandle)
+            if (wasDismissed) dismissed.add(device)
+            ask(device)
             return r.reason === "limit" ? ({ kind: "limit" } as const) : ({ kind: "failed" } as const)
           }
           const spoken = built.presentation.spoken
@@ -529,15 +538,20 @@ export const makeChecklists = (ctx: {
           const device = yield* turnDevice
           if (device === undefined) return { kind: "no-device" } as const
           const now = yield* Clock.currentTimeMillis
-          const row = yield* pinStore.get(pinIdOf(device))
+          const row = yield* readPin(device)
           const pin = row?.value
           if (row === undefined || pin === undefined || pin.owed === "remove" || dismissed.has(device) || now >= pin.until) return { kind: "none" } as const
           if (list !== undefined && pin.list !== list) return { kind: "none" } as const
-          yield* write({ device, list: pin.list, key: pin.key, until: pin.until, ...(pin.shown !== undefined ? { shown: pin.shown } : {}), owed: "dismiss" }, () => {})
-          const done = yield* Effect.exit(reconcileLocked(device))
-          settled(device, done, now)
-          poke()
-          return { kind: Exit.isSuccess(done) && done.value.down ? "closed" : "later", list: pin.list } as const
+          yield* write({ device, list: pin.list, key: pin.key, until: pin.until, ...(pin.shown !== undefined ? { shown: pin.shown } : {}), owed: "dismiss" }, () => { refused.delete(device) })
+          const handle = handles.get(device)
+          const done = yield* Effect.exit(handle === undefined ? takeDown(pin, lang())
+            : Effect.map(tried(handle.handle.dismiss), (r) => "ok" in r && r.ok))
+          if (Exit.isSuccess(done) && done.value) {
+            dismissed.add(device)
+            handles.delete(device)
+          }
+          // The committed dismissal already woke the worker; row removal and retries cannot delay this answer.
+          return { kind: Exit.isSuccess(done) && done.value ? "closed" : "later", list: pin.list } as const
         })),
       /** The lists a committed transaction wrote: their pins are reconciled at once. */
       changed: (touched: ReadonlySet<string>) => {

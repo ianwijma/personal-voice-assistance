@@ -105,6 +105,7 @@ describe("one pin per device, found by its id (finding 1)", () => {
         const hidden = yield* kit.action("hide", { list: name }, { device: "kitchen-display" })
         // Taken down (the row's removal is owed, not the close): the answer says what happened.
         assert.deepStrictEqual(hidden, { ok: true, say: `Closed the ${name} list on this screen.` }, name)
+        yield* kit.present.settle // The worker records the failed removal after hide has answered.
         // One row per device, however many removals failed; the kitchen display's says it is to be removed.
         const rows = yield* pinRows(kit)
         assert.deepStrictEqual(rows.map((r) => [r.value.device, r.value.owed]).sort(), [["hall-screen", undefined], ["kitchen-display", "remove"]], name)

@@ -163,9 +163,9 @@ stand in for a name:
   says "This device can't show it." and then the read-out sentence of the list ("The shopping list has 3 things: …",
   which is also the presentation's spoken fallback). Its accepted presentation (including any earlier checklist
   replaced under its key) is dismissed; the handle and dismissal work stay in the pin until that succeeds, then the pin
-  is removed. If saving dismissal work fails, the accepted handle closes the presentation and reconciliation removes
-  the remaining row; the answer still gives the readout. A failed dismissal is retried by reconciliation and can also
-  be closed with `lists_hide`. The spoken
+  is removed. The worker saves dismissal work before closing the accepted handle; if that write fails it retains the
+  handle and retries the write before dismissal, while the answer still gives the readout. A failed dismissal is retried
+  by reconciliation and can also be closed with `lists_hide`. The spoken
   sentence is at most 300 characters: it uses whole item names, within `readItems`, and counts the items left out;
   the separate 80-character visual limit does not shorten speech. If no whole item fits, the sentence says how many were not read out. The model's tool says the same.
 - **Privacy.** A list is household data, read out on shared, private and public devices alike, so its presentation is
@@ -180,8 +180,11 @@ stand in for a name:
   content with its new end, is recorded as owed first and cleared after the show), so an interruption or a restart
   leaves work that reconciliation finishes, and a checklist is never on a screen without a row. A show or hide asks
   the worker from its intent transaction's `afterCommit`, even if the caller is interrupted. Once the Presenter
-  accepts a show, its answer does not wait for the worker to clear the owed work. Committing a replacement also
-  invalidates the old handle and any old dismissal marker.
+  answers a show or a close, the request returns its sentence without waiting for bookkeeping: the worker clears a
+  successful show's owed work, rolls back a refused show's intent, or removes a dismissed pin. Until rollback commits,
+  requests use the previous pin and handle; a refused first show has no previous pin. Every worker dismissal is recorded
+  as owed before the screen is touched. Committing a replacement also invalidates the old handle and any old dismissal
+  marker.
 - **When the list changes.** Every committed change of the module's lists (a voice add or tick, a tool,
   `lists_update`, undo, the `Lists` service, the daily clean-up, deleting the list) names the lists it wrote from the
   committing transaction's `afterCommit`, even if its caller has gone away; their
@@ -195,8 +198,8 @@ stand in for a name:
   later try for that pin alone (5 s, 20 s, 80 s, 320 s, then every 10 minutes). A new change of the pin's list asks
   for another try at once. After a failed read, the next change to any checklist can reach its screen up to five
   seconds late. A checklist that was taken down while its row could not be removed leaves the row saying so, and
-  the next try removes it: rows never pile up. If the Presenter refuses a replacement and restoring the previous pin
-  also fails, the replacement can still be shown on a retry; it then follows the ordinary close and expiry rules.
+  the next try removes it: rows never pile up. A refused show followed by a module restart before its rollback commits
+  can still show the recorded intent; it then follows the ordinary close and expiry rules.
 - **When a device is offline.** A change while the device's page is disconnected is still a success: the host keeps
   the pinned presentation, updated, and gives it back when the page reconnects (docs/PRESENTING.md); the pin stays.
   Showing a list on a device that is offline at that moment keeps the pin too, and answers "I can't show it here right
@@ -209,7 +212,8 @@ stand in for a name:
   down; with a list named, only when that is the list shown ("The shopping list isn't on this screen." otherwise);
   without one, whatever list it is ("Closed what I showed on this screen."). The list itself is not changed. The close is
   first recorded in the row, then done; if the host is busy it is tried again until done, and the answer says "I'll
-  take the shopping list off this screen as soon as I can." A close is a close until the checklist's actual end, also
+  take the shopping list off this screen as soon as I can." A handle that no longer closes the current card also leaves
+  the fallback close to the worker and answers with that sentence. A close is a close until the checklist's actual end, also
   in its last seconds. If the list is gone (for example its creation was undone), the answer says "That list is gone."
   / "Die lijst bestaat niet meer."; a closing card uses a generic localized title and the same sentence when the list's row
   is absent, while a deleted list retained for undo keeps its name and says "The camping list isn't shown any more."
