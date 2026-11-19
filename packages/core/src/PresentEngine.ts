@@ -154,8 +154,12 @@ export interface PresentEngineOptions {
   readonly scheduler: SchedulerEngine
   /** The known devices (`Devices.list`): names, rooms. */
   readonly devices: () => ReadonlyArray<KnownDevice>
-  /** A device's presentation outputs now (serve mode: `DeviceFacts.presentOf`, from `devicePresentFrom`). */
-  readonly outputs: (device: KnownDevice) => DevicePresentOutputs
+  /**
+   * A device's presentation outputs now (serve mode: `DeviceFacts.presentOf`, from `devicePresentFrom`): its display and
+   * the owner's overrides, with the kinds of `declared` (one connection's own page, G11) when it is given, else of the
+   * device's latest declaration.
+   */
+  readonly outputs: (device: KnownDevice, declared?: Readonly<Record<string, number>>) => DevicePresentOutputs
   /** The privacy rule, asked at each decision for the device that would show it. */
   readonly privacy: PrivacyService
   /** Late-bound: the voice pages (the hub). Absent: nobody is connected. */
@@ -518,21 +522,30 @@ export const makePresentEngine = (options: PresentEngineOptions): Effect.Effect<
     }
 
     /** THE decision for one presentation on one device, now: the privacy rule asked for that device at this moment. */
-    const decide = (e: Pick<Entry, "id" | "kind" | "owner">, d: KnownDevice, connected: boolean): PresentDecision => {
+    const decide = (e: Pick<Entry, "id" | "kind" | "owner">, d: KnownDevice, connected: boolean, outs: DevicePresentOutputs = options.outputs(d)): PresentDecision => {
       const decision = decidePresentation({
         kind: e.kind,
         personal: e.owner !== undefined,
         mayReveal: e.owner === undefined ? true : options.privacy.mayReveal(e.owner, d.id),
-        device: { connected, ...options.outputs(d) }
+        device: { connected, ...outs }
       })
       decided({ id: e.id, deviceId: d.id, decision })
       return decision
     }
-    /** Whether a connection's own page draws a kind (G11): its own declaration, when the outlet knows it. */
-    const draws = (conn: PresentConnection, kind: PresentKindName) => {
-      if (conn.kinds === undefined) return true
-      const v = conn.kinds()?.[kind]
-      return typeof v === "number" && v >= PRESENT_KIND_VERSIONS[kind]
+    /** A connection's own declared kinds (G11), when the outlet knows them: an older page declared none (`{}`). */
+    const declaredBy = (conn: PresentConnection): Readonly<Record<string, number>> | undefined => (conn.kinds === undefined ? undefined : conn.kinds() ?? {})
+    /** A device's outputs as one connection's page sees them: its display and overrides, the kinds that page draws. */
+    const outputsFor = (d: KnownDevice, conn: PresentConnection) => {
+      const declared = declaredBy(conn)
+      return declared === undefined ? options.outputs(d) : options.outputs(d, declared)
+    }
+    /** A device's outputs for the note: the kinds any of its open pages draws (when the outlet knows them). */
+    const outputsOfDevice = (d: KnownDevice) => {
+      const conns = connectionsOf(d.id)
+      if (conns.length === 0 || conns.some((c) => c.kinds === undefined)) return options.outputs(d)
+      const union: Record<string, number> = {}
+      for (const c of conns) for (const [k, v] of Object.entries(declaredBy(c) ?? {})) union[k] = Math.max(union[k] ?? 0, v)
+      return options.outputs(d, union)
     }
 
     /** The wire form of a row for one connection (every module text through the page boundary; its own image address). */
@@ -584,11 +597,12 @@ export const makePresentEngine = (options: PresentEngineOptions): Effect.Effect<
       const conns = heldOf(deviceId)
       if (conns.length === 0) return true
       const device = deviceOf(deviceId)
-      const candidates = device === undefined
-        ? []
-        : [...index.values()].filter((e) => e.expiresAt > now && applies(e.target, device)).map((e) => ({ id: e.id, lifetime: e.lifetime, shownAt: e.shownAt, decision: decide(e, device, true) }))
-      const chosen = selectPresentations(candidates)
-      const shares = conns.map(({ by, conn }) => ({ by, share: chosen.filter((c) => draws(conn, index.get(c.id)!.kind)) }))
+      const applying = device === undefined ? [] : [...index.values()].filter((e) => e.expiresAt > now && applies(e.target, device))
+      // Each connection's share, decided with what its own page draws (G11): an older tab beside a newer one gets none.
+      const shares = conns.map(({ by, conn }) => {
+        const outs = device === undefined ? undefined : outputsFor(device, conn)
+        return { by, share: outs === undefined ? [] : selectPresentations(applying.map((e) => ({ id: e.id, lifetime: e.lifetime, shownAt: e.shownAt, decision: decide(e, device!, true, outs) }))) }
+      })
       // Withdrawals first: they need no read, so a failing store never keeps on a page what may not be there.
       for (const { by, share } of shares) {
         const keep = new Set(share.map((c) => c.id))
@@ -772,7 +786,7 @@ export const makePresentEngine = (options: PresentEngineOptions): Effect.Effect<
     const outcomeOf = (e: Pick<Entry, "id" | "kind" | "owner" | "target">, o: { readonly asking?: string | undefined; readonly spoken: string; readonly module: string; readonly image: boolean }): ShowOutcome => {
       const devices = targetDevices(e.target)
       const shownOn: Array<ShownOn> = devices.map((d) => {
-        const decision = decide(e, d, connectionsOf(d.id).length > 0)
+        const decision = decide(e, d, connectionsOf(d.id).length > 0, outputsOfDevice(d))
         return decision.show ? { deviceId: d.id, shown: true } : { deviceId: d.id, shown: false, why: decision.why }
       })
       const names = new Map(devices.map((d) => [d.id, d.name] as const))
@@ -1270,15 +1284,15 @@ export const makePresentEngine = (options: PresentEngineOptions): Effect.Effect<
         type Admitted = { readonly row: Row<StoredPresentation>; readonly entry: PublishedHandler } | PresentPressAnswer
         const admitted = ((): Admitted => {
           const conns = heldOf(request.deviceId)
-          const holds = conns.some(({ by, conn }) => by.items.has(request.presentationId) && (request.connection === undefined || conn.id === request.connection.id))
-          if (!holds) return answer(false, "cantNow", "unknown")
+          const holder = conns.find(({ by, conn }) => by.items.has(request.presentationId) && (request.connection === undefined || conn.id === request.connection.id))
+          if (holder === undefined) return answer(false, "cantNow", "unknown")
           const e = index.get(request.presentationId)
           if (e === undefined || e.expiresAt <= now) {
             enqueue(request.deviceId)
             return answer(false, "over", "unknown")
           }
           const device = deviceOf(request.deviceId)
-          const decision = device === undefined || !applies(e.target, device) ? undefined : decide(e, device, true)
+          const decision = device === undefined || !applies(e.target, device) ? undefined : decide(e, device, true, outputsFor(device, holder.conn))
           if (decision?.show !== true || !decision.interactive) {
             enqueue(request.deviceId)
             return answer(false, "cantNow", "unknown")

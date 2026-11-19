@@ -186,7 +186,11 @@ export const presentWorld = (
         scheduler,
         writeRetryMs: [100, 200],
         devices: () => devices,
-        outputs: (d) => outputs.get(d.id) ?? SCREEN,
+        // A connection's own kinds stand in for the device's declaration; the owner's exclusions (the map's kinds) still apply.
+        outputs: (d, declared) => {
+          const base = outputs.get(d.id) ?? SCREEN
+          return declared === undefined ? base : { ...base, kinds: Object.fromEntries(Object.entries(declared).filter(([k]) => base.kinds[k] !== undefined)) }
+        },
         privacy: makePrivacy((id) => places.get(id), (id) => MEMBERS.has(id)),
         outlet: () => ({
           connections: (deviceId) =>
