@@ -1,6 +1,6 @@
 import type { MediaOutcome, MediaPort, MediaRefusal } from "@pva/core"
 import { type ContentTypePolicy, NetRefused, NetTooLarge, safeFetch, type SafeFetchError, type SafeFetchOptions, type SafeResponse } from "@pva/net"
-import { MEDIA_HASH } from "@pva/protocol"
+import { MEDIA_HASH, MEDIA_TOKEN } from "@pva/protocol"
 import { Deferred, Effect, Exit, type Scope } from "effect"
 import { createHash, randomBytes } from "node:crypto"
 import { chmodSync, mkdirSync, readdirSync, readFileSync, renameSync, statSync, unlinkSync, utimesSync, writeFileSync } from "node:fs"
@@ -8,15 +8,20 @@ import type http from "node:http"
 import { join } from "node:path"
 
 /**
- * The image cache behind `/media/<hash>` (docs/PRESENTING.md "Images"; docs/MODULES-PLAN.md §4 P10, first version). The
- * only way an image reaches a page: the Presenter asks it to `fetch` an address a module gave, off the turn's path; it
- * fetches it once through `safeFetch` (public addresses only, never the owner-configured helper), with its own image
- * policy (PNG, JPEG, GIF, WebP; never SVG, which can carry script), checks the type it says and the bytes it is, and its
- * size, keeps it under its content hash in a directory of its own for a day, within a bounded number of files and
- * bytes, and serves it with headers that make a browser treat it as an image and nothing else, only while a page holds
- * it (`mayServe`). No resizing.
+ * The image cache behind `/media/<token>` (docs/PRESENTING.md "Images"; docs/MODULES-PLAN.md §4 P10, first version). The
+ * only way an image reaches a page: the Presenter asks it to `fetch` an address a module gave, off the turn's path, once a
+ * page is to show it; it fetches it through `safeFetch` (public addresses only, never the owner-configured helper), with
+ * its own image policy (PNG, JPEG, GIF, WebP; never SVG, which can carry script), checks the type it says and the bytes
+ * it is, and its size, keeps it under its content hash in a directory of its own for a day, within a bounded number of
+ * files and bytes, and serves it, to the page whose own address names it (`PresentEngine.mediaFor`), with headers that
+ * make a browser treat it as an image and nothing else and keep it out of every cache. No resizing.
  *
- * The cache survives a restart: the directory is read at start (what has expired, or is not one of its files, is
+ * What it promises, exactly (review round 1, b8, b9): an address is not fetched again while it is in this run's bounded
+ * in-memory index of addresses (at most 1,024, the oldest forgotten first; not kept across a restart); a file is never
+ * served after its day, and is removed by the next hourly sweep (or before a write that needs its room). A file whose
+ * removal fails stays counted against the bounds and is tried again.
+ *
+ * The files survive a restart: the directory is read at start (what has expired, or is not one of its files, is
  * removed) and every file is written through a temporary file and one `rename`.
  */
 
@@ -75,10 +80,10 @@ export interface MediaCacheOptions {
 }
 
 export interface MediaCache extends MediaPort {
-  /** Answer `GET /media/<hash>`: the image while `mayServe(hash)` (a page holds it) and it is kept; else 404. */
-  readonly serve: (req: http.IncomingMessage, res: http.ServerResponse, mayServe: (hash: string) => boolean) => void
+  /** Answer `GET /media/<token>`: the image `resolve(token)` names (a page's own address, `PresentEngine.mediaFor`) while it is kept; else 404. */
+  readonly serve: (req: http.IncomingMessage, res: http.ServerResponse, resolve: (token: string) => string | undefined) => void
   /** What is kept and under way (tests, Health). */
-  readonly stats: () => { readonly files: number; readonly bytes: number; readonly inFlight: number }
+  readonly stats: () => { readonly files: number; readonly bytes: number; readonly inFlight: number; readonly stale: number }
   /** Remove what has expired now (an hourly fiber does it by itself). */
   readonly sweep: () => void
 }
@@ -96,18 +101,46 @@ export const makeMediaCache = (options: MediaCacheOptions): Effect.Effect<MediaC
     const urls = new Map<string, string>()
     const inFlight = new Map<string, Deferred.Deferred<MediaOutcome>>()
     let bytes = 0
+    /**
+     * Files whose removal failed (other than "not there"): never served, still counted against the bounds until their
+     * removal succeeds, tried again at every sweep and before every write (review round 1, b4).
+     */
+    const stale = new Map<string, number>()
+    let staleBytes = 0
     const fileOf = (k: Pick<Kept, "hash" | "type">) => join(options.dir, `${k.hash}.${MEDIA_TYPES[k.type]}`)
+    /** Remove a file; true when it is gone (removed, or not there). */
+    const unlink = (path: string): boolean => {
+      try {
+        unlinkSync(path)
+        return true
+      } catch (e) {
+        if ((e as { code?: unknown }).code === "ENOENT") return true
+        log(`Media: ${path} could not be removed (${String((e as { code?: unknown }).code ?? e)}); tried again`)
+        return false
+      }
+    }
+    const removeLater = (path: string, size: number) => {
+      if (stale.has(path)) return
+      stale.set(path, size)
+      staleBytes += size
+    }
+    const retryStale = () => {
+      for (const [path, size] of [...stale]) {
+        if (!unlink(path)) continue
+        stale.delete(path)
+        staleBytes -= size
+      }
+    }
     const remove = (k: Kept) => {
+      // Not served from now on; its place in the bounds is given back only once the file is gone.
       kept.delete(k.hash)
       bytes -= k.bytes
-      try {
-        unlinkSync(fileOf(k))
-      } catch {
-        // Gone already.
-      }
+      const path = fileOf(k)
+      if (!unlink(path)) removeLater(path, k.bytes)
     }
     const sweep = () => {
       const t = now()
+      retryStale()
       for (const k of [...kept.values()]) if (k.at + MEDIA_KEEP_MS <= t) remove(k)
       for (const [url, hash] of urls) if (!kept.has(hash)) urls.delete(url)
     }
@@ -123,7 +156,9 @@ export const makeMediaCache = (options: MediaCacheOptions): Effect.Effect<MediaC
         try {
           const st = statSync(path)
           if (m === null || type === undefined || !st.isFile() || st.size > MAX_IMAGE_BYTES || st.mtimeMs + MEDIA_KEEP_MS <= now() || kept.size >= maxFiles || bytes + st.size > maxBytes) {
-            unlinkSync(path)
+            // Debris (an interrupted write, a foreign file), an expired or an over-bound file: removed; if that fails,
+            // counted against the bounds and tried again.
+            if (!unlink(path)) removeLater(path, st.isFile() ? st.size : 0)
             continue
           }
           kept.set(m[1]!, { hash: m[1]!, type, bytes: st.size, at: st.mtimeMs })
@@ -155,10 +190,11 @@ export const makeMediaCache = (options: MediaCacheOptions): Effect.Effect<MediaC
         if (MEDIA_TYPES[said] === undefined || is !== said) return { refused: "type" } satisfies MediaOutcome
         const hash = createHash("sha256").update(r.body).digest("hex")
         const t = now()
+        // What has expired is dealt with before the same bytes are matched against it (b5): an expired copy is a new admission.
+        sweep()
         const already = kept.get(hash)
         if (already === undefined) {
-          sweep()
-          if (kept.size >= maxFiles || bytes + r.body.length > maxBytes) return { refused: "full" } satisfies MediaOutcome
+          if (kept.size + stale.size >= maxFiles || bytes + staleBytes + r.body.length > maxBytes) return { refused: "full" } satisfies MediaOutcome
           const k: Kept = { hash, type: said, bytes: r.body.length, at: t }
           const tmp = join(options.dir, `.tmp-${randomBytes(8).toString("hex")}`)
           try {
@@ -208,16 +244,18 @@ export const makeMediaCache = (options: MediaCacheOptions): Effect.Effect<MediaC
     const notFound = (res: http.ServerResponse) =>
       void res.writeHead(404, { "Content-Type": "text/plain; charset=utf-8", "X-Content-Type-Options": "nosniff", "Cache-Control": "no-store" }).end("Not found")
 
-    const serve: MediaCache["serve"] = (req, res, mayServe) => {
+    const serve: MediaCache["serve"] = (req, res, resolve) => {
       if (req.method !== "GET" && req.method !== "HEAD") {
         res.writeHead(405, { Allow: "GET, HEAD", "X-Content-Type-Options": "nosniff" }).end()
         return
       }
-      const hash = (req.url ?? "").split("?")[0]!.slice(MEDIA_PREFIX.length)
-      if (!MEDIA_HASH.test(hash)) return notFound(res)
-      const k = kept.get(hash)
-      // Only what a page holds now: a hash a page was never told is not served (nor one no page holds any more).
-      if (k === undefined || k.at + MEDIA_KEEP_MS <= now() || !mayServe(hash)) return notFound(res)
+      // A page's own address (review round 1, b1): a token the server made for one connection and one image, which names
+      // its image only while that connection is open and holds a presentation with it. Anything else is 404.
+      const token = (req.url ?? "").split("?")[0]!.slice(MEDIA_PREFIX.length)
+      if (!MEDIA_TOKEN.test(token)) return notFound(res)
+      const hash = resolve(token)
+      const k = hash === undefined || !MEDIA_HASH.test(hash) ? undefined : kept.get(hash)
+      if (k === undefined || k.at + MEDIA_KEEP_MS <= now()) return notFound(res)
       let body: Buffer
       try {
         body = readFileSync(fileOf(k))
@@ -225,7 +263,6 @@ export const makeMediaCache = (options: MediaCacheOptions): Effect.Effect<MediaC
         remove(k)
         return notFound(res)
       }
-      const left = Math.max(0, Math.floor((k.at + MEDIA_KEEP_MS - now()) / 1000))
       res.writeHead(200, {
         "Content-Type": k.type,
         "Content-Length": String(body.length),
@@ -236,7 +273,8 @@ export const makeMediaCache = (options: MediaCacheOptions): Effect.Effect<MediaC
         "Content-Disposition": `inline; filename="image.${MEDIA_TYPES[k.type]}"`,
         "Cross-Origin-Resource-Policy": "same-origin",
         "Referrer-Policy": "no-referrer",
-        "Cache-Control": `private, max-age=${left}, immutable`
+        // For that page only, and not kept by any cache: the address is the page's, and stops working when it lets go.
+        "Cache-Control": "private, no-store"
       })
       res.end(req.method === "HEAD" ? undefined : body)
     }
@@ -247,7 +285,7 @@ export const makeMediaCache = (options: MediaCacheOptions): Effect.Effect<MediaC
     return {
       fetch: cacheFetch,
       serve,
-      stats: () => ({ files: kept.size, bytes, inFlight: inFlight.size }),
+      stats: () => ({ files: kept.size, bytes, inFlight: inFlight.size, stale: stale.size }),
       sweep
     } satisfies MediaCache
   })

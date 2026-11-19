@@ -881,6 +881,8 @@ export const makeNotifyEngine = (options: NotifyEngineOptions): Effect.Effect<No
       if (job?.deviceId !== undefined) return job.deviceId
       const principal = yield* CurrentPrincipal
       if (principal?._tag === "notification") return principal.notification.deviceId
+      // P10: a press on a presentation (its handler may send to "origin": the device it was pressed on).
+      if (principal?._tag === "presentation") return principal.presentation.deviceId
       return undefined
     })
 
@@ -1326,8 +1328,13 @@ export const makeNotifyEngine = (options: NotifyEngineOptions): Effect.Effect<No
 
     const say = (moduleId: string) => (target: SpeechTarget, text: string, o: SpeechOptions = {}): Effect.Effect<SpeechHandle, SpeechError> =>
       Effect.gen(function*() {
-        if (typeof text !== "string" || text.trim() === "" || text.length > MAX_SPEECH_CHARS || !NOTIFY_TEXT.test(text)) {
-          return yield* new SpeechError({ reason: "invalid", message: `an announcement is 1 to ${MAX_SPEECH_CHARS} characters of text, without control characters` })
+        // An empty text is a chime alone, so it needs `cue` (a broadcast's "ding").
+        const chimeOnly = typeof text === "string" && text.trim() === "" && o.cue === true
+        if (typeof text !== "string" || (text.trim() === "" && !chimeOnly) || text.length > MAX_SPEECH_CHARS || !NOTIFY_TEXT.test(text)) {
+          return yield* new SpeechError({ reason: "invalid", message: `an announcement is 1 to ${MAX_SPEECH_CHARS} characters of text, without control characters (or empty, with a cue: a chime alone)` })
+        }
+        if (typeof target === "object" && target !== null && "except" in target && (typeof target.except !== "string" || !("room" in target))) {
+          return yield* new SpeechError({ reason: "invalid", message: "except names one device, beside a room" })
         }
         if (o.owner !== undefined && (typeof o.owner !== "string" || !PERSON_ID.test(o.owner))) return yield* new SpeechError({ reason: "invalid", message: "owner is a Members id" })
         const devicesNow = options.devices()
@@ -1336,12 +1343,12 @@ export const makeNotifyEngine = (options: NotifyEngineOptions): Effect.Effect<No
           : typeof target === "object" && target !== null && "device" in target
           ? devicesNow.filter((d) => d.id === target.device)
           : typeof target === "object" && target !== null && "room" in target && typeof target.room === "string"
-          ? devicesNow.filter((d) => d.room !== undefined && sameRoom(d.room, target.room))
+          ? devicesNow.filter((d) => d.room !== undefined && sameRoom(d.room, target.room) && d.id !== (target as { readonly except?: string }).except)
           : undefined
         if (devices === undefined) return yield* new SpeechError({ reason: "invalid", message: "target is { device }, { room } or \"everywhere\"" })
         if (devices.length === 0) return yield* new SpeechError({ reason: "no-device", message: "the target names no known device" })
         // The module's text passes the page boundary before it is spoken.
-        const line = options.pageText(moduleId, text, MAX_SPEECH_CHARS)
+        const line = chimeOnly ? "" : options.pageText(moduleId, text, MAX_SPEECH_CHARS)
         const id = newId()
         const items: Array<SpeechItem> = []
         const deliveries: Array<SpeechDelivery> = []

@@ -214,16 +214,17 @@ describe("the mock, through its handlers, as the server", { timeout: 30_000 }, (
     const one = await Peer.open({ device: { id: "d-mock-present1", kind: "web-voice", name: "One", capabilities: screen } as never })
     const old = await Peer.open({ device: { id: "d-mock-present2", kind: "web-voice", name: "Old", capabilities: { v: 1, display: screen.display } } as never })
     const post = (path: string, body: unknown) => fetch(`${http}${path}`, { method: "POST", body: JSON.stringify(body) }).then((r) => r.json() as Promise<{ id?: string }>)
-    const list = await post("/mock/present", { lifetime: "pinned", content: { kind: "list", title: "Shopping", style: "checklist", items: [{ id: "milk", text: "Milk", done: false }] }, buttons: [{ id: "clear", label: "Clear" }] })
+    const card = (title: string, extra: Record<string, unknown> = {}) => ({ kind: "card", title, spoken: `${title}.`, ...extra })
+    const list = await post("/mock/present", { options: { lifetime: "pinned" }, presentation: { kind: "list", title: "Shopping", style: "checklist", items: [{ id: "milk", text: "Milk" }], spoken: "Milk.", handler: "h", buttons: [{ id: "clear", label: "Clear" }] } })
     const shown = await one.waitFor("present.show", (m) => m.presentation.id === list.id)
     expect(shown.presentation.interactive).toBe(true)
     expect(shown.presentation.texts.region).toBe("On screen")
     await new Promise((r) => setTimeout(r, 200))
     expect(old.messages.some((m) => m.type.startsWith("present."))).toBe(false)
     // A transient one, then another: one at a time.
-    const t1 = await post("/mock/present", { content: { kind: "card", title: "First", facts: [] } })
+    const t1 = await post("/mock/present", { presentation: card("First") })
     await one.waitFor("present.show", (m) => m.presentation.id === t1.id)
-    const t2 = await post("/mock/present", { content: { kind: "card", title: "Second", facts: [] } })
+    const t2 = await post("/mock/present", { presentation: card("Second") })
     await one.waitFor("present.dismiss", (m) => m.id === t1.id)
     await one.waitFor("present.show", (m) => m.presentation.id === t2.id)
     // A page that says hello gets the pinned one and the live transient again.
@@ -235,13 +236,65 @@ describe("the mock, through its handlers, as the server", { timeout: 30_000 }, (
     expect([ticked.ok, ticked.say]).toEqual([true, "Done."])
     await again.waitFor("present.update", (m) => m.presentation.id === list.id && m.presentation.content.kind === "list" && m.presentation.content.items[0]!.done)
     expect((await old.request({ type: "present.action", id: list.id, action: "clear" })).ok).toBe(false)
-    const down = await post("/mock/present", { lifetime: "pinned", content: { kind: "card", title: "Down", facts: [] }, buttons: [{ id: "go", label: "Go" }], handlerDown: true })
+    const down = await post("/mock/present", { options: { lifetime: "pinned" }, presentation: card("Down", { buttons: [{ id: "go", label: "Go" }], handler: "h" }), handlerDown: true })
     await one.waitFor("present.show", (m) => m.presentation.id === down.id)
     const refused = await one.request({ type: "present.action", id: down.id, action: "go" })
     expect([refused.ok, refused.error?.code, refused.say]).toEqual([false, "not_running", "I can't do that right now."])
     await post("/mock/present/dismiss", { id: list.id })
     await one.waitFor("present.dismiss", (m) => m.id === list.id)
+    await post("/mock/present/dismiss", { id: down.id })
+    await post("/mock/present/dismiss", { id: t2.id })
     for (const p of [one, old, again]) p.ws.close()
+  })
+
+  it("P10 review round 1: the mock checks before it commits (b10), ends presentations at their end (b12), derives lifetimes with the shared helper (b13), reconciles after a saved settings change (b14), sends each tab only its own kinds (G11) and serves images by a page's own address (b11)", async () => {
+    const http = url.replace(/^ws/, "http").replace(/\/ws$/, "")
+    const screen = { v: 1, display: { class: "standard", widthPx: 800, heightPx: 600, dpr: 1, touch: "coarse", colour: true }, present: { kinds: { card: 1, list: 1, timer: 1, image: 1, weather: 1 } } }
+    const page = await Peer.open({ device: { id: "d-mock-round1a", kind: "web-voice", name: "Page", capabilities: screen } as never })
+    const oldTab = await Peer.open({ device: { id: "d-mock-round1a", kind: "web-voice", name: "Page", capabilities: { v: 1, display: screen.display } } as never })
+    const post = (path: string, body: unknown) => fetch(`${http}${path}`, { method: "POST", body: JSON.stringify(body) }).then(async (r) => ({ status: r.status, body: await r.json() as { id?: string; lifetime?: string; expiresAt?: number; error?: string } }))
+    const card = (title: string) => ({ kind: "card", title, spoken: `${title}.` })
+    // b10: a refused presentation changes nothing, and the next valid one is shown.
+    expect((await post("/mock/present", { options: { lifetime: "pinned" }, presentation: card("T".repeat(61)) })).status).toBe(400)
+    expect((await post("/mock/present", { presentation: { ...card("x"), buttons: [1, 2, 3, 4] } })).status).toBe(400)
+    expect((await post("/mock/present", { presentation: card("x"), options: { expiresInMs: 25 * 3_600_000, lifetime: "pinned" } })).status).toBe(400)
+    const valid = await post("/mock/present", { options: { lifetime: "pinned", expiresInMs: 3_000 }, presentation: card("Valid") })
+    expect(valid.status).toBe(200)
+    await page.waitFor("present.show", (m) => m.presentation.id === valid.body.id)
+    // b13: a timer is pinned by default and lasts until ten minutes after it ends.
+    const endsAt = Date.now() + 60_000
+    const timer = await post("/mock/present", { presentation: { kind: "timer", label: "Tea", endsAt, spoken: "Tea." } })
+    expect(timer.body.lifetime).toBe("pinned")
+    expect(timer.body.expiresAt).toBe(endsAt + 10 * 60_000)
+    // b12: eight pins with a three-second life end and free their places.
+    const ids: Array<string> = [valid.body.id!, timer.body.id!]
+    for (let i = 0; i < 6; i++) ids.push((await post("/mock/present", { options: { lifetime: "pinned", expiresInMs: 3_000 }, presentation: card(`P${i}`) })).body.id!)
+    expect((await post("/mock/present", { options: { lifetime: "pinned" }, presentation: card("Full") })).body.error).toBe("limit")
+    // No dismissal: their end alone frees their places.
+    await page.waitFor("present.dismiss", (m) => m.id === valid.body.id, 0, 6_000)
+    expect((await post("/mock/present", { options: { lifetime: "pinned" }, presentation: card("Fits") })).status).toBe(200)
+    // G11: the older tab of the same device got nothing.
+    expect(oldTab.messages.some((m) => m.type.startsWith("present."))).toBe(false)
+    // b11: an image through the page's own address, with the server's headers; nothing for another address.
+    const image = await post("/mock/present", { presentation: { kind: "image", url: "https://example.org/a.png", alt: "A", credit: "C", spoken: "A." } })
+    const shown = await page.waitFor("present.show", (m) => m.presentation.id === image.body.id)
+    const img = shown.presentation.content.kind === "image" && shown.presentation.content.image.state === "ready" ? shown.presentation.content.image.token : ""
+    const got = await fetch(`${http}/media/${img}`)
+    expect(got.status).toBe(200)
+    expect(got.headers.get("content-type")).toBe("image/png")
+    expect(got.headers.get("cache-control")).toBe("private, no-store")
+    expect((await fetch(`${http}/media/${"x".repeat(32)}`)).status).toBe(404)
+    await post("/mock/present/dismiss", { id: image.body.id })
+    await page.waitFor("present.dismiss", (m) => m.id === image.body.id)
+    expect((await fetch(`${http}/media/${img}`)).status).toBe(404)
+    // b14: a saved language change reaches the held presentations at once.
+    const a = await admin()
+    const from = page.messages.length
+    expect((await a.request({ type: "settings.update", sectionId: "home", patch: { values: { HOME_LANGUAGE: "nl-NL" }, secrets: {} } })).ok).toBe(true)
+    await page.waitFor("present.update", (m) => m.presentation.texts.region === "Op het scherm", from)
+    expect((await a.request({ type: "settings.update", sectionId: "home", patch: { values: { HOME_LANGUAGE: "en-GB" }, secrets: {} } })).ok).toBe(true)
+    await post("/mock/present/dismiss", { id: timer.body.id })
+    for (const p of [page, oldTab, a]) p.ws.close()
   })
 
   it("P7: the reply volume as the server keeps it: output.volume to the device's voice pages, again after a welcome, with the server's step and bounds", async () => {
