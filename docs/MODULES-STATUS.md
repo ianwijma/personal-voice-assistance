@@ -18,10 +18,10 @@ findings fixed; it does not mean merged.
 | P5 people, rooms, devices | #93 | `t3/modules-05-people-rooms` | `3e19fba` | closed |
 | P6 scheduler | #92 | `t3/modules-06-scheduler` | `c842653` | closed |
 | P11 scaffold, contracts, test kit, guide | #94 | `t3/modules-11-scaffold` | `5bfeca0d` | closed; CI green |
-| P9 notifications, speech, ringing | #106 | `t3/modules-09-notify` | `d177f3ec` | closed after three review rounds; CI green |
-| P7 phrase commands, essential controls | #107 | `t3/modules-07-phrases` | `86ab9161` | closed after two review rounds (24, then 8 findings, all fixed) |
-| P10 presentation | #108 | `t3/modules-10-present` | `3280b6ef` | built on top of P9; first review running; P7 is being merged in, then the pull request's base becomes P7 |
-| P8 risk policy in admin | being built | `t3/modules-08-risk` | (being built) | build started on top of P10 |
+| P9 notifications, speech, ringing | #106 | `t3/modules-09-notify` | `a7fccff9` | closed after three review rounds; carries the scaffold's last store fix |
+| P7 phrase commands, essential controls | #107 | `t3/modules-07-phrases` | `471d0d5e` | closed after two review rounds (24, then 8 findings, all fixed); CI was green at `86ab9161`, the head adds a merge of P9 |
+| P10 presentation | #108 | `t3/modules-10-present` | `8a27cb59` | P7 merged in (base is now #107); first review found 30 problems; fix round running |
+| P8 risk policy in admin | #115 | `t3/modules-08-risk` | `46fd00da` | built on P10 as it was before the merge; first review running |
 
 **Fixes to P1 to P6 code found later live on the scaffold branch**, not on their own branches: the worker-thread
 helper `offThread`; POST and typed loopback in `@pva/net`; the gateway no longer timing its own risk lookup (an
@@ -49,17 +49,17 @@ its own pull request on the scaffold.
 | kitchen | #104 | `t3/module-kitchen` | `8c194006` |
 | calendar (ICS only) | #105 | `t3/module-calendar` | `7050c33e` |
 
-CI is green on all eleven at these heads. They carry the scaffold up to `6aa6005c`; the scaffold's last store change (`5bfeca0d`) still has to be
-merged into each.
+CI is green on all eleven at these heads. They carry the whole scaffold (`5bfeca0d`); their heads moved with that merge (see each pull request).
 
 ## What is left, in order
 
 1. P10 (#108): review, fix, merge P7 into it, make P7 its base.
 2. P8, first version (the risk policy as a household setting in admin): finish the build, review, fix.
 3. A browser-test run with new cases and fresh screenshots at the top of the stack (the last one on the whole stack was at P6; the existing 218 cases pass on P9).
-4. Wave B, one pull request per module (they end up on top of P8): assistant controls is #109 (built, in review);
-   notifications, music, images and photos, broadcast and reminders are being built; timers and alarms and routines
-   and automations start when their base is ready; and the phrase commands and presentations wave A
+4. Wave B, one pull request per module (they end up on top of P8; until then each sits on the newest part it
+   needs): assistant controls #109 (closed), notifications #110, images and photos #111, broadcast #112, music #113,
+   reminders #114 (each in its review and fix round); timers and alarms is being built; routines and automations
+   starts when P8 has been reviewed; and the phrase commands and presentations wave A
    left out, one small pull request per module.
 5. Deferred, with a plan of their own ([MODULES-DEFERRED-PLAN.md](MODULES-DEFERRED-PLAN.md): sixteen pull requests in order, with eighteen decisions for the owner and a recommendation for each): google, t3-code, mcp-client, calls and intercom, CalDAV; connections and
    OAuth (the rest of P8); streaming and WebSocket to an owner-typed address.
