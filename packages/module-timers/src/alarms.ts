@@ -465,14 +465,25 @@ export const alarmsModule = defineModule({
       const readLive = (forCancel = false) =>
         Effect.gen(function*() {
           const set = yield* readSet
+          const now = yield* Clock.currentTimeMillis
+          // Project catch-up on reads; cancellation persists it before selecting. Only the row's job sends a delivery.
+          const current: Array<Row<Alarm>> = []
+          for (const row of set.rows) {
+            const due = (row.value.next?.at ?? Infinity) <= now || (row.value.ring?.again ?? Infinity) <= now
+            if (!due) current.push(row)
+            else {
+              current.push(forCancel ? (yield* reconcile(row.id)) ?? row : { ...row, value: advance(row.value, now) })
+              yield* Effect.yieldNow
+            }
+          }
           const notifications = yield* ctx.notify.list()
           const open: Open = { ids: new Set(notifications.map((n) => n.id)), keys: new Set(notifications.map((n) => n.key)) }
           const pending = yield* readPending
           const ended = pending.rows.filter((r) => r.value.phase === "ended")
           const ringing = ended.filter((r) => ringingNow(r, open))
           const cleanup = forCancel ? ended.filter((r) => !ringing.includes(r) && r.value.withdraw !== undefined) : []
-          const all = [...set.rows, ...ringing, ...cleanup]
-          const upcoming = (r: Row<Alarm>) => Math.min(r.value.next?.at ?? Infinity, r.value.ring?.again ?? Infinity, r.value.owed?.at ?? Infinity)
+          const all = [...current, ...ringing, ...cleanup]
+          const upcoming = (r: Row<Alarm>) => Math.min(r.value.next?.at ?? Infinity, r.value.ring?.again ?? Infinity, r.value.owed !== undefined && (ringingNow(r, open) || now - r.value.owed.at <= DELIVER_WITHIN_MS) ? r.value.owed.at : Infinity)
           return { rows: all.sort((a, b) => upcoming(a) - upcoming(b)), open, cut: set.cut || pending.cut }
         })
 
@@ -491,7 +502,7 @@ export const alarmsModule = defineModule({
         const rule = ruleWords(v, lang)
         const ringing = ringingNow(row, open)
         // A current ring or snooze belongs to its own occurrence, even when the series already has a next date.
-        const occurrence = v.owed ?? (v.ring !== undefined && (v.ring.again !== undefined || ringing) ? v.ring : v.next) ?? v.withdraw
+        const occurrence = (v.owed !== undefined && (ringing || now - v.owed.at <= DELIVER_WITHIN_MS || v.next === undefined) ? v.owed : undefined) ?? (v.ring !== undefined && (v.ring.again !== undefined || ringing) ? v.ring : v.next) ?? v.withdraw
         const moment = occurrence === undefined ? "" : momentOf(occurrence.date, occurrence.time, now, z, lang)
         const repeat = isRepeating(v)
         const what = !mine
@@ -594,9 +605,9 @@ export const alarmsModule = defineModule({
               if (at.kind !== "ok") return say(texts, lang, "when")
               if (at.value.instant === undefined || at.value.time === undefined) return say(texts, lang, "noTime")
               if (at.value.inPast || at.value.instant <= now) return say(texts, lang, "passed")
-              if (at.value.instant > DateTime.toEpochMillis(DateTime.add(DateTime.setZoneNamedUnsafe(DateTime.makeUnsafe(now), z), { years: 1 }))) return say(texts, lang, "tooFar")
               value = { ...base, next: { date: dateText(at.value.date), time: timeText(at.value.time), at: at.value.instant } }
             }
+            if (value.next!.at > DateTime.toEpochMillis(DateTime.add(DateTime.setZoneNamedUnsafe(DateTime.makeUnsafe(now), z), { years: 1 }))) return say(texts, lang, "tooFar")
             const read = yield* readSet.pipe(Effect.mapError(failure))
             if (read.cut || read.rows.length >= MAX_ALARMS) return yield* Effect.fail(fail(say(texts, lang, "full", { count: MAX_ALARMS })))
             yield* commit(undefined, randomUUID(), value).pipe(Effect.mapError(failure))
@@ -647,7 +658,7 @@ export const alarmsModule = defineModule({
               const after = yield* Effect.flatMap(ended(row, now), (value) => change(row, value)).pipe(Effect.mapError(failure))
               return pendingSay(after, say(texts, lang, "cancelledRepeat", { rule }))
             }
-            if (t.snoozed || v.ring?.again !== undefined || (v.owed !== undefined && !t.ringing) || v.withdraw !== undefined) {
+            if (t.snoozed || v.ring?.again !== undefined || (v.owed !== undefined && !t.ringing && now - v.owed.at <= DELIVER_WITHIN_MS) || v.withdraw !== undefined) {
               // The current occurrence (including an owed snooze or its unfinished withdrawal) comes before the series.
               const occurrence = v.owed ?? v.ring ?? v.withdraw!
               const next = momentOf(v.next.date, v.next.time, now, z, lang)

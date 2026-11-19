@@ -35,7 +35,8 @@ Some requests are a question or a refusal instead:
 - an ambiguous moment ("next Friday at 7") is a question;
 - a rule with no time ("every Monday") is a question;
 - a moment that has passed, or one beyond the same local date and time next year, is refused (29 February clamps to
-  28 February when needed).
+  28 February when needed). The same limit applies to the first ring of a repeating alarm; later occurrences of an
+  accepted series are not capped.
 
 The answer says the day and the time with its part of the day, so a mistake is heard: "Alarm set for tomorrow at seven
 o'clock in the morning.", or "Alarm set every weekday; the first one is tomorrow at quarter to seven in the morning.".
@@ -153,8 +154,10 @@ alarms still being withdrawn appear only in cancellation choices. Their labels s
 Cancelling a repeating alarm must say which. Without it the answer is the question "That alarm repeats every weekday.
 Only the next one, or all of them?", and nothing changes (docs/MODULES-PLAN.md §2 row 6).
 
-- **"Only the next"** skips that occurrence ("… is skipped; the next one is Friday at quarter to seven in the
-  morning."). When a snooze is still to ring, that snooze is the next ring: "The snoozed alarm is cancelled; the next
+- **"Only the next"** catches the series up to now first, then skips the occurrence that would ring next and names it
+  in the answer. An occurrence already outside the 15-minute late window is reported as missed by its job; it is not
+  the ring being skipped. The answer says "… is skipped; the next one is Friday at quarter to seven in the
+  morning." When a snooze is still to ring, that snooze is the next ring: "The snoozed alarm is cancelled; the next
   one is tomorrow at …". An owed snooze is still matched by its snooze time, and cancelling again while its withdrawal
   is unfinished finishes that withdrawal before skipping a later series occurrence. Selecting an open snooze by its
   snooze time stops that ring and keeps tomorrow's regular occurrence; selecting the regular time still skips the next

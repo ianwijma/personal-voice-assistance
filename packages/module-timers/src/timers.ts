@@ -130,7 +130,7 @@ const itemOf = (row: Row<Timer>, shown: Shown, now: number, language: Language):
 
 /** The ambient line: at most three running timers among the rows the host read (the most recently changed ones). */
 const ambientLine = (rows: ReadonlyArray<Row<Timer>>, now: number): string | undefined => {
-  const active = rows.filter((r) => r.value.phase === "active")
+  const active = rows.filter((r) => r.value.phase === "active" && (r.value.state !== "running" || r.value.dueAt > now))
   if (active.length === 0) return undefined
   const items = active.slice(0, 3).map((r) => itemOf(r, "active", now, "en"))
   const more = active.length > 3 ? `, and ${active.length - 3} more` : ""
@@ -462,6 +462,16 @@ export const timersModule = defineModule({
       // -- reading ---------------------------------------------------------------------------------------------------------
 
       const readActive = scan<Timer>((q) => store.list({ where: { phase: "active" }, orderBy: { field: "createdAt", direction: "asc" }, ...q }), PAGE, SCAN_ACTIVE)
+      const readCurrentActive = (rearming?: string) => Effect.gen(function*() {
+        const read = yield* readActive
+        const now = yield* Clock.currentTimeMillis
+        // Under the lock, due timers leave the active count with their ring still owed to their own job.
+        for (const row of read.rows) if (row.id !== rearming && row.value.state === "running" && row.value.dueAt <= now) {
+          yield* commit(row, row.id, advance(row.value, now))
+          yield* Effect.yieldNow
+        }
+        return { ...read, rows: read.rows.filter((r) => r.id !== rearming && (r.value.state !== "running" || r.value.dueAt > now)) }
+      })
       const readPending = scan<Timer>((q) => store.list({ where: { pending: true }, orderBy: { field: "nextAt", direction: "asc" }, ...q }), PAGE, SCAN_PENDING)
 
       /**
@@ -571,7 +581,7 @@ export const timersModule = defineModule({
       const startTimer = (input: { readonly durationMs: number; readonly name?: string | undefined; readonly deviceId: string; readonly room?: string | undefined }) =>
         locked(Effect.gen(function*() {
           const now = yield* Clock.currentTimeMillis
-          const active = yield* readActive
+          const active = yield* readCurrentActive()
           if (active.cut || active.rows.length >= TIMERS_LIMITS.running) return { kind: "limit" } satisfies StartOutcome as StartOutcome
           if (input.name !== undefined) {
             const key = nameKey(input.name)
@@ -700,7 +710,7 @@ export const timersModule = defineModule({
             if (t.shown !== "active") {
               // A timer that came due given more time runs again for that long; its ring is withdrawn.
               if (deltaMs <= 0) return say(texts, lang, t.shown === "waiting" ? "oneWaiting" : "notPausedRinging", { Name })
-              const active = yield* readActive.pipe(Effect.mapError(failure))
+              const active = yield* readCurrentActive(row.id).pipe(Effect.mapError(failure))
               if (active.cut || active.rows.length >= TIMERS_LIMITS.running) return yield* Effect.fail(fail(say(texts, lang, "full", { count: TIMERS_LIMITS.running })))
               const after = yield* Effect.flatMap(rearmed(row.id, row.value, now, deltaMs, { snoozed: false }), (value) => change(row, value)).pipe(Effect.mapError(failure))
               return say(texts, lang, leftovers(after).ring ? "restartedPending" : "restarted", { Name, left: speakLeft(deltaMs, lang) })
@@ -885,7 +895,7 @@ export const timersModule = defineModule({
               const left = leftOf(row.value, now)
               return { say: !snooze && left === MORE_MINUTES * 60_000 ? say(texts, lang, "moreDone", { Name }) : say(texts, lang, "snoozed", { Name, left: speakLeft(left, lang) }) }
             }
-            const active = yield* readActive
+            const active = yield* readCurrentActive(row.id)
             if (active.cut || active.rows.length >= TIMERS_LIMITS.running) return { say: say(texts, lang, "full", { count: TIMERS_LIMITS.running }), keepOpen: true }
             const duplicate = row.value.name === undefined ? undefined : active.rows.find((r) => r.id !== row.id && r.value.name !== undefined && nameKey(r.value.name) === nameKey(row.value.name!))
             if (duplicate !== undefined) return { say: say(texts, lang, "duplicate", { name: duplicate.value.name!, left: speakLeft(leftOf(duplicate.value, now), lang) }), keepOpen: true }
