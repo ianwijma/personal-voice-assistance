@@ -272,7 +272,8 @@ describe("the mock, through its handlers, as the server", { timeout: 30_000 }, (
     expect((await post("/mock/present", { options: { lifetime: "pinned" }, presentation: card("Full") })).body.error).toBe("limit")
     // No dismissal: their end alone frees their places.
     await page.waitFor("present.dismiss", (m) => m.id === valid.body.id, 0, 6_000)
-    expect((await post("/mock/present", { options: { lifetime: "pinned" }, presentation: card("Fits") })).status).toBe(200)
+    const fits = await post("/mock/present", { options: { lifetime: "pinned" }, presentation: card("Fits") })
+    expect(fits.status).toBe(200)
     // G11: the older tab of the same device got nothing.
     expect(oldTab.messages.some((m) => m.type.startsWith("present."))).toBe(false)
     // b11: an image through the page's own address, with the server's headers; nothing for another address.
@@ -294,7 +295,74 @@ describe("the mock, through its handlers, as the server", { timeout: 30_000 }, (
     await page.waitFor("present.update", (m) => m.presentation.texts.region === "Op het scherm", from)
     expect((await a.request({ type: "settings.update", sectionId: "home", patch: { values: { HOME_LANGUAGE: "en-GB" }, secrets: {} } })).ok).toBe(true)
     await post("/mock/present/dismiss", { id: timer.body.id })
+    await post("/mock/present/dismiss", { id: fits.body.id })
     for (const p of [page, oldTab, a]) p.ws.close()
+  })
+
+  it("P10 review round 2 (R7): the mock checks the whole request before it changes anything, refuses what it does not model (personal content, a key), and admits with the server's live bounds", async () => {
+    const http = url.replace(/^ws/, "http").replace(/\/ws$/, "")
+    const screen = { v: 1, display: { class: "standard", widthPx: 800, heightPx: 600, dpr: 1, touch: "coarse", colour: true }, present: { kinds: { card: 1, list: 1, timer: 1, image: 1, weather: 1 } } }
+    const pages = await Promise.all(["d-mock-round2a", "d-mock-round2b", "d-mock-round2c"].map((id) => Peer.open({ device: { id, kind: "web-voice", name: id, capabilities: screen } as never })))
+    const [a, b, c] = pages as [typeof pages[0], typeof pages[0], typeof pages[0]]
+    const post = (path: string, body: unknown) => fetch(`${http}${path}`, { method: "POST", body: JSON.stringify(body) }).then(async (r) => ({ status: r.status, body: await r.json() as { id?: string; error?: string } }))
+    const card = (title: string, extra: Record<string, unknown> = {}) => ({ kind: "card", title, spoken: `${title}.`, ...extra })
+    const pinned = { lifetime: "pinned" }
+    const shown: Array<string> = []
+    const pin = async (deviceId: string, title: string, options: Record<string, unknown> = pinned) => {
+      const r = await post("/mock/present", { deviceId, options, presentation: card(title) })
+      if (r.status === 200) shown.push(r.body.id!)
+      return r
+    }
+    const first = await pin("d-mock-round2a", "First")
+    expect(first.status).toBe(200)
+    await a.waitFor("present.show", (m) => m.presentation.id === first.body.id)
+    // Finding 5: a malformed, empty or overlong id, an unknown field, an unknown device: 400 each, nothing consumed or
+    // changed; the next valid request is shown and the page still holds what it held.
+    for (const body of [
+      { id: "not a protocol id!", options: pinned, presentation: card("Bad") },
+      { id: "", options: pinned, presentation: card("Bad") },
+      { id: "x".repeat(65), options: pinned, presentation: card("Bad") },
+      { id: 7, options: pinned, presentation: card("Bad") },
+      { surprise: true, options: pinned, presentation: card("Bad") },
+      { deviceId: "d-mock-nowhere", options: pinned, presentation: card("Bad") }
+    ]) {
+      const r = await post("/mock/present", body)
+      expect(r.status, JSON.stringify(body)).toBe(400)
+    }
+    const after = await pin("d-mock-round2a", "After")
+    expect(after.status).toBe(200)
+    await a.waitFor("present.show", (m) => m.presentation.id === after.body.id)
+    expect(a.messages.filter((m) => m.type === "present.show").map((m) => (m as { presentation: { id: string } }).presentation.id)).toEqual([first.body.id, after.body.id])
+    // Finding 4 and 6: what the mock does not model is refused with a sentence that says so.
+    const personal = await post("/mock/present", { deviceId: "d-mock-round2a", presentation: card("Dentist", { sensitivity: { personal: "p-sam" } }) })
+    expect([personal.status, personal.body.error]).toEqual([400, "the mock shows household presentations only (it has no privacy model): leave sensitivity out or say household"])
+    expect((await post("/mock/present", { deviceId: "d-mock-round2a", presentation: card("Bins", { sensitivity: "household" }) })).status).toBe(200)
+    shown.push(...a.messages.filter((m) => m.type === "present.show").map((m) => (m as { presentation: { id: string } }).presentation.id).filter((id) => !shown.includes(id)))
+    const keyed = await post("/mock/present", { deviceId: "d-mock-round2a", options: { lifetime: "pinned", key: "same" }, presentation: card("Keyed") })
+    expect([keyed.status, keyed.body.error]).toEqual([400, "the mock does not replace by key: leave options.key out (dismiss and show again)"])
+    // Finding 7: the server's per-module bound (8 live; the mock is one module) across devices, not only per device.
+    // Three live now (two pins and a transient on a); five more pins on b make eight.
+    const onB: Array<string> = []
+    for (let i = 0; i < 5; i++) {
+      const r = await pin("d-mock-round2b", `B${i}`)
+      expect(r.status).toBe(200)
+      onB.push(r.body.id!)
+    }
+    expect((await pin("d-mock-round2c", "One too many")).body.error).toBe("limit")
+    // A transient that replaces the live transient of its device does not count again (as the server).
+    const replacing = await post("/mock/present", { deviceId: "d-mock-round2a", presentation: card("Replacing") })
+    expect(replacing.status).toBe(200)
+    shown.push(replacing.body.id!)
+    // A dismissal gives its place back; an end does too.
+    expect((await post("/mock/present/dismiss", { id: onB[0] })).body).toEqual({ dismissed: true })
+    const short = await pin("d-mock-round2c", "Short", { lifetime: "pinned", expiresInMs: 3_000 })
+    expect(short.status).toBe(200)
+    expect((await pin("d-mock-round2c", "Full again")).body.error).toBe("limit")
+    await c.waitFor("present.dismiss", (m) => m.id === short.body.id, 0, 6_000)
+    expect((await pin("d-mock-round2c", "Fits again")).status).toBe(200)
+    for (const id of shown) await post("/mock/present/dismiss", { id })
+    void b
+    for (const p of pages) p.ws.close()
   })
 
   it("P7: the reply volume as the server keeps it: output.volume to the device's voice pages, again after a welcome, with the server's step and bounds", async () => {
