@@ -3,7 +3,8 @@ import { defineTexts } from "@pva/module-contracts"
 /**
  * Every sentence the module speaks, failures and refusals included, in both languages with the same placeholders. A
  * refusal names the routine (the owner's own name) and the step by its number in the owner's list; it never repeats
- * what another module answered or what someone said.
+ * what another module answered or what someone said. `{why}`, `{before}` and `{steps}` are filled with texts of this
+ * table in the same language.
  */
 export const texts = defineTexts({
   en: {
@@ -11,9 +12,9 @@ export const texts = defineTexts({
     notHere: "I can't run {name} here.",
     refusedMissing: "I can't run {name}: step {step} is something this assistant can't do here.",
     refusedConfirm: "I can't run {name}: step {step} needs a confirmation I can't ask for yet.",
-    refusedUnchecked: "I can't run {name}: whether step {step} is allowed depends on its values, which I can't check before it runs.",
     refusedParams: "I can't run {name}: the values in step {step} don't fit that action.",
     already: "{name} is already running.",
+    busyHere: "{other} is still running here.",
     started: "Starting {name}.",
     unknown: "I don't know a routine by that name.",
     which: "Which one: {list}?",
@@ -23,20 +24,29 @@ export const texts = defineTexts({
     doneUnconfirmed: "{name} is done, but I couldn't confirm {steps}.",
     stepOne: "step {list}",
     stepsMany: "steps {list}",
-    stoppedFailed: "{name} stopped: I couldn't confirm step {step}, so I left out the rest.",
-    stoppedRefused: "{name} stopped at step {step}: that isn't allowed here any more, so I left out the rest.",
-    withheldAnswer: "I don't read out the answer to step {step} in a routine: it may be personal.",
+    stoppedAt: "{name} stopped at step {step}: {why}. {before}",
+    whyRefused: "I'm not allowed to do that",
+    whyValues: "its values don't fit that action",
+    stoppedFailed: "{name} stopped: I couldn't confirm step {step}, so I left out the rest. {before}",
+    beforeNone: "Nothing before it was done.",
+    beforeOne: "Step {list} is done.",
+    beforeMany: "Steps {list} are done.",
+    alsoUnconfirmed: "I couldn't confirm {steps}.",
     cutShort: "{name} was cut short when the routines module restarted; it had finished {done} of its {total} steps.",
-    cutShortCall: "{name} was cut short when the routines module restarted, during step {step}, which may or may not have been done."
+    cutShortCall: "{name} was cut short when the routines module restarted, during step {step}, which may or may not have been done.",
+    nothingRunning: "No routine is running here.",
+    cancelled: "I stopped {name}; it had finished {done} of its {total} steps.",
+    cancelledCall: "I stopped {name} during step {step}; that step may still complete.",
+    noLine: "That line belongs to no routine running here."
   },
   nl: {
     noDevice: "Ik kan een routine alleen vanaf een apparaat uitvoeren.",
     notHere: "Ik kan {name} hier niet uitvoeren.",
     refusedMissing: "Ik kan {name} niet uitvoeren: stap {step} kan deze assistent hier niet doen.",
     refusedConfirm: "Ik kan {name} niet uitvoeren: stap {step} vraagt een bevestiging die ik nog niet kan vragen.",
-    refusedUnchecked: "Ik kan {name} niet uitvoeren: of stap {step} mag, hangt af van de waarden, en dat kan ik niet vooraf nagaan.",
     refusedParams: "Ik kan {name} niet uitvoeren: de waarden in stap {step} passen niet bij die actie.",
     already: "{name} loopt al.",
+    busyHere: "{other} loopt hier nog.",
     started: "Ik start {name}.",
     unknown: "Ik ken geen routine met die naam.",
     which: "Welke: {list}?",
@@ -46,11 +56,20 @@ export const texts = defineTexts({
     doneUnconfirmed: "{name} is klaar, maar {steps} kon ik niet bevestigen.",
     stepOne: "stap {list}",
     stepsMany: "stappen {list}",
-    stoppedFailed: "{name} is gestopt: stap {step} kon ik niet bevestigen, dus de rest heb ik overgeslagen.",
-    stoppedRefused: "{name} is gestopt bij stap {step}: dat mag hier niet meer, dus de rest heb ik overgeslagen.",
-    withheldAnswer: "Het antwoord op stap {step} lees ik in een routine niet voor: het kan persoonlijk zijn.",
+    stoppedAt: "{name} is gestopt bij stap {step}: {why}. {before}",
+    whyRefused: "dat mag ik niet doen",
+    whyValues: "de waarden passen niet bij die actie",
+    stoppedFailed: "{name} is gestopt: stap {step} kon ik niet bevestigen, dus de rest heb ik overgeslagen. {before}",
+    beforeNone: "Daarvoor is niets gedaan.",
+    beforeOne: "Stap {list} is gedaan.",
+    beforeMany: "Stappen {list} zijn gedaan.",
+    alsoUnconfirmed: "Niet bevestigd: {steps}.",
     cutShort: "{name} is afgebroken doordat de routinemodule opnieuw startte; {done} van de {total} stappen waren klaar.",
-    cutShortCall: "{name} is afgebroken doordat de routinemodule opnieuw startte, tijdens stap {step}, die misschien wel en misschien niet is uitgevoerd."
+    cutShortCall: "{name} is afgebroken doordat de routinemodule opnieuw startte, tijdens stap {step}, die misschien wel en misschien niet is uitgevoerd.",
+    nothingRunning: "Hier loopt geen routine.",
+    cancelled: "Ik heb {name} gestopt; {done} van de {total} stappen waren klaar.",
+    cancelledCall: "Ik heb {name} gestopt tijdens stap {step}; die stap kan nog worden afgemaakt.",
+    noLine: "Die zin hoort bij geen routine die hier loopt."
   }
 })
 

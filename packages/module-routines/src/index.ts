@@ -1,18 +1,19 @@
-import { defineAction, defineModule, makeTool, type ModuleDefinition } from "@pva/core"
+import { ActionError, defineAction, defineModule, makeTool, type ModuleDefinition, Param } from "@pva/core"
 import { homeLanguage, type Language, say } from "@pva/module-contracts"
 import { Effect, Schema } from "effect"
-import { makeRunner, type Runner } from "./run.ts"
-import { findRoutine, nameIn, type Routine, routinesOf, settings } from "./routines.ts"
+import { LINE_ACTION, makeRunner, type Runner } from "./run.ts"
+import { CANCEL_PHRASES, findRoutine, MAX_STEPS, nameIn, type Routine, routinesOf, settings } from "./routines.ts"
 import { texts } from "./texts.ts"
 
-export { fitSpeech, joinList, SAY_WAIT_MS } from "./run.ts"
-export { GOOD_MORNING, MAX_ROUTINES, MAX_STEPS, parseSteps, routinesOf, routinesProblem, settings } from "./routines.ts"
+export { joinList, LINE_ACTION, MAX_REPLAYS, SAY_WAIT_MS } from "./run.ts"
+export { CANCEL_PHRASES, GOOD_MORNING, MAX_ROUTINES, MAX_STEPS, parseSteps, routinesOf, routinesProblem, settings } from "./routines.ts"
 export { texts } from "./texts.ts"
 
 /**
  * Routines the owner defines in settings, started by one of their phrases after the wake phrase (no model) or by the
- * tool `routines_run`. Each run is checked as a whole first, then runs in the module's shared part, one step after the
- * other, each through the gateway as the person and device that started it (docs/modules/routines.md).
+ * tool `routines_run`. What the catalogue can tell is checked first; then the steps run in the module's shared part,
+ * one after the other, each a gateway call as the person and device that started it, and the run stops where a step
+ * is refused (docs/modules/routines.md).
  */
 export const routinesModule = defineModule({
   apiVersion: 2,
@@ -36,7 +37,7 @@ export const routinesModule = defineModule({
       /** Start one routine as the calling turn; the answer is a refusal, or nothing (the routine speaks for itself). */
       const begin = (routine: Routine) => ctx.shared.start(routine, language())
 
-      const actions = routines.map((routine) => {
+      const routineActions = routines.map((routine) => {
         const phrases = {
           ...(routine.phrases.en.length > 0 ? { en: [...routine.phrases.en] } : {}),
           ...(routine.phrases.nl.length > 0 ? { nl: [...routine.phrases.nl] } : {})
@@ -54,15 +55,46 @@ export const routinesModule = defineModule({
           // Not a tool of its own: the model has `routines_run`. Its phrases are in the assistant's set all the same.
           offerAsTool: false,
           risk: "change",
-          run: () =>
-            Effect.map(begin(routine), (answer) => (answer.kind === "refused" ? { say: answer.text } : {}))
+          run: () => Effect.map(begin(routine), (answer) => (answer.kind === "refused" ? { say: answer.text } : {}))
         })
+      })
+
+      // A `say` step is a gateway call: the run calls this action as the person and device that started it, and it
+      // enqueues the current step's line of that run on that device and returns; the run waits for the line outside
+      // the turn. No phrases (it is not one of the 16), not a tool of the model, and it speaks no text it is given:
+      // only the line the owner wrote for that step of a run on that device.
+      const line = defineAction({
+        id: LINE_ACTION,
+        label: "Speak a routine's line",
+        description: "Used by a running routine for its say steps; never for a request of the person.",
+        examples: ["(a running routine's say step)"],
+        params: {
+          run: Param.number({ label: "Run", integer: true, min: 1 }),
+          step: Param.number({ label: "Step", integer: true, min: 1, max: MAX_STEPS })
+        },
+        offerAsTool: false,
+        risk: "change",
+        run: ({ run, step }) =>
+          Effect.flatMap(ctx.shared.enqueueLine(run, step), (ok) => (ok ? Effect.succeed({}) : Effect.fail(new ActionError({ message: say(texts, language(), "noLine") }))))
+      })
+
+      // The module's own way to cancel: the host's "stop" stops what the device is saying (which ends the routine when it
+      // is the routine's line) but gives a module no signal while an action runs. Offered as the tool `routines_stop`.
+      const stop = defineAction({
+        id: "stop",
+        label: "Cancel the routine",
+        description: "Cancel the routine running on this device: no further step starts and its line stops. An action already under way may still complete.",
+        examples: [...CANCEL_PHRASES.en, ...CANCEL_PHRASES.nl, "stop the good night routine"],
+        params: {},
+        phrases: { en: [...CANCEL_PHRASES.en], nl: [...CANCEL_PHRASES.nl] },
+        risk: "change",
+        run: () => Effect.map(ctx.shared.cancel(language()), (answer) => ({ say: answer.text }))
       })
 
       const run = makeTool({
         name: "routines_run",
         description:
-          "Start one of the owner's routines by its name on this device. It runs its steps by itself after you answer; a routine with a step this assistant may not do here is refused as a whole.",
+          "Start one of the owner's routines by its name on this device. It runs its steps by itself after you answer, each decided when it runs; it stops where a step is refused.",
         parameters: Schema.Struct({
           name: Schema.String.check(Schema.isMinLength(1), Schema.isMaxLength(80)).annotate({ description: "The routine's name, as the person said it" })
         }),
@@ -76,11 +108,10 @@ export const routinesModule = defineModule({
             if (found.kind === "none") return { spoken: say(texts, lang, "unknown") }
             if (found.kind === "ambiguous") {
               const names = found.routines.map((r) => nameIn(r.name, lang))
-              return { spoken: say(texts, lang, "which", { list: names.length <= 1 ? (names[0] ?? "") : `${names.slice(0, -1).join(", ")} ${say(texts, lang, "or")} ${names.at(-1)}` }) }
+              return { spoken: say(texts, lang, "which", { list: `${names.slice(0, -1).join(", ")} ${say(texts, lang, "or")} ${names.at(-1)}` }) }
             }
             const answer = yield* begin(found.routine)
-            const routineName = nameIn(found.routine.name, lang)
-            return answer.kind === "refused" ? { spoken: answer.text } : { spoken: say(texts, lang, "started", { name: routineName }) }
+            return answer.kind === "refused" ? { spoken: answer.text } : { spoken: say(texts, lang, "started", { name: nameIn(found.routine.name, lang) }) }
           })
       })
 
@@ -108,8 +139,8 @@ export const routinesModule = defineModule({
 
       return {
         tools: [run, list],
-        actions,
-        instructions: "When the person asks for one of the owner's routines by name, start it with routines_run; it speaks for itself."
+        actions: [...routineActions, line, stop],
+        instructions: "When the person asks for one of the owner's routines by name, start it with routines_run; it speaks for itself. To cancel one, use routines_stop."
       }
     })
 })

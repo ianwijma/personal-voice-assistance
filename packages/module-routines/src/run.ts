@@ -1,75 +1,69 @@
-// The run of a routine: checked as a whole before anything runs, then its steps one after the other in the module's
-// shared scope, each through the gateway as the person and device that started it. One state per routine (`running`),
-// one fiber per run, which a module stop interrupts.
-import { type CatalogAction, CurrentJob, CurrentPrincipal, CurrentTurn, CurrentTurnTrace, type ModuleHostApi, type ModuleSpeech, type TurnContext } from "@pva/core"
+// The run of a routine. Before it starts, what the action catalogue can tell is checked (a courtesy, not a guarantee);
+// then its steps run one after the other in the module's shared scope, each one admitted and decided by the gateway as
+// the person and device that started it, and the run stops, saying so in one true sentence, where a step is refused.
+// One state per running routine, one fiber per run, which a module stop interrupts; a cancel only sets a flag and stops
+// the line being spoken, so an action under way is never cut off in the middle.
+import { type CatalogAction, CurrentJob, CurrentPrincipal, CurrentTurn, CurrentTurnTrace, type ModuleHostApi, type ModuleSpeech, type SpeechHandle, type TurnContext } from "@pva/core"
 import { type Language, say } from "@pva/module-contracts"
-import { Effect, Exit, type Scope } from "effect"
+import { Deferred, Effect, Exit, type Scope } from "effect"
 import { nameIn, type Routine, type Step } from "./routines.ts"
 import { texts } from "./texts.ts"
 
-/** How long one `say` step may wait for its announcement to be spoken (it waits for quiet on the device first). */
+/** How long one `say` step may wait for its line to be spoken (it waits for quiet on the device first). */
 export const SAY_WAIT_MS = 120_000
-/** The longest line a step speaks: an announcement's bound. */
-export const SPEECH_CHARS = 300
+/** The internal action that speaks a `say` step's line: `routines.line`, no phrases, not a tool of the model. */
+export const LINE_ACTION = "line"
+/** Phrase starts remembered so that a replay of the same phrase turn starts nothing (finished ones; unfinished stay). */
+export const MAX_REPLAYS = 64
 
 /** Why a routine is refused before it runs (said in one sentence, the step by its number in the owner's list). */
 export type Refusal =
-  | { readonly kind: "noDevice" | "notHere" | "already" }
-  | { readonly kind: "refusedMissing" | "refusedConfirm" | "refusedUnchecked" | "refusedParams"; readonly step: number }
+  | { readonly kind: "noDevice" | "notHere" }
+  | { readonly kind: "already" | "busyHere"; readonly other: string }
+  | { readonly kind: "refusedMissing" | "refusedConfirm" | "refusedParams"; readonly step: number }
 
 export type StartAnswer = { readonly kind: "started" } | { readonly kind: "refused"; readonly refusal: Refusal; readonly text: string }
 
-/**
- * What a run is doing now: one per routine at a time. Its only continuation is the run's own fiber, and nothing but
- * that fiber ends it (a module stop interrupts it), so no other path can act for a run that is no longer current.
- */
+/** What a cancel answers (`routines_stop`, "cancel the routine"). */
+export type CancelAnswer = { readonly kind: "none"; readonly text: string } | { readonly kind: "cancelled"; readonly text: string; readonly inCall: boolean }
+
+/** What a run is doing now. One per routine, and one per device, at a time. */
 interface RunState {
   readonly runId: number
   readonly routine: Routine
+  readonly language: Language
   readonly deviceId: string
   /** The step being run (1-based, the owner's numbering); 0 before the first. */
   step: number
   /** Steps finished, whatever their outcome. */
   finished: number
-  /** A `call` step is under way: interrupted now, it may or may not have been done. */
+  /** A `call` step's action is under way: interrupted or cancelled now, it may or may not complete. */
   inCall: boolean
+  /** The line of the current `say` step, from its enqueue until it has ended. */
+  line: SpeechHandle | undefined
+  /** Cancelled by the person: no further step starts and nothing more is said. */
+  cancelled: boolean
 }
 
 export interface Runner {
-  /** Check the routine as the calling turn and, if every step may run, start it in the shared scope. Answers at once. */
+  /** Check the routine as the calling turn and, if the catalogue allows it, start it in the shared scope. Answers at once. */
   readonly start: (routine: Routine, language: Language) => Effect.Effect<StartAnswer>
+  /** Cancel the routine running for the calling turn's device. */
+  readonly cancel: (language: Language) => Effect.Effect<CancelAnswer>
+  /**
+   * The body of the internal line action: enqueue step `step`'s line of run `runId` on the calling device, for a turn of
+   * that run's device with `source: "routine"`, and keep its handle with the run. `false`: no such line here.
+   */
+  readonly enqueueLine: (runId: number, step: number) => Effect.Effect<boolean>
   /** The routines running now, by key. */
   readonly running: () => ReadonlySet<string>
 }
 
-/** The text of a step in the household's language. */
-const textOf = (text: Step & { readonly kind: "say" }, language: Language) => (typeof text.text === "string" ? text.text : text.text[language])
+/** The current line of a run, as the line action left it. */
+const lineOf = (state: RunState): SpeechHandle | undefined => state.line
 
-/**
- * A line another module answered, made fit to be spoken as an announcement: control characters become spaces, and a
- * line over the bound keeps its whole sentences (or, when the first alone is too long, its words up to the bound, cut
- * at a code point, with an ellipsis).
- */
-export const fitSpeech = (text: string, max = SPEECH_CHARS): string => {
-  // eslint-disable-next-line no-control-regex
-  const clean = text.replace(/[\u0000-\u001f\u007f-\u009f\u2028\u2029]+/g, " ").replace(/\s+/g, " ").trim()
-  if (clean.length <= max) return clean
-  let out = ""
-  for (const sentence of clean.split(/(?<=[.!?])\s+/)) {
-    const next = out === "" ? sentence : `${out} ${sentence}`
-    if (next.length > max) break
-    out = next
-  }
-  if (out !== "") return out
-  const points = Array.from(clean)
-  let cut = ""
-  for (const p of points) {
-    if (cut.length + p.length > max - 1) break
-    cut += p
-  }
-  const space = cut.lastIndexOf(" ")
-  return `${(space > max / 2 ? cut.slice(0, space) : cut).trimEnd()}…`
-}
+/** The text of a step in the household's language. */
+const textOf = (step: Step & { readonly kind: "say" }, language: Language) => (typeof step.text === "string" ? step.text : step.text[language])
 
 /** Whether the values a `call` step gives fit the action as the catalogue describes it (names, required ones, kinds). */
 const paramsFit = (action: CatalogAction, given: Readonly<Record<string, unknown>>): boolean => {
@@ -82,145 +76,231 @@ const paramsFit = (action: CatalogAction, given: Readonly<Record<string, unknown
   return action.params.every((p) => p.optional || p.kind === "boolean" || Object.hasOwn(given, p.name))
 }
 
+/** "1, 2 and 3" / "1, 2 en 3". */
+export const joinList = (items: ReadonlyArray<string>, last: string): string =>
+  items.length <= 1 ? (items[0] ?? "") : `${items.slice(0, -1).join(", ")} ${last} ${items[items.length - 1]}`
+
+const listOf = (language: Language, steps: ReadonlyArray<number>) => joinList(steps.map(String), language === "en" ? "and" : "en")
+
+/** "step 2" / "steps 2 and 4", in the language. */
+const stepsText = (language: Language, steps: ReadonlyArray<number>) => say(texts, language, steps.length === 1 ? "stepOne" : "stepsMany", { list: listOf(language, steps) })
+
+/** How far a run that stopped got: the steps before it that were done, and those it could not confirm. */
+const before = (language: Language, done: ReadonlyArray<number>, unconfirmed: ReadonlyArray<number>) => {
+  const doneText = done.length === 0
+    ? say(texts, language, "beforeNone")
+    : say(texts, language, done.length === 1 ? "beforeOne" : "beforeMany", { list: listOf(language, done) })
+  return unconfirmed.length === 0 ? doneText : `${doneText} ${say(texts, language, "alsoUnconfirmed", { steps: stepsText(language, unconfirmed) })}`
+}
+
+/** The sentence of a run that stopped at step `at`: refused there, its values did not fit, or the step before it failed (`stop_if_failed`). */
+export const stoppedSentence = (
+  language: Language,
+  name: string,
+  at: number,
+  why: "whyRefused" | "whyValues" | "failed",
+  done: ReadonlyArray<number>,
+  unconfirmed: ReadonlyArray<number>
+): string =>
+  why === "failed"
+    ? say(texts, language, "stoppedFailed", { name, step: at, before: before(language, done, unconfirmed.filter((n) => n !== at)) })
+    : say(texts, language, "stoppedAt", { name, step: at, why: say(texts, language, why), before: before(language, done, unconfirmed) })
+
 export const makeRunner = (deps: { readonly host: ModuleHostApi; readonly speech: ModuleSpeech; readonly scope: Scope.Scope; readonly moduleId: string }): Runner => {
   const { host, speech, scope } = deps
   const running = new Map<string, RunState>()
+  const byId = new Map<number, RunState>()
   let runs = 0
+  /** Phrase starts by their turn and routine: the first start's answer, for a replay of the same phrase turn. */
+  const replays = new Map<string, Deferred.Deferred<StartAnswer>>()
 
   const refusal = (refusal: Refusal, language: Language, name: string): StartAnswer => ({
     kind: "refused",
     refusal,
-    text: say(texts, language, refusal.kind, { name, ...("step" in refusal ? { step: refusal.step } : {}) })
+    text: say(texts, language, refusal.kind, { name, ...("step" in refusal ? { step: refusal.step } : {}), ...("other" in refusal ? { other: refusal.other } : {}) })
   })
 
   /**
-   * Every step checked as the turn that starts it, before anything runs: the routine's own action is offered to this
-   * assistant on this device, and each `call` names an action of its catalogue (the gateway's list: the module on for
-   * the assistant, the action not switched off, not every class it can have refused by the risk policy) that needs no
-   * confirmation, whose class does not depend on its values (then being listed means the policy allows it), and whose
-   * parameters the step's values fit.
+   * What the catalogue can tell, as the turn that starts it, before anything runs: the routine's own command (and,
+   * when it has a `say` step, the line action) is offered to this assistant on this device, and each `call` names an
+   * action of its catalogue (the module on for the assistant, the action not switched off, not every class it can have
+   * refused by the policy) that needs no confirmation and whose parameters the step's values fit by name and kind. A
+   * courtesy: each step is admitted and decided by the gateway again when it runs.
    */
-  const precheck = (routine: Routine): Effect.Effect<Refusal | { readonly kind: "ok"; readonly household: ReadonlySet<string> }> =>
+  const precheck = (routine: Routine): Effect.Effect<Refusal | undefined> =>
     Effect.gen(function*() {
       const catalogue = yield* host.actions.list
-      if (!catalogue.some((a) => a.id === `${deps.moduleId}.${routine.actionId}`)) return { kind: "notHere" }
-      const household = new Set<string>()
+      const offered = (id: string) => catalogue.some((a) => a.id === `${deps.moduleId}.${id}`)
+      if (!offered(routine.actionId)) return { kind: "notHere" }
+      if (routine.steps.some((s) => s.kind === "say") && !offered(LINE_ACTION)) return { kind: "notHere" }
       for (const [i, step] of routine.steps.entries()) {
         if (step.kind !== "call") continue
         const action = catalogue.find((a) => a.id === `${step.moduleId}.${step.actionId}`)
         if (action === undefined) return { kind: "refusedMissing", step: i + 1 }
         if (action.confirm) return { kind: "refusedConfirm", step: i + 1 }
-        if (action.risk === undefined) return { kind: "refusedUnchecked", step: i + 1 }
         if (!paramsFit(action, step.params)) return { kind: "refusedParams", step: i + 1 }
-        if (action.sensitivity === "household") household.add(action.id)
       }
-      return { kind: "ok", household }
+      return undefined
     })
 
-  /** One line on the run's device, waited for: spoken to its end, stopped there, or not spoken (skipped, failed, too late). */
-  const speak = (deviceId: string, text: string): Effect.Effect<"spoken" | "stopped" | "not-spoken"> =>
-    Effect.gen(function*() {
-      const handle = yield* speech.say({ device: deviceId }, text)
-      if (!handle.deliveries.some((d) => d.queued)) return "not-spoken" as const
-      const outcomes = yield* handle.done.pipe(
-        Effect.timeoutOrElse({ duration: SAY_WAIT_MS, orElse: () => Effect.andThen(handle.stop, Effect.succeed(undefined)) })
-      )
-      const mine = outcomes?.find((o) => o.deviceId === deviceId)
-      return mine?.outcome === "spoken" ? "spoken" as const : mine?.outcome === "stopped" ? "stopped" as const : "not-spoken" as const
-    }).pipe(Effect.catch(() => Effect.succeed("not-spoken" as const)))
+  /** A line said by the run itself (its closing sentence), not waited for; nothing of it can hold the run up. */
+  const tell = (deviceId: string, text: string) => Effect.ignore(Effect.catchDefect(speech.say({ device: deviceId }, text), () => Effect.void))
 
-  /** A line said when the run ends, not waited for in a way that could hold anything up. */
-  const tell = (deviceId: string, text: string) => Effect.ignore(speak(deviceId, text))
+  /**
+   * Wait for a line to end: spoken, stopped there, or not spoken (skipped, failed, past `SAY_WAIT_MS`). A timeout stops
+   * the line through its handle, queued or playing; an interruption is the run's: its finalizer stops `state.line`.
+   */
+  const waitLine = (deviceId: string, handle: SpeechHandle): Effect.Effect<"spoken" | "stopped" | "not-spoken"> =>
+    handle.done.pipe(
+      Effect.timeoutOrElse({ duration: SAY_WAIT_MS, orElse: () => Effect.as(handle.stop, undefined) }),
+      Effect.map((outcomes) => {
+        const mine = outcomes?.find((o) => o.deviceId === deviceId)
+        return mine?.outcome === "spoken" ? "spoken" as const : mine?.outcome === "stopped" ? "stopped" as const : "not-spoken" as const
+      }),
+      Effect.catch(() => Effect.as(handle.stop, "not-spoken" as const))
+    )
 
-  /** The steps, one after the other, as the starting turn (`source: "routine"`); outside any turn for speech. */
-  const runSteps = (state: RunState, stepTurn: TurnContext, household: ReadonlySet<string>, language: Language): Effect.Effect<void> =>
+  /** The steps, one after the other, each a gateway call as the starting turn (`source: "routine"`); waits outside any turn. */
+  const runSteps = (state: RunState, stepTurn: TurnContext): Effect.Effect<void> =>
     Effect.gen(function*() {
-      const { routine, deviceId } = state
+      const { routine, deviceId, language } = state
       const name = nameIn(routine.name, language)
       const asStep = <A>(effect: Effect.Effect<A>) => Effect.provideService(effect, CurrentTurn, stepTurn)
       let lastFailed = false
       let spoke = false
+      const done: Array<number> = []
       const unconfirmed: Array<number> = []
+      /** The run stops at step `at`, which the gateway refused or whose values did not fit: one sentence, how far it got. */
+      const stopAt = (at: number, why: "whyRefused" | "whyValues" | "failed") => tell(deviceId, stoppedSentence(language, name, at, why, done, unconfirmed))
       for (const [i, step] of routine.steps.entries()) {
+        if (state.cancelled) return
         state.step = i + 1
         if (step.kind === "stop_if_failed") {
-          if (lastFailed) return yield* tell(deviceId, say(texts, language, "stoppedFailed", { name, step: i }))
+          if (lastFailed) return yield* stopAt(i, "failed")
           state.finished = i + 1
           continue
         }
-        if (step.kind === "say") {
-          // The step's own check, as the person and device that started it: the routine is still offered here.
-          const catalogue = yield* asStep(host.actions.list)
-          if (!catalogue.some((a) => a.id === `${deps.moduleId}.${routine.actionId}`)) return yield* tell(deviceId, say(texts, language, "stoppedRefused", { name, step: i + 1 }))
-          const outcome = yield* speak(deviceId, textOf(step, language))
-          state.finished = i + 1
-          // Stopped on the device (the spoken "stop", the page's Stop, a reply taking the speaker): the person ended it.
-          if (outcome === "stopped") return
-          lastFailed = outcome !== "spoken"
-          if (lastFailed) unconfirmed.push(i + 1)
-          else spoke = true
-          continue
-        }
-        state.inCall = true
-        const result = yield* asStep(host.actions.run({ moduleId: step.moduleId, actionId: step.actionId, params: step.params }))
+        // Every step is a gateway call: a `say` through the module's own line action, a `call` through the action named.
+        const request = step.kind === "say"
+          ? { moduleId: deps.moduleId, actionId: LINE_ACTION, params: { run: state.runId, step: i + 1 } }
+          : { moduleId: step.moduleId, actionId: step.actionId, params: step.params }
+        state.inCall = step.kind === "call"
+        state.line = undefined
+        const result = yield* asStep(host.actions.run(request))
         state.inCall = false
-        state.finished = i + 1
+        // The line action set it while it ran (read through a function: the compiler cannot see that write).
+        const line = lineOf(state)
+        if (state.cancelled) {
+          if (line !== undefined) yield* line.stop
+          return
+        }
         if (!result.ok) {
-          // A refusal now (the policy, the assistant's switches or the device changed since the check): stop here.
-          if (result.code === "refused" || result.code === "needs_confirmation") return yield* tell(deviceId, say(texts, language, "stoppedRefused", { name, step: i + 1 }))
+          state.finished = i + 1
+          // Refused now (the policy, the assistant's switches or the device changed), or values that do not fit: stop here.
+          if (result.code === "refused" || result.code === "needs_confirmation") return yield* stopAt(i + 1, "whyRefused")
+          if (result.code === "invalid_params") return yield* stopAt(i + 1, "whyValues")
           lastFailed = true
           unconfirmed.push(i + 1)
           continue
         }
-        lastFailed = false
-        if (result.say !== undefined && result.say.trim() !== "") {
-          // The action ran as this turn and answered for this device: said here, and nowhere else. An answer that may
-          // be someone's personal content (the action does not declare it the household's) is not read out: the run
-          // gets no owner with it to ask the privacy rule about, so it says that it kept it back.
-          const outcome = yield* speak(deviceId, household.has(`${step.moduleId}.${step.actionId}`) ? fitSpeech(result.say) : say(texts, language, "withheldAnswer", { step: i + 1 }))
-          if (outcome === "stopped") return
-          if (outcome === "spoken") spoke = true
+        if (step.kind === "call") {
+          // A called action's answer is never read out: it does not say whose content it is (docs/modules/routines.md).
+          state.finished = i + 1
+          lastFailed = false
+          done.push(i + 1)
+          continue
+        }
+        const outcome = line === undefined ? "not-spoken" as const : yield* waitLine(deviceId, line)
+        state.line = undefined
+        state.finished = i + 1
+        // Stopped on the device (the spoken "stop", the page's Stop, a reply taking the speaker) or cancelled: it ends here.
+        if (outcome === "stopped" || state.cancelled) return
+        lastFailed = outcome !== "spoken"
+        if (lastFailed) unconfirmed.push(i + 1)
+        else {
+          spoke = true
+          done.push(i + 1)
         }
       }
-      if (unconfirmed.length > 0) {
-        const list = unconfirmed.map(String)
-        const steps = say(texts, language, list.length === 1 ? "stepOne" : "stepsMany", { list: joinList(list, language === "en" ? "and" : "en") })
-        yield* tell(deviceId, say(texts, language, "doneUnconfirmed", { name, steps }))
-      } else if (!spoke) yield* tell(deviceId, say(texts, language, "doneQuiet", { name }))
+      if (state.cancelled) return
+      if (unconfirmed.length > 0) yield* tell(deviceId, say(texts, language, "doneUnconfirmed", { name, steps: stepsText(language, unconfirmed) }))
+      else if (!spoke) yield* tell(deviceId, say(texts, language, "doneQuiet", { name }))
     }).pipe(
-      // The module stopped (a restart, a settings save, the server shutting down): nothing resumes. Said on the device
-      // while the part is still closing; a server that is going down may not get to say it.
+      // The module stopped (a restart, a settings save, the server shutting down): nothing resumes. The line of the
+      // run is stopped first (queued or playing), then the device is told, while the part is still closing.
       Effect.onInterrupt(() =>
-        Effect.suspend(() => {
-          const name = nameIn(state.routine.name, language)
+        Effect.gen(function*() {
+          if (state.line !== undefined) yield* state.line.stop
+          if (state.cancelled) return
+          const name = nameIn(state.routine.name, state.language)
           const text = state.inCall
-            ? say(texts, language, "cutShortCall", { name, step: state.step })
-            : say(texts, language, "cutShort", { name, done: state.finished, total: state.routine.steps.length })
-          return speech.say({ device: state.deviceId }, text).pipe(Effect.ignore, Effect.catchDefect(() => Effect.void))
-        })
+            ? say(texts, state.language, "cutShortCall", { name, step: state.step })
+            : say(texts, state.language, "cutShort", { name, done: state.finished, total: state.routine.steps.length })
+          yield* tell(state.deviceId, text)
+        }).pipe(Effect.catchDefect(() => Effect.void))
       )
     )
 
-  const start = (routine: Routine, language: Language): Effect.Effect<StartAnswer> =>
+  const enqueueLine = (runId: number, step: number): Effect.Effect<boolean> =>
     Effect.gen(function*() {
       const turn = yield* CurrentTurn
+      const state = byId.get(runId)
+      const s = state?.routine.steps[step - 1]
+      // Only the current step's line of a run on this very device, called by that run.
+      if (state === undefined || s?.kind !== "say" || state.step !== step || turn?.source !== "routine" || turn.deviceId !== state.deviceId || state.cancelled) return false
+      // Enqueued and kept in one uninterruptible step: whatever interrupts the run afterwards finds the handle to stop.
+      return yield* Effect.uninterruptible(
+        speech.say({ device: state.deviceId }, textOf(s, state.language)).pipe(
+          Effect.map((handle) => {
+            state.line = handle
+            return true
+          }),
+          Effect.catch(() => Effect.succeed(false))
+        )
+      )
+    })
+
+  const cancel = (language: Language): Effect.Effect<CancelAnswer> =>
+    Effect.gen(function*() {
+      const turn = yield* CurrentTurn
+      const state = [...running.values()].find((r) => r.deviceId === turn?.deviceId && !r.cancelled)
+      if (state === undefined) return { kind: "none" as const, text: say(texts, language, "nothingRunning") }
+      state.cancelled = true
+      const name = nameIn(state.routine.name, language)
+      const inCall = state.inCall
+      // How far it got, read before anything moves on.
+      const answer: CancelAnswer = inCall
+        ? { kind: "cancelled", inCall, text: say(texts, language, "cancelledCall", { name, step: state.step }) }
+        : { kind: "cancelled", inCall, text: say(texts, language, "cancelled", { name, done: state.finished, total: state.routine.steps.length }) }
+      // No further step starts. The line being spoken (or waiting) stops now; an action under way is left to finish.
+      if (state.line !== undefined) yield* state.line.stop
+      return answer
+    })
+
+  /** Start for real: reserve, check, fork. */
+  const begin = (routine: Routine, language: Language, turn: TurnContext & { readonly deviceId: string }): Effect.Effect<StartAnswer> =>
+    Effect.gen(function*() {
       const name = nameIn(routine.name, language)
-      if (turn?.deviceId === undefined || turn.assistantId === undefined) return refusal({ kind: "noDevice" }, language, name)
-      // A second start while it runs is refused (it does not join): one run per routine at a time, reserved at once.
-      if (running.has(routine.key)) return refusal({ kind: "already" }, language, name)
-      const state: RunState = { runId: ++runs, routine, deviceId: turn.deviceId, step: 0, finished: 0, inCall: false }
+      // A second start while it runs is refused (it does not join); so is a start on a device already running one.
+      if (running.has(routine.key)) return refusal({ kind: "already", other: name }, language, name)
+      const here = [...running.values()].find((r) => r.deviceId === turn.deviceId)
+      if (here !== undefined) return refusal({ kind: "busyHere", other: nameIn(here.routine.name, language) }, language, name)
+      const state: RunState = { runId: ++runs, routine, language, deviceId: turn.deviceId, step: 0, finished: 0, inCall: false, line: undefined, cancelled: false }
       running.set(routine.key, state)
+      byId.set(state.runId, state)
       const release = Effect.sync(() => {
         if (running.get(routine.key)?.runId === state.runId) running.delete(routine.key)
+        byId.delete(state.runId)
       })
-      const checked = yield* precheck(routine).pipe(Effect.onExit((exit) => (Exit.isFailure(exit) ? release : Effect.void)))
-      if (checked.kind !== "ok") {
+      const problem = yield* precheck(routine).pipe(Effect.onExit((exit) => (Exit.isFailure(exit) ? release : Effect.void)))
+      if (problem !== undefined) {
         yield* release
-        return refusal(checked, language, name)
+        return refusal(problem, language, name)
       }
       const stepTurn: TurnContext = { ...turn, source: "routine" }
-      // Outside the turn that started it: no turn, trace, job or principal of its own; each step names its turn.
-      const run = runSteps(state, stepTurn, checked.household, language).pipe(
+      // Outside the turn that started it: no turn, trace, job or principal of its own; each step names its turn. The
+      // starting turn's trace is not kept open: the gateway records each step's decision (docs/modules/routines.md).
+      const run = runSteps(state, stepTurn).pipe(
         Effect.ensuring(release),
         Effect.provideService(CurrentTurn, undefined),
         Effect.provideService(CurrentTurnTrace, undefined),
@@ -231,9 +311,38 @@ export const makeRunner = (deps: { readonly host: ModuleHostApi; readonly speech
       return { kind: "started" as const }
     })
 
-  return { start, running: () => new Set(running.keys()) }
-}
+  const start = (routine: Routine, language: Language): Effect.Effect<StartAnswer> =>
+    Effect.gen(function*() {
+      const turn = yield* CurrentTurn
+      if (turn?.deviceId === undefined || turn.assistantId === undefined) return refusal({ kind: "noDevice" }, language, nameIn(routine.name, language))
+      const asked = { ...turn, deviceId: turn.deviceId }
+      // The model's calls run every time. A phrase heard once starts once: a replay of the same phrase turn gets the
+      // first start's answer (reserved before any wait), and runs nothing.
+      if (turn.source !== "phrase") return yield* begin(routine, language, asked)
+      const key = JSON.stringify([turn.assistantId, turn.conversationId, turn.turnId, turn.deviceId, routine.key])
+      const known = replays.get(key)
+      if (known !== undefined) return yield* Deferred.await(known)
+      const first = Deferred.makeUnsafe<StartAnswer>()
+      replays.set(key, first)
+      const answer = yield* begin(routine, language, asked).pipe(
+        Effect.onExit((exit) =>
+          Effect.sync(() => {
+            if (Exit.isSuccess(exit)) Deferred.doneUnsafe(first, Effect.succeed(exit.value))
+            else {
+              // Interrupted before it answered: a replay waiting for it is interrupted too, and a later one starts afresh.
+              replays.delete(key)
+              Deferred.doneUnsafe(first, Effect.interrupt)
+            }
+          })
+        )
+      )
+      // Bounded: the oldest finished starts go first; one still unfinished is never dropped.
+      for (const [k, d] of replays) {
+        if (replays.size <= MAX_REPLAYS) break
+        if (Deferred.isDoneUnsafe(d)) replays.delete(k)
+      }
+      return answer
+    })
 
-/** "1, 2 and 3" / "1, 2 of 3" / "1 en 2". */
-export const joinList = (items: ReadonlyArray<string>, last: string): string =>
-  items.length <= 1 ? (items[0] ?? "") : `${items.slice(0, -1).join(", ")} ${last} ${items[items.length - 1]}`
+  return { start, cancel, enqueueLine, running: () => new Set(running.keys()) }
+}

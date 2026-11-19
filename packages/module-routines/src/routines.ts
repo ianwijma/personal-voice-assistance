@@ -4,8 +4,11 @@ import { PHRASE_LIMITS, phraseProblems, phraseWords, Setting } from "@pva/core"
 import { isLine } from "@pva/module-contracts"
 import { Exit, Schema } from "effect"
 
-/** The most routines: one phrase-command action each, and an instance may have at most 16 actions with phrases. */
-export const MAX_ROUTINES = PHRASE_LIMITS.actionsPerModule
+/**
+ * The most routines: one phrase-command action each, and an instance may have at most 16 actions with phrases, one of
+ * which is the module's own "cancel the routine".
+ */
+export const MAX_ROUTINES = PHRASE_LIMITS.actionsPerModule - 1
 /** Phrases of one routine in one language: the host's bound for one action. */
 export const MAX_PHRASES = PHRASE_LIMITS.phrasesPerAction
 /** Steps of one routine. */
@@ -19,6 +22,9 @@ export const SAY_CHARS = 300
 /** Parameters of one `call` step, and the characters of one text value. */
 export const MAX_PARAMS = 8
 export const PARAM_TEXT_CHARS = 200
+
+/** The phrases of the module's own command that cancels the routine running on a device (never the bare "stop"). */
+export const CANCEL_PHRASES = { en: ["cancel the routine"], nl: ["annuleer de routine"] } as const
 
 /** `<moduleId>.<actionId>`, as an action's identity is written (docs/MODULES.md §10). */
 const CALL_ID = /^([a-z0-9][a-z0-9-]{0,63})\.([a-z][a-z0-9_]{0,39})$/
@@ -115,7 +121,7 @@ export const parseSteps = (text: string): ReadonlyArray<Step> | string => {
 export const wordsKey = (text: string): string => phraseWords(text).map((w) => w.norm).join(" ")
 
 /** Words dropped before a spoken name is matched ("run the bedtime routine" → "bedtime"). */
-const FILLERS = new Set(["the", "a", "an", "my", "our", "routine", "de", "het", "een", "mijn", "onze", "routine", "please", "graag"])
+const FILLERS = new Set(["the", "a", "an", "my", "our", "routine", "de", "het", "een", "mijn", "onze", "please", "graag"])
 
 /** A name's words without fillers, for matching what someone said. */
 export const nameWords = (text: string): ReadonlyArray<string> => phraseWords(text).map((w) => w.norm).filter((w) => !FILLERS.has(w))
@@ -164,6 +170,7 @@ export const routinesProblem = (list: ReadonlyArray<SavedRoutine>): string | und
         const problem = phraseProblem(language, phrase)
         const which = language === "en" ? "English" : "Dutch"
         if (problem !== undefined) return `Routine "${r.name}", ${which} phrase "${phrase}": ${problem}`
+        if (CANCEL_PHRASES[language].some((c) => wordsKey(c) === wordsKey(phrase))) return `Routine "${r.name}", ${which} phrase "${phrase}": it is the phrase that cancels a running routine`
         const shape = `${language}:${wordsKey(phrase)}`
         const owner = phrases.get(shape)
         if (owner !== undefined) {
@@ -191,7 +198,7 @@ export const settings = {
     description:
       `At most ${MAX_ROUTINES}. Each has a name, up to ${MAX_PHRASES} phrases per language that start it after the wake phrase with no model, and its steps as JSON: ` +
       "{ \"say\": \"text\" } speaks on the device that started it, { \"call\": \"module.action\", \"params\": { … } } runs an action of that assistant, " +
-      "{ \"stop_if_failed\": true } stops when the step before did not work. A routine with a step the assistant may not do is refused as a whole.",
+      "{ \"stop_if_failed\": true } stops when the step before did not work. Each step is decided when it runs; the routine stops where one is refused. An action's answer is never read out.",
     itemLabel: "routine",
     titleKey: "name",
     maxItems: MAX_ROUTINES,
@@ -207,7 +214,7 @@ export const settings = {
   goodMorning: Setting.boolean({
     label: "Good morning routine",
     description:
-      "Adds the template \"Good morning\" (\"goedemorgen\"): a greeting, the time (clock) and the weather. Left out while 16 routines of yours are set, or one of yours has its name or phrase.",
+      "Adds the template \"Good morning\" (\"goedemorgen\"): a greeting to build on. Left out while 15 routines of yours are set, or one of yours has its name or phrase.",
     default: false
   })
 }
@@ -230,11 +237,7 @@ export interface Routine {
 export const GOOD_MORNING = {
   name: { en: "Good morning", nl: "Goedemorgen" },
   phrases: { en: ["good morning"], nl: ["goedemorgen"] },
-  steps: [
-    { kind: "say", text: { en: "Good morning!", nl: "Goedemorgen!" } },
-    { kind: "call", moduleId: "clock", actionId: "time_now", params: {} },
-    { kind: "call", moduleId: "weather", actionId: "today", params: {} }
-  ] satisfies ReadonlyArray<Step>
+  steps: [{ kind: "say", text: { en: "Good morning! Have a good day.", nl: "Goedemorgen! Een fijne dag." } }] satisfies ReadonlyArray<Step>
 } as const
 
 /** A name in the household's language. */
@@ -270,20 +273,26 @@ export const routinesOf = (values: { readonly routines: ReadonlyArray<SavedRouti
   return out
 }
 
-/** Which routines a spoken name means: one, several (ask), or none. Whole words, fillers dropped; an exact name wins. */
+/**
+ * Which routines a spoken name means: one, several (ask), or none. First a saved name exactly as said (its words, so
+ * case, accents and punctuation do not count; a name made only of words like "the" or "my routine" is found too), then
+ * one of its phrases exactly, then the same with filler words dropped, then whole-word containment.
+ */
 export const findRoutine = (routines: ReadonlyArray<Routine>, spoken: string, language: "en" | "nl"): { readonly kind: "found"; readonly routine: Routine } | { readonly kind: "ambiguous"; readonly routines: ReadonlyArray<Routine> } | { readonly kind: "none" } => {
+  const namesOf = (r: Routine) => (typeof r.name === "string" ? [r.name] : [r.name.en, r.name.nl])
+  const one = (found: ReadonlyArray<Routine>) =>
+    found.length === 1 ? { kind: "found" as const, routine: found[0]! } : found.length > 1 ? { kind: "ambiguous" as const, routines: found } : undefined
+  const whole = wordsKey(spoken)
+  if (whole === "") return { kind: "none" }
+  const byName = one(routines.filter((r) => namesOf(r).some((n) => wordsKey(n) === whole)))
+  if (byName !== undefined) return byName
+  const byPhrase = one(routines.filter((r) => r.phrases[language].some((p) => wordsKey(p) === whole)))
+  if (byPhrase !== undefined) return byPhrase
   const said = nameWords(spoken)
   if (said.length === 0) return { kind: "none" }
-  const namesOf = (r: Routine) => (typeof r.name === "string" ? [r.name] : [r.name.en, r.name.nl])
   const same = (a: ReadonlyArray<string>, b: ReadonlyArray<string>) => a.length === b.length && a.every((w, i) => w === b[i])
-  const exact = routines.filter((r) =>
-    namesOf(r).some((n) => same(nameWords(n), said)) || r.phrases[language].some((p) => same(nameWords(p), said))
-  )
-  if (exact.length === 1) return { kind: "found", routine: exact[0]! }
-  if (exact.length > 1) return { kind: "ambiguous", routines: exact }
-  const contains = (whole: ReadonlyArray<string>, part: ReadonlyArray<string>) => part.length > 0 && part.every((w) => whole.includes(w))
-  const partial = routines.filter((r) => namesOf(r).some((n) => contains(nameWords(n), said) || contains(said, nameWords(n))))
-  if (partial.length === 1) return { kind: "found", routine: partial[0]! }
-  if (partial.length > 1) return { kind: "ambiguous", routines: partial }
-  return { kind: "none" }
+  const loose = one(routines.filter((r) => namesOf(r).some((n) => same(nameWords(n), said)) || r.phrases[language].some((p) => same(nameWords(p), said))))
+  if (loose !== undefined) return loose
+  const contains = (all: ReadonlyArray<string>, part: ReadonlyArray<string>) => part.length > 0 && part.every((w) => all.includes(w))
+  return one(routines.filter((r) => namesOf(r).some((n) => contains(nameWords(n), said) || contains(said, nameWords(n))))) ?? { kind: "none" }
 }
