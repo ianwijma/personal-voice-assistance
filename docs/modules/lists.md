@@ -163,7 +163,9 @@ more are open than are shown, so what is not shown is counted and never hidden):
   last shown, and the work still owed (show it, take it down, remove the row) with its attempts and next try. Every
   write of a pin is one transaction that records what is owed then. One function, `reconcile(device)`, reads the row and
   the list as they are and does what is owed; a worker of the `shared` part runs it, under the module's one permit,
-  off the path of the call that asked.
+  off the path of the call that asked. The row is written before the screen is touched (a first show, or a changed
+  content with its new end, is recorded as owed first and cleared after the show), so an interruption or a restart
+  leaves work that reconciliation finishes, and a checklist is never on a screen without a row.
 - **When the list changes.** Every committed change of the module's lists (a voice add or tick, a tool,
   `lists_update`, undo, the `Lists` service, the daily clean-up, deleting the list) names the lists it wrote; their
   pins are found through the `list` index, a page of 16 at a time until the end, and reconciled at once. A change that
