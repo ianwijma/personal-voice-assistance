@@ -2,7 +2,8 @@
 // - H2 (finding 2): a generated action tool's classifier judges the action's own outcome, before it is formatted or
 //   handed to the Presenter; only an admitted outcome is formatted, spoken or shown.
 // - H3 (finding 3): a failure or a defect is covered by the decision its result would have had: fixed household passes;
-//   fixed personal only where its result could be shown; a classifier cannot be asked about a failure, so withheld. The
+//   fixed personal only where its result could be shown; with per-result sensitivity (after review 2, H3') a typed failure
+//   is the module's own sentence and goes back as it is, a defect is withheld. The
 //   host's own refusals (validation, access, policy) stay as they are.
 // - H4 (finding 4): an unknown owner cannot be a person id, so it is withheld before any membership lookup, also when a
 //   household member's id is the word "unknown"; a classifier that throws falls back to it.
@@ -132,13 +133,17 @@ describe("H3: a failure is covered by the same decision as a result", () => {
       assert.strictEqual((yield* runIn(yes.gateway, [crashing(personal)], "crashed")).content, "Tool crashed: Error: PRIVATE-DEFECT-CONTENT")
     }))
 
-  it.effect("a classifier of the result cannot be asked about a failure: withheld even where its result could be shown", () =>
+  it.effect("H3' (after review 2): per-result sensitivity: a typed failure is the module's own sentence on both devices; a defect is withheld on both", () =>
     Effect.gen(function*() {
-      const yes = gatewayWith(true)
-      const dynamic = () => ({ kind: "household" as const })
-      const failed = yield* runIn(yes.gateway, [failing(dynamic)], "failed")
-      const crashed = yield* runIn(yes.gateway, [crashing(dynamic)], "crashed")
-      assert.deepStrictEqual([failed.content, failed.isError, crashed.content, crashed.isError], [WITHHELD, true, WITHHELD, true])
+      const dynamic = () => ({ kind: "personal" as const, owner: "p-sam" })
+      for (const may of [true, false]) {
+        const g = gatewayWith(may)
+        const failed = yield* runIn(g.gateway, [failing(dynamic)], "failed")
+        const crashed = yield* runIn(g.gateway, [crashing(dynamic)], "crashed")
+        assert.deepStrictEqual([failed.content, failed.isError, crashed.content, crashed.isError], ["PRIVATE-FAILURE-CONTENT", true, WITHHELD, true], `may: ${may}`)
+        // The failure is not marked withheld; the defect is.
+        assert.deepStrictEqual(g.records.map((r) => r.withheld === true), [false, true], `may: ${may}`)
+      }
     }))
 
   it.effect("fixed household passes as before; the host's own refusals (validation, policy) are its own words", () =>
@@ -218,8 +223,9 @@ describe("H3 for generated actions: a typed failure and a defect, fixed personal
   ]
   for (const c of cases) {
     for (const may of [true, false]) {
-      // Shown only for a fixed personal sensitivity on a device that may reveal it; a classifier is never asked.
-      const shown = c.sensitivity === "fixed" && may
+      // H3' (after review 2): a fixed personal failure or defect is shown where its result could be; with per-result
+      // sensitivity a typed failure is the module's own sentence everywhere and a defect is withheld everywhere.
+      const shown = c.sensitivity === "fixed" ? may : c.failure === "typed"
       it.effect(`${c.failure} failure, ${c.sensitivity} sensitivity, the device ${may ? "may" : "may not"} reveal it: ${shown ? "its text" : "withheld"}`, () =>
         Effect.gen(function*() {
           const { CurrentTurnTrace, makeTurnTrace } = yield* Effect.promise(() => import("../src/TurnTrace.ts"))

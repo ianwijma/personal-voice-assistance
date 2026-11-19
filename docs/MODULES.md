@@ -379,10 +379,12 @@ gateway enforces it for a tool's result on its way back to the model**: a `perso
 a fixed sentence ("Withheld: …") and nothing of the result, and nothing of it is presented. For an action called as a
 tool, the classifier receives **the action's own outcome** (`ActionOutcome`: its `say`, `present`, …), before it is
 formatted or shown. **A failure is covered too**: a `ToolError`, an `ActionError` or a defect of a tool or action whose
-results are fixed `personal` is withheld where such a result would be ("Withheld: …", still an error result); a
-classifier of the result cannot be asked about a failure, so a failure of a tool with a classifier is always withheld
-from the model. Write failure messages that help the person, and expect them to be withheld from shared and public
-devices. `personal` without a known owner (`sensitivity: "personal"`, or a classifier that throws or answers nonsense)
+results are fixed `personal` is withheld where such a result would be ("Withheld: …", still an error result). With
+`sensitivity` decided per result (a function), a classifier cannot be asked about a failure: a defect (a crash) is
+withheld from the model everywhere, but a typed failure (`ToolError`, `ActionError`) is your module's own sentence and
+goes back as it is, so **a failure sentence of a tool with per-result sensitivity is not withheld and must not carry
+personal content** ("The calendar could not be read just now", never the event it could not save). Write failure
+messages that help the person. `personal` without a known owner (`sensitivity: "personal"`, or a classifier that throws or answers nonsense)
 is someone else's: it is withheld everywhere, also on a private device. A result is decided once, when its tool
 finishes; it is not checked again while it waits for sibling tools (serve ends a device's session when its privacy
 changes). A job, a route and `host.actions.run` hand results to module code, not to a model, and a job has no asking
@@ -668,6 +670,10 @@ content with no known owner is treated as someone else's. So:
 - **A confirmation is revealing too.** A public screen can have a default person: the write then has its owner, and
   the confirmation still must not repeat the personal text there. Ask `Privacy.mayReveal(owner, turn)` before you
   echo it, and say that it was saved without the text when it says no ("Pinned, only for you.").
+- **Your `sensitivity` answer is what the gateway acts on** (§4). A result you already reduced so it names no detail
+  (that quiet confirmation) is household: classify it so, or the gateway withholds it where its owner may not be
+  revealed. A failure sentence of a tool with per-result sensitivity is never withheld: it must not carry personal
+  content.
 - **Ask `Privacy.mayReveal` at the moment of revealing**, for that device (the reference module's read tool above). When
   it says no: on a known `shared` device, for a member, you may reduce it to what names no detail ("Sam has two things
   today") where your module's document says so; on a `public` or unknown device, or for an owner who is not a member,
