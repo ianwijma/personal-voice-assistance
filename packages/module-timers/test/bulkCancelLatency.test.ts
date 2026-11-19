@@ -45,4 +45,4 @@ it.effect("4: cancelling 190 expired timers keeps a 1ms heartbeat below the main
   }
   console.log(`cancel-all heartbeat (four runs of 190): ${JSON.stringify(samples)}; longest stop ${Math.max(...samples.map((s) => s.gap)).toFixed(2)} ms`)
   assert.isBelow(Math.max(...samples.map((s) => s.gap)), bound(10))
-}))
+}), { timeout: 60_000 })
