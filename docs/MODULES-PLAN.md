@@ -197,10 +197,14 @@ modules built early, and P7 to P10 are built as small first versions:
 4. **Wave B: the modules that need them**: timers-and-alarms, reminders, notifications, assistant-controls, music,
    routines-and-automations, broadcast, images-and-photos; and the phrase commands and presentations wave A left
    out, as one small PR per module.
-5. **Later, not in this piece of work**: connections and OAuth (the rest of P8) with the google and t3-code
-   modules; mcp-client, because `@pva/net` fetches with GET and HEAD only and an MCP client needs POST with
-   streamed answers to an address the owner typed; CalDAV in the calendar module, for the same reason; and
-   calls-and-intercom with the `call` guard. They get their own plan.
+5. **Later, not in this piece of work**: accounts and OAuth (the rest of P8) with the google and t3-code
+   modules; mcp-client, because an MCP client needs streamed answers (`@pva/net` can since send one JSON POST to an
+   address the owner typed, but cannot stream or hold a socket); CalDAV in the calendar module, which needs request
+   kinds the helper does not make; and calls-and-intercom with the `call` guard. Their plan is
+   [MODULES-DEFERRED-PLAN.md](MODULES-DEFERRED-PLAN.md), whose §13 also lists where this document is stale in the
+   light of the code (among them: `ctx.connections` is renamed to accounts there, because a connection already
+   means a browser tab in the code; the two outside client libraries of Appendix A are not to be used, because they
+   make their own network requests).
 
 ### P1. Module API v2, tool context, the execution gateway
 
@@ -514,6 +518,15 @@ The scheduler does one thing: it calls a module's handler at a time, once.
 - An utterance that is not taken goes through the gates exactly as today; the PR shows that with `TurnTrace`.
 - Not now: typed actions before the model, switching the assistant, sleep, microphone mute, earcons, wake-free
   control while a reply is audible.
+- **Decided after review round 1** (24 blocking findings): a phrase command is `phrases` on an existing action; a
+  slot is a number, a duration, a fixed choice of at most 32 declared values, or text, and never asks a module for a
+  list (matching against a module's list of names on the matching path stopped the main thread for over 200 ms; a
+  module that needs a room's name takes text and resolves it in its action); matching is exact and fails closed (a
+  search that used up its budget means the utterance is not taken); phrase sets are prepared ahead and a recogniser
+  final only reads a ready one; every taken utterance ends in one settlement (the command's answer in its own
+  assistant's voice, then the interrupted reply in its voice) and has an execution trace; a cancelled utterance runs
+  nothing; the host's controls are never refused as busy; "stop" picks the first of a ring, an announcement, the
+  reply, room media.
 
 The fast path the basics need: commands that run without the language model.
 
@@ -616,8 +629,18 @@ The fast path the basics need: commands that run without the language model.
 
 - `ctx.notify`: `send` (title, text, priority `normal` or `ring`, an owner for `Privacy.mayReveal`, a target of the
   origin device or everywhere, a dedupe key, an expiry, and actions) and `resolve`; notifications are rows of a
-  core collection, with `list` for the notifications module. Sending at a later time is a scheduler job of the
-  service's own core handler.
+  core collection, with `list` for the notifications module. The service does not send later: a module that
+  wants a notification at a later time schedules its own job and sends from its handler.
+- **Decided after review round 1** (36 blocking findings, most from per-notification jobs, one-shot deliveries,
+  actions without a claim and decisions taken before a wait): the service owns two jobs and no per-notification job: one
+  one-shot job planned for the next thing that is due (an expiry, the end of do not disturb, retention, a stale claim,
+  a device that needs another pass; none when nothing is due) and one hourly safety net that does the full pass and
+  plans again, so expiry is on time ordinarily and up to an hour late only after a store failure lost the plan (a job
+  every minute, tried first, ran ten thousand times when a module's test advanced the clock by a week); delivery is reconciliation (one function makes what each connection of a
+  device holds equal to what the live rows and the one decision allow now, asked again after every wait); an action
+  is claimed on the row before module code runs and is admitted only from a device that holds the card (`stop`
+  included; `stop` wins over a pending action); a handler may be called again for the same notification after a
+  store failure; do not disturb that could not be read counts as on; `send` returns a view, not a list cursor.
 - **One delivery decision** per notification and device, when it is delivered: do not disturb (for the house, on
   or off with an optional end time kept by the scheduler; `notify.dnd` to read, set and clear it), a device that
   cannot speak or show, and `Privacy.mayReveal`. Under do not disturb a `ring` is kept silent and listed; nothing
