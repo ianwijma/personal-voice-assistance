@@ -20,6 +20,9 @@ const NL = { household: { home: { HOME_LANGUAGE: "nl-NL" } } }
 const K = () => at("kitchen-display")
 const P = () => at("robins-phone")
 const H = () => at("hall-screen")
+/** A phrase command's turn on the kitchen display: the only invocations whose identity is held. */
+const PH = (kit: Pick<Effect.Success<ReturnType<typeof startTestModule>>, "turn">) => kit.turn({ ...at("kitchen-display"), source: "phrase" })
+const MAYBE = "I may already have done that. If not, say it again."
 const stopped = () => Effect.die(new ModuleStopped({ message: "The providing module stopped during the call (test)." }))
 const RECENT = "At Home Assistant's last check, up to about a minute ago"
 
@@ -117,6 +120,38 @@ describe("@pva/module-music", () => {
         assert.deepStrictEqual(sent(ha), ["media_player.media_pause media_player.p_250", "media_player.media_pause media_player.p_259"])
       }))
 
+    it.effect("two players of one name are asked about even when one is Music Assistant's: by name, from an area without players, and past the old cut-off", () =>
+      Effect.gen(function*() {
+        const h = house()
+        const dupes = [
+          player("media_player.same_a", { name: "Same speaker", state: "playing" }),
+          player("media_player.same_b", { name: "Same speaker", state: "playing", attributes: MASS }),
+          player("media_player.garage_a", { name: "Garage", state: "playing", attributes: MASS }),
+          player("media_player.garage_b", { name: "Garage", state: "playing" })
+        ]
+        const ha = makeHa({ ...h, entities: [...h.entities, ...dupes] })
+        const kit = yield* start(ha)
+        assert.deepStrictEqual(yield* kit.action("pause", { where: "same speaker" }, K()), { ok: true, say: "same speaker has more than one player: Same speaker and Same speaker. Which one?" })
+        // The area Garage has no player; two players are named Garage.
+        assert.deepStrictEqual(yield* kit.action("pause", { where: "garage" }, K()), { ok: true, say: "garage has more than one player: Garage and Garage. Which one?" })
+        assert.strictEqual((yield* Effect.flip(kit.service(Playback)!.pause("Same speaker"))).reason, "no_player")
+        // Past the 200th: one ordinary, one Music Assistant's, and a third: all three counted.
+        const many = Array.from({ length: 260 }, (_, i) =>
+          player(`media_player.p_${String(i).padStart(3, "0")}`, { name: [0, 250, 255].includes(i) ? "Same speaker" : `Player ${i}`, ...(i === 250 ? { attributes: MASS } : {}) })
+        )
+        const far = makeHa({ areas: [], entities: many })
+        const farKit = yield* start(far)
+        assert.deepStrictEqual(yield* farKit.action("pause", { where: "same speaker" }, K()), { ok: true, say: "same speaker has more than one player: Same speaker, Same speaker and Same speaker. Which one?" })
+        many.push(player("media_player.p_259b", { name: "Same speaker", attributes: MASS }))
+        const four = yield* start(makeHa({ areas: [], entities: many }))
+        assert.deepStrictEqual(yield* four.action("pause", { where: "same speaker" }, K()), {
+          ok: true,
+          say: "same speaker has 4 players, among them Same speaker, Same speaker and Same speaker. Which one?"
+        })
+        assert.deepStrictEqual(sent(ha), [])
+        assert.deepStrictEqual(sent(far), [])
+      }))
+
     it.effect("a question about 101 players names three and gives the count: a short sentence", () =>
       Effect.gen(function*() {
         const many = Array.from({ length: 101 }, (_, i) => player(`media_player.k_${String(i).padStart(3, "0")}`, { name: `Kitchen speaker number ${i} ${"x".repeat(30)}`, areaId: "kitchen" }))
@@ -173,46 +208,57 @@ describe("@pva/module-music", () => {
   })
 
   describe("the same invocation acts once", () => {
-    it.effect("a repeat of one phrase's or tool's invocation sends nothing and gets the first outcome; new invocations act again", () =>
+    it.effect("calls made by the model are never held back: two next calls skip twice, two up calls step twice, on one turn with one input", () =>
       Effect.gen(function*() {
         const ha = makeHa()
         const kit = yield* start(ha)
-        const same = K()
+        const turn = K()
+        assert.deepStrictEqual(yield* kit.action("next", {}, turn), { ok: true, say: "Asked Kitchen speaker to skip to the next track." })
+        assert.deepStrictEqual(yield* kit.action("next", {}, turn), { ok: true, say: "Asked Kitchen speaker to skip to the next track." })
+        assert.strictEqual((yield* kit.tool("music_previous", {}, turn)).value, "Asked Kitchen speaker to go back to the previous track.")
+        assert.strictEqual((yield* kit.tool("music_previous", {}, turn)).value, "Asked Kitchen speaker to go back to the previous track.")
+        yield* kit.tool("music_volume", { change: "up" }, turn)
+        yield* kit.tool("music_volume", { change: "up" }, turn)
+        yield* kit.tool("music_play", { query: "Nina Simone", kind: "artist", queue: "add" }, turn)
+        yield* kit.tool("music_play", { query: "Nina Simone", kind: "artist", queue: "add" }, turn)
+        assert.deepStrictEqual(ha.calls.map((c) => c.service), ["media_next_track", "media_next_track", "media_previous_track", "media_previous_track", "volume_up", "volume_up", "play_media", "play_media"])
+      }))
+
+    it.effect("a phrase invocation repeated sends nothing and gets the first outcome; two new phrases act twice", () =>
+      Effect.gen(function*() {
+        const ha = makeHa()
+        const kit = yield* start(ha)
+        const same = PH(kit)
         const first = yield* kit.action("next", {}, same)
-        const again = yield* kit.action("next", {}, same)
-        assert.deepStrictEqual(again, first)
+        assert.deepStrictEqual(yield* kit.action("next", {}, same), first)
         assert.strictEqual(ha.calls.length, 1)
-        // The generated tool on the same turn is the same invocation.
-        assert.strictEqual((yield* kit.tool("music_next", {}, same)).value, "Asked Kitchen speaker to skip to the next track.")
-        assert.strictEqual(ha.calls.length, 1)
-        // Another turn, or another input on the same turn, acts.
-        yield* kit.action("next", {}, K())
+        // Another phrase turn, or another input on the same one, acts.
+        yield* kit.action("next", {}, PH(kit))
         yield* kit.action("next", { where: "bedroom" }, same)
         assert.strictEqual(ha.calls.length, 3)
-        // Two new phrases skip twice.
         yield* kit.phrases.say("next song", KITCHEN)
         yield* kit.phrases.say("next song", KITCHEN)
         assert.strictEqual(ha.calls.length, 5)
       }))
 
-    it.effect("a failure is kept too: its repeat says it again without sending", () =>
+    it.effect("a phrase's failure is kept too: its repeat says it again without sending", () =>
       Effect.gen(function*() {
         const ha = makeHa()
         const kit = yield* start(ha)
         ha.answer(() => Effect.fail(new HomeAssistantError({ reason: "refused", detail: "test" })))
-        const same = K()
+        const same = PH(kit)
         const first = yield* kit.action("volume", { change: "up" }, same)
         assert.deepStrictEqual(first, { ok: false, code: "failed", message: "Home Assistant refused that for Kitchen speaker." })
         assert.deepStrictEqual(yield* kit.action("volume", { change: "up" }, same), first)
         assert.strictEqual(ha.calls.length, 1)
       }))
 
-    it.effect("two concurrent runs of the same invocation send once and both get its outcome", () =>
+    it.effect("two concurrent runs of the same phrase invocation send once and both get its outcome", () =>
       Effect.gen(function*() {
         const ha = makeHa()
         const kit = yield* start(ha)
         ha.answer(() => Effect.as(Effect.sleep(1_000), {}))
-        const same = K()
+        const same = PH(kit)
         const a = yield* Effect.forkChild(kit.action("play", { query: "Nina Simone", kind: "artist" }, same))
         const b = yield* Effect.forkChild(kit.action("play", { query: "Nina Simone", kind: "artist" }, same))
         yield* kit.advance(1_000)
@@ -222,18 +268,60 @@ describe("@pva/module-music", () => {
         assert.strictEqual(ha.calls.length, 1)
       }))
 
-    it.effect("an invocation cut short keeps nothing: the same identity runs again", () =>
+    it.effect("a phrase cut short after its call went out is not run again: its replay sends nothing and says it may already have happened", () =>
       Effect.gen(function*() {
+        const cases = [
+          ["pause", {}, "media_pause"],
+          ["next", {}, "media_next_track"],
+          ["previous", {}, "media_previous_track"],
+          ["volume", { change: "up" }, "volume_up"],
+          ["volume", { change: "down" }, "volume_down"],
+          ["play", { query: "Kind of Blue", kind: "album", queue: "next" }, "play_media"],
+          ["play", { query: "Kind of Blue", kind: "album", queue: "add" }, "play_media"]
+        ] as const
+        for (const [id, params, service] of cases) {
+          const ha = makeHa()
+          const kit = yield* start(ha)
+          ha.answer(() => Effect.never)
+          const same = PH(kit)
+          const fiber = yield* Effect.forkChild(kit.action(id, params, same))
+          yield* kit.advance(10)
+          assert.deepStrictEqual(ha.calls.map((c) => c.service), [service], id)
+          yield* Fiber.interrupt(fiber)
+          ha.answer(() => Effect.succeed({}))
+          assert.deepStrictEqual(yield* kit.action(id, params, same), { ok: false, code: "failed", message: MAYBE }, `${id} ${JSON.stringify(params)}`)
+          assert.strictEqual(ha.calls.length, 1, id)
+          // A new utterance is a new identity, and acts.
+          assert.isTrue((yield* kit.action(id, params, PH(kit))).ok, id)
+          assert.strictEqual(ha.calls.length, 2, id)
+        }
+        // In Dutch.
         const ha = makeHa()
-        const kit = yield* start(ha)
+        const nl = yield* start(ha, NL)
         ha.answer(() => Effect.never)
-        const same = K()
-        const fiber = yield* Effect.forkChild(kit.action("pause", {}, same))
-        yield* kit.advance(10)
+        const same = PH(nl)
+        const fiber = yield* Effect.forkChild(nl.action("next", {}, same))
+        yield* nl.advance(10)
         yield* Fiber.interrupt(fiber)
-        ha.answer(() => Effect.succeed({}))
-        assert.deepStrictEqual(yield* kit.action("pause", {}, same), { ok: true, say: "Asked Kitchen speaker to pause." })
-        assert.strictEqual(ha.calls.length, 2)
+        assert.deepStrictEqual(yield* nl.action("next", {}, same), { ok: false, code: "failed", message: "Misschien heb ik dat al gedaan. Zo niet, zeg het nog eens." })
+        assert.strictEqual(ha.calls.length, 1)
+      }))
+
+    it.effect("a phrase cut short before anything was sent keeps nothing: its replay runs", () =>
+      Effect.gen(function*() {
+        // Many players: resolving a name takes real time, in steps, so the cut comes while it resolves, before any call.
+        const many = Array.from({ length: 5_000 }, (_, i) =>
+          player(`media_player.p_${String(i).padStart(4, "0")}`, { name: `Player ${i}`, aliases: Array.from({ length: 10 }, (_, k) => `Player ${i} alias ${k} ${"é".repeat(150)}`) })
+        )
+        const ha = makeHa({ areas: [], entities: many })
+        const kit = yield* start(ha)
+        const same = PH(kit)
+        const fiber = yield* Effect.forkChild(kit.action("next", { where: "Player 4999" }, same))
+        yield* Effect.promise(() => new Promise((resolve) => setTimeout(resolve, 50)))
+        yield* Fiber.interrupt(fiber)
+        assert.strictEqual(ha.calls.length, 0)
+        assert.deepStrictEqual(yield* kit.action("next", { where: "Player 4999" }, same), { ok: true, say: "Asked Player 4999 to skip to the next track." })
+        assert.strictEqual(ha.calls.length, 1)
       }))
   })
 
@@ -376,15 +464,17 @@ describe("@pva/module-music", () => {
             "~/a.mp3",
             "./song",
             "../song",
-            "music/song.mp3",
-            "folder\\song",
-            "song.mp3",
-            "Hits.flac",
-            "playlist.m3u8"
+            "folder\\song"
           ]
         ) {
           assert.deepStrictEqual(yield* kit.action("play", { query, kind: "track" }, K()), { ok: true, say: "I play music by its name; I can't play an address or a file." }, query)
         }
+        // A name ending like a file is refused as a form of name this connection cannot look up safely, not as a file.
+        const form = { ok: true, say: "This connection can't safely look up a name of that form, so I can't play it." } as const
+        for (const query of ["music/song.mp3", "song.mp3", "Hits.flac", "playlist.m3u8", "Love.exe"]) assert.deepStrictEqual(yield* kit.action("play", { query, kind: "track" }, K()), form, query)
+        assert.deepStrictEqual(yield* kit.action("play", { query: "will.i.am", kind: "artist" }, K()), form)
+        assert.deepStrictEqual(yield* kit.action("play", { query: "Love.exe", kind: "track", artist: "Nobody" }, K()), form)
+        assert.deepStrictEqual(yield* kit.action("play", { query: "Song", kind: "track", artist: "will.i.am" }, K()), form)
         // An artist that is a path is refused too.
         assert.deepStrictEqual(yield* kit.action("play", { query: "Song", kind: "track", artist: "/tmp" }, K()), { ok: true, say: "I play music by its name; I can't play an address or a file." })
         assert.deepStrictEqual(yield* kit.action("play", { query: "a\nb", kind: "track" }, K()), { ok: true, say: "Say what to play in a few words." })
@@ -426,6 +516,10 @@ describe("@pva/module-music", () => {
         })
         assert.deepStrictEqual(yield* kit.action("play", { query: "1989", kind: "album" }, K()), { ok: true, say: "Van welke artiest is 1989?" })
         assert.deepStrictEqual(yield* kit.action("play", { query: "https://x.example/a", kind: "track" }, K()), { ok: true, say: "Ik speel muziek op naam; een adres of een bestand kan ik niet afspelen." })
+        assert.deepStrictEqual(yield* kit.action("play", { query: "will.i.am", kind: "artist" }, K()), {
+          ok: true,
+          say: "Een naam in die vorm kan ik via deze verbinding niet veilig opzoeken, dus die kan ik niet afspelen."
+        })
       }))
   })
 

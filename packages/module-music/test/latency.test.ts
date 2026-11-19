@@ -5,12 +5,13 @@
 // 1 ms heartbeat measures the longest stop; it must stay under 10 ms (three times that on CI).
 import { assert, describe, it } from "@effect/vitest"
 import { vi } from "vitest"
+import { Playback } from "@pva/core"
 import { startTestModule } from "@pva/core/testing"
 import { HA_LIMITS } from "@pva/module-contracts"
-import { Effect } from "effect"
+import { Effect, Fiber } from "effect"
 import { bound } from "../../store-sqlite/test/latencyBound.ts"
 import { musicModule } from "../src/index.ts"
-import { area, at, makeHa, player } from "./helpers.ts"
+import { area, at, KITCHEN, makeHa, player } from "./helpers.ts"
 
 // Each test starts one or more test households with the real host.
 vi.setConfig({ testTimeout: 60_000 })
@@ -102,4 +103,76 @@ describe("@pva/module-music: resolving a room at the largest cache", () => {
       assert.isBelow(longest, bound(10))
       assert.strictEqual(ha.calls.length, 0)
     }))
+
+  describe("Playback has one 3 s budget from entry: resolving spends from it, the call gets what is left", () => {
+    /** Waits in real time until `done()` (the call has gone out), at most 20 s. */
+    const until = (done: () => boolean) =>
+      Effect.promise(async () => {
+        const end = Date.now() + 20_000
+        while (!done() && Date.now() < end) await new Promise((resolve) => setTimeout(resolve, 5))
+      })
+
+    /** The largest cache, cold, with the last player playing and named `name`, and a provider that answers in 2.6 s (within its own limit). */
+    const slowHouse = (name: string) => {
+      const cache = largest()
+      const last = cache.entities.length - 1
+      cache.entities[last] = { ...cache.entities[last]!, name, aliases: [], state: "playing" }
+      const ha = makeHa(cache)
+      ha.answer(() => Effect.as(Effect.sleep(2_600), {}))
+      return ha
+    }
+
+    it.effect("pause and changeVolume, called directly: after a cold search the call gets only what is left, and runs out as timeout", () =>
+      Effect.gen(function*() {
+        for (const op of ["pause", "changeVolume"] as const) {
+          const ha = slowHouse("Last speaker")
+          const kit = yield* startTestModule(musicModule, { provide: [ha.provided] })
+          const playback = kit.service(Playback)!
+          const began = performance.now()
+          const fiber = yield* Effect.forkChild(Effect.flip<unknown, import("@pva/core").PlaybackError, never>(op === "pause" ? playback.pause("Last speaker") : playback.changeVolume("Last speaker", { to: 0.4 })))
+          yield* until(() => ha.calls.length === 1)
+          const searched = performance.now() - began
+          // The provider would answer at 2.6 s: within its own limit, but not within what is left of 3 s.
+          yield* kit.advance(2_600)
+          const e = yield* Fiber.join(fiber)
+          console.log(`music: Playback.${op} after a ${searched.toFixed(0)} ms cold search: ${e.reason}`)
+          assert.isAbove(searched, 300)
+          assert.strictEqual(e.reason, "timeout")
+          assert.strictEqual(ha.calls.length, 1)
+        }
+      }))
+
+    it.effect("through the host's stop: the pause times out inside the host's 3 s, so stop says it could not stop it rather than running past", () =>
+      Effect.gen(function*() {
+        // The kitchen display's room is Kitchen; no area of that name: the room is found only as the last player's name.
+        const ha = slowHouse("Kitchen")
+        const kit = yield* startTestModule(musicModule, { provide: [ha.provided] })
+        const fiber = yield* Effect.forkChild(kit.phrases.say("stop", KITCHEN))
+        yield* until(() => ha.calls.length === 1)
+        yield* kit.advance(2_600)
+        const stop = yield* Fiber.join(fiber)
+        assert.isTrue(stop.taken && stop.by === "control" && stop.outcome.did === "failed", JSON.stringify(stop))
+        assert.strictEqual(ha.calls.length, 1)
+      }))
+
+    it.effect("resolving that uses the whole budget is timeout, and nothing is sent", () =>
+      Effect.gen(function*() {
+        const ha = makeHa({ areas: [], entities: [player("media_player.slow", { name: "Slow speaker", state: "playing" })] })
+        const all = [...ha.world.entities.values()]
+        // A provider whose cache read holds the thread for 3.1 s (as an overloaded machine would).
+        ha.stub.answer("entities", () => {
+          const end = performance.now() + 3_100
+          while (performance.now() < end) {
+            // busy
+          }
+          return all
+        })
+        const kit = yield* startTestModule(musicModule, { provide: [ha.provided] })
+        const e = yield* Effect.flip(kit.service(Playback)!.pause("Slow speaker"))
+        assert.strictEqual(e.reason, "timeout")
+        const v = yield* Effect.flip(kit.service(Playback)!.changeVolume("Slow speaker", { to: 0.4 }))
+        assert.strictEqual(v.reason, "timeout")
+        assert.strictEqual(ha.calls.length, 0)
+      }))
+  })
 })
