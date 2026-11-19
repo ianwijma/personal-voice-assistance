@@ -7,6 +7,7 @@ import {
   type ModuleDefinition,
   type PeopleService,
   Param,
+  PHRASE_ANSWER_CHARS,
   type PresentHandle,
   type Presentation,
   People,
@@ -494,56 +495,61 @@ export const makePresenceModule = () => {
           return say(texts, lang, r.at === "home" ? "rowHomeSince" : "rowOutSince", { name, when: sinceText(r.since, g.now, g.zone) })
         }
 
+        /** How many people the answer names: four, or fewer when `limit` (a phrase's reply) would otherwise cut it. Whole items only. */
+        const namedCount = (lang: Lang, g: Gathered, limit?: number): number => {
+          if (g.kind !== "rows") return 0
+          let n = Math.min(MAX_NAMED, g.rows.length)
+          if (limit !== undefined) while (n > 0 && sentences(lang, g, n).length > limit) n--
+          return n
+        }
+
         /**
-         * The same answer as a list: one line per person the answer named (never anyone it withheld), then the honest notes
-         * ("and 2 more", how many are not said here, "last heard"). Personal to the first person named, so the Presenter asks
-         * `Privacy.mayReveal` again for the device that would show it whenever it reconciles.
+         * The same answer as a list: the same people as the sentences name (`named`), the same overflow ("and 2 more"), and
+         * every note the answer has. A presentation has one owner, so a list exists only when it names exactly one person
+         * (personal to that person; the counts and notes tell nothing of anyone). An answer that names several people's
+         * whereabouts is not shown as a list: it is only spoken.
          */
-        const listOf = (lang: Lang, g: Extract<Gathered, { kind: "rows" }>): Presentation => {
-          const notes = (g.withheld > 0 ? 1 : 0) + (g.stale ? 1 : 0)
-          const room = LIST_ITEMS - notes
-          const shownRows = g.rows.length <= room ? g.rows : g.rows.slice(0, room - 1)
-          const items: Array<{ readonly id: string; readonly text: string }> = shownRows.map((r) => ({ id: r.owner, text: rowLine(lang, g, r) }))
-          if (shownRows.length < g.rows.length) items.push({ id: ":more", text: say(texts, lang, "moreHidden", { count: g.rows.length - shownRows.length }) })
+        const listOf = (lang: Lang, g: Extract<Gathered, { kind: "rows" }>, named: number): Presentation | undefined => {
+          if (named !== 1) return undefined
+          const items: Array<{ readonly id: string; readonly text: string }> = g.rows.slice(0, named).map((r) => ({ id: r.owner, text: rowLine(lang, g, r) }))
+          if (g.rows.length > named) items.push({ id: ":more", text: say(texts, lang, "moreHidden", { count: g.rows.length - named }) })
           if (g.withheld > 0) items.push({ id: ":withheld", text: cutText(say(texts, lang, "withheld", { count: g.withheld }), 80) })
           if (g.stale) items.push({ id: ":stale", text: cutText(say(texts, lang, "stale"), 80) })
           // The fallback is the answer's own sentences, with fewer names until it fits (never cut in the middle of one).
           let spoken = ""
-          for (let n = Math.min(MAX_NAMED, g.rows.length); n >= 0 && spoken === ""; n--) {
+          for (let n = named; n >= 0 && spoken === ""; n--) {
             const text = oneLine(sentences(lang, g, n))
             if (text.length <= SPOKEN_CHARS) spoken = text
           }
-          return {
-            kind: "list",
-            title: say(texts, lang, "listTitle"),
-            style: "bullets",
-            items,
-            spoken,
-            sensitivity: { personal: g.rows[0]!.owner }
-          }
+          return { kind: "list", title: say(texts, lang, "listTitle"), style: "bullets", items, spoken, sensitivity: { personal: g.rows[0]!.owner } }
         }
 
         /**
-         * Shows the answer on the asking device, as a transient list, and keeps its handle: the next answer from that device
-         * takes it down first (and shows nothing when it has nothing to show, also after an empty answer), and a change of
-         * the data takes every list down. A device that cannot show it changes nothing about the answer; the same turn on
-         * the same device is shown once.
+         * Shows the answer on the asking device, as a transient list, and keeps its handle (whether or not a page shows it
+         * now: a page that gains a screen later must not show what is out of date): the next answer from that device takes
+         * it down first (and shows nothing when it has nothing to show), and a change of the data takes every list down. A
+         * device that cannot show it changes nothing about the answer. A phrase turn that repeats (same assistant,
+         * conversation, turn and device) is shown once; a call the model makes runs every time.
          */
-        const showAnswer = (lang: Lang, g: Gathered): Effect.Effect<void> =>
+        const showAnswer = (lang: Lang, g: Gathered, named: number): Effect.Effect<void> =>
           Effect.gen(function*() {
             const turn = yield* CurrentTurn
             const device = turn?.deviceId
             if (turn === undefined || device === undefined) return
-            const identity = JSON.stringify([turn.assistantId, turn.conversationId, turn.turnId, device])
-            if (ctx.shared.seen.has(identity)) return
-            ctx.shared.seen.add(identity)
-            if (ctx.shared.seen.size > MAX_SEEN) ctx.shared.seen.delete(ctx.shared.seen.values().next().value!)
+            if (turn.source === "phrase") {
+              const identity = JSON.stringify([turn.assistantId, turn.conversationId, turn.turnId, device])
+              if (ctx.shared.seen.has(identity)) return
+              ctx.shared.seen.add(identity)
+              if (ctx.shared.seen.size > MAX_SEEN) ctx.shared.seen.delete(ctx.shared.seen.values().next().value!)
+            }
             const before = ctx.shared.shown.get(device)
             ctx.shared.shown.delete(device)
             if (before !== undefined) yield* before.dismiss.pipe(Effect.ignore, Effect.catchDefect(() => Effect.void))
             if (g.kind !== "rows") return
-            const handle = yield* ctx.present.show("origin", listOf(lang, g)).pipe(Effect.option, Effect.catchDefect(() => Effect.succeed(Option.none<PresentHandle>())))
-            if (Option.isNone(handle) || !handle.value.outcome.devices.some((d) => d.shown)) return
+            const presentation = listOf(lang, g, named)
+            if (presentation === undefined) return
+            const handle = yield* ctx.present.show("origin", presentation).pipe(Effect.option, Effect.catchDefect(() => Effect.succeed(Option.none<PresentHandle>())))
+            if (Option.isNone(handle)) return
             ctx.shared.shown.set(device, handle.value)
             if (ctx.shared.shown.size > MAX_HANDLES) {
               const oldest = ctx.shared.shown.keys().next().value!
@@ -637,8 +643,11 @@ export const makePresenceModule = () => {
             Effect.gen(function*() {
               const lang = homeLanguage(view())
               const g = yield* gather(lang, person)
-              yield* showAnswer(lang, g)
-              return { say: sentences(lang, g) }
+              // In a phrase turn the answer must fit what a phrase may say; anywhere else it is as it always was.
+              const turn = yield* CurrentTurn
+              const named = namedCount(lang, g, turn?.source === "phrase" ? PHRASE_ANSWER_CHARS : undefined)
+              yield* showAnswer(lang, g, named)
+              return { say: sentences(lang, g, named) }
             })
         })
 
