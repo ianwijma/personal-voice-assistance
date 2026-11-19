@@ -29,7 +29,8 @@ const snapshot = (kit: Kit) => Effect.map(kit.jobs, (jobs) => jobs.filter((j) =>
  * Wait, in real time, for the outcome of the jobs the clock just made due: their row has moved past what it was before the
  * call (a run has begun and ended, or failed) and none is running. A job's handler reads the calendar in a worker thread,
  * which the test clock does not move, so `runJob` and `advance` return while a job has not begun or still runs; "none is
- * running" alone is also true before the job starts. No fixed sleeps and no raised limit: the loop is capped as before.
+ * running" alone is also true before the job starts, and the Health issue of a failed job follows its row (and goes the same way)
+ * a moment later. No fixed sleeps and no raised limit: the loop is capped as before.
  */
 const settle = (kit: Kit, before: ReadonlyArray<Job> = []) =>
   Effect.gen(function*() {
@@ -40,7 +41,10 @@ const settle = (kit: Kit, before: ReadonlyArray<Job> = []) =>
         const j = jobs.find((x) => x.id === b.id)
         return j !== undefined && progress(j) === progress(b)
       })
-      if (!waiting && !jobs.some((j) => j.state === "running")) return
+      // The Health issue of a failed job follows its row a moment later (and goes the same way): its outcome is its issue too.
+      const failing = jobs.filter((j) => j.failedAt !== undefined && (j.state === "scheduled" || j.state === "failed")).map((j) => `core.scheduler.failed.${j.id}`).sort()
+      const raised = kit.issues().map((i) => i.id).filter((id) => id.startsWith("core.scheduler.failed.")).sort()
+      if (!waiting && !jobs.some((j) => j.state === "running") && JSON.stringify(failing) === JSON.stringify(raised)) return
       yield* Effect.promise(() => new Promise((resolve) => setTimeout(resolve, 20)))
     }
     assert.fail("a refresh job did not finish")

@@ -33,15 +33,22 @@ instead: …]" after it). The card says what the answer said and nothing more:
   split); outside text, shown as text and never as markup.
 - **now** (the kind's headline, which for a forecast is the day, not the moment): the day's range ("8 – 13°", "46 – 55 °F"),
   the condition in words ("Light rain", "Lichte regen") and an icon from the closed set, chosen from the weather code
-  (clear or mainly clear: `sun`; partly cloudy: `partly`; overcast: `cloud`; fog: `fog`; drizzle, rain, showers: `rain`; snow:
-  `snow`; thunderstorm: `storm`). A weather code with no icon gives the answer **without a card** rather than a guessed icon.
+  (exactly the codes the module has words for: 0 and 1 `sun`; 2 `partly`; 3 `cloud`; 45, 48 `fog`; 51, 53, 55, 56, 57, 61, 63,
+  65, 66, 67, 80, 81, 82 `rain`; 71, 73, 75, 77, 85, 86 `snow`; 95, 96, 99 `storm`). Any other code (52, 62, 72, a fraction) has
+  no icon and the answer comes **without a card** rather than with a guessed icon.
 - **days**: one row, the asked day ("Today", "Tomorrow" or its weekday, in the household's language), its high and low
   and the same icon.
 - The chance of rain, the wind and the coming hours (`hours`) have no field in the kind and stay in the spoken answer;
   the card never shows what the answer did not say.
-- **spoken**: the day's sentence without the hours ("Tomorrow: light rain, 8 to 13 degrees, 70 percent chance of rain, wind up
-  to 35 km/h."), which stands on its own for a device that cannot show the card. A rain answer (`weather_rain_soon`) and a
-  failed or refused forecast show nothing and change nothing on the screen.
+- **spoken**: the complete answer that was asked for, the coming hours and any note of what is only known until a time
+  included ("Today: overcast, 6 to 11 degrees. In the next 3 hours: 9 to 10 degrees, up to 10 percent chance of rain."), so
+  that a device that cannot show the card is told the same as one that can. When the complete answer is longer than the
+  presentation's bound (300 characters) there is **no card at all**: the card never costs the answer. A rain answer
+  (`weather_rain_soon`) and a failed or refused forecast show nothing and change nothing on the screen.
+- **Speculative turns** (docs/PRESENTING.md, R8): `weather_forecast` is `speculative: true` and `weather.tomorrow` is a read
+  action, so both only return the card with their result and never call `ctx.present`: a turn that is discarded shows nothing
+  and withdraws nothing, and a promoted one shows the card once. A later answer with nothing to show does not withdraw an
+  earlier card: it ends by its lifetime or is replaced by the next one on that device.
 - **Transient**, the host's default: it stays 30 seconds and is replaced by the next thing shown on that device; it is
   withdrawn when it ends, and a page that was away does not get it back. A restart ends it with the module's part.
 - **Privacy**: weather is the household's, so the presentation has no owner (`sensitivity: household`): the host decides

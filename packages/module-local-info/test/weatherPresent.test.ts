@@ -2,7 +2,7 @@
 // what the card says (and does not), where it is shown (the shared, private and public devices of the default household,
 // and a device without a screen), that it is replaced and ends, and that the answer the model reads is unchanged.
 import { assert, describe, it } from "@effect/vitest"
-import { presentationProblem } from "@pva/core"
+import { CurrentTurnCommit, presentationProblem, type TurnCommit } from "@pva/core"
 import { checkModule, makeOfflineNet, startTestModule } from "@pva/core/testing"
 import { Effect } from "effect"
 import { vi } from "vitest"
@@ -262,6 +262,63 @@ describe("the forecast card: replaced and withdrawn", () => {
       yield* kit.advance(40_000)
       yield* kit.notify.connect("kitchen-display")
       assert.deepStrictEqual(kit.present.shown("kitchen-display"), [])
+    }))
+})
+
+/** A turn that is not committed yet (a speculative one): what it asked to show waits for `promote()`, and `discard` never runs it. */
+const speculativeTurn = () => {
+  const waiting: Array<() => void> = []
+  let committed = false
+  const commit: TurnCommit = { committed: () => committed, whenCommitted: (f) => (committed ? f() : void waiting.push(f)) }
+  return {
+    run: <A, E, R>(effect: Effect.Effect<A, E, R>) => Effect.provideService(effect, CurrentTurnCommit, commit),
+    promote: () => {
+      committed = true
+      for (const f of waiting.splice(0)) f()
+    }
+  }
+}
+
+describe("the forecast card and a speculative turn (docs/PRESENTING.md, R8)", () => {
+  // `weather_forecast` is `speculative: true` and the action `weather.tomorrow` is a read action: both only return their card
+  // with the result, and call `ctx.present` never, so what a turn that may be discarded asked for reaches no screen.
+  it.effect("a discarded turn shows nothing and withdraws nothing; a promoted one shows once", () =>
+    Effect.gen(function*() {
+      const kit = yield* on(world())
+      yield* kit.tool("weather_forecast", { day: "Friday" })
+      yield* kit.present.settle
+      const before = kit.present.shown("kitchen-display").map((p) => p.id)
+      assert.strictEqual(before.length, 1)
+      // The tool: the turn is discarded (its promotion never comes).
+      const discarded = speculativeTurn()
+      const r = yield* discarded.run(kit.tool("weather_forecast", { day: "tomorrow" }))
+      assert.isTrue(r.ok)
+      assert.include(r.content, "Tomorrow: light rain")
+      yield* kit.present.settle
+      assert.deepStrictEqual(kit.present.shown("kitchen-display").map((p) => p.id), before)
+      assert.strictEqual(kit.present.messages.filter((m) => m.message.type === "present.show").length, 1)
+      // The action in a discarded turn: the same.
+      const discardedAction = speculativeTurn()
+      assert.deepStrictEqual((yield* discardedAction.run(kit.action("tomorrow", {}))).ok, true)
+      yield* kit.present.settle
+      assert.deepStrictEqual(kit.present.shown("kitchen-display").map((p) => p.id), before)
+      // A promoted turn shows it, once, replacing the earlier transient.
+      const promoted = speculativeTurn()
+      yield* promoted.run(kit.tool("weather_forecast", { day: "tomorrow" }))
+      yield* kit.present.settle
+      assert.deepStrictEqual(kit.present.shown("kitchen-display").map((p) => p.id), before, "nothing before the promotion")
+      promoted.promote()
+      yield* kit.present.settle
+      const shown = kit.present.shown("kitchen-display")
+      assert.strictEqual(shown.length, 1)
+      assert.strictEqual(shown[0]?.content.kind === "weather" ? shown[0].content.days?.[0]?.label : undefined, "Tomorrow")
+      assert.strictEqual(kit.present.messages.filter((m) => m.message.type === "present.show").length, 2)
+      // And the promoted action, once.
+      const promotedAction = speculativeTurn()
+      yield* promotedAction.run(kit.action("tomorrow", {}))
+      promotedAction.promote()
+      yield* kit.present.settle
+      assert.strictEqual(kit.present.shown("kitchen-display").length, 1)
     }))
 })
 
