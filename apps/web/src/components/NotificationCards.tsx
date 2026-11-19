@@ -1,5 +1,5 @@
 "use client"
-import { useLayoutEffect, useRef } from "react"
+import { type KeyboardEvent, useLayoutEffect, useRef } from "react"
 import { type ClientState, ringingCard } from "@/lib/state.ts"
 import { useClient, useClientState } from "./context.tsx"
 import { cx } from "./ui/controls.tsx"
@@ -21,15 +21,27 @@ export function NotificationCards() {
   const region = useRef<HTMLElement>(null)
   const firstRing = shown.find(ringingCard)
   useLayoutEffect(() => {
-    // A newly leading ring must not inherit the scroll position used to read an older card.
-    if (firstRing !== undefined && region.current !== null) region.current.scrollTop = 0
+    // Keep keyboard focus with the ring we bring into view, without taking it from elsewhere on the page.
+    const el = region.current
+    if (firstRing === undefined || el === null) return
+    if (el.contains(document.activeElement)) el.querySelector<HTMLButtonElement>("[data-ringing] [data-action=stop]")?.focus({ preventScroll: true })
+    el.scrollTop = 0
   }, [firstRing?.id, firstRing?.sentAt])
+  const visibleAction = (event: KeyboardEvent<HTMLElement>) => {
+    if ((event.key !== "Enter" && event.key !== " ") || !(event.target instanceof HTMLButtonElement)) return
+    const button = event.target.getBoundingClientRect()
+    const bounds = event.currentTarget.getBoundingClientRect()
+    // Scrolling must not leave an offscreen action armed. Tab/focus brings it back into view before activation.
+    if (button.top < bounds.top || button.bottom > bounds.bottom) event.preventDefault()
+  }
   if (shown.length === 0) return null
   return (
     <section
       ref={region}
       aria-label={shown[0]!.texts.region}
       data-testid="notification-cards"
+      onKeyDown={visibleAction}
+      onKeyUp={visibleAction}
       className="flex h-full max-h-full w-full flex-col items-center gap-2 overflow-y-auto overscroll-contain [overflow-anchor:none]"
     >
       {shown.map((card, i) => <Card key={card.id} card={card} audioOn={audioOn} more={i === 0 ? shown.length - 1 : 0} />)}

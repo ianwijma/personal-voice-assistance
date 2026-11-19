@@ -432,3 +432,44 @@ for (const width of [375, 768]) {
     await expect.poll(() => strip.getByRole("button", { name: "Stop", exact: true }).evaluate(tappable)).toBe(true)
   })
 }
+
+test("r9 b1: focus follows the leading ring so Enter stops the timer, not the hidden reminder", async ({ page, baseURL }, info) => {
+  for (const width of [375, 768]) {
+    await mock.scenario("voice")
+    await page.setViewportSize({ width, height: width === 375 ? 667 : 1024 })
+    await page.emulateMedia({ reducedMotion: "reduce" })
+    await page.goto(appUrl(baseURL))
+    await expect(page.getByTestId("start")).toBeVisible()
+    await page.evaluate(() => {
+      const client = (window as unknown as { __pva: AssistantClient }).__pva
+      client.store.dispatch({ type: "local/audio", phase: "running" })
+    })
+    const timer = serverExamples["notification.ring"]
+    const reminder = { ...timer, notification: { ...timer.notification, id: "n-reminder", title: "Laundry reminder", priority: "normal", sound: false, actions: [{ id: "stop", label: "Stop" }], sentAt: timer.notification.sentAt - 60_000 } }
+    await mock.send([reminder])
+    const strip = page.getByTestId("voice-notifications")
+    const reminderCard = strip.getByTestId("notification-card").filter({ has: page.getByRole("heading", { name: "Laundry reminder", exact: true }) })
+    const reminderStop = reminderCard.getByRole("button", { name: "Stop", exact: true })
+    await expect(reminderStop).toBeVisible()
+    for (let i = 0; i < 45 && !(await reminderStop.evaluate((el) => el === document.activeElement)); i++) await page.keyboard.press("Tab")
+    await expect(reminderStop).toBeFocused()
+    await expect.poll(() => reminderStop.evaluate(tappable)).toBe(true)
+    const before = await strip.boundingBox()
+    await strip.screenshot({ path: info.outputPath(`r9-${width}-before-ring.png`), animations: "disabled" })
+    await mock.send([timer])
+    const timerCard = strip.getByTestId("notification-card").filter({ has: page.getByRole("heading", { name: timer.notification.title, exact: true }) })
+    const timerStop = timerCard.getByRole("button", { name: "Stop", exact: true })
+    await expect.poll(() => timerStop.evaluate(tappable)).toBe(true)
+    const timerHasFocus = await timerStop.evaluate((el) => el === document.activeElement)
+    expect(await reminderStop.evaluate(tappable)).toBe(false)
+    expect(await strip.boundingBox()).toEqual(before)
+    await strip.screenshot({ path: info.outputPath(`r9-${width}-after-ring.png`), animations: "disabled" })
+    await page.keyboard.press("Enter")
+    await expect.poll(async () => (await mock.log()).messages.filter((m) => m.type === "notification.action").map((m) => ({ id: m.id, actionId: m.actionId }))).toEqual([{ id: timer.notification.id, actionId: "stop" }])
+    expect(timerHasFocus).toBe(true)
+    await mock.send([{ type: "notification.resolved", id: timer.notification.id, outcome: "stop" }])
+    await expect(strip.getByTestId("notification-card")).toHaveCount(1)
+    await expect(reminderCard).toBeVisible()
+    await expect.poll(() => reminderStop.evaluate(tappable)).toBe(true)
+  }
+})
