@@ -1,6 +1,8 @@
 import { CurrentJob, defineModule, type ModuleDefinition, Setting } from "@pva/core"
+import { homeLanguage } from "@pva/module-contracts"
 import { Clock, Effect, Schema } from "effect"
 import { collections, DATA_VERSION } from "./data.ts"
+import { LOW_HANDLER, makeScreens } from "./lowScreen.ts"
 import { makePantry } from "./pantry.ts"
 import { type KitchenSettings, pantryActions, productTools } from "./pantryActions.ts"
 import { recipeTools } from "./recipes.ts"
@@ -96,7 +98,11 @@ export const kitchenModule = defineModule({
       // outage before it ran. The kitchen has no other job, so its one page of live jobs holds it if it is there.
       const live = yield* ctx.scheduler.list().pipe(Effect.orDie)
       if (!live.some((j) => j.key === "tidy" && j.cron === TIDY_CRON)) yield* ctx.scheduler.schedule({ handler: "tidy", key: "tidy", cron: TIDY_CRON }).pipe(Effect.orDie)
-      return { value: makePantry({ store: ctx.store, host: ctx.host }) }
+      const pantry = makePantry({ store: ctx.store, host: ctx.host })
+      // What is low, shown as a checklist: a tick is a handler registered here, with the pantry's own path to the list.
+      const screens = makeScreens({ pantry, present: ctx.present, lang: () => homeLanguage(ctx.host.view()) })
+      yield* ctx.present.handle(LOW_HANDLER, { run: (press) => screens.press(press, homeLanguage(ctx.host.view())) }).pipe(Effect.orDie)
+      return { value: { ...pantry, screens } }
     }),
   start: (ctx) =>
     Effect.sync(() => {

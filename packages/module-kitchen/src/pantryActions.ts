@@ -10,11 +10,11 @@ import {
   amountText, book, createProduct, drainForgotten, fits, FORGET_NOW, lastKnownText, listText, lowOf, overviewText, type Pantry, type PantrySettings, PRODUCT_PAGE,
   PRODUCT_SCAN, removeProduct, round, saidText, stockSentence, stockText, storeFailureText, undoable
 } from "./pantry.ts"
+import { lowSay } from "./lowScreen.ts"
 import { texts, type TextKey, unitWords } from "./texts.ts"
 import { cleanPhrase, KEY_CHARS, keyOf, readPhrase } from "./words.ts"
 
-/** The most low products one answer reads: four pages of 25. */
-export const LOW_SCAN = 100
+export { LOW_SCAN } from "./pantry.ts"
 
 /** What the pantry's actions read of the module's settings (all shared fields: a change restarts the module). */
 export interface KitchenSettings extends PantrySettings {
@@ -104,6 +104,8 @@ export const pantryActions = (deps: PantryDeps) => {
       }
       // A product made by this call was not on the list before it.
       const list = yield* pantry.followList(outcome.id, outcome.created ? undefined : outcome.before, outcome.after.name, settings, l)
+      // A list of what is low that is on a screen follows the stock (it never changes the answer).
+      if (pantry.screens !== undefined) yield* pantry.screens.refresh
       return { say: list === undefined ? outcome.main : `${outcome.main} ${list}` }
     })
 
@@ -221,21 +223,36 @@ export const pantryActions = (deps: PantryDeps) => {
     description: "Set a product's stock to none: it ran out (\"we're out of rice\"). Puts it on the shopping list.",
     examples: ["we're out of rice", "we ran out of milk", "there are no eggs left", "we hebben geen rijst meer", "de melk is op"],
     params: { what: whatParam("What ran out", ["of", "no", "geen", "de", "het"]) },
+    // What people say with their hands full: said after the wake phrase it runs this action, with no model call.
+    phrases: {
+      en: ["we're out of {what}", "we are out of {what}", "we ran out of {what}", "we've run out of {what}", "we have run out of {what}"],
+      nl: ["we hebben geen {what} meer", "de {what} is op", "het {what} is op"]
+    },
     risk: "change",
     run: ({ what }) =>
       Effect.gen(function*() {
-        const l = lang()
-        const device = yield* deviceOf
-        const r = readPhrase(what, l, cupMl)
-        if (r.kind === "several") return { say: say(texts, l, "several") }
-        if (r.kind === "unclear") return { say: say(texts, l, "unclear") }
-        const outcome = yield* transact(l, (tx, now): Outcome => {
-          const row = lookup(tx, r.item)
-          if (row === undefined) return { kind: "unknown", item: r.item }
-          const b = book(tx, row, { kind: "set", delta: -row.value.stock, approx: false, unknown: false, said: cleanPhrase(what).slice(0, 80), ...(device !== undefined ? { device } : {}) }, now)
-          return { kind: "booked", id: row.id, ...b, created: false, main: say(texts, l, "none", { item: row.value.name }) }
-        })
-        return yield* finish(outcome, l)
+        const turn = yield* CurrentTurn
+        // The same phrase invocation twice acts once: keyed by the identity the gateway gave it (a spoken phrase has a
+        // fresh turn each time, so two utterances still act twice). A model's or a routine's call is not keyed: it
+        // books as before.
+        const identity = turn?.source === "phrase" ? [turn.assistantId ?? "", turn.conversationId, turn.turnId, turn.deviceId ?? ""].join("|") : undefined
+        return yield* pantry.once(
+          identity,
+          Effect.gen(function*() {
+            const l = lang()
+            const device = yield* deviceOf
+            const r = readPhrase(what, l, cupMl)
+            if (r.kind === "several") return { say: say(texts, l, "several") }
+            if (r.kind === "unclear") return { say: say(texts, l, "unclear") }
+            const outcome = yield* transact(l, (tx, now): Outcome => {
+              const row = lookup(tx, r.item)
+              if (row === undefined) return { kind: "unknown", item: r.item }
+              const b = book(tx, row, { kind: "set", delta: -row.value.stock, approx: false, unknown: false, said: cleanPhrase(what).slice(0, 80), ...(device !== undefined ? { device } : {}) }, now)
+              return { kind: "booked", id: row.id, ...b, created: false, main: say(texts, l, "none", { item: row.value.name }) }
+            })
+            return yield* finish(outcome, l)
+          })
+        )
       })
   })
 
@@ -305,6 +322,21 @@ export const pantryActions = (deps: PantryDeps) => {
       })
   })
 
+  const lowAnswer = (keep: boolean) =>
+    Effect.gen(function*() {
+        const l = lang()
+        const device = yield* deviceOf
+        const { rows, cut } = yield* pantry.low().pipe(Effect.mapError(() => new ActionError({ message: say(texts, l, "unreadable") })))
+        if (rows.length === 0) {
+          // Nothing is low any more: a list this device still shows is taken down.
+          if (device !== undefined && pantry.screens !== undefined) yield* pantry.screens.clear(device)
+          return { say: say(texts, l, "lowNone") }
+        }
+        // Shown as the answer says it, and never instead of it: a device that cannot show it changes nothing here.
+        if (device !== undefined && pantry.screens !== undefined) yield* pantry.screens.show(device, rows, cut, keep, l)
+        return { say: lowSay(rows, cut, l) }
+      })
+
   const low = defineAction({
     id: "stock_low",
     label: "What is running low",
@@ -312,16 +344,17 @@ export const pantryActions = (deps: PantryDeps) => {
     examples: ["what are we running low on", "what do we need", "what's running out", "wat is er bijna op", "wat moeten we kopen"],
     params: {},
     speculative: true,
-    run: () =>
-      Effect.gen(function*() {
-        const l = lang()
-        const { rows, cut } = yield* scan(pantry.productStore, { where: { low: true }, orderBy: { field: "key", direction: "asc" } }, PRODUCT_PAGE, LOW_SCAN).pipe(
-          Effect.mapError(() => new ActionError({ message: say(texts, l, "unreadable") }))
-        )
-        if (rows.length === 0) return { say: say(texts, l, "lowNone") }
-        const main = say(texts, l, "low", { list: listText(rows.map((r) => r.value.name), l, cut) })
-        return { say: cut ? `${main} ${say(texts, l, "lowCut", { count: LOW_SCAN })}` : main }
-      })
+    run: () => lowAnswer(false)
+  })
+
+  const keepLow = defineAction({
+    id: "keep_low",
+    label: "Keep what is running low on the screen",
+    description: "Show what is running low as a checklist on this device's screen and keep it there until it is dismissed (stock_low shows it for a short while only). Only when someone asks to keep the list on the screen.",
+    examples: ["keep the low list on the screen", "keep what we are low on on the screen", "houd het lijstje met wat bijna op is op het scherm"],
+    params: {},
+    speculative: true,
+    run: () => lowAnswer(true)
   })
 
   const undo = defineAction({
@@ -390,7 +423,7 @@ export const pantryActions = (deps: PantryDeps) => {
       })
   })
 
-  return [add, use, out, set, query, low, undo, keepMinimum]
+  return [add, use, out, set, query, low, keepLow, undo, keepMinimum]
 }
 
 /** The product settings tools, for the model: change a product's minimum, package size or names, or forget it. */
@@ -478,6 +511,7 @@ export const productTools = (deps: PantryDeps) => {
         const { id, before, after, details } = result.booked
         const main = say(texts, l, "productSaved", { item: after.name.charAt(0).toUpperCase() + after.name.slice(1), details: speakList(details, l, { max: 4 }) ?? "" })
         const list = yield* pantry.followList(id, before, after.name, settings, l)
+        if (pantry.screens !== undefined) yield* pantry.screens.refresh
         return { spoken: list === undefined ? main : `${main} ${list}` }
       })
   })
@@ -503,6 +537,7 @@ export const productTools = (deps: PantryDeps) => {
           return { spoken: suggestion !== undefined ? say(texts, l, "unknownMaybe", { item, suggestion }) : say(texts, l, "unknown", { item }) }
         }
         if (gone.left) yield* drainForgotten(store, gone.id, FORGET_NOW).pipe(Effect.orElseSucceed(() => ({ removed: 0, done: false })))
+        if (pantry.screens !== undefined) yield* pantry.screens.refresh
         return { spoken: say(texts, l, "forgotten", { item: gone.name.charAt(0).toUpperCase() + gone.name.slice(1) }) }
       })
   })

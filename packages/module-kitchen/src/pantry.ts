@@ -10,12 +10,15 @@ import { Effect, Option, Semaphore } from "effect"
 import Fuse from "fuse.js"
 import { randomUUID } from "node:crypto"
 import { type BaseUnit, type Booking, type BookingKind, bookings, forgotten, MAX_AMOUNT, names, type Product, products, scan } from "./data.ts"
+import type { Screens } from "./lowScreen.ts"
 import { texts, type TextKey } from "./texts.ts"
 import { keyOf } from "./words.ts"
 
 /** The most products one answer reads: 20 pages of 25. A turn never reads further, and says so when it was cut. */
 export const PRODUCT_SCAN = 500
 export const PRODUCT_PAGE = 25
+/** The most low products one answer reads: four pages of 25. */
+export const LOW_SCAN = 100
 /** An undo reaches the asking device's last booking, made at most this long ago. */
 export const UNDO_WINDOW_MS = 10 * 60_000
 /** A call to the shopping list waits at most this long: the booking stands whatever the list does. */
@@ -313,7 +316,61 @@ export const makePantry = (deps: { readonly store: ModuleStore; readonly host: M
     )
   }
 
-  return { productStore, nameStore, bookingStore, find, all, suggest, followList }
+  /** The low products, in name order, at most `LOW_SCAN` (and whether the read was cut). */
+  const low = () => scan(productStore, { where: { low: true }, orderBy: { field: "key", direction: "asc" } }, PRODUCT_PAGE, LOW_SCAN)
+
+  /**
+   * Put a product on the shopping list when its tick asks for it, by the path of `followList`: its dedupe key on the
+   * `Lists` service, one call per product at a time, each call within `LISTS_TIMEOUT_MS`. Idempotent by the key: a
+   * second tick finds the item and changes nothing (`already`).
+   */
+  const putOnList = (id: string): Effect.Effect<PutOutcome> =>
+    Effect.gen(function*() {
+      const row = yield* productStore.get(id).pipe(Effect.map((r) => ({ read: true as const, row: r })), Effect.orElseSucceed(() => ({ read: false as const, row: undefined })))
+      if (!row.read) return { kind: "unreadable" } as const
+      if (row.row === undefined) return { kind: "gone" } as const
+      const name = row.row.value.name
+      const asked = useService(deps.host, Lists, (lists) => lists.addItem({ text: name, dedupeKey: listKey(id) })).pipe(
+        Effect.timeoutOption(LISTS_TIMEOUT_MS),
+        Effect.map((o): PutOutcome => (Option.isNone(o) ? { kind: "failed", name } : { kind: o.value.outcome === "updated" ? "already" : "listed", name })),
+        Effect.catchTag("ProviderOff", () => Effect.succeed<PutOutcome>({ kind: "off", name })),
+        Effect.catchTag("ListsError", (e: ListsError) => Effect.succeed<PutOutcome>({ kind: e.reason === "limit" ? "full" : "failed", name }))
+      )
+      return yield* oneAtATime(id, asked).pipe(
+        Effect.timeoutOption(2 * LISTS_TIMEOUT_MS + 500),
+        Effect.map((o): PutOutcome => (Option.isSome(o) ? o.value : { kind: "failed", name }))
+      )
+    })
+
+  // The same phrase invocation twice acts once: the first answer of each identity (assistant, conversation, turn and
+  // device) is kept, a bounded few, and a repeat gets it back without booking again.
+  const replays = new Map<string, string>()
+  const REPLAYS = 64
+  const once = <E>(identity: string | undefined, run: Effect.Effect<{ readonly say: string }, E>): Effect.Effect<{ readonly say: string }, E> =>
+    identity === undefined
+      ? run
+      : Effect.suspend(() => {
+        const first = replays.get(identity)
+        if (first !== undefined) return Effect.succeed({ say: first })
+        return run.pipe(Effect.tap((r) =>
+          Effect.sync(() => {
+            replays.set(identity, r.say)
+            for (const old of replays.keys()) {
+              if (replays.size <= REPLAYS) break
+              replays.delete(old)
+            }
+          })
+        ))
+      })
+
+  return { productStore, nameStore, bookingStore, find, all, suggest, followList, low, putOnList, once }
 }
 
-export type Pantry = ReturnType<typeof makePantry>
+/** What a tick on the checklist came to. */
+export type PutOutcome =
+  | { readonly kind: "gone" }
+  | { readonly kind: "unreadable" }
+  | { readonly kind: "listed" | "already" | "off" | "full" | "failed"; readonly name: string }
+
+/** The pantry, with (once the shared part has made them) the lists it has on screens. */
+export type Pantry = ReturnType<typeof makePantry> & { readonly screens?: Screens }

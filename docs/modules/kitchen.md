@@ -85,6 +85,64 @@ is safe by construction rather than clever:
 
 Diets are met only when a recipe declares them ("vegan" satisfies "vegetarian"). A dislike only lowers a recipe.
 
+## Phrases
+
+One phrase command, for what people say with their hands full: that something has run out. It runs the existing action
+`stock_out` with no model call, after the wake phrase (docs/PHRASES.md): same parameter (`what`, taken as text and
+resolved in the action), same refusals, same sentences, same risk class (`change`). In both languages, exact words:
+
+| Language | Phrases (`{what}` is the product) | Example, and what is said |
+|---|---|---|
+| English | "we're out of {what}", "we are out of {what}", "we ran out of {what}", "we've run out of {what}", "we have run out of {what}" | "we're out of rice": "Okay, no rice left. Rice is on the shopping list." |
+| Dutch | "we hebben geen {what} meer", "de {what} is op", "het {what} is op" | "we hebben geen rijst meer": "Oké, geen rijst meer. Rijst staat op het boodschappenlijstje." |
+
+The household's language decides which set is heard. A near miss is not a phrase and goes to the assistant ("we're
+almost out of rice", "the rice is gone", "we hebben geen rijst", "rijst is op"). The slot is read as the tool reads
+it, so "rice and milk" is "One thing at a time, please: how much of what?", an unknown product is a question ("There's
+no basmati in the pantry."), and the usual fillers at its end ("please") are dropped. A phrase is one invocation: the
+same phrase run twice with the identity the gateway gave it (assistant, conversation, turn, device) acts once and
+returns its first answer, kept for the last 64 in the shared part (not across a restart: a spoken phrase is never
+retried); two utterances are two invocations and act twice. A call that is not a phrase (the model's tool, a routine)
+is not held back.
+
+## On a screen
+
+`stock_low` also puts **what is low or missing on the screen of the device that asked**, as a checklist
+(`docs/PRESENTING.md`, a `list` with `style: "checklist"`). Showing it never changes the answer: the spoken sentence
+(and the tool's result) is exactly what it was, and a device with no display, an older page or no Presenter (the CLI
+modes) simply shows nothing.
+
+- **What it shows**: the products `stock_low` read, in name order, at most twelve (a checklist's bound), each by its
+  name. The title says when it is not the whole list: "Running low: the first 12 of 30", or, when the read itself was
+  cut at 100, "…of at least 100". Texts are cut at a character boundary inside the limit (never in the middle of an
+  emoji). The sentence the model says where nothing can be shown is the answer's own (with fewer names when it would
+  pass 300 characters). It shows no recipe, so the allergy rules have nothing to leave out.
+- **Privacy**: it is household data, like the spoken answer, and carries the household sensitivity; the decision is the
+  Presenter's, at each moment of showing, for each device. So it is shown on the shared, the private and the public
+  screen alike, as the answer is said on all of them; the module's tests run all three and a speaker with no display.
+- **Transient, unless asked to keep it**: it is on the screen for the default 30 seconds and a newer transient one of
+  any module takes the screen. "Keep the low list on the screen" runs `keep_low`, which shows the same list pinned
+  (4 hours, until dismissed), and a page that reconnects is given it again. One list per device (its key is the
+  device's); asking again replaces it in place.
+- **It follows the stock**: after a booking, a change of a product's settings or forgetting a product, a list still on
+  a screen is brought into line with what is low then (an item that is not low any more leaves it; the last one takes
+  the whole list down), and an answer that finds nothing low takes a list that device still shows down. The module
+  holds a handle for each list it showed, so it only ever updates a list that is still live: one that ended (it ran
+  out, another module's list took the screen) is never shown again by a booking.
+- **A tick** (the `low` press handler, registered in `shared`) puts that product on the shopping list: the same call the
+  stock answers make (`Lists.addItem` with the key `kitchen:product:<id>`), one product at a time under the pantry's
+  one-at-a-time rule, within the same 1.5 s. It is idempotent by that key: a second tick finds the item and answers "Rice
+  was already on the shopping list." (the first, "Rice is on the shopping list."), and the item is shown ticked only
+  when the list took it. The Lists module off, full or slow is said as it is for a booking ("The Lists module is off, so
+  I couldn't update the shopping list for rice.") and nothing is shown ticked. A product forgotten since is "That
+  product isn't in the pantry any more, so I left the shopping list alone." Unticking changes nothing ("I can't take it
+  off the shopping list from here; do that on the list itself."). A tick is admitted only from a page that holds the
+  list.
+- **After a restart** the handles are gone: a transient list is gone with them, and a kept (pinned) one stays until it
+  ends, its ticks still work (the next tick shows it again by its key) and the next `stock_low` replaces it.
+  Ticked marks live in memory and are not kept: a list shown again after a restart starts unticked, which says nothing
+  untrue (it never claims a state it did not observe).
+
 ## Tools
 
 Typed actions (they run without the model from their examples; the model gets each as the tool `kitchen_<id>`):
@@ -93,10 +151,11 @@ Typed actions (they run without the model from their examples; the model gets ea
 |---|---|---|---|
 | `stock_add` / `kitchen_stock_add` (`what`) | "I bought a kilo of rice", "ik heb een kilo rijst gekocht" | change | "Added 1 kilogram of rice. You now have 1.2 kilograms of rice." |
 | `stock_use` / `kitchen_stock_use` (`what`) | "I used 250 grams of rice", "I used some of the cheese" | change | "Okay, 950 grams of rice left." (plus the shopping list line when it went low); after "some" or "about": that the amount is not known now |
-| `stock_out` / `kitchen_stock_out` (`what`) | "we're out of rice", "we hebben geen rijst meer" | change | "Okay, no rice left. Rice is on the shopping list." |
+| `stock_out` / `kitchen_stock_out` (`what`) | "we're out of rice", "we hebben geen rijst meer" (also a phrase command: see "Phrases") | change | "Okay, no rice left. Rice is on the shopping list." |
 | `stock_set` / `kitchen_stock_set` (`what`) | "there is a kilo of rice left" | change | "Okay, you have 1 kilogram of rice." (exact: known again); "about a kilo" is noted and stays not known exactly |
 | `stock_query` / `kitchen_stock_query` (`item`, optional) | "how much rice is left", "hoeveel rijst hebben we nog" | read | "You have 950 grams of rice." / not known: "I don't know exactly how much rice there is; last I knew, about …" / with no item: "In the pantry: …" |
-| `stock_low` / `kitchen_stock_low` | "what are we running low on" | read | "Running low: rice and milk." |
+| `stock_low` / `kitchen_stock_low` | "what are we running low on" | read | "Running low: rice and milk." (and the checklist on the asking device's screen: see "On a screen") |
+| `keep_low` / `kitchen_keep_low` | "keep the low list on the screen", "houd het lijstje met wat bijna op is op het scherm" | read | the same answer as `stock_low`, with its checklist kept on the screen (pinned) instead of for a short while |
 | `undo` / `kitchen_undo` | "undo that", "maak dat ongedaan" | change | "Undone. You now have 1 kilogram of rice." / more than ten minutes old, or the product changed since: refused, "tell me how much there is instead" |
 | `keep_minimum` / `kitchen_keep_minimum` (`what`) | "always keep two kilos of rice" | change | "Okay, I'll keep at least 2 kilograms of rice in stock." |
 | `what_to_make` (not offered as a tool: the model has `kitchen_what_can_i_make`) | "what can I cook within 15 minutes", "wat kan ik maken" | read | "You could make Egg fried rice, short of spring onion." with every note (a cut read, what was left out) and the allergy sentence last |
@@ -206,12 +265,12 @@ screen with and without a default person, and a shared screen with nobody.
 
 ## What was left out
 
-Waits for wave B (P7, P9, P10 do not exist yet):
+Added since the first version: the phrase "we're out of …" and the low-stock checklist (above). Still left out:
 
-- **Presentations**: the `facts` stock answer, the low and expiring `list` checklist with ticks, the "what can I make"
-  `list` with pick, the recipe `card`, the `steps` view (research §8).
+- **Presentations**: the `facts` stock answer, the expiring part of the checklist (there are no expiry dates), the
+  "what can I make" `list` with pick, the recipe `card`, the `steps` view (research §8).
 - **Notifications**: the expiry check, the daily low-stock inbox line, the thaw reminder (§9).
-- **Phrase commands** and the hands-free cooking window ("next", "back") (§12).
+- **Other phrase commands** and the hands-free cooking window ("next", "back") (§12); the checklist's buttons.
 
 Left for later by the plan's row: URL import, scaling, guided cooking (sessions, step timers through `Timers`), the
 meal plan and shopping for it, the Chef template, outside providers (Grocy, Mealie, Tandoor) and their outbox,
