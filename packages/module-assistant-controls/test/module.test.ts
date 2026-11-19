@@ -4,17 +4,29 @@
 import { assert, describe, it } from "@effect/vitest"
 import { checkModule, expectOffByDefault, startTestModule } from "@pva/core/testing"
 import { ModuleStopped, type ModuleDefinition } from "@pva/core"
-import { Effect } from "effect"
-import { assistantControlsModule, catalog, gainOfLevel, stepOfGain, texts } from "../src/index.ts"
+import { Effect, Logger } from "effect"
+import { vi } from "vitest"
+import { assistantControlsModule, catalog, diagnosticName, gainOfLevel, stepOfGain, texts } from "../src/index.ts"
+
+// Several tests start more than one test household.
+vi.setConfig({ testTimeout: 30_000 })
 
 const NL = { household: { home: { HOME_LANGUAGE: "nl-NL" } } } as const
 const spoken = (r: { readonly value: unknown }) => (r.value as { readonly spoken: string }).spoken
 
 /** The module with the core's services replaced (a CLI mode has none; a provider may stop or fail while called). */
-const withServices = (service: (key: unknown) => unknown): ModuleDefinition<any> => ({
+const withServices = (service: (key: unknown, real: unknown) => unknown): ModuleDefinition<any> => ({
   ...assistantControlsModule,
-  start: (ctx: any) => assistantControlsModule.start!({ ...ctx, host: { ...ctx.host, service } } as never)
+  start: (ctx: any) => assistantControlsModule.start!({ ...ctx, host: { ...ctx.host, service: (key: unknown) => service(key, ctx.host.service(key)) } } as never)
 })
+const idOf = (key: unknown) => (key as { id: string }).id
+const SESSION = "core.session-control"
+const DEVICE = "core.device-control"
+/** The real services, with some replaced: a service object, or `"absent"` for a mode that has none. */
+const replacing = (by: Record<string, unknown>) => (key: unknown, real: unknown) => {
+  const r = by[idOf(key)]
+  return r === "absent" ? undefined : (r ?? real)
+}
 
 describe("@pva/module-assistant-controls", () => {
   it.effect("accepted by the host, off by default, conformant, texts in both languages", () =>
@@ -281,5 +293,119 @@ describe("@pva/module-assistant-controls", () => {
         // The module is still up: another tool answers.
         assert.include(JSON.stringify((yield* broken.tool("controls_louder", {}, { device: "kitchen-display" })).content), "I can't do that here.")
       }))
+  })
+
+  describe("review round 1", () => {
+    /** The real session, with every `newConversation` call recorded (its device argument), and an optional fixed answer. */
+    const recording = (calls: Array<string>, answer?: "undefined") =>
+      withServices((key, real) => {
+        if (idOf(key) !== SESSION) return real
+        const session = real as { newConversation: (d: string) => Effect.Effect<string | undefined> }
+        return { ...session, newConversation: (d: string) => (calls.push(d), answer === "undefined" ? Effect.succeed(undefined) : session.newConversation(d)) }
+      })
+
+    it.effect("a new conversation resets the asking device and only it, once per request, by tool, phrase and action", () =>
+      Effect.gen(function*() {
+        const calls: Array<string> = []
+        const kit = yield* startTestModule(recording(calls))
+        for (const device of ["kitchen-display", "robins-phone"]) {
+          calls.length = 0
+          yield* kit.tool("controls_new_conversation", {}, { device })
+          assert.deepStrictEqual(calls, [device])
+          calls.length = 0
+          assert.isTrue((yield* kit.phrases.say("start over", { device })).taken)
+          assert.deepStrictEqual(calls, [device])
+          calls.length = 0
+          assert.strictEqual((yield* kit.action("new_conversation", {}, { device })).ok, true)
+          assert.deepStrictEqual(calls, [device])
+        }
+      }))
+
+    it.effect("a service that knows no such device is not confirmed as a reset: it says so, in both languages", () =>
+      Effect.gen(function*() {
+        for (const [options, sentence] of [[{}, "I can't tell which device that is for."], [NL, "Ik weet niet voor welk apparaat dit is."]] as const) {
+          const calls: Array<string> = []
+          const kit = yield* startTestModule(recording(calls, "undefined"), options)
+          const tool = yield* kit.tool("controls_new_conversation", {}, { device: "kitchen-display" })
+          assert.isFalse(tool.ok)
+          assert.include(JSON.stringify(tool.content), sentence)
+          assert.notInclude(JSON.stringify(tool.content).toLowerCase(), "conversation.")
+          const action = yield* kit.action("new_conversation", {}, { device: "kitchen-display" })
+          assert.isFalse(action.ok)
+          yield* kit.phrases.say(options === NL ? "nieuw gesprek" : "new conversation", { device: "kitchen-display" })
+          assert.deepStrictEqual(kit.phrases.spoken.map((s) => s.text), [sentence])
+          assert.strictEqual(calls.length, 3)
+        }
+      }))
+
+    it.effect("the Dutch outcomes through real paths: a reply stopped, a pending one cancelled, a kept reply repeated, a step louder", () =>
+      Effect.gen(function*() {
+        const kit = yield* startTestModule(assistantControlsModule, NL)
+        const d = { device: "kitchen-display" }
+        yield* kit.notify.replying("kitchen-display", true)
+        assert.strictEqual(spoken(yield* kit.tool("controls_stop_reply", {}, d)), "Gestopt.")
+        yield* kit.notify.replying("kitchen-display", true)
+        assert.strictEqual(spoken(yield* kit.tool("controls_cancel_pending", {}, d)), "Geannuleerd.")
+        kit.phrases.replied("kitchen-display", "Het wordt zonnig.")
+        assert.strictEqual(spoken(yield* kit.tool("controls_repeat_last", {}, d)), "Ik zeg het nog eens.")
+        assert.deepStrictEqual(kit.phrases.spoken.map((s) => s.text), ["Het wordt zonnig."])
+        yield* kit.tool("controls_set_volume", { level: 3 }, d)
+        assert.strictEqual(spoken(yield* kit.tool("controls_louder", {}, d)), "Harder: volume 3 van 5.")
+      }))
+
+    const logged: Array<string> = []
+    const capture = Logger.make<unknown, void>(({ message }) => void logged.push(Array.isArray(message) ? message.join(" ") : String(message)))
+
+    it.effect("a service that dies: the failure sentence in both languages, the module runs on, and the log has the error's built-in name only", () =>
+      Effect.gen(function*() {
+        const secret = "boom-secret-text-123"
+        for (const [options, sentence] of [[{}, "That didn't work. Try again in a moment."], [NL, "Dat lukte niet. Probeer het zo nog eens."]] as const) {
+          const kit = yield* startTestModule(withServices(replacing({ [SESSION]: { stopReply: () => Effect.die(new TypeError(secret)) } })), options)
+          const r = yield* kit.tool("controls_stop_reply", {}, { device: "kitchen-display" })
+          assert.isFalse(r.ok)
+          assert.include(JSON.stringify(r.content), sentence)
+          assert.notInclude(JSON.stringify(r.content), secret)
+        }
+        const kit = yield* startTestModule(withServices(replacing({ [SESSION]: { stopReply: () => Effect.die(new TypeError(secret)) } })))
+        yield* kit.tool("controls_stop_reply", {}, { device: "kitchen-display" })
+        // One warning per failed call, naming the error's built-in type, and nothing of its message.
+        const ours = logged.filter((l) => l.includes("assistant-controls"))
+        assert.strictEqual(ours.length, 3)
+        assert.isTrue(ours.every((l) => l.includes("(TypeError)")))
+        assert.notInclude(logged.join("\n"), secret)
+      }).pipe(Effect.provide(Logger.layer([capture]))))
+
+    it("the diagnostic is a built-in error name and nothing of the message", () => {
+      assert.strictEqual(diagnosticName(new TypeError("the secret")), "TypeError")
+      assert.strictEqual(diagnosticName(new Error("x")), "Error")
+      const custom = new Error("x")
+      custom.name = "SecretProviderError: token=abc"
+      assert.strictEqual(diagnosticName(custom), "other")
+      assert.strictEqual(diagnosticName("a string with a secret"), "other")
+      assert.strictEqual(diagnosticName({ name: "Error" }), "other")
+    })
+
+    describe("the volume actions and the phrase with DeviceControl absent, stopping or dying", () => {
+      const cases = [
+        ["absent", "absent", "I can't do that here.", "Dat kan ik hier niet."],
+        ["stopping", { replyVolume: () => 1, changeReplyVolume: () => Effect.die(new ModuleStopped({ message: "stopped" })) }, "I can't do that here.", "Dat kan ik hier niet."],
+        ["dying", { replyVolume: () => 1, changeReplyVolume: () => Effect.die(new RangeError("volume-secret")) }, "That didn't work. Try again in a moment.", "Dat lukte niet. Probeer het zo nog eens."]
+      ] as const
+      for (const [name, service, en, nl] of cases) {
+        for (const [language, options, expected, phrase] of [["English", {}, en, "volume six"], ["Dutch", NL, nl, "volume zes"]] as const) {
+          it.effect(`${name}, ${language}: a localized failure from the action and the phrase, never a confirmed change`, () =>
+            Effect.gen(function*() {
+              const kit = yield* startTestModule(withServices(replacing({ [DEVICE]: service })), options)
+              const action = yield* kit.action("set_volume", { level: 6 }, { device: "kitchen-display" })
+              assert.isFalse(action.ok)
+              assert.include(JSON.stringify(action), expected)
+              assert.notInclude(JSON.stringify(action), "volume-secret")
+              assert.isTrue((yield* kit.phrases.say(phrase, { device: "kitchen-display" })).taken)
+              assert.deepStrictEqual(kit.phrases.spoken.map((s) => s.text), [expected])
+              assert.deepStrictEqual(kit.phrases.volumeSends, [])
+            }))
+        }
+      }
+    })
   })
 })

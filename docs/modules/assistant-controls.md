@@ -88,7 +88,7 @@ Nothing (no collection, no job, no notification, no secret). The volume is the s
 `requires` nothing from the network or the machine. It uses the core services `SessionControl` and `DeviceControl`,
 looked up at each use. **In the CLI modes they are absent**, and a stopped provider ends the same way: every control
 answers "I can't do that here." / "Dat kan ik hier niet."; any other failure of a service call answers "That didn't work.
-Try again in a moment." (the cause only in the log). The module runs on after either.
+Try again in a moment." (the log gets one warning with the error's built-in name only, such as `TypeError`, never its message; nothing of the cause reaches the model or speech). The module runs on after either.
 
 ## What was left out
 

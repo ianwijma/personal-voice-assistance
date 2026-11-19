@@ -85,6 +85,10 @@ export const texts = defineTexts({
   }
 })
 
+/** The built-in name of a thrown value ("Error", "TypeError", …) and nothing of its message; any other value is "other". */
+const BUILT_IN = new Set(["Error", "TypeError", "RangeError", "SyntaxError", "ReferenceError", "EvalError", "URIError"])
+export const diagnosticName = (defect: unknown): string => (defect instanceof Error && BUILT_IN.has(defect.name) ? defect.name : "other")
+
 /** A control that could not be carried out; `message` is spoken (a tool's error, an action's error). */
 class ControlFailure extends Data.TaggedError("ControlFailure")<{ readonly message: string }> {}
 
@@ -100,7 +104,7 @@ const num = (n: number, lang: Lang): string => speakNumber(n, lang) ?? String(n)
  */
 const makeControls = (host: ModuleHostApi) => {
   const language = (): Lang => homeLanguage(host.view())
-  const run = (use: (deviceId: string, lang: Lang) => Effect.Effect<string, ProviderOff>) =>
+  const run = (use: (deviceId: string, lang: Lang) => Effect.Effect<string, ProviderOff | ControlFailure>) =>
     Effect.gen(function*() {
       const lang = language()
       const turn = yield* CurrentTurn
@@ -108,7 +112,13 @@ const makeControls = (host: ModuleHostApi) => {
       if (deviceId === undefined) return yield* Effect.fail(new ControlFailure({ message: say(texts, lang, "noDevice") }))
       return yield* use(deviceId, lang)
     }).pipe(
-      Effect.catchDefect(() => Effect.fail(new ControlFailure({ message: say(texts, language(), "failed") }))),
+      // The cause goes nowhere near the model or speech. The log gets the error's built-in name only (never its message,
+      // which a provider may fill with anything), so a failing service can be told from a quiet one.
+      Effect.catchDefect((defect) =>
+        Effect.logWarning(`assistant-controls: a service call failed (${diagnosticName(defect)})`).pipe(
+          Effect.andThen(Effect.fail(new ControlFailure({ message: say(texts, language(), "failed") })))
+        )
+      ),
       Effect.catchTag("ProviderOff", () => Effect.fail(new ControlFailure({ message: say(texts, language(), "unavailable") })))
     ) as Effect.Effect<string, ControlFailure>
 
@@ -126,7 +136,12 @@ const makeControls = (host: ModuleHostApi) => {
     session((s) => s.repeatLast(id)).pipe(Effect.map((did) => say(texts, lang, did ? "repeating" : "nothingToRepeat")))
   )
   const newConversation = run((id, lang) =>
-    session((s) => s.newConversation(id)).pipe(Effect.map((conversation) => say(texts, lang, conversation === undefined ? "noDevice" : "newConversation")))
+    // The service answers `undefined` for a device it does not know: nothing was reset, so it is a failure, never "starting".
+    session((s) => s.newConversation(id)).pipe(
+      Effect.flatMap((conversation) =>
+        conversation === undefined ? Effect.fail(new ControlFailure({ message: say(texts, lang, "noDevice") })) : Effect.succeed(say(texts, lang, "newConversation"))
+      )
+    )
   )
   const volumeIs = run((id, lang) =>
     device((d) => Effect.sync(() => d.replyVolume(id))).pipe(Effect.map((gain) => say(texts, lang, "volumeIs", { step: num(stepOfGain(gain), lang), steps: num(STEPS, lang) })))
