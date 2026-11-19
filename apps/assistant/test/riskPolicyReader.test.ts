@@ -17,7 +17,7 @@ vi.mock("node:fs", async (importOriginal) => {
 })
 
 const { makeSections } = await import("../src/serve/sections.ts")
-const { effectiveRiskPolicy, servePolicyReader } = await import("../src/serve/riskPolicy.ts")
+const { effectiveRiskPolicy, serveLanguageReader, servePolicyReader } = await import("../src/serve/riskPolicy.ts")
 const { startCliModules } = await import("../src/modules.ts")
 const { withCliSettings } = await import("../src/cliSettings.ts")
 const { makeRequirementChecker } = await import("../src/requirements.ts")
@@ -124,6 +124,21 @@ describe("serve's record: published with the commit, read as a field (finding 6)
     expect((await call("look")).content).toBe("seen")
     expect((await call("lamp")).content).toBe("Not run: it would change something in the house, which this household does not allow.")
     void registry.specs
+    expect(fsCalls() - before).toBe(0)
+  })
+
+  it("review round 2, the note: the first refusal right after a save, with serve's language hook too, does no file-system work and speaks the saved language", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "pva-risk-serve-"))
+    const sections = makeSections(await Effect.runPromise(openStore(dir)), {})
+    const gateway = makeExecutionGateway({ policy: servePolicyReader(sections), language: serveLanguageReader(sections) })
+    const lamp = makeTool({ name: "lamp", description: "", parameters: Schema.Struct({}), risk: "change", execute: () => Effect.succeed("on") })
+    const registry = makeToolRegistry([{ name: "house", tools: [lamp] }], { gateway })
+    const call = () => Effect.runPromise(registry.run({ id: "lamp", name: "lamp", input: {} }).pipe(Effect.provideService(CurrentTurn, { turnId: 1, conversationId: "c", source: "voice" as const })))
+    expect((await call()).content).toBe("on")
+    expect((await Effect.runPromise(sections.update("home", { values: { HOME_LANGUAGE: "nl-NL" }, secrets: {} }))).result.ok).toBe(true)
+    expect((await Effect.runPromise(sections.update("risk", { values: { RISK_CHANGE: "deny" }, secrets: {} }))).result.ok).toBe(true)
+    const before = fsCalls()
+    expect((await call()).content).toBe("Niet uitgevoerd: het zou iets in huis veranderen, en dat staat dit huishouden niet toe.")
     expect(fsCalls() - before).toBe(0)
   })
 

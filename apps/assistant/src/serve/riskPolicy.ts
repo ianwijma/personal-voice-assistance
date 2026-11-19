@@ -1,6 +1,6 @@
 import { resolveSettings } from "@pva/core"
-import { decodeRiskPolicy, RISK_POLICY_KEYS, type RiskPolicy } from "@pva/protocol"
-import { riskSection } from "./sectionDefinitions.ts"
+import { decodeRiskPolicy, RISK_POLICY_KEYS, type RiskLanguage, riskLanguageOf, type RiskPolicy } from "@pva/protocol"
+import { homeSection, riskSection } from "./sectionDefinitions.ts"
 
 /**
  * THE reader of the household's effective risk policy (P8, review round 1 H1): the `risk` section's own fields resolved
@@ -24,6 +24,20 @@ export const effectiveRiskPolicy = (sources: {
   const values = resolveSettings(riskSection.spec, { stored, secrets: {}, env }).form.values
   return decodeRiskPolicy((key) => values[key])
 }
+
+/**
+ * The language of the policy's sentences (review round 2, the note): the Home section's `HOME_LANGUAGE` field alone,
+ * resolved as every reader resolves it, then `riskLanguageOf`. Pure, like `effectiveRiskPolicy`; published with it.
+ */
+export const effectiveRiskLanguage = (sources: { readonly stored: Readonly<Record<string, unknown>>; readonly env: Readonly<Record<string, string | undefined>> }): RiskLanguage => {
+  const field = { HOME_LANGUAGE: homeSection.spec.HOME_LANGUAGE! }
+  const stored = Object.hasOwn(sources.stored, "HOME_LANGUAGE") ? { HOME_LANGUAGE: sources.stored.HOME_LANGUAGE } : {}
+  const env = Object.hasOwn(sources.env, "HOME_LANGUAGE") ? { HOME_LANGUAGE: sources.env.HOME_LANGUAGE } : {}
+  return riskLanguageOf(resolveSettings(field, { stored, secrets: {}, env }).form.values.HOME_LANGUAGE)
+}
+
+/** Serve mode's language hook (`gatewayHooks.language`): the record the sections publish, read as a field. */
+export const serveLanguageReader = (sections: { readonly riskLanguage: () => RiskLanguage }): (() => RiskLanguage) => () => sections.riskLanguage()
 
 /** The policy as flat values of its keys (what the settings `ConfigProvider` serves for them). */
 export const riskPolicyValues = (policy: RiskPolicy): Readonly<Record<string, string>> => ({

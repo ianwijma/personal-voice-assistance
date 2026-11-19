@@ -8,7 +8,6 @@ import {
   makePresentEngine,
   type NotDelivered,
   notifyLanguageOf,
-  riskLanguageOf,
   makeToolRegistry,
   type ModuleDemand,
   type Principal,
@@ -116,7 +115,7 @@ import { type Jobs, makeJobs } from "./jobs.ts"
 import { makeModels, type Models, type PresetDownloader, presetsInUse } from "./models.ts"
 import { type Keys, makeKeys } from "./Keys.ts"
 import { makeSections } from "./sections.ts"
-import { servePolicyReader } from "./riskPolicy.ts"
+import { serveLanguageReader, servePolicyReader } from "./riskPolicy.ts"
 import { makeAssistants } from "./assistants.ts"
 import { makeSessionHub, type SessionHub } from "./SessionHub.ts"
 import { DataDirConfig, KEYS_LOCKED_MESSAGE, loadSettingsStore, type SaveStep, type SettingsStore, SettingsStoreError } from "./SettingsStore.ts"
@@ -524,7 +523,7 @@ export const startServe = (options: ServeOptions): Effect.Effect<ServeHandle, Ht
       // refusal outside a turn logged (a turn's decisions are in its trace line).
       gatewayHooks: {
         policy: servePolicyReader(sections),
-        language: () => riskLanguageOf(sections.value("HOME_LANGUAGE")),
+        language: serveLanguageReader(sections),
         mayReveal: (owner, deviceId) => deviceFacts.privacy.mayReveal(owner, deviceId),
         onDecision: (record) => {
           if (record.turnId === undefined && record.outcome !== "allow") {

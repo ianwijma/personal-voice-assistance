@@ -1,10 +1,10 @@
 import { applySettingsPatch, type HostResult, parseVoiceKey, resolveSettings, runSettingsChecks, type SettingsSources } from "@pva/core"
-import { DEFAULT_RISK_POLICY, type FieldError, type RiskPolicy, type SettingsPatch, type SettingsSection, type SettingValue } from "@pva/protocol"
+import { DEFAULT_RISK_POLICY, type FieldError, type RiskLanguage, type RiskPolicy, type SettingsPatch, type SettingsSection, type SettingValue } from "@pva/protocol"
 import * as SherpaStt from "@pva/stt-sherpa"
 import * as SherpaTts from "@pva/tts-sherpa"
 import { ConfigProvider, Effect, Semaphore } from "effect"
 import { type ModelDirs, type SectionDefinition, sectionDefinitions, sectionPath } from "./sectionDefinitions.ts"
-import { effectiveRiskPolicy, riskPolicyValues } from "./riskPolicy.ts"
+import { effectiveRiskLanguage, effectiveRiskPolicy, riskPolicyValues } from "./riskPolicy.ts"
 import type { SettingsStore } from "./SettingsStore.ts"
 
 /**
@@ -63,6 +63,8 @@ export interface Sections {
    * waits.
    */
   readonly riskPolicy: () => RiskPolicy
+  /** The language of the policy's sentences (`HOME_LANGUAGE`), published with the policy, read as a field. */
+  readonly riskLanguage: () => RiskLanguage
 }
 
 /**
@@ -135,14 +137,18 @@ export const makeSections = (
   const revisions = new Map<string, number>()
   /** P8: the effective risk policy, published off the call path (`riskPolicy`). The defaults until the first publication. */
   let riskRecord: RiskPolicy = DEFAULT_RISK_POLICY
-  const publishRisk = () => {
-    riskRecord = effectiveRiskPolicy({ stored: store.settings().assistant, env })
+  /** The language of its sentences, published with it (review round 2, the note). */
+  let languageRecord: RiskLanguage = "en"
+  const publishFrom = (stored: Readonly<Record<string, unknown>>) => {
+    riskRecord = effectiveRiskPolicy({ stored, env })
+    languageRecord = effectiveRiskLanguage({ stored, env })
   }
+  const publishRisk = () => publishFrom(store.settings().assistant)
   // P8 (review round 2): published in the step that commits a new settings state, before every other commit listener
   // and before the save's caller or any other fiber runs again, from the committed values alone (five fields resolved,
   // no section definitions, no file).
   store.onCommitted((before, after) => {
-    if (before.assistant !== after.assistant) riskRecord = effectiveRiskPolicy({ stored: after.assistant, env })
+    if (before.assistant !== after.assistant) publishFrom(after.assistant)
   }, { first: true })
   const listeners = new Set<(section: SettingsSection) => void>()
   const origin = {
@@ -388,6 +394,7 @@ export const makeSections = (
       announce(current().sections)
     },
     modelDirs,
-    riskPolicy: () => riskRecord
+    riskPolicy: () => riskRecord,
+    riskLanguage: () => languageRecord
   }
 }
