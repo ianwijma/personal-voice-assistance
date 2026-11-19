@@ -1,0 +1,51 @@
+import { defineTexts } from "@pva/module-contracts"
+
+/** Every sentence the module speaks, failures and questions included, in both languages with the same placeholders. */
+export const texts = defineTexts({
+  en: {
+    found: "I found a picture of {title}: {description}. I can't show it here.",
+    foundBare: "I found a picture of {title}, but I can't show it here.",
+    foundCommons: "I found a picture on Wikimedia Commons that matches {title}, but I can't show it here.",
+    alt: "A picture of {title}",
+    which: "{word} could be several things. Which do you mean: {list}?",
+    whichUnnamed: "{word} could be several things, and I can't tell which. Can you say a bit more?",
+    nothing: "I couldn't find a picture of {word} on Wikipedia or Wikimedia Commons.",
+    noPicture: "Wikipedia has a page on {title}, but no picture I can use.",
+    noPictureNoCommons: "Wikipedia has a page on {title}, but no picture I can use, and the search of Wikimedia Commons is switched off.",
+    slow: "Wikipedia is too slow to answer right now. I couldn't look for a picture; try again in a minute.",
+    unreachable: "I can't reach Wikipedia right now, so I couldn't look for a picture.",
+    rateLimited: "Wikipedia has had enough requests from me for now; try again in a minute.",
+    rubbish: "Wikipedia sent an answer I couldn't read, so I couldn't look for a picture.",
+    failed: "The picture search didn't work.",
+    badWord: "Tell me what the picture should be of, in a few words.",
+    creditVia: "{who}, {licence}, via Wikimedia Commons",
+    creditNoAuthor: "Author not stated, {licence}, via Wikimedia Commons",
+    sourceWikipedia: "Wikipedia",
+    sourceCommons: "Wikimedia Commons",
+    noSafeSearchTitle: "Pictures have no safe-search filter",
+    noSafeSearchDetail: "Wikipedia and Wikimedia Commons have no safe-search filter, so a picture of a thing may show anything that has a page about it. Nothing here keeps children from seeing it."
+  },
+  nl: {
+    found: "Ik vond een plaatje van {title}: {description}. Ik kan het hier niet laten zien.",
+    foundBare: "Ik vond een plaatje van {title}, maar ik kan het hier niet laten zien.",
+    foundCommons: "Ik vond op Wikimedia Commons een plaatje dat past bij {title}, maar ik kan het hier niet laten zien.",
+    alt: "Een plaatje van {title}",
+    which: "{word} kan van alles zijn. Welke bedoel je: {list}?",
+    whichUnnamed: "{word} kan van alles zijn en ik weet niet welke. Kun je iets meer zeggen?",
+    nothing: "Ik kon geen plaatje van {word} vinden op Wikipedia of Wikimedia Commons.",
+    noPicture: "Wikipedia heeft een pagina over {title}, maar geen plaatje dat ik kan gebruiken.",
+    noPictureNoCommons: "Wikipedia heeft een pagina over {title}, maar geen plaatje dat ik kan gebruiken, en het zoeken op Wikimedia Commons staat uit.",
+    slow: "Wikipedia antwoordt nu te traag. Ik kon niet naar een plaatje zoeken; probeer het over een minuut nog eens.",
+    unreachable: "Ik kan Wikipedia nu niet bereiken, dus ik kon niet naar een plaatje zoeken.",
+    rateLimited: "Wikipedia heeft voorlopig genoeg verzoeken van mij gehad; probeer het over een minuut nog eens.",
+    rubbish: "Wikipedia stuurde een antwoord dat ik niet kon lezen, dus ik kon niet naar een plaatje zoeken.",
+    failed: "Het zoeken naar een plaatje is niet gelukt.",
+    badWord: "Zeg in een paar woorden waarvan het plaatje moet zijn.",
+    creditVia: "{who}, {licence}, via Wikimedia Commons",
+    creditNoAuthor: "Maker niet vermeld, {licence}, via Wikimedia Commons",
+    sourceWikipedia: "Wikipedia",
+    sourceCommons: "Wikimedia Commons",
+    noSafeSearchTitle: "Plaatjes hebben geen veilig-zoeken-filter",
+    noSafeSearchDetail: "Wikipedia en Wikimedia Commons hebben geen veilig-zoeken-filter, dus een plaatje van iets kan alles laten zien waarover een pagina bestaat. Niets hier houdt kinderen ervan weg."
+  }
+})
