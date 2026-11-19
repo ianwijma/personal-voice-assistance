@@ -260,11 +260,12 @@ describe("presentation through the hub", () => {
     a.close()
     await sleep(300)
     expect((await fetch(`${http}/media/${mine}`)).status).toBe(404)
-    expect((await fetch(`${http}/media/${tokenOf(sameDevice)!}`)).status).toBe(200)
+    // The surviving tab's address, saved before the withdrawal, stops working with it.
+    const other = tokenOf(sameDevice)!
+    expect((await fetch(`${http}/media/${other}`)).status).toBe(200)
     await run(h.dismiss)
     await until(() => !holds(sameDevice).has(h.id))
-    const other = tokenOf(sameDevice)
-    expect(other).toBeUndefined()
+    expect((await fetch(`${http}/media/${other}`)).status).toBe(404)
   })
 
   it("b3: an older tab beside a newer one of the same device is sent no presentation messages, in either order of connecting", async () => {
