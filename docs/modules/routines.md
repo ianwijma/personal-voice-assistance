@@ -28,7 +28,8 @@ name ("run the bedtime routine") runs it through the tool `routines_run`.
    class depends on its values, a choice value it does not have, a number outside its bounds, a duration that does not
    read), and the policy may change while a routine runs.
 2. **Then it runs in the module's shared part, outside the turn that started it**: the phrase command answers nothing
-   itself (the routine speaks for itself); the tool answers "Starting Good night.".
+   itself (the routine speaks for itself); the tool answers "Starting Good night." If cancellation won while the
+   initial catalogue lookup was pending, the start instead answers that the routine was stopped, and no step runs.
 3. **Before each `call` or `say`, the live catalogue is checked again** as the starting assistant: the routine's own
    command must still be offered, and a call's parameter names and kinds must still fit the registered action. A
    withdrawal or a mismatch stops there; an action already under way finishes. Every dispatched step is then a gateway
@@ -45,7 +46,7 @@ name ("run the bedtime routine") runs it through the tool `routines_run`.
 
 | Step | JSON | What it does |
 |---|---|---|
-| `say` | `{ "say": "Sleep well." }` | One line (the owner's text, at most 300 characters) on the device that started the routine, after whatever is being said there. The run waits until it has been spoken, at most 2 minutes (`SAY_WAIT_MS`); past that the line is taken back (it is never said late) and the step counts as not confirmed. |
+| `say` | `{ "say": "Sleep well." }` | One line (the owner's text, at most 300 characters) on the device that started the routine, after whatever is being said there. The run waits until it has been spoken, at most 2 minutes (`SAY_WAIT_MS`); past that the run requests a stop and waits for the handle's terminal outcome before advancing, and the step counts as not confirmed. The host handoff limit below applies. |
 | `call` | `{ "call": "lamp.switch", "params": { "to": "off" } }` | An action of the starting assistant's catalogue (`<moduleId>.<actionId>`), with fixed parameters in their tool input form (a choice by its value, a duration as a phrase such as `"10 minutes"`, a number, true or false). **The action's answer is never read out** (below). |
 | `stop_if_failed` | `{ "stop_if_failed": true }` | Stops the routine when the step before it did not work. Not the first step. After a `call` it is about whether the action ran and succeeded, not about anything being spoken (nothing of a called action's answer is). |
 
@@ -59,8 +60,15 @@ not a tool of the model; risk `change`. It enqueues the current step's line of a
 to, for a turn of that device with `source: "routine"`, and returns; it speaks no text it is given, and refuses
 anything else ("That line belongs to no routine running here."). The run keeps the line's handle and waits for it
 outside the turn. Each run/step is claimed once before enqueueing; redelivering that internal line request keeps the
-original handle and enqueues nothing else. Every dispatched `say` reaches the gateway, and a policy that refuses
-`change` refuses it.
+original handle and enqueues nothing else. A failed or timed-out line action revokes that step's claim, waits for
+any pending enqueue to settle, and requests a stop and waits for its handle's terminal outcome before the run advances
+or releases its reservation. A later delivery cannot enqueue the revoked step. Every dispatched `say` reaches the
+gateway, and a policy that refuses `change` refuses it.
+
+**Speech handoff limit.** The module waits for `stop` and the handle's terminal outcome, but the host can report an
+item stopped before its playback fiber has ended and can miss an item between its queue and that fiber. A line that
+was already handed to the device may still be spoken once, even after a cancellation or timeout has answered. No
+later step starts after cancellation. Preventing that last playback requires the host change listed below.
 
 **What the person hears**, besides the routine's own lines:
 
@@ -87,18 +95,25 @@ already running." (on any device). A start of another routine on a device that i
 
 **A phrase heard once starts once.** A start whose turn came in as a phrase command is remembered (in the shared part,
 by assistant, conversation, turn, device and routine, reserved before anything waits; the newest 64 finished ones,
-and every unfinished one): the same phrase turn again gets the first start's answer and runs nothing. A call by the
+and every unfinished one): the same phrase turn again gets the first start's answer and runs nothing. Finished
+answers are retained in completion order; pending starts consume none of those 64 slots. The shared runner owns the
+reservation, cleanup and replay answer once the request is handed to it: interruption of the requesting turn does not
+cancel that work or erase an accepted start's answer. Use the module's cancellation command to cancel it. A call by the
 model (`routines_run`) runs every time; while the routine runs it is refused as above.
 
 **Stopping a routine.**
 
 - **"cancel the routine"** ("annuleer de routine"), a phrase command of the module, or the tool **`routines_stop`**,
-  ends the routine running on the asking device: no further step starts, its current line stops (playing or still
-  waiting), and nothing more is said. If the line is still being enqueued, cancellation waits for its handle or an
-  enqueue failure and stops the handle before answering. The answer says how far it got: "I stopped Queued; it had
+  ends the routine running on the asking device: no further step starts, and the run requests a stop for its current
+  line (playing or still waiting). If the line is still being enqueued, cancellation waits for its handle or an enqueue
+  failure, requests a stop and waits for the handle's terminal outcome before answering. The speech handoff limit
+  above still permits one late playback; the routine queues no more lines. The shared runner owns this cleanup even
+  if the caller of cancellation is interrupted. The answer says how far it got: "I stopped Queued; it had
   finished 0 of its 2 steps." or, while an action is under way, "I stopped Slowly during step 2; that step may still
   complete." (the action is not cut off in the middle). "No routine is running here." when there is none or a closing
-  report is already committed; a run cannot both acknowledge cancellation and announce completion. The routine can
+  report is already committed; a run cannot both acknowledge cancellation and announce completion. The closing
+  decision and its acceptance by the speech queue are protected together from interruption, including for refusal
+  reports; a module restart waits for that acceptance, without waiting for playback. The routine can
   be started again once the action under way has finished. Phrase cancellation outcomes are remembered by assistant,
   conversation, turn, device and command (the newest 64, including pending cleanup), checked before selecting a run:
   a replay waits for the first cancellation to finish cleanup, returns its answer and cancels nothing else.
@@ -112,9 +127,9 @@ model (`routines_run`) runs every time; while the routine runs it is refused as 
 **A run that is interrupted does not resume in the middle.** A provider action interrupting itself is an unconfirmed
 step, following the ordinary failure and `stop_if_failed` rules above; it is not a module stop. When the module stops
 while a routine runs (a disable, a restart, a settings save, which restarts the module, the server shutting down), the
-run's fiber is interrupted with the shared part: its line is stopped first, whether it is playing or still waiting behind a reply, and only then the device is
-told, while the part is still closing: "Good night was cut short when the routines module stopped; it had finished
-1 of its 2 steps." or, during a `call`, "… during step 2, which may or may not have been done." Nothing is stored
+run's fiber is interrupted with the shared part: it requests a stop for its line and waits for the handle's terminal
+outcome (subject to the speech handoff limit above), and only then the device is told, while the part is still closing:
+"Good night was cut short when the routines module stopped; it had finished 1 of its 2 steps." or, during a `call`, "… during step 2, which may or may not have been done." Nothing is stored
 about runs, so after a server restart nothing is resumed and nothing more is said (a server that is going down may not
 get to say even that line); saying the phrase again runs the routine from the beginning.
 
@@ -271,6 +286,10 @@ Missing below (each with the smallest change that would provide it):
 - **Whose content an action's answer is.** `ActionRunResult` is `{ ok, say }`; so a routine reads out no answer at
   all. Smallest change: `ActionRunResult` carries the result's sensitivity (`household`, or `personal` with its owner)
   for the execution that ran, so the routine can ask `Privacy.mayReveal` for its device.
+- **A terminal speech stop across the device handoff.** A line already handed to the device may still be spoken once
+  after cancellation or timeout has answered, because the host can lose sight of an item between its queue and current
+  playback, and can mark it stopped before the playback fiber ends. Smallest change: keep the item cancellable across
+  that transition in `NotifyEngine`, and make the handle's stop/outcome wait until playback can no longer start.
 - **A device's "stop" delivered to the module running something for it.** The host's "stop" reaches the speech service
   and the reply, not a module; so a "stop" said while a routine's action runs does not stop the routine. Smallest
   change: a subscription (or a callback registered with the run) through which the host tells a module that the person

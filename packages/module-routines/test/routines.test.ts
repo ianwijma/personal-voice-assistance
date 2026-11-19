@@ -5,7 +5,7 @@
 import { assert, describe, it } from "@effect/vitest"
 import { ActionError, CurrentTurn, CurrentTurnTrace, defineAction, defineModule, Param, SpeechError, type Trace, type TurnContext } from "@pva/core"
 import { checkModule, startTestModule, type TestHouseholdInput } from "@pva/core/testing"
-import { Deferred, Effect, Fiber } from "effect"
+import { Deferred, Effect, Fiber, Scheduler } from "effect"
 import { vi } from "vitest"
 import { catalog, routinesModule, routinesOf, texts } from "../src/index.ts"
 import { makeRunner } from "../src/run.ts"
@@ -1214,4 +1214,245 @@ describe("routines: review round 3 regressions", () => {
         assert.deepStrictEqual(seen, [])
       }))
   }
+})
+
+
+describe("routines: review round 4 ownership regressions", () => {
+  it.effect("R4.1: interrupting phrase delivery across the start handoff never executes a replay twice", () =>
+    Effect.gen(function*() {
+      for (let ticks = 0; ticks < 75; ticks++) {
+        yield* Effect.scoped(Effect.gen(function*() {
+          const seen: Array<Seen> = []
+          const kit = yield* start(seen, [routine("Dim", [{ call: "lamp.quiet" }], ["dim it"])])
+          const turn = { ...kit.turn({ source: "phrase" }), turnId: 41 }
+          const asking = yield* Effect.forkChild(kit.action("r_dim", {}, turn).pipe(Effect.provideService(Scheduler.MaxOpsBeforeYield, 4)))
+          for (let i = 0; i < ticks; i++) yield* Effect.yieldNow
+          yield* Fiber.interrupt(asking)
+          yield* kit.advance(10_000)
+          yield* kit.action("r_dim", {}, turn)
+          yield* kit.advance(10_000)
+          assert.isAtMost(seen.length, 1, `interrupted at yield ${ticks}`)
+        }))
+      }
+    }))
+
+  it.effect("R4.2: interrupting a start across reservation never strands the routine or device", () =>
+    Effect.gen(function*() {
+      for (let ticks = 0; ticks < 70; ticks++) {
+        yield* Effect.scoped(Effect.gen(function*() {
+          const seen: Array<Seen> = []
+          const kit = yield* start(seen, [routine("Bedtime", [{ say: "Night." }]), routine("Lights", [{ call: "lamp.quiet" }])])
+          const asking = yield* Effect.forkChild(kit.tool("routines_run", { name: "Bedtime" }).pipe(Effect.provideService(Scheduler.MaxOpsBeforeYield, 2)))
+          for (let i = 0; i < ticks; i++) yield* Effect.yieldNow
+          yield* Fiber.interrupt(asking)
+          yield* kit.advance(0)
+          yield* kit.advance(180_000)
+          assert.deepStrictEqual((yield* kit.tool("routines_run", { name: "Lights" })).value, { spoken: "Starting Lights." }, `interrupted at yield ${ticks}`)
+          yield* kit.advance(10_000)
+          assert.strictEqual(seen.length, 1)
+        }))
+      }
+    }))
+
+  it.effect("R4.3: the host handoff limit permits at most one late line and never a later step", () =>
+    Effect.gen(function*() {
+      const seen: Array<Seen> = []
+      const kit = yield* start(seen, [routine("Lights", [{ say: "First line." }, { call: "lamp.quiet" }])])
+      yield* kit.notify.replying("kitchen-display", true)
+      yield* kit.tool("routines_run", { name: "Lights" }).pipe(Effect.provideService(Scheduler.MaxOpsBeforeYield, 8))
+      for (let i = 0; i < 6; i++) yield* Effect.yieldNow
+      assert.strictEqual((yield* kit.tool("routines_stop", {})).value, "I stopped Lights; it had finished 0 of its 2 steps.")
+      assert.deepStrictEqual(kit.notify.announced, [])
+      yield* kit.notify.replying("kitchen-display", false)
+      yield* kit.advance(10_000)
+      assert.isAtMost(kit.notify.announced.length, 1)
+      assert.isTrue(kit.notify.announced.every((a) => a.text === "First line."))
+      assert.deepStrictEqual(seen, [])
+    }))
+
+  it.effect("R4.3: cancellation waits for a stopped handle's terminal outcome before acknowledging", () =>
+    Effect.gen(function*() {
+      const stopping = yield* Deferred.make<void>()
+      const ended = yield* Deferred.make<void>()
+      const gated: typeof routinesModule = {
+        ...routinesModule,
+        shared: (ctx) => routinesModule.shared!({ ...ctx, speech: { ...ctx.speech,
+          say: (target, text) => ctx.speech.say(target, text).pipe(Effect.map((handle) => ({
+            ...handle,
+            stop: Effect.asVoid(Effect.andThen(handle.stop, Deferred.succeed(stopping, undefined))),
+            done: Effect.tap(handle.done, () => Deferred.await(ended))
+          })))
+        } })
+      }
+      const kit = yield* startTestModule(gated, { settings: { routines: [routine("Lights", [{ say: "First." }])] } })
+      yield* kit.notify.replying("kitchen-display", true)
+      yield* kit.tool("routines_run", { name: "Lights" })
+      yield* kit.advance(100)
+      let returned = false
+      const cancelling = yield* Effect.forkChild(kit.tool("routines_stop", {}).pipe(Effect.tap(() => Effect.sync(() => { returned = true }))))
+      yield* Deferred.await(stopping)
+      yield* kit.advance(0)
+      const returnedBeforeEnd = returned
+      yield* Deferred.succeed(ended, undefined)
+      yield* Fiber.join(cancelling)
+      yield* kit.notify.replying("kitchen-display", false)
+      yield* kit.advance(3_000)
+      assert.isFalse(returnedBeforeEnd)
+      assert.deepStrictEqual(kit.notify.announced, [])
+    }))
+
+  it.effect("R4.4: a line action timing out during enqueue stops its late handle before the run ends", () =>
+    Effect.gen(function*() {
+      let stops = 0
+      const delayed: typeof routinesModule = {
+        ...routinesModule,
+        shared: (ctx) => routinesModule.shared!({ ...ctx, speech: {
+          ...ctx.speech,
+          say: (target, text) => text !== "First line." ? ctx.speech.say(target, text) : Effect.gen(function*() {
+            yield* Effect.sleep(6_500)
+            const handle = yield* ctx.speech.say(target, text)
+            return { ...handle, stop: Effect.andThen(Effect.sync(() => { stops++ }), handle.stop) }
+          })
+        } })
+      }
+      const kit = yield* startTestModule(delayed, { settings: { routines: [routine("Lights", [{ say: "First line." }, { stop_if_failed: true }, { say: "Last line." }])] } })
+      yield* kit.notify.replying("kitchen-display", true)
+      yield* kit.tool("routines_run", { name: "Lights" })
+      yield* kit.advance(180_000)
+      const stoppedBeforeRelease = stops
+      assert.strictEqual((yield* kit.tool("routines_stop", {})).value, "No routine is running here.")
+      yield* kit.notify.replying("kitchen-display", false)
+      yield* kit.advance(10_000)
+      assert.isAbove(stoppedBeforeRelease, 0)
+      assert.isFalse(kit.notify.announced.some((a) => a.text === "First line." && a.outcome === "spoken"))
+      assert.notInclude(texts_(kit), "Last line.")
+      assert.include(texts_(kit), "Lights stopped: I couldn't confirm step 1, so I left out the rest. Nothing before it was done.")
+    }))
+
+  it.effect("R4.5: interrupting cancellation across its handoff cannot abandon speech cleanup", () =>
+    Effect.gen(function*() {
+      for (let ticks = 0; ticks < 70; ticks++) {
+        yield* Effect.scoped(Effect.gen(function*() {
+          let stops = 0
+          const observed: typeof routinesModule = {
+            ...routinesModule,
+            shared: (ctx) => routinesModule.shared!({ ...ctx, speech: { ...ctx.speech,
+              say: (target, text) => ctx.speech.say(target, text).pipe(Effect.map((handle) => ({
+                ...handle, stop: Effect.andThen(Effect.sync(() => { stops++ }), handle.stop)
+              })))
+            } })
+          }
+          const kit = yield* startTestModule(observed, { settings: { routines: [routine("Lights", [{ say: "First." }, { say: "Last." }])] } })
+          yield* kit.notify.replying("kitchen-display", true)
+          yield* kit.tool("routines_run", { name: "Lights" })
+          yield* kit.advance(100)
+          const cancelling = yield* Effect.forkChild(kit.tool("routines_stop", {}).pipe(Effect.provideService(Scheduler.MaxOpsBeforeYield, 2)))
+          for (let i = 0; i < ticks; i++) yield* Effect.yieldNow
+          yield* Fiber.interrupt(cancelling)
+          yield* kit.tool("routines_stop", {})
+          yield* kit.advance(0)
+          const stoppedBeforeRelease = stops
+          yield* kit.notify.replying("kitchen-display", false)
+          yield* kit.advance(10_000)
+          assert.isAbove(stoppedBeforeRelease, 0, `interrupted at yield ${ticks}`)
+          assert.isFalse(kit.notify.announced.some((a) => a.outcome === "spoken"))
+        }))
+      }
+    }))
+
+  it.effect("R4.6: a pending phrase on another device does not evict any of 64 finished starts", () =>
+    Effect.gen(function*() {
+      const reading = yield* Deferred.make<void>()
+      const resume = yield* Deferred.make<void>()
+      let pause = false
+      const gated: typeof routinesModule = {
+        ...routinesModule,
+        shared: (ctx) => routinesModule.shared!({ ...ctx, host: { ...ctx.host, actions: { ...ctx.host.actions,
+          list: Effect.gen(function*() {
+            if (pause) { pause = false; yield* Deferred.succeed(reading, undefined); yield* Deferred.await(resume) }
+            return yield* ctx.host.actions.list
+          })
+        } } })
+      }
+      const kit = yield* startTestModule(gated, { settings: { routines: [routine("Lights", [{ say: "First." }]), routine("Quiet", [{ say: "Other." }])] } })
+      const turn = { ...kit.turn({ source: "phrase" }), turnId: 1 }
+      for (let id = 1; id < 64; id++) {
+        yield* kit.action("r_lights", {}, { ...turn, turnId: id })
+        yield* kit.advance(3_000)
+      }
+      pause = true
+      const pending = yield* Effect.forkChild(kit.action("r_quiet", {}, { ...kit.turn({ source: "phrase", device: "robins-phone" }), turnId: 100 }))
+      yield* Deferred.await(reading)
+      yield* kit.action("r_lights", {}, { ...turn, turnId: 64 })
+      yield* kit.advance(3_000)
+      yield* kit.action("r_lights", {}, turn)
+      yield* kit.advance(3_000)
+      const beforePendingFinished = texts_(kit).filter((s) => s === "First.").length
+      yield* Deferred.succeed(resume, undefined)
+      yield* Fiber.join(pending)
+      yield* kit.advance(3_000)
+      assert.strictEqual(beforePendingFinished, 64)
+      // The later completion is now the 65th: completion order evicts turn 1.
+      yield* kit.action("r_lights", {}, turn)
+      yield* kit.advance(3_000)
+      assert.strictEqual(texts_(kit).filter((s) => s === "First.").length, 65)
+    }))
+
+  for (const [step, closing] of [
+    [{ call: "lamp.quiet" }, "Dim is done."],
+    [{ call: "flaky.fail" }, "Dim is done, but I couldn't confirm step 1."],
+    [{ call: "lamp.dim", params: { level: 150 } }, "Dim stopped at step 1: its values don't fit that action. Nothing before it was done."]
+  ] as const) {
+    it.effect(`R4.7: restart during acceptance preserves "${closing}"`, () =>
+      Effect.gen(function*() {
+        const entering = yield* Deferred.make<void>()
+        const delayed: typeof routinesModule = {
+          ...routinesModule,
+          shared: (ctx) => routinesModule.shared!({ ...ctx, speech: { ...ctx.speech,
+            say: (target, text) => Effect.gen(function*() {
+              if (text === closing) { yield* Deferred.succeed(entering, undefined); yield* Effect.sleep(10) }
+              return yield* ctx.speech.say(target, text)
+            })
+          } })
+        }
+        const seen: Array<Seen> = []
+        const kit = yield* startTestModule(delayed, { settings: { routines: [routine("Dim", [step])] }, others: helpers(seen) })
+        yield* kit.tool("routines_run", { name: "Dim" })
+        yield* Deferred.await(entering)
+        const restarting = yield* Effect.forkChild(kit.restart)
+        yield* kit.advance(5_000)
+        yield* Fiber.join(restarting)
+        assert.deepStrictEqual(texts_(kit), [closing])
+        assert.deepStrictEqual(seen.map((s) => s.action), step.call === "lamp.dim" ? [] : [step.call])
+      }))
+  }
+
+  it.effect("R4.8: cancellation during the initial lookup returns a cancelled start in both languages", () =>
+    Effect.gen(function*() {
+      for (const [language, cancelled] of [["en-GB", "I stopped Lights; it had finished 0 of its 1 steps."], ["nl-NL", "Ik heb Lights gestopt; 0 van de 1 stappen waren klaar."]] as const) {
+        const reading = yield* Deferred.make<void>()
+        const resume = yield* Deferred.make<void>()
+        let reads = 0
+        const gated: typeof routinesModule = {
+          ...routinesModule,
+          shared: (ctx) => routinesModule.shared!({ ...ctx, host: { ...ctx.host, actions: { ...ctx.host.actions,
+            list: Effect.gen(function*() {
+              if (++reads === 1) { yield* Deferred.succeed(reading, undefined); yield* Deferred.await(resume) }
+              return yield* ctx.host.actions.list
+            })
+          } } })
+        }
+        const kit = yield* startTestModule(gated, { settings: { routines: [routine("Lights", [{ say: "First." }])] }, household: { home: { HOME_LANGUAGE: language } } })
+        const starting = yield* Effect.forkChild(kit.tool("routines_run", { name: "Lights" }))
+        yield* Deferred.await(reading)
+        assert.strictEqual((yield* kit.tool("routines_stop", {})).value, cancelled)
+        yield* Deferred.succeed(resume, undefined)
+        const answer = yield* Fiber.join(starting)
+        yield* kit.advance(10_000)
+        assert.deepStrictEqual(answer.value, { spoken: cancelled })
+        assert.deepStrictEqual(kit.notify.announced, [])
+        assert.deepStrictEqual((yield* kit.tool("routines_run", { name: "Lights" })).value, { spoken: language === "en-GB" ? "Starting Lights." : "Ik start Lights." })
+        yield* kit.advance(3_000)
+      }
+    }))
 })

@@ -55,7 +55,7 @@ export const routinesModule = defineModule({
           // Not a tool of its own: the model has `routines_run`. Its phrases are in the assistant's set all the same.
           offerAsTool: false,
           risk: "change",
-          run: () => Effect.map(begin(routine), (answer) => (answer.kind === "refused" ? { say: answer.text } : {}))
+          run: () => Effect.map(begin(routine), (answer) => (answer.kind !== "started" ? { say: answer.text } : {}))
         })
       })
 
@@ -83,7 +83,7 @@ export const routinesModule = defineModule({
       const stop = defineAction({
         id: "stop",
         label: "Cancel the routine",
-        description: "Cancel the routine running on this device: no further step starts and its line stops. An action already under way may still complete.",
+        description: "Cancel the routine running on this device: no further step starts; request its line to stop. An action already under way may still complete.",
         examples: [...CANCEL_PHRASES.en, ...CANCEL_PHRASES.nl, "stop the good night routine"],
         params: {},
         phrases: { en: [...CANCEL_PHRASES.en], nl: [...CANCEL_PHRASES.nl] },
@@ -116,7 +116,7 @@ export const routinesModule = defineModule({
                 : say(texts, lang, "which", { list }) }
             }
             const answer = yield* begin(found.routine)
-            return answer.kind === "refused" ? { spoken: answer.text } : { spoken: say(texts, lang, "started", { name: nameIn(found.routine.name, lang) }) }
+            return answer.kind !== "started" ? { spoken: answer.text } : { spoken: say(texts, lang, "started", { name: nameIn(found.routine.name, lang) }) }
           })
       })
 

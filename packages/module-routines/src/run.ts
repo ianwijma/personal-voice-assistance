@@ -22,7 +22,7 @@ export type Refusal =
   | { readonly kind: "already" | "busyHere"; readonly other: string }
   | { readonly kind: "refusedMissing" | "refusedConfirm" | "refusedParams"; readonly step: number }
 
-export type StartAnswer = { readonly kind: "started" } | { readonly kind: "refused"; readonly refusal: Refusal; readonly text: string }
+export type StartAnswer = { readonly kind: "started" } | { readonly kind: "cancelled"; readonly text: string } | { readonly kind: "refused"; readonly refusal: Refusal; readonly text: string }
 
 /** What a cancel answers (`routines_stop`, "cancel the routine"). */
 export type CancelAnswer = { readonly kind: "none"; readonly text: string } | { readonly kind: "cancelled"; readonly text: string; readonly inCall: boolean }
@@ -43,6 +43,8 @@ interface RunState {
   line: SpeechHandle | undefined
   /** Claimed before enqueueing; settles once its handle is stored or enqueueing fails. */
   lineClaimed: Deferred.Deferred<void> | undefined
+  /** Whether the current step may still claim an enqueue; revoked before any failed-step cleanup. */
+  lineOpen: boolean
   /** The steps ended and their closing sentence is committed; cancellation can no longer win. */
   ending: boolean
   /** Cancelled by the person: no further step starts and nothing more is said. */
@@ -117,6 +119,7 @@ export const makeRunner = (deps: { readonly host: ModuleHostApi; readonly speech
   let runs = 0
   /** Phrase starts by their turn and routine: the first start's answer, for a replay of the same phrase turn. */
   const replays = new Map<string, Deferred.Deferred<StartAnswer>>()
+  const finishedReplays = new Set<string>()
   const cancelReplays = new Map<string, Deferred.Deferred<CancelAnswer>>()
 
   const refusal = (refusal: Refusal, language: Language, name: string): StartAnswer => ({
@@ -148,28 +151,37 @@ export const makeRunner = (deps: { readonly host: ModuleHostApi; readonly speech
       return undefined
     })
 
-  /** A claimed enqueue must settle before cancellation or shutdown can take back its queued/playing line. */
+  /** Stop requests and their terminal outcomes are awaited outside the invoking turn. The host handoff limit
+   * (a line already handed to the device may still start once) is documented on the module page. */
+  const stopHandle = (handle: SpeechHandle) => Effect.andThen(handle.stop, Effect.ignore(handle.done)).pipe(
+    Effect.provideService(CurrentTurn, undefined)
+  )
+
+  /** Revoke the step before waiting: a failed/timed-out action cannot enqueue a new line later. */
   const stopLine = (state: RunState): Effect.Effect<void> => Effect.gen(function*() {
+    state.lineOpen = false
     if (state.lineClaimed !== undefined) yield* Deferred.await(state.lineClaimed)
     const line = lineOf(state)
-    if (line !== undefined) yield* line.stop
-  })
+    if (line !== undefined) yield* stopHandle(line)
+  }).pipe(Effect.uninterruptible)
 
-  /** A line said by the run itself (its closing sentence), not waited for; nothing of it can hold the run up. */
+  /** A closing report waits for queue acceptance, never playback. */
   const tell = (deviceId: string, text: string) => Effect.ignore(Effect.catchDefect(speech.say({ device: deviceId }, text), () => Effect.void))
+  const close = (state: RunState, text?: string) => Effect.suspend(() => {
+    if (state.cancelled) return Effect.void
+    state.ending = true
+    return text === undefined ? Effect.void : tell(state.deviceId, text)
+  }).pipe(Effect.uninterruptible)
 
-  /**
-   * Wait for a line to end: spoken, stopped there, or not spoken (skipped, failed, past `SAY_WAIT_MS`). A timeout stops
-   * the line through its handle, queued or playing; an interruption is the run's: its finalizer stops `state.line`.
-   */
+  /** Wait for playback, taking back the line before a timeout/failure advances the run. */
   const waitLine = (deviceId: string, handle: SpeechHandle): Effect.Effect<"spoken" | "stopped" | "not-spoken"> =>
     handle.done.pipe(
-      Effect.timeoutOrElse({ duration: SAY_WAIT_MS, orElse: () => Effect.as(handle.stop, undefined) }),
+      Effect.timeoutOrElse({ duration: SAY_WAIT_MS, orElse: () => Effect.as(stopHandle(handle), undefined) }),
       Effect.map((outcomes) => {
         const mine = outcomes?.find((o) => o.deviceId === deviceId)
         return mine?.outcome === "spoken" ? "spoken" as const : mine?.outcome === "stopped" ? "stopped" as const : "not-spoken" as const
       }),
-      Effect.catch(() => Effect.as(handle.stop, "not-spoken" as const))
+      Effect.catch(() => Effect.as(stopHandle(handle), "not-spoken" as const))
     )
 
   /** The steps, one after the other, each a gateway call as the starting turn (`source: "routine"`); waits outside any turn. */
@@ -183,11 +195,8 @@ export const makeRunner = (deps: { readonly host: ModuleHostApi; readonly speech
       const done: Array<number> = []
       const unconfirmed: Array<number> = []
       /** The run stops at step `at`, which the gateway refused or whose values did not fit: one sentence, how far it got. */
-      const stopAt = (at: number, why: "whyRefused" | "whyValues" | "failed") => Effect.suspend(() => {
-        if (state.cancelled) return Effect.void
-        state.ending = true
-        return tell(deviceId, stoppedSentence(language, name, at, why, done, unconfirmed))
-      })
+      const stopAt = (at: number, why: "whyRefused" | "whyValues" | "failed") =>
+        close(state, stoppedSentence(language, name, at, why, done, unconfirmed))
       for (const [i, step] of routine.steps.entries()) {
         if (state.cancelled) return
         state.step = i + 1
@@ -214,6 +223,7 @@ export const makeRunner = (deps: { readonly host: ModuleHostApi; readonly speech
         state.inCall = step.kind === "call"
         state.line = undefined
         state.lineClaimed = undefined
+        state.lineOpen = step.kind === "say"
         // A provider may interrupt its own call. Observe that child's outcome without interrupting this run; an
         // interruption of the outer run still reaches its cleanup and interrupts the child with it.
         const call = yield* Effect.forkChild(asStep(host.actions.run(request)))
@@ -223,10 +233,12 @@ export const makeRunner = (deps: { readonly host: ModuleHostApi; readonly speech
         // The line action set it while it ran (read through a function: the compiler cannot see that write).
         const line = lineOf(state)
         if (state.cancelled) {
-          if (line !== undefined) yield* line.stop
+          yield* stopLine(state)
           return
         }
         if (!result.ok) {
+          if (step.kind === "say") yield* stopLine(state)
+          if (state.cancelled) return
           // The host withdraws our instance before closing the shared scope. Its missing line action means this
           // run is being stopped too: use the same cleanup now, before a failed step can announce completion.
           if (step.kind === "say" && result.code === "not_running") return yield* Effect.interrupt
@@ -246,6 +258,7 @@ export const makeRunner = (deps: { readonly host: ModuleHostApi; readonly speech
           continue
         }
         const outcome = line === undefined ? "not-spoken" as const : yield* waitLine(deviceId, line)
+        state.lineOpen = false
         state.line = undefined
         state.finished = i + 1
         // Stopped on the device (the spoken "stop", the page's Stop, a reply taking the speaker) or cancelled: it ends here.
@@ -257,10 +270,9 @@ export const makeRunner = (deps: { readonly host: ModuleHostApi; readonly speech
           done.push(i + 1)
         }
       }
-      if (state.cancelled) return
-      state.ending = true
-      if (unconfirmed.length > 0) yield* tell(deviceId, say(texts, language, "doneUnconfirmed", { name, steps: stepsText(language, unconfirmed) }))
-      else if (!spoke) yield* tell(deviceId, say(texts, language, "doneQuiet", { name }))
+      yield* close(state, unconfirmed.length > 0
+        ? say(texts, language, "doneUnconfirmed", { name, steps: stepsText(language, unconfirmed) })
+        : !spoke ? say(texts, language, "doneQuiet", { name }) : undefined)
     }).pipe(
       // The module stopped (a restart, a settings save, the server shutting down): nothing resumes. The line of the
       // run is stopped first (queued or playing), then the device is told, while the part is still closing.
@@ -283,7 +295,7 @@ export const makeRunner = (deps: { readonly host: ModuleHostApi; readonly speech
       const state = byId.get(runId)
       const s = state?.routine.steps[step - 1]
       // Only the current step's line of a run on this very device, called by that run.
-      if (state === undefined || s?.kind !== "say" || state.step !== step || turn?.source !== "routine" || turn.deviceId !== state.deviceId || state.cancelled) return false
+      if (state === undefined || s?.kind !== "say" || state.step !== step || turn?.source !== "routine" || turn.deviceId !== state.deviceId || state.cancelled || !state.lineOpen) return false
       // Claim before the enqueue can yield. Duplicates retain the original handle until this step settles.
       if (state.lineClaimed !== undefined) return true
       const claimed = Deferred.makeUnsafe<void>()
@@ -301,100 +313,100 @@ export const makeRunner = (deps: { readonly host: ModuleHostApi; readonly speech
       Effect.uninterruptible
     )
 
-  const cancel = (language: Language): Effect.Effect<CancelAnswer> =>
+  /** Reserve an answer and hand the work to the shared scope before the caller can leave. The observer also
+   * settles an unstarted fiber when that scope is already closed; a caller never owns cleanup or replay completion. */
+  const owned = <A>(work: Effect.Effect<A>, settled: Deferred.Deferred<A>, onDone?: (exit: Exit.Exit<A>) => void) =>
     Effect.gen(function*() {
+      const fiber = yield* Effect.forkIn(work, scope, { startImmediately: true })
+      fiber.addObserver((exit) => {
+        onDone?.(exit)
+        Deferred.doneUnsafe(settled, exit)
+      })
+    })
+
+  const cancel = (language: Language): Effect.Effect<CancelAnswer> =>
+    Effect.uninterruptibleMask((restore) => Effect.gen(function*() {
       const turn = yield* CurrentTurn
       const replayKey = turn?.source === "phrase" ? JSON.stringify([turn.assistantId, turn.conversationId, turn.turnId, turn.deviceId, "stop"]) : undefined
       const known = replayKey === undefined ? undefined : cancelReplays.get(replayKey)
-      if (known !== undefined) return yield* Deferred.await(known)
-      const remember = (answer: CancelAnswer, stop: Effect.Effect<void> = Effect.void): Effect.Effect<CancelAnswer> => {
-        const result = Effect.as(stop, answer)
-        if (replayKey === undefined) return result
-        // Reserve before waiting; a concurrent phrase replay waits for the same completed cleanup.
-        const settled = Deferred.makeUnsafe<CancelAnswer>()
+      if (known !== undefined) return yield* restore(Deferred.await(known))
+      const settled = Deferred.makeUnsafe<CancelAnswer>()
+      if (replayKey !== undefined) {
         cancelReplays.set(replayKey, settled)
         if (cancelReplays.size > MAX_REPLAYS) cancelReplays.delete(cancelReplays.keys().next().value!)
-        return result.pipe(Effect.onExit((exit) => Deferred.done(settled, exit)))
       }
       const state = [...running.values()].find((r) => r.deviceId === turn?.deviceId && !r.cancelled && !r.ending)
-      if (state === undefined) return yield* remember({ kind: "none", text: say(texts, language, "nothingRunning") })
-      state.cancelled = true
-      const name = nameIn(state.routine.name, language)
-      const inCall = state.inCall
-      // How far it got, read before anything moves on.
-      const answer: CancelAnswer = inCall
-        ? { kind: "cancelled", inCall, text: say(texts, language, "cancelledCall", { name, step: state.step }) }
-        : { kind: "cancelled", inCall, text: say(texts, language, "cancelled", { name, done: state.finished, total: state.routine.steps.length }) }
-      // No further step starts. A claimed line stops before the acknowledgement; a call is left to finish.
-      return yield* remember(answer, stopLine(state))
-    })
+      let answer: CancelAnswer = { kind: "none", text: say(texts, language, "nothingRunning") }
+      if (state !== undefined) {
+        state.cancelled = true
+        const name = nameIn(state.routine.name, language)
+        const inCall = state.inCall
+        answer = inCall
+          ? { kind: "cancelled", inCall, text: say(texts, language, "cancelledCall", { name, step: state.step }) }
+          : { kind: "cancelled", inCall, text: say(texts, language, "cancelled", { name, done: state.finished, total: state.routine.steps.length }) }
+      }
+      // Marking cancelled and handing off cleanup share a mask. A caller leaving cannot abandon a claimed line.
+      yield* owned(Effect.as(state === undefined ? Effect.void : stopLine(state), answer), settled)
+      return yield* restore(Deferred.await(settled))
+    }))
 
-  /** Start for real: reserve, check, fork. */
+  /** Reserve and register cleanup under one mask; only the courtesy precheck is interruptible. */
   const begin = (routine: Routine, language: Language, turn: TurnContext & { readonly deviceId: string }): Effect.Effect<StartAnswer> =>
-    Effect.gen(function*() {
+    Effect.uninterruptibleMask((restore) => Effect.gen(function*() {
       const name = nameIn(routine.name, language)
-      // A second start while it runs is refused (it does not join); so is a start on a device already running one.
       if (running.has(routine.key)) return refusal({ kind: "already", other: name }, language, name)
       const here = [...running.values()].find((r) => r.deviceId === turn.deviceId)
       if (here !== undefined) return refusal({ kind: "busyHere", other: nameIn(here.routine.name, language) }, language, name)
-      const state: RunState = { runId: ++runs, routine, language, deviceId: turn.deviceId, step: 0, finished: 0, inCall: false, line: undefined, lineClaimed: undefined, ending: false, cancelled: false }
+      const state: RunState = { runId: ++runs, routine, language, deviceId: turn.deviceId, step: 0, finished: 0, inCall: false, line: undefined, lineClaimed: undefined, lineOpen: false, ending: false, cancelled: false }
       running.set(routine.key, state)
       byId.set(state.runId, state)
       const release = Effect.sync(() => {
         if (running.get(routine.key)?.runId === state.runId) running.delete(routine.key)
         byId.delete(state.runId)
       })
-      const problem = yield* precheck(routine).pipe(Effect.onExit((exit) => (Exit.isFailure(exit) ? release : Effect.void)))
-      if (problem !== undefined) {
-        yield* release
-        return refusal(problem, language, name)
-      }
-      const stepTurn: TurnContext = { ...turn, source: "routine" }
-      // Outside the turn that started it: no turn, trace, job or principal of its own; each step names its turn. The
-      // starting turn's trace is not kept open: the gateway records each step's decision (docs/modules/routines.md).
-      const run = runSteps(state, stepTurn).pipe(
-        Effect.ensuring(release),
-        Effect.provideService(CurrentTurn, undefined),
-        Effect.provideService(CurrentTurnTrace, undefined),
-        Effect.provideService(CurrentJob, undefined),
-        Effect.provideService(CurrentPrincipal, undefined)
-      )
-      yield* Effect.forkIn(run, scope).pipe(Effect.onExit((exit) => (Exit.isFailure(exit) ? release : Effect.void)))
-      return { kind: "started" as const }
-    })
+      let handedOff = false
+      return yield* Effect.gen(function*() {
+        const problem = yield* restore(precheck(routine))
+        if (state.cancelled) return { kind: "cancelled" as const, text: say(texts, language, "cancelled", { name, done: state.finished, total: routine.steps.length }) }
+        if (problem !== undefined) return refusal(problem, language, name)
+        const stepTurn: TurnContext = { ...turn, source: "routine" }
+        const run = runSteps(state, stepTurn).pipe(
+          Effect.ensuring(release),
+          Effect.provideService(CurrentTurn, undefined),
+          Effect.provideService(CurrentTurnTrace, undefined),
+          Effect.provideService(CurrentJob, undefined),
+          Effect.provideService(CurrentPrincipal, undefined)
+        )
+        const fiber = yield* Effect.forkIn(run, scope)
+        // Also releases a fork rejected by an already closed scope, before its effect could install its finalizer.
+        fiber.addObserver(() => { if (running.get(routine.key) === state) running.delete(routine.key); byId.delete(state.runId) })
+        handedOff = true
+        return { kind: "started" as const }
+      }).pipe(Effect.ensuring(Effect.suspend(() => handedOff ? Effect.void : release)))
+    }))
 
   const start = (routine: Routine, language: Language): Effect.Effect<StartAnswer> =>
-    Effect.gen(function*() {
+    Effect.uninterruptibleMask((restore) => Effect.gen(function*() {
       const turn = yield* CurrentTurn
       if (turn?.deviceId === undefined || turn.assistantId === undefined) return refusal({ kind: "noDevice" }, language, nameIn(routine.name, language))
-      const asked = { ...turn, deviceId: turn.deviceId }
-      // The model's calls run every time. A phrase heard once starts once: a replay of the same phrase turn gets the
-      // first start's answer (reserved before any wait), and runs nothing.
-      if (turn.source !== "phrase") return yield* begin(routine, language, asked)
-      const key = JSON.stringify([turn.assistantId, turn.conversationId, turn.turnId, turn.deviceId, routine.key])
-      const known = replays.get(key)
-      if (known !== undefined) return yield* Deferred.await(known)
+      const key = turn.source === "phrase" ? JSON.stringify([turn.assistantId, turn.conversationId, turn.turnId, turn.deviceId, routine.key]) : undefined
+      const known = key === undefined ? undefined : replays.get(key)
+      if (known !== undefined) return yield* restore(Deferred.await(known))
       const first = Deferred.makeUnsafe<StartAnswer>()
-      replays.set(key, first)
-      const answer = yield* begin(routine, language, asked).pipe(
-        Effect.onExit((exit) =>
-          Effect.sync(() => {
-            if (Exit.isSuccess(exit)) Deferred.doneUnsafe(first, Effect.succeed(exit.value))
-            else {
-              // Interrupted before it answered: a replay waiting for it is interrupted too, and a later one starts afresh.
-              replays.delete(key)
-              Deferred.doneUnsafe(first, Effect.interrupt)
-            }
-          })
-        )
-      )
-      // Bounded: the oldest finished starts go first; one still unfinished is never dropped.
-      for (const [k, d] of replays) {
-        if (replays.size <= MAX_REPLAYS) break
-        if (Deferred.isDoneUnsafe(d)) replays.delete(k)
-      }
-      return answer
-    })
+      if (key !== undefined) replays.set(key, first)
+      yield* owned(begin(routine, language, { ...turn, deviceId: turn.deviceId }), first, (exit) => {
+        if (key === undefined) return
+        if (Exit.isFailure(exit)) { replays.delete(key); return }
+        // Completion order, counting only finished answers. Pending starts consume none of the 64 slots.
+        finishedReplays.add(key)
+        if (finishedReplays.size > MAX_REPLAYS) {
+          const oldest = finishedReplays.values().next().value!
+          finishedReplays.delete(oldest)
+          replays.delete(oldest)
+        }
+      })
+      return yield* restore(Deferred.await(first))
+    }))
 
   return { start, cancel, enqueueLine, running: () => new Set(running.keys()) }
 }
