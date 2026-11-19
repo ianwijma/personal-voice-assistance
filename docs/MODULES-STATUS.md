@@ -1,7 +1,7 @@
 # Modules: where the work stands
 
 Status of the work planned in [MODULES-PLAN.md](MODULES-PLAN.md), kept here so it does not depend on any one working
-session. Updated 2026-11-19, 21:28. Nothing below is merged into `main`; the owner merges.
+session. Updated 2026-11-20, 06:59. Nothing below is merged into `main`; the owner merges.
 
 **State: the work is done and waits for the owner.** Every preparation part, every module that was not deferred and
 every follow-up has an open pull request, has had at least one complete Sol review, and has its findings fixed. On
@@ -29,13 +29,41 @@ its owner (#114); a browser test did not know the new Risk policy page (#115).
 passed and none failed, the latency tests the way CI runs them pass (37 files, 420 tests), the browser tests pass
 (218 cases).
 
-**One thing is still to come: a GPT review cycle on six pull requests** (owner's instruction, 2026-11-19 evening). The
-last fix rounds of #108, #114, #115, #117, #122 and #129 were not reviewed. They get a review by GPT Astra; what it
-finds is fixed by GPT Sol on a separate branch `<branch>-gpt-review` with its own pull request "[GPT Review] …" into
-the reviewed branch; then Astra looks again, at most ten rounds. Everything for it is prepared (the briefs are under
-`briefs/gpt/` in the working notes). **It is running** (started 2026-11-19 late evening, after the reviewer's allowance was reset; round 1: seven
-reviews, the presentation layer in two parts). Until a pull request's cycle has ended, it is as described under
-"Known gaps kept on purpose".
+**The GPT review cycle on six pull requests is finished** (owner's instruction, 2026-11-19 evening; ran through the
+night to 2026-11-20 morning). The last fix rounds of #108, #114, #115, #117, #122 and #129 had not been reviewed. Each
+was reviewed by GPT Astra; what it found was fixed by GPT Sol on a separate branch `<branch>-gpt-review` with its own
+pull request "[GPT Review] …" into the reviewed branch; then Astra looked again, at most ten rounds.
+
+| Reviewed pull request | Fix pull request | Head | Blocking findings per round | Result |
+|---|---|---|---|---|
+| #115 risk policy (P8) | #135 | `22032ab6` | 7, 4, 2, 3, 2, 3 (outside this pull request) | approved in round 7 |
+| #129 routines | #132 | `f85752da` | 13, 5, 3, 8, 2 | approved in round 6 |
+| #122 lists follow-up | #131 | `89beb5a8` | 12, 5, 3, 3, 3, 3, 1 | approved in round 8 |
+| #114 reminders | #133 | `93e86c27` | 16, 9, 8, 4, 4, 2, 1 | approved in round 8 |
+| #108 presentation (P10) | #136 | `47602005` | 26, 14, 7, 3, 4, 2, 2, 1, 1 | core approved in round 6, the voice page in round 10 |
+| #117 timers and alarms | #134 | `b22a69d0` | 16, 10, 4, 2, 3, 2, 7, 6, 2, 2 | **not approved**: the round limit was reached. The two findings of the last review were fixed in a last round that was not reviewed again |
+
+The fix pull requests are **not** part of the branch with everything (#130): each targets the branch it reviewed.
+To take them, merge each into its branch before that branch is merged, or, after #130 is on `main`, point each at
+`main` and merge it there. The review reports and the fixer's account of every round (what was fixed, what was stated
+as a limit, what was decided and not changed) are in the working notes under `reports/gpt/`.
+
+What the cycle found that matters beyond its six pull requests:
+
+- **The direct path hands an action only its declared parameter values**, never the person's words or the words no
+  parameter consumed. An action therefore cannot tell "cancel the eggs timer" with "eggs" dropped by the host's
+  extraction from "cancel the timer", and can act on the only timer. Timers and alarms now ask back wherever a
+  parameter they did receive holds something they do not understand; the rest needs the host to give an action the
+  utterance or what was not consumed. Two rounds of the timers review were spent on phrasings; other modules were not
+  looked at for this.
+- **The rule that nothing a speculative turn asks for reaches a screen did not hold on the real voice path** through
+  the Claude Code agent adapter (the tool's callback did not see the turn's commit state). Fixed in #136.
+- **"Move to settings"** (moving a value from a `.env` file into the settings): three findings outside #115, not
+  fixed: the module host reports a module setting's save as done when writing it failed; a Home save from another page
+  at the same moment can undo part of "Move all"; moving an unchanged Home Assistant token restarts that part. And one
+  stated limit: the `.env` files must not be edited by hand while a move runs.
+- Limits that the fix rounds stated on the pages instead of fixing (sequences that need two faults at once, or a
+  changed system clock) are listed in each fixer's account under "stated as a limit".
 
 **Two ways to merge.** Either #130 alone (it contains every commit of #87 to #129; the others can then be
 closed), or the stack one by one in the order of the tables below.
@@ -149,9 +177,9 @@ Found by the last checks and written down instead of fixed:
 - **Timers and alarms, reminders:** delivery is at least once (a ring that was already stopped can sound again after a
   crash between sending and recording); Stop pressed in the same instant as "five more minutes" or a snooze can lose.
 - **Routines:** not all-or-nothing; the host's "stop" ends a routine only while it is speaking its own line.
-- **No review after the last fix round** of: reminders, timers and alarms, routines, the lists follow-up, the web
-  search follow-up (its list was rebuilt after its review), P8's correction, P10's third round. Each has its tests,
-  `pnpm check` and the full run on the whole.
+- **No review after the last fix round** of: the web search follow-up (its list was rebuilt after its review) and
+  the last fix round of timers and alarms (#134). The other pull requests named here before had the GPT review
+  cycle described at the top of this page.
 
 ## Open points
 
