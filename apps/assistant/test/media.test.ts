@@ -5,12 +5,15 @@
 // resolver and connector stand behind the real safeFetch.
 import type { ConnectRequest, ConnectResponse } from "@pva/net"
 import { Deferred, Effect, Exit, Fiber, Scope } from "effect"
+import { createHash } from "node:crypto"
 import { chmodSync, mkdtempSync, readdirSync, statSync, utimesSync, writeFileSync } from "node:fs"
 import type http from "node:http"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { describe, expect, it } from "vitest"
-import { MAX_IMAGE_BYTES, MAX_MEDIA_FETCHES, MEDIA_KEEP_MS, makeMediaCache } from "../src/serve/media.ts"
+import { makeIssueRegistry } from "@pva/core"
+import { chmodSync as realChmod, readdirSync as realReaddir, statSync as realStat, unlinkSync as realUnlink, utimesSync as realUtimes } from "node:fs"
+import { MAX_IMAGE_BYTES, MAX_MEDIA_FETCHES, MEDIA_KEEP_MS, makeMediaCache, type MediaCacheOptions, type MediaFs } from "../src/serve/media.ts"
 
 const PNG = Uint8Array.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0, 0, 0, 13, 1, 2, 3, 4])
 const JPEG = Uint8Array.from([0xff, 0xd8, 0xff, 0xe0, 0, 16, 1, 2, 3])
@@ -33,13 +36,14 @@ interface World {
 
 const world = (): World => ({ requests: [], routes: new Map(), clock: { now: Date.UTC(2026, 10, 19, 12) } })
 
-const open = (w: World, dir = mkdtempSync(join(tmpdir(), "pva-media-")), limits?: { files?: number; bytes?: number }) =>
+const open = (w: World, dir = mkdtempSync(join(tmpdir(), "pva-media-")), limits?: { files?: number; bytes?: number }, extra: Pick<MediaCacheOptions, "fs" | "issues"> = {}) =>
   Effect.gen(function*() {
     const scope = yield* Scope.make()
     const cache = yield* makeMediaCache({
       dir,
       now: () => w.clock.now,
       ...(limits !== undefined ? { limits } : {}),
+      ...extra,
       fetchOptions: {
         // Every public name resolves to a public address; `private.example` to a private one.
         resolver: async (host) => (host === "private.example" ? ["192.168.1.20"] : ["93.184.216.34"]),
@@ -207,31 +211,58 @@ describe("the image cache (/media)", () => {
     utimesSync(join(first.dir, old), (w.clock.now - MEDIA_KEEP_MS - 1) / 1000, (w.clock.now - MEDIA_KEEP_MS - 1) / 1000)
     const again = await run(open(w, first.dir))
     expect(readdirSync(first.dir).sort()).toEqual([`${hash}.png`])
-    expect(again.cache.stats()).toMatchObject({ files: 1, stale: 0 })
+    expect(again.cache.stats()).toMatchObject({ files: 1, sure: true })
     expect(serveOnce(again.cache, `/media/${TOKEN}`, only(hash)).status).toBe(200)
     await run(again.close)
   })
 
-  it("b4: a file whose removal fails stays counted against the bounds and is removed later; the disk never holds more than the bound", async () => {
+  /** File operations that throw EIO for paths in `dir` while `fail` names them. */
+  const faulty = (dir: string) => {
+    const fail = new Set<keyof MediaFs>()
+    let unreadable: string | undefined
+    const eio = (op: keyof MediaFs, path: unknown) => {
+      if (fail.has(op) && String(path).startsWith(dir)) throw Object.assign(new Error(`injected ${op} failure`), { code: "EIO" })
+    }
+    const fs: Partial<MediaFs> = {
+      readdirSync: (p) => (eio("readdirSync", p), realReaddir(p)),
+      statSync: (p) => {
+        // A stat fault hits one entry only (the first it meets), like one unreadable file.
+        if (fail.has("statSync") && String(p).startsWith(dir)) {
+          unreadable ??= String(p)
+          if (unreadable === String(p)) throw Object.assign(new Error("injected statSync failure"), { code: "EIO" })
+        }
+        return realStat(p)
+      },
+      utimesSync: ((p: string, a: number, m: number) => (eio("utimesSync", p), realUtimes(p, a, m))) as MediaFs["utimesSync"],
+      unlinkSync: ((p: string) => (eio("unlinkSync", p), realUnlink(p))) as MediaFs["unlinkSync"],
+      chmodSync: ((p: string, m: number) => realChmod(p, m)) as MediaFs["chmodSync"]
+    }
+    return { fs, fail }
+  }
+  const onDisk = (dir: string) => {
+    const names = readdirSync(dir)
+    return { files: names.length, bytes: names.reduce((n, name) => n + statSync(join(dir, name)).size, 0), names }
+  }
+
+  it("b4 (R6): a file whose removal fails makes the cache not sure: nothing new is admitted until an inventory removes it; the disk never holds more than the bound", async () => {
     const w = world()
     for (let i = 0; i < 2; i++) w.routes.set(`img.example/${i}.png`, () => reply(200, Uint8Array.from([...PNG, i]), { "content-type": "image/png" }))
-    const { cache, dir, close } = await run(open(w, undefined, { files: 1 }))
+    const dir = mkdtempSync(join(tmpdir(), "pva-media-"))
+    const f = faulty(dir)
+    const { cache, close } = await run(open(w, dir, { files: 1 }, { fs: f.fs }))
     expect("hash" in (await run(cache.fetch("https://img.example/0.png")))).toBe(true)
     w.clock.now += MEDIA_KEEP_MS + 1
-    chmodSync(dir, 0o500)
-    try {
-      cache.sweep()
-      expect(cache.stats()).toMatchObject({ files: 0, stale: 1 })
-      // Its place is not free yet: refused full, and the disk holds one file.
-      expect(await run(cache.fetch("https://img.example/1.png"))).toEqual({ refused: "full" })
-    } finally {
-      chmodSync(dir, 0o700)
-    }
+    f.fail.add("unlinkSync")
+    cache.sweep()
+    expect(cache.stats()).toMatchObject({ files: 0, sure: false })
+    // Not sure: refused, and the disk holds one file.
+    expect(await run(cache.fetch("https://img.example/1.png"))).toEqual({ refused: "unavailable" })
+    f.fail.clear()
     expect(readdirSync(dir)).toHaveLength(1)
-    // The removal is tried again before the next write: then there is room.
+    // The next admission takes an inventory first: the expired file goes, then there is room.
     expect("hash" in (await run(cache.fetch("https://img.example/1.png")))).toBe(true)
     expect(readdirSync(dir)).toHaveLength(1)
-    expect(cache.stats()).toMatchObject({ files: 1, stale: 0 })
+    expect(cache.stats()).toMatchObject({ files: 1, sure: true })
     await run(close)
   })
 
@@ -247,6 +278,104 @@ describe("the image cache (/media)", () => {
     expect(serveOnce(cache, `/media/${TOKEN}`, only(hash)).status).toBe(200)
     expect(await run(cache.fetch("https://img.example/heron.png"))).toEqual({ hash })
     expect(w.requests.filter((r) => r === "img.example/heron.png")).toHaveLength(2)
+    await run(close)
+  })
+  // ---- Review round 2, R6: the directory is the truth, and a fault closes the door.
+
+  it("R6 media-write-failure: a write whose temporary file cannot be removed closes admission; the disk stays inside the bounds; a clean inventory removes it and admits again", async () => {
+    const w = world()
+    for (let i = 0; i < 40; i++) w.routes.set(`img.example/${i}.png`, () => reply(200, Uint8Array.from([...PNG, i]), { "content-type": "image/png" }))
+    const dir = mkdtempSync(join(tmpdir(), "pva-media-"))
+    const f = faulty(dir)
+    const issues = makeIssueRegistry()
+    const { cache, close } = await run(open(w, dir, { files: 2 }, { fs: f.fs, issues }))
+    f.fail.add("utimesSync")
+    f.fail.add("unlinkSync")
+    const outcomes = []
+    for (let i = 0; i < 33; i++) outcomes.push(await run(cache.fetch(`https://img.example/${i}.png`)))
+    // The first write fails (its temporary file stays); every later one is refused while the cache is not sure.
+    expect(outcomes[0]).toEqual({ refused: "fetch" })
+    expect(outcomes.slice(1).every((o) => "refused" in o && o.refused === "unavailable")).toBe(true)
+    expect(cache.stats()).toMatchObject({ files: 0, sure: false })
+    expect(onDisk(dir).files).toBe(1)
+    expect(issues.all().map((i) => i.id)).toEqual(["media.cache"])
+    f.fail.clear()
+    cache.sweep()
+    expect(onDisk(dir).files).toBe(0)
+    expect(cache.stats()).toMatchObject({ files: 0, bytes: 0, sure: true })
+    expect(issues.all()).toEqual([])
+    const { hash } = (await run(cache.fetch("https://img.example/39.png"))) as { hash: string }
+    expect(onDisk(dir).names).toEqual([`${hash}.png`])
+    expect(serveOnce(cache, `/media/${TOKEN}`, only(hash)).status).toBe(200)
+    await run(close)
+  })
+
+  it("R6 media-startup-failure: an entry unreadable at start is never taken as absent: nothing new is admitted until an inventory reads it; then the bounds count it", async () => {
+    const w = world()
+    w.routes.set("img.example/new.png", () => reply(200, Uint8Array.from([...PNG, 99]), { "content-type": "image/png" }))
+    const dir = mkdtempSync(join(tmpdir(), "pva-media-"))
+    // Two valid images: the whole (small) bound.
+    const seeded = [0, 1].map((i) => {
+      const body = Uint8Array.from([...PNG, i])
+      const name = `${createHash("sha256").update(body).digest("hex")}.png`
+      writeFileSync(join(dir, name), body, { mode: 0o600 })
+      utimesSync(join(dir, name), w.clock.now / 1000, w.clock.now / 1000)
+      return name
+    })
+    const f = faulty(dir)
+    f.fail.add("statSync")
+    const { cache, close } = await run(open(w, dir, { files: 2 }, { fs: f.fs }))
+    expect(cache.stats()).toMatchObject({ files: 1, sure: false })
+    // The one it could not read is not taken as absent: nothing new is admitted.
+    expect(await run(cache.fetch("https://img.example/new.png"))).toEqual({ refused: "unavailable" })
+    expect(onDisk(dir).files).toBe(2)
+    f.fail.clear()
+    // The inventory reads every entry: both counted, so the bound is reached; the disk never holds three.
+    expect(await run(cache.fetch("https://img.example/new.png"))).toEqual({ refused: "full" })
+    expect(cache.stats()).toMatchObject({ files: 2, sure: true })
+    expect(onDisk(dir).names.sort()).toEqual([...seeded].sort())
+    await run(close)
+  })
+
+  it("R6: a directory that cannot be read at start admits nothing until it can; then what is there is counted", async () => {
+    const w = world()
+    w.routes.set("img.example/heron.png", () => reply(200, PNG, { "content-type": "image/png" }))
+    const first = await run(open(w))
+    const { hash } = (await run(first.cache.fetch("https://img.example/heron.png"))) as { hash: string }
+    await run(first.close)
+    const f = faulty(first.dir)
+    f.fail.add("readdirSync")
+    const second = await run(open(w, first.dir, undefined, { fs: f.fs }))
+    expect(second.cache.stats()).toMatchObject({ files: 0, sure: false })
+    expect(await run(second.cache.fetch("https://img.example/heron.png"))).toEqual({ refused: "unavailable" })
+    f.fail.clear()
+    second.cache.sweep()
+    expect(second.cache.stats()).toMatchObject({ files: 1, sure: true })
+    expect(serveOnce(second.cache, `/media/${TOKEN}`, only(hash)).status).toBe(200)
+    await run(second.close)
+  })
+
+  it("R6 media-stale-replacement: an expired file whose removal failed is removed only by an inventory that sees it expired; the same bytes admitted afterwards stay and are served", async () => {
+    const w = world()
+    w.routes.set("img.example/heron.png", () => reply(200, PNG, { "content-type": "image/png" }))
+    w.routes.set("img.example/other.png", () => reply(200, PNG, { "content-type": "image/png" }))
+    const dir = mkdtempSync(join(tmpdir(), "pva-media-"))
+    const f = faulty(dir)
+    const { cache, close } = await run(open(w, dir, undefined, { fs: f.fs }))
+    const { hash } = (await run(cache.fetch("https://img.example/heron.png"))) as { hash: string }
+    w.clock.now += MEDIA_KEEP_MS + 1
+    f.fail.add("unlinkSync")
+    // The expired copy cannot be removed: the same bytes from another address are not admitted on top of it.
+    expect(await run(cache.fetch("https://img.example/other.png"))).toEqual({ refused: "unavailable" })
+    expect(serveOnce(cache, `/media/${TOKEN}`, only(hash)).status).toBe(404)
+    f.fail.clear()
+    // The next admission takes the inventory: the expired file goes, the same bytes are a new file, served.
+    expect(await run(cache.fetch("https://img.example/other.png"))).toEqual({ hash })
+    cache.sweep()
+    cache.sweep()
+    expect(onDisk(dir).names).toEqual([`${hash}.png`])
+    expect(cache.stats()).toMatchObject({ files: 1, sure: true })
+    expect(serveOnce(cache, `/media/${TOKEN}`, only(hash)).status).toBe(200)
     await run(close)
   })
 })

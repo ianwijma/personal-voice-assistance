@@ -458,7 +458,7 @@ export const startServe = (options: ServeOptions): Effect.Effect<ServeHandle, Ht
     // P10: the Presenter (docs/PRESENTING.md) on the same store, made before the module host it gives `ctx.present` and the
     // gateway's split to. Pages (the hub), the image cache, the gateway and the page boundary are bound once they exist;
     // nothing is shown before a page says hello.
-    const media = yield* makeMediaCache({ dir: join(options.dataDir, "media"), log: logInfo, ...(options.mediaFetch !== undefined ? { fetchOptions: options.mediaFetch } : {}) })
+    const media = yield* makeMediaCache({ dir: join(options.dataDir, "media"), log: logInfo, issues, ...(options.mediaFetch !== undefined ? { fetchOptions: options.mediaFetch } : {}) })
     const present = yield* makePresentEngine({
       store: household.store,
       scheduler,

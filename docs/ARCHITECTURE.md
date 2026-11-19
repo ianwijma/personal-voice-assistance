@@ -1066,7 +1066,8 @@ PresentHandle = { id; key?; outcome: ShowOutcome; update(Presentation): Effect<S
 ShowOutcome   = { devices: [{ deviceId, shown, why? }], note }       // the note for the model: what the server decided ("Showing on …")
 PresentResult = { forModel, present: Presentation, show?: ShowOptions }   // a tool's result; an action's outcome gains { present, show }
 PresentPress  = { presentationId, key?, deviceId, action: "tick" | <button id>, item?, done? }
-PresentError  = { reason: "unavailable" | "invalid" | "limit" | "busy" | "failed", message }
+PresentError  = { reason: "unavailable" | "invalid" | "limit" | "busy" | "failed" | "uncommitted", message }   // uncommitted: from inside a speculative turn not promoted yet (R8)
+CurrentTurnCommit = Context.Reference<{ committed(): boolean; whenCommitted(f: () => void): void } | undefined>  // TurnContext.ts: provided by Conversation for a turn's calls; cleared by the gateway for another principal
 // @pva/protocol (presentation.ts), shared with the web mock:
 decidePresentation({ kind, personal, mayReveal, device: { connected, display, kinds, touch } }): { show: false, why } | { show: true, interactive }
 selectPresentations(candidates): what a device shows (pinned ≤ 8 oldest first, the newest transient)

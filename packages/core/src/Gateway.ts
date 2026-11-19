@@ -10,6 +10,7 @@ import {
   CurrentJob,
   CurrentPrincipal,
   CurrentTurn,
+  CurrentTurnCommit,
   LOCAL_PRINCIPAL,
   type Principal,
   type TurnContext,
@@ -757,10 +758,11 @@ export const makeExecutionGateway = (options: GatewayOptions = {}): ExecutionGat
 
 /**
  * Run `effect` as `principal`: exactly its turn or job (an ambient one of someone else is replaced, cleared for a local
- * or notification call) and the principal itself, for the calls it makes in turn.
+ * or notification call) and the principal itself, for the calls it makes in turn. The ambient turn's commit state
+ * (`CurrentTurnCommit`, R8) is kept only for a turn principal.
  */
 export const asPrincipal = <A, E, R>(principal: Principal, effect: Effect.Effect<A, E, R>): Effect.Effect<A, E, R> =>
-  effect.pipe(
+  (principal._tag === "turn" ? effect : Effect.provideService(effect, CurrentTurnCommit, undefined)).pipe(
     Effect.provideService(CurrentTurn, principal._tag === "turn" ? principal.turn : undefined),
     Effect.provideService(CurrentJob, principal._tag === "job" ? principal.job : undefined),
     Effect.provideService(CurrentPrincipal, principal)

@@ -74,7 +74,7 @@ import type { PrivacyService } from "./Privacy.ts"
 import { quotedName } from "./PromptText.ts"
 import type { PartRunner } from "./Scheduler.ts"
 import type { SchedulerEngine } from "./SchedulerEngine.ts"
-import { CurrentJob, CurrentPrincipal, CurrentTurn, type Principal } from "./TurnContext.ts"
+import { CurrentJob, CurrentPrincipal, CurrentTurn, CurrentTurnCommit, type Principal } from "./TurnContext.ts"
 
 /**
  * The Presenter (docs/PRESENTING.md; the contract is `Present.ts`). One per server: serve mode makes it on the household
@@ -266,6 +266,13 @@ interface Entry {
 interface Held {
   /** The rev, the form and the language it was sent with: anything else is sent again. */
   readonly sig: string
+  /**
+   * The show whose content the page holds, with its owner and kind (review round 2, R1): withdrawal decides on what is
+   * on the page, not on a row that replaced it under the same id.
+   */
+  readonly showId: string
+  readonly owner: string | undefined
+  readonly kind: PresentKindName
   readonly hash: string | undefined
   /** This connection's address for its image (`/media/<token>`). */
   readonly token: string | undefined
@@ -292,6 +299,8 @@ interface PendingShow {
   readonly buttons: ReadonlyArray<{ readonly id: string; readonly label: string }>
   /** Its quick retries failed: maintenance writes it again. */
   failed: boolean
+  /** When maintenance writes it again (review round 2, R4): set when a try fails, never moved later by planning. */
+  retryAt?: number
 }
 
 const failure = (e: StoreFailure | unknown): PresentError => {
@@ -411,6 +420,11 @@ export const makePresentEngine = (options: PresentEngineOptions): Effect.Effect<
     const jobs = options.scheduler.forCore(PRESENT_OWNER)
     const lang = () => options.language()
     const wallNow: Effect.Effect<number> = options.now ?? Clock.currentTimeMillis
+    /**
+     * The wall clock read synchronously inside a transaction attempt (R3): the caller's clock; with an `options.now` (an
+     * effect, tests only) the value read just before the transaction.
+     */
+    const timeIn = (clock: Clock.Clock, before: number): number => (options.now === undefined ? clock.currentTimeMillisUnsafe() : before)
     const writeRetryMs = options.writeRetryMs ?? [100, 400, 1_600]
     const decided = (record: PresentDecisionRecord) => {
       try {
@@ -463,6 +477,8 @@ export const makePresentEngine = (options: PresentEngineOptions): Effect.Effect<
       if (e.key !== undefined && byKey.get(keyOf(e.module, e.key)) === id) byKey.delete(keyOf(e.module, e.key))
     }
     let loaded = false
+    /** When a failed start-up read is tried again (R4). */
+    let loadRetryAt: number | undefined
 
     const devicesNow = () => {
       try {
@@ -604,11 +620,19 @@ export const makePresentEngine = (options: PresentEngineOptions): Effect.Effect<
         const outs = device === undefined ? undefined : outputsFor(device, conn)
         return { by, share: outs === undefined ? [] : selectPresentations(applying.map((e) => ({ id: e.id, lifetime: e.lifetime, shownAt: e.shownAt, decision: decide(e, device!, true, outs) }))) }
       })
-      // Withdrawals first: they need no read, so a failing store never keeps on a page what may not be there.
-      for (const { by, share } of shares) {
+      // Withdrawals first: they need no read, so a failing store never keeps on a page what may not be there. What a
+      // page holds of an earlier show under the same id is judged as what it is (its own owner and kind): forbidden
+      // content goes before its replacement is read.
+      for (let i = 0; i < shares.length; i++) {
+        const { by, share } = shares[i]!
+        const conn = conns[i]!.conn
         const keep = new Set(share.map((c) => c.id))
         for (const [id, h] of [...by.items]) {
-          if (keep.has(id)) continue
+          if (keep.has(id)) {
+            const e = index.get(id)
+            if (e === undefined || e.showId === h.showId) continue
+            if (device !== undefined && decide({ id, kind: h.kind, owner: h.owner }, device, true, outputsFor(device, conn)).show) continue
+          }
           by.items.delete(id)
           forget(h)
           send(by, { type: "present.dismiss", id })
@@ -651,7 +675,7 @@ export const makePresentEngine = (options: PresentEngineOptions): Effect.Effect<
             tokens.set(token, { connId: by.connId, id: c.id, hash })
           } else if (hash === undefined) forget(before)
           send(by, { type: before === undefined ? "present.show" : "present.update", presentation: wireOf(c.id, row.value, c.decision.interactive, now, token) })
-          by.items.set(c.id, { sig, hash, token: hash === undefined ? undefined : token })
+          by.items.set(c.id, { sig, hash, token: hash === undefined ? undefined : token, showId: e.showId, owner: e.owner, kind: e.kind })
         }
       }
       options.observe?.({ kind: "step", ms: performance.now() - started, rows: read, connections: conns.length })
@@ -661,7 +685,8 @@ export const makePresentEngine = (options: PresentEngineOptions): Effect.Effect<
     // ---- The reconciliation fiber: coalesced devices, one pass at a time
 
     const dirty = new Set<string>()
-    const failedPasses = new Set<string>()
+    /** Devices whose pass did not finish, with the time it is repeated (kept until a retry fails again: R4). */
+    const failedPasses = new Map<string, number>()
     let all = false
     let working = false
     const wake = yield* Queue.sliding<void>(1)
@@ -702,9 +727,10 @@ export const makePresentEngine = (options: PresentEngineOptions): Effect.Effect<
           const now = yield* wallNow
           const exit = yield* Effect.exit(Effect.try(() => syncDevice(next.value, now)))
           if (Exit.isFailure(exit) || exit.value === false) {
-            const first = failedPasses.size === 0
-            failedPasses.add(next.value)
-            if (first) requestPlan()
+            const before = failedPasses.get(next.value)
+            // A pass that fails again before its retry keeps that retry's time; one that failed at its retry gets a new one.
+            failedPasses.set(next.value, before !== undefined && before > now ? before : now + PRESENT_RETRY_MS)
+            if (before === undefined) requestPlan()
             log(`Presentations: reconciling ${next.value} did not finish (a store read failed); repeated by the next trigger or maintenance`)
           } else if (failedPasses.delete(next.value) && failedPasses.size === 0) requestPlan()
           yield* Effect.yieldNow
@@ -784,6 +810,24 @@ export const makePresentEngine = (options: PresentEngineOptions): Effect.Effect<
     }
 
     /** What was decided for each device of the target now, and the note for the model (G5, G6). */
+    /**
+     * THE check before a presentation's `spoken` text goes into a note (review round 2, R2), on every path: household
+     * content always; personal content only when the asking device is known and the privacy rule lets it be shown that
+     * person's things now. When that cannot be established, nothing of the content is forwarded.
+     */
+    const mayForward = (owner: string | undefined, asking: string | undefined): boolean => {
+      if (owner === undefined) return true
+      if (asking === undefined || deviceOf(asking) === undefined) return false
+      try {
+        return options.privacy.mayReveal(owner, asking)
+      } catch {
+        return false
+      }
+    }
+    /** The spoken fallback for a note, or `undefined` when privacy does not allow it (`mayForward`). */
+    const spokenFor = (moduleId: string, presentation: Presentation, asking: string | undefined): string | undefined =>
+      mayForward(ownerOf(presentation.sensitivity), asking) ? options.pageText(moduleId, presentation.spoken, MAX_NOTE_SPOKEN_CHARS) : undefined
+
     const outcomeOf = (e: Pick<Entry, "id" | "kind" | "owner" | "target">, o: { readonly asking?: string | undefined; readonly spoken: string; readonly module: string; readonly image: boolean }): ShowOutcome => {
       const devices = targetDevices(e.target)
       const shownOn: Array<ShownOn> = devices.map((d) => {
@@ -792,7 +836,9 @@ export const makePresentEngine = (options: PresentEngineOptions): Effect.Effect<
       })
       const names = new Map(devices.map((d) => [d.id, d.name] as const))
       const asking = o.asking === undefined ? undefined : shownOn.find((s) => s.deviceId === o.asking)
-      const fallback = asking !== undefined && !asking.shown && asking.why !== "private"
+      // Privacy first: an asking device that is offline or has no display is not asked the privacy question by the
+      // decision's order, so it is asked here before any of the content is forwarded.
+      const fallback = asking !== undefined && !asking.shown && asking.why !== "private" && mayForward(e.owner, o.asking)
       return {
         devices: shownOn,
         note: noteOf(shownOn, (id) => names.get(id) ?? id, { ...(fallback ? { spoken: options.pageText(o.module, o.spoken, MAX_NOTE_SPOKEN_CHARS) } : {}), image: o.image })
@@ -801,43 +847,87 @@ export const makePresentEngine = (options: PresentEngineOptions): Effect.Effect<
 
     // ---- Images: fetched once some page is to show one; the outcome written on the row, retried until it is
 
-    const fetching = new Set<string>()
-    /** Outcomes not written yet (the write failed): maintenance writes them. */
-    const imageOutcomes = new Map<string, { readonly url: string; readonly showId: string; readonly outcome: MediaOutcome }>()
-    const writeImage = (id: string, w: { readonly url: string; readonly showId: string; readonly outcome: MediaOutcome }) =>
-      tx((p) => {
+    /**
+     * Fetches under way, by the address fetched (review round 2, R1): the presentations waiting for it. A completion is
+     * written on whichever show of a waiting presentation still wants that address and has no outcome; a waiting
+     * presentation whose current show wants another address is woken (reconciled), so that show fetches its own.
+     */
+    const fetching = new Map<string, Set<string>>()
+    /** Outcomes not written yet (the write failed): by presentation, for that address, with their retry time (R4). */
+    const imageOutcomes = new Map<string, { readonly url: string; readonly outcome: MediaOutcome; readonly retryAt: number }>()
+    /** Write an outcome on the presentation's current show if it wants that address unresolved; else wake it. */
+    const writeImage = (id: string, w: { readonly url: string; readonly outcome: MediaOutcome }) =>
+      tx((p): Row<StoredPresentation> | "stale" | undefined => {
         const row = p.get(id)
-        if (row === undefined || row.value.ended === true || row.value.showId !== w.showId || row.value.content.kind !== "image" || row.value.content.url !== w.url) return undefined
-        const { hash: _h, failed: _f, ...content } = row.value.content
+        if (row === undefined || row.value.ended === true) return undefined
+        const c = row.value.content
+        if (c.kind !== "image" || c.url !== w.url) return "stale"
+        if (c.hash !== undefined || c.failed !== undefined) return undefined
+        const { hash: _h, failed: _f, ...content } = c
         p.update(id, (v) => ({ ...v, content: { ...content, ...("hash" in w.outcome ? { hash: w.outcome.hash } : { failed: w.outcome.refused }) } }), { expectRev: row.rev })
         return p.get(id)
       }, (row) => {
         imageOutcomes.delete(id)
-        if (row !== undefined && index.get(id)?.showId === row.value.showId) {
-          put(entryOf(row))
-          touch(id)
-        }
+        if (row !== undefined && row !== "stale" && index.get(id)?.showId === row.value.showId) put(entryOf(row))
+        // Written, or not wanted any more: whoever holds it (or would) is reconciled; a show that wants another address
+        // fetches its own there.
+        touch(id, index.get(id)?.target)
       })
     const fetchImage = (id: string, url: string) => {
-      const key = `${id} ${url}`
-      const e = index.get(id)
-      if (fetching.has(key) || imageOutcomes.has(id) || e === undefined) return
-      fetching.add(key)
+      if (index.get(id) === undefined) return
+      const pendingOutcome = imageOutcomes.get(id)
+      if (pendingOutcome?.url === url) return
+      if (pendingOutcome !== undefined) imageOutcomes.delete(id)
+      const waiting = fetching.get(url)
+      if (waiting !== undefined) {
+        waiting.add(id)
+        return
+      }
+      const ids = new Set([id])
+      fetching.set(url, ids)
       fork(Effect.gen(function*() {
         const media = options.media?.()
         const outcome: MediaOutcome = media === undefined ? { refused: "unavailable" } : yield* media.fetch(url)
         if ("refused" in outcome) log(`Presentations: an image was not kept (${outcome.refused})`)
-        const w = { url, showId: e.showId, outcome }
-        const exit = yield* Effect.exit(writeImage(id, w))
-        if (Exit.isFailure(exit)) {
-          imageOutcomes.set(id, w)
-          requestPlan()
-          log("Presentations: an image's outcome could not be written; maintenance writes it again")
+        for (const waiter of ids) {
+          const w = { url, outcome }
+          const exit = yield* Effect.exit(writeImage(waiter, w))
+          if (Exit.isFailure(exit)) {
+            imageOutcomes.set(waiter, { ...w, retryAt: (yield* wallNow) + PRESENT_RETRY_MS })
+            requestPlan()
+            log("Presentations: an image's outcome could not be written; maintenance writes it again")
+          }
         }
-      }).pipe(Effect.ensuring(Effect.sync(() => fetching.delete(key)))))
+      }).pipe(Effect.ensuring(Effect.sync(() => {
+        if (fetching.get(url) === ids) fetching.delete(url)
+      }))))
     }
 
     // ---- Maintenance (the notification service's pattern): `due`, one-shot, planned for the next thing due; `hourly`
+
+    let hourly = false
+    let schedulingHourly = false
+    /**
+     * The hourly safety net, scheduled by key; ensured on every change (a show, a plan, a hello, a reconciliation: R4),
+     * as the notification service does, so a first failure to schedule it is repaired by the next change.
+     */
+    function ensureHourly(): void {
+      if (hourly || schedulingHourly) return
+      schedulingHourly = true
+      fork(jobs.schedule({ handler: PRESENT_HOURLY_HANDLER, key: PRESENT_HOURLY_HANDLER, cron: HOURLY_CRON, timeZone: "UTC", origin: {} }).pipe(
+        Effect.match({
+          onSuccess: () => {
+            hourly = true
+            setIssue("hourly", undefined)
+          },
+          onFailure: (e) => {
+            log(`Presentations: the hourly maintenance job could not be scheduled (${e.message}); tried again at the next change`)
+            setIssue("hourly", { title: "Presentations have no hourly maintenance yet", detail: "Its job could not be scheduled; it is tried again with the next change." })
+          }
+        }),
+        Effect.ensuring(Effect.sync(() => void (schedulingHourly = false)))
+      ))
+    }
 
     let plannedAt: number | undefined | "unknown" = "unknown"
     let planning = false
@@ -850,8 +940,11 @@ export const makePresentEngine = (options: PresentEngineOptions): Effect.Effect<
       const consider = (t: number) => void (next = next === undefined ? t : Math.min(next, t))
       for (const e of index.values()) consider(e.expiresAt)
       for (const d of doomed.values()) consider(d.at)
-      for (const s of pending) consider(s.failed ? now + PRESENT_RETRY_MS : s.entry.expiresAt)
-      if (!loaded || failedPasses.size > 0 || imageOutcomes.size > 0) consider(now + PRESENT_RETRY_MS)
+      // Failed work is due at the retry time it was given when it failed (R4): planning again never moves it later.
+      for (const s of pending) consider(s.failed ? s.retryAt ?? now : s.entry.expiresAt)
+      for (const t of failedPasses.values()) consider(t)
+      for (const w of imageOutcomes.values()) consider(w.retryAt)
+      if (!loaded) consider(loadRetryAt ?? now + PRESENT_RETRY_MS)
       return next
     }
     const planOnce: Effect.Effect<void, unknown> = Effect.gen(function*() {
@@ -875,6 +968,7 @@ export const makePresentEngine = (options: PresentEngineOptions): Effect.Effect<
       plannedAt = at
     })
     function requestPlan(): void {
+      ensureHourly()
       if (planning) {
         planAgain = true
         return
@@ -902,26 +996,6 @@ export const makePresentEngine = (options: PresentEngineOptions): Effect.Effect<
       requestPlan()
       return Deferred.await(d)
     })
-    let hourly = false
-    let schedulingHourly = false
-    const ensureHourly = () => {
-      if (hourly || schedulingHourly) return
-      schedulingHourly = true
-      fork(jobs.schedule({ handler: PRESENT_HOURLY_HANDLER, key: PRESENT_HOURLY_HANDLER, cron: HOURLY_CRON, timeZone: "UTC", origin: {} }).pipe(
-        Effect.match({
-          onSuccess: () => {
-            hourly = true
-            setIssue("hourly", undefined)
-          },
-          onFailure: (e) => {
-            log(`Presentations: the hourly maintenance job could not be scheduled (${e.message}); tried again at the next change`)
-            setIssue("hourly", { title: "Presentations have no hourly maintenance yet", detail: "Its job could not be scheduled; it is tried again with the next change." })
-          }
-        }),
-        Effect.ensuring(Effect.sync(() => void (schedulingHourly = false)))
-      ))
-    }
-
     /** Remove the rows of what left the index (due now), a page per transaction; each removed only if it is still that show. */
     const removeDoomed = (now: number): Effect.Effect<void, PresentError> =>
       Effect.gen(function*() {
@@ -953,11 +1027,17 @@ export const makePresentEngine = (options: PresentEngineOptions): Effect.Effect<
       for (const e of [...index.values()]) if (e.expiresAt <= now) doom(e, now)
       for (const s of [...pending]) if (s.entry.expiresAt <= now || !partOpen(s.entry.module, s.entry.part)) dropPending(s)
       if (Exit.isFailure(yield* Effect.exit(removeDoomed(now)))) failedSome = true
-      for (const s of [...pending]) if (s.failed && pending.includes(s)) yield* writePending(s)
+      for (const s of [...pending]) if (s.failed && (s.retryAt ?? 0) <= now && pending.includes(s)) yield* writePending(s)
       if (pending.some((s) => s.failed)) failedSome = true
-      for (const [id, w] of [...imageOutcomes]) if (Exit.isFailure(yield* Effect.exit(writeImage(id, w)))) failedSome = true
+      for (const [id, w] of [...imageOutcomes]) {
+        if (w.retryAt > now) continue
+        if (Exit.isFailure(yield* Effect.exit(writeImage(id, w)))) {
+          imageOutcomes.set(id, { ...w, retryAt: now + PRESENT_RETRY_MS })
+          failedSome = true
+        }
+      }
       if (failedPasses.size > 0) {
-        for (const d of failedPasses) dirty.add(d)
+        for (const d of failedPasses.keys()) dirty.add(d)
         kick()
       }
       lastRun = failedSome ? "failed" : "succeeded"
@@ -989,6 +1069,7 @@ export const makePresentEngine = (options: PresentEngineOptions): Effect.Effect<
         return live
       }))
       if (Exit.isFailure(exit)) {
+        loadRetryAt = (yield* wallNow) + PRESENT_RETRY_MS
         setIssue("load", { title: "Presentations could not be read", detail: "Nothing is shown or withdrawn until the stored presentations can be read; tried again every minute." })
         log(`Presentations: the stored presentations could not be read (${Cause.pretty(exit.cause).split("\n")[0]}); tried again in a minute`)
         return
@@ -1069,10 +1150,25 @@ export const makePresentEngine = (options: PresentEngineOptions): Effect.Effect<
       }
       return { row, ended, before: index.get(e.id) }
     }
-    /** After a show's commit: the index follows what was committed; what it ended leaves the index. */
+    /**
+     * Accepted work a newer show supersedes (review round 2, R1): a pending show of the same id (key) under another show
+     * id, and, when the newer one is transient, every pending transient it would share a device with. Retired: it is
+     * never written, and holds no place behind a counted id.
+     */
+    const retireSupersededBy = (e: Pick<Entry, "id" | "showId" | "lifetime" | "target">) => {
+      const devices = e.lifetime === "transient" ? targetDevices(e.target) : []
+      for (const s of [...pending]) {
+        if (s.entry.showId === e.showId) continue
+        const sameId = s.entry.id === e.id
+        const replaced = e.lifetime === "transient" && s.entry.lifetime === "transient" && devices.some((d) => applies(s.entry.target, d))
+        if (sameId || replaced) dropPending(s)
+      }
+    }
+    /** After a show's commit: the index follows what was committed; what it ended leaves the index; what it supersedes is retired. */
     const afterShow = (w: Exclude<Written, { readonly limit: string }>, now: number) => {
       for (const old of w.ended) doom(old, now + PRESENT_PURGE_AFTER_MS)
       const e = entryOf(w.row)
+      retireSupersededBy(e)
       put(e)
       touch(e.id, e.target, w.before?.target)
       requestPlan()
@@ -1109,8 +1205,15 @@ export const makePresentEngine = (options: PresentEngineOptions): Effect.Effect<
       return open === undefined || open.size === 0 ? undefined : Math.max(...open)
     }
 
+    /**
+     * R8: a way-2 call made from inside a turn that is not committed yet (a speculative tool's run) changes nothing. A
+     * call from a committed turn, a job, a press or a route is not in one (`CurrentTurnCommit` absent or committed).
+     */
+    const uncommitted: Effect.Effect<boolean> = Effect.map(CurrentTurnCommit, (c) => c !== undefined && !c.committed())
+
     const show = (moduleId: string, partId: number) => (target: PresentTarget, presentation: Presentation, o?: ShowOptions): Effect.Effect<PresentHandle, PresentError> =>
       Effect.gen(function*() {
+        if (yield* uncommitted) return yield* new PresentError({ reason: "uncommitted", message: "not shown: the turn is not committed yet (a speculative tool returns its presentation with its result instead)" })
         const now = yield* wallNow
         const problem = requestProblem(moduleId, presentation, o, now)
         if (problem !== undefined) return yield* invalid(problem)
@@ -1119,16 +1222,27 @@ export const makePresentEngine = (options: PresentEngineOptions): Effect.Effect<
         const resolved = resolveTarget(target, origin)
         if (typeof resolved === "string") return yield* invalid(resolved)
         const buttons = (presentation.buttons ?? []).map((b) => ({ id: b.id, label: b.label }))
+        const clock = yield* Clock.Clock
+        // How long it would have been shown, counted from the call: a show that waited longer on the store is refused.
+        const lasts = presentLifetime(presentation, o, now).expiresAt - now
         let committed: Entry | undefined
-        const out = yield* tx((p) => {
-          // The entry (and the key's id) is derived in the attempt that commits.
-          const e = newEntry(moduleId, partId, resolved, presentation, o, now)
-          return writeShow(p, e, (prior) => storedContentOf(presentation, prior), presentation.spoken, buttons, now)
+        let at = now
+        type Out = Written | { readonly invalid: string } | { readonly late: true }
+        const out = yield* tx((p): Out => {
+          // The clock is read, and the entry (its times and the key's id) derived, in the attempt that commits (R3).
+          at = timeIn(clock, now)
+          if (at - now >= lasts) return { late: true }
+          const stale = presentationProblem(presentation, at)
+          if (stale !== undefined) return { invalid: stale }
+          const e = newEntry(moduleId, partId, resolved, presentation, o, at)
+          return writeShow(p, e, (prior) => storedContentOf(presentation, prior), presentation.spoken, buttons, at)
         }, (w) => {
-          if ("limit" in w) return
-          afterShow(w, now)
+          if ("limit" in w || "invalid" in w || "late" in w) return
+          afterShow(w, at)
           committed = entryOf(w.row)
         })
+        if ("late" in out) return yield* new PresentError({ reason: "busy", message: "the store was busy for longer than it would have been shown; nothing was shown" })
+        if ("invalid" in out) return yield* invalid(out.invalid)
         if ("limit" in out) return yield* new PresentError({ reason: "limit", message: out.limit })
         const e = committed ?? entryOf(out.row)
         const c = out.row.value.content
@@ -1146,14 +1260,21 @@ export const makePresentEngine = (options: PresentEngineOptions): Effect.Effect<
     /** G3: the entry and its row are read again in the attempt that commits; a replaced or ended show changes nothing. */
     const update = (moduleId: string, id: string, showId: string, presentation: Presentation): Effect.Effect<ShowOutcome | undefined, PresentError> =>
       Effect.gen(function*() {
+        // Not committed yet (R8): nothing changes; `undefined`, as for a show that is no longer there to change.
+        if (yield* uncommitted) return undefined
         const now = yield* wallNow
         const problem = presentationProblem(presentation, now) ?? handlerProblem(moduleId, presentation)
         if (problem !== undefined) return yield* invalid(problem)
         const asking = yield* originDevice(undefined)
+        const clock = yield* Clock.Clock
         const out = yield* tx((p): { readonly row: Row<StoredPresentation> } | { readonly invalid: string } | undefined => {
+          // The clock of the attempt that commits (R3): an end passed while it waited means it has ended.
+          const at = timeIn(clock, now)
           const e = index.get(id)
           const row = p.get(id)
-          if (e === undefined || row === undefined || row.value.ended === true || e.showId !== showId || row.value.showId !== showId || row.value.module !== moduleId || e.expiresAt <= now) return undefined
+          if (e === undefined || row === undefined || row.value.ended === true || e.showId !== showId || row.value.showId !== showId || row.value.module !== moduleId || e.expiresAt <= at) return undefined
+          const stale = presentationProblem(presentation, at)
+          if (stale !== undefined) return { invalid: stale }
           if (presentation.kind !== row.value.content.kind) return { invalid: `an update keeps the kind (${row.value.content.kind}); show a new presentation for another` }
           if (ownerOf(presentation.sensitivity) !== row.value.owner) return { invalid: "an update keeps the sensitivity; show a new presentation for another" }
           const content = storedContentOf(presentation, row.value.content)
@@ -1182,6 +1303,8 @@ export const makePresentEngine = (options: PresentEngineOptions): Effect.Effect<
     /** G1: no longer eligible at once; the row is marked ended (or removed later by maintenance if that fails). */
     const dismiss = (moduleId: string, id: string, showId: string): Effect.Effect<boolean, PresentError> =>
       Effect.gen(function*() {
+        // Not committed yet (R8): nothing is dismissed.
+        if (yield* uncommitted) return false
         const e = index.get(id)
         if (e === undefined || e.module !== moduleId || e.showId !== showId) return false
         const now = yield* wallNow
@@ -1204,17 +1327,28 @@ export const makePresentEngine = (options: PresentEngineOptions): Effect.Effect<
           if (!pending.includes(s)) return
           const now = yield* wallNow
           if (s.entry.expiresAt <= now || !partOpen(s.entry.module, s.entry.part)) return dropPending(s)
-          // Its own reservation (the same id) does not count against it in `writeShow`'s bounds.
-          const exit = yield* Effect.exit(tx((p): Written | "gone" => {
+          const clock = yield* Clock.Clock
+          // Its own reservation (the same id) does not count against it in `writeShow`'s bounds. It keeps the end it was
+          // accepted with; whether it still applies is judged with the clock of the attempt that commits (R3), and that
+          // it is still the current show of its id (R1).
+          let at = now
+          const exit = yield* Effect.exit(tx((p): Written | "gone" | "ended" => {
+            at = timeIn(clock, now)
             if (!pending.includes(s)) return "gone"
-            return writeShow(p, s.entry, (prior) => (s.content.kind === "image" && prior?.kind === "image" && prior.url === s.content.url ? { ...s.content, ...(prior.hash !== undefined ? { hash: prior.hash } : {}) } : s.content), s.spoken, s.buttons, now)
+            if (s.entry.expiresAt <= at) return "ended"
+            const current = index.get(s.entry.id)
+            if (current !== undefined && current.showId !== s.entry.showId && current.shownAt > s.entry.shownAt) return "gone"
+            return writeShow(p, s.entry, (prior) => (s.content.kind === "image" && prior?.kind === "image" && prior.url === s.content.url ? { ...s.content, ...(prior.hash !== undefined ? { hash: prior.hash } : {}) } : s.content), s.spoken, s.buttons, at)
           }, (w) => {
-            if (w === "gone") return
+            if (w === "gone" || w === "ended") {
+              dropPending(s)
+              return
+            }
             dropPending(s)
-            if (!("limit" in w)) afterShow(w, now)
+            if (!("limit" in w)) afterShow(w, at)
           }))
           if (Exit.isSuccess(exit)) {
-            if (exit.value !== "gone" && "limit" in exit.value) log(`Presentations: a presentation of ${s.entry.module} passed a bound while it waited (${exit.value.limit}); not shown`)
+            if (exit.value !== "gone" && exit.value !== "ended" && "limit" in exit.value) log(`Presentations: a presentation of ${s.entry.module} passed a bound while it waited (${exit.value.limit}); not shown`)
             s.failed = false
             if (!pending.some((x) => x.failed)) setIssue("write", undefined)
             return
@@ -1222,6 +1356,8 @@ export const makePresentEngine = (options: PresentEngineOptions): Effect.Effect<
           const pause = writeRetryMs[attempt]
           if (pause === undefined || s.failed) {
             s.failed = true
+            // The next try a minute from this failure; planning for anything else never moves it (R4).
+            s.retryAt = now + PRESENT_RETRY_MS
             setIssue("write", { title: "A presentation could not be shown yet", detail: "The store refused it; it is written again every minute until it is written or has ended." })
             log(`Presentations: a presentation of ${s.entry.module} could not be written (${Cause.pretty(exit.cause).split("\n")[0]}); maintenance writes it again`)
             requestPlan()
@@ -1255,22 +1391,39 @@ export const makePresentEngine = (options: PresentEngineOptions): Effect.Effect<
           log(`Presentations: a presentation of ${moduleId} was refused (${problem})`)
           return withScreenNote(forModel, refusedNote(`the presentation was not valid (${problem.slice(0, 200)})`))
         }
-        const spoken = options.pageText(moduleId, presentation.spoken, MAX_NOTE_SPOKEN_CHARS)
+        // Every refusal below carries the fallback only when privacy allows it for the asking device (R2).
+        const origin = yield* originDevice(principal)
+        const spoken = spokenFor(moduleId, presentation, origin)
         const part = partOf(moduleId)
         if (part === undefined) return withScreenNote(forModel, refusedNote("this module cannot show things (it is not a version 2 module, or it is stopping)", spoken))
         if (!loaded) return withScreenNote(forModel, refusedNote("the screen's data is still being read", spoken))
-        const origin = yield* originDevice(principal)
-        if (origin === undefined || deviceOf(origin) === undefined) return withScreenNote(forModel, refusedNote("there is no device to show it on", spoken))
+        if (origin === undefined || deviceOf(origin) === undefined) return withScreenNote(forModel, refusedNote("there is no device to show it on"))
         const e = newEntry(moduleId, part, { device: origin }, presentation, o, now)
         const bound = boundProblem(moduleId, e.lifetime, e.target, e.id, now)
         if (bound !== undefined) return withScreenNote(forModel, refusedNote(`too much is on screen (${bound})`, spoken))
         const outcome = outcomeOf(e, { asking: origin, spoken: presentation.spoken, module: moduleId, image: presentation.kind === "image" })
         // Accepted: its key's id reserved, its place held in the bounds, one enqueue; written and shown off the turn's path.
-        if (e.key !== undefined) pendingKeys.set(keyOf(moduleId, e.key), e.id)
-        const s: PendingShow = { entry: e, content: storedContentOf(presentation), spoken: presentation.spoken, buttons: (presentation.buttons ?? []).map((b) => ({ id: b.id, label: b.label })), failed: false }
-        pending.push(s)
-        work.push(s)
-        void Queue.offerUnsafe(workWake, undefined)
+        // It supersedes accepted work it replaces (the same key, or a transient it would end): retired now (R1).
+        const accept = (accepted: Omit<Entry, "rev">) => {
+          retireSupersededBy(accepted)
+          if (accepted.key !== undefined) pendingKeys.set(keyOf(moduleId, accepted.key), accepted.id)
+          const s: PendingShow = { entry: accepted, content: storedContentOf(presentation), spoken: presentation.spoken, buttons: (presentation.buttons ?? []).map((b) => ({ id: b.id, label: b.label })), failed: false }
+          pending.push(s)
+          work.push(s)
+          void Queue.offerUnsafe(workWake, undefined)
+        }
+        // R8: the result of a tool that ran while its turn was speculative is accepted when the turn is promoted (its
+        // entry, times and key's id derived then), and dropped without reaching a screen when the turn is discarded. The
+        // note is the one composed now, for the promoted turn. A call made as another principal is not held.
+        const commit = principal === undefined || principal._tag === "turn" ? yield* CurrentTurnCommit : undefined
+        if (commit === undefined || commit.committed()) accept(e)
+        else {
+          const clock = yield* Clock.Clock
+          commit.whenCommitted(() => {
+            if (partOf(moduleId) !== part) return
+            accept(newEntry(moduleId, part, { device: origin }, presentation, o, timeIn(clock, now)))
+          })
+        }
         return withScreenNote(forModel, outcome.note)
       })
 
@@ -1428,8 +1581,14 @@ export const makePresentEngine = (options: PresentEngineOptions): Effect.Effect<
 
     const engine: PresentEngine = {
       forPart,
-      reconcile: enqueue,
-      reconcileAll: enqueueAll,
+      reconcile: (deviceId) => {
+        ensureHourly()
+        enqueue(deviceId)
+      },
+      reconcileAll: () => {
+        ensureHourly()
+        enqueueAll()
+      },
       press,
       fromResult,
       mediaFor: (token) => {
