@@ -204,3 +204,56 @@ describe("H4: an unknown owner is not a person", () => {
       assert.strictEqual((yield* runIn(open, [throwing], "throwing")).content, WITHHELD)
     }))
 })
+
+// Review round 2, finding 4: the generated-action branch of H3, complete. A generated action (the model calls an action)
+// whose run fails with an ActionError or dies, with fixed personal and with dynamic sensitivity, on a device that may
+// reveal it and one that may not: the model's content, isError, one decision of class `change`, and the withheld state
+// on the decision's record and the turn's trace.
+describe("H3 for generated actions: a typed failure and a defect, fixed personal and dynamic, reveal yes and no", () => {
+  const cases = [
+    { failure: "typed" as const, sensitivity: "fixed" as const },
+    { failure: "defect" as const, sensitivity: "fixed" as const },
+    { failure: "typed" as const, sensitivity: "dynamic" as const },
+    { failure: "defect" as const, sensitivity: "dynamic" as const }
+  ]
+  for (const c of cases) {
+    for (const may of [true, false]) {
+      // Shown only for a fixed personal sensitivity on a device that may reveal it; a classifier is never asked.
+      const shown = c.sensitivity === "fixed" && may
+      it.effect(`${c.failure} failure, ${c.sensitivity} sensitivity, the device ${may ? "may" : "may not"} reveal it: ${shown ? "its text" : "withheld"}`, () =>
+        Effect.gen(function*() {
+          const { CurrentTurnTrace, makeTurnTrace } = yield* Effect.promise(() => import("../src/TurnTrace.ts"))
+          const broken = defineAction({
+            id: "broken",
+            label: "Broken",
+            description: "",
+            examples: ["broken"],
+            params: {},
+            risk: "change",
+            sensitivity: c.sensitivity === "fixed" ? { kind: "personal", owner: "p-sam" } : () => ({ kind: "household" }),
+            run: () =>
+              c.failure === "typed"
+                ? Effect.fail(new ActionError({ message: "PRIVATE-ACTION-FAILURE" }))
+                : Effect.sync(() => {
+                  throw new Error("PRIVATE-ACTION-DEFECT")
+                })
+          })
+          const { call, records } = yield* actionTool(broken, may)
+          const trace = makeTurnTrace().begin("voice")
+          const result = yield* call("m_broken").pipe(Effect.provideService(CurrentTurnTrace, trace), Effect.provideService(CurrentTurn, { ...turn, turnId: trace.id }))
+          assert.isTrue(result.isError)
+          if (shown) {
+            assert.strictEqual(result.content, c.failure === "typed" ? "PRIVATE-ACTION-FAILURE" : "Tool crashed: Error: PRIVATE-ACTION-DEFECT")
+          } else {
+            assert.strictEqual(result.content, WITHHELD)
+            assert.notInclude(result.content, "PRIVATE")
+          }
+          // One decision, of the action's class, allowed (the failure is the executor's, not a refusal).
+          assert.deepStrictEqual(records.map((r) => [r.kind, r.name, r.outcome, r.by]), [["tool", "m_broken", "allow", "change"]])
+          assert.strictEqual(records[0]!.withheld === true, !shown)
+          assert.strictEqual(trace.calls?.length, 1)
+          assert.strictEqual(trace.calls?.[0]?.withheld === true, !shown)
+        }).pipe(Effect.scoped))
+    }
+  }
+})
