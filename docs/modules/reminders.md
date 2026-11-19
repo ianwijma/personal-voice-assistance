@@ -17,6 +17,7 @@ to put the bins out", "remind the house at six to tidy up". It is **time only**:
 `@pva/language` recurrence phrases: "every weekday at 7 am", "every second Tuesday at nine", "on the first of every
 month at ten"). Anything that is not clear is a question, never a guess: "At what time?" for "tomorrow" and for a repeat
 without a clock time ("every Monday"), "Say the day and the time." for something that could mean two moments.
+Empty or whitespace-only reminder words ask "What should I remind you about?" without saving or changing a reminder.
 One-off requests and the duration action are limited to 366 days ahead; repeats may start later (for example the next February 29).
 
 - **Whose.** For the person asking (the asking device's default person; `scope: me`, the default when a person is
@@ -86,7 +87,8 @@ case a reminder that was already stopped can ring once more; it can never ring z
   the series goes on. **Done on a repeat that is not ringing skips its next time** ("Done: I'll skip the one today at
   eight. The next one is tomorrow at eight."); the series goes on after it. If cleanup from the answered ring is still owed, named Done retries that cleanup first. Cancel ends a repeat for good.
 - **Snooze** takes the notification and card down and rings the same time again after the setting's minutes (or a said
-  duration). After redelivery its notification, due card and lists use the snooze deadline as the due time; the original
+  duration). A snooze ending at or after the next regular occurrence is declined: choose a shorter snooze.
+  After redelivery its notification, due card and lists use the snooze deadline as the due time; the original
   occurrence time remains its stable identity. The same button pressed again (the service may run a handler twice) does not push it further, even after redelivery; only the fresh delivery's own button can snooze it again.
 - An unnamed voice answer or a button answers one occurrence and the open notification selected for it. Admission is
   checked again under the reminder lock: an answer selected before a successful Snooze cannot finish it or change that
@@ -103,7 +105,8 @@ case a reminder that was already stopped can ring once more; it can never ring z
   for the same time: **it rings again** after cleanup succeeds. The confirmation says the new words are waiting for delivery.
   If a newer occurrence is already waiting for delivery, that occurrence is kept instead of resending the older ring.
   A delivery already attempted also has its possibly open notification taken down before the new words are sent.
-  Snoozed, it keeps its snooze and rings with the new words then.
+  Snoozed, it keeps its snooze and rings with the new words then. Editing only the words preserves the effective due
+  time on the card, in lists and in the confirmation; the resend lateness clock starts at the edit.
 - **A new time** ends the ring (notification and card go) and any delivery under way; the reminder waits for its new
   time (or its new repeat).
 - The confirmation is built from the reminder as written: a text change during a snooze says the snooze's time.
@@ -111,6 +114,8 @@ case a reminder that was already stopped can ring once more; it can never ring z
 ### When taking it down fails
 
 Finishing, cancelling, answering, snoozing or changing a reminder takes its notification down and dismisses its card.
+Once a button's answer is saved, the host resolves that pressed notification even if the inline cleanup read fails;
+the row's job continues the remaining cleanup.
 The tool or button tries that once, at once. If it fails, the reminder keeps **clean-up owed**, its job comes back a few
 seconds later (5 s, then doubling) and tries again, at most five times; then it is given up with a Health issue (the
 notification and card still end by themselves when they expire). The answer is true in each case: "Cancelled: call mum."
@@ -195,7 +200,7 @@ more.", or "I couldn't read all the reminders; there may be some today." when no
 | Keep finished reminders | 7 days (1–90) | Days a finished, cancelled or lapsed reminder is kept before the daily clean-up removes it. |
 
 All three are shared (no assistant owns its own value). The household's language and time zone come from the Home
-section (`HOME_LANGUAGE`, `HOME_TIME_ZONE`, empty meaning this machine's).
+section (`HOME_LANGUAGE`, `HOME_TIME_ZONE`, surrounding zone whitespace is trimmed, empty meaning this machine's).
 
 ## What it stores
 
@@ -207,8 +212,8 @@ One collection, `reminders` (scope household; rows carry their owner), `storage.
 | `whose`, `owner` | `household`, or `personal` with the owner's Members id |
 | `state` | `open` (a series, a delivery under way or a ring is left), `done`, `cancelled`, `lapsed` |
 | `dueAt` | the next time not yet handed to delivery; absent once a one-off was handed over or a series ended |
-| `owed` | a delivery under way: `{ at, from, attempts, tryAt }` (`from`: what the late rule counts from) |
-| `ring` | a delivered time not yet answered: `{ at, deliveredAt, from?, snoozeUntil? }` (`from`: the effective due time after delivery) |
+| `owed` | a delivery under way: `{ at, from, attempts, tryAt }` (`from`: what the late rule counts from; a text resend retains its ring's effective due time for display) |
+| `ring` | a delivered time not yet answered: `{ at, deliveredAt, from?, snoozeUntil? }` (`from`: the effective due time after delivery); retained during text redelivery to preserve that time |
 | `stop` | clean-up owed: `{ notes, card, cardAt?, attempts, tryAt }` (the times whose notifications are to go; `cardAt` limits an answer's card cleanup to that occurrence) |
 | `stopFailed` | the clean-up's tries were used up: a ring or card may still be open and ends by itself when it expires |
 | `nextAt` | the next moment anything happens for it; its one job is planned for it |
@@ -251,10 +256,12 @@ snoozes at once leave one snooze and one job.
   asking device **at the moment of answering**, after the last read; nothing is cached or decided when a reminder is
   stored. The delivery passes the owner to the notification service and the card carries `sensitivity: personal`, so
   each device is decided again when it would ring or show: a shared device whose default person changed since the
-  reminder was set gets neither. A confirmation asks after the last wait and write, immediately before its sentence is
-  built; a list is built from the rows just read under the same answer. Done and Snooze buttons check the pressing
-  device before accepting the answer. A refused answer keeps its refusal and notification; permission lost after a
-  successful Done reduces its confirmation to "Done." without the schedule.
+  reminder was set gets neither. Every tool, action and button passes a common final reply check after its last wait;
+  a successful confirmation carries a plain alternative, while a refusal keeps its refusal. Every user change to an
+  existing reminder checks permission at transaction admission, after notification lookup, job preparation and the
+  store's wait. Already-owed cleanup continues independently. A list is built from the rows just read and checked again
+  before it is returned. Done and Snooze buttons use the pressing device. A refused answer keeps its refusal and
+  notification; permission lost after a successful Done reduces its confirmation to "Done." without the schedule.
 - Reading and matching look at the household's reminders and the **asking person's own** only; another person's are not
   read, not counted, not matched. Without a known person only the household's are read, and the answer says so. The
   person's own that the asking device may not be told are counted anonymously ("2 personal reminders are not read out
