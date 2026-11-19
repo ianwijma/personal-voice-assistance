@@ -992,12 +992,16 @@ export const remindersModule = defineModule({
             if (said !== undefined) {
               // A new time ends a ring (its notification and card go) and an owed delivery, and replaces the series.
               const notes = [ring?.at, r.owed !== undefined && r.owed.attempts > 0 ? r.owed.at : undefined].filter((x): x is number => x !== undefined)
-              row = yield* sh.write(row, (v) => withStop({
-                ...without(v, "owed", "ring", "handled", "rrule", "dtstart", "timeZone", "dropped"),
-                text: text ?? v.text,
-                dueAt: said.at,
-                ...(said.kind === "repeat" ? { rrule: said.rrule, dtstart: said.dtstart, timeZone: said.timeZone } : {})
-              }, notes.length > 0 || ring !== undefined ? addStop(v.stop, notes, true, now) : v.stop))
+              row = yield* sh.write(row, (v) => {
+                // The new occurrence owes the old cleanup, but has not inherited its answer.
+                const stop = v.stop === undefined ? undefined : without(v.stop, "cardAt")
+                return withStop({
+                  ...without(v, "owed", "ring", "handled", "rrule", "dtstart", "timeZone", "dropped"),
+                  text: text ?? v.text,
+                  dueAt: said.at,
+                  ...(said.kind === "repeat" ? { rrule: said.rrule, dtstart: said.dtstart, timeZone: said.timeZone } : {})
+                }, notes.length > 0 || ring !== undefined ? addStop(stop, notes, true, now) : stop)
+              })
             } else if (ring !== undefined && ring.snoozeUntil === undefined && (openAttempt || (yield* sh.isOpen(id, ring.at)))) {
               // New words while it rings: its notification and card go, and the same occurrence is sent again with them.
               resend = r.owed === undefined || r.owed.at === ring.at
