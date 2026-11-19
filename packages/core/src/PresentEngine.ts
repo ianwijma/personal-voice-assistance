@@ -1292,6 +1292,8 @@ export const makePresentEngine = (options: PresentEngineOptions): Effect.Effect<
           const e = entryOf(w.row)
           put(e)
           touch(id, e.target)
+          // A change like a show (round 3, R4): planning is asked for, and with it the hourly job ensured.
+          requestPlan()
         })
         if (out === undefined) return undefined
         if ("invalid" in out) return yield* invalid(out.invalid)
@@ -1442,6 +1444,13 @@ export const makePresentEngine = (options: PresentEngineOptions): Effect.Effect<
           if (holder === undefined) return answer(false, "cantNow", "unknown")
           const e = index.get(request.presentationId)
           if (e === undefined || e.expiresAt <= now) {
+            enqueue(request.deviceId)
+            return answer(false, "over", "unknown")
+          }
+          // A press runs only what the page holds (round 3): the show this connection holds must be the current show of
+          // that presentation. A page still showing an older show (a replacement whose content could not be read yet) is
+          // answered as for a presentation that is gone, and reconciled.
+          if (holder.by.items.get(request.presentationId)?.showId !== e.showId) {
             enqueue(request.deviceId)
             return answer(false, "over", "unknown")
           }

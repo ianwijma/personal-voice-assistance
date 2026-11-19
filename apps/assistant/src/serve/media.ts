@@ -149,7 +149,7 @@ export const makeMediaCache = (options: MediaCacheOptions): Effect.Effect<MediaC
         id: "media.cache",
         severity: "warning",
         title: "The image cache could not be read or cleaned",
-        detail: "New images are not fetched until its directory (data/media) has been read completely; images already kept are still shown. It is tried again every minute."
+        detail: "New images are not kept until its directory (data/media) has been read completely; images already kept are still shown. It is tried again every minute."
       }])
     }
     const fault = (why: string) => {
@@ -354,9 +354,8 @@ export const makeMediaCache = (options: MediaCacheOptions): Effect.Effect<MediaC
       try {
         body = fs.readFileSync(fileOf(k))
       } catch (e) {
-        // Not served; what is on disk is decided by the next inventory.
-        kept.delete(k.hash)
-        bytes -= k.bytes
+        // Not served this time. The entry is kept (round 3): the cache is not sure and the inventory decides whether the
+        // file is there; a read that works again serves it again without waiting for that.
         fault(`${fileOf(k)} could not be read (${code(e)})`)
         return notFound(res)
       }

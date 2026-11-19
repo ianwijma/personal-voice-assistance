@@ -12,7 +12,7 @@ import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { describe, expect, it } from "vitest"
 import { makeIssueRegistry } from "@pva/core"
-import { chmodSync as realChmod, readdirSync as realReaddir, statSync as realStat, unlinkSync as realUnlink, utimesSync as realUtimes } from "node:fs"
+import { chmodSync as realChmod, readFileSync as realReadFile, readdirSync as realReaddir, statSync as realStat, unlinkSync as realUnlink, utimesSync as realUtimes } from "node:fs"
 import { MAX_IMAGE_BYTES, MAX_MEDIA_FETCHES, MEDIA_KEEP_MS, makeMediaCache, type MediaCacheOptions, type MediaFs } from "../src/serve/media.ts"
 
 const PNG = Uint8Array.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0, 0, 0, 13, 1, 2, 3, 4])
@@ -235,6 +235,7 @@ describe("the image cache (/media)", () => {
       },
       utimesSync: ((p: string, a: number, m: number) => (eio("utimesSync", p), realUtimes(p, a, m))) as MediaFs["utimesSync"],
       unlinkSync: ((p: string) => (eio("unlinkSync", p), realUnlink(p))) as MediaFs["unlinkSync"],
+      readFileSync: (p) => (eio("readFileSync", p), realReadFile(p)),
       chmodSync: ((p: string, m: number) => realChmod(p, m)) as MediaFs["chmodSync"]
     }
     return { fs, fail }
@@ -376,6 +377,27 @@ describe("the image cache (/media)", () => {
     expect(onDisk(dir).names).toEqual([`${hash}.png`])
     expect(cache.stats()).toMatchObject({ files: 1, sure: true })
     expect(serveOnce(cache, `/media/${TOKEN}`, only(hash)).status).toBe(200)
+    await run(close)
+  })
+  it("round 3: a failed read while serving a held image keeps it: the cache is not sure, and a read that works again serves it again without an inventory", async () => {
+    const w = world()
+    w.routes.set("img.example/heron.png", () => reply(200, PNG, { "content-type": "image/png" }))
+    const dir = mkdtempSync(join(tmpdir(), "pva-media-"))
+    const f = faulty(dir)
+    const { cache, close } = await run(open(w, dir, undefined, { fs: f.fs }))
+    const { hash } = (await run(cache.fetch("https://img.example/heron.png"))) as { hash: string }
+    expect(serveOnce(cache, `/media/${TOKEN}`, only(hash)).status).toBe(200)
+    f.fail.add("readFileSync")
+    expect(serveOnce(cache, `/media/${TOKEN}`, only(hash)).status).toBe(404)
+    expect(cache.stats()).toMatchObject({ files: 1, sure: false })
+    f.fail.clear()
+    // No inventory in between: still held, and readable again.
+    expect(cache.stats().sure).toBe(false)
+    const again = serveOnce(cache, `/media/${TOKEN}`, only(hash))
+    expect(again.status).toBe(200)
+    expect(again.body).toEqual(Buffer.from(PNG))
+    cache.sweep()
+    expect(cache.stats()).toMatchObject({ files: 1, sure: true })
     await run(close)
   })
 })

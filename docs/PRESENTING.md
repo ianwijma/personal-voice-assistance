@@ -57,7 +57,9 @@ ctx.present.handle(name, { run: (press) => Effect<{ say? } | void> })   // in sh
   without reaching a screen when the turn is discarded. Way 2 from inside such a turn changes nothing: `show` is refused
   `uncommitted` ("not shown: the turn is not committed yet"), `update` answers `undefined` and `dismiss` `false`. A call
   from a committed turn, a job, a press or a route is not affected (`CurrentTurnCommit`, which `Conversation` provides
-  for a turn's calls and the gateway clears for a call made as another principal).
+  for a turn's calls and the gateway clears for a call made as another principal). *Known gap* (round 3): such a
+  presentation is checked against the live bounds when the tool answers, not again at promotion, so if the module's
+  places fill up in between, the note said "Showing on …" and the writer drops it (logged) without showing it.
 - **Way 2** is one synchronous transaction and an enqueue, and answers with a typed refusal (`PresentError`): `invalid`,
   `limit`, `busy` (the store was busy, or the stored presentations are still being read at start), `unavailable`,
   `uncommitted` (called from inside a turn that is not committed yet). Its
@@ -151,8 +153,9 @@ rows.
   from its failure: a pass, an accepted write, an image's outcome, the start-up read; none when nothing is due), planned
   again after every change, at the end of every run and at start; and `core.present/hourly` (cron `0 * * * *` in UTC),
   the safety net that runs the same work. A failure keeps the retry time it was given: planning again for other changes
-  never moves it later. The hourly job, if it could not be scheduled, is scheduled again with every change (a show, a
-  plan, a page's hello or a reconciliation), not only by maintenance. The Presenter has no timer of its own. So ends
+  never moves it later. The hourly job, if it could not be scheduled, is scheduled again with every change (a show, an
+  update (round 3), a plan, a page's hello or a reconciliation), not only by maintenance; a successful update asks for
+  planning as a show does. The Presenter has no timer of its own. So ends
   happen on time, and work that failed is done at most a minute after its failure, or an hour later after a lost plan.
 - **Accepted work a newer show replaces is retired** (review round 2): an accepted tool result not yet written is dropped
   when a newer show of the same key is accepted or committed, and, for a transient, when a newer transient on one of its
@@ -220,7 +223,10 @@ transient the decision allows.
   gateway (a tool, an action) is decided there as well.
 - **Admission** (synchronous, against this moment): the connection holds the presentation, it is live, the decision lets
   it be pressed there, and the press is a tick of an item a checklist has (with `done`) or a button it has. Knowing an id
-  is not enough; another device's page gets "I can't do that right now."
+  is not enough; another device's page gets "I can't do that right now." **A press runs only what the page holds**
+  (round 3): the show the connection holds must be the current show of that presentation; a page still showing an older
+  show (a keyed replacement whose content could not be read yet) is answered as for a presentation that is gone, nothing
+  is claimed or run, and the page is reconciled.
 - **The claim**: one press at a time per presentation, in memory, before any module code runs; a second gets "That is
   being handled already." (A restart forgets the claim with the run.)
 - **The handler** the module registered with `ctx.present.handle(name, …)` **in `shared`** (a registration of the part:
@@ -271,7 +277,10 @@ transient the decision allows.
   cache could not be read or cleaned", until an inventory has read every entry, removed what it had to and what remains
   is inside 256 files and 64 MiB. An unreadable entry is never taken as absent. There is no list of files to remove
   later: a file is removed by an inventory that sees it expired at that moment, so a copy admitted since is never
-  removed by an old retry. While it is not sure, an image already kept is still served if its file can be read. The
+  removed by an old retry. While it is not sure, an image already kept is still served if its file can be read: a read
+  that fails while serving keeps the entry (the cache becomes not sure, and the inventory decides), and a read that works
+  again serves it again at once (round 3). *Known gap* (round 3): while the cache is not sure, a request is still
+  fetched from the network before it is refused `unavailable` (the refusal comes after the response). The
   files **survive a restart**: what the inventory at start keeps is served for the rest of its day.
 - **The response headers**, exactly: `Content-Type` (the kept type), `Content-Length`, `X-Content-Type-Options:
   nosniff`, `Content-Security-Policy: default-src 'none'; sandbox`, `Content-Disposition: inline; filename="image.<ext>"`,

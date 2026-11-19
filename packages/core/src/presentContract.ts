@@ -1399,4 +1399,45 @@ export const presentContract = (name: string, open: OpenPresentStore) =>
           assert.strictEqual(reasonOf(yield* Effect.exit(world.showOn("kitchen-display", bad as Presentation, badOptions as never))), "invalid", `${name} at ${past}`)
         }
       }))
+    // ---- Round 3
+
+    it.effect("r3-1: a press runs only what the page holds: an old card left on the page by a replacement whose read failed cannot run the replacement", () =>
+      Effect.gen(function*() {
+        const { faulty, world } = yield* faultyStart()
+        const old = yield* world.showOn("kitchen-display", card("Archive Sam", { handler: "answer", buttons: [{ id: "go", label: "Archive" }] } as Partial<Presentation>), { lifetime: "pinned", key: "task" })
+        assert.deepStrictEqual(titlesOn(world, "kitchen-display"), ["Archive Sam"])
+        // The pass that would send the new content fails its one read; the store reads again after it.
+        faulty.faults.reads = 1
+        const next = yield* world.showOn("kitchen-display", card("Delete Robin", { handler: "answer", buttons: [{ id: "go", label: "Delete" }] } as Partial<Presentation>), { lifetime: "pinned", key: "task" })
+        assert.strictEqual(next.id, old.id)
+        // The household card is still allowed, so the page keeps it until the new content can be read (R1).
+        assert.deepStrictEqual(titlesOn(world, "kitchen-display"), ["Archive Sam"])
+        const stale = yield* world.pressOn("kitchen-display", old.id, "go")
+        assert.isFalse(stale.ok)
+        assert.strictEqual(stale.code, "unknown")
+        assert.deepStrictEqual(world.presses, [])
+        yield* world.advance(MINUTE)
+        assert.deepStrictEqual(titlesOn(world, "kitchen-display"), ["Delete Robin"])
+        assert.isTrue((yield* world.pressOn("kitchen-display", old.id, "go")).ok)
+        assert.strictEqual(world.presses.length, 1)
+      }))
+
+    it.effect("r3-2: a successful update asks for planning and ensures the hourly job, as a show does", () =>
+      Effect.gen(function*() {
+        const attempts: Array<string> = []
+        const refuse = { hourly: true, due: 1 }
+        const { world } = yield* start({ wrapScheduler: refusing(refuse, attempts) })
+        const h = yield* world.showOn("kitchen-display", card("Three seconds"), { expiresInMs: 3 * SECOND })
+        assert.strictEqual(refuse.due, 0)
+        // The scheduler accepts again; the next change is an update.
+        refuse.hourly = false
+        const before = attempts.length
+        assert.isDefined(yield* h.update(card("Updated")))
+        yield* world.settle
+        assert.includeMembers(attempts.slice(before), ["hourly", "due"])
+        yield* world.advance(HOUR + 1)
+        assert.deepStrictEqual(titlesOn(world, "kitchen-display"), [])
+        assert.deepStrictEqual(world.present.live(), [])
+        assert.isFalse(world.issues.all().some((i) => i.id === "core.present.hourly" || i.id === "core.present.plan"))
+      }))
   })
