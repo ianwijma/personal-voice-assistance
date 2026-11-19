@@ -6,7 +6,7 @@ import { shallowEqual } from "@/lib/store.ts"
 import { ClientContext, useClientState } from "../context.tsx"
 import { ControlDock } from "../ControlDock.tsx"
 import { LiveAnnouncer } from "../LiveAnnouncer.tsx"
-import { NotificationCards } from "../NotificationCards.tsx"
+import { PresentationStage } from "../PresentationStage.tsx"
 import { ShortcutsDialog } from "../ShortcutsDialog.tsx"
 import { Stage } from "../Stage.tsx"
 import { StateAnnouncer } from "../StateLabel.tsx"
@@ -61,7 +61,8 @@ function Shell() {
         <ChatPanel />
       </div>
       <div className="contents" inert={modal}>
-        <NotificationCards />
+        {/* P10: the presentation stage beside the character: P9's notification cards first, then the presentations. */}
+        <PresentationStage />
       </div>
       <VoiceSheet />
       <ShortcutsDialog />

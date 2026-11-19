@@ -1,3 +1,4 @@
+import type { Presentation, ShowOptions } from "./Present.ts"
 import { Effect, Schema } from "effect"
 import { ToolError } from "./Errors.ts"
 import { makeTool, type RiskByInput, type Tool, type ToolMetadata } from "./Module.ts"
@@ -149,6 +150,10 @@ export class ActionError extends Schema.TaggedError<ActionError>()("ActionError"
 export interface ActionOutcome {
   /** Spoken after the action ran (a query's answer: "It's 14:32."). */
   readonly say?: string
+  /** P10: shown on the device the action ran for (docs/PRESENTING.md); `say` is still spoken. */
+  readonly present?: Presentation
+  /** P10: how it is shown (lifetime, key, end). */
+  readonly show?: ShowOptions
 }
 
 export interface ActionDefinition<P extends ActionParams = ActionParams> extends ToolMetadata<ParamValues<P>> {

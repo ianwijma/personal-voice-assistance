@@ -3,6 +3,7 @@ import { ACTION_TIMEOUT_MS, ActionError, type ActionOutcome, actionToolName, act
 import { ToolError } from "./Errors.ts"
 import { actionRunnerOf, registerConfirmedRunner, toolRunnerOf } from "./GatewayPrivate.ts"
 import { declaredSensitivity, riskOf, type Sensitivity, type Tool, type ToolLatency, type ToolMetadata, toolMetadata, type ToolRisk } from "./Module.ts"
+import { isPresentResult } from "./Present.ts"
 import type { RiskPolicy } from "./RiskPolicy.ts"
 import {
   type ConnectionRef,
@@ -123,6 +124,13 @@ export interface GatewayOptions {
    * person at the terminal) or `refuse` (serve mode). Default: `local` without `access`, `refuse` with it.
    */
   readonly withoutPrincipal?: "local" | "refuse"
+  /**
+   * P10: the Presenter's split of a result (`PresentEngine.fromResult`): a tool's or action's `{ forModel, present }`
+   * is handed to the Presenter (one synchronous enqueue) and the model gets `forModel` with a note of what the server
+   * did. Absent (the CLI modes, hand-made registries): such a result still gives the model `forModel`, with the note
+   * that nothing can be shown here.
+   */
+  readonly present?: (moduleId: string | undefined, principal: Principal, value: unknown) => Effect.Effect<unknown>
 }
 
 /** How one call is made: the principal it runs for, when the caller names it (a notification's action, P9). */
@@ -221,8 +229,11 @@ const CONFIRMATION_OFF = "this action needs the owner's spoken confirmation, whi
 /** An action declared `confirm: true` (refused on every public path: confirmation is off in this stack). */
 const needsYes = (registered: RegisteredAction) => registered.definition.confirm !== undefined && registered.definition.confirm !== false
 
-/** The generated tool's result for an action that ran: its `say`, else its `announce`, else "ok". */
-const runForTool = (registered: RegisteredAction, values: Readonly<Record<string, unknown>>): Effect.Effect<string, ToolError> => {
+/**
+ * The generated tool's result for an action that ran: its `say`, else its `announce`, else "ok"; with `present` (P10),
+ * that and the presentation, for the Presenter's split.
+ */
+const runForTool = (registered: RegisteredAction, values: Readonly<Record<string, unknown>>): Effect.Effect<unknown, ToolError> => {
   const def = registered.definition
   return Effect.suspend(() => actionRunnerOf(registered)(values)).pipe(
     Effect.timeoutOrElse({
@@ -230,8 +241,19 @@ const runForTool = (registered: RegisteredAction, values: Readonly<Record<string
       orElse: () => Effect.fail(new ActionError({ message: `${def.label} did not finish within ${ACTION_TIMEOUT_MS / 1000} s` }))
     }),
     Effect.mapError((error) => new ToolError({ message: error.message, cause: error })),
-    Effect.map((outcome) => outcome?.say ?? def.announce?.(values as never) ?? "ok")
+    Effect.map((outcome) => {
+      const said = outcome?.say ?? def.announce?.(values as never) ?? "ok"
+      return outcome?.present === undefined ? said : { forModel: said, present: outcome.present, ...(outcome.show !== undefined ? { show: outcome.show } : {}) }
+    })
   )
+}
+
+/** A result that asks to show something, without a Presenter here: `forModel`, and the note that nothing is shown. */
+const NO_SCREEN = "Not shown: nothing can be shown here; say it instead."
+const screenless = (value: unknown): unknown => {
+  if (!isPresentResult(value)) return value
+  const text = typeof value.forModel === "string" ? value.forModel : value.forModel === undefined ? "ok" : JSON.stringify(value.forModel)
+  return `${text}\n[Screen: ${NO_SCREEN}]`
 }
 
 export const makeExecutionGateway = (options: GatewayOptions = {}): ExecutionGateway => {
@@ -243,6 +265,10 @@ export const makeExecutionGateway = (options: GatewayOptions = {}): ExecutionGat
   type Resolved = Principal | { readonly refused: string }
   const noPrincipal: Effect.Effect<Resolved> = Effect.succeed({ refused: NO_PRINCIPAL })
   const local: Effect.Effect<Resolved> = Effect.succeed(LOCAL_PRINCIPAL)
+  /** P10: a result that asks to show something goes to the Presenter (or, without one, loses its presentation). */
+  const presentHook = options.present
+  const split = (moduleId: string | undefined, principal: Principal, value: unknown): Effect.Effect<unknown> =>
+    !isPresentResult(value) ? Effect.succeed(value) : presentHook === undefined ? Effect.succeed(screenless(value)) : presentHook(moduleId, principal, value)
 
   const principalNow: Effect.Effect<Resolved> = Effect.flatMap(CurrentTurn, (turn): Effect.Effect<Resolved> => {
     if (turn !== undefined) return Effect.succeed({ _tag: "turn", turn })
@@ -250,7 +276,7 @@ export const makeExecutionGateway = (options: GatewayOptions = {}): ExecutionGat
       if (job !== undefined) return Effect.succeed({ _tag: "job", job })
       return Effect.flatMap(CurrentPrincipal, (outer): Effect.Effect<Resolved> => {
         // A call made from inside a local or notification call runs for it (a turn or job one is read above).
-        if (outer !== undefined && (outer._tag === "local" || outer._tag === "notification")) return Effect.succeed(outer)
+        if (outer !== undefined && (outer._tag === "local" || outer._tag === "notification" || outer._tag === "presentation")) return Effect.succeed(outer)
         return withoutPrincipal === "local" ? local : noPrincipal
       })
     })
@@ -274,6 +300,8 @@ export const makeExecutionGateway = (options: GatewayOptions = {}): ExecutionGat
       if (blank(p.job.jobId) || blank(p.job.moduleId)) return "the job names no job or module."
     } else if (p._tag === "notification") {
       if (blank(p.notification.notificationId) || blank(p.notification.deviceId)) return "the notification names no notification or device."
+    } else if (p._tag === "presentation") {
+      if (blank(p.presentation.presentationId) || blank(p.presentation.deviceId)) return "the press names no presentation or device."
     }
     return access.principalProblem?.(p)
   }
@@ -317,12 +345,12 @@ export const makeExecutionGateway = (options: GatewayOptions = {}): ExecutionGat
   ): Omit<GatewayCall, "risk"> => {
     const turn = principal._tag === "turn" ? principal.turn : undefined
     const job = principal._tag === "job" ? principal.job : undefined
-    const notification = principal._tag === "notification" ? principal.notification : undefined
+    const notification = principal._tag === "notification" ? principal.notification : principal._tag === "presentation" ? principal.presentation : undefined
     return {
       ...base,
       principal,
       turn,
-      // A notification's action is admitted by the notification: no assistant's choices apply to it.
+      // A notification's action (and a press on a presentation) is admitted by what was pressed: no assistant's choices apply to it.
       assistantId: turn?.assistantId ?? job?.assistantId,
       deviceId: turn?.deviceId ?? job?.deviceId ?? notification?.deviceId,
       person: turn?.person ?? job?.person ?? notification?.person,
@@ -399,13 +427,15 @@ export const makeExecutionGateway = (options: GatewayOptions = {}): ExecutionGat
         const call = callOf({ kind: "tool", moduleId, name: t.name, input: values, confirmed: false, action: registered }, def, principal)
         const refused = yield* admitCall(call, def)
         if (refused !== undefined) return yield* refusedTool(refused)
-        return yield* asPrincipal(principal, runForTool(registered, values))
+        const ran = yield* asPrincipal(principal, runForTool(registered, values))
+        return yield* split(moduleId, principal, ran)
       }
       const call = callOf({ kind: "tool", moduleId, name: t.name, input, confirmed: false }, t, principal)
       const refused = yield* admitCall(call, t)
       if (refused !== undefined) return yield* refusedTool(refused)
       // Suspended: a tool that throws while building its effect is a defect, as before.
-      return yield* asPrincipal(principal, Effect.suspend(() => toolRunnerOf(t)(input)))
+      const value = yield* asPrincipal(principal, Effect.suspend(() => toolRunnerOf(t)(input)))
+      return yield* split(moduleId, principal, value)
     })
 
   const runAction = (
@@ -440,7 +470,12 @@ export const makeExecutionGateway = (options: GatewayOptions = {}): ExecutionGat
         const again = yield* admitCall(call, def)
         if (again !== undefined) return yield* refusedAction(again)
       }
-      return yield* asPrincipal(principal, Effect.suspend(() => actionRunnerOf(registered)(values)))
+      const outcome = yield* asPrincipal(principal, Effect.suspend(() => actionRunnerOf(registered)(values)))
+      // P10: an outcome's presentation goes to the Presenter (the intent agent speaks `say`; the note is for a model).
+      if (outcome?.present === undefined) return outcome
+      yield* split(registered.moduleId, principal, { forModel: outcome.say ?? "", present: outcome.present, ...(outcome.show !== undefined ? { show: outcome.show } : {}) })
+      const { present: _p, show: _s, ...rest } = outcome
+      return rest
     })
 
   const action: ExecutionGateway["action"] = (registered, values, actionOptions = {}) => runAction(registered, values, actionOptions, false)

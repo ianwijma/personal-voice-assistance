@@ -10,7 +10,8 @@
     "./store-backend": "./src/StoreEngine.ts",
     "./store-contract": "./src/storeContract.ts",
     "./scheduler-contract": "./src/schedulerContract.ts",
-    "./notify-contract": "./src/notifyContract.ts"
+    "./notify-contract": "./src/notifyContract.ts",
+    "./present-contract": "./src/presentContract.ts"
   },
   "scripts": {
     "check": "tsc -p tsconfig.json",

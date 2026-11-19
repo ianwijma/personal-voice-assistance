@@ -5,12 +5,13 @@ for their module and their module's research document (`docs/research/modules/<n
 what a module is, the rules the preparation stack (P1 to P6) settled, and how to test a module so that it keeps them.
 Where this page and a research document disagree, the plan and this page win.
 
-> **Wave A: what does not exist yet.** You are writing on the scaffold (P11), before P10. **Presentations (a
-> checklist, a card, the timer view, `ctx.present`) do not exist.** Notifications, ringing and a module's own speech
-> (`ctx.notify`, `ctx.speech`) exist in a first version since P9 (§16, [NOTIFICATIONS.md](NOTIFICATIONS.md)); phrase
-> commands after the wake phrase, the host's essential controls and the ringing window since P7 (§16 "Phrase commands",
-> [PHRASES.md](PHRASES.md)). Where your row in the plan's §5.1 names a presentation, that part waits for wave B: build
-> the rest, and list the part under "Left out" on your page and in your pull request. Also later, for everyone: connections
+> **Wave A: what does not exist yet.** You are writing on the scaffold (P11). Notifications, ringing and a module's own
+> speech (`ctx.notify`, `ctx.speech`) exist in a first version since P9 (§16, [NOTIFICATIONS.md](NOTIFICATIONS.md));
+> phrase commands after the wake phrase, the host's essential controls and the ringing window since P7 (§16 "Phrase
+> commands", [PHRASES.md](PHRASES.md)); and presentations (a card, a list with ticks, a timer, an image, the weather:
+> `ctx.present`, or `{ forModel, present }` from a tool) since P10 (§16, [PRESENTING.md](PRESENTING.md)). A
+> presentation your first version names is one small PR after yours, unless your PR is written on top of P10. Not yet,
+> for everyone: connections
 > and OAuth, CalDAV, an MCP client, and any outgoing HTTP but `GET` and `HEAD` (§12). The plan's "Order from here" (§4)
 > has the waves.
 
@@ -1422,6 +1423,126 @@ assert.strictEqual(kit.notify.engine.ringingOn("kitchen-display").length, 1)
 assert.isTrue(kit.notify.decisions.every((d) => d.deviceId === "kitchen-display" && d.decision.deliver))
 ```
 
+### Presenting (P10)
+
+What a module shows on a device's screen goes through the Presenter, never a module's own message
+([PRESENTING.md](PRESENTING.md) has the kinds, their bounds, the decision and what is left out):
+
+- **From a tool or an action**, return `{ forModel, present, show? }`: the model gets `forModel` with a note of what the
+  server did ("Shown on "Kitchen display".", or "Not shown: … has no display; say it instead."), and the presentation
+  goes to the device the call came from in one enqueue (nothing else on the turn's path). An action returns
+  `{ say, present }`. A presentation that is not valid or passes a bound is not shown and the note says why.
+- **From other code** (a job, a press handler), `ctx.present.show(target, presentation, options?)` answers a handle
+  with `update` and `dismiss` (they die with `ModuleStopped` once the part has closed); `target` is `"origin"`, a
+  `{ device }` or a `{ room }`.
+- Five kinds: `card`, `list` (`bullets` or a `checklist`), `timer` (a countdown to an instant), `image` (an `https:`
+  address the server fetches once, with a credit) and `weather`. Every one needs `spoken`: what the model says where
+  nothing can be shown. `sensitivity: { personal: id }` is decided per device by the privacy rule.
+- **Transient** (default; one at a time per device, 30 s) or **pinned** (a timer's default; up to 8 per device, back
+  after a reconnect, until dismissed or its end). A `key` makes it one per module: showing the key again replaces it.
+  A transient one goes when the part that made it stops; a pinned one is stored and stays.
+- **Ticks and buttons reach a press handler registered in `shared`** with `ctx.present.handle(name, { run })`, like
+  notification action handlers: claimed first (one press at a time), as the press (its device is the origin), within
+  5 s; while your module is down they answer "I can't do that right now". The handler shows the change; the press
+  itself changes nothing.
+
+<!-- region: packages/module-contracts/test/kit/presentExample.test.ts#present-module -->
+```ts
+const errandTexts = defineTexts({
+  en: { title: "Errands", spoken: "Your errands: {list}.", ticked: "Ticked off.", unticked: "Back on the list.", none: "nothing" },
+  nl: { title: "Boodschappen", spoken: "Je boodschappen: {list}.", ticked: "Afgevinkt.", unticked: "Weer op de lijst.", none: "niets" }
+})
+
+const Errand = Schema.Struct({ id: Schema.String, text: Schema.String, done: Schema.Boolean })
+const errands = defineCollection({ name: "errands", scope: "household", schema: Schema.Struct({ items: Schema.Array(Errand) }), maxChars: 4_000 })
+const START = [{ id: "bread", text: "Bread", done: false }, { id: "stamps", text: "Stamps", done: false }]
+
+export const errandsModule = defineModule({
+  apiVersion: 2,
+  id: "errands",
+  name: "Errands",
+  description: "Shows the household's errands as a checklist.",
+  enabledByDefault: false,
+  storage: { version: 1, collections: [errands] },
+  shared: (ctx) =>
+    Effect.gen(function*() {
+      const list = ctx.store.collection(errands)
+      // A press handler is registered in `shared`, like a job handler: published and withdrawn with the module. A tick
+      // arrives as the press (which device, which item, ticked or not); the module changes its own data and shows the
+      // list again by its key, which replaces it in place on every page that holds it.
+      yield* ctx.present.handle("errands", {
+        run: (press) =>
+          Effect.gen(function*() {
+            const lang = homeLanguage(ctx.host.view())
+            const row = yield* list.get("list")
+            const items = (row?.value.items ?? START).map((i) => (i.id === press.item ? { ...i, done: press.done === true } : i))
+            yield* row === undefined ? list.insert({ items }, { id: "list" }) : list.update("list", () => ({ items }))
+            yield* ctx.present.show({ device: press.deviceId }, errandList(lang, items), { lifetime: "pinned", key: "errands" })
+            return { say: say(errandTexts, lang, press.done === true ? "ticked" : "unticked") }
+          })
+      }).pipe(Effect.orDie)
+      return { value: undefined }
+    }),
+  start: (ctx) =>
+    Effect.succeed({
+      tools: [makeTool({
+        name: "errands_show",
+        description: "Show the household's errands on this device's screen.",
+        parameters: Schema.Struct({}),
+        speculative: true,
+        execute: () =>
+          Effect.gen(function*() {
+            const lang = homeLanguage(ctx.host.view())
+            const row = yield* ctx.store.collection(errands).get("list").pipe(Effect.orElseSucceed(() => undefined))
+            const items = row?.value.items ?? START
+            // The model gets `forModel` and a note of what the server did; the list goes to the Presenter in one enqueue.
+            return { forModel: { open: items.filter((i) => !i.done).map((i) => i.text) }, present: errandList(lang, items), show: { lifetime: "pinned" as const, key: "errands" } }
+          })
+      })]
+    })
+})
+
+/** The checklist; `spoken` is what the model says where nothing can be shown. */
+const errandList = (lang: "en" | "nl", items: ReadonlyArray<typeof Errand.Type>): Presentation => {
+  const open = items.filter((i) => !i.done).map((i) => i.text)
+  return {
+    kind: "list",
+    title: say(errandTexts, lang, "title"),
+    style: "checklist",
+    items,
+    spoken: say(errandTexts, lang, "spoken", { list: open.length === 0 ? say(errandTexts, lang, "none") : open.join(", ") }),
+    handler: "errands"
+  }
+}
+```
+
+Its test, through the kit's `present` handles (what each page holds, a press as a page's, every decision):
+
+<!-- region: packages/module-contracts/test/kit/presentExample.test.ts#present-test -->
+```ts
+const kit = yield* startTestModule(errandsModule)
+const shown = yield* kit.tool("errands_show", {}, { device: "kitchen-display" })
+// The model gets what the tool returned for it, and the note of what the server did.
+assert.strictEqual(shown.content, "{\"open\":[\"Bread\",\"Stamps\"]}\n[Screen: Shown on \"Kitchen display\".]")
+yield* kit.present.settle
+const [list] = kit.present.shown("kitchen-display")
+assert.strictEqual(list?.content.kind, "list")
+assert.deepStrictEqual(kit.present.shown("hall-screen"), [])
+// A tick, as the kitchen page's checkbox: the handler runs as the press and shows the list again by its key.
+assert.deepStrictEqual(yield* kit.present.press(list!.id, "tick", { device: "kitchen-display", item: "bread", done: true }), { ok: true, say: "Ticked off." })
+const [again] = kit.present.shown("kitchen-display")
+assert.strictEqual(again?.id, list!.id)
+assert.deepStrictEqual(again?.content.kind === "list" ? again.content.items.map((i) => i.done) : [], [true, false])
+// From a page that does not hold it: refused, nothing changes.
+assert.deepStrictEqual(yield* kit.present.press(list!.id, "tick", { device: "hall-screen", item: "stamps", done: true }), { ok: false, say: "I can't do that right now.", code: "unknown" })
+// It is pinned: a page that goes and comes back gets it again.
+yield* kit.notify.disconnect("kitchen-display")
+yield* kit.notify.connect("kitchen-display")
+assert.deepStrictEqual(kit.present.shown("kitchen-display").map((p) => p.id), [list!.id])
+// Every decision is recorded: where it showed, and why not.
+assert.isTrue(kit.present.decisions.some((d) => d.deviceId === "kitchen-display" && d.decision.show))
+```
+
 **One line or stored text.** `StoredText(n)` bounds a stored text and keeps its JSON cost at 2 a character; it allows
 tab, line feed, carriage return, backspace and form feed. Where a value must be **one line** (a name, a list item, a
 route's field), check that separately: `isLine(text, n)` from `@pva/module-contracts`, the core's own one-line rule
@@ -1714,11 +1835,12 @@ check` behind the shared lock (`flock /workspace/build-cache/ian/pva-heavy.lock 
 
 - Its own package (§19) under `packages/module-<pkg>/` (source, tests, `package.json`).
 - **Its own pages, `docs/modules/<id>.md`** (one per module id), filled in under the stub's headings: what it does, its
-  tools, settings, what it stores, what it needs, and what was left out. **"Left out" lists every part of the plan's
-  row that needs a presentation (P10): it does not exist yet, and comes with wave B.** Notifications and a module's
-  speech exist since P9, and phrase commands (`phrases` on an action), the host's controls and the ringing window since
-  P7 (§16, [PHRASES.md](PHRASES.md)): build those parts of your row now, within their first version (a slot is a
-  number, a duration, a fixed choice or text). This replaces the plan's "own section in `docs/MODULES.md`", so twenty pull
+  tools, settings, what it stores, what it needs, and what was left out. Notifications and a module's speech exist
+  since P9, phrase commands (`phrases` on an action), the host's controls and the ringing window since P7 (§16,
+  [PHRASES.md](PHRASES.md)), and presentations since P10 (§16, [PRESENTING.md](PRESENTING.md)): build those parts of
+  your row now, within their first version (a slot is a number, a duration, a fixed choice or text; a presentation is
+  one of the five kinds). **"Left out" lists every part of your row that needs what is not there yet** (the list at the
+  top of this page). This replaces the plan's "own section in `docs/MODULES.md`", so twenty pull
   requests never edit the same file.
 - `pnpm-lock.yaml`, only when it adds a dependency the scaffold did not foresee; the description names it.
 - **Nothing else.** The scaffold has created the package, registered it in the catalogue, added the dependencies of

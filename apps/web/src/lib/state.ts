@@ -17,6 +17,7 @@ import {
   type ModuleInfo,
   MAX_NOTIFICATION_CARDS,
   type NotificationCard,
+  type PresentationWire,
   type Role,
   type ServerMessage,
   type ServerMessageType,
@@ -275,6 +276,13 @@ export interface ClientState {
    * pressed here, so the page's ring cue stops for it at once (the server's `resolved` takes the card down).
    */
   readonly notifications: ReadonlyArray<NotificationCard & { readonly quiet?: boolean }>
+  /**
+   * P10: the presentations on this device (`present.show` / `present.update` until `present.dismiss`), in the order the
+   * server gave them; never cut here (the server sends a page at most `MAX_PRESENTATIONS_PER_PAGE`). Emptied at every
+   * welcome and when the session ends: the server sends what applies again after a hello. `clockOffset`: the server's
+   * clock minus this page's when the message arrived, so a countdown runs from the server's instant on this clock.
+   */
+  readonly presentations: ReadonlyArray<HeldPresentation>
   readonly toasts: ReadonlyArray<Toast>
   readonly ui: {
     readonly chatOpen: boolean
@@ -296,6 +304,12 @@ export interface ClientState {
     readonly shortcutsOpen: boolean
   }
 }
+
+/** A presentation as the page holds it: the server's form and the clock offset taken when it arrived. */
+export type HeldPresentation = PresentationWire & { readonly clockOffset: number }
+
+/** The page's clock (epoch ms); tests move it. */
+export const pageClock = { now: (): number => Date.now() }
 
 export const MAX_TURNS = 300
 export const MAX_TRACES = 50
@@ -344,6 +358,7 @@ export const initialState: ClientState = {
   pending: {},
   sessionSeq: 0,
   notifications: [],
+  presentations: [],
   toasts: [],
   ui: { chatOpen: false, chatView: undefined, sheetOpen: false, settingsOpen: false, settingsPath: [], settingsDirty: false, unread: 0, shortcutsOpen: false }
 }
@@ -697,7 +712,20 @@ const server: ServerHandlers = {
   },
   // P7: the reply volume reaches the audio graph (`connection.ts`); nothing on the page shows it.
   "output.volume": (s) => s,
-  "notification.resolved": (s, m) => (s.notifications.some((n) => n.id === m.id) ? { ...s, notifications: s.notifications.filter((n) => n.id !== m.id) } : s)
+  "notification.resolved": (s, m) => (s.notifications.some((n) => n.id === m.id) ? { ...s, notifications: s.notifications.filter((n) => n.id !== m.id) } : s),
+  // P10: a presentation held (or replaced in place), and one taken down. Never cut: the server bounds what a page holds.
+  "present.show": (s, m) => withPresentation(s, m.presentation),
+  "present.update": (s, m) => withPresentation(s, m.presentation),
+  "present.dismiss": (s, m) => (s.presentations.some((p) => p.id === m.id) ? { ...s, presentations: s.presentations.filter((p) => p.id !== m.id) } : s)
+}
+
+const withPresentation = (s: ClientState, p: PresentationWire): ClientState => {
+  const held: HeldPresentation = { ...p, clockOffset: p.serverNow - pageClock.now() }
+  const i = s.presentations.findIndex((x) => x.id === p.id)
+  if (i === -1) return { ...s, presentations: [...s.presentations, held] }
+  const presentations = s.presentations.slice()
+  presentations[i] = held
+  return { ...s, presentations }
 }
 
 const local = (s: ClientState, a: LocalAction): ClientState => {
@@ -717,6 +745,7 @@ const local = (s: ClientState, a: LocalAction): ClientState => {
       return {
         ...s,
         notifications: [],
+        presentations: [],
         pending: {},
         audio: withoutPlaying(s.audio),
         liveTranscript: "",

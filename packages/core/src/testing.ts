@@ -21,6 +21,7 @@ import { makeSchedulerEngine, type SchedulerEngineOptions } from "./SchedulerEng
 import { TestClock } from "effect/testing"
 import { schedulerStorage } from "./SchedulerJobs.ts"
 import { notifyStorage } from "./Notify.ts"
+import { presentStorage } from "./Present.ts"
 
 export interface Sleep {
   readonly _tag: "Sleep"
@@ -466,7 +467,7 @@ export const makeTestHousehold = (
   Effect.gen(function*() {
     const store = makeMemoryHouseholdStore(options)
     // P6: the scheduler's collections (core.scheduler) are prepared with the modules', as in serve mode.
-    yield* store.prepare(modules.map((m) => ({ id: m.id, storage: m.storage })), [schedulerStorage, notifyStorage])
+    yield* store.prepare(modules.map((m) => ({ id: m.id, storage: m.storage })), [schedulerStorage, notifyStorage, presentStorage])
     const recording = makeRecordingEventBus()
     connectStoreToBus(store, recording.bus)
     return { store, bus: recording.bus, events: recording.events, household: { store, events: recording.bus } }

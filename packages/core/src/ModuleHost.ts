@@ -79,6 +79,7 @@ import { type InstanceTarget, type ModuleTarget, planModule, reachedBy, usesOrde
 import type { PartHandle, PartState, Registrar, Registration } from "./ModuleRegistrations.ts"
 import { closedModuleScheduler, type ModuleScheduler, type PartRunner, type SchedulerHook } from "./Scheduler.ts"
 import { closedModuleNotify, type ModuleNotify, type ModuleSpeech, type NotifyHook } from "./Notify.ts"
+import { closedModulePresent, type ModulePresent, type PresentHandle, type PresentHook } from "./Present.ts"
 import {
   applicableOwnValues,
   applySettingsPatch,
@@ -454,10 +455,18 @@ export interface ModuleHostOptions {
    * registers nothing and every other call fails `unavailable`.
    */
   readonly notify?: NotifyHook
+  /**
+   * P10: `ctx.present` of version 2 modules (`PresentEngine.forPart`), given the part and the same runner (a press runs
+   * as a call in flight of the part's published module), and the gateway's split of a tool's or action's
+   * `{ forModel, present }` (`PresentEngine.fromResult`). Absent (the CLI modes): `present.handle` registers nothing,
+   * `show` fails `unavailable`, and such a result gives the model `forModel` with the note that nothing is shown.
+   */
+  readonly present?: PresentHook & { readonly fromResult: NonNullable<GatewayOptions["present"]> }
 }
 
 const NO_SCHEDULER = closedModuleScheduler("Timers and scheduled jobs run only in the server (pnpm start serve).")
 const NO_NOTIFY = closedModuleNotify("Notifications and announcements work only in the server (pnpm start serve).")
+const NO_PRESENT = closedModulePresent("Presentations work only in the server (pnpm start serve).")
 
 // ---------------------------------------------------------------------------------------------------------------------
 // Internal state
@@ -709,6 +718,8 @@ export const makeModuleHost = Effect.fnUntraced(function*(options: ModuleHostOpt
   const gateway = makeExecutionGateway({
     ...(options.access !== undefined ? { access: options.access } : {}),
     ...options.gatewayHooks,
+    // P10: a tool's or action's `{ forModel, present }` goes to the Presenter (one synchronous enqueue).
+    ...(options.present !== undefined ? { present: options.present.fromResult } : {}),
     withoutPrincipal: local ? "local" : "refuse"
   })
   const issues = options.issues ?? makeIssueRegistry()
@@ -2956,7 +2967,23 @@ export const makeModuleHost = Effect.fnUntraced(function*(options: ModuleHostOpt
       // P6: the part's scheduler; like the store handle, every call dies with `ModuleStopped` once the part has closed.
       scheduler: schedulerFor(options.scheduler === undefined ? NO_SCHEDULER : options.scheduler.forPart(part.handle, runnerFor(entry, part)), effect, now),
       // P9: the part's notifications and speech; like the others, every call dies with `ModuleStopped` once it has closed.
-      ...notifyFor(options.notify === undefined ? NO_NOTIFY : options.notify.forPart(part.handle, runnerFor(entry, part)), effect)
+      ...notifyFor(options.notify === undefined ? NO_NOTIFY : options.notify.forPart(part.handle, runnerFor(entry, part)), effect),
+      // P10: the part's presentations; every call, and every call of a handle it returned, dies with `ModuleStopped` once
+      // the part has closed.
+      present: presentFor(options.present === undefined ? NO_PRESENT : options.present.forPart(part.handle, runnerFor(entry, part)), effect)
+    }
+  }
+
+  /** P10: `ctx.present` of one part, every call (a handle's too) guarded by the part's lifetime. */
+  function presentFor(p: ModulePresent, effect: <A, E = never>(f: () => Effect.Effect<A, E>) => Effect.Effect<A, E>): ModulePresent {
+    const guard = (h: PresentHandle): PresentHandle => ({
+      ...h,
+      update: (presentation) => effect(() => h.update(presentation)),
+      dismiss: effect(() => h.dismiss)
+    })
+    return {
+      show: (target, presentation, o) => Effect.map(effect(() => p.show(target, presentation, o)), guard),
+      handle: (name, handler) => effect(() => p.handle(name, handler))
     }
   }
 

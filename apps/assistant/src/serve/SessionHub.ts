@@ -1,5 +1,5 @@
 import type { AudioClientLink } from "@pva/audio-web"
-import { adminModules, type ConnectionRef, type HostDeviceView, type HostResult, makeConnectionRef, type ModuleHost, type NotifyEngine, STOP_ACTION, withinModuleFrame } from "@pva/core"
+import { adminModules, type ConnectionRef, type HostDeviceView, type HostResult, makeConnectionRef, type ModuleHost, type NotifyEngine, type PresentEngine, STOP_ACTION, withinModuleFrame } from "@pva/core"
 import {
   type AdminSnapshot,
   type AdminState,
@@ -214,6 +214,12 @@ export interface HubOptions {
    * voice connections right after its `welcome`. Absent, or `undefined` for the device: nothing is sent.
    */
   readonly replyVolume?: (deviceId: string) => number | undefined
+  /**
+   * P10: the Presenter (docs/PRESENTING.md). The device is reconciled at the same moments as for notifications (a hello
+   * once its record is written, a close, a changed declaration); a tick or a button is `present.action`, through the
+   * bounded admission, answered with `result` (`say`). Absent: none of it.
+   */
+  readonly present?: Pick<PresentEngine, "reconcile" | "press" | "busyAnswer">
   /** P5: a device's connections, declaration or live state changed (the device facts rebuild their list). */
   readonly onDeviceChange?: () => void
   /**
@@ -641,6 +647,8 @@ export const makeSessionHub = (options: HubOptions): SessionHub => {
     if (client.role !== "voice" || client.device === undefined || client.notifyStarted === true || client.closed || options.notify === undefined) return
     client.notifyStarted = true
     options.notify.reconcile(client.device.id)
+    // P10: and the presentations shown there (its pinned ones again after a reconnect).
+    options.present?.reconcile(client.device.id)
   }
 
   const registerDevice = (device: DeviceHello) =>
@@ -670,6 +678,8 @@ export const makeSessionHub = (options: HubOptions): SessionHub => {
     deviceChanged()
     // P9: what the device's pages hold follows its new outputs (a ring silenced, a card withdrawn or given back).
     options.notify?.reconcile(deviceId)
+    // P10: and what it shows (a display taken away withdraws it; a kind it now draws is sent).
+    options.present?.reconcile(deviceId)
     if (spoke && !(options.speakerAllowed?.(deviceId, kind) ?? true)) {
       const session = sessions.get(deviceId)
       if (session !== undefined && session.publisher.committedTurn() !== undefined) session.conversation.stop()
@@ -824,6 +834,7 @@ export const makeSessionHub = (options: HubOptions): SessionHub => {
       if (last) options.household?.deviceDisconnected(id)
       // P9: what this connection held is dropped, and the device's other pages are reconciled.
       options.notify?.reconcile(id)
+      options.present?.reconcile(id)
     }
     const key = client.sessionKey
     if (key === undefined) return
@@ -1335,6 +1346,33 @@ export const makeSessionHub = (options: HubOptions): SessionHub => {
         return options.run(Effect.map(pressed, (r) => {
           if (!client.closed) result(client, requestId, r)
         }))
+      }
+      case "present.action": {
+        // P10: a tick or a button on a presentation, from a voice page of the device it was shown on (the Presenter
+        // checks that this connection holds it and may press it). Always through the bounded admission.
+        if (client.role !== "voice" || client.device === undefined || options.present === undefined) {
+          return result(client, message.requestId, failure("bad_message", "A presentation is answered from a voice page of its device"))
+        }
+        const present = options.present
+        const deviceId = client.device.id
+        const pressed = Effect.map(
+          present.press({
+            presentationId: message.id,
+            action: message.action,
+            ...(message.item !== undefined ? { item: message.item } : {}),
+            ...(message.done !== undefined ? { done: message.done } : {}),
+            deviceId,
+            connection: client.ref
+          }),
+          (answer): HostResult & { readonly say: string } =>
+            answer.ok
+              ? { ok: true, say: answer.say }
+              : { ok: false, error: { code: answer.code === "not_running" ? "not_running" : answer.code === "busy" ? "busy" : "bad_message", message: answer.say }, say: answer.say }
+        )
+        return limited(client, message.requestId, pressed, undefined, () => {
+          const busy = present.busyAnswer()
+          return { ok: false, error: { code: "busy", message: busy.say }, say: busy.say } as HostResult
+        })
       }
       case "device.caps": {
         // P5: only a voice connection with a device declares (admin pages and pages without a device are ignored).

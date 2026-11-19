@@ -51,7 +51,7 @@ export type DisplayCapability = typeof DisplayCapability.Type
 export const DeviceCapabilities = Schema.Struct({
   v: Schema.Literal(1),
   display: Schema.optionalKey(DisplayCapability),
-  /** Kind → the highest version the page renders. Empty until the presentation stage exists (P10). */
+  /** Kind → the highest version the page renders (P10: `PRESENT_KIND_VERSIONS`). */
   present: Schema.optionalKey(Schema.Struct({
     kinds: Schema.Record(PresentKind, Schema.Int.check(Schema.isBetween({ minimum: 1, maximum: 1000 })))
       .check(Schema.makeFilter((r: Readonly<Record<string, number>>) => Object.keys(r).length <= MAX_PRESENT_KINDS || `at most ${MAX_PRESENT_KINDS} kinds`))
@@ -187,10 +187,9 @@ export const capabilityWords = (caps: DeviceCapabilities): string => {
 
 /**
  * The presentation kinds the protocol knows, for the "never show these" switches of a device type that has no
- * representative device. Empty until the presentation catalogue arrives (P10 fills this one constant); admin then says
- * "none yet".
+ * representative device: the first version's kinds (P10, `PRESENT_KIND_VERSIONS` in `presentation.ts`).
  */
-export const KNOWN_PRESENT_KINDS: ReadonlyArray<PresentKind> = []
+export const KNOWN_PRESENT_KINDS: ReadonlyArray<PresentKind> = ["card", "list", "timer", "image", "weather"]
 
 // -- Place (the `place` device settings section) -----------------------------------------------------------------------
 

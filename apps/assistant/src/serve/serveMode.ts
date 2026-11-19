@@ -5,6 +5,7 @@ import {
   LlmError,
   makeModuleHost,
   makeNotifyEngine,
+  makePresentEngine,
   type NotDelivered,
   notifyLanguageOf,
   defaultRiskPolicy,
@@ -136,6 +137,7 @@ import { ringingWithoutWake } from "@pva/protocol"
 import { makeReplyVolumes, makeServePhrases } from "./phraseCommands.ts"
 import { openServeScheduler } from "./scheduler.ts"
 import { boundaryChanged, makeDeviceFacts, membersRemoved } from "./deviceFacts.ts"
+import { makeMediaCache } from "./media.ts"
 import { effectiveMembersOf, makeMembersGate, makePeopleService, MEMBERS_ENV_REFUSED, MEMBERS_KEY, MEMBERS_SECTION_ID } from "./people.ts"
 import { householdBackupIssues, runMaintenance } from "@pva/store-sqlite"
 import { type KdfParams, openVault, type Vault, VaultPathConfig } from "./Vault.ts"
@@ -449,6 +451,27 @@ export const startServe = (options: ServeOptions): Effect.Effect<ServeHandle, Ht
     const replyVolumes = makeReplyVolumes((deviceId, message) => {
       for (const c of hub?.voiceConnections() ?? []) if (c.deviceId === deviceId) c.send(message)
     })
+    // P10: the Presenter (docs/PRESENTING.md) on the same store, made before the module host it gives `ctx.present` and the
+    // gateway's split to. Pages (the hub), the image cache, the gateway and the page boundary are bound once they exist;
+    // nothing is shown before a page says hello.
+    const media = yield* makeMediaCache({ dir: join(options.dataDir, "media"), log: logInfo })
+    const present = yield* makePresentEngine({
+      store: household.store,
+      devices: () => deviceFacts.devices.list(),
+      // One place for what a device can show: its declaration minus its overrides (`devicePresentFrom`).
+      outputs: (d) => deviceFacts.presentOf(d.id, d.kind),
+      privacy: deviceFacts.privacy,
+      outlet: () =>
+        hub === undefined ? undefined : {
+          connections: (deviceId) => hub!.voiceConnections().filter((c) => c.deviceId === deviceId).map((c) => ({ id: c.id, send: c.send }))
+        },
+      media: () => media,
+      issues,
+      gateway: () => hostRef?.gateway,
+      pageText: (moduleId, text, max) => hostRef?.pageText(moduleId, text, max) ?? oneLine(text, max),
+      language: () => notifyLanguageOf(sections.value("HOME_LANGUAGE")),
+      log: logInfo
+    })
     // Capabilities run for the assistants that switch them on (`moduleDemand`, below; read from startEnabled on).
     const host = yield* makeModuleHost({
       // P5: the core's own services for modules (`host.service`).
@@ -473,6 +496,7 @@ export const startServe = (options: ServeOptions): Effect.Effect<ServeHandle, Ht
       issues,
       scheduler,
       notify,
+      present,
       catalog,
       persistence: store.modulePersistence,
       env,
@@ -519,6 +543,8 @@ export const startServe = (options: ServeOptions): Effect.Effect<ServeHandle, Ht
         ? { assistantId: principal.job.assistantId, deviceId: principal.job.deviceId, connection: undefined, person: principal.job.person }
         : principal._tag === "notification"
         ? { assistantId: undefined, deviceId: principal.notification.deviceId, connection: principal.notification.connection, person: principal.notification.person }
+        : principal._tag === "presentation"
+        ? { assistantId: undefined, deviceId: principal.presentation.deviceId, connection: principal.presentation.connection, person: principal.presentation.person }
         : undefined
       if (parts === undefined) return undefined
       const { assistantId, connection, deviceId, person } = parts
@@ -1550,6 +1576,7 @@ export const startServe = (options: ServeOptions): Effect.Effect<ServeHandle, Ht
       notify,
       // P7: a voice page of a device whose reply volume is not the default is told it after its welcome.
       replyVolume: replyVolumes.levelOf,
+      present,
       onDeviceChange: deviceFacts.changed,
       speakerAllowed: deviceFacts.speakerAllowed,
       admin,
@@ -1634,6 +1661,8 @@ export const startServe = (options: ServeOptions): Effect.Effect<ServeHandle, Ht
       // Review round 3: then, in the same step, every page whose device record changed (a room alone, a name) drops
       // the snapshot it was sending and starts one of the new record, so no later part is built with the old one.
       push.hooks.devicesChanged()
+      // P10: what may be shown where may have changed (a room, a place): every device is decided again.
+      present.reconcileAll()
     })
     yield* Effect.addFinalizer(() => Effect.sync(stopBoundary))
     // P5: a person removed from Members is no device's default person any more (also at start, after a crash between
@@ -1788,6 +1817,8 @@ export const startServe = (options: ServeOptions): Effect.Effect<ServeHandle, Ht
       crossOriginIsolation: options.crossOriginIsolation ?? true,
       hub: hubNow,
       api: (req, res) => (isModuleRoutePath(req.url) ? moduleRouter.handle(req, res) : api(req, res)),
+      // P10: `/media/<hash>`, only for an image a page holds now.
+      media: (req, res) => media.serve(req, res, present.holdsHash),
       ...(options.pingIntervalMs !== undefined ? { pingIntervalMs: options.pingIntervalMs } : {})
     })
 

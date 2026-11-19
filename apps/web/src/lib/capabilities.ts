@@ -1,4 +1,4 @@
-import { type ClientMessage, type DeviceCapabilities, type DeviceLiveState, displayClassOf } from "@pva/protocol"
+import { type ClientMessage, type DeviceCapabilities, type DeviceLiveState, displayClassOf, PRESENT_KIND_VERSIONS } from "@pva/protocol"
 
 /**
  * What this browser can do (protocol 11, docs/MODULES-PLAN.md §4 P5; presentation-and-device-capabilities.md §5.2),
@@ -7,8 +7,8 @@ import { type ClientMessage, type DeviceCapabilities, type DeviceLiveState, disp
  * and again with `device.caps` when it changes; the live state (visible, last interaction) at most once a second.
  */
 
-/** Presentation renderers this page has, kind → highest version (P10 fills it). */
-export const PRESENT_KINDS: Readonly<Record<string, number>> = {}
+/** Presentation renderers this page has, kind → highest version (P10: every kind of the first version). */
+export const PRESENT_KINDS: Readonly<Record<string, number>> = { ...PRESENT_KIND_VERSIONS }
 
 /** The parts of the browser the measurement reads (a fake in tests). */
 export interface CapabilityEnv {

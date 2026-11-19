@@ -229,8 +229,9 @@ speaker and no display gets the cue and no card.
 ## The voice page
 
 - `notification.ring` gives a card (title, text, buttons) shown above the dock in a region that scrolls within the
-  viewport (long text wraps, every Stop is reachable), outside the character's stage, so every character draws as
-  before (P10 moves the card into its presentation stage). A card the server says not to show (`show: false`) is not
+  viewport (long text wraps, every Stop is reachable), outside the character's box, so every character draws as
+  before. Since P10 the cards are drawn first in the presentation stage (docs/PRESENTING.md "The voice page"), with
+  the same messages and behaviour. A card the server says not to show (`show: false`) is not
   drawn but may still ring. `notification.resolved` takes it down. The page keeps every card it is sent, never cutting
   (the server never sends a page more than 64), and empties them at every welcome (the server sends what is open again
   after it).
@@ -259,7 +260,7 @@ speaker and no display gets the cue and no card.
   undone; it answers how many it stopped, and fails, busy or failed, when one it found could not be stopped: a zero is
   "nothing rang any more", never a failure), `engine.stopSpeech(deviceId)`, `engine.press(…)` for a ringing phrase of an
   action, and `engine.busyAnswer()` (the refusal of a press over an admission bound, in the household's language).
-- P10: the card's data is `NotificationCard` on the wire; the stage draws it instead of `NotificationCards.tsx`.
+- P10: the card's data is `NotificationCard` on the wire; the presentation stage draws `NotificationCards.tsx` first.
 
 ## Latency
 

@@ -293,7 +293,7 @@ defineModule({
 SharedContext<A>      = { settings: Partial<A> /* no overridable fields */; settingsFor(assistantId?): A | undefined } & ModuleServicesV2
 ModuleContextV2<A, X> = ModuleContext<A> & ModuleServicesV2 & { shared: X }
 ModuleServicesV2      = { host: ModuleHostApi; store: ModuleStore; events: ModuleEvents; scheduler: ModuleScheduler;
-                          notify: ModuleNotify; speech: ModuleSpeech }   // P9; later PRs add present, connections
+                          notify: ModuleNotify; speech: ModuleSpeech; present: ModulePresent }   // P9, P10; later: connections
                         // P7: phrase commands are `phrases` on an instance's actions (below); SessionControl and DeviceControl are core services
 SharedPart<X>         = { value: X; services?: [ServiceKey<T>.of(impl)]; contributions?: [ContributionKey<T>.of(value)];
                           routes?: ReadonlyArray<ModuleRoute> }   // P3: HTTP routes under /api/modules/<id>/ (ModuleRoutes.ts)
@@ -307,7 +307,7 @@ ModuleHostApi = {
   requestRestart(reason): Effect<void>             // stop the module, then start it again (live parts only; one request taken up per 5 s, merged)
   reportMissingProgram(tool): Effect<void>         // ENOENT/EACCES at run time: judged unavailable at once
 }                                                   // after its part closed, every member answers ModuleStopped (a defect)
-Principal = { turn } | { job } | { local } | { notification }   // TurnContext.ts: on whose behalf a call runs
+Principal = { turn } | { job } | { local } | { notification } | { presentation }   // TurnContext.ts: on whose behalf a call runs (P10: a press on a presentation)
 CurrentPrincipal: Context.Reference<Principal | undefined>       // the admitted principal, around execute/run
 ```
 
@@ -822,8 +822,8 @@ quotedName(text), plainName(text), QUOTED_NAMES_NOTE (PromptText.ts)          //
   anything (an older page) keeps speaking. "Treat as no display" removes the screen from the context line and from the
   other-screen ranking, the only display-only things this PR sends. Capability words name the speaker's actual media
   set ("speaker (speech and sound)", "no screen, speaker (sound, no speech)"). A type's "What it may show" switches
-  list the kinds the protocol knows (`KNOWN_PRESENT_KINDS`, empty until P10: "none yet"), those its devices declared
-  and those excluded already.
+  list the kinds the protocol knows (`KNOWN_PRESENT_KINDS`: P10's five), those its devices declared and those excluded
+  already; since P10 "Treat as no display" and the excluded kinds also decide what is presented there (`devicePresentFrom`).
 - **The context line**: a host context provider (`This device`) after the modules' context and before the ambient facts.
   Every name in it (devices, rooms, the person) is one quoted, bounded (40 characters), single-line value with control,
   format and structural characters removed (`quotedName`), and the line says that quoted values are names, not
@@ -995,7 +995,65 @@ SpeechPort    = { speak(deviceId, text, { cue, gate: () => "go" | "wait" | NotDe
 - **P7 seams**: `ringingOn`, `onRingingChanged`, `stopRinging` (recorded in one step, finished by work the service owns;
   fails when a ring it found could not be stopped, after trying every one),
   `stopSpeech`, `press`, `busyAnswer` (P7 reads `ringingOn` at each final and calls `stopRinging`, `stopSpeech` and `press`; it does not use `onRingingChanged`: the window is read, never cached). **P10**: the card is drawn by
-  `apps/web/src/components/NotificationCards.tsx`, outside the character; the ring cue loop is `apps/web/src/lib/audio/ringLoop.ts`.
+  `apps/web/src/components/NotificationCards.tsx`, first in the presentation stage (`PresentationStage.tsx`), outside the
+  character; the ring cue loop is `apps/web/src/lib/audio/ringLoop.ts`.
+
+### Presentation (docs/MODULES-PLAN.md §4 P10, first version; how to use it: [docs/PRESENTING.md](PRESENTING.md))
+
+```ts
+ModulePresent (ctx.present) = {
+  show(target: "origin" | { device } | { room }, Presentation, { lifetime?: "transient" | "pinned", expiresInMs?, key? }?): Effect<PresentHandle, PresentError>
+  handle(name, { run(PresentPress): Effect<{ say? } | void, unknown> }): Effect<void, PresentError>      // in shared: a registration
+}
+Presentation  = (card { title, text?, facts? } | list { title, style?, items } | timer { label, endsAt } | image { url, alt, credit, caption? }
+                 | weather { place, now, days? }) & { kind, spoken, sensitivity?: "household" | { personal }, buttons?, handler? }
+PresentHandle = { id; key?; outcome: ShowOutcome; update(Presentation): Effect<ShowOutcome | undefined, PresentError>; dismiss: Effect<boolean, PresentError> }
+ShowOutcome   = { devices: [{ deviceId, shown, why? }], note }       // the note for the model: what the server did
+PresentResult = { forModel, present: Presentation, show?: ShowOptions }   // a tool's result; an action's outcome gains { present, show }
+PresentPress  = { presentationId, key?, deviceId, action: "tick" | <button id>, item?, done? }
+PresentError  = { reason: "unavailable" | "invalid" | "limit" | "busy" | "failed", message }
+// @pva/protocol (presentation.ts), shared with the web mock:
+decidePresentation({ kind, personal, mayReveal, device: { connected, display, kinds, touch } }): { show: false, why } | { show: true, interactive }
+selectPresentations(candidates): what a device shows (pinned ≤ 8 oldest first, the newest transient)
+devicePresentFrom(settings, declared): DevicePresentOutputs = { display, kinds, touch }   // declaration minus overrides
+// present.show / present.update { presentation: PresentationWire }, present.dismiss { id } (server → voice connection),
+// present.action { requestId, id, action, item?, done? } (page → server) answered by result { say? }: additive within protocol 11
+PresentHook (ModuleHostOptions.present) = { forPart(part, runner): ModulePresent; fromResult(moduleId, principal, value) }
+PresentEngine = PresentHook & { reconcile(deviceId); reconcileAll(); press(PresentPressRequest): Effect<PresentPressAnswer>;
+                                holdsHash(hash); busyAnswer(); live(); held(deviceId); expireNow; settled }
+makePresentEngine({ store, devices, outputs(device): DevicePresentOutputs, privacy, outlet: () => PresentOutlet?, media?: () => MediaPort?,
+                    gateway, pageText, language, issues?, log?, newId?, onDecision?, observe?, now? }): Effect<PresentEngine, never, Scope>
+MediaPort     = { fetch(url): Effect<{ hash } | { refused: "type" | "size" | "busy" | "full" | "fetch" | "blocked" | "unavailable" }> }
+GatewayOptions.present = fromResult                                 // the gateway's split of { forModel, present }
+```
+
+- **Where**: `Present.ts` (the contract, the bounds, the validation, the collection `core.present/presentations`,
+  `maxChars` 5,000: 5 rows a read), `PresentEngine.ts` (the engine), `PresentTexts.ts` (the stage's own words and the
+  answers, English and Dutch), `presentContract.ts` (`@pva/core/present-contract`, the contract suite and its world),
+  `apps/assistant/src/serve/media.ts` (the image cache and `/media/<hash>`).
+- **The index**: the live presentations without their content (module, key, part, lifetime, target, owner, kind,
+  handler, times) are kept in memory, loaded at start (transient and ended rows of an earlier process removed) and
+  changed only in the commit hooks of the engine's transactions; bounds, targets and the next end are read from it.
+- **Reconciliation is the only sender**, per connection, one synchronous step per device (index → decision → selection
+  → each chosen row read now → sends, withdrawals first), one pass at a time, yielding between devices; a failed pass is
+  repeated by the next trigger or a minute later. Triggers: every change of a row, an end, a part's close, the hub's
+  hello / close / declaration (with the notification service's), every settings commit (`reconcileAll`).
+- **Ends**: one fiber sleeps until the earliest end and removes what ended in transactions of a page. Dismissing, or a
+  newer transient taking a device, marks the row `ended` (an update) and the fiber removes ended rows ten seconds later.
+- **Parts**: `forPart` records the part as open and adds a finaliser to its scope; when it closes, its transient rows
+  are removed. A tool's `{ forModel, present }` belongs to the module's newest open part (`fromResult` refuses, with the
+  note, a module that has none: a version 1 module, or one stopping).
+- **Presses**: admitted only for a connection that holds the presentation and while the decision makes it interactive
+  there; claimed in memory (one per presentation); the handler runs through `PartRunner.inFlight` with the presentation
+  principal, admitted by `ExecutionGateway.principal` first, within 5 s. The hub sends every `present.action` through
+  its bounded admission (`busyAnswer()` at the bound).
+- **Turn path**: way 1 is a validation, the bounds read from memory, the decision for the origin device and one enqueue
+  (the writer stores and reconciles off the turn); way 2 is one synchronous transaction and an enqueue. Measured:
+  docs/PRESENTING.md "Latency".
+- **Serve mode** makes the engine after the notification service and before the module host (`serveMode.ts`), with the
+  device facts (`DeviceFacts.presentOf`), the hub's voice connections (outlet) and the image cache; `/media/` is answered
+  by the cache (`HttpOptions.media`) only for a hash a connection holds (`holdsHash`). The CLI modes have none:
+  `present.handle` succeeds, `show` fails `unavailable`, a result's presentation becomes the note that nothing is shown.
 
 ### Phrase commands, the essential controls, the ringing window (docs/MODULES-PLAN.md §4 P7, first version; how to use it: [docs/PHRASES.md](PHRASES.md))
 

@@ -7,9 +7,9 @@ import { cx } from "./ui/controls.tsx"
 /**
  * P9: the notification cards of this device (docs/NOTIFICATIONS.md "The voice page"): a plain card per notification the
  * server says to show, with its title, its text and its buttons (`stop` first). Every word on it comes from the server,
- * in the household's language (the card's `texts` and labels). Outside the character's stage, in a region that scrolls
- * within the viewport (every Stop reachable, long text wrapped), so every character keeps drawing exactly as before
- * (docs/CHARACTERS.md); P10 moves it into its presentation stage. A press goes to the server (`notification.action`):
+ * in the household's language (the card's `texts` and labels). Since P10 it is drawn first in the presentation stage
+ * (`PresentationStage.tsx`), the one region beside the character's box that scrolls within the viewport (every Stop
+ * reachable, long text wrapped), so every character keeps drawing exactly as before (docs/CHARACTERS.md). A press goes to the server (`notification.action`):
  * Stop is always usable, a module action disables only its own button while it is pending, and an answer that comes
  * after the card is gone is ignored.
  */
@@ -22,7 +22,7 @@ export function NotificationCards() {
     <section
       aria-label={shown[0]!.texts.region}
       data-testid="notification-cards"
-      className="pointer-events-none fixed inset-x-0 top-[calc(64px+env(safe-area-inset-top))] z-[60] flex max-h-[calc(100dvh-200px-env(safe-area-inset-top)-env(safe-area-inset-bottom))] flex-col items-center gap-2 overflow-y-auto overscroll-contain px-4 pb-2"
+      className="flex max-h-[max(160px,min(42dvh,calc(100dvh-540px)))] min-h-0 w-full shrink-0 flex-col items-center gap-2 overflow-y-auto overscroll-contain"
     >
       {shown.map((card) => <Card key={card.id} card={card} audioOn={audioOn} />)}
     </section>
@@ -65,7 +65,7 @@ function Card({ card, audioOn }: { readonly card: ClientState["notifications"][n
       role={ringing ? "alert" : "status"}
       data-testid="notification-card"
       data-ringing={ringing || undefined}
-      className="pointer-events-auto w-full max-w-[420px] shrink-0 rounded-lg border border-line bg-surface px-4 py-3 text-ink shadow-panel animate-[pva-rise_200ms_var(--ease-out)]"
+      className="w-full shrink-0 rounded-lg border border-line bg-surface px-4 py-3 text-ink shadow-panel animate-[pva-rise_200ms_var(--ease-out)]"
     >
       <div className="flex items-start gap-2">
         <span aria-hidden="true" className={cx("mt-[7px] size-2 shrink-0 rounded-full", ringing ? "bg-voice animate-pulse" : "bg-ink-faint")} />
