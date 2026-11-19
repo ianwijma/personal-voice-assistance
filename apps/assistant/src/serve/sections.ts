@@ -1,9 +1,10 @@
 import { applySettingsPatch, type HostResult, parseVoiceKey, resolveSettings, runSettingsChecks, type SettingsSources } from "@pva/core"
-import type { FieldError, SettingsPatch, SettingsSection, SettingValue } from "@pva/protocol"
+import { DEFAULT_RISK_POLICY, type FieldError, type RiskLanguage, type RiskPolicy, type SettingsPatch, type SettingsSection, type SettingValue } from "@pva/protocol"
 import * as SherpaStt from "@pva/stt-sherpa"
 import * as SherpaTts from "@pva/tts-sherpa"
 import { ConfigProvider, Effect, Semaphore } from "effect"
 import { type ModelDirs, type SectionDefinition, sectionDefinitions, sectionPath } from "./sectionDefinitions.ts"
+import { effectiveRiskLanguage, effectiveRiskPolicy, riskPolicyValues } from "./riskPolicy.ts"
 import type { SettingsStore } from "./SettingsStore.ts"
 
 /**
@@ -54,6 +55,16 @@ export interface Sections {
   readonly announceAll: () => void
   /** Where the recogniser's and the voices' models are (environment > saved > `<repo>/models`). */
   readonly modelDirs: () => ModelDirs
+  /**
+   * P8 (review round 1, H1; round 2): the household's effective risk policy, a field read of an in-memory record. It is
+   * published by `effectiveRiskPolicy` when the sections are made, by the store's first commit listener in the very step
+   * that commits a new settings state (before any other listener, the save's caller or another fiber runs), and by
+   * `announceAll` (the environment changed); reading it never builds a section definition, touches the file system or
+   * waits.
+   */
+  readonly riskPolicy: () => RiskPolicy
+  /** The language of the policy's sentences (`HOME_LANGUAGE`), published with the policy, read as a field. */
+  readonly riskLanguage: () => RiskLanguage
 }
 
 /**
@@ -124,6 +135,21 @@ export const makeSections = (
   } = {}
 ): Sections => {
   const revisions = new Map<string, number>()
+  /** P8: the effective risk policy, published off the call path (`riskPolicy`). The defaults until the first publication. */
+  let riskRecord: RiskPolicy = DEFAULT_RISK_POLICY
+  /** The language of its sentences, published with it (review round 2, the note). */
+  let languageRecord: RiskLanguage = "en"
+  const publishFrom = (stored: Readonly<Record<string, unknown>>) => {
+    riskRecord = effectiveRiskPolicy({ stored, env })
+    languageRecord = effectiveRiskLanguage({ stored, env })
+  }
+  const publishRisk = () => publishFrom(store.settings().assistant)
+  // P8 (review round 2): published in the step that commits a new settings state, before every other commit listener
+  // and before the save's caller or any other fiber runs again, from the committed values alone (five fields resolved,
+  // no section definitions, no file).
+  store.onCommitted((before, after) => {
+    if (before.assistant !== after.assistant) publishFrom(after.assistant)
+  }, { first: true })
   const listeners = new Set<(section: SettingsSection) => void>()
   const origin = {
     ...(options.envOrigin !== undefined ? { envOrigin: options.envOrigin } : {}),
@@ -170,6 +196,9 @@ export const makeSections = (
       const checked = runSettingsChecks(d.checks ?? [], checkView)
       errors.push(...checked.errors)
       warnings.push(...checked.warnings)
+      // P8: a fixed field is shown locked with its reason (its value is the fixed one: `loaded` dropped any saved value).
+      const fixed = d.fixed
+      const fields = fixed === undefined ? form.fields : form.fields.map((f) => (Object.hasOwn(fixed, f.key) ? { ...f, locked: { reason: fixed[f.key]!.reason } } : f))
       return {
         id: d.id,
         title: d.title,
@@ -181,6 +210,7 @@ export const makeSections = (
         ...(d.protected === true ? { protected: true } : {}),
         form: {
           ...form,
+          fields,
           errors: [...form.errors, ...checked.errors],
           ...(checked.warnings.length > 0 ? { warnings: checked.warnings } : {})
         },
@@ -195,6 +225,15 @@ export const makeSections = (
   const loaded = (definitions: ReadonlyArray<SectionDefinition>, stored: Readonly<Record<string, unknown>>) => {
     let out = stored
     for (const d of definitions) if (d.load !== undefined) out = d.load(out)
+    // P8: a fixed field's saved value (a hand-edited file) is never read: every reader sees the fixed value.
+    for (const d of definitions) {
+      if (d.fixed === undefined) continue
+      for (const key of Object.keys(d.fixed)) {
+        if (!Object.hasOwn(out, key)) continue
+        const { [key]: _ignored, ...rest } = out
+        out = rest
+      }
+    }
     return out
   }
   const saved = (definitions: ReadonlyArray<SectionDefinition> = sectionDefinitions(modelDirs())) => ({
@@ -250,6 +289,20 @@ export const makeSections = (
         const built = build((key) => before.values.get(key) as SettingValue | undefined)
         if ("refused" in built) return failed(path, { ok: false, error: { code: "invalid_settings", message: built.refused } })
         const patch: SettingsPatch = built
+        // P8 (H5): the section's own check first (the risk policy's: the function the web mock runs too).
+        const own = d.checkPatch?.(patch.values, patch.secrets) ?? []
+        if (own.length > 0) {
+          return failed(path, { ok: false, error: { code: "invalid_settings", message: own[0]!.message, fieldErrors: own.map((e) => ({ key: e.key, message: e.message })) } })
+        }
+        // P8: a fixed field takes only its fixed value (or `null`); it is never written either way.
+        const fixedErrors: Array<FieldError> = []
+        for (const [key, fixed] of Object.entries(d.fixed ?? {})) {
+          const v = patch.values[key]
+          if (v !== undefined && v !== null && v !== fixed.value) fixedErrors.push({ key, message: fixed.reason })
+        }
+        if (fixedErrors.length > 0) {
+          return failed(path, { ok: false, error: { code: "invalid_settings", message: fixedErrors[0]!.message, fieldErrors: fixedErrors } })
+        }
         const missingModel = [...checkModel(patch, modelDirs().stt), ...checkLocalVoice(patch, modelDirs().tts)]
         if (missingModel.length > 0) {
           return failed(path, { ok: false, error: { code: "invalid_settings", message: missingModel[0]!.message, fieldErrors: missingModel } })
@@ -260,6 +313,12 @@ export const makeSections = (
         }
         // P5: a section may complete its values before they are written (Members gives a new person an id).
         if (d.normalize !== undefined) patched = { ...patched, stored: d.normalize(patched.stored, stored) }
+        // P8: a fixed field is never written (its key is in the section's keys, so a hand-edited value goes too).
+        if (d.fixed !== undefined) {
+          const out: Record<string, SettingValue> = {}
+          for (const [key, value] of Object.entries(patched.stored)) if (!Object.hasOwn(d.fixed, key)) out[key] = value
+          patched = { ...patched, stored: out }
+        }
         // The values after this save, for every section (keys are global), and the keys it writes.
         const keys = [...Object.keys(d.spec), ...(d.storedKeys ?? [])]
         const replace = <V>(base: Readonly<Record<string, V>>, next: Readonly<Record<string, V>>) => {
@@ -307,6 +366,8 @@ export const makeSections = (
     return options.around === undefined ? save : options.around(id, save)
   }
 
+  publishRisk()
+
   return {
     list: () => current().sections,
     value: (key) => effective().get(key) as SettingValue | undefined,
@@ -317,6 +378,9 @@ export const makeSections = (
       const { stored, secrets } = saved()
       for (const [key, value] of Object.entries(stored)) values[key] = encode(value)
       for (const [key, value] of Object.entries(secrets)) values[key] = value
+      // P8: the policy's keys as the canonical reader resolves them (a saved value of the wrong type is its default,
+      // never the string it would encode to); the environment's own value still comes first.
+      for (const [key, value] of Object.entries(riskPolicyValues(riskRecord))) values[key] = value
       return ConfigProvider.orElse(ConfigProvider.fromEnvRecord(nonEmptyEnv()), ConfigProvider.fromEnvRecord(values))
     },
     subscribe: (listener) => {
@@ -325,9 +389,12 @@ export const makeSections = (
     },
     announceAll: () => {
       values = undefined
+      publishRisk()
       for (const d of sectionDefinitions(modelDirs())) revisions.set(d.id, (revisions.get(d.id) ?? 0) + 1)
       announce(current().sections)
     },
-    modelDirs
+    modelDirs,
+    riskPolicy: () => riskRecord,
+    riskLanguage: () => languageRecord
   }
 }

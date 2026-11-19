@@ -310,6 +310,14 @@ export const PhraseTraceInfo = Schema.Struct({
   /** The class the execution gateway judged a command's call as, and its refusal. */
   risk: Schema.optionalKey(Schema.String.check(Schema.isMaxLength(20))),
   refused: Schema.optionalKey(Schema.String.check(Schema.isMaxLength(300))),
+  /**
+   * P8 (additive): the household risk policy's decision for the command's action, when one was taken: its outcome and
+   * the class it was decided by (as for the model's call of the same action).
+   */
+  decision: Schema.optionalKey(Schema.Struct({
+    outcome: Schema.Literals(["allow", "confirm", "deny"]),
+    by: Schema.String.check(Schema.isMaxLength(20))
+  })),
   /** The person the command ran for (a Members id). */
   person: Schema.optionalKey(Schema.String.check(Schema.isMaxLength(64))),
   /** How long the module's action ran. */

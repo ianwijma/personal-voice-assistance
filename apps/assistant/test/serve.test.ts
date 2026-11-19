@@ -79,6 +79,7 @@ describe("serve: handshake", () => {
     expect(snapshot.sections.map((s) => [s.id, `${s.group}/${s.page?.id}`])).toEqual([
       ["home", "modules/home"],
       ["members", "modules/members"],
+      ["risk", "modules/risk"],
       ["llm-openai-accounts", "agents/openai-accounts"],
       ["language-model", "agents/provider"],
       ["llm-behaviour", "agents/behaviour"],

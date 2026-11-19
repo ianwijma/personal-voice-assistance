@@ -1,10 +1,10 @@
+import { decideRisk, type RiskDecision, type RiskLanguage, riskOffered, type RiskPolicy, riskPolicyKey, riskReason, riskRefusalPrefix, riskSpoken, riskWithheld } from "@pva/protocol"
 import { Effect, Schema } from "effect"
 import { ACTION_TIMEOUT_MS, ActionError, type ActionOutcome, actionToolName, actionValues, type RegisteredAction } from "./Actions.ts"
 import { ToolError } from "./Errors.ts"
 import { actionRunnerOf, registerConfirmedRunner, toolRunnerOf } from "./GatewayPrivate.ts"
-import { declaredSensitivity, riskOf, type Sensitivity, type Tool, type ToolLatency, type ToolMetadata, toolMetadata, type ToolRisk } from "./Module.ts"
+import { declaredSensitivity, riskOf, type Sensitivity, sensitivityOf, type Tool, type ToolLatency, type ToolMetadata, toolMetadata, type ToolRisk, UNKNOWN_OWNER } from "./Module.ts"
 import { isPresentResult } from "./Present.ts"
-import type { RiskPolicy } from "./RiskPolicy.ts"
 import {
   type ConnectionRef,
   CurrentJob,
@@ -16,6 +16,7 @@ import {
   type TurnContext,
   type TurnPerson
 } from "./TurnContext.ts"
+import { CurrentTurnTrace, type TraceCall } from "./TurnTrace.ts"
 
 /**
  * The execution gateway (docs/MODULES-PLAN.md §4 P1): the one way a tool's `execute` or an action's `run` is reached.
@@ -41,16 +42,28 @@ import {
  * 4. only then the module's risk function on the validated input (a generated action tool's input is turned into the
  *    action's values once; those are classified, admitted and run), within `RISK_BUDGET_MS`; one that throws,
  *    answers an undeclared class or is too slow refuses the call with a generic sentence (details to the log);
- * 5. the risk policy on that class (`GatewayOptions.riskPolicy`, `defaultRiskPolicy` in serve mode, the CLI modes and
- *    the test kit): `confirm` and `deny` refuse, each with its own sentence;
+ * 5. the household's risk policy (`GatewayOptions.policy`, read now: serve mode's saved setting, the CLI modes' saved
+ *    setting at their start, the test kit's household), decided by THE function `decideRisk` (`@pva/protocol`) from the
+ *    policy, the classes the tool or action declares and the class of this input: `confirm` and `deny` refuse, each with
+ *    its own sentence (the household's language), and every decision is recorded (the turn's `Trace.calls`, and
+ *    `GatewayOptions.onDecision`);
  * 6. the later hook (`GatewayOptions.risk`), empty in this stack.
+ *
+ * After `execute` (a tool, for the model only): a result whose `sensitivity` is `personal` is passed through
+ * `GatewayOptions.mayReveal` for the call's device; when it may not be revealed there the model gets a fixed sentence
+ * (`riskWithheld`) and nothing of the result, and nothing of it is presented.
  *
  * Checks 2 and 3 apply to a turn's assistant and to a job made for an assistant; a local call and a notification's
  * action skip them. An action declared `confirm: true` is refused on every path here (confirmation is off in this
  * stack); only core's confirmed path (`GatewayPrivate.confirmedRunnerOf`, `Conversation`) runs one.
  *
  * A tool or action whose every declared class the policy refuses is left out of a turn's tool list and action catalogue
- * (`offers`, read by `makeToolRegistry` and the host's catalogue); a call that names it anyway is refused by check 5.
+ * (`offers`, by `riskOffered` over the same `decideRisk`, read by `makeToolRegistry` whenever its list is read and by the
+ * host's catalogue at each listing); a call that names it anyway, or a list read before a change that refuses it now, is
+ * refused by check 5.
+ *
+ * A press on a presentation and an action on a notification run a handler the module registered, not a tool or action:
+ * `handler` admits that run (the principal, then the policy on the handler's declared `risk`, inferred `change`).
  *
  * **Adding a check (later PRs):** fill the `risk` hook where the gateway is made (`makeExecutionGateway`, given to the
  * module host by serve mode as `ModuleHostOptions.gatewayHooks`); a new kind of check is one more optional hook in
@@ -73,7 +86,8 @@ export interface GatewayAccess {
 
 /** One call, as the checks see it. */
 export interface GatewayCall {
-  readonly kind: "tool" | "action"
+  /** `handler`: a registered handler's run (a press on a presentation, an action on a notification). */
+  readonly kind: "tool" | "action" | "handler"
   /** On whose behalf it runs. */
   readonly principal: Principal
   /** The turn it belongs to (a `turn` principal); `undefined` otherwise. */
@@ -101,8 +115,30 @@ export interface GatewayCall {
 
 export type GatewayDecision = { readonly _tag: "Allow" } | { readonly _tag: "Refuse"; readonly reason: string }
 
-/** The `cause` of the `ToolError` / `ActionError` of a call the gateway did not admit. */
-export class GatewayRefused extends Schema.TaggedError<GatewayRefused>()("GatewayRefused", { reason: Schema.String }) {}
+/**
+ * The `cause` of the `ToolError` / `ActionError` of a call the gateway did not admit. A refusal of the risk policy also
+ * carries its decision and what the person hears (`spoken`, the household's language).
+ */
+export class GatewayRefused extends Schema.TaggedError<GatewayRefused>()("GatewayRefused", {
+  reason: Schema.String,
+  spoken: Schema.optionalKey(Schema.String),
+  outcome: Schema.optionalKey(Schema.Literals(["confirm", "deny"])),
+  by: Schema.optionalKey(Schema.String)
+}) {}
+
+/** The sentence for the person of a refusal by the risk policy, or `undefined` (another refusal, or no refusal). */
+export const spokenRefusal = (error: { readonly cause?: unknown }): string | undefined =>
+  error.cause instanceof GatewayRefused ? error.cause.spoken : undefined
+
+/** One decision of the risk policy, on any path (`GatewayOptions.onDecision`). */
+export interface GatewayDecisionRecord extends TraceCall {
+  readonly kind: GatewayCall["kind"]
+  readonly moduleId: string | undefined
+  /** On whose behalf the call was made. */
+  readonly principal: Principal["_tag"]
+  /** The turn's id, for a call of a turn. */
+  readonly turnId?: number
+}
 
 /** Whether an error is the gateway's refusal (not a failure of the tool or action itself). */
 export const isGatewayRefusal = (error: { readonly cause?: unknown }): boolean => error.cause instanceof GatewayRefused
@@ -116,8 +152,22 @@ export type GatewayHook = (call: GatewayCall) => Effect.Effect<GatewayDecision>
 export interface GatewayOptions {
   /** Absent: the access checks are skipped (tests, the CLI modes). */
   readonly access?: GatewayAccess
-  /** Check 5, the risk policy on the call's class. Absent: every class is allowed (tests, hand-made registries). */
-  readonly riskPolicy?: RiskPolicy
+  /**
+   * Check 5: the household's risk policy, read at every decision and every time a tool list is read (nothing keeps it:
+   * a saved change applies to the next call and the next list). Must be a cheap synchronous read. Absent: nothing is
+   * decided and every class is allowed (tests, hand-made registries).
+   */
+  readonly policy?: () => RiskPolicy
+  /** The language of the refusal and withheld sentences (`HOME_LANGUAGE`). Absent: English. */
+  readonly language?: () => RiskLanguage
+  /**
+   * `sensitivity`: may personal content of `owner` be revealed on the device `deviceId` (`Privacy.mayReveal`; no device:
+   * no). Asked for a tool's `personal` result at the moment it would go back to the model. Absent: not asked (the CLI
+   * modes, which have no devices; tests).
+   */
+  readonly mayReveal?: (owner: string, deviceId: string | undefined) => boolean
+  /** Told every decision of the policy, on every path (the turn's trace gets those of a turn as well). Must not throw. */
+  readonly onDecision?: (record: GatewayDecisionRecord) => void
   /** Check 6, a later hook (P8). */
   readonly risk?: GatewayHook
   /**
@@ -159,7 +209,20 @@ export interface ActionCallOptions extends GatewayCallOptions {
    * Must not throw (a throw is ignored). P10: told once more, `presented: true`, when the action's outcome carried a
    * presentation and it was handed to the Presenter.
    */
-  readonly onDecision?: (decision: { readonly risk?: ToolRisk; readonly refused?: string; readonly presented?: true }) => void
+  readonly onDecision?: (decision: ActionDecisionNote) => void
+}
+
+/**
+ * What an action call's observer is told (`ActionCallOptions.onDecision`): the class it was judged as, the refusal's
+ * reason, and (P8) the risk policy's decision when one was taken (`outcome`, `by`; absent for a call refused before the
+ * decision or with no policy).
+ */
+export interface ActionDecisionNote {
+  readonly risk?: ToolRisk
+  readonly refused?: string
+  readonly presented?: true
+  readonly outcome?: RiskDecision["outcome"]
+  readonly by?: RiskDecision["by"]
 }
 
 export interface ExecutionGateway {
@@ -188,12 +251,29 @@ export interface ExecutionGateway {
    * One it refuses for every class is left out of tool lists and catalogues; its calls are refused anyway.
    */
   readonly offers: (meta: ToolMetadata & { readonly speculative?: boolean | undefined }) => boolean
+  /**
+   * What `offers` depends on now: a key that changes exactly when the policy's offers change (a tool list made for one
+   * key fits as long as the key is the same). "" without a policy.
+   */
+  readonly offerKey: () => string
+  /**
+   * P8: admit a registered handler's run for the principal of now (a press on a presentation, an action on a
+   * notification: the engines run it as that principal): the principal's checks, then the risk policy on the handler's
+   * declared `risk` (inferred `change`) with `input`, recorded like every decision. `undefined`: admitted. A refusal of
+   * the policy carries what the person hears (`spoken`).
+   */
+  readonly handler: (
+    moduleId: string,
+    name: string,
+    meta: ToolMetadata & { readonly speculative?: boolean | undefined },
+    input: unknown
+  ) => Effect.Effect<{ readonly refused: string; readonly spoken?: string } | undefined>
 }
 
 const decoders = new WeakMap<Tool, (u: unknown) => Effect.Effect<unknown, Schema.SchemaError>>()
 
 /** Tell an action call's observer the admission's outcome; an observer that throws changes nothing. */
-const tellDecision = (options: ActionCallOptions, decision: { readonly risk?: ToolRisk; readonly refused?: string; readonly presented?: true }) => {
+const tellDecision = (options: ActionCallOptions, decision: ActionDecisionNote) => {
   try {
     options.onDecision?.(decision)
   } catch {
@@ -223,9 +303,6 @@ const NO_PRINCIPAL = "it has no turn, job or other principal to run for."
  */
 export const RISK_BUDGET_MS = 2
 
-/** What the owner hears when a call's risk could not be judged (never the module's own text). */
-const UNJUDGED = "what it would do could not be judged."
-
 const CONFIRMATION_OFF = "this action needs the owner's spoken confirmation, which only the assistant can ask for."
 
 /** An action declared `confirm: true` (refused on every public path: confirmation is off in this stack). */
@@ -235,19 +312,25 @@ const needsYes = (registered: RegisteredAction) => registered.definition.confirm
  * The generated tool's result for an action that ran: its `say`, else its `announce`, else "ok"; with `present` (P10),
  * that and the presentation, for the Presenter's split.
  */
-const runForTool = (registered: RegisteredAction, values: Readonly<Record<string, unknown>>): Effect.Effect<unknown, ToolError> => {
+const runForTool = (registered: RegisteredAction, values: Readonly<Record<string, unknown>>): Effect.Effect<ActionOutcome | void, ToolError> => {
   const def = registered.definition
   return Effect.suspend(() => actionRunnerOf(registered)(values)).pipe(
     Effect.timeoutOrElse({
       duration: ACTION_TIMEOUT_MS,
       orElse: () => Effect.fail(new ActionError({ message: `${def.label} did not finish within ${ACTION_TIMEOUT_MS / 1000} s` }))
     }),
-    Effect.mapError((error) => new ToolError({ message: error.message, cause: error })),
-    Effect.map((outcome) => {
-      const said = outcome?.say ?? def.announce?.(values as never) ?? "ok"
-      return outcome?.present === undefined ? said : { forModel: said, present: outcome.present, ...(outcome.show !== undefined ? { show: outcome.show } : {}) }
-    })
+    Effect.mapError((error) => new ToolError({ message: error.message, cause: error }))
   )
+}
+
+/**
+ * The generated tool's result for an action's outcome (P8, review round 1 H2: made only after the outcome itself was
+ * judged by its sensitivity): its `say`, else its `announce`, else "ok"; with `present`, that and the presentation.
+ */
+const formatForTool = (registered: RegisteredAction, values: Readonly<Record<string, unknown>>, outcome: ActionOutcome | void): unknown => {
+  const def = registered.definition
+  const said = outcome?.say ?? def.announce?.(values as never) ?? "ok"
+  return outcome?.present === undefined ? said : { forModel: said, present: outcome.present, ...(outcome.show !== undefined ? { show: outcome.show } : {}) }
 }
 
 /** A result that asks to show something, without a Presenter here: `forModel`, and the note that nothing is shown. */
@@ -258,9 +341,28 @@ const screenless = (value: unknown): unknown => {
   return `${text}\n[Screen: ${NO_SCREEN}]`
 }
 
+/** Why a call is not admitted: the reason for the model, its prefix, and (a refusal of the policy) its decision. */
+interface Refusal {
+  readonly reason: string
+  readonly prefix: string
+  readonly decision?: RiskDecision
+  readonly spoken?: string
+}
+
+const NOT_RUN = "Not run: "
+
 export const makeExecutionGateway = (options: GatewayOptions = {}): ExecutionGateway => {
   const access = options.access
-  const riskPolicy = options.riskPolicy
+  const policyNow = options.policy
+  const languageNow = (): RiskLanguage => {
+    try {
+      return options.language?.() === "nl" ? "nl" : "en"
+    } catch {
+      return "en"
+    }
+  }
+  const mayReveal = options.mayReveal
+  const onDecision = options.onDecision
   const withoutPrincipal = options.withoutPrincipal ?? (access === undefined ? "local" : "refuse")
   // Made once: nothing is allocated per call for the checks.
   const hooks: ReadonlyArray<GatewayHook> = [options.risk].filter((h): h is GatewayHook => h !== undefined)
@@ -331,12 +433,54 @@ export const makeExecutionGateway = (options: GatewayOptions = {}): ExecutionGat
       return ALLOW
     })
 
+  /**
+   * Check 5: THE decision on the policy of now, recorded (the turn's trace, `onDecision`). `undefined` without a policy
+   * (nothing decided, nothing recorded). The record is returned, so a withheld result can be noted on it.
+   */
+  const decide = (
+    call: Omit<GatewayCall, "risk">,
+    declared: ReadonlyArray<ToolRisk>,
+    risk: ToolRisk | undefined
+  ): Effect.Effect<{ readonly decision: RiskDecision; readonly record: GatewayDecisionRecord } | undefined> => {
+    if (policyNow === undefined) return Effect.succeed(undefined)
+    return Effect.map(CurrentTurnTrace, (trace) => {
+      const decision = decideRisk(policyNow(), declared, risk)
+      const record: GatewayDecisionRecord = {
+        kind: call.kind,
+        moduleId: call.moduleId,
+        name: call.name,
+        principal: call.principal._tag,
+        ...(call.turn !== undefined ? { turnId: call.turn.turnId } : {}),
+        outcome: decision.outcome,
+        by: decision.by
+      }
+      // The turn's trace holds the decisions of its own calls only (a job's call inside a turn's fiber is not the turn's).
+      if (trace !== undefined && (call.turn === undefined ? call.principal._tag === "local" : call.turn.turnId === trace.id)) {
+        ;(trace.calls ??= []).push(record)
+      }
+      try {
+        onDecision?.(record)
+      } catch {
+        // A recorder that throws is the app's defect; the decision stands.
+      }
+      return { decision, record }
+    })
+  }
+
+  const refusalOf = (decision: RiskDecision): Refusal | undefined => {
+    if (decision.outcome === "allow") return undefined
+    const language = languageNow()
+    return { reason: riskReason(language, decision)!, prefix: riskRefusalPrefix(language), decision, spoken: riskSpoken(language, decision)! }
+  }
+
   const admit = (call: GatewayCall): Effect.Effect<GatewayDecision> =>
     Effect.suspend(() => {
       const problem = accessProblem(call)
       if (problem !== undefined) return Effect.succeed(refuse(problem))
-      const verdict = riskPolicy?.(call.risk)
-      return verdict !== undefined && verdict.outcome !== "allow" ? Effect.succeed(refuse(verdict.reason)) : runHooks(call)
+      return Effect.flatMap(decide(call, [call.risk], call.risk), (decided) => {
+        const refusal = decided === undefined ? undefined : refusalOf(decided.decision)
+        return refusal !== undefined ? Effect.succeed(refuse(refusal.reason)) : runHooks(call)
+      })
     })
 
   /** The call with its principal resolved (its risk not yet). */
@@ -370,16 +514,11 @@ export const makeExecutionGateway = (options: GatewayOptions = {}): ExecutionGat
   const admitCall = (
     call: Omit<GatewayCall, "risk">,
     meta: ToolMetadata & { readonly speculative?: boolean | undefined }
-  ): Effect.Effect<string | undefined> => Effect.map(judgeCall(call, meta), (j) => j.refused)
-
-  /** `admitCall` with the class it judged the call as (for an observer). */
-  const judgeCall = (
-    call: Omit<GatewayCall, "risk">,
-    meta: ToolMetadata & { readonly speculative?: boolean | undefined }
-  ): Effect.Effect<{ readonly refused?: string; readonly risk?: ToolRisk }> =>
-    Effect.suspend((): Effect.Effect<{ readonly refused?: string; readonly risk?: ToolRisk }> => {
+  ): Effect.Effect<{ readonly refusal: Refusal | undefined; readonly record: GatewayDecisionRecord | undefined; readonly risk?: ToolRisk }> =>
+    Effect.suspend((): Effect.Effect<{ readonly refusal: Refusal | undefined; readonly record: GatewayDecisionRecord | undefined; readonly risk?: ToolRisk }> => {
       const problem = accessProblem(call)
-      if (problem !== undefined) return Effect.succeed({ refused: problem })
+      // Refused before the decision: nothing is recorded for it.
+      if (problem !== undefined) return Effect.succeed({ refusal: { reason: problem, prefix: NOT_RUN }, record: undefined })
       let risk: ToolRisk | undefined
       let failure: string | undefined
       // Only a risk function of the input (module code) has the budget. A fixed or inferred risk is the host's own
@@ -395,19 +534,108 @@ export const makeExecutionGateway = (options: GatewayOptions = {}): ExecutionGat
       }
       const ms = performance.now() - started
       if (failure === undefined && judgedByModule && ms > RISK_BUDGET_MS) failure = `its risk function took ${ms.toFixed(1)} ms (at most ${RISK_BUDGET_MS} ms)`
+      let declared: ReadonlyArray<ToolRisk>
+      try {
+        declared = toolMetadata(meta).risks
+      } catch {
+        declared = []
+      }
       if (failure !== undefined || risk === undefined) {
-        return Effect.as(Effect.logWarning(`Execution gateway: ${call.name} (module ${call.moduleId ?? "none"}) refused: ${failure}`), { refused: UNJUDGED })
+        // Not judged: the policy decides `deny` (`unjudged`) and it is recorded; without a policy the call is refused
+        // all the same, with the generic sentence. What went wrong goes to the log only.
+        const unjudged: RiskDecision = { outcome: "deny", by: "unjudged" }
+        return Effect.andThen(
+          Effect.logWarning(`Execution gateway: ${call.name} (module ${call.moduleId ?? "none"}) refused: ${failure}`),
+          Effect.map(decide(call, declared, undefined), (decided) => ({ refusal: refusalOf(decided?.decision ?? unjudged), record: decided?.record }))
+        )
       }
       const judged = risk
-      const verdict = riskPolicy?.(judged)
-      if (verdict !== undefined && verdict.outcome !== "allow") return Effect.succeed({ refused: verdict.reason, risk: judged })
-      return Effect.map(runHooks({ ...call, risk: judged }), (decision) => (decision._tag === "Allow" ? { risk: judged } : { refused: decision.reason, risk: judged }))
+      return Effect.flatMap(decide(call, declared, judged), (decided) => {
+        const refusal = decided === undefined ? undefined : refusalOf(decided.decision)
+        if (refusal !== undefined) return Effect.succeed({ refusal, record: decided?.record, risk: judged })
+        return Effect.map(runHooks({ ...call, risk: judged }), (decision) => ({
+          refusal: decision._tag === "Allow" ? undefined : { reason: decision.reason, prefix: NOT_RUN },
+          record: decided?.record,
+          risk: judged
+        }))
+      })
     })
+
+  /**
+   * `sensitivity`, at the moment a tool's result would go back to the model: a `personal` result (fixed, or decided on
+   * this result) is revealed only where `mayReveal` allows it for the call's device. Otherwise the model gets the fixed
+   * sentence, and the decision's record says so.
+   */
+  /** May personal content of `owner` go to the call's device? An unknown owner is never anyone's (H4). */
+  const mayRevealOwner = (owner: string, call: Omit<GatewayCall, "risk">): boolean => {
+    if (mayReveal === undefined) return true
+    if (owner === UNKNOWN_OWNER) return false
+    try {
+      return mayReveal(owner, call.deviceId) === true
+    } catch {
+      return false
+    }
+  }
+  const markWithheld = (record: GatewayDecisionRecord | undefined) => {
+    if (record !== undefined) (record as { withheld?: boolean }).withheld = true
+  }
+
+  /** Whether the executor's own result `value` may go back to the model (it is marked withheld otherwise). */
+  const mayRevealResult = (meta: ToolMetadata, call: Omit<GatewayCall, "risk">, record: GatewayDecisionRecord | undefined, value: unknown): boolean => {
+    if (mayReveal === undefined) return true
+    const sensitivity = sensitivityOf(meta, value)
+    if (sensitivity.kind === "household" || mayRevealOwner(sensitivity.owner, call)) return true
+    markWithheld(record)
+    return false
+  }
+
+  /**
+   * H3: whether an admitted executor's failure or defect may go back to the model, by the decision its result would have
+   * had: a fixed household sensitivity yes; a fixed personal one where its result could be shown; a classifier of the
+   * result cannot be asked about a failure, so no.
+   */
+  const mayRevealFailure = (meta: ToolMetadata, call: Omit<GatewayCall, "risk">, record: GatewayDecisionRecord | undefined): boolean => {
+    if (mayReveal === undefined) return true
+    const declared = declaredSensitivity(meta)
+    const ok = declared !== "per-result" && (declared.kind === "household" || mayRevealOwner(declared.owner, call))
+    if (!ok) markWithheld(record)
+    return ok
+  }
+
+  /**
+   * `run` (an admitted executor) with its failure and its defect under the reveal decision (H3): one that may not be
+   * revealed is replaced by the fixed withheld sentence as a failure (`isError` kept), never its text. An interruption
+   * passes through.
+   */
+  const guardedRun = <A>(meta: ToolMetadata, call: Omit<GatewayCall, "risk">, record: GatewayDecisionRecord | undefined, run: Effect.Effect<A, ToolError>): Effect.Effect<A, ToolError> =>
+    mayReveal === undefined ? run : run.pipe(
+      Effect.catch((error) => (mayRevealFailure(meta, call, record) ? Effect.fail(error) : Effect.fail(new ToolError({ message: riskWithheld(languageNow()) })))),
+      Effect.catchDefect((defect) => (mayRevealFailure(meta, call, record) ? Effect.die(defect) : Effect.fail(new ToolError({ message: riskWithheld(languageNow()) }))))
+    )
+
+  /** What an action call's observer is told about an admission. */
+  const decisionNote = (a: { readonly refusal: Refusal | undefined; readonly record: GatewayDecisionRecord | undefined; readonly risk?: ToolRisk }): ActionDecisionNote => ({
+    ...(a.risk !== undefined ? { risk: a.risk } : {}),
+    ...(a.refusal !== undefined ? { refused: a.refusal.reason } : {}),
+    ...(a.record !== undefined ? { outcome: a.record.outcome, by: a.record.by } : {})
+  })
 
   const resolve = (explicit: Principal | undefined): Effect.Effect<Resolved> => (explicit !== undefined ? Effect.succeed(explicit) : principalNow)
 
-  const refusedTool = (reason: string) => new ToolError({ message: `Not run: ${reason}`, cause: new GatewayRefused({ reason }) })
-  const refusedAction = (reason: string) => new ActionError({ message: `Not run: ${reason}`, cause: new GatewayRefused({ reason }) })
+  const causeOf = (r: Refusal) =>
+    new GatewayRefused({
+      reason: r.reason,
+      ...(r.spoken !== undefined ? { spoken: r.spoken } : {}),
+      ...(r.decision !== undefined && r.decision.outcome !== "allow" ? { outcome: r.decision.outcome, by: r.decision.by } : {})
+    })
+  const refusedTool = (r: Refusal | string) => {
+    const refusal = typeof r === "string" ? { reason: r, prefix: NOT_RUN } : r
+    return new ToolError({ message: `${refusal.prefix}${refusal.reason}`, cause: causeOf(refusal) })
+  }
+  const refusedAction = (r: Refusal | string) => {
+    const refusal = typeof r === "string" ? { reason: r, prefix: NOT_RUN } : r
+    return new ActionError({ message: `${refusal.prefix}${refusal.reason}`, cause: causeOf(refusal) })
+  }
 
   const tool: ExecutionGateway["tool"] = (moduleId, t, raw, callOptions = {}) =>
     Effect.gen(function*() {
@@ -427,16 +655,24 @@ export const makeExecutionGateway = (options: GatewayOptions = {}): ExecutionGat
           return yield* (error instanceof ToolError ? error : new ToolError({ message: String(error) }))
         }
         const call = callOf({ kind: "tool", moduleId, name: t.name, input: values, confirmed: false, action: registered }, def, principal)
-        const refused = yield* admitCall(call, def)
-        if (refused !== undefined) return yield* refusedTool(refused)
-        const ran = yield* asPrincipal(principal, runForTool(registered, values))
-        return yield* split(moduleId, principal, ran)
+        const admitted = yield* admitCall(call, def)
+        if (admitted.refusal !== undefined) return yield* refusedTool(admitted.refusal)
+        // H2: the action's own outcome is judged by its sensitivity first; only an admitted one is formatted and shown.
+        const record = admitted.record
+        const formatted = yield* guardedRun(def, call, record, Effect.gen(function*() {
+          const outcome = yield* asPrincipal(principal, runForTool(registered, values))
+          if (!mayRevealResult(def, call, record, outcome)) return { withheld: true as const }
+          return { value: formatForTool(registered, values, outcome) }
+        }))
+        if ("withheld" in formatted) return riskWithheld(languageNow())
+        return yield* split(moduleId, principal, formatted.value)
       }
       const call = callOf({ kind: "tool", moduleId, name: t.name, input, confirmed: false }, t, principal)
-      const refused = yield* admitCall(call, t)
-      if (refused !== undefined) return yield* refusedTool(refused)
+      const admitted = yield* admitCall(call, t)
+      if (admitted.refusal !== undefined) return yield* refusedTool(admitted.refusal)
       // Suspended: a tool that throws while building its effect is a defect, as before.
-      const value = yield* asPrincipal(principal, Effect.suspend(() => toolRunnerOf(t)(input)))
+      const value = yield* guardedRun(t, call, admitted.record, asPrincipal(principal, Effect.suspend(() => toolRunnerOf(t)(input))))
+      if (!mayRevealResult(t, call, admitted.record, value)) return riskWithheld(languageNow())
       return yield* split(moduleId, principal, value)
     })
 
@@ -462,15 +698,18 @@ export const makeExecutionGateway = (options: GatewayOptions = {}): ExecutionGat
         def,
         principal
       )
-      const judged = yield* judgeCall(call, def)
-      tellDecision(actionOptions, judged)
-      const refused = judged.refused
-      if (refused !== undefined) return yield* refusedAction(refused)
+      const first = yield* admitCall(call, def)
+      tellDecision(actionOptions, decisionNote(first))
+      if (first.refusal !== undefined) return yield* refusedAction(first.refusal)
       if (actionOptions.onAdmitted !== undefined) yield* actionOptions.onAdmitted
       if (actionOptions.holdUntil !== undefined) {
         yield* actionOptions.holdUntil
+        // Decided again on the policy of now, just before it runs (a change saved meanwhile refuses it).
         const again = yield* admitCall(call, def)
-        if (again !== undefined) return yield* refusedAction(again)
+        if (again.refusal !== undefined) {
+          tellDecision(actionOptions, decisionNote(again))
+          return yield* refusedAction(again.refusal)
+        }
       }
       const outcome = yield* asPrincipal(principal, Effect.suspend(() => actionRunnerOf(registered)(values)))
       // P10: an outcome's presentation goes to the Presenter (the intent agent speaks `say`; the note is for a model).
@@ -491,15 +730,27 @@ export const makeExecutionGateway = (options: GatewayOptions = {}): ExecutionGat
   })
 
   const offers: ExecutionGateway["offers"] = (meta) => {
-    if (riskPolicy === undefined) return true
+    if (policyNow === undefined) return true
     try {
-      return toolMetadata(meta).risks.some((r) => riskPolicy(r).outcome === "allow")
+      return riskOffered(policyNow(), toolMetadata(meta).risks)
     } catch {
       return false
     }
   }
 
-  const gateway: ExecutionGateway = { admit, tool, action, principal, offers }
+  const offerKey = (): string => (policyNow === undefined ? "" : riskPolicyKey(policyNow()))
+
+  const handler: ExecutionGateway["handler"] = (moduleId, name, meta, input) =>
+    Effect.gen(function*() {
+      const p = yield* principal
+      if ("refused" in p) return { refused: p.refused }
+      const call = callOf({ kind: "handler", moduleId, name: `${moduleId}/${name}`, input, confirmed: false }, meta, p)
+      const admitted = yield* admitCall(call, meta)
+      if (admitted.refusal === undefined) return undefined
+      return { refused: admitted.refusal.reason, ...(admitted.refusal.spoken !== undefined ? { spoken: admitted.refusal.spoken } : {}) }
+    })
+
+  const gateway: ExecutionGateway = { admit, tool, action, principal, offers, offerKey, handler }
   // Core's confirmed path (`Conversation`, after a consumed spoken yes): reachable from inside core only.
   registerConfirmedRunner(gateway, (registered, values) => runAction(registered, values, {}, true))
   return gateway

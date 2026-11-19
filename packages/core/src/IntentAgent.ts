@@ -1,4 +1,4 @@
-import { defaultGateway } from "./Gateway.ts"
+import { defaultGateway, spokenRefusal } from "./Gateway.ts"
 import { Cause, Clock, Deferred, Effect, Exit, Fiber, Stream } from "effect"
 import { ACTION_TIMEOUT_MS, ActionError, type ActionOutcome, actionToolName, type RegisteredAction } from "./Actions.ts"
 import type { AgentEvent, AgentTurnInput, IntentDecisionInfo } from "./Agent.ts"
@@ -334,9 +334,11 @@ export const makeIntentAgent = (options: IntentAgentOptions = {}): AgentImplemen
           }
           const error = Cause.findErrorOption(exit.cause)
           const message = error._tag === "Some" ? error.value.message : "Something went wrong."
+          // P8: a refusal of the risk policy is said in its own spoken sentence, in the household's language.
+          const spoken = error._tag === "Some" ? spokenRefusal(error.value) : undefined
           return Stream.fromIterable<AgentEvent>([
             { _tag: "ActionFinished", callId, ok: false, ms, error: message },
-            ...sentence(`Sorry, ${message.length > 0 ? message : "that failed."}`)
+            ...sentence(spoken ?? `Sorry, ${message.length > 0 ? message : "that failed."}`)
           ])
         }))),
         Stream.concat(speculative ? commitPending(input, store, undefined, at) : Stream.empty),

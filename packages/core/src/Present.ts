@@ -34,6 +34,7 @@ import {
 } from "@pva/protocol"
 import { Effect, Schema } from "effect"
 import { type CoreStorage, defineCollection, maxListRows } from "./HouseholdStore.ts"
+import type { RiskByInput, ToolRisk } from "./Module.ts"
 import type { PartHandle } from "./ModuleRegistrations.ts"
 import { NOTIFY_TEXT } from "./Notify.ts"
 import type { PartRunner } from "./Scheduler.ts"
@@ -166,6 +167,12 @@ export interface PresentPressHandler {
    * same key again; the press itself changes nothing on the page.
    */
   readonly run: (press: PresentPress) => Effect.Effect<PresentAnswer | void, unknown>
+  /**
+   * P8: what running it does, for the household's risk policy (decided by the execution gateway before `run`, on every
+   * press): a class, or a function of the press with the classes it can return. Absent: `change`. A refusal answers the
+   * press with the policy's spoken sentence, and `run` is not called.
+   */
+  readonly risk?: ToolRisk | RiskByInput<PresentPress>
 }
 
 /**
@@ -304,8 +311,11 @@ export interface PresentPressRequest {
 export interface PresentPressAnswer {
   readonly ok: boolean
   readonly say: string
-  /** `not_running` (its handler is not published), `unknown` (not held there, ended, not pressable), `busy`, `failed`. */
-  readonly code?: "not_running" | "unknown" | "busy" | "failed"
+  /**
+   * `not_running` (its handler is not published), `unknown` (not held there, ended, not pressable), `busy`, `failed`,
+   * `refused` (P8: the household's risk policy refused it; `say` is its spoken sentence).
+   */
+  readonly code?: "not_running" | "unknown" | "busy" | "failed" | "refused"
 }
 
 /** The module-facing calls of a mode without the service (the CLI modes): `handle` succeeds, `show` is `unavailable`. */

@@ -193,13 +193,17 @@ speaker and no display gets the cue and no card.
   the claim's wall time on the row is only for a claim found with no run alive.
 - **What a press is**: the module's registered handler, run as a call in flight of the module's part with the press's
   notification principal (`CurrentPrincipal` `notification`: the notification and the device it was pressed on), after
-  the holder, decision and claim checks, within 5 s. **It is not a tool call**: it has no risk class and no trace of its
-  own, and the assistant's module and tool switches do not apply to it (the execution gateway admits it by its principal
-  only); whatever the handler calls through the gateway is checked there as always, risk policy included. It answers
-  `{ say?, keepOpen? }`: `say` is shown on the card (cut to 300 at the page boundary; default "Done."); unless
-  `keepOpen`, the notification is then resolved with the action as its outcome. A handler that fails or times out
-  answers "That didn't work." and the notification stays open; what the handler committed before that stays (there is
-  no rollback of a handler's own effects).
+  the holder, decision and claim checks, within 5 s. **It is not a tool call**: the assistant's module and tool switches
+  do not apply to it. **Under the household's risk policy (P8) it is a call of its own**: the execution gateway admits
+  it by its principal and then decides it with the same function as every tool call, on the handler's declared `risk`
+  (`NotifyActionHandler.risk`: a class, or a function of the press with the classes it can return; absent: `change`).
+  A refusal answers the press with the policy's spoken sentence in the household's language and `code: "refused"`, and
+  the handler does not run; the decision is recorded like every other (`onDecision`, the kit's `riskDecisions()`).
+  `stop` is the host's own and is never refused. Whatever the handler calls through the gateway is decided there too.
+  It answers `{ say?, keepOpen? }`: `say` is shown on the card (cut to 300 at the page boundary; default "Done.");
+  unless `keepOpen`, the notification is then resolved with the action as its outcome. A handler that fails or times
+  out answers "That didn't work." and the notification stays open; what the handler committed before that stays (there
+  is no rollback of a handler's own effects).
 - **After a store failure the handler may run again**: the outcome is written with a few retries; if it still cannot be
   written the answer is the failure sentence, the claim stays until maintenance releases it (15 s after it was taken,
   planned by `plan()`), and a later press runs the handler again for the same notification. **Handlers are idempotent

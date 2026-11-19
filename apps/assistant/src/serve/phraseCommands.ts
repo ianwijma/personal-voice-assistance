@@ -72,7 +72,10 @@ export const makeServePhrases = (options: ServePhrasesOptions): Effect.Effect<Se
     }
     const actionsOf = (id: string): ReadonlyArray<RegisteredAction> => {
       const assistant = options.assistants().get(id)
-      return assistant === undefined ? [] : offeredActions(options.partsOf(options.host.snapshot(), assistant).map((p) => p.module), options.host.gateway)
+      // P8: every published action of the modules the assistant has on, whatever the risk policy says now. A phrase is
+      // taken, and the gateway decides its action at execution on the policy of that moment (the same decision and
+      // refusal sentence as the model's call of it), never "not taken" or "can't now" because of the policy.
+      return assistant === undefined ? [] : offeredActions(options.partsOf(options.host.snapshot(), assistant).map((p) => p.module))
     }
     const sets = yield* makePhraseSets({
       language: options.language,

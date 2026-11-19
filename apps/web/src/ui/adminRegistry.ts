@@ -10,6 +10,7 @@ import { HealthPage } from "@/components/settings/pages/HealthPage.tsx"
 import { SpeechModelsPage, VoiceModelsPage } from "@/components/settings/pages/ModelsPages.tsx"
 import { OverridesPage } from "@/components/settings/pages/OverridesPage.tsx"
 import { OverviewPage } from "@/components/settings/pages/OverviewPage.tsx"
+import { RiskPolicyPage } from "@/components/settings/pages/RiskPolicyPage.tsx"
 import { ScheduledJobsPage } from "@/components/settings/pages/ScheduledJobsPage.tsx"
 import type { ClientPageRef } from "@/lib/settingsTree.ts"
 
@@ -42,6 +43,8 @@ export const settingsPages: ReadonlyArray<SettingsPageEntry> = [
   // The model lists complete the shared pages they are named after (`<page>-extra`): not pages of their own.
   { group: "shared", id: "speech-extra", title: "Models", order: 0, component: SpeechModelsPage },
   { group: "shared", id: "providers-extra", title: "Voice models", order: 0, component: VoiceModelsPage },
+  // P8: under the risk policy's form, what the person hears for each refusal (in the household's language).
+  { group: "shared", id: "risk-extra", title: "What the assistant says", order: 0, component: RiskPolicyPage },
   { group: "about", id: "about", title: "About", description: "Version and connection.", order: 0, component: AboutPage }
 ]
 

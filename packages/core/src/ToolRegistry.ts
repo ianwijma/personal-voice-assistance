@@ -2,7 +2,7 @@ import { Context, Effect, Layer, Schema, SchemaAST as AST } from "effect"
 import { type ActionError, type ActionOutcome, actionToolName, type RegisteredAction } from "./Actions.ts"
 import type { ToolCall, ToolResult, ToolSpec } from "./Domain.ts"
 import { type ActionCallOptions, defaultGateway, type ExecutionGateway, prepareTool } from "./Gateway.ts"
-import { registerRegistryGateway } from "./GatewayPrivate.ts"
+import { carryRegistryGateway, registerRegistryGateway } from "./GatewayPrivate.ts"
 import type { AssistantModule, ContextProvider, Tool } from "./Module.ts"
 
 /**
@@ -73,7 +73,8 @@ const encodeResult = (value: unknown): string => {
 export interface ToolRegistryOptions {
   /**
    * The gateway every call goes through. Default: `defaultGateway` (no access checks, no hooks). A tool or action its
-   * risk policy refuses for every class (`ExecutionGateway.offers`) is left out of `specs` and `actions`; a call that
+   * risk policy refuses for every class (`ExecutionGateway.offers`) is left out of `specs` and `actions`, decided on the
+   * policy of the moment they are read (P8: a saved change applies to the next list without a new registry); a call that
    * names it anyway reaches the gateway, which refuses it.
    */
   readonly gateway?: ExecutionGateway
@@ -92,9 +93,26 @@ export const withoutOffTools = (module: AssistantModule, offTools: ReadonlyArray
 }
 
 /**
+ * A registry like `base` with some members replaced (a wrapper's `run`, `context`). Its tool list and actions are read
+ * through `base` whenever they are read (P8: `base` decides them on the risk policy of that moment), never copied.
+ */
+export const registryWith = (
+  base: ToolRegistry["Service"],
+  patch: Partial<Omit<ToolRegistry["Service"], "specs" | "actions">>
+): ToolRegistry["Service"] => {
+  const out = { ...base, ...patch }
+  Object.defineProperty(out, "specs", { get: () => base.specs, enumerable: true, configurable: true })
+  if (base.actions !== undefined) Object.defineProperty(out, "actions", { get: () => base.actions, enumerable: true, configurable: true })
+  // H6: the private association with its gateway goes with it (the confirmed path looks it up by the registry).
+  carryRegistryGateway(base, out)
+  return ToolRegistry.of(out)
+}
+
+/**
  * The actions a registry of `modules` offers (`ToolRegistry.actions`), without building one: those of its generated
  * action tools and its intent-only actions that the gateway offers (the risk policy allows a class), in module order.
- * P7's phrase sets read an assistant's actions with it, by the same rule as its turns.
+ * Without a gateway (the default gateway has no policy) it lists every action: P7's phrase sets read an assistant's
+ * actions that way (P8: a phrase's action is decided by the policy when it runs, not left out of the set).
  */
 export const offeredActions = (modules: ReadonlyArray<AssistantModule>, gateway: ExecutionGateway = defaultGateway): Array<RegisteredAction> => {
   const out: Array<RegisteredAction> = []
@@ -108,20 +126,37 @@ export const offeredActions = (modules: ReadonlyArray<AssistantModule>, gateway:
 /** A registry of `modules`' tools; each tool belongs to the module whose `name` lists it (the module host names parts by module id). */
 export const makeToolRegistry = (modules: ReadonlyArray<AssistantModule>, options: ToolRegistryOptions = {}): ToolRegistry["Service"] => {
   const gateway = options.gateway ?? defaultGateway
-  const tools = new Map<string, { readonly tool: Tool; readonly moduleId: string }>()
+  const tools = new Map<string, { readonly tool: Tool; readonly moduleId: string; readonly spec: ToolSpec }>()
   const providers: Array<ContextProvider> = []
-  // The same rule as `offeredActions` (P7's phrase sets read it without a registry).
-  const actions = offeredActions(modules, gateway)
+  /** Every action, in module order, before the policy (each with its generated tool's entry when it has one). */
+  const allActions: Array<RegisteredAction> = []
   for (const module of modules) {
     for (const tool of module.tools ?? []) {
       if (tools.has(tool.name)) throw new Error(`Duplicate tool name "${tool.name}" (module ${module.name})`)
-      tools.set(tool.name, { tool, moduleId: module.name })
-      // The input decoder is made here, once per tool (cached across registries), never on a call.
+      // The input decoder and the JSON Schema are made here, once per tool (the decoder cached across registries), never on a call.
       prepareTool(tool)
+      tools.set(tool.name, { tool, moduleId: module.name, spec: toolSpec(tool) })
+      if (tool.action !== undefined) allActions.push(tool.action)
     }
+    allActions.push(...(module.intentActions ?? []))
     providers.push(...(module.context ?? []))
   }
-  const specs = Array.from(tools.values()).filter(({ tool }) => gateway.offers(tool.action?.definition ?? tool)).map(({ tool }) => toolSpec(tool))
+  /**
+   * The list and the actions the policy offers now (`ExecutionGateway.offerKey`): decided again only when what the
+   * policy offers changed, so reading them is a key comparison (one decision per tool after a change).
+   */
+  let offered: { readonly key: string; readonly specs: ReadonlyArray<ToolSpec>; readonly actions: ReadonlyArray<RegisteredAction> } | undefined
+  const offeredNow = () => {
+    const key = gateway.offerKey()
+    if (offered === undefined || offered.key !== key) {
+      offered = {
+        key,
+        specs: Array.from(tools.values()).filter(({ tool }) => gateway.offers(tool.action?.definition ?? tool)).map(({ spec }) => spec),
+        actions: allActions.filter((a) => gateway.offers(a.definition))
+      }
+    }
+    return offered
+  }
 
   const run = (call: ToolCall): Effect.Effect<ToolResult> => {
     const entry = tools.get(call.name)
@@ -142,10 +177,14 @@ export const makeToolRegistry = (modules: ReadonlyArray<AssistantModule>, option
     }).pipe(Effect.map((sections) => sections.filter((s) => s.length > 0).join("\n\n")))
 
   const registry = ToolRegistry.of({
-    specs,
+    get specs() {
+      return offeredNow().specs
+    },
     isSpeculative: (name) => tools.get(name)?.tool.speculative === true,
     actionFor: (name) => tools.get(name)?.tool.action,
-    actions,
+    get actions() {
+      return offeredNow().actions
+    },
     // Never with a caller's principal or a claim of confirmation: the turn's own context decides who it runs for.
     runAction: (action, values, runOptions) =>
       gateway.action(action, values, {

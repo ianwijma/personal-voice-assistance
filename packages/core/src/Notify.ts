@@ -16,6 +16,7 @@ import {
 } from "@pva/protocol"
 import { Effect, Schema } from "effect"
 import { type CoreStorage, defineCollection, maxListRows } from "./HouseholdStore.ts"
+import type { RiskByInput, ToolRisk } from "./Module.ts"
 import type { PartHandle } from "./ModuleRegistrations.ts"
 import type { PartRunner } from "./Scheduler.ts"
 import { NOT_ONE_LINE } from "./SettingsExtra.ts"
@@ -226,6 +227,12 @@ export interface NotifyActionHandler {
    * id**: after a store failure on the outcome's write, the same press may be made again and the handler runs again.
    */
   readonly run: (press: ActionPress) => Effect.Effect<ActionAnswer | void, unknown>
+  /**
+   * P8: what running it does, for the household's risk policy (decided by the execution gateway before `run`, on every
+   * press): a class, or a function of the press with the classes it can return. Absent: `change`. A refusal answers the
+   * press with the policy's spoken sentence, and `run` is not called.
+   */
+  readonly risk?: ToolRisk | RiskByInput<ActionPress>
 }
 
 /**
@@ -427,7 +434,7 @@ export interface PressAnswer {
    * Why it did not run: `not_running` (its handler is not published), `unknown` (no such notification or action here,
    * or not held by that connection), `busy` (another action of it is under way), `failed` (a store or handler failure).
    */
-  readonly code?: "not_running" | "unknown" | "busy" | "failed"
+  readonly code?: "not_running" | "unknown" | "busy" | "failed" | "refused"
 }
 
 /** The module-facing calls of a mode without the service (the CLI modes): `handle` succeeds, everything else is `unavailable`. */

@@ -17,12 +17,17 @@ export interface RiskByInput<I = any> {
 
 /**
  * Whose a result is (docs/MODULES-PLAN.md §2 row 8): the household's, or one person's (`owner`: a person id, or
- * `"unknown"`, which is treated as someone else's).
+ * `UNKNOWN_OWNER`, which is treated as someone else's).
  */
 export type Sensitivity = { readonly kind: "household" } | { readonly kind: "personal"; readonly owner: string }
 
-/** The owner of personal content that names nobody. */
-export const UNKNOWN_OWNER = "unknown"
+/**
+ * The owner of personal content that names nobody (`sensitivity: "personal"`, or a classifier that threw or answered
+ * nonsense). P8 review round 1 (H4): it cannot be a person id (`PersonId` is lower-case letters, digits, `_` and `-`), so
+ * no household member can be it, and the gateway withholds it before any membership lookup. A member whose id is the
+ * word "unknown" is an ordinary member.
+ */
+export const UNKNOWN_OWNER = "(unknown owner)"
 
 /**
  * What a tool or an action may do and how it behaves (docs/MODULES-PLAN.md §2 row 5, module-definition §B.5). All

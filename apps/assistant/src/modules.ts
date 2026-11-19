@@ -1,5 +1,5 @@
 import { claudeSubscriptionAgent } from "@pva/agent-claude-code"
-import { defaultRiskPolicy, makeModuleHost, type ModuleDefinition, type ModuleDemand, type ModuleHost, type ModulePersistence, type ModuleSnapshot, readOnlyPersistence, type TurnSetup, withContextProvider } from "@pva/core"
+import { makeModuleHost, RISK_POLICY_KEYS, riskLanguageOf, type ModuleDefinition, type ModuleDemand, type ModuleHost, type ModulePersistence, type ModuleSnapshot, readOnlyPersistence, type TurnSetup, withContextProvider } from "@pva/core"
 import { homeAssistantModule } from "@pva/module-home-assistant"
 import { catalog as assistantControlsModules } from "@pva/module-assistant-controls"
 import { catalog as briefingModules } from "@pva/module-briefing"
@@ -24,6 +24,7 @@ import type { Assistant, ModuleInfo } from "@pva/protocol"
 import { Config, Effect, type Scope } from "effect"
 import { CliSettingsRef } from "./cliSettings.ts"
 import { makeRequirementChecker, type RequirementChecker } from "./requirements.ts"
+import { effectiveRiskPolicy } from "./serve/riskPolicy.ts"
 import { DataDirConfig, loadSettingsStore } from "./serve/SettingsStore.ts"
 import { openVault, VaultPathConfig } from "./serve/Vault.ts"
 import { openCliHousehold } from "./serve/household.ts"
@@ -154,6 +155,20 @@ export const startCliModules = (
     // The household data read-only (serve is its one writer): version 2 modules read it here and every write is refused.
     const services = yield* Effect.context<never>()
     const household = yield* openCliHousehold({ dataDir, catalog, log: (line) => void Effect.runForkWith(services)(Effect.logWarning(line)) })
+    // P8: the household's risk policy and language as saved (serve mode is their one writer): read once here, through
+    // the same decoder as serve mode, from the settings the CLI modes read (the environment, then the saved values).
+    const saved = yield* Effect.all({
+      read: Config.String(RISK_POLICY_KEYS.read).pipe(Config.withDefault("")),
+      change: Config.String(RISK_POLICY_KEYS.change).pipe(Config.withDefault("")),
+      message: Config.String(RISK_POLICY_KEYS.message).pipe(Config.withDefault("")),
+      language: Config.String("HOME_LANGUAGE").pipe(Config.withDefault(""))
+    }).pipe(Effect.orElseSucceed(() => ({ read: "", change: "", message: "", language: "" })))
+    // The canonical reader (serve's): the values as environment values (trimmed, checked against the choices; the
+    // settings ConfigProvider already serves a saved value of the wrong type as its default).
+    const riskPolicy = effectiveRiskPolicy({
+      stored: {},
+      env: { [RISK_POLICY_KEYS.read]: saved.read, [RISK_POLICY_KEYS.change]: saved.change, [RISK_POLICY_KEYS.message]: saved.message }
+    })
     const host = yield* makeModuleHost({
       catalog,
       persistence,
@@ -163,8 +178,9 @@ export const startCliModules = (
       requirements: checker.check,
       // The CLI modes have no assistants: a call runs for the person at the terminal.
       localPrincipal: true,
-      // The same risk policy as serve mode: message, money and security are refused here too.
-      gatewayHooks: { riskPolicy: defaultRiskPolicy },
+      // The household's risk policy, decided as serve mode decides it (money and security are refused here too). No
+      // `mayReveal`: the CLI modes have no devices, and the person at the terminal is who asked.
+      gatewayHooks: { policy: () => riskPolicy, language: () => riskLanguageOf(saved.language) },
       programMissing: (tool) => checker.markMissing(tool)
     })
     yield* host.startEnabled

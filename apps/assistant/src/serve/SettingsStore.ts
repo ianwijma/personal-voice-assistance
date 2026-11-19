@@ -387,9 +387,11 @@ export interface SettingsStore {
   readonly settings: () => SettingsFile
   /**
    * P5: `listener(before, after)` runs synchronously in the step that commits a new settings state, before anything
-   * else can run (the device boundary, `serveMode.ts`). Returns an unsubscribe function.
+   * else can run (the device boundary, `serveMode.ts`). Returns an unsubscribe function. P8 (review round 2): a listener
+   * registered with `{ first: true }` runs before every other one (the risk policy's record is published there, so no
+   * commit observer and no resumed reader sees the old one).
    */
-  readonly onCommitted: (listener: (before: SettingsFile, after: SettingsFile) => void) => () => void
+  readonly onCommitted: (listener: (before: SettingsFile, after: SettingsFile) => void, options?: { readonly first?: boolean }) => () => void
   /** The secrets in effect: the vault's (empty while it is locked) once a vault exists, else `data/secrets.json`. */
   readonly secrets: () => SecretsFile
   /** Keys still in `data/secrets.json` (a count; 0 when the file is gone or empty). */
@@ -999,9 +1001,11 @@ export const loadSettingsStore = (directory: string, options: LoadOptions = {}):
        * save's.
        */
       const commitListeners = new Set<(before: SettingsFile, after: SettingsFile) => void>()
+      /** Listeners that run before every other one (`onCommitted(…, { first: true })`). */
+      const firstCommitListeners = new Set<(before: SettingsFile, after: SettingsFile) => void>()
       const notifyCommitted = (before: SettingsFile, after: SettingsFile) => {
         if (before === after) return
-        for (const listener of commitListeners) {
+        for (const listener of [...firstCommitListeners, ...commitListeners]) {
           try {
             listener(before, after)
           } catch (error) {
@@ -1461,9 +1465,10 @@ export const loadSettingsStore = (directory: string, options: LoadOptions = {}):
       const store: SettingsStore = {
         directory,
         settings: () => settings,
-        onCommitted: (listener) => {
-          commitListeners.add(listener)
-          return () => commitListeners.delete(listener)
+        onCommitted: (listener, options) => {
+          const set = options?.first === true ? firstCommitListeners : commitListeners
+          set.add(listener)
+          return () => set.delete(listener)
         },
         secrets: current,
         legacySecretCount: () => countKeys(secrets),

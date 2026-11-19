@@ -325,9 +325,11 @@ CurrentPrincipal: Context.Reference<Principal | undefined>       // the admitted
 - **The execution gateway** (`packages/core/src/Gateway.ts`) is the one way to `Tool.execute` and `ActionDefinition.run`:
   `ToolRegistry.run` (core's tool loop, the Claude Code bridge), `ToolRegistry.runAction` (the intent agent) and
   `host.actions.run`, and phrase commands (P7: `runTaken` in `PhraseRunner.ts` calls `ExecutionGateway.action` as a
-  `phrase` turn of the device, with the risk policy and the 5 s limit); later taps and routine steps (a notification's
-  action handler, P9, is admitted by `ExecutionGateway.principal` with the notification principal, as a job's handler
-  is). Every tool and action the
+  `phrase` turn of the device, with the risk policy and the 5 s limit); a press on a notification (P9) or a presentation
+  (P10) runs the module's registered handler after `ExecutionGateway.handler` admitted it (P8: the press's principal,
+  then the risk policy on the handler's declared `risk`, inferred `change`, recorded as a decision of kind `handler`; a
+  refusal answers `{ ok: false, say: <the policy's spoken sentence>, code: "refused" }`); a job's handler is admitted by
+  `ExecutionGateway.principal`; routine steps later. Every tool and action the
   host publishes is **sealed**: its own `execute`/`run` only refuses, and the real one (inside the host's in-flight
   tracking) is reachable only from the gateway (`GatewayPrivate.ts`, not exported from the package); a generated
   action tool's `execute` refuses too. Sealing stops **accidental** direct calls; it is not a security boundary against
@@ -345,12 +347,12 @@ CurrentPrincipal: Context.Reference<Principal | undefined>       // the admitted
   assistant has the module on; the tool is not in its `offTools` (`ModuleHostOptions.access`; skipped for the local
   principal and a notification); only then the module's **risk function** (`risk: { classes, of }`, else the declared
   or inferred class: `read` for speculative tools, else `change`), run on the validated input (a generated action
-  tool's input is resolved to the action's values once; those are classified, admitted and run); then the **risk
-  policy** on that class (`ModuleHostOptions.gatewayHooks.riskPolicy`: `defaultRiskPolicy` in serve mode, the CLI modes
-  and the module test kit; `read` and `change` run, `message` is refused as needing confirmation, `money` and
-  `security` are denied, each with its own sentence); then the later hook (`gatewayHooks.risk`, empty). A tool or
-  action whose every declared class the policy refuses is left out of every registry's `specs` and `actions` and of the
-  host's action catalogue (`ExecutionGateway.offers`); a call that names it is still refused. A tool without
+  tool's input is resolved to the action's values once; those are classified, admitted and run); then the household's
+  **risk policy** (P8, "Risk policy" below: `gatewayHooks.policy`, read at that moment, decided by `decideRisk`, the
+  refusal in the household's language, the decision recorded); then the later hook (`gatewayHooks.risk`, empty). A tool
+  or action whose every declared class the policy refuses is left out of every registry's `specs` and `actions`
+  (decided when they are read) and of the host's action catalogue (`ExecutionGateway.offers`); a call that names it is
+  still refused. After a tool runs, its result passes the `sensitivity` check before it goes back to the model. A tool without
   parameters is sent to a model as `{ "type": "object", "properties": {} }` (`toolSpec`). The host refuses, when a
   module starts, a tool name outside `[A-Za-z0-9_-]{1,64}`, a duplicate, and an action whose generated tool name is
   over 64 characters, naming it. A risk function that throws, answers a class it did not
@@ -379,6 +381,65 @@ CurrentPrincipal: Context.Reference<Principal | undefined>       // the admitted
   is 0.9 ms at the median before P1 (`main` at `548f5d2`) and 0.8 ms with it, 0.8 and 0.7 ms on the session path, and
   the tool turn's `current_time` takes 0.2 ms in both; every realistic scenario is within 1 ms. The bench's tools are a
   hand-made registry (through `defaultGateway` with P1), not the module host, and it has no Claude Code bridge.
+- **Risk policy (P8, first version; docs/MODULES.md §4).** A household setting (Shared settings › Risk policy: flat
+  keys `RISK_READ`, `RISK_CHANGE`, `RISK_MESSAGE`; `RISK_MONEY` and `RISK_SECURITY` shown fixed), one level: no
+  narrowing by assistant or device. The pure functions live in `@pva/protocol` (`risk.ts`), so the server, the CLI
+  modes, the test kit and the web mock share them; `@pva/core` re-exports them (`RiskPolicy.ts`):
+
+  ```ts
+  type RiskOutcome = "allow" | "confirm" | "deny"
+  interface RiskPolicy { read: RiskOutcome; change: RiskOutcome; message: RiskOutcome; money: "deny"; security: "deny" }
+  const DEFAULT_RISK_POLICY: RiskPolicy                    // { allow, allow, confirm, deny, deny }: P1's behaviour
+  type RiskDecision =
+    | { outcome: "allow"; by: ToolRisk } | { outcome: "confirm"; by: "read" | "change" | "message" }
+    | { outcome: "deny"; by: ToolRisk | "unjudged" | "unknown" }
+  decideRisk(policy, declared: ReadonlyArray<ToolRisk>, risk: ToolRisk | undefined): RiskDecision  // THE decision
+  riskOffered(policy, declared): boolean                   // some declared class is allowed (the tool list)
+  riskPolicyKey(policy): string                            // changes exactly when riskOffered can change
+  decodeRiskPolicy(value: (key) => unknown): RiskPolicy    // flat keys; a bad value is its default; money/security deny
+  riskPolicyOf(partial): RiskPolicy                        // the same decoder over an object (the kit)
+  riskPolicyValueProblem(key, value): string | undefined   // one value's save check
+  riskPolicyPatchProblems(values): ReadonlyArray<{ key, message }>  // THE save check: the real section (checkPatch) and the mock
+  riskReason / riskSpoken(language, decision), riskRefusalPrefix(language), riskWithheld(language), riskLanguageOf(HOME_LANGUAGE)
+  ```
+
+  The gateway's options (`GatewayOptions`, given to the host as `ModuleHostOptions.gatewayHooks`): `policy: () =>
+  RiskPolicy` (read at every decision and every list read; absent: nothing decided, every class allowed), `language: ()
+  => "en" | "nl"`, `mayReveal(owner, deviceId)` (the `sensitivity` check; absent in the CLI modes), `onDecision(record:
+  GatewayDecisionRecord)` (every decision on every path: kind, module, name, principal, turn id, outcome, class,
+  `withheld`). `ExecutionGateway` gains `offerKey()` (the registry decides its list again only when it changes) and
+  `handler(moduleId, name, meta, input)`: the admission of a registered press handler (a presentation's, a
+  notification's), with the handler's declared `risk` (`PresentPressHandler.risk`, `NotifyActionHandler.risk`, inferred
+  `change`). `GatewayRefused` carries `spoken`, `outcome` and `by` for a refusal of the policy (`spokenRefusal(error)`);
+  the intent agent says `spoken`; a refused press is answered `{ ok: false, say: spoken, code: "refused" }`. A turn's
+  decisions are on its `Trace.calls` (`TraceCall`: name, outcome, by, withheld; the latency line's `risk:` part):
+  `Conversation` provides `CurrentTurnTrace` around its tool calls and action runs, and the Claude Code bridge gives
+  each SDK call the turn's trace. A registry wrapper keeps reading the list through and carries the registry's gateway
+  association (`registryWith`, so core's confirmed path never falls back to a gateway without the policy).
+
+  **Serve's reader** (review round 1, H1): `effectiveRiskPolicy({ stored, env })` (`apps/assistant/src/serve/riskPolicy.ts`)
+  resolves the `risk` section's own fields exactly as every settings reader does (the environment trimmed and checked
+  against the choices, a saved value of the wrong type or outside them read as the field's default) and decodes them.
+  `Sections` publish its result into an in-memory record when they are made, in the settings store's first commit
+  listener (`SettingsStore.onCommitted(…, { first: true })`: the synchronous step that makes a new state the committed
+  one, before every other commit listener, before the save's caller and before any other fiber runs again; computed
+  from the committed values alone) and on `announceAll`, together with the language of its sentences
+  (`effectiveRiskLanguage`, the Home section's `HOME_LANGUAGE` field alone; `serveLanguageReader`); the gateway hook
+  (`servePolicyReader`) reads that record as a field: no section definitions are built and no file is touched on a
+  call. The settings `ConfigProvider` serves the policy's keys as the reader resolves them, and the CLI start runs the
+  same function over what it reads. **What is checked when:** the policy at every decision (each call, each held
+  action's second admission) and each tool-list read; `sensitivity` once, when a tool finishes (its result, or its
+  failure, H3), before it is formatted or presented (H2). A completed result that waits for sibling tools is not checked
+  again at dispatch: a result is decided once, when its tool finishes; serve fences and discards a device's session on
+  a committed boundary change (its turn is cancelled, `serveRiskWait.test.ts`).
+
+  **Measured** (the shared `bound()`, latency project; after review round 2's publication at the commit): `decideRisk`
+  58.5 ns per decision; a 64-tool list read 5.5 µs after a change and 0.46 µs otherwise
+  (`packages/core/test/RiskLatency.test.ts`); with serve's production reader over a real settings store
+  (`apps/assistant/test/riskLatency.test.ts`): a policy read 3.4 ns, the first read after a committed save 1.03 µs at
+  the median, a gateway tool call 4.28 µs without a policy and 4.43 µs with serve's reader and the decision (0.15 µs
+  added); a turn's end of turn → playback start (`TurnTrace`, a tool round, 80 turns × 4 counterbalanced runs)
+  10.710 ms with nothing saved and 10.761 ms with a saved policy.
 - **Availability.** `requires`, `platforms` and `apiVersion` are judged before anything starts, from the app's probes
   (`apps/assistant/src/requirements.ts`). Two kinds of requirement: a **program on the server** (`{ tool, version?,
   why }`) and the **network** (`{ network }`, not probed yet: `unchecked`). One program registry (argv and a version
@@ -916,7 +977,7 @@ ModuleNotify (ctx.notify) = {
   send(NotifyRequest): Effect<{ notification: Notification; deduped: boolean }, NotifyError>      // delivered now (no sending later)
   resolve(id | { key }, outcome? = "resolved"): Effect<boolean, NotifyError>
   list({ after?, limit? ≤ MAX_NOTIFY_PAGE (12) }?): Effect<ReadonlyArray<Notification>, NotifyError>   // the module's open ones; `after`: a view list returned
-  handle(name, { run(ActionPress): Effect<ActionAnswer | void, unknown> }): Effect<void, NotifyError>    // in shared: a registration
+  handle(name, { run(ActionPress): Effect<ActionAnswer | void, unknown>; risk?: ToolRisk | RiskByInput<ActionPress> }): Effect<void, NotifyError>    // in shared: a registration; risk (P8): absent = change
   dnd: { get: Effect<DndState, NotifyError>; set({ until? }?): Effect<DndState, NotifyError>; clear: Effect<DndState, NotifyError> }
 }
 NotifyRequest = { title (one line ≤ 60); text? (≤ 200); priority?: "normal" | "ring"; owner?: PersonId; target?: "origin" | "everywhere";
@@ -942,7 +1003,7 @@ NotifyEngine  = NotifyHook & { reconcile(deviceId); reconcileAll(); press(PressR
                                ringingOn(deviceId): RingingNotification[]; stopRinging(deviceId): Effect<number, NotifyError>; stopSpeech(deviceId): Effect<boolean>;
                                onRingingChanged(listener): () => void; dnd(): DndState & { known }; busyAnswer(): PressAnswer;
                                maintenanceScheduled(); plannedAt(); planNow; maintainNow; settled }
-PressRequest  = { notificationId, actionId, deviceId, connection?, person? }   PressAnswer = { ok, say, code?: "not_running" | "unknown" | "busy" | "failed" }
+PressRequest  = { notificationId, actionId, deviceId, connection?, person? }   PressAnswer = { ok, say, code?: "not_running" | "unknown" | "busy" | "failed" | "refused" }   // refused: P8, the risk policy
 makeNotifyEngine({ store, scheduler, devices, outputs(device): DeviceOutputs, privacy, outlet: () => NotifyOutlet?, speech: () => SpeechPort?,
                    gateway, pageText, language, issues?, log?, newId?, onDecision?, observe?, outcomeRetryMs?, now? }): Effect<NotifyEngine, never, Scope>
 NotifyOutlet  = { connections(deviceId): [{ id, send(NotifyMessage) }] }        // serve mode: the hub's voice connections of the device
@@ -982,8 +1043,9 @@ SpeechPort    = { speak(deviceId, text, { cue, gate: () => "go" | "wait" | NotDe
   `notify.handle` succeeds, every other call fails `unavailable` (`closedModuleNotify`).
 - **Presses**: admitted only for a connection that holds the card and while the decision allows it; a module action is
   claimed on the row in one transaction, then the handler runs through `PartRunner.inFlight` with the notification
-  principal (`asPrincipal`), admitted by `ExecutionGateway.principal` first, within 5 s; the outcome is written with
-  retries; `stop` is the host's and wins.
+  principal (`asPrincipal`), admitted by `ExecutionGateway.handler` first (P8: the principal, then the risk policy on
+  the handler's `risk`, inferred `change`; a refusal answers with the policy's spoken sentence, `code: "refused"`, and
+  releases the claim), within 5 s; the outcome is written with retries; `stop` is the host's, wins and is never refused.
 - **Speech**: `VoiceSession.announce.speak` makes the voice ready (`TurnSetup.tts`, `ttsReady`), waits until no play holds
   the output lease, no turn is in flight, no utterance is open in the recogniser and the state is not hearing, then plays
   with `OutputLease.playIfFree`, which checks under the lease's lock, in the step the play starts, that nothing plays and
@@ -1003,7 +1065,7 @@ SpeechPort    = { speak(deviceId, text, { cue, gate: () => "go" | "wait" | NotDe
 ```ts
 ModulePresent (ctx.present) = {
   show(target: "origin" | { device } | { room }, Presentation, { lifetime?: "transient" | "pinned", expiresInMs?, key? }?): Effect<PresentHandle, PresentError>
-  handle(name, { run(PresentPress): Effect<{ say? } | void, unknown> }): Effect<void, PresentError>      // in shared: a registration
+  handle(name, { run(PresentPress): Effect<{ say? } | void, unknown>; risk?: ToolRisk | RiskByInput<PresentPress> }): Effect<void, PresentError>      // in shared: a registration; risk (P8): absent = change
 }
 Presentation  = (card { title, text?, facts? } | list { title, style?, items } | timer { label, endsAt } | image { url, alt, credit, caption? }
                  | weather { place, now, days? }) & { kind, spoken, sensitivity?: "household" | { personal }, buttons?, handler? }
@@ -1029,7 +1091,7 @@ makePresentEngine({ store, scheduler, devices, outputs(device, declaredKinds?): 
 PresentOutlet = { connections(deviceId): [{ id, send(PresentMessage), kinds?(): Record<kind, version> | undefined }] }   // kinds: that page's own
 MediaPort     = { fetch(url): Effect<{ hash } | { refused: "type" | "size" | "busy" | "full" | "fetch" | "blocked" | "unavailable" }> }
 GatewayOptions.present = fromResult                                 // the gateway's split of { forModel, present }
-ActionCallOptions.onDecision({ risk?, refused?, presented? })      // P7's trace; P10 adds presented: true (TraceInfo.phrase.presented)
+ActionCallOptions.onDecision(ActionDecisionNote = { risk?, refused?, presented?, outcome?, by? })   // P7's trace; P10 adds presented: true; P8 the risk policy's decision (outcome, by)
 // @pva/protocol: presentationProblem, showOptionsProblem, presentLifetime, presentWireContent (the server and the mock);
 // ImageState.ready = { token }: a page's own address /media/<token>, never a hash
 ```
@@ -1072,9 +1134,9 @@ ActionCallOptions.onDecision({ risk?, refused?, presented? })      // P7's trace
   dropped. A tool's `{ forModel, present }` belongs to the module's newest open part.
 - **Presses**: admitted only for a connection that holds the presentation and while the decision (with that page's
   kinds) makes it interactive there; claimed in memory (one per presentation); the handler runs through
-  `PartRunner.inFlight` with the presentation principal, admitted by `ExecutionGateway.principal` first, within 5 s. It
-  is not a tool call: no risk class or trace of its own (the gateway has no call kind for registered handlers), the
-  same as a notification's action. The hub sends every `present.action` through its bounded admission (`busyAnswer()`
+  `PartRunner.inFlight` with the presentation principal, admitted by `ExecutionGateway.handler` first (P8: the
+  principal, then the risk policy on the handler's declared `risk`, inferred `change`, recorded; a refusal answers
+  `{ ok: false, say: <spoken>, code: "refused" }`), within 5 s, the same as a notification's action. The hub sends every `present.action` through its bounded admission (`busyAnswer()`
   at the bound). `NotifyEngine`'s origin knows the presentation principal.
 - **Turn path**: way 1 is a validation, the bounds read from memory, the decision for the origin device and one enqueue
   (the writer stores and reconciles off the turn); way 2 is one synchronous transaction and an enqueue. Measured:
@@ -1131,10 +1193,10 @@ PhraseSessionPort = { replyActive(); announcementActive(); stopReply; stopAnnoun
                       replyCancelled(); answering(); say(assistant?, text): Effect<"done" | "cut"> }   // replyCancelled: read after each wait (b1)
 CommandSlot = { take(); give() };  makeCommandSlot()            // one module action at a time per device; controls never busy
 KeptReply = { assistant; text };  keptReplyText(clauses);  MAX_KEPT_REPLY_CHARS = 2_000
-PhraseTrace = { by; name; turn?; tool?; risk?; refused?; actionMs?; totalMs; did: PhraseDid | "interrupted"; why? }   // once, from a finaliser; identity first
+PhraseTrace = { by; name; turn?; tool?; risk?; refused?; decision?: { outcome; by }; actionMs?; totalMs; did: PhraseDid | "interrupted"; why? }   // once, from a finaliser; identity first; decision: P8
 PhraseOutcome = { taken; did: "stopped-ring" | "pressed" | "stopped-announcement" | "stopped-reply" | "paused-media" | "cancelled" | "repeated" | "volume"
                   | "ran" | "nothing" | "refused" | "not-running" | "failed" | "busy"; said?; why? }
-ActionCallOptions.onDecision?({ risk?, refused? })              // Gateway.ts: the admission's outcome, for the trace
+ActionCallOptions.onDecision?(ActionDecisionNote)                // Gateway.ts: the admission's outcome (class, refusal, P8's decision), for the trace
 NotifyEngine.stopRinging(deviceId): Effect<number, NotifyError>  // fails (busy, failed) when a ring it found could not be stopped
 RouteGate.cancelReply()                                         // "never mind": the reply playing counts no more, windows close
 SessionControl (ServiceKey "core.session-control") = { stopReply(deviceId); cancelPending(deviceId); repeatLast(deviceId); newConversation(deviceId) }
@@ -1145,7 +1207,7 @@ REPLY_VOLUME = { min: 0.2, max: 1, step: 0.2, default: 1 };  stepReplyVolume(lev
 changeReplyVolume(volumes: ReplyVolumes, deviceId, change, cap = MAX_KEPT_VOLUMES (256)): { volumes; change; sends }   // THE state machine
 ReplyVolumes; NO_REPLY_VOLUMES; replyVolumeOf(volumes, deviceId)
 output.volume { volume }  (server → the voice connections of one device);  DevicePlace.ringingWithoutWake?: boolean (absent = on)
-TraceInfo.phrase?: PhraseTraceInfo = { by; name; did; why?; risk?; refused?; person?; actionMs? }   // a taken utterance's execution trace
+TraceInfo.phrase?: PhraseTraceInfo = { by; name; did; why?; risk?; refused?; decision?: { outcome; by }; person?; actionMs?; presented? }   // a taken utterance's execution trace (decision: P8, additive)
 // serve mode: VoiceSessionOptions.phrases: SessionPhrases = { language(); commandsFor(assistant?); ringing(); ports; onOutcome? }; onPhraseTrace(info)
 //             VoiceSession.control = { stopReply; cancelPending; repeatLast; lastReply() }; VoiceSession.phraseSlot; HubOptions.replyVolume(deviceId)
 //             INTERRUPTED_REPLY_WAIT_MS (2 s), CANNED_REPLY_WAIT_MS (3 min)
@@ -1159,8 +1221,10 @@ TraceInfo.phrase?: PhraseTraceInfo = { by; name; did; why?; risk?; refused?; per
   `phrase` turn. The host's `phrase` registrar (`ModuleHost.ts`, beside the routes) refuses a start whose phrases break a
   bound, name no parameter, use a `Param.dynamic` or a choice of more than 32 options or 96 names (or a name over 40
   characters), or are the host's; the check makes no lookup keys, so it is one short synchronous step. An assistant's
-  set is built from the actions its turns are offered (`offeredActions`: its module and tool switches, the risk
-  policy's offers), **prepared ahead** in steps of bounded work whenever those change (`makePhraseSets`; a yield after
+  set is built from every published, enabled action of the modules it has on, without the tools and action tools it
+  switched off (`offeredActions` without the policy's gateway): what the risk policy refuses stays in the set (P8), so
+  its phrase is taken and the decision is taken when the command runs (the same decision and spoken refusal as the
+  model's call of that action). It is **prepared ahead** in steps of bounded work whenever those change (`makePhraseSets`; a yield after
   `PREPARE_STEP_WORK` units), keyed by what it depends on; a final reads a ready set, or the host's controls alone.
 - **One decision per utterance**, in `VoiceSession.onStt` at the utterance's final (`decideUtterance`): nothing for an
   utterance cancelled before its final, whose final the session sends to the dispatcher with no words (with or without
@@ -1287,7 +1351,8 @@ apps/
 - Serve mode is tested with a scripted client (`apps/assistant/test/support/scriptedClient.ts`: a Node `ws` client that speaks the protocol and simulates the browser's player) against the real server with injected providers, plus one live test with the local models. Gotcha: `TestClock.adjust` waits only one scheduler hop before advancing, so let freshly forked fibers run first (see `advance` in `Conversation.test.ts`). The Conversation table above — speculation, promotion, discard, barge-in, tool loop — each has a test.
 - Adapters have unit tests for their protocol mapping against recorded/mock messages (a local mock WebSocket server), and an opt-in live test that runs only when the provider's API key is set.
 - Modules are tested with the module test kit (`@pva/core/testing`, P11; docs/MODULES.md §17): `startTestModule` runs one
-  definition in the real module host with serve mode's gateway checks and risk policy, the real scheduler engine on the
+  definition in the real module host with serve mode's gateway checks and risk policy (the household's `risk`,
+  changed with `setRiskPolicy`, every decision in `riskDecisions()`), the real scheduler engine on the
   in-memory store, the core's `Privacy` rule over a test household fixed for the test, and stand-ins for the modules it
   uses (`provide`, with stubs of their services: `stubService` records calls and answers what the test programs), and
   runs its tools, actions and jobs as a given turn; it does not imitate the HTTP router. `makeOfflineNet` gives

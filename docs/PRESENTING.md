@@ -212,22 +212,30 @@ transient the decision allows.
 - **What a press is**: the module's registered handler, run with the press's principal (`CurrentPrincipal`
   `presentation`: the presentation, and the device and connection it was pressed on), after three checks: the
   connection holds the presentation, the decision still lets it be pressed there (`interactive`), and the press is
-  claimed. **It is not a tool call**: it has no risk class and no trace of its own, and the assistant's module and tool
-  switches do not apply to it (it is admitted by the gateway's principal check, as a notification's action is; serve mode
-  checks that the connection is the device's). Whatever the handler calls through the gateway (a tool, an action) is
-  checked there as always, risk policy included.
+  claimed. **It is not a tool call**: the assistant's module and tool switches do not apply to it (it is admitted by the
+  gateway's principal check, as a notification's action is; serve mode checks that the connection is the device's).
+  **Under the risk policy (P8) it is a call of its own**: the gateway then decides it on the handler's declared `risk`
+  (absent: `change`) with the same function as every tool call, records the decision, and a refusal answers with the
+  policy's spoken sentence (`code: "refused"`) without running the handler. Whatever the handler calls through the
+  gateway (a tool, an action) is decided there as well.
 - **Admission** (synchronous, against this moment): the connection holds the presentation, it is live, the decision lets
   it be pressed there, and the press is a tick of an item a checklist has (with `done`) or a button it has. Knowing an id
   is not enough; another device's page gets "I can't do that right now."
 - **The claim**: one press at a time per presentation, in memory, before any module code runs; a second gets "That is
   being handled already." (A restart forgets the claim with the run.)
 - **The handler** the module registered with `ctx.present.handle(name, …)` **in `shared`** (a registration of the part:
-  published and withdrawn with the module) runs as a call in flight of the part, within 5 s. While it is not published
-  (the module is stopped, failed or restarting), the press answers "I can't do that right now." and nothing runs. It
-  answers `{ say? }` (default "Done."); a handler that fails or runs out of time answers "That didn't work.", and what it
-  committed before that stays (there is no rollback of a handler's own effects). The press itself changes nothing on the
-  page: the handler shows the change (`update`, or the same key again), which reconciliation sends. A handler may send a
-  notification to `"origin"`: the device it was pressed on.
+  published and withdrawn with the module) runs as a call in flight of the part, within 5 s, with the press's principal
+  (`CurrentPrincipal` `presentation`). Under the household's risk policy (P8) a press is a call of its own: after the
+  holder, decision and claim checks the execution gateway admits it by its principal and decides it with the same
+  function as every tool call, on the handler's declared `risk` (`PresentPressHandler.risk`: a class, or a function of
+  the press with the classes it can return; absent: `change`). A refusal answers with the policy's spoken sentence in
+  the household's language and `code: "refused"`, and the handler does not run; the decision is recorded like every
+  other (docs/MODULES.md §4). While it is not published (the module is stopped, failed or restarting), the press
+  answers "I can't do that right now." and nothing runs. It answers `{ say? }` (default "Done."); a handler that fails
+  or runs out of time answers "That didn't work.", and what it committed before that stays (there is no rollback of a
+  handler's own effects). The press itself changes nothing on the page: the handler shows the change (`update`, or the
+  same key again), which reconciliation sends. A handler may send a notification to `"origin"`: the device it was
+  pressed on.
 - The page sends `present.action` `{ id, action: "tick", item, done }` or `{ id, action: <button id> }`; it goes
   through the hub's bounded admission like every other request.
 
@@ -352,6 +360,6 @@ under 10 ms.
 `facts` as its own kind, `table`, `gallery`, `progress`, `confirm`, `handoff`, the built-in `show` and `show_on` tools,
 `present.status` (a page's report of a failed load, and the next turn's context), the reveal rule tied to clauses,
 resizing images (`sharp`), a reduced form of personal content on a shared screen, a presentation on "wherever this is
-already shown", moving or shrinking the character's box, a close button on the page, a risk class and a trace for a
-press handler (the gateway has no call kind for registered handlers yet), and keeping the image cache's address index
-across a restart.
+already shown", moving or shrinking the character's box, a close button on the page, and keeping the image cache's
+address index across a restart. (A press handler's risk class and its decision's record exist since P8: see "What a press
+is" above and docs/MODULES.md §4.)

@@ -402,10 +402,12 @@ export interface ModuleHostOptions {
    */
   readonly access?: GatewayAccess
   /**
-   * The gateway's risk policy (`defaultRiskPolicy`: serve mode, the CLI modes and the test kit give it) and its later
-   * check. Absent: every class is allowed (hand-made hosts of tests). There is no confirmation hook (§2 row 6).
+   * The gateway's risk policy (P8: a reader of the household's saved policy; serve mode, the CLI modes and the test kit
+   * give it), the language of its sentences, the `sensitivity` check (`mayReveal`), the recorder of its decisions, and
+   * its later check. Absent: nothing is decided and every class is allowed (hand-made hosts of tests). There is no
+   * confirmation hook (§2 row 6).
    */
-  readonly gatewayHooks?: Pick<GatewayOptions, "risk" | "riskPolicy">
+  readonly gatewayHooks?: Pick<GatewayOptions, "risk" | "policy" | "language" | "mayReveal" | "onDecision">
   /**
    * A call with no turn and no job runs for the local principal (the CLI modes: the person at the terminal). Default:
    * true without `access`, false with it (serve mode: such a call is refused).

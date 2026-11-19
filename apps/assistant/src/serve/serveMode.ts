@@ -8,7 +8,6 @@ import {
   makePresentEngine,
   type NotDelivered,
   notifyLanguageOf,
-  defaultRiskPolicy,
   makeToolRegistry,
   type ModuleDemand,
   type Principal,
@@ -116,6 +115,7 @@ import { type Jobs, makeJobs } from "./jobs.ts"
 import { makeModels, type Models, type PresetDownloader, presetsInUse } from "./models.ts"
 import { type Keys, makeKeys } from "./Keys.ts"
 import { makeSections } from "./sections.ts"
+import { serveLanguageReader, servePolicyReader } from "./riskPolicy.ts"
 import { makeAssistants } from "./assistants.ts"
 import { makeSessionHub, type SessionHub } from "./SessionHub.ts"
 import { DataDirConfig, KEYS_LOCKED_MESSAGE, loadSettingsStore, type SaveStep, type SettingsStore, SettingsStoreError } from "./SettingsStore.ts"
@@ -516,9 +516,21 @@ export const startServe = (options: ServeOptions): Effect.Effect<ServeHandle, Ht
       programMissing: (tool) => checker.markMissing(tool),
       // Serve mode: a call with no turn and no job is refused (a missing context never means "allowed").
       localPrincipal: false,
-      // The risk policy (P1's default): read and change run; message, money and security are refused, and a tool that
-      // can only be one of those is not offered at all.
-      gatewayHooks: { riskPolicy: defaultRiskPolicy },
+      // P8: the household's risk policy (Shared settings › Risk policy), read at every decision and every tool list from
+      // the record the sections publish with every committed save (a field read; review round 1, H1): a save applies to
+      // the next call. Its refusals in
+      // the household's language; a tool's `personal` result asked of the privacy rule for the call's device; a
+      // refusal outside a turn logged (a turn's decisions are in its trace line).
+      gatewayHooks: {
+        policy: servePolicyReader(sections),
+        language: serveLanguageReader(sections),
+        mayReveal: (owner, deviceId) => deviceFacts.privacy.mayReveal(owner, deviceId),
+        onDecision: (record) => {
+          if (record.turnId === undefined && record.outcome !== "allow") {
+            logInfo(`Risk policy: ${record.name} refused (${record.outcome}, ${record.by}) for a ${record.principal} call`)
+          }
+        }
+      },
       // The execution gateway's first checks, on every call (and the turn's action catalogue): the assistant has the
       // module on, and the tool is not one it switched off. Agents and decision providers are not per assistant.
       access: {
