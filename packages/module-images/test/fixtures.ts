@@ -13,6 +13,7 @@ export interface FileFixture {
   readonly thumburl?: string
   readonly mime?: string
   readonly licence?: string
+  readonly noLicence?: boolean
   readonly artist?: string
   readonly nonFree?: boolean
 }
@@ -45,7 +46,7 @@ export const fileAnswer = (files: ReadonlyArray<FileFixture>) => ({
         url: `https://upload.wikimedia.org/wikipedia/commons/a/ab/${encodeURIComponent(f.title.replace(/^File:/, ""))}`,
         mime: f.mime ?? "image/jpeg",
         extmetadata: {
-          ...(f.licence !== undefined || f.licence === undefined ? { LicenseShortName: { value: f.licence ?? "CC BY-SA 4.0" } } : {}),
+          ...(f.noLicence === true ? {} : { LicenseShortName: { value: f.licence ?? "CC BY-SA 4.0" } }),
           ...(f.artist !== undefined ? { Artist: { value: f.artist } } : {}),
           ...(f.nonFree === true ? { NonFree: { value: "true" } } : {})
         }
@@ -69,6 +70,12 @@ const empty = { batchcomplete: true }
 export const worldNet = (world: World, wrap?: (c: OfflineConnector) => OfflineConnector) => {
   const wikiFixture = (table: World["en"]) => (request: { readonly url: URL }) => {
     const q = request.url.searchParams.get("gsrsearch") ?? ""
+    const titled = request.url.searchParams.get("titles")
+    if (titled !== null) {
+      // A page by its exact title: any page of the table with that title, else a missing page.
+      const page = Object.values(table ?? {}).flat().find((p) => p.title === titled)
+      return { body: page === undefined ? { batchcomplete: true, query: { pages: [{ title: titled, missing: true }] } } : pageAnswer([page]) }
+    }
     const hit = table?.[q.toLowerCase()]
     return { body: hit === undefined ? empty : pageAnswer(hit) }
   }
