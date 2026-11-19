@@ -94,13 +94,16 @@ model (`routines_run`) runs every time; while the routine runs it is refused as 
 
 - **"cancel the routine"** ("annuleer de routine"), a phrase command of the module, or the tool **`routines_stop`**,
   ends the routine running on the asking device: no further step starts, its current line stops (playing or still
-  waiting), and nothing more is said. The answer says how far it got: "I stopped Queued; it had finished 0 of its 2
-  steps." or, while an action is under way, "I stopped Slowly during step 2; that step may still complete." (the
-  action is not cut off in the middle). "No routine is running here." when there is none. The routine can be started
-  again once the action under way has finished. The newest 64 phrase cancellation outcomes are remembered by assistant,
-  conversation, turn, device and command, before selecting a run: a replay returns the first answer and cancels nothing
-  else. Model calls cancel anew each time. The cancel action has `endsReply: true`, so cancelling over "Starting
-  Bedtime." does not repeat that start reply after the acknowledgement.
+  waiting), and nothing more is said. If the line is still being enqueued, cancellation waits for its handle or an
+  enqueue failure and stops the handle before answering. The answer says how far it got: "I stopped Queued; it had
+  finished 0 of its 2 steps." or, while an action is under way, "I stopped Slowly during step 2; that step may still
+  complete." (the action is not cut off in the middle). "No routine is running here." when there is none or a closing
+  report is already committed; a run cannot both acknowledge cancellation and announce completion. The routine can
+  be started again once the action under way has finished. Phrase cancellation outcomes are remembered by assistant,
+  conversation, turn, device and command (the newest 64, including pending cleanup), checked before selecting a run:
+  a replay waits for the first cancellation to finish cleanup, returns its answer and cancels nothing else.
+  Model calls cancel anew each time. The cancel action has `endsReply: true`, so cancelling over "Starting Bedtime."
+  does not repeat that start reply after the acknowledgement.
 - **The host's "stop"** stops what the device is saying. When that is the routine's own line, the routine ends there.
   **The host gives a module no signal for a "stop" said while an action of the routine runs** (or while nothing of the
   routine is being said), so that "stop" does not stop the routine: it goes on with its next step. Use "cancel the

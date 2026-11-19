@@ -3,9 +3,9 @@
 // step a gateway call as the person and device that started it, the run stopped (with one true sentence) by a refusal,
 // values that do not fit, a failure, the person, a cancel or a restart.
 import { assert, describe, it } from "@effect/vitest"
-import { ActionError, CurrentTurn, CurrentTurnTrace, defineAction, defineModule, Param, type Trace, type TurnContext } from "@pva/core"
+import { ActionError, CurrentTurn, CurrentTurnTrace, defineAction, defineModule, Param, SpeechError, type Trace, type TurnContext } from "@pva/core"
 import { checkModule, startTestModule, type TestHouseholdInput } from "@pva/core/testing"
-import { Deferred, Effect } from "effect"
+import { Deferred, Effect, Fiber } from "effect"
 import { vi } from "vitest"
 import { catalog, routinesModule, routinesOf, texts } from "../src/index.ts"
 import { makeRunner } from "../src/run.ts"
@@ -1064,4 +1064,154 @@ describe("routines: review round 2 regressions", () => {
         assert.notInclude(listed.content, rows[3]!.name)
       }
     }))
+})
+
+
+describe("routines: review round 3 regressions", () => {
+  it.effect("R3.1: cancellation waits for a claimed enqueue and prevents every playback start", () =>
+    Effect.gen(function*() {
+      const enqueuing = yield* Deferred.make<void>()
+      const resume = yield* Deferred.make<void>()
+      const gated: typeof routinesModule = {
+        ...routinesModule,
+        shared: (ctx) => routinesModule.shared!({
+          ...ctx,
+          speech: {
+            ...ctx.speech,
+            say: (target, text) => Effect.gen(function*() {
+              if (text === "First line.") {
+                yield* Deferred.succeed(enqueuing, undefined)
+                yield* Deferred.await(resume)
+              }
+              return yield* ctx.speech.say(target, text)
+            })
+          }
+        })
+      }
+      const seen: Array<Seen> = []
+      const kit = yield* startTestModule(gated, {
+        settings: { routines: [routine("Lights", [{ say: "First line." }, { call: "lamp.quiet" }])] }, others: helpers(seen)
+      })
+      yield* kit.notify.replying("kitchen-display", true)
+      yield* kit.tool("routines_run", { name: "Lights" })
+      yield* Deferred.await(enqueuing)
+      let returned = false
+      const cancelling = yield* Effect.forkChild(kit.tool("routines_stop", {}).pipe(Effect.tap(() => Effect.sync(() => { returned = true }))))
+      yield* kit.advance(0)
+      const returnedBeforeHandle = returned
+      yield* Deferred.succeed(resume, undefined)
+      const cancelled = yield* Fiber.join(cancelling)
+      yield* kit.notify.replying("kitchen-display", false)
+      yield* kit.advance(10_000)
+      assert.isFalse(returnedBeforeHandle, "cancellation must wait until the claimed enqueue settles")
+      assert.strictEqual(cancelled.value, "I stopped Lights; it had finished 0 of its 2 steps.")
+      assert.deepStrictEqual(kit.notify.announced, [])
+      assert.deepStrictEqual(seen, [])
+    }))
+
+  it.effect("R3.1: a concurrent phrase replay waits for cancellation cleanup even when enqueue fails", () =>
+    Effect.gen(function*() {
+      const enqueuing = yield* Deferred.make<void>()
+      const resume = yield* Deferred.make<void>()
+      const gated: typeof routinesModule = {
+        ...routinesModule,
+        shared: (ctx) => routinesModule.shared!({
+          ...ctx,
+          speech: {
+            ...ctx.speech,
+            say: (target, text) => Effect.gen(function*() {
+              if (text === "First line.") {
+                yield* Deferred.succeed(enqueuing, undefined)
+                yield* Deferred.await(resume)
+                return yield* new SpeechError({ reason: "unavailable", message: "Enqueue failed." })
+              }
+              return yield* ctx.speech.say(target, text)
+            })
+          }
+        })
+      }
+      const seen: Array<Seen> = []
+      const kit = yield* startTestModule(gated, {
+        settings: { routines: [routine("Lights", [{ say: "First line." }, { call: "lamp.quiet" }])] }, others: helpers(seen)
+      })
+      yield* kit.tool("routines_run", { name: "Lights" })
+      yield* Deferred.await(enqueuing)
+      const turn = { ...kit.turn({ source: "phrase" }), turnId: 41 }
+      let returned = 0
+      const cancel = kit.action("stop", {}, turn).pipe(Effect.tap(() => Effect.sync(() => { returned++ })))
+      const first = yield* Effect.forkChild(cancel)
+      yield* kit.advance(0)
+      const replay = yield* Effect.forkChild(cancel)
+      yield* kit.advance(0)
+      const returnedBeforeFailure = returned
+      yield* Deferred.succeed(resume, undefined)
+      const results = yield* Effect.all([Fiber.join(first), Fiber.join(replay)])
+      yield* kit.advance(10_000)
+      assert.strictEqual(returnedBeforeFailure, 0)
+      assert.deepStrictEqual(results, [
+        { ok: true, say: "I stopped Lights; it had finished 0 of its 2 steps." },
+        { ok: true, say: "I stopped Lights; it had finished 0 of its 2 steps." }
+      ])
+      assert.deepStrictEqual(kit.notify.announced, [])
+      assert.deepStrictEqual(seen, [])
+    }))
+
+  for (const [step, closing] of [
+    [{ call: "lamp.quiet" }, "Dim is done."],
+    [{ call: "flaky.fail" }, "Dim is done, but I couldn't confirm step 1."],
+    [{ call: "lamp.dim", params: { level: 150 } }, "Dim stopped at step 1: its values don't fit that action. Nothing before it was done."]
+  ] as const) {
+    it.effect(`R3.2: committing "${closing}" makes the run no longer cancellable`, () =>
+      Effect.gen(function*() {
+        const enqueuing = yield* Deferred.make<void>()
+        const resume = yield* Deferred.make<void>()
+        const gated: typeof routinesModule = {
+          ...routinesModule,
+          shared: (ctx) => routinesModule.shared!({
+            ...ctx,
+            speech: {
+              ...ctx.speech,
+              say: (target, text) => Effect.gen(function*() {
+                if (text === closing) {
+                  yield* Deferred.succeed(enqueuing, undefined)
+                  yield* Deferred.await(resume)
+                }
+                return yield* ctx.speech.say(target, text)
+              })
+            }
+          })
+        }
+        const seen: Array<Seen> = []
+        const kit = yield* startTestModule(gated, {
+          settings: { routines: [routine("Dim", [step])] }, others: helpers(seen)
+        })
+        yield* kit.notify.replying("kitchen-display", true)
+        yield* kit.tool("routines_run", { name: "Dim" })
+        yield* Deferred.await(enqueuing)
+        const cancelled = yield* kit.tool("routines_stop", {})
+        yield* Deferred.succeed(resume, undefined)
+        yield* kit.notify.replying("kitchen-display", false)
+        yield* kit.advance(10_000)
+        assert.strictEqual(cancelled.value, "No routine is running here.")
+        assert.deepStrictEqual(texts_(kit), [closing])
+        assert.deepStrictEqual(seen.map((s) => s.action), step.call === "lamp.dim" ? [] : [step.call])
+      }))
+  }
+
+  for (const how of ["disable", "restart", "settings save"] as const) {
+    it.effect(`R3.3: ${how} before a first call reports cut short with zero steps finished`, () =>
+      Effect.gen(function*() {
+        const seen: Array<Seen> = []
+        const rows = [routine("Lights", [{ call: "lamp.quiet" }, { say: "Good night." }]), GOOD_NIGHT]
+        const kit = yield* start(seen, rows)
+        assert.deepStrictEqual((yield* kit.tool("routines_run", { name: "Lights" })).value, { spoken: "Starting Lights." })
+        if (how === "settings save") assert.isTrue((yield* kit.configure({ routines: rows.slice(0, 1) })).ok)
+        else if (how === "restart") yield* kit.restart
+        else yield* kit.stop
+        yield* kit.advance(10_000)
+        assert.deepStrictEqual(texts_(kit), ["Lights was cut short when the routines module stopped; it had finished 0 of its 2 steps."])
+        assert.deepStrictEqual(kit.riskDecisions().map((d) => d.name), ["routines_run"])
+        assert.deepStrictEqual(seen, [])
+      }))
+  }
 })
