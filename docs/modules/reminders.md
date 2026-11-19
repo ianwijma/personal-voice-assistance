@@ -88,7 +88,7 @@ case a reminder that was already stopped can ring once more; it can never ring z
   eight. The next one is tomorrow at eight."); the series goes on after it. If cleanup from the answered ring is still owed, named Done retries that cleanup first. Cancel ends a repeat for good.
 - **Snooze** takes the notification and card down and rings the same time again after the setting's minutes (or a said
   duration). A snooze ending at or after the next regular occurrence is declined: choose a shorter snooze.
-  An older ring cannot be snoozed while a newer occurrence is waiting for delivery; snooze the newer one when it arrives.
+  An older ring cannot be snoozed while a newer occurrence is still recorded as owed; use Snooze on the newer notification once you see it, including when it is already on screen.
   After redelivery its notification, due card and lists use the snooze deadline as the due time; the original
   occurrence time remains its stable identity. The same button pressed again (the service may run a handler twice) does not push it further, even after redelivery; only the fresh delivery's own button can snooze it again.
 - An unnamed voice answer or a button answers one occurrence and the open notification selected for it. Admission is
@@ -106,6 +106,8 @@ case a reminder that was already stopped can ring once more; it can never ring z
   for the same time: **it rings again** after cleanup succeeds. The confirmation says the new words are waiting for delivery.
   If a newer occurrence is already waiting for delivery, that occurrence is kept instead of resending the older ring.
   A delivery already attempted also has its possibly open notification taken down before the new words are sent.
+  If that notification is open but recording its ring failed, the edit uses the same resend path: its retry window
+  starts at the edit, while its original effective due time remains on the card and in lists.
   Snoozed, it keeps its snooze and rings with the new words then. Editing only the words preserves the effective due
   time on the card, in lists and in the confirmation; the resend lateness clock starts at the edit.
 - **A new time** ends the ring (notification and card go) and any delivery under way; the reminder waits for its new
@@ -117,8 +119,10 @@ case a reminder that was already stopped can ring once more; it can never ring z
 Finishing, cancelling, answering, snoozing or changing a reminder takes its notification down and dismisses its card.
 Once an answer, change or cancellation is saved, a failed inline cleanup read does not turn its confirmation into a
 save failure: it confirms the saved result and reports any cleanup still owed. The row's job continues the remaining
-cleanup. For a notification button, the host also resolves that pressed notification.
-The tool or button tries that once, at once. If it fails, the reminder keeps **clean-up owed**, its job comes back a few
+cleanup. For a notification button, the host resolves the pressed notification after the handler returns. The saved
+answer keeps that notification as cleanup owed; its row job verifies the closure five seconds later, and resolves it
+if it is still open (including after a handler timeout). The inline cleanup leaves the host's active claim alone.
+Other notification and card cleanup is tried once, at once. If it fails, the reminder keeps **clean-up owed**, its job comes back a few
 seconds later (5 s, then doubling) and tries again, at most five times; then it is given up with a Health issue (the
 notification and card still end by themselves when they expire). The answer is true in each case: "Cancelled: call mum."
 only when the ring is gone; while tries are left "Cancelled: call mum. Its ring is still being taken down; I'll keep trying."; and
@@ -189,7 +193,7 @@ The briefing section `reminders` (a `BriefingSection` contribution) says what is
 the household's reminders and, only where `Privacy.mayReveal` allows it on the asking device now, their own. Personal
 ones it may not tell are only counted (`withheld`), within the same day as the visible ones; on a public device the
 personal content is never named. One sentence of at most 300 characters, built from whole items: three at most, else
-two and "and N more" when three do not fit ("You have four reminders today: A at five, B at six and two more."). It
+two and "and N more" when three do not fit, then one if needed ("You have four reminders today: A at five, B at six and two more."). It
 reads at most 204 open reminders; when that read was cut, every answer says so: "You have at least …; there may be
 more.", or "I couldn't read all the reminders; there may be some today." when none of today's were among them.
 
