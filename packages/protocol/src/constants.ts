@@ -86,6 +86,10 @@
  * pages; a page that does not know them ignores them), `notification.action` (a request a newer page sends; an older
  * page never sends it, and the server needs nothing from a page that does not) and `Result.say`. No closed set
  * gains a member: a press of an action whose handler is not running is answered with the existing `not_running`.
+ * P10, additive within 11 (docs/PRESENTING.md): `present.show`, `present.update` and `present.dismiss` (server → voice
+ * pages; a page that does not know them ignores them, and it is sent none, because it declares no presentation kinds)
+ * and `present.action` (a request only a newer page sends). No closed set the decoder checks gains a member: the kinds
+ * live inside the new messages, and `present.kinds` in a declaration was always an open record. So the version stays.
  */
 export const PROTOCOL_VERSION = 11
 

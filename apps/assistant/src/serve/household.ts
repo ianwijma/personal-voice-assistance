@@ -11,6 +11,7 @@ import {
   type FeedProblem,
   type ModuleDefinition,
   notifyStorage,
+  presentStorage,
   schedulerStorage,
   type TurnContext,
   StoreError
@@ -50,7 +51,7 @@ const assemble = (
 ) =>
   Effect.gen(function*() {
     // P6: the scheduler's collections (core.scheduler) are judged and upgraded with the modules'.
-    yield* store.prepare(declared(catalog), [schedulerStorage, notifyStorage])
+    yield* store.prepare(declared(catalog), [schedulerStorage, notifyStorage, presentStorage])
     for (const d of catalog) {
       const verdict = store.availability(d.id)
       if (verdict !== undefined && d.storage !== undefined) log(`Module ${d.name}: ${verdict.reason}`)

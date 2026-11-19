@@ -20,10 +20,13 @@ import {
   BUILT_IN_PLACE,
   type DeviceCapabilities,
   type DevicePrivacy,
+  devicePresentFrom,
   type HealthIssue,
   homeValuesOf,
   linkedModuleDefaults,
   type ModuleInfo,
+  PRESENT_KIND_VERSIONS,
+  type PresentationWire,
   type SettingsPatch,
   type SettingValue
 } from "@pva/protocol"
@@ -49,6 +52,8 @@ import { makeMemoryHouseholdStore } from "./MemoryHouseholdStore.ts"
 import { makeSchedulerEngine } from "./SchedulerEngine.ts"
 import { schedulerStorage } from "./SchedulerJobs.ts"
 import { type DndState, type Notification, notifications as notificationRows, NOTIFY_OWNER, notifyStorage, type PressAnswer, type StoredNotification } from "./Notify.ts"
+import { presentStorage, type PresentPressAnswer } from "./Present.ts"
+import { makePresentEngine, type MediaPort, type PresentDecisionRecord, type PresentMessage } from "./PresentEngine.ts"
 import { type DecisionRecord, makeNotifyEngine, notificationView, type NotifyMessage, type SpeechPort } from "./NotifyEngine.ts"
 import { deviceOutputsFrom } from "./Notify.ts"
 import { notifyLanguageOf } from "./NotifyTexts.ts"
@@ -465,6 +470,24 @@ export interface StartTestModuleOptions {
   readonly graceMs?: number
   /** P9: how long one announcement takes to play on the kit's speech (test-clock ms). Default 2,000. */
   readonly speechMs?: number
+  /**
+   * P10: the image cache the Presenter fetches images through (a fake: tests never reach the network). Default: none,
+   * so an image presentation is shown without its image (`unavailable`), as serve mode shows one it could not fetch.
+   */
+  readonly media?: MediaPort
+}
+
+/**
+ * P10: what a kit device's page declares when the test gives it no `capabilities`: this build's voice page on a tablet
+ * (a display with touch, every presentation kind, a speaker, a microphone), so the Presenter decides for it as serve
+ * mode decides for this build's page. A test that gives `capabilities` models any other device.
+ */
+export const KIT_PAGE_CAPABILITIES: DeviceCapabilities = {
+  v: 1,
+  display: { class: "standard", widthPx: 1024, heightPx: 768, dpr: 1, touch: "coarse", colour: true },
+  present: { kinds: { ...PRESENT_KIND_VERSIONS } },
+  speaker: { media: ["speech", "audio"] },
+  microphone: { farField: false }
 }
 
 export const DEFAULT_TEST_START = Date.UTC(2026, 10, 18, 9, 0, 0)
@@ -529,7 +552,7 @@ export const startTestModule = (definition: ModuleDefinition<any>, options: Star
     )
     // The household store and bus, and the scheduler engine, exactly as makeTestHousehold and makeTestScheduler make them.
     const store: HouseholdStore = makeMemoryHouseholdStore()
-    yield* store.prepare(catalog.map((m) => ({ id: m.id, storage: m.storage })), [schedulerStorage, notifyStorage]).pipe(Effect.orDie)
+    yield* store.prepare(catalog.map((m) => ({ id: m.id, storage: m.storage })), [schedulerStorage, notifyStorage, presentStorage]).pipe(Effect.orDie)
     const events: Array<HouseholdEvent> = []
     const recording = { bus: makeEventBus({ observe: (event) => void events.push(event) }), events }
     connectStoreToBus(store, recording.bus)
@@ -630,6 +653,37 @@ export const startTestModule = (definition: ModuleDefinition<any>, options: Star
       onDecision: (record) => void decisions.push(record)
     }).pipe(Scope.provide(lifetime))
 
+    // P10: the real Presenter on the same store, clock and gateway; one page per connected device records what it is sent.
+    const presentMessages: Array<{ readonly deviceId: string; readonly message: PresentMessage }> = []
+    const presentDecisions: Array<PresentDecisionRecord> = []
+    /** What each device's page holds now, replayed from what it was sent. */
+    const presentPages = new Map<string, Map<string, PresentationWire>>()
+    const recordPresent = (deviceId: string, message: PresentMessage) => {
+      presentMessages.push({ deviceId, message })
+      let page = presentPages.get(deviceId)
+      if (page === undefined) {
+        page = new Map()
+        presentPages.set(deviceId, page)
+      }
+      if (message.type === "present.dismiss") page.delete(message.id)
+      else page.set(message.presentation.id, message.presentation)
+    }
+    const present = yield* makePresentEngine({
+      store,
+      devices: () => people.devices.list(),
+      outputs: (d) => devicePresentFrom({ capabilities: { noDisplay: false, noSpeaker: false, excludeKinds: [] } }, declaredOf.get(d.id) ?? KIT_PAGE_CAPABILITIES),
+      privacy: people.privacy,
+      outlet: () => ({
+        connections: (deviceId) => (connectedNow.has(deviceId) ? [{ id: testConnectionOf(deviceId).id, send: (message) => recordPresent(deviceId, message) }] : [])
+      }),
+      ...(options.media !== undefined ? { media: () => options.media } : {}),
+      gateway: () => hostRef?.gateway,
+      pageText: (moduleId, text, max) => hostRef?.pageText(moduleId, text, max) ?? String(text).slice(0, max),
+      language: () => notifyLanguageOf(home.HOME_LANGUAGE),
+      issues,
+      onDecision: (record) => void presentDecisions.push(record)
+    }).pipe(Scope.provide(lifetime))
+
     // Who has which module on: every assistant has the module and the stand-ins on unless it says otherwise.
     let running = options.started ?? true
     const choiceOf = (assistant: TestAssistant, moduleId: string) => {
@@ -654,6 +708,8 @@ export const startTestModule = (definition: ModuleDefinition<any>, options: Star
         ? { assistantId: principal.job.assistantId, deviceId: principal.job.deviceId, connection: undefined, person: principal.job.person }
         : principal._tag === "notification"
         ? { assistantId: undefined, deviceId: principal.notification.deviceId, connection: principal.notification.connection, person: principal.notification.person }
+        : principal._tag === "presentation"
+        ? { assistantId: undefined, deviceId: principal.presentation.deviceId, connection: principal.presentation.connection, person: principal.presentation.person }
         : undefined
       if (parts === undefined) return undefined
       if (parts.assistantId !== undefined && !assistantIds.has(parts.assistantId)) return `the assistant "${parts.assistantId}" does not exist.`
@@ -683,6 +739,7 @@ export const startTestModule = (definition: ModuleDefinition<any>, options: Star
       household: { store, events: recording.bus },
       scheduler: observedScheduler(engine, schedulerUses),
       notify,
+      present,
       coreServices: people.coreServices,
       issues,
       localPrincipal: false,
@@ -710,7 +767,7 @@ export const startTestModule = (definition: ModuleDefinition<any>, options: Star
     hostRef = host
     yield* checked("after the start", driven(`the start of ${id}${(options.others ?? []).length > 0 ? " and the modules beside it" : ""}`, host.startEnabled))
 
-    const settle = Effect.andThen(Effect.andThen(engine.settled, notify.settled), Effect.repeat(Effect.yieldNow, { times: 20 }))
+    const settle = Effect.andThen(Effect.andThen(Effect.andThen(engine.settled, notify.settled), present.settled), Effect.repeat(Effect.yieldNow, { times: 20 }))
 
     /** The turn serve mode would make on a device of the household (default its first device). */
     const turn = (t: TestTurnInput = {}): TurnContext => {
@@ -932,6 +989,7 @@ export const startTestModule = (definition: ModuleDefinition<any>, options: Star
             // A new session: announcements from now on wait in it, not in the one that ended.
             if (sessions.get(deviceId) !== undefined && Deferred.isDoneUnsafe(sessions.get(deviceId)!)) sessions.delete(deviceId)
             notify.reconcile(deviceId)
+            present.reconcile(deviceId)
             return settle
           }),
         disconnect: (deviceId: string) =>
@@ -946,12 +1004,52 @@ export const startTestModule = (definition: ModuleDefinition<any>, options: Star
             Deferred.doneUnsafe(sessionOf(deviceId), Effect.void)
             replying.delete(deviceId)
             notify.reconcile(deviceId)
+            present.reconcile(deviceId)
             return settle
           }),
         /** Do not disturb now (`known: false` until it was read: it counts as on). */
         dnd: (): DndState & { readonly known: boolean } => notify.dnd(),
         /** Let deliveries and the scheduler finish what is due now. */
         settle: settle
+      },
+      /**
+       * P10: the Presenter as the module's tests see it: the real service on the kit's store, clock and gateway, one
+       * page per connected device (docs/PRESENTING.md "Testing"). `connect` and `disconnect` are the same as `notify`'s.
+       */
+      present: {
+        /** The service itself (`live`, `held`, `expireNow`). */
+        engine: present,
+        /** What a device's page holds now (default the first device), in the order it was given them. */
+        shown: (deviceId?: string): ReadonlyArray<PresentationWire> => [...(presentPages.get(deviceId ?? deviceList[0]?.id ?? "kitchen-display")?.values() ?? [])],
+        /** What the pages were sent, in order (`present.show`, `present.update`, `present.dismiss`), per device. */
+        messages: presentMessages as ReadonlyArray<{ readonly deviceId: string; readonly message: PresentMessage }>,
+        /** Every decision, in order: where something would show, and why not. */
+        decisions: presentDecisions as ReadonlyArray<PresentDecisionRecord>,
+        /**
+         * Press on a presentation as a device's page does (default the first device; its connection must hold it): a
+         * button by its id, or `tick` with `item` and `done`. The test clock is driven while the module's handler runs.
+         */
+        press: (presentationId: string, action: string, as: { readonly device?: string; readonly item?: string; readonly done?: boolean } = {}): Effect.Effect<PresentPressAnswer> => {
+          const deviceId = as.device ?? deviceList[0]?.id ?? "kitchen-display"
+          return checked(
+            `after pressing ${action}`,
+            Effect.andThen(
+              Effect.andThen(
+                settle,
+                driven(`the press of ${action}`, present.press({
+                  presentationId,
+                  action,
+                  ...(as.item !== undefined ? { item: as.item } : {}),
+                  ...(as.done !== undefined ? { done: as.done } : {}),
+                  deviceId,
+                  connection: testConnectionOf(deviceId)
+                }))
+              ),
+              (a) => Effect.as(settle, a)
+            )
+          )
+        },
+        settle
       },
       /**
        * Fail the test when the value of a secret given to the kit (`options.secrets`, four characters or more) is in

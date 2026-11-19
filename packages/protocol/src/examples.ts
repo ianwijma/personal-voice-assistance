@@ -630,6 +630,8 @@ export const clientExamples: { readonly [T in ClientMessageType]: Extract<Client
   },
   // P9 (additive within 11): a press on a ring card's button.
   "notification.action": { type: "notification.action", requestId: "n1", id: "n-4f2a", actionId: "stop" },
+  // P10 (additive within 11): a tick on a checklist item.
+  "present.action": { type: "present.action", requestId: "p1", id: "p-7c1d", action: "tick", item: "milk", done: true },
   ...assistantsClientExamples
 }
 
@@ -677,6 +679,19 @@ export const exampleHouseholdSnapshotFinal: Extract<ServerMessage, { readonly ty
   collections: [],
   truncated: [{ module: "shopping", collection: "items" }]
 }
+
+/** P10: a pinned checklist as a voice connection holds it. */
+export const examplePresentation = {
+  id: "p-7c1d",
+  lifetime: "pinned",
+  shownAt: 1_763_100_600_000,
+  serverNow: 1_763_100_600_000,
+  v: 1,
+  content: { kind: "list", title: "Shopping", style: "checklist", items: [{ id: "milk", text: "Milk", done: false }, { id: "eggs", text: "Eggs", done: false }] },
+  buttons: [{ id: "clear", label: "Clear ticked" }],
+  interactive: true,
+  texts: { region: "On screen", loading: "Loading the image…", imageMissing: "The image is not available.", timerDone: "Done", credit: "Image:", high: "High", low: "Low" }
+} as const
 
 export const serverExamples: { readonly [T in ServerMessageType]: Extract<ServerMessage, { readonly type: T }> } = {
   "welcome": {
@@ -787,6 +802,17 @@ export const serverExamples: { readonly [T in ServerMessageType]: Extract<Server
     }
   },
   "notification.resolved": { type: "notification.resolved", id: "n-4f2a", outcome: "stop" },
+  // P10 (additive within 11): a checklist on the stage, a tick taken in, and its end.
+  "present.show": { type: "present.show", presentation: examplePresentation },
+  "present.update": {
+    type: "present.update",
+    presentation: {
+      ...examplePresentation,
+      serverNow: 1_763_100_660_000,
+      content: { kind: "list", title: "Shopping", style: "checklist", items: [{ id: "milk", text: "Milk", done: true }, { id: "eggs", text: "Eggs", done: false }] }
+    }
+  },
+  "present.dismiss": { type: "present.dismiss", id: "p-7c1d" },
   ...assistantsServerExamples
 }
 

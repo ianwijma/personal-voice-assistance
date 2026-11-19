@@ -15,6 +15,7 @@ import type { ModuleEvents } from "./EventBus.ts"
 import type { ModuleStore } from "./HouseholdStore.ts"
 import type { ModuleRoute, RouteTokens } from "./ModuleRoutes.ts"
 import type { ModuleNotify, ModuleSpeech } from "./Notify.ts"
+import type { ModulePresent } from "./Present.ts"
 import type { ModuleScheduler } from "./Scheduler.ts"
 
 /**
@@ -452,6 +453,14 @@ export interface ModuleServicesV2 {
   readonly notify: ModuleNotify
   /** P9: one announcement on a device, a room's devices or everywhere, after whatever is spoken there (docs/NOTIFICATIONS.md). */
   readonly speech: ModuleSpeech
+  /**
+   * P10: presentations (docs/PRESENTING.md): `show` a card, a list, a timer, an image or the weather on the origin
+   * device, a device or a room (a handle with `update` and `dismiss`), and press handlers registered with `handle` during
+   * `shared` (published and withdrawn with the module). A tool or an action may instead return `{ forModel, present }`.
+   * Every call, a handle's too, dies with `ModuleStopped` once the part has closed. In the CLI modes `handle` succeeds and
+   * `show` fails `unavailable`.
+   */
+  readonly present: ModulePresent
 }
 
 /**

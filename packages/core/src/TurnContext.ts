@@ -97,6 +97,17 @@ export interface NotificationOrigin {
 }
 
 /**
+ * Where a press on a presentation comes from (P10): the presentation, and the device and connection it was pressed on.
+ * The gateway admits such a call by the presentation (`Principal`), like a notification's action.
+ */
+export interface PresentationOrigin {
+  readonly presentationId: string
+  readonly deviceId: string
+  readonly connection?: ConnectionRef
+  readonly person?: TurnPerson
+}
+
+/**
  * On whose behalf a tool or action runs: the execution gateway's admission takes one (docs/MODULES-PLAN.md §4 P1).
  *
  * - `turn`: a turn (assistant, device, person, connection), from `CurrentTurn`.
@@ -104,12 +115,15 @@ export interface NotificationOrigin {
  * - `local`: the person at the terminal (the CLI modes, which have no assistants); explicit, never assumed in serve mode.
  * - `notification`: an action on a notification (P9), admitted by the notification whatever modules the device's
  *   assistant has on. Passed explicitly; nothing produces it yet.
+ * - `presentation`: a press on a presentation (P10: a tick or a button), admitted by the presentation like a
+ *   notification's action. Passed explicitly by the Presenter.
  */
 export type Principal =
   | { readonly _tag: "turn"; readonly turn: TurnContext }
   | { readonly _tag: "job"; readonly job: JobOrigin }
   | { readonly _tag: "local" }
   | { readonly _tag: "notification"; readonly notification: NotificationOrigin }
+  | { readonly _tag: "presentation"; readonly presentation: PresentationOrigin }
 
 /** The local principal of the CLI modes. */
 export const LOCAL_PRINCIPAL: Principal = { _tag: "local" }
