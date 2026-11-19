@@ -718,11 +718,16 @@ For configurable risk keys and `HOME_LANGUAGE` (the policy's sentence language),
 file and compares its parsed values for those keys with the declarations captured at startup (or after this mover's
 own successful rewrites). A changed declaration or unreadable file refuses the move before any settings are saved;
 restart the assistant to reload the `.env` files, then retry. The override and field lock stay in place until the value
-is saved and every declaring file has been rewritten and checked with Node's parser to contain no assignment for
-the moved key. The line scanner includes Unicode line separators inside comments. Shadowed declarations are removed
-first, the winning declaration last; a failed or incomplete rewrite leaves earlier declarations in place, the override
-effective and the field locked. The value is already saved, and retrying the move finishes the remaining rewrites;
-if the files are edited by hand, restart the assistant to reload them first. File rewrites, release and the section
+is saved and every loaded file has been checked with Node's parser to contain no assignment for the moved key.
+After saving, the mover rereads every loaded file and compares its full text with the pre-save check; the rewrite
+also rereads its file immediately before replacement. A changed or unreadable file keeps the override locked and
+returns the retry sentence; hand edits require restarting the assistant to reload the files first. The line scanner
+uses Node's whitespace rules before a quote and includes Unicode line separators inside comments. Before replacement,
+Node's parser must confirm that every other key keeps its value; the mover checks those values again after rewriting.
+Shadowed declarations are removed first, the winning declaration last; a failed or incomplete rewrite leaves earlier
+declarations in place, the override effective and the field locked. The value is already saved, and retrying the move
+finishes the remaining rewrites. A completed rewrite whose verification read failed is remembered: Retry accepts the
+key's verified absence, but refuses an unexpected replacement value. File rewrites, release and the section
 announcement finish without caller interruption between them. An unrelated Home save does not write `HOME_LANGUAGE`.
 
 The Overrides page (Keys & access › Settings from outside) is derived client-side from every form's `locked` fields,

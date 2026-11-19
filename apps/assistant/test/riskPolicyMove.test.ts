@@ -1,8 +1,11 @@
 import { makeExecutionGateway, makeTool, makeToolRegistry } from "@pva/core"
 import { Effect, Schema } from "effect"
 import { existsSync, mkdtempSync, readFileSync, unlinkSync, writeFileSync } from "node:fs"
+import fsPromises from "node:fs/promises"
+import { syncBuiltinESMExports } from "node:module"
+import { parseEnv } from "node:util"
 import { tmpdir } from "node:os"
-import { join } from "node:path"
+import { dirname, join } from "node:path"
 import { describe, expect, it } from "vitest"
 import { commentOutKeys, makeEnvView } from "../src/envView.ts"
 import { makeEnvMover } from "../src/serve/envSettings.ts"
@@ -299,5 +302,156 @@ describe("policy move file validation (review round 3)", () => {
       expect(t.view.get(key)).toBeUndefined()
       expect(await t.restart()).toBe(t.state(t.sections))
     })
+  }
+})
+
+
+describe("policy move rewrite validation (review round 4)", () => {
+  const setup = async (key: string, initial?: string, duringSave?: (paths: string[]) => void) => {
+    const dir = mkdtempSync(join(tmpdir(), "pva-policy-rewrite-"))
+    const paths = [join(dir, "launch.env"), join(dir, "repo.env")]
+    const value = key === "HOME_LANGUAGE" ? "nl-NL" : "deny"
+    writeFileSync(paths[0]!, initial ?? `${key}=${value}\n`)
+    writeFileSync(paths[1]!, "# secondary\n")
+    const load = () => makeEnvView({ processEnv: {}, files: paths.map((path) => ({ path, text: readFileSync(path, "utf8") })) })
+    const view = load()
+    let armed = true
+    const store = await run(openStore(dir, { beforeStep: async (step) => {
+      if (armed && step === "journal") { armed = false; duringSave?.(paths) }
+    } }))
+    const sections = makeSections(store, view.record)
+    let announcements = 0
+    const options = { view, catalog: [], sections, store, host: {} as never, vaultState: () => "none" as const, onMoved: () => { announcements++ } }
+    const restart = async () => makeSections(await run(loadSettingsStore(dir, { readOnly: true })), load().record)
+    return { paths, value, view, sections, options, restart, announcements: () => announcements }
+  }
+
+  for (const key of ["HOME_LANGUAGE", "RISK_READ"]) {
+    for (const changed of ["shadow", "winner", "neighbor"]) {
+      it(`preserves ${key} files edited during save (${changed}) and stays locked with retry advice`, async () => {
+        const replacement = key === "HOME_LANGUAGE" ? "en-GB" : "allow"
+        let edited = ""
+        const t = await setup(key, undefined, (paths) => {
+          edited = changed === "neighbor" ? `${key}=${key === "HOME_LANGUAGE" ? "nl-NL" : "deny"}\nOTHER=changed\n` : `${key}=${replacement}\n`
+          writeFileSync(paths[changed === "shadow" ? 1 : 0]!, edited)
+        })
+        const result = await run(makeEnvMover(t.options).move([key]))
+        expect(result).toMatchObject({ ok: false, error: { message: expect.stringMatching(/retry the move.*reload/i) } })
+        expect(readFileSync(t.paths[changed === "shadow" ? 1 : 0]!, "utf8")).toBe(edited)
+        expect(t.view.get(key)).toBe(t.value)
+        expect(t.announcements()).toBe(0)
+      })
+    }
+  }
+
+  it("rechecks a file at the rewrite and preserves an edit made after the save check", async () => {
+    const t = await setup("HOME_LANGUAGE")
+    const edited = "HOME_LANGUAGE=en-GB\nOTHER=kept\n"
+    const mover = makeEnvMover({ ...t.options, commentOut: async (...args) => {
+      writeFileSync(args[0], edited)
+      return commentOutKeys(...args)
+    } })
+    expect(await run(mover.move(["HOME_LANGUAGE"]))).toMatchObject({ ok: false, error: { message: expect.stringMatching(/retry the move/i) } })
+    expect(readFileSync(t.paths[0]!, "utf8")).toBe(edited)
+    expect(t.view.get("HOME_LANGUAGE")).toBe(t.value)
+    expect(t.announcements()).toBe(0)
+  })
+
+  it("preserves an edit made while the replacement file is written", async () => {
+    const t = await setup("HOME_LANGUAGE")
+    const originalWrite = fsPromises.writeFile
+    const edited = "HOME_LANGUAGE=en-GB\nOTHER=kept\n"
+    fsPromises.writeFile = (async (...args: Parameters<typeof originalWrite>) => {
+      await Reflect.apply(originalWrite, fsPromises, args)
+      if (String(args[0]).startsWith(join(dirname(t.paths[0]!), ".launch.env.")) && String(args[0]).endsWith(".tmp")) writeFileSync(t.paths[0]!, edited)
+    }) as typeof originalWrite
+    syncBuiltinESMExports()
+    try {
+      expect(await run(makeEnvMover(t.options).move(["HOME_LANGUAGE"]))).toMatchObject({ ok: false })
+      expect(readFileSync(t.paths[0]!, "utf8")).toBe(edited)
+      expect(t.view.get("HOME_LANGUAGE")).toBe(t.value)
+    } finally {
+      fsPromises.writeFile = originalWrite
+      syncBuiltinESMExports()
+    }
+  })
+
+  it("verifies absence in a loaded file which originally had no declaration", async () => {
+    const t = await setup("HOME_LANGUAGE")
+    const mover = makeEnvMover({ ...t.options, commentOut: async (...args) => {
+      const result = await commentOutKeys(...args)
+      writeFileSync(t.paths[1]!, "HOME_LANGUAGE=en-GB\n")
+      return result
+    } })
+    expect(await run(mover.move(["HOME_LANGUAGE"]))).toMatchObject({ ok: false, error: { message: expect.stringMatching(/retry the move/i) } })
+    expect(t.view.get("HOME_LANGUAGE")).toBe(t.value)
+    expect(t.announcements()).toBe(0)
+  })
+
+  it("keeps the override when a completed rewrite changed another parsed value", async () => {
+    const t = await setup("HOME_LANGUAGE", "HOME_LANGUAGE=nl-NL\nHOME_TIME_ZONE=Europe/Amsterdam\n")
+    const mover = makeEnvMover({ ...t.options, commentOut: async (...args) => {
+      const result = await commentOutKeys(...args)
+      writeFileSync(args[0], "# incomplete rewrite\nHOME_TIME_ZONE=Australia/Sydney\n")
+      return result
+    } })
+    expect(await run(mover.move(["HOME_LANGUAGE"]))).toMatchObject({ ok: false })
+    expect(t.view.get("HOME_LANGUAGE")).toBe(t.value)
+    expect(t.announcements()).toBe(0)
+  })
+
+  for (const whitespace of ["\u00a0", "\v", "\f", "\u2028", "\u2029"]) {
+    it(`preserves neighboring values when a quote follows U+${whitespace.charCodeAt(0).toString(16)}`, async () => {
+      const text = `HOME_LANGUAGE=${whitespace}"old\nHOME_TIME_ZONE=Europe/Amsterdam\n# "\nHOME_LANGUAGE=nl-NL\nOTHER=kept\n`
+      const t = await setup("HOME_LANGUAGE", text)
+      expect(await run(makeEnvMover(t.options).move(["HOME_LANGUAGE"]))).toEqual({ ok: true, moved: ["HOME_LANGUAGE"] })
+      const { HOME_LANGUAGE: _language, ...before } = parseEnv(text)
+      expect(parseEnv(readFileSync(t.paths[0]!, "utf8"))).toEqual(before)
+      expect((await run(t.sections.update("home", { values: { HOME_LANGUAGE: "en-GB" }, secrets: {} }))).result.ok).toBe(true)
+      expect((await t.restart()).riskLanguage()).toBe("en")
+    })
+  }
+
+  for (const key of ["HOME_LANGUAGE", "RISK_READ"]) {
+    for (const replaced of [false, true]) {
+      it(`${replaced ? "rejects replacement on" : "recovers on"} retry after ${key} rename succeeds and one verification read fails`, async () => {
+        const t = await setup(key)
+        const originalRead = fsPromises.readFile
+        let failNext = false
+        fsPromises.readFile = (async (...args: Parameters<typeof originalRead>) => {
+          if (failNext && args[0] === t.paths[0]) {
+            failNext = false
+            throw Object.assign(new Error("one verification read failed"), { code: "EIO" })
+          }
+          return Reflect.apply(originalRead, fsPromises, args)
+        }) as typeof originalRead
+        syncBuiltinESMExports()
+        const mover = makeEnvMover({ ...t.options, commentOut: async (...args) => {
+          const result = await commentOutKeys(...args)
+          failNext = true
+          return result
+        } })
+        try {
+          expect(await run(mover.move([key]))).toMatchObject({ ok: false, error: { message: expect.stringMatching(/retry the move/i) } })
+          expect(t.view.get(key)).toBe(t.value)
+          expect(parseEnv(readFileSync(t.paths[0]!, "utf8"))[key]).toBeUndefined()
+          if (replaced) writeFileSync(t.paths[0]!, `${key}=${key === "HOME_LANGUAGE" ? "en-GB" : "allow"}\n`)
+          const retry = await run(mover.move([key]))
+          if (replaced) {
+            expect(retry).toMatchObject({ ok: false, error: { message: expect.stringMatching(/reload/i) } })
+            expect(t.view.get(key)).toBe(t.value)
+          } else {
+            expect(retry).toEqual({ ok: true, moved: [key] })
+            expect(t.view.get(key)).toBeUndefined()
+            const restarted = await t.restart()
+            expect(restarted.riskLanguage()).toBe(t.sections.riskLanguage())
+            expect(restarted.riskPolicy()).toEqual(t.sections.riskPolicy())
+          }
+        } finally {
+          fsPromises.readFile = originalRead
+          syncBuiltinESMExports()
+        }
+      })
+    }
   }
 })

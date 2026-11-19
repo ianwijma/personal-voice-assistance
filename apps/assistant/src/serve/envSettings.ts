@@ -258,7 +258,7 @@ export const makeEnvMover = (options: {
   readonly onMoved: () => void
   /** For tests. */
   readonly now?: () => Date
-  readonly commentOut?: (path: string, keys: ReadonlyArray<string>, now: Date) => Promise<CommentOutResult>
+  readonly commentOut?: (path: string, keys: ReadonlyArray<string>, now: Date, expectedText?: string) => Promise<CommentOutResult>
 }): EnvMover => {
   const envCatalog = makeEnvCatalog(options.catalog)
   const commentOut = options.commentOut ?? commentOutKeys
@@ -267,6 +267,7 @@ export const makeEnvMover = (options: {
   const expectedFiles = new Map(options.view.files.map((file) => [file, Object.fromEntries(
     Object.entries(options.view.fileValues(file)).filter(([key]) => policyInput(key))
   )]))
+  const pendingFiles = new Map<string, Set<string>>()
   let busy = false
 
   const fail = (code: "invalid_settings" | "locked" | "busy" | "internal", message: string): HostResult => ({ ok: false, error: { code, message } })
@@ -299,10 +300,24 @@ export const makeEnvMover = (options: {
       busy = true
       try {
         const policyKeys = planned.filter((p) => policyInput(p.key)).map((p) => p.key)
+        const checkedFiles = new Map<string, string>()
         if (policyKeys.length > 0) {
           for (const file of options.view.files) {
-            const current = yield* Effect.tryPromise(async () => parseEnv(await readFile(file, "utf8"))).pipe(Effect.result)
-            if (current._tag === "Failure" || policyKeys.some((key) => current.success[key] !== expectedFiles.get(file)?.[key])) {
+            const current = yield* Effect.tryPromise(async () => {
+              const text = await readFile(file, "utf8")
+              return { text, values: parseEnv(text) }
+            }).pipe(Effect.result)
+            if (current._tag === "Success") {
+              // A rename can succeed before its verification read fails. Absence on Retry completes that check.
+              for (const key of pendingFiles.get(file) ?? []) {
+                if (current.success.values[key] === undefined) {
+                  delete expectedFiles.get(file)![key]
+                  pendingFiles.get(file)!.delete(key)
+                }
+              }
+              checkedFiles.set(file, current.success.text)
+            }
+            if (current._tag === "Failure" || policyKeys.some((key) => current.success.values[key] !== expectedFiles.get(file)?.[key])) {
               return fail("invalid_settings", `${file} changed or could not be read: restart the assistant to reload .env files before moving these settings`)
             }
           }
@@ -332,6 +347,14 @@ export const makeEnvMover = (options: {
         }
         if (moved.length > 0) {
           yield* Effect.uninterruptible(Effect.gen(function*() {
+            // Saving can yield to a hand edit. Check every loaded path again before removing any declaration.
+            for (const [file, text] of checkedFiles) {
+              const unchanged = yield* Effect.tryPromise(async () => await readFile(file, "utf8") === text).pipe(Effect.result)
+              if (unchanged._tag === "Failure" || !unchanged.success) {
+                problems.push(`${file} changed or could not be read: retry the move; if the file was edited by hand, restart the assistant to reload .env files first`)
+                return
+              }
+            }
             // Remove shadowed declarations first and the winning one last. If a rewrite fails, leave earlier
             // declarations of that key in place: even a restart during this step still reads the chosen value.
             const byFile = new Map<string, Array<string>>()
@@ -346,9 +369,17 @@ export const makeEnvMover = (options: {
               const fileKeys = plannedKeys.filter((key) => !failedKeys.has(key))
               if (fileKeys.length === 0) continue
               const result = yield* Effect.tryPromise(async () => {
-                const rewritten = await commentOut(file, fileKeys, (options.now ?? (() => new Date()))())
+                const rewritten = await commentOut(file, fileKeys, (options.now ?? (() => new Date()))(), checkedFiles.get(file))
+                const pending = pendingFiles.get(file) ?? new Set<string>()
+                for (const key of fileKeys.filter(policyInput)) pending.add(key)
+                pendingFiles.set(file, pending)
                 // A completed write is not proof that the line scanner removed every Node-readable assignment.
                 const remaining = parseEnv(await readFile(file, "utf8"))
+                const before = checkedFiles.has(file) ? parseEnv(checkedFiles.get(file)!) : undefined
+                if (before !== undefined && [...new Set([...Object.keys(before), ...Object.keys(remaining)])]
+                  .some((key) => !fileKeys.includes(key) && before[key] !== remaining[key])) {
+                  throw new Error("Another environment value changed after rewriting")
+                }
                 if (fileKeys.some((key) => Object.hasOwn(remaining, key))) throw new Error("An environment assignment remains after rewriting")
                 return rewritten
               }).pipe(Effect.result)
@@ -359,13 +390,28 @@ export const makeEnvMover = (options: {
                 yield* Effect.logWarning(`Moved ${fileKeys.join(", ")} into the settings, but could not edit ${file} (${code})`)
               } else {
                 const expected = expectedFiles.get(file)
-                if (expected !== undefined) for (const key of fileKeys) delete expected[key]
+                if (expected !== undefined) for (const key of fileKeys) {
+                  delete expected[key]
+                  pendingFiles.get(file)?.delete(key)
+                }
                 yield* Effect.logInfo(`Moved ${fileKeys.join(", ")} from ${file} into the settings (backup: ${result.success.backup})`)
               }
             }
+            // Even a path with no original declaration must be free of the moved key before unlocking.
+            const movedPolicyKeys = moved.filter((p) => policyInput(p.key) && !failedKeys.has(p.key)).map((p) => p.key)
+            if (movedPolicyKeys.length > 0) for (const file of options.view.files) {
+              const remaining = yield* Effect.tryPromise(async () => parseEnv(await readFile(file, "utf8"))).pipe(Effect.result)
+              const unverified = movedPolicyKeys.filter((key) => remaining._tag === "Failure" || Object.hasOwn(remaining.success, key))
+              if (unverified.length > 0) {
+                for (const key of unverified) failedKeys.add(key)
+                problems.push(`${unverified.join(", ")} saved, but ${file} could not be verified: retry the move; if the file was edited by hand, restart the assistant to reload .env files first`)
+              }
+            }
             for (const p of moved) if (policyInput(p.key) && !failedKeys.has(p.key)) options.view.release(p.key)
-            options.sections.announceAll()
-            options.onMoved()
+            if (moved.some((p) => !failedKeys.has(p.key))) {
+              options.sections.announceAll()
+              options.onMoved()
+            }
           }))
         }
         if (problems.length > 0) {

@@ -24,7 +24,8 @@ export interface EnvAssignment {
   readonly lines: number
 }
 
-const ASSIGNMENT = /^\s*(?:export\s+)?([\w.-]+)\s*=\s*(.*)$/s
+// Node ignores carriage returns and skips only spaces and tabs before a quoted value.
+const ASSIGNMENT = /^[ \t\r]*(?:export[ \t\r]+)?([\w.-]+)[ \t\r]*=[ \t\r]*(.*)$/s
 
 /**
  * The assignments of a `.env` text, in order (a key assigned twice appears twice; the last one wins, as in
@@ -198,9 +199,11 @@ export interface CommentOutResult {
 export const commentOutKeys = async (
   path: string,
   keys: ReadonlyArray<string>,
-  now: Date = new Date()
+  now: Date = new Date(),
+  expectedText?: string
 ): Promise<CommentOutResult> => {
   const text = await readFile(path, "utf8")
+  if (expectedText !== undefined && text !== expectedText) throw new Error("The environment file changed before rewriting")
   const { mode } = await stat(path)
   const wanted = new Set(keys)
   const eol = text.includes("\r\n") ? "\r\n" : "\n"
@@ -217,14 +220,23 @@ export const commentOutKeys = async (
   }
   for (; next < lines.length; next++) out.push(lines[next]!)
 
+  const rewritten = out.join(eol)
+  const originalValues = parseEnv(text)
+  const rewrittenValues = parseEnv(rewritten)
+  const otherKeys = new Set([...Object.keys(originalValues), ...Object.keys(rewrittenValues)].filter((key) => !wanted.has(key)))
+  if ([...otherKeys].some((key) => originalValues[key] !== rewrittenValues[key])) {
+    throw new Error("Rewriting would change another environment value")
+  }
+
   const stamp = now.toISOString().replace(/[:.]/g, "-")
   const backup = `${path}.bak-${stamp}`
   await copyFile(path, backup)
   await chmod(backup, 0o600)
   const tmp = join(dirname(path), `.${basename(path)}.${randomBytes(6).toString("hex")}.tmp`)
   try {
-    await writeFile(tmp, out.join(eol), { mode: mode & 0o777 })
+    await writeFile(tmp, rewritten, { mode: mode & 0o777 })
     await chmod(tmp, mode & 0o777)
+    if (await readFile(path, "utf8") !== text) throw new Error("The environment file changed before rewriting")
     await rename(tmp, path)
   } catch (error) {
     await unlink(tmp).catch(() => {})
