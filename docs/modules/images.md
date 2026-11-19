@@ -102,8 +102,12 @@ a deeply nested one, asserted under 10 ms with the shared `bound()`).
 
 ## What was left out
 
-- **Phrase commands and a typed action** (the fast path "show me a …" without the model): phrase commands are not in this
-  stack's base yet ([MODULES.md](../MODULES.md) wave note); the plan's row asks only for the tool.
+- **A typed action and phrase commands** ("show me a picture of …" without the model; phrase commands are in this stack
+  since P7, [PHRASES.md](../PHRASES.md)): the plan's row asks only for the tool, and an action cannot say a true sentence
+  yet. An action returns one `say`, spoken as it is, and the gateway drops the Presenter's note for an action outcome
+  (`Gateway.ts`, the intent agent path), so the action cannot know whether the picture was shown. "Here is a picture of …"
+  is false on a speaker, and "I can't show it here" false on a screen. The smallest change that would provide it: an action
+  outcome `{ say, sayIfNotShown, present }` where the server speaks `sayIfNotShown` when the Presenter did not show it.
 - **`gallery` with `pick`** and other kinds that are not in the Presenter (PRESENTING.md, "Not now"): an ambiguous word is a
   spoken question with the candidates named. The module also does not split results into clusters; only a Wikipedia
   disambiguation page (or a title match on one) makes a word ambiguous.
