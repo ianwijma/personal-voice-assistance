@@ -138,6 +138,7 @@ import { makeReplyVolumes, makeServePhrases } from "./phraseCommands.ts"
 import { openServeScheduler } from "./scheduler.ts"
 import { boundaryChanged, makeDeviceFacts, membersRemoved } from "./deviceFacts.ts"
 import { makeMediaCache } from "./media.ts"
+import type { SafeFetchOptions } from "@pva/net"
 import { effectiveMembersOf, makeMembersGate, makePeopleService, MEMBERS_ENV_REFUSED, MEMBERS_KEY, MEMBERS_SECTION_ID } from "./people.ts"
 import { householdBackupIssues, runMaintenance } from "@pva/store-sqlite"
 import { type KdfParams, openVault, type Vault, VaultPathConfig } from "./Vault.ts"
@@ -255,6 +256,8 @@ export interface ServeOptions {
   readonly minuteMs?: number
   readonly helloTimeoutMs?: number
   readonly pingIntervalMs?: number
+  /** P10, tests: where the image cache's fetches go (a resolver and a connector standing in for the network). */
+  readonly mediaFetch?: Pick<SafeFetchOptions, "resolver" | "connector">
   /** Tests: called before each file step of a settings save (to hold one save while another request comes in). */
   readonly settingsBeforeStep?: (step: SaveStep) => void | Promise<void>
 }
@@ -454,16 +457,18 @@ export const startServe = (options: ServeOptions): Effect.Effect<ServeHandle, Ht
     // P10: the Presenter (docs/PRESENTING.md) on the same store, made before the module host it gives `ctx.present` and the
     // gateway's split to. Pages (the hub), the image cache, the gateway and the page boundary are bound once they exist;
     // nothing is shown before a page says hello.
-    const media = yield* makeMediaCache({ dir: join(options.dataDir, "media"), log: logInfo })
+    const media = yield* makeMediaCache({ dir: join(options.dataDir, "media"), log: logInfo, ...(options.mediaFetch !== undefined ? { fetchOptions: options.mediaFetch } : {}) })
     const present = yield* makePresentEngine({
       store: household.store,
+      scheduler,
       devices: () => deviceFacts.devices.list(),
       // One place for what a device can show: its declaration minus its overrides (`devicePresentFrom`).
-      outputs: (d) => deviceFacts.presentOf(d.id, d.kind),
+      outputs: (d, declared) => deviceFacts.presentOf(d.id, d.kind, declared),
       privacy: deviceFacts.privacy,
       outlet: () =>
         hub === undefined ? undefined : {
-          connections: (deviceId) => hub!.voiceConnections().filter((c) => c.deviceId === deviceId).map((c) => ({ id: c.id, send: c.send }))
+          // Each connection is sent only the kinds its own page declared (an older tab beside a newer one gets none).
+          connections: (deviceId) => hub!.voiceConnections().filter((c) => c.deviceId === deviceId).map((c) => ({ id: c.id, send: c.send, kinds: () => c.declared?.()?.present?.kinds }))
         },
       media: () => media,
       issues,
@@ -1817,8 +1822,8 @@ export const startServe = (options: ServeOptions): Effect.Effect<ServeHandle, Ht
       crossOriginIsolation: options.crossOriginIsolation ?? true,
       hub: hubNow,
       api: (req, res) => (isModuleRoutePath(req.url) ? moduleRouter.handle(req, res) : api(req, res)),
-      // P10: `/media/<hash>`, only for an image a page holds now.
-      media: (req, res) => media.serve(req, res, present.holdsHash),
+      // P10: `/media/<token>`, a page's own address of an image it holds now.
+      media: (req, res) => media.serve(req, res, present.mediaFor),
       ...(options.pingIntervalMs !== undefined ? { pingIntervalMs: options.pingIntervalMs } : {})
     })
 

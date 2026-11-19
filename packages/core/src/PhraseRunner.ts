@@ -129,6 +129,8 @@ export interface PhraseTrace {
   readonly refused?: string
   /** How long the module's action ran. */
   readonly actionMs?: number
+  /** P10: the action's outcome carried a presentation, handed to the Presenter. */
+  readonly presented?: boolean
   /** From the run's start to the end of what was said (or to the interruption). */
   readonly totalMs: number
   /** What it came to; `interrupted`: the caller was interrupted before the operation decided an outcome. */
@@ -243,6 +245,7 @@ interface TraceRecord {
   refused?: string
   actionStarted?: bigint
   actionMs?: number
+  presented?: boolean
 }
 
 /** Run what took an utterance. Never fails (an interruption of the caller interrupts it): every failure is an outcome. */
@@ -278,6 +281,7 @@ export const runTaken = (taken: Taken, ports: PhrasePorts): Effect.Effect<Phrase
             ...(rec.risk !== undefined ? { risk: rec.risk } : {}),
             ...(rec.refused !== undefined ? { refused: rec.refused } : {}),
             ...(rec.actionMs !== undefined ? { actionMs: rec.actionMs } : {}),
+            ...(rec.presented === true ? { presented: true } : {}),
             totalMs: Number(now - started) / 1e6,
             did,
             ...(why !== undefined ? { why } : {})
@@ -408,6 +412,7 @@ const operate = (taken: Taken, ports: PhrasePorts, rec: TraceRecord): Effect.Eff
           onDecision: (d) => {
             if (d.risk !== undefined) rec.risk = d.risk
             if (d.refused !== undefined) rec.refused = d.refused
+            if (d.presented === true) rec.presented = true
           }
         }).pipe(Effect.timeoutOrElse({ duration: ACTION_TIMEOUT_MS, orElse: () => Effect.fail(new PhraseTimeout()) }))
       )

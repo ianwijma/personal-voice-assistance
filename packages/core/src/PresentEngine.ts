@@ -21,12 +21,13 @@ import {
   type PresentDecision,
   PRESENT_KIND_VERSIONS,
   type PresentKindName,
+  presentLifetime,
   sameRoom,
   selectPresentations,
   type ServerMessageOf,
   TICK_ACTION
 } from "@pva/protocol"
-import { Cause, Clock, Effect, Exit, Queue, Scope } from "effect"
+import { Cause, Clock, Deferred, Effect, Exit, Queue, Schema, Scope } from "effect"
 import type { KnownDevice } from "./Devices.ts"
 import { asPrincipal, type ExecutionGateway } from "./Gateway.ts"
 import { HOUSEHOLD_SCOPE, type HouseholdStore, type Row, type StoreFailure, type TxCollection, type TxResult } from "./HouseholdStore.ts"
@@ -35,15 +36,13 @@ import { isModuleStopped } from "./ModuleApi.ts"
 import type { PartHandle } from "./ModuleRegistrations.ts"
 import type { NotifyLanguage } from "./NotifyTexts.ts"
 import {
-  PRESENT_DEFAULT_EXPIRY_MS,
   isPresentResult,
-  PRESENT_MAX_EXPIRY_MS,
   MAX_LIVE_PER_MODULE,
   MAX_LIVE_TOTAL,
   MAX_NOTE_CHARS,
+  MAX_NOTE_SPOKEN_CHARS,
   MAX_PINNED_PER_DEVICE,
   MAX_PRESS_ANSWER_CHARS,
-  PRESENT_MIN_EXPIRY_MS,
   type ModulePresent,
   type Presentation,
   presentationProblem,
@@ -67,34 +66,37 @@ import {
   type ShowOutcome,
   type ShownOn,
   type StoredContent,
-  type StoredPresentation,
-  TIMER_GRACE_MS
+  type StoredPresentation
 } from "./Present.ts"
 import { presentPageTexts, presentText, type PresentTextKey } from "./PresentTexts.ts"
 import type { PrivacyService } from "./Privacy.ts"
 import { quotedName } from "./PromptText.ts"
 import type { PartRunner } from "./Scheduler.ts"
+import type { SchedulerEngine } from "./SchedulerEngine.ts"
 import { CurrentJob, CurrentPrincipal, CurrentTurn, type Principal } from "./TurnContext.ts"
 
 /**
  * The Presenter (docs/PRESENTING.md; the contract is `Present.ts`). One per server: serve mode makes it on the household
- * store before the module host, and the module test kit on its in-memory store and test clock. On a turn's path it costs
- * only what `fromResult` does (a validation, the decision for the turn's device and one enqueue) or, for a module that
- * calls `ctx.present.show` itself, one synchronous transaction and an enqueue.
+ * store and the scheduler before the module host, and the module test kit on its in-memory store and test clock.
  *
- * - **An index** of the live presentations (id → module, key, part, lifetime, target, owner, kind, handler, times) is
- *   kept in memory, loaded from the store at start and changed only in the commit hooks of the engine's own
- *   transactions, so the bounds, the targets and the next end are read without the store; the content is read from the
- *   store with its synchronous reader in the step that sends it.
+ * - **What is shown is decided from the current state at once** (review round 1, G1): an in-memory index of the live
+ *   presentations (everything but their content) is the truth of what is eligible. A presentation that ends, is
+ *   dismissed or replaced, or whose part stopped leaves the index at that moment and its holders are reconciled at
+ *   once, whether or not its row could be marked or removed yet. Durable removal is separate work (`doomed`), repeated
+ *   until it succeeds.
  * - **Reconciliation** (`reconcile`) is the only sender of `present.show`, `present.update` and `present.dismiss`. A pass
- *   over a device is one synchronous step: what applies to it now (the index), each decided now (`decidePresentation`,
- *   the privacy rule asked for that device), what it shows of them (`selectPresentations`), each row read now, and every
- *   connection of the device made to hold exactly that. Passes run one at a time in one fiber, yielding between devices;
- *   a pass that fails marks its device for the next trigger and a retry a minute later.
- * - **Ends**: one fiber sleeps until the earliest end among the live ones and removes what has ended (a page of rows per
- *   transaction); a part that stops removes its transient presentations; dismissing removes the row.
+ *   over a device is one synchronous step that first withdraws, from each connection, what it holds and may not hold
+ *   now (the index and the decision alone, no store read), and only then reads the content of what stays or is added;
+ *   a failed read affects only those items and is repeated (G2). What each connection may hold is also limited to the
+ *   kinds that connection declared (G11).
+ * - **Writes are derived inside their transaction** (G3): an update re-reads the entry and its row in the attempt that
+ *   succeeds and the index follows what it committed; a key has one stable id across queued and committed shows.
+ * - **Maintenance** (the notification service's pattern): one one-shot scheduler job `core.present/due`, planned by
+ *   `plan()` for the next thing due (an end, removal of what left the index, failed work to repeat; none when nothing
+ *   is), planned again after every change, at the end of every run and at start; plus `core.present/hourly`, a safety
+ *   net counting in UTC. The Presenter has no timer of its own.
  * - **A press** is admitted only for a connection that holds the presentation and while the decision still lets it be
- *   pressed there; it is claimed (one at a time per presentation) before the module's handler runs through the gateway.
+ *   pressed there; it is claimed (one at a time per presentation) before the module's handler runs.
  */
 
 export type PresentMessage = ServerMessageOf<"present.show"> | ServerMessageOf<"present.update"> | ServerMessageOf<"present.dismiss">
@@ -103,6 +105,11 @@ export type PresentMessage = ServerMessageOf<"present.show"> | ServerMessageOf<"
 export interface PresentConnection {
   readonly id: string
   readonly send: (message: PresentMessage) => void
+  /**
+   * The presentation kinds this connection's own page declared (its hello, then `device.caps`), kind → version;
+   * `undefined` when it declared none (an older page). Absent (tests, the kit): the device's outputs alone decide.
+   */
+  readonly kinds?: () => Readonly<Record<string, number>> | undefined
 }
 
 /** The voice pages (serve mode: the hub). */
@@ -141,12 +148,18 @@ export interface PresentView {
 }
 
 export interface PresentEngineOptions {
-  /** The household store, prepared with `presentStorage`. */
+  /** The household store, prepared with `presentStorage` (and `schedulerStorage`). */
   readonly store: HouseholdStore
+  /** The scheduler: the service's two jobs (`forCore("core.present")`). */
+  readonly scheduler: SchedulerEngine
   /** The known devices (`Devices.list`): names, rooms. */
   readonly devices: () => ReadonlyArray<KnownDevice>
-  /** A device's presentation outputs now (serve mode: `DeviceFacts.presentOf`, from `devicePresentFrom`). */
-  readonly outputs: (device: KnownDevice) => DevicePresentOutputs
+  /**
+   * A device's presentation outputs now (serve mode: `DeviceFacts.presentOf`, from `devicePresentFrom`): its display and
+   * the owner's overrides, with the kinds of `declared` (one connection's own page, G11) when it is given, else of the
+   * device's latest declaration.
+   */
+  readonly outputs: (device: KnownDevice, declared?: Readonly<Record<string, number>>) => DevicePresentOutputs
   /** The privacy rule, asked at each decision for the device that would show it. */
   readonly privacy: PrivacyService
   /** Late-bound: the voice pages (the hub). Absent: nobody is connected. */
@@ -155,7 +168,7 @@ export interface PresentEngineOptions {
   readonly media?: () => MediaPort | undefined
   /** Late-bound: the execution gateway that admits a press's principal. Absent: not checked (tests). */
   readonly gateway: () => ExecutionGateway | undefined
-  /** The page boundary (`ModuleHost.pageText`): a module's text on its way to a page. */
+  /** The page boundary (`ModuleHost.pageText`): a module's text on its way to a page (or into a note). */
   readonly pageText: (moduleId: string, text: unknown, max: number) => string
   /** The household's language now. */
   readonly language: () => NotifyLanguage
@@ -169,6 +182,8 @@ export interface PresentEngineOptions {
   readonly observe?: (event: { readonly kind: "step"; readonly ms: number; readonly rows: number; readonly connections: number }) => void
   /** The wall clock (epoch ms) for what is stored and compared with stored times. Default `Clock.currentTimeMillis`. */
   readonly now?: Effect.Effect<number>
+  /** Pauses before writing an accepted presentation again when the store fails, before maintenance takes it over. Default 100, 400, 1600 ms. */
+  readonly writeRetryMs?: ReadonlyArray<number>
 }
 
 export interface PresentEngine extends PresentHook {
@@ -180,20 +195,29 @@ export interface PresentEngine extends PresentHook {
   readonly press: (request: PresentPressRequest) => Effect.Effect<PresentPressAnswer>
   /**
    * The gateway's split of a tool's or action's result: a `{ forModel, present }` is handed to the Presenter (a
-   * validation, the decision for the origin device and one enqueue) and the model gets `forModel` with the note of what
-   * the server did. Anything else is returned unchanged.
+   * validation, the bounds from memory, the decision for the origin device and one enqueue) and the model gets
+   * `forModel` with the note of what the server decided. Anything else is returned unchanged.
    */
   readonly fromResult: (moduleId: string | undefined, principal: Principal | undefined, value: unknown) => Effect.Effect<unknown>
-  /** Whether an open connection holds an image with this content hash now (`/media` serves only those). */
-  readonly holdsHash: (hash: string) => boolean
+  /**
+   * The image a page's address names (`/media/<token>`): its content hash while the connection the token was made for
+   * is open and holds a presentation with that image; else `undefined`.
+   */
+  readonly mediaFor: (token: string) => string | undefined
   /** The answer to a press refused because too much is pending at once (the hub's bound), in the household's language. */
   readonly busyAnswer: () => PresentPressAnswer
   /** The live presentations, oldest first (tests and the kit). */
   readonly live: () => ReadonlyArray<PresentView>
   /** What each open connection of a device holds now, by connection (tests and the kit). */
   readonly held: (deviceId: string) => ReadonlyArray<{ readonly connection: string; readonly ids: ReadonlyArray<string> }>
-  /** Remove what has ended now (tests; the engine's own fiber does it on time). */
-  readonly expireNow: Effect.Effect<void>
+  /** Run the maintenance work now (tests; the `due` and `hourly` jobs do the same). */
+  readonly maintainNow: Effect.Effect<void>
+  /** Plan again now and wait for it (tests). */
+  readonly planNow: Effect.Effect<void>
+  /** When the `due` job is planned for (as far as this process knows); `undefined`: nothing is due. */
+  readonly plannedAt: () => number | undefined
+  /** Whether everything stored has been read (G4): until then nothing is shown or withdrawn. */
+  readonly loaded: () => boolean
   /** Tests: completes once nothing is waiting to be written, fetched or reconciled. */
   readonly settled: Effect.Effect<void>
 }
@@ -202,15 +226,29 @@ export interface PresentEngine extends PresentHook {
 
 const randomId = () => `p-${crypto.randomUUID().replace(/-/g, "")}`
 const ISSUE_SOURCE = "core.present"
-/** A read of every live row never reads more than this many (a corrupt store cannot make it unbounded). */
-const SWEEP_ROWS = 4 * MAX_LIVE_TOTAL
-const RETRY_AFTER_MS = 60_000
-/** Rows marked ended (dismissed, or ended by a newer transient) are removed this long after the first of them, together. */
-const PURGE_AFTER_MS = 10_000
+/** Failed work (a pass, a write, an image outcome, the start-up read) is tried again this soon by maintenance. */
+export const PRESENT_RETRY_MS = 60_000
+/** What left the index is removed from the store this long after, together (an update on a caller's path, no removal). */
+export const PRESENT_PURGE_AFTER_MS = 10_000
+export const PRESENT_DUE_HANDLER = "due"
+export const PRESENT_HOURLY_HANDLER = "hourly"
+const HOURLY_CRON = "0 * * * *"
+
+/** A page's image address token: 24 random bytes, base64url (32 characters). */
+const newToken = () => {
+  const b = new Uint8Array(24)
+  crypto.getRandomValues(b)
+  let s = ""
+  for (const x of b) s += String.fromCharCode(x)
+  return btoa(s).replace(/\+/g, "-").replace(/\//g, "_")
+}
 
 /** What the engine keeps in memory of a live presentation (everything but the content). */
 interface Entry {
   readonly id: string
+  readonly showId: string
+  /** The committed row's rev: a page holding another rev is sent the content again. */
+  readonly rev: number
   readonly module: string
   readonly key: string | undefined
   readonly part: number
@@ -223,14 +261,17 @@ interface Entry {
   readonly expiresAt: number
 }
 
-/** What one connection holds of one presentation (what it was sent last). */
+/** What one connection holds of one presentation. */
 interface Held {
-  /** The wire form without `serverNow`, as JSON: an unchanged presentation is not sent again. */
-  readonly fp: string
+  /** The rev, the form and the language it was sent with: anything else is sent again. */
+  readonly sig: string
   readonly hash: string | undefined
+  /** This connection's address for its image (`/media/<token>`). */
+  readonly token: string | undefined
 }
 
 interface HeldBy {
+  readonly connId: string
   readonly deviceId: string
   readonly send: (message: PresentMessage) => void
   readonly items: Map<string, Held>
@@ -242,12 +283,14 @@ interface PublishedHandler {
   readonly runner: PartRunner
 }
 
-/** A show from a tool's result, waiting for the engine's writer (it holds its place in the bounds meanwhile). */
+/** A show from a tool's result, accepted and waiting for the writer (it holds its place in the bounds meanwhile). */
 interface PendingShow {
-  readonly entry: Entry
+  readonly entry: Omit<Entry, "rev">
   readonly content: StoredContent
   readonly spoken: string
   readonly buttons: ReadonlyArray<{ readonly id: string; readonly label: string }>
+  /** Its quick retries failed: maintenance writes it again. */
+  failed: boolean
 }
 
 const failure = (e: StoreFailure | unknown): PresentError => {
@@ -263,7 +306,7 @@ const invalid = (message: string) => new PresentError({ reason: "invalid", messa
 
 const ownerOf = (s: PresentSensitivity | undefined): string | undefined => (s === undefined || s === "household" ? undefined : s.personal)
 
-/** A presentation's content as it is stored (an image's address kept; its hash once fetched). */
+/** A presentation's content as it is stored (an image's address kept; what was fetched for the same address kept). */
 const storedContentOf = (p: Presentation, before?: StoredContent): StoredContent => {
   switch (p.kind) {
     case "card":
@@ -273,7 +316,6 @@ const storedContentOf = (p: Presentation, before?: StoredContent): StoredContent
     case "timer":
       return { kind: "timer", label: p.label, endsAt: p.endsAt }
     case "image": {
-      // The same address keeps what was fetched for it.
       const kept = before?.kind === "image" && before.url === p.url ? { ...(before.hash !== undefined ? { hash: before.hash } : {}), ...(before.failed !== undefined ? { failed: before.failed } : {}) } : {}
       return { kind: "image", url: p.url, alt: p.alt, credit: p.credit, ...(p.caption !== undefined && p.caption !== "" ? { caption: p.caption } : {}), ...kept }
     }
@@ -287,19 +329,24 @@ const storedContentOf = (p: Presentation, before?: StoredContent): StoredContent
   }
 }
 
-const entryOf = (id: string, v: StoredPresentation): Entry => ({
-  id,
-  module: v.module,
-  key: v.key,
-  part: v.part,
-  lifetime: v.lifetime,
-  target: v.target,
-  owner: v.owner,
-  kind: v.content.kind,
-  handler: v.handler,
-  shownAt: v.shownAt,
-  expiresAt: v.expiresAt
-})
+const entryOf = (row: Row<StoredPresentation>): Entry => {
+  const v = row.value
+  return {
+    id: row.id,
+    showId: v.showId,
+    rev: row.rev,
+    module: v.module,
+    key: v.key,
+    part: v.part,
+    lifetime: v.lifetime,
+    target: v.target,
+    owner: v.owner,
+    kind: v.content.kind,
+    handler: v.handler,
+    shownAt: v.shownAt,
+    expiresAt: v.expiresAt
+  }
+}
 
 const WHY_WORDS: Readonly<Record<NotShownWhy, string>> = {
   offline: "is not connected",
@@ -308,19 +355,42 @@ const WHY_WORDS: Readonly<Record<NotShownWhy, string>> = {
   "cannot-show-kind": "cannot show this kind of thing"
 }
 
-/** The note for the model: what the server did, never what the eye saw. English: the model words the reply itself. */
-export const noteOf = (devices: ReadonlyArray<ShownOn>, nameOf: (deviceId: string) => string): string => {
+const cut = (text: string, max: number) => (text.length <= max ? text : max <= 1 ? "" : `${text.slice(0, max - 1)}…`)
+const list = (xs: ReadonlyArray<string>) => (xs.length <= 1 ? xs.join("") : `${xs.slice(0, -1).join(", ")} and ${xs[xs.length - 1]}`)
+
+/** The sentence that adds the presentation's `spoken` text to a note (G6). */
+export const SPOKEN_PREFIX = " Say this instead: "
+/** The sentence a note ends with while the image is still to be fetched. */
+export const IMAGE_SENTENCE = " Its image is being fetched; if that fails it shows without it."
+
+/**
+ * The note for the model: what the server decided, in words true when the call answers ("Showing on …"), never what the
+ * eye saw (review round 1, G5). The exact sentences:
+ *
+ * - every device of the target shows it: `Showing on "A".` (`"A" and "B"`, `"A", "B" and "C"`);
+ * - some do: `Showing on "A"; not on "B" (has no display).`;
+ * - none does: `Not showing it: "A" has no display.`;
+ * - and when the asking device does not show it for a reason other than privacy (G6): ` Say this instead: <spoken>`;
+ * - and while its image is still to be fetched (shown somewhere): ` Its image is being fetched; if that fails it shows without it.`
+ *
+ * The whole note is at most `MAX_NOTE_CHARS`: the device part is cut first, the spoken text is at most
+ * `MAX_NOTE_SPOKEN_CHARS`.
+ */
+export const noteOf = (devices: ReadonlyArray<ShownOn>, nameOf: (deviceId: string) => string, extra: { readonly spoken?: string; readonly image?: boolean } = {}): string => {
   const shown = devices.filter((d) => d.shown).map((d) => quotedName(nameOf(d.deviceId)))
   const not = devices.filter((d) => !d.shown)
-  const list = (xs: ReadonlyArray<string>) => (xs.length <= 1 ? xs.join("") : `${xs.slice(0, -1).join(", ")} and ${xs[xs.length - 1]}`)
-  let note: string
-  if (shown.length === 0) {
-    note = not.length === 1
-      ? `Not shown: ${quotedName(nameOf(not[0]!.deviceId))} ${WHY_WORDS[not[0]!.why ?? "offline"]}; say it instead.`
-      : `Not shown: ${list(not.map((d) => `${quotedName(nameOf(d.deviceId))} ${WHY_WORDS[d.why ?? "offline"]}`))}; say it instead.`
-  } else if (not.length === 0) note = `Shown on ${list(shown)}.`
-  else note = `Shown on ${list(shown)}; not shown on ${list(not.map((d) => `${quotedName(nameOf(d.deviceId))} (${WHY_WORDS[d.why ?? "offline"]})`))}.`
-  return note.length > MAX_NOTE_CHARS ? `${note.slice(0, MAX_NOTE_CHARS - 1)}…` : note
+  const tail = `${extra.spoken !== undefined ? `${SPOKEN_PREFIX}${cut(extra.spoken, MAX_NOTE_SPOKEN_CHARS)}` : ""}${extra.image === true && shown.length > 0 ? IMAGE_SENTENCE : ""}`
+  let head: string
+  if (shown.length === 0) head = `Not showing it: ${list(not.map((d) => `${quotedName(nameOf(d.deviceId))} ${WHY_WORDS[d.why ?? "offline"]}`))}.`
+  else if (not.length === 0) head = `Showing on ${list(shown)}.`
+  else head = `Showing on ${list(shown)}; not on ${list(not.map((d) => `${quotedName(nameOf(d.deviceId))} (${WHY_WORDS[d.why ?? "offline"]})`))}.`
+  return `${cut(head, MAX_NOTE_CHARS - tail.length)}${tail}`
+}
+
+/** A note for a presentation the server did not take (`reason`), with the fallback when it may be said (G6). */
+export const refusedNote = (reason: string, spoken?: string): string => {
+  const tail = spoken !== undefined ? `${SPOKEN_PREFIX}${cut(spoken, MAX_NOTE_SPOKEN_CHARS)}` : ""
+  return `${cut(`Not showing it: ${reason}.`, MAX_NOTE_CHARS - tail.length)}${tail}`
 }
 
 /** A tool result for the model with the note after it: `forModel` as the registry would encode it, then `[Screen: …]`. */
@@ -337,8 +407,10 @@ export const makePresentEngine = (options: PresentEngineOptions): Effect.Effect<
     const log = options.log ?? (() => undefined)
     const newId = options.newId ?? randomId
     const core = options.store.forCore(PRESENT_OWNER)
+    const jobs = options.scheduler.forCore(PRESENT_OWNER)
     const lang = () => options.language()
     const wallNow: Effect.Effect<number> = options.now ?? Clock.currentTimeMillis
+    const writeRetryMs = options.writeRetryMs ?? [100, 400, 1_600]
     const decided = (record: PresentDecisionRecord) => {
       try {
         options.onDecision?.(record)
@@ -348,37 +420,40 @@ export const makePresentEngine = (options: PresentEngineOptions): Effect.Effect<
     }
     const issues = new Map<string, { readonly id: string; readonly severity: "warning"; readonly title: string; readonly detail: string }>()
     const setIssue = (key: string, issue: { readonly title: string; readonly detail: string } | undefined) => {
-      if (issue === undefined ? !issues.has(key) : false) return
+      if (issue === undefined && !issues.has(key)) return
       if (issue === undefined) issues.delete(key)
       else issues.set(key, { id: `core.present.${key}`, severity: "warning", ...issue })
       options.issues?.set(ISSUE_SOURCE, [...issues.values()])
     }
 
-    /** One transaction of the service's collection. */
+    /** One transaction of the service's collection; `after` runs after its commit with what it returned. */
     const tx = <X>(f: (p: TxCollection<StoredPresentation>) => TxResult<X>, after?: (x: X) => void): Effect.Effect<X, PresentError> =>
       core.transaction<X>((t) => {
         const out = f(t.collection(presentations))
         if (after !== undefined) t.afterCommit(() => after(out as X))
         return out
       }).pipe(Effect.mapError(failure))
-    /** The synchronous reader (throws when the store fails a read). */
     const reader = () => {
       const r = options.store.reader(PRESENT_OWNER, presentations)
       if (r === undefined) throw new PresentError({ reason: "unavailable", message: "the presentation data is not usable here" })
       return r
     }
 
-    // ---- The index of live presentations
+    // ---- The index of live presentations (the truth of what is eligible), and what waits for durable removal
 
     const index = new Map<string, Entry>()
     const byKey = new Map<string, string>()
+    /** Keys of accepted shows not written yet, with their reserved id (one stable id per key: G3). */
+    const pendingKeys = new Map<string, string>()
     const keyOf = (module: string, key: string) => `${module}|${key}`
+    /** Ids that left the index, with the show whose row is to be removed and when (G1: removal follows). */
+    const doomed = new Map<string, { readonly showId: string; readonly at: number }>()
     const put = (e: Entry) => {
       const before = index.get(e.id)
-      if (before?.key !== undefined) byKey.delete(keyOf(before.module, before.key))
+      if (before?.key !== undefined && byKey.get(keyOf(before.module, before.key)) === e.id) byKey.delete(keyOf(before.module, before.key))
       index.set(e.id, e)
       if (e.key !== undefined) byKey.set(keyOf(e.module, e.key), e.id)
-      wakeEnds()
+      doomed.delete(e.id)
     }
     const drop = (id: string) => {
       const e = index.get(id)
@@ -386,7 +461,6 @@ export const makePresentEngine = (options: PresentEngineOptions): Effect.Effect<
       index.delete(id)
       if (e.key !== undefined && byKey.get(keyOf(e.module, e.key)) === id) byKey.delete(keyOf(e.module, e.key))
     }
-    /** Loaded from the store (at start; again a minute later while that fails). */
     let loaded = false
 
     const devicesNow = () => {
@@ -403,6 +477,8 @@ export const makePresentEngine = (options: PresentEngineOptions): Effect.Effect<
     // ---- What every connection holds
 
     const held = new Map<string, HeldBy>()
+    /** Page image addresses: token → the connection, the presentation and the image it names. */
+    const tokens = new Map<string, { readonly connId: string; readonly id: string; readonly hash: string }>()
     const connectionsOf = (deviceId: string): ReadonlyArray<PresentConnection> => {
       try {
         return options.outlet()?.connections(deviceId) ?? []
@@ -417,35 +493,63 @@ export const makePresentEngine = (options: PresentEngineOptions): Effect.Effect<
         log(`Presentations: a message to ${by.deviceId} could not be sent (${String(e)})`)
       }
     }
-    /** The device's connections now, with their bookkeeping; what closed connections held is dropped. */
-    const heldOf = (deviceId: string): ReadonlyArray<HeldBy> => {
+    const forget = (h: Held | undefined) => {
+      if (h?.token !== undefined) tokens.delete(h.token)
+    }
+    /** The device's connections now, with their bookkeeping; what closed connections held (and their addresses) is dropped. */
+    const heldOf = (deviceId: string): ReadonlyArray<{ readonly by: HeldBy; readonly conn: PresentConnection }> => {
       const conns = connectionsOf(deviceId)
       const open = new Set(conns.map((c) => c.id))
-      for (const [cid, by] of held) if (by.deviceId === deviceId && !open.has(cid)) held.delete(cid)
-      return conns.map((c) => {
-        let by = held.get(c.id)
-        if (by === undefined || by.deviceId !== deviceId) {
-          by = { deviceId, send: c.send, items: new Map() }
-          held.set(c.id, by)
+      for (const [cid, by] of held) {
+        if (by.deviceId === deviceId && !open.has(cid)) {
+          for (const h of by.items.values()) forget(h)
+          held.delete(cid)
         }
-        return by
+      }
+      return conns.map((conn) => {
+        let by = held.get(conn.id)
+        if (by === undefined || by.deviceId !== deviceId) {
+          by = { connId: conn.id, deviceId, send: conn.send, items: new Map() }
+          held.set(conn.id, by)
+        }
+        return { by, conn }
       })
+    }
+    const holders = (id: string) => {
+      const ids = new Set<string>()
+      for (const by of held.values()) if (by.items.has(id)) ids.add(by.deviceId)
+      return ids
     }
 
     /** THE decision for one presentation on one device, now: the privacy rule asked for that device at this moment. */
-    const decide = (e: Pick<Entry, "id" | "kind" | "owner">, d: KnownDevice, connected: boolean): PresentDecision => {
+    const decide = (e: Pick<Entry, "id" | "kind" | "owner">, d: KnownDevice, connected: boolean, outs: DevicePresentOutputs = options.outputs(d)): PresentDecision => {
       const decision = decidePresentation({
         kind: e.kind,
         personal: e.owner !== undefined,
         mayReveal: e.owner === undefined ? true : options.privacy.mayReveal(e.owner, d.id),
-        device: { connected, ...options.outputs(d) }
+        device: { connected, ...outs }
       })
       decided({ id: e.id, deviceId: d.id, decision })
       return decision
     }
+    /** A connection's own declared kinds (G11), when the outlet knows them: an older page declared none (`{}`). */
+    const declaredBy = (conn: PresentConnection): Readonly<Record<string, number>> | undefined => (conn.kinds === undefined ? undefined : conn.kinds() ?? {})
+    /** A device's outputs as one connection's page sees them: its display and overrides, the kinds that page draws. */
+    const outputsFor = (d: KnownDevice, conn: PresentConnection) => {
+      const declared = declaredBy(conn)
+      return declared === undefined ? options.outputs(d) : options.outputs(d, declared)
+    }
+    /** A device's outputs for the note: the kinds any of its open pages draws (when the outlet knows them). */
+    const outputsOfDevice = (d: KnownDevice) => {
+      const conns = connectionsOf(d.id)
+      if (conns.length === 0 || conns.some((c) => c.kinds === undefined)) return options.outputs(d)
+      const union: Record<string, number> = {}
+      for (const c of conns) for (const [k, v] of Object.entries(declaredBy(c) ?? {})) union[k] = Math.max(union[k] ?? 0, v)
+      return options.outputs(d, union)
+    }
 
-    /** The wire form of a row for a device that may show it (every module text through the page boundary). */
-    const wireOf = (id: string, v: StoredPresentation, interactive: boolean, now: number): PresentationWire => {
+    /** The wire form of a row for one connection (every module text through the page boundary; its own image address). */
+    const wireOf = (id: string, v: StoredPresentation, interactive: boolean, now: number, token: string | undefined): PresentationWire => {
       const t = (text: string, max: number) => options.pageText(v.module, text, max)
       const c = v.content
       const content: PresentContent = c.kind === "card"
@@ -460,7 +564,7 @@ export const makePresentEngine = (options: PresentEngineOptions): Effect.Effect<
           alt: t(c.alt, MAX_IMAGE_ALT_CHARS),
           credit: t(c.credit, MAX_IMAGE_CREDIT_CHARS),
           ...(c.caption !== undefined ? { caption: t(c.caption, MAX_IMAGE_CAPTION_CHARS) } : {}),
-          image: c.hash !== undefined ? { state: "ready", hash: c.hash } : c.failed !== undefined ? { state: "failed" } : { state: "loading" }
+          image: c.hash !== undefined && token !== undefined ? { state: "ready", token } : c.failed !== undefined ? { state: "failed" } : { state: "loading" }
         }
         : {
           kind: "weather",
@@ -482,58 +586,85 @@ export const makePresentEngine = (options: PresentEngineOptions): Effect.Effect<
     }
 
     /**
-     * One device, in one synchronous step: what applies to it now, decided now, what it shows of that, each row read
-     * now, and every connection of it made to hold exactly that. Throws when the store fails a read.
+     * One device, in one synchronous step (G2). First, from the index and the decision alone: what applies to the device
+     * now, what it shows of that, and each connection's share of it (the kinds its own page draws); everything a
+     * connection holds outside its share is withdrawn. Then the content of what a connection lacks or holds in another
+     * form is read, item by item: a failed read affects that item only, and the pass reports it (`false`) to be repeated.
      */
-    const syncDevice = (deviceId: string, now: number) => {
+    const syncDevice = (deviceId: string, now: number): boolean => {
+      if (!loaded) return true
       const started = performance.now()
-      const bys = heldOf(deviceId)
-      if (bys.length === 0) return
+      const conns = heldOf(deviceId)
+      if (conns.length === 0) return true
       const device = deviceOf(deviceId)
-      const candidates = device === undefined
-        ? []
-        : [...index.values()].filter((e) => e.expiresAt > now && applies(e.target, device)).map((e) => ({ id: e.id, lifetime: e.lifetime, shownAt: e.shownAt, decision: decide(e, device, true) }))
-      const chosen = selectPresentations(candidates)
-      const want = new Map<string, { readonly message: PresentationWire; readonly fp: string; readonly hash: string | undefined }>()
-      const r = chosen.length > 0 ? reader() : undefined
-      for (const c of chosen) {
-        const row = r!.get(c.id, HOUSEHOLD_SCOPE)
-        if (row === undefined) continue
-        const wire = wireOf(c.id, row.value, c.decision.interactive, now)
-        const { serverNow: _now, ...rest } = wire
-        want.set(c.id, { message: wire, fp: JSON.stringify(rest), hash: wire.content.kind === "image" && wire.content.image.state === "ready" ? wire.content.image.hash : undefined })
-      }
-      for (const by of bys) {
-        // Withdrawals first: a page never holds more than it should, even for a moment.
-        for (const id of [...by.items.keys()]) {
-          if (want.has(id)) continue
+      const applying = device === undefined ? [] : [...index.values()].filter((e) => e.expiresAt > now && applies(e.target, device))
+      // Each connection's share, decided with what its own page draws (G11): an older tab beside a newer one gets none.
+      const shares = conns.map(({ by, conn }) => {
+        const outs = device === undefined ? undefined : outputsFor(device, conn)
+        return { by, share: outs === undefined ? [] : selectPresentations(applying.map((e) => ({ id: e.id, lifetime: e.lifetime, shownAt: e.shownAt, decision: decide(e, device!, true, outs) }))) }
+      })
+      // Withdrawals first: they need no read, so a failing store never keeps on a page what may not be there.
+      for (const { by, share } of shares) {
+        const keep = new Set(share.map((c) => c.id))
+        for (const [id, h] of [...by.items]) {
+          if (keep.has(id)) continue
           by.items.delete(id)
+          forget(h)
           send(by, { type: "present.dismiss", id })
         }
-        for (const [id, w] of want) {
-          const before = by.items.get(id)
-          if (before?.fp === w.fp) continue
-          send(by, { type: before === undefined ? "present.show" : "present.update", presentation: w.message })
-          by.items.set(id, { fp: w.fp, hash: w.hash })
+      }
+      // Then what stays or is added: the content read now, per item.
+      const language = lang()
+      const rows = new Map<string, Row<StoredPresentation> | "failed" | undefined>()
+      let ok = true
+      let read = 0
+      for (const { by, share } of shares) {
+        for (const c of share) {
+          const e = index.get(c.id)!
+          const sig = `${e.rev}|${c.decision.interactive}|${language}`
+          const before = by.items.get(c.id)
+          if (before?.sig === sig) continue
+          if (!rows.has(c.id)) {
+            try {
+              read++
+              const row = reader().get(c.id, HOUSEHOLD_SCOPE)
+              rows.set(c.id, row !== undefined && row.value.showId === e.showId && row.value.ended !== true ? row : undefined)
+            } catch {
+              rows.set(c.id, "failed")
+            }
+          }
+          const row = rows.get(c.id)
+          if (row === "failed") {
+            ok = false
+            continue
+          }
+          if (row === undefined) continue
+          const content = row.value.content
+          const hash = content.kind === "image" ? content.hash : undefined
+          // An image is fetched only once some page is to show it (not for a target nobody would show it on).
+          if (content.kind === "image" && hash === undefined && content.failed === undefined) fetchImage(c.id, content.url)
+          let token = before?.hash === hash ? before?.token : undefined
+          if (hash !== undefined && token === undefined) {
+            forget(before)
+            token = newToken()
+            tokens.set(token, { connId: by.connId, id: c.id, hash })
+          } else if (hash === undefined) forget(before)
+          send(by, { type: before === undefined ? "present.show" : "present.update", presentation: wireOf(c.id, row.value, c.decision.interactive, now, token) })
+          by.items.set(c.id, { sig, hash, token: hash === undefined ? undefined : token })
         }
       }
-      options.observe?.({ kind: "step", ms: performance.now() - started, rows: want.size, connections: bys.length })
+      options.observe?.({ kind: "step", ms: performance.now() - started, rows: read, connections: conns.length })
+      return ok
     }
 
     // ---- The reconciliation fiber: coalesced devices, one pass at a time
 
     const dirty = new Set<string>()
-    const failed = new Set<string>()
-    /** When the failed passes are tried again without a trigger (a minute after the first failure since the last retry). */
-    let retryAt: number | undefined
+    const failedPasses = new Set<string>()
     let all = false
     let working = false
     const wake = yield* Queue.sliding<void>(1)
-    const kick = () => {
-      for (const id of failed) dirty.add(id)
-      failed.clear()
-      void Queue.offerUnsafe(wake, undefined)
-    }
+    const kick = () => void Queue.offerUnsafe(wake, undefined)
     const enqueue = (deviceId: string) => {
       dirty.add(deviceId)
       kick()
@@ -548,10 +679,10 @@ export const makePresentEngine = (options: PresentEngineOptions): Effect.Effect<
       for (const by of held.values()) ids.add(by.deviceId)
       return ids
     }
-    /** The devices to reconcile after a change of `e` (its target's devices and whoever holds it). */
-    const touch = (id: string, target: Entry["target"] | undefined) => {
-      for (const by of held.values()) if (by.items.has(id)) dirty.add(by.deviceId)
-      if (target !== undefined) for (const d of targetDevices(target)) dirty.add(d.id)
+    /** Reconcile whoever holds it and the devices of its target (old and new). */
+    const touch = (id: string, ...targets: ReadonlyArray<Entry["target"] | undefined>) => {
+      for (const d of holders(id)) dirty.add(d)
+      for (const t of targets) if (t !== undefined) for (const d of targetDevices(t)) dirty.add(d.id)
       kick()
     }
 
@@ -569,251 +700,306 @@ export const makePresentEngine = (options: PresentEngineOptions): Effect.Effect<
           dirty.delete(next.value)
           const now = yield* wallNow
           const exit = yield* Effect.exit(Effect.try(() => syncDevice(next.value, now)))
-          if (Exit.isFailure(exit)) {
-            failed.add(next.value)
-            if (retryAt === undefined) retryAt = now + RETRY_AFTER_MS
-            wakeEnds()
-            log(`Presentations: reconciling ${next.value} failed (${Cause.pretty(exit.cause).split("\n")[0]}); the next trigger or a minute repeats it`)
-          }
+          if (Exit.isFailure(exit) || exit.value === false) {
+            const first = failedPasses.size === 0
+            failedPasses.add(next.value)
+            if (first) requestPlan()
+            log(`Presentations: reconciling ${next.value} did not finish (a store read failed); repeated by the next trigger or maintenance`)
+          } else if (failedPasses.delete(next.value) && failedPasses.size === 0) requestPlan()
           yield* Effect.yieldNow
         }
         working = false
       }
     })
 
-    // ---- Parts and their transient presentations
+    // ---- Leaving the index (G1): at once, whatever the store does; removal follows
 
-    /** The open parts of each module (a part is open from `forPart` until its scope closes). */
-    const openParts = new Map<string, Set<number>>()
-    const work: Array<Effect.Effect<void>> = []
-    let writing = false
-    const workWake = yield* Queue.sliding<void>(1)
-    const queueWork = (w: Effect.Effect<void>) => {
-      work.push(w)
-      void Queue.offerUnsafe(workWake, undefined)
+    /** It is no longer eligible from now: out of the index, its holders reconciled; its row removed at `removeAt`. */
+    const doom = (e: Entry, removeAt: number) => {
+      drop(e.id)
+      doomed.set(e.id, { showId: e.showId, at: removeAt })
+      touch(e.id)
+      requestPlan()
     }
-    const workLoop = Effect.gen(function*() {
-      for (;;) {
-        yield* Queue.take(workWake)
-        writing = true
-        for (let w = work.shift(); w !== undefined; w = work.shift()) {
-          yield* w
-          yield* Effect.yieldNow
-        }
-        writing = false
-      }
-    })
 
-    /** Remove rows by id in transactions of a page; after each commit, the index follows and their devices are reconciled. */
-    const removeRows = (ids: ReadonlyArray<string>, still: (e: Entry) => boolean): Effect.Effect<void, PresentError> =>
+    // ---- Parts
+
+    const openParts = new Map<string, Set<number>>()
+    const partOpen = (moduleId: string, part: number) => openParts.get(moduleId)?.has(part) === true
+    const partClosed = (moduleId: string, partId: number) =>
       Effect.gen(function*() {
-        for (let i = 0; i < ids.length; i += PRESENT_PAGE) {
-          const page = ids.slice(i, i + PRESENT_PAGE)
-          yield* tx((p) => {
-            const gone: Array<Entry> = []
-            for (const id of page) {
-              const e = index.get(id)
-              if (e === undefined || !still(e)) continue
-              if (p.get(id) !== undefined) p.remove(id)
-              gone.push(e)
-            }
-            return gone
-          }, (gone) => {
-            for (const e of gone) {
-              drop(e.id)
-              touch(e.id, e.target)
-            }
-          })
-          yield* Effect.yieldNow
-        }
+        const open = openParts.get(moduleId)
+        open?.delete(partId)
+        if (open !== undefined && open.size === 0) openParts.delete(moduleId)
+        const now = yield* wallNow
+        // A transient presentation belongs to the part that made it: no longer eligible once it stops. Pinned ones stay.
+        for (const e of [...index.values()]) if (e.part === partId && e.module === moduleId && e.lifetime === "transient") doom(e, now + PRESENT_PURGE_AFTER_MS)
+        // Accepted shows of that part that were not written yet no longer apply.
+        for (const s of [...pending]) if (s.entry.part === partId && s.entry.module === moduleId) dropPending(s)
       })
 
-    const partClosed = (moduleId: string, partId: number) => {
-      const open = openParts.get(moduleId)
-      open?.delete(partId)
-      if (open !== undefined && open.size === 0) openParts.delete(moduleId)
-      // A transient presentation belongs to the part that made it: withdrawn when that part stops. Pinned ones stay.
-      queueWork(Effect.gen(function*() {
-        const ids = [...index.values()].filter((e) => e.part === partId && e.module === moduleId && e.lifetime === "transient").map((e) => e.id)
-        const exit = yield* Effect.exit(removeRows(ids, (e) => e.part === partId && e.lifetime === "transient"))
-        if (Exit.isFailure(exit)) {
-          log(`Presentations: the transient presentations of a stopped part of ${moduleId} could not be removed; they end by themselves`)
-        }
-      }))
-    }
-
-    // ---- Ends: one fiber, sleeping until the earliest end
-
-    const endsWake = yield* Queue.sliding<void>(1)
-    function wakeEnds() {
-      void Queue.offerUnsafe(endsWake, undefined)
-    }
-    /** Rows marked ended, removed together `PURGE_AFTER_MS` after the first (never on a caller's path). */
-    const tombstones = new Set<string>()
-    let purgeAt: number | "soon" | undefined
-    function entombed(id: string) {
-      tombstones.add(id)
-      if (purgeAt === undefined) purgeAt = "soon"
-      wakeEnds()
-    }
-    const purge: Effect.Effect<void, PresentError> = Effect.gen(function*() {
-      const ids = [...tombstones]
-      for (let i = 0; i < ids.length; i += PRESENT_PAGE) {
-        const page = ids.slice(i, i + PRESENT_PAGE)
-        yield* tx((p) => {
-          for (const id of page) {
-            const row = p.get(id)
-            if (row !== undefined && row.value.ended === true && !index.has(id)) p.remove(id)
-          }
-        }, () => {
-          for (const id of page) tombstones.delete(id)
-        })
-        yield* Effect.yieldNow
-      }
-    })
-    let sweeping = false
-    const sweepEnded: Effect.Effect<void, PresentError> = Effect.gen(function*() {
-      const now = yield* wallNow
-      const ended = [...index.values()].filter((e) => e.expiresAt <= now).map((e) => e.id)
-      yield* removeRows(ended, (e) => e.expiresAt <= now)
-    })
-    const endsLoop = Effect.gen(function*() {
-      for (;;) {
-        const now = yield* wallNow
-        let next: number | undefined
-        for (const e of index.values()) next = next === undefined ? e.expiresAt : Math.min(next, e.expiresAt)
-        if (!loaded && (next === undefined || next > now + RETRY_AFTER_MS)) next = now + RETRY_AFTER_MS
-        if (purgeAt === "soon") purgeAt = now + PURGE_AFTER_MS
-        if (typeof purgeAt === "number") next = next === undefined ? purgeAt : Math.min(next, purgeAt)
-        if (retryAt !== undefined && failed.size > 0) next = next === undefined ? retryAt : Math.min(next, retryAt)
-        if (next === undefined) yield* Queue.take(endsWake)
-        else if (next > now) yield* Effect.raceFirst(Effect.asVoid(Effect.sleep(next - now)), Queue.take(endsWake))
-        sweeping = true
-        if (!loaded) yield* load
-        // Failed passes are repeated a minute later (a trigger repeats them sooner), never in a tight loop.
-        const at = yield* wallNow
-        if (retryAt !== undefined && at >= retryAt) {
-          retryAt = undefined
-          if (failed.size > 0) kick()
-        }
-        const exit = yield* Effect.exit(Effect.andThen(sweepEnded, Effect.suspend(() => {
-          if (typeof purgeAt !== "number" || purgeAt > at) return Effect.void
-          purgeAt = undefined
-          return Effect.tap(purge, () => Effect.sync(() => {
-            if (tombstones.size > 0 && purgeAt === undefined) purgeAt = "soon"
-          }))
-        })))
-        sweeping = false
-        if (Exit.isFailure(exit)) {
-          log("Presentations: what has ended could not be removed; tried again in a minute")
-          yield* Effect.sleep(RETRY_AFTER_MS).pipe(Effect.raceFirst(Queue.take(endsWake)))
-        }
-        yield* Effect.yieldNow
-      }
-    })
-
-    /** Read every live row into the index; transient rows of an earlier process (whose parts are gone) are removed. */
-    const load: Effect.Effect<void> = Effect.gen(function*() {
-      const exit = yield* Effect.exit(Effect.gen(function*() {
-        const rows: Array<Row<StoredPresentation>> = []
-        let after: Row<StoredPresentation> | undefined
-        for (let read = 0; read < SWEEP_ROWS;) {
-          const page = yield* core.collection(presentations).list({ orderBy: { field: "createdAt", direction: "asc" }, limit: PRESENT_PAGE, ...(after !== undefined ? { after } : {}) })
-          rows.push(...page)
-          read += page.length
-          if (page.length < PRESENT_PAGE) break
-          after = page[page.length - 1]
-        }
-        const now = yield* wallNow
-        const stale = rows.filter((r) => r.value.lifetime === "transient" || r.value.ended === true || r.value.expiresAt <= now).map((r) => r.id)
-        for (let i = 0; i < stale.length; i += PRESENT_PAGE) {
-          const page = stale.slice(i, i + PRESENT_PAGE)
-          yield* core.transaction((t) => {
-            const p = t.collection(presentations)
-            for (const id of page) if (p.get(id) !== undefined) p.remove(id)
-          })
-        }
-        const gone = new Set(stale)
-        return rows.filter((r) => !gone.has(r.id))
-      }))
-      if (Exit.isFailure(exit)) {
-        setIssue("load", { title: "Presentations could not be read", detail: "Pinned presentations come back once the store can be read; it is tried again every minute." })
-        log(`Presentations: the stored presentations could not be read (${Cause.pretty(exit.cause).split("\n")[0]}); tried again in a minute`)
-        return
-      }
-      for (const row of exit.value) if (!index.has(row.id)) put(entryOf(row.id, row.value))
-      loaded = true
-      setIssue("load", undefined)
-      enqueueAll()
-    })
-
-    // ---- Bounds, from the index (and the shows waiting for the writer)
+    // ---- Bounds, from the index and the accepted shows
 
     const pending: Array<PendingShow> = []
-    /** Why one more presentation would pass a bound, or `undefined`. `replacing`: the id a key replaces. */
-    const boundProblem = (module: string, lifetime: "transient" | "pinned", target: Entry["target"], replacing: string | undefined, now: number): string | undefined => {
-      // A transient one ends the transient ones it would share a device with: those do not count against it.
-      const ending = new Set(lifetime === "transient" ? overlapping(target, replacing).map((e) => e.id) : [])
-      const live = [...index.values()].filter((e) => e.id !== replacing && !ending.has(e.id) && e.expiresAt > now)
-      const waiting = pending.map((p) => p.entry).filter((e) => e.id !== replacing)
-      const every = [...live, ...waiting]
-      if (every.length >= MAX_LIVE_TOTAL) return `${MAX_LIVE_TOTAL} presentations are live already`
-      if (every.filter((e) => e.module === module).length >= MAX_LIVE_PER_MODULE) return `${module} has ${MAX_LIVE_PER_MODULE} live presentations already`
+    const releaseKey = (s: PendingShow) => {
+      const e = s.entry
+      if (e.key === undefined) return
+      const k = keyOf(e.module, e.key)
+      if (pendingKeys.get(k) === e.id && !pending.some((x) => x !== s && x.entry.id === e.id)) pendingKeys.delete(k)
+    }
+    const dropPending = (s: PendingShow) => {
+      const at = pending.indexOf(s)
+      if (at >= 0) pending.splice(at, 1)
+      releaseKey(s)
+      if (!pending.some((x) => x.failed)) setIssue("write", undefined)
+    }
+
+    /**
+     * Why one more presentation would pass a bound, or `undefined` (G3). `id`: its own (a key's stable id: the shows of
+     * that id are counted once). A transient one ends the transient ones it would share a device with, committed or
+     * queued: those do not count against it.
+     */
+    const boundProblem = (module: string, lifetime: "transient" | "pinned", target: Entry["target"], id: string, now: number): string | undefined => {
+      const devices = targetDevices(target)
+      const ends = (e: Pick<Entry, "lifetime" | "target">) => lifetime === "transient" && e.lifetime === "transient" && devices.some((d) => applies(e.target, d))
+      const every = new Map<string, Pick<Entry, "module" | "lifetime" | "target">>()
+      for (const e of index.values()) if (e.id !== id && e.expiresAt > now && !ends(e)) every.set(e.id, e)
+      for (const s of pending) if (s.entry.id !== id && s.entry.expiresAt > now && !ends(s.entry)) every.set(s.entry.id, s.entry)
+      const all = [...every.values()]
+      if (all.length >= MAX_LIVE_TOTAL) return `${MAX_LIVE_TOTAL} presentations are live already`
+      if (all.filter((e) => e.module === module).length >= MAX_LIVE_PER_MODULE) return `${module} has ${MAX_LIVE_PER_MODULE} live presentations already`
       if (lifetime === "pinned") {
-        for (const d of targetDevices(target)) {
-          // A pinned presentation another of the same key replaces is not counted.
-          const pinnedThere = every.filter((e) => e.lifetime === "pinned" && applies(e.target, d)).length
-          if (pinnedThere >= MAX_PINNED_PER_DEVICE) return `${quotedName(d.name)} shows ${MAX_PINNED_PER_DEVICE} pinned presentations already`
+        for (const d of devices) {
+          if (all.filter((e) => e.lifetime === "pinned" && applies(e.target, d)).length >= MAX_PINNED_PER_DEVICE) return `${quotedName(d.name)} shows ${MAX_PINNED_PER_DEVICE} pinned presentations already`
         }
       }
       return undefined
     }
 
     /** The live transient presentations that would share a device with `target` now (a device shows one at a time). */
-    const overlapping = (target: Entry["target"], except: string | undefined): ReadonlyArray<Entry> => {
+    const overlapping = (target: Entry["target"], except: string): ReadonlyArray<Entry> => {
       const devices = targetDevices(target)
       return [...index.values()].filter((e) => e.id !== except && e.lifetime === "transient" && devices.some((d) => applies(e.target, d)))
     }
 
-    /**
-     * What was decided for each device of the target now, and the note for the model; an image not fetched yet says that
-     * it may be shown without the image (the fetch's outcome is not known when the call answers).
-     */
-    const outcomeOf = (e: Pick<Entry, "id" | "kind" | "owner" | "target">, imagePending = false): ShowOutcome => {
+    /** What was decided for each device of the target now, and the note for the model (G5, G6). */
+    const outcomeOf = (e: Pick<Entry, "id" | "kind" | "owner" | "target">, o: { readonly asking?: string | undefined; readonly spoken: string; readonly module: string; readonly image: boolean }): ShowOutcome => {
       const devices = targetDevices(e.target)
       const shownOn: Array<ShownOn> = devices.map((d) => {
-        const decision = decide(e, d, connectionsOf(d.id).length > 0)
+        const decision = decide(e, d, connectionsOf(d.id).length > 0, outputsOfDevice(d))
         return decision.show ? { deviceId: d.id, shown: true } : { deviceId: d.id, shown: false, why: decision.why }
       })
       const names = new Map(devices.map((d) => [d.id, d.name] as const))
-      const note = noteOf(shownOn, (id) => names.get(id) ?? id)
-      return { devices: shownOn, note: imagePending && shownOn.some((d) => d.shown) ? `${note} The image is being fetched; if it cannot be, it shows without it.` : note }
+      const asking = o.asking === undefined ? undefined : shownOn.find((s) => s.deviceId === o.asking)
+      const fallback = asking !== undefined && !asking.shown && asking.why !== "private"
+      return {
+        devices: shownOn,
+        note: noteOf(shownOn, (id) => names.get(id) ?? id, { ...(fallback ? { spoken: options.pageText(o.module, o.spoken, MAX_NOTE_SPOKEN_CHARS) } : {}), image: o.image })
+      }
     }
 
-    // ---- Images: fetched once by the cache, off the turn's path, the outcome written on the row
+    // ---- Images: fetched once some page is to show one; the outcome written on the row, retried until it is
 
     const fetching = new Set<string>()
+    /** Outcomes not written yet (the write failed): maintenance writes them. */
+    const imageOutcomes = new Map<string, { readonly url: string; readonly showId: string; readonly outcome: MediaOutcome }>()
+    const writeImage = (id: string, w: { readonly url: string; readonly showId: string; readonly outcome: MediaOutcome }) =>
+      tx((p) => {
+        const row = p.get(id)
+        if (row === undefined || row.value.ended === true || row.value.showId !== w.showId || row.value.content.kind !== "image" || row.value.content.url !== w.url) return undefined
+        const { hash: _h, failed: _f, ...content } = row.value.content
+        p.update(id, (v) => ({ ...v, content: { ...content, ...("hash" in w.outcome ? { hash: w.outcome.hash } : { failed: w.outcome.refused }) } }), { expectRev: row.rev })
+        return p.get(id)
+      }, (row) => {
+        imageOutcomes.delete(id)
+        if (row !== undefined && index.get(id)?.showId === row.value.showId) {
+          put(entryOf(row))
+          touch(id)
+        }
+      })
     const fetchImage = (id: string, url: string) => {
       const key = `${id} ${url}`
-      if (fetching.has(key)) return
+      const e = index.get(id)
+      if (fetching.has(key) || imageOutcomes.has(id) || e === undefined) return
       fetching.add(key)
       fork(Effect.gen(function*() {
         const media = options.media?.()
         const outcome: MediaOutcome = media === undefined ? { refused: "unavailable" } : yield* media.fetch(url)
-        // Written only if the row still shows that address (an update may have changed it meanwhile).
-        const exit = yield* Effect.exit(tx((p) => {
-          const row = p.get(id)
-          if (row === undefined || row.value.ended === true || row.value.content.kind !== "image" || row.value.content.url !== url) return false
-          const { hash: _h, failed: _f, ...content } = row.value.content
-          p.update(id, (v) => ({ ...v, content: { ...content, ...("hash" in outcome ? { hash: outcome.hash } : { failed: outcome.refused }) } }), { expectRev: row.rev })
-          return true
-        }, (wrote) => {
-          if (wrote) touch(id, index.get(id)?.target)
-        }))
-        if (Exit.isFailure(exit)) log(`Presentations: an image's outcome could not be written; it shows without it`)
         if ("refused" in outcome) log(`Presentations: an image was not kept (${outcome.refused})`)
+        const w = { url, showId: e.showId, outcome }
+        const exit = yield* Effect.exit(writeImage(id, w))
+        if (Exit.isFailure(exit)) {
+          imageOutcomes.set(id, w)
+          requestPlan()
+          log("Presentations: an image's outcome could not be written; maintenance writes it again")
+        }
       }).pipe(Effect.ensuring(Effect.sync(() => fetching.delete(key)))))
     }
+
+    // ---- Maintenance (the notification service's pattern): `due`, one-shot, planned for the next thing due; `hourly`
+
+    let plannedAt: number | undefined | "unknown" = "unknown"
+    let planning = false
+    let planAgain = false
+    let lastRun: "succeeded" | "failed" | undefined
+    const planIdle: Array<Deferred.Deferred<void>> = []
+    /** When maintenance is next needed, from memory only: an end, a removal, failed work to repeat (a minute from now). */
+    const nextDue = (now: number): number | undefined => {
+      let next: number | undefined
+      const consider = (t: number) => void (next = next === undefined ? t : Math.min(next, t))
+      for (const e of index.values()) consider(e.expiresAt)
+      for (const d of doomed.values()) consider(d.at)
+      for (const s of pending) consider(s.failed ? now + PRESENT_RETRY_MS : s.entry.expiresAt)
+      if (!loaded || failedPasses.size > 0 || imageOutcomes.size > 0) consider(now + PRESENT_RETRY_MS)
+      return next
+    }
+    const planOnce: Effect.Effect<void, unknown> = Effect.gen(function*() {
+      const ran = lastRun
+      lastRun = undefined
+      const now = yield* wallNow
+      const next = nextDue(now)
+      if (next === undefined) {
+        if (plannedAt !== undefined) {
+          plannedAt = "unknown"
+          yield* jobs.cancel({ key: PRESENT_DUE_HANDLER })
+          plannedAt = undefined
+        }
+        return
+      }
+      const at = next > now ? next : ran === "failed" ? now + PRESENT_RETRY_MS : now
+      const known = typeof plannedAt === "number" ? plannedAt : undefined
+      if (at === known) return
+      plannedAt = "unknown"
+      yield* jobs.schedule({ handler: PRESENT_DUE_HANDLER, key: PRESENT_DUE_HANDLER, at, origin: {} })
+      plannedAt = at
+    })
+    function requestPlan(): void {
+      if (planning) {
+        planAgain = true
+        return
+      }
+      planning = true
+      fork(
+        Effect.gen(function*() {
+          do {
+            planAgain = false
+            const exit = yield* Effect.exit(planOnce)
+            if (Exit.isFailure(exit)) {
+              log(`Presentations: maintenance could not be planned (${Cause.pretty(exit.cause).split("\n")[0]}); planned again at the next change, and the hourly job runs meanwhile`)
+              setIssue("plan", { title: "Presentations' maintenance could not be planned", detail: "Ends, removals and retries may be up to an hour late until it can be planned again." })
+            } else setIssue("plan", undefined)
+          } while (planAgain)
+        }).pipe(Effect.ensuring(Effect.sync(() => {
+          planning = false
+          for (const d of planIdle.splice(0)) Deferred.doneUnsafe(d, Effect.void)
+        })))
+      )
+    }
+    const planNow: Effect.Effect<void> = Effect.suspend(() => {
+      const d = Deferred.makeUnsafe<void>()
+      planIdle.push(d)
+      requestPlan()
+      return Deferred.await(d)
+    })
+    let hourly = false
+    let schedulingHourly = false
+    const ensureHourly = () => {
+      if (hourly || schedulingHourly) return
+      schedulingHourly = true
+      fork(jobs.schedule({ handler: PRESENT_HOURLY_HANDLER, key: PRESENT_HOURLY_HANDLER, cron: HOURLY_CRON, timeZone: "UTC", origin: {} }).pipe(
+        Effect.match({
+          onSuccess: () => {
+            hourly = true
+            setIssue("hourly", undefined)
+          },
+          onFailure: (e) => {
+            log(`Presentations: the hourly maintenance job could not be scheduled (${e.message}); tried again at the next change`)
+            setIssue("hourly", { title: "Presentations have no hourly maintenance yet", detail: "Its job could not be scheduled; it is tried again with the next change." })
+          }
+        }),
+        Effect.ensuring(Effect.sync(() => void (schedulingHourly = false)))
+      ))
+    }
+
+    /** Remove the rows of what left the index (due now), a page per transaction; each removed only if it is still that show. */
+    const removeDoomed = (now: number): Effect.Effect<void, PresentError> =>
+      Effect.gen(function*() {
+        const due = [...doomed].filter(([, d]) => d.at <= now)
+        for (let i = 0; i < due.length; i += PRESENT_PAGE) {
+          const page = due.slice(i, i + PRESENT_PAGE)
+          yield* tx((p) => {
+            for (const [id, d] of page) {
+              const row = p.get(id)
+              if (row !== undefined && row.value.showId === d.showId) p.remove(id)
+            }
+          }, () => {
+            for (const [id, d] of page) if (doomed.get(id)?.showId === d.showId) doomed.delete(id)
+          })
+          yield* Effect.yieldNow
+        }
+      })
+
+    /** The maintenance work: the start-up read if it failed, ends, removals, accepted writes and image outcomes, failed passes. */
+    const maintain: Effect.Effect<void> = Effect.gen(function*() {
+      lastRun = undefined
+      let failedSome = false
+      if (!loaded) {
+        yield* load
+        if (!loaded) failedSome = true
+      }
+      const now = yield* wallNow
+      // Ended: no longer eligible from their end (a pass after it already left them out); removed now.
+      for (const e of [...index.values()]) if (e.expiresAt <= now) doom(e, now)
+      for (const s of [...pending]) if (s.entry.expiresAt <= now || !partOpen(s.entry.module, s.entry.part)) dropPending(s)
+      if (Exit.isFailure(yield* Effect.exit(removeDoomed(now)))) failedSome = true
+      for (const s of [...pending]) if (s.failed && pending.includes(s)) yield* writePending(s)
+      if (pending.some((s) => s.failed)) failedSome = true
+      for (const [id, w] of [...imageOutcomes]) if (Exit.isFailure(yield* Effect.exit(writeImage(id, w)))) failedSome = true
+      if (failedPasses.size > 0) {
+        for (const d of failedPasses) dirty.add(d)
+        kick()
+      }
+      lastRun = failedSome ? "failed" : "succeeded"
+    }).pipe(Effect.ensuring(Effect.sync(() => {
+      if (lastRun === undefined) lastRun = "failed"
+      ensureHourly()
+      requestPlan()
+    })))
+
+    // ---- Start-up (G4): the whole collection, in bounded steps with real yields
+
+    const load: Effect.Effect<void> = Effect.gen(function*() {
+      const exit = yield* Effect.exit(Effect.gen(function*() {
+        const live: Array<Row<StoredPresentation>> = []
+        let after: Row<StoredPresentation> | undefined
+        for (;;) {
+          const page = yield* core.collection(presentations).list({ orderBy: { field: "createdAt", direction: "asc" }, limit: PRESENT_PAGE, ...(after !== undefined ? { after } : {}) })
+          const now = yield* wallNow
+          for (const row of page) {
+            const v = row.value
+            // No part survives a restart: transient rows go; so do ended and expired ones (removed below, a page at a time).
+            if (v.lifetime === "transient" || v.ended === true || v.expiresAt <= now) doomed.set(row.id, { showId: v.showId, at: now })
+            else live.push(row)
+          }
+          if (page.length < PRESENT_PAGE) break
+          after = page[page.length - 1]
+          yield* Effect.yieldNow
+        }
+        return live
+      }))
+      if (Exit.isFailure(exit)) {
+        setIssue("load", { title: "Presentations could not be read", detail: "Nothing is shown or withdrawn until the stored presentations can be read; tried again every minute." })
+        log(`Presentations: the stored presentations could not be read (${Cause.pretty(exit.cause).split("\n")[0]}); tried again in a minute`)
+        return
+      }
+      for (const row of exit.value) if (!index.has(row.id)) put(entryOf(row))
+      loaded = true
+      setIssue("load", undefined)
+      // What was read and must go is removed off this step (maintenance repeats a failed removal).
+      const now = yield* wallNow
+      yield* Effect.ignore(removeDoomed(now))
+      enqueueAll()
+    })
 
     // ---- Showing
 
@@ -847,11 +1033,18 @@ export const makePresentEngine = (options: PresentEngineOptions): Effect.Effect<
       return "target is \"origin\", { device } or { room }"
     }
 
-    /** Insert (or replace by key) one presentation; earlier transients that share a device with it end. Synchronous. */
-    const writeShow = (p: TxCollection<StoredPresentation>, e: Entry, content: StoredContent, spoken: string, buttons: PendingShow["buttons"], now: number): { readonly removed: ReadonlyArray<Entry> } | { readonly limit: string } => {
-      const replacing = e.key === undefined ? undefined : byKey.get(keyOf(e.module, e.key))
-      const problem = boundProblem(e.module, e.lifetime, e.target, replacing ?? e.id, now)
+    /** The key's stable id (committed or reserved by an accepted show), else `undefined`. */
+    const keyId = (module: string, key: string | undefined) => (key === undefined ? undefined : byKey.get(keyOf(module, key)) ?? pendingKeys.get(keyOf(module, key)))
+
+    type Written = { readonly row: Row<StoredPresentation>; readonly ended: ReadonlyArray<Entry>; readonly before: Entry | undefined } | { readonly limit: string }
+    /**
+     * Insert (or replace, by its key's id) one presentation inside the caller's transaction, the bounds checked against the
+     * state in this attempt; earlier transients that share a device with it are marked ended (an update). Synchronous.
+     */
+    const writeShow = (p: TxCollection<StoredPresentation>, e: Omit<Entry, "rev">, content: (prior: StoredContent | undefined) => StoredContent, spoken: string, buttons: PendingShow["buttons"], now: number): Written => {
+      const problem = boundProblem(e.module, e.lifetime, e.target, e.id, now)
       if (problem !== undefined) return { limit: problem }
+      const prior = p.get(e.id)
       const value: StoredPresentation = {
         module: e.module,
         ...(e.key !== undefined ? { key: e.key } : {}),
@@ -859,43 +1052,37 @@ export const makePresentEngine = (options: PresentEngineOptions): Effect.Effect<
         lifetime: e.lifetime,
         target: e.target,
         ...(e.owner !== undefined ? { owner: e.owner } : {}),
-        content,
+        content: content(prior?.value.ended === true ? undefined : prior?.value.content),
         spoken,
         buttons,
         ...(e.handler !== undefined ? { handler: e.handler } : {}),
         shownAt: e.shownAt,
-        expiresAt: e.expiresAt
+        expiresAt: e.expiresAt,
+        showId: e.showId
       }
-      // A key shown again replaces its row whole (an ended mark too).
-      if (p.get(e.id) !== undefined) p.update(e.id, () => value)
-      else p.insert(value, { id: e.id })
-      // Ended, not removed: an update in the caller's transaction (the removal comes later, off its path).
-      const removed = e.lifetime === "transient" ? overlapping(e.target, e.id) : []
-      for (const old of removed) if (p.get(old.id) !== undefined) p.update(old.id, (v) => ({ ...v, ended: true as const }))
-      return { removed }
+      const row = prior !== undefined ? p.update(e.id, () => value) : p.insert(value, { id: e.id })
+      const ended = e.lifetime === "transient" ? overlapping(e.target, e.id) : []
+      for (const old of ended) {
+        const r = p.get(old.id)
+        if (r !== undefined && r.value.showId === old.showId) p.update(old.id, (v) => ({ ...v, ended: true as const }))
+      }
+      return { row, ended, before: index.get(e.id) }
     }
-
-    const afterShow = (e: Entry, removed: ReadonlyArray<Entry>, content: StoredContent, before: Entry | undefined) => {
-      for (const old of removed) {
-        drop(old.id)
-        touch(old.id, old.target)
-        entombed(old.id)
-      }
+    /** After a show's commit: the index follows what was committed; what it ended leaves the index. */
+    const afterShow = (w: Exclude<Written, { readonly limit: string }>, now: number) => {
+      for (const old of w.ended) doom(old, now + PRESENT_PURGE_AFTER_MS)
+      const e = entryOf(w.row)
       put(e)
-      touch(e.id, e.target)
-      if (before !== undefined && JSON.stringify(before.target) !== JSON.stringify(e.target)) touch(e.id, before.target)
-      if (content.kind === "image" && content.hash === undefined && content.failed === undefined) fetchImage(e.id, content.url)
+      touch(e.id, e.target, w.before?.target)
+      requestPlan()
     }
 
-    /** The entry for a new show (its id: the key's when the module shows that key again). */
-    const newEntry = (module: string, part: number, target: Entry["target"], presentation: Presentation, o: ShowOptions | undefined, now: number): Entry => {
-      const lifetime = o?.lifetime ?? (presentation.kind === "timer" ? "pinned" : "transient")
-      const timerEnd = presentation.kind === "timer" && lifetime === "pinned" && o?.expiresInMs === undefined
-        ? Math.min(now + PRESENT_MAX_EXPIRY_MS.pinned, Math.max(now + PRESENT_MIN_EXPIRY_MS, presentation.endsAt + TIMER_GRACE_MS))
-        : undefined
-      const id = (o?.key !== undefined ? byKey.get(keyOf(module, o.key)) : undefined) ?? newId()
+    /** The entry for a show accepted now (its id: the key's stable one when the module shows that key again). */
+    const newEntry = (module: string, part: number, target: Entry["target"], presentation: Presentation, o: ShowOptions | undefined, now: number): Omit<Entry, "rev"> => {
+      const { lifetime, expiresAt } = presentLifetime(presentation, o, now)
       return {
-        id,
+        id: keyId(module, o?.key) ?? newId(),
+        showId: newId(),
         module,
         key: o?.key,
         part,
@@ -905,20 +1092,17 @@ export const makePresentEngine = (options: PresentEngineOptions): Effect.Effect<
         kind: presentation.kind,
         handler: presentation.handler,
         shownAt: now,
-        expiresAt: timerEnd ?? now + (o?.expiresInMs ?? PRESENT_DEFAULT_EXPIRY_MS[lifetime])
+        expiresAt
       }
     }
 
     const published = new Map<string, PublishedHandler>()
-    /** Handlers registered by a part that has not closed (staged or published): what `show` accepts by name. */
     const known = new Map<string, number>()
-
+    const handlerProblem = (moduleId: string, presentation: Presentation) =>
+      presentation.handler !== undefined && !known.has(`${moduleId}/${presentation.handler}`) ? `${moduleId} has no press handler "${presentation.handler}" (register it in shared with present.handle)` : undefined
     const requestProblem = (moduleId: string, presentation: Presentation, o: ShowOptions | undefined, now: number): string | undefined =>
-      presentationProblem(presentation, now) ??
-        showOptionsProblem(o, (presentation as { kind?: PresentKindName }).kind) ??
-        (presentation.handler !== undefined && !known.has(`${moduleId}/${presentation.handler}`) ? `${moduleId} has no press handler "${presentation.handler}" (register it in shared with present.handle)` : undefined)
+      presentationProblem(presentation, now) ?? showOptionsProblem(o, (presentation as { kind?: PresentKindName }).kind) ?? handlerProblem(moduleId, presentation)
 
-    /** The newest open part of a module (what a tool's presentation belongs to), or `undefined`. */
     const partOf = (moduleId: string): number | undefined => {
       const open = openParts.get(moduleId)
       return open === undefined || open.size === 0 ? undefined : Math.max(...open)
@@ -929,109 +1113,133 @@ export const makePresentEngine = (options: PresentEngineOptions): Effect.Effect<
         const now = yield* wallNow
         const problem = requestProblem(moduleId, presentation, o, now)
         if (problem !== undefined) return yield* invalid(problem)
-        if (!loaded) return yield* new PresentError({ reason: "busy", message: "the stored presentations could not be read yet; try again" })
-        const resolved = resolveTarget(target, yield* originDevice(undefined))
+        if (!loaded) return yield* new PresentError({ reason: "busy", message: "the stored presentations are still being read; try again" })
+        const origin = yield* originDevice(undefined)
+        const resolved = resolveTarget(target, origin)
         if (typeof resolved === "string") return yield* invalid(resolved)
-        const e = newEntry(moduleId, partId, resolved, presentation, o, now)
-        const before = index.get(e.id)
-        const spoken = presentation.spoken
         const buttons = (presentation.buttons ?? []).map((b) => ({ id: b.id, label: b.label }))
+        let committed: Entry | undefined
         const out = yield* tx((p) => {
-          // Showing a key again keeps what was fetched for the same image address.
-          const prior = p.get(e.id)
-          const kept = storedContentOf(presentation, prior?.value.content)
-          const w = writeShow(p, e, kept, spoken, buttons, now)
-          return "limit" in w ? w : { ...w, content: kept }
+          // The entry (and the key's id) is derived in the attempt that commits.
+          const e = newEntry(moduleId, partId, resolved, presentation, o, now)
+          return writeShow(p, e, (prior) => storedContentOf(presentation, prior), presentation.spoken, buttons, now)
         }, (w) => {
-          if (!("limit" in w)) afterShow(e, w.removed, w.content, before)
+          if ("limit" in w) return
+          afterShow(w, now)
+          committed = entryOf(w.row)
         })
         if ("limit" in out) return yield* new PresentError({ reason: "limit", message: out.limit })
-        return handleOf(moduleId, e, outcomeOf(e, out.content.kind === "image" && out.content.hash === undefined && out.content.failed === undefined))
+        const e = committed ?? entryOf(out.row)
+        const c = out.row.value.content
+        return handleOf(moduleId, e, outcomeOf(e, { asking: origin, spoken: presentation.spoken, module: moduleId, image: c.kind === "image" && c.hash === undefined && c.failed === undefined }))
       })
 
     const handleOf = (moduleId: string, e: Entry, outcome: ShowOutcome): PresentHandle => ({
       id: e.id,
       ...(e.key !== undefined ? { key: e.key } : {}),
       outcome,
-      update: (presentation) => update(moduleId, e.id, presentation),
-      dismiss: dismiss(moduleId, e.id)
+      update: (presentation) => update(moduleId, e.id, e.showId, presentation),
+      dismiss: dismiss(moduleId, e.id, e.showId)
     })
 
-    const update = (moduleId: string, id: string, presentation: Presentation): Effect.Effect<ShowOutcome | undefined, PresentError> =>
+    /** G3: the entry and its row are read again in the attempt that commits; a replaced or ended show changes nothing. */
+    const update = (moduleId: string, id: string, showId: string, presentation: Presentation): Effect.Effect<ShowOutcome | undefined, PresentError> =>
       Effect.gen(function*() {
         const now = yield* wallNow
-        const problem = presentationProblem(presentation, now) ??
-          (presentation.handler !== undefined && !known.has(`${moduleId}/${presentation.handler}`) ? `${moduleId} has no press handler "${presentation.handler}"` : undefined)
+        const problem = presentationProblem(presentation, now) ?? handlerProblem(moduleId, presentation)
         if (problem !== undefined) return yield* invalid(problem)
-        const e = index.get(id)
-        if (e === undefined || e.module !== moduleId || e.expiresAt <= now) return undefined
-        if (presentation.kind !== e.kind) return yield* invalid(`an update keeps the kind (${e.kind}); show a new presentation for another`)
-        if (ownerOf(presentation.sensitivity) !== e.owner) return yield* invalid("an update keeps the sensitivity; show a new presentation for another")
-        const next: Entry = { ...e, handler: presentation.handler }
-        const wrote = yield* tx((p) => {
+        const asking = yield* originDevice(undefined)
+        const out = yield* tx((p): { readonly row: Row<StoredPresentation> } | { readonly invalid: string } | undefined => {
+          const e = index.get(id)
           const row = p.get(id)
-          if (row === undefined || row.value.ended === true) return undefined
+          if (e === undefined || row === undefined || row.value.ended === true || e.showId !== showId || row.value.showId !== showId || row.value.module !== moduleId || e.expiresAt <= now) return undefined
+          if (presentation.kind !== row.value.content.kind) return { invalid: `an update keeps the kind (${row.value.content.kind}); show a new presentation for another` }
+          if (ownerOf(presentation.sensitivity) !== row.value.owner) return { invalid: "an update keeps the sensitivity; show a new presentation for another" }
           const content = storedContentOf(presentation, row.value.content)
           const { handler: _h, ...rest } = row.value
-          p.update(id, () => ({
+          const next = p.update(id, () => ({
             ...rest,
             content,
             spoken: presentation.spoken,
             buttons: (presentation.buttons ?? []).map((b) => ({ id: b.id, label: b.label })),
             ...(presentation.handler !== undefined ? { handler: presentation.handler } : {})
           }), { expectRev: row.rev })
-          return content
-        }, (content) => {
-          if (content === undefined) return
-          put(next)
-          touch(id, next.target)
-          if (content.kind === "image" && content.hash === undefined && content.failed === undefined) fetchImage(id, content.url)
+          return { row: next }
+        }, (w) => {
+          if (w === undefined || "invalid" in w) return
+          const e = entryOf(w.row)
+          put(e)
+          touch(id, e.target)
         })
-        return wrote === undefined ? undefined : outcomeOf(next)
+        if (out === undefined) return undefined
+        if ("invalid" in out) return yield* invalid(out.invalid)
+        const e = entryOf(out.row)
+        const c = out.row.value.content
+        return outcomeOf(e, { asking, spoken: presentation.spoken, module: moduleId, image: c.kind === "image" && c.hash === undefined && c.failed === undefined })
       })
 
-    const dismiss = (moduleId: string, id: string): Effect.Effect<boolean, PresentError> =>
+    /** G1: no longer eligible at once; the row is marked ended (or removed later by maintenance if that fails). */
+    const dismiss = (moduleId: string, id: string, showId: string): Effect.Effect<boolean, PresentError> =>
       Effect.gen(function*() {
         const e = index.get(id)
-        if (e === undefined || e.module !== moduleId) return false
-        return yield* tx((p) => {
+        if (e === undefined || e.module !== moduleId || e.showId !== showId) return false
+        const now = yield* wallNow
+        doom(e, now + PRESENT_PURGE_AFTER_MS)
+        yield* Effect.ignore(tx((p) => {
           const row = p.get(id)
-          if (row === undefined || row.value.ended === true) return false
-          // Ended, not removed: an update in the caller's transaction (the removal comes later, off its path).
-          p.update(id, (v) => ({ ...v, ended: true as const }), { expectRev: row.rev })
-          return true
-        }, (gone) => {
-          drop(id)
-          if (gone) {
-            touch(id, e.target)
-            entombed(id)
-          }
-        })
+          if (row !== undefined && row.value.showId === showId && row.value.ended !== true) p.update(id, (v) => ({ ...v, ended: true as const }))
+        }))
+        return true
       })
 
-    /** The writer's side of a tool's show: the same transaction as `show`, with the bounds checked again. */
+    // ---- Accepted shows (way 1): written off the turn's path, retried until written or no longer applying (G5)
+
+    const work: Array<PendingShow> = []
+    let writing = false
+    const workWake = yield* Queue.sliding<void>(1)
     const writePending = (s: PendingShow): Effect.Effect<void> =>
       Effect.gen(function*() {
-        const now = yield* wallNow
-        const exit = yield* Effect.exit(tx((p) => {
-          // Its own reservation no longer counts once it is being written.
-          const at = pending.indexOf(s)
-          if (at >= 0) pending.splice(at, 1)
-          const prior = p.get(s.entry.id)
-          const content = prior === undefined ? s.content : { ...s.content, ...(s.content.kind === "image" && prior.value.content.kind === "image" && prior.value.content.url === s.content.url ? { ...(prior.value.content.hash !== undefined ? { hash: prior.value.content.hash } : {}) } : {}) } as StoredContent
-          const w = writeShow(p, s.entry, content, s.spoken, s.buttons, now)
-          return "limit" in w ? w : { ...w, content }
-        }, (w) => {
-          if (!("limit" in w)) afterShow(s.entry, w.removed, w.content, undefined)
-        }))
-        const at = pending.indexOf(s)
-        if (at >= 0) pending.splice(at, 1)
-        if (Exit.isFailure(exit)) {
-          setIssue("write", { title: "A presentation could not be shown", detail: "The store refused it; the model was told it was shown. It is not tried again." })
-          log(`Presentations: a presentation of ${s.entry.module} could not be written (${Cause.pretty(exit.cause).split("\n")[0]})`)
-        } else if ("limit" in exit.value) log(`Presentations: a presentation of ${s.entry.module} passed a bound while it waited (${exit.value.limit}); not shown`)
-        else setIssue("write", undefined)
+        for (let attempt = 0;; attempt++) {
+          if (!pending.includes(s)) return
+          const now = yield* wallNow
+          if (s.entry.expiresAt <= now || !partOpen(s.entry.module, s.entry.part)) return dropPending(s)
+          // Its own reservation (the same id) does not count against it in `writeShow`'s bounds.
+          const exit = yield* Effect.exit(tx((p): Written | "gone" => {
+            if (!pending.includes(s)) return "gone"
+            return writeShow(p, s.entry, (prior) => (s.content.kind === "image" && prior?.kind === "image" && prior.url === s.content.url ? { ...s.content, ...(prior.hash !== undefined ? { hash: prior.hash } : {}) } : s.content), s.spoken, s.buttons, now)
+          }, (w) => {
+            if (w === "gone") return
+            dropPending(s)
+            if (!("limit" in w)) afterShow(w, now)
+          }))
+          if (Exit.isSuccess(exit)) {
+            if (exit.value !== "gone" && "limit" in exit.value) log(`Presentations: a presentation of ${s.entry.module} passed a bound while it waited (${exit.value.limit}); not shown`)
+            s.failed = false
+            if (!pending.some((x) => x.failed)) setIssue("write", undefined)
+            return
+          }
+          const pause = writeRetryMs[attempt]
+          if (pause === undefined || s.failed) {
+            s.failed = true
+            setIssue("write", { title: "A presentation could not be shown yet", detail: "The store refused it; it is written again every minute until it is written or has ended." })
+            log(`Presentations: a presentation of ${s.entry.module} could not be written (${Cause.pretty(exit.cause).split("\n")[0]}); maintenance writes it again`)
+            requestPlan()
+            return
+          }
+          yield* Effect.sleep(pause)
+        }
       })
+    const workLoop = Effect.gen(function*() {
+      for (;;) {
+        yield* Queue.take(workWake)
+        writing = true
+        for (let s = work.shift(); s !== undefined; s = work.shift()) {
+          yield* writePending(s)
+          yield* Effect.yieldNow
+        }
+        writing = false
+      }
+    })
 
     const fromResult: PresentEngine["fromResult"] = (moduleId, principal, value) =>
       Effect.gen(function*() {
@@ -1039,28 +1247,29 @@ export const makePresentEngine = (options: PresentEngineOptions): Effect.Effect<
         const forModel = value.forModel
         const presentation = value.present
         const o = value.show
-        const not = (why: string) => withScreenNote(forModel, `Not shown: ${why}; say it instead.`)
-        if (moduleId === undefined) return not("this tool belongs to no module")
+        if (moduleId === undefined) return withScreenNote(forModel, refusedNote("this tool belongs to no module"))
         const now = yield* wallNow
-        const problem = presentationProblem(presentation, now) ?? showOptionsProblem(o, (presentation as { kind?: PresentKindName }).kind) ??
-          (presentation.handler !== undefined && !known.has(`${moduleId}/${presentation.handler}`) ? `${moduleId} has no press handler "${presentation.handler}"` : undefined)
+        const problem = requestProblem(moduleId, presentation, o, now)
         if (problem !== undefined) {
           log(`Presentations: a presentation of ${moduleId} was refused (${problem})`)
-          return not(`the presentation was not valid (${problem.slice(0, 200)})`)
+          return withScreenNote(forModel, refusedNote(`the presentation was not valid (${problem.slice(0, 200)})`))
         }
+        const spoken = options.pageText(moduleId, presentation.spoken, MAX_NOTE_SPOKEN_CHARS)
         const part = partOf(moduleId)
-        if (part === undefined) return not("this module cannot show things (it is not a version 2 module, or it is stopping)")
-        if (!loaded) return not("the screen's data could not be read yet")
+        if (part === undefined) return withScreenNote(forModel, refusedNote("this module cannot show things (it is not a version 2 module, or it is stopping)", spoken))
+        if (!loaded) return withScreenNote(forModel, refusedNote("the screen's data is still being read", spoken))
         const origin = yield* originDevice(principal)
-        if (origin === undefined || deviceOf(origin) === undefined) return not("there is no device to show it on")
+        if (origin === undefined || deviceOf(origin) === undefined) return withScreenNote(forModel, refusedNote("there is no device to show it on", spoken))
         const e = newEntry(moduleId, part, { device: origin }, presentation, o, now)
-        const bound = boundProblem(moduleId, e.lifetime, e.target, e.key !== undefined ? byKey.get(keyOf(moduleId, e.key)) ?? e.id : e.id, now)
-        if (bound !== undefined) return not(`too much is on screen (${bound})`)
-        const outcome = outcomeOf(e, presentation.kind === "image")
-        // One enqueue: the writer stores it and reconciliation shows it, off the turn's path.
-        const s: PendingShow = { entry: e, content: storedContentOf(presentation), spoken: presentation.spoken, buttons: (presentation.buttons ?? []).map((b) => ({ id: b.id, label: b.label })) }
+        const bound = boundProblem(moduleId, e.lifetime, e.target, e.id, now)
+        if (bound !== undefined) return withScreenNote(forModel, refusedNote(`too much is on screen (${bound})`, spoken))
+        const outcome = outcomeOf(e, { asking: origin, spoken: presentation.spoken, module: moduleId, image: presentation.kind === "image" })
+        // Accepted: its key's id reserved, its place held in the bounds, one enqueue; written and shown off the turn's path.
+        if (e.key !== undefined) pendingKeys.set(keyOf(moduleId, e.key), e.id)
+        const s: PendingShow = { entry: e, content: storedContentOf(presentation), spoken: presentation.spoken, buttons: (presentation.buttons ?? []).map((b) => ({ id: b.id, label: b.label })), failed: false }
         pending.push(s)
-        queueWork(writePending(s))
+        work.push(s)
+        void Queue.offerUnsafe(workWake, undefined)
         return withScreenNote(forModel, outcome.note)
       })
 
@@ -1072,20 +1281,18 @@ export const makePresentEngine = (options: PresentEngineOptions): Effect.Effect<
     const press = (request: PresentPressRequest): Effect.Effect<PresentPressAnswer> =>
       Effect.gen(function*() {
         const now = yield* wallNow
-        // Admission, against this moment (synchronous): the connection holds it, it is live, the decision lets it be
-        // pressed there now, and the action is one it offers.
         type Admitted = { readonly row: Row<StoredPresentation>; readonly entry: PublishedHandler } | PresentPressAnswer
         const admitted = ((): Admitted => {
-          const bys = heldOf(request.deviceId)
-          const holds = bys.some((by) => by.items.has(request.presentationId) && (request.connection === undefined || held.get(request.connection.id) === by))
-          if (!holds) return answer(false, "cantNow", "unknown")
+          const conns = heldOf(request.deviceId)
+          const holder = conns.find(({ by, conn }) => by.items.has(request.presentationId) && (request.connection === undefined || conn.id === request.connection.id))
+          if (holder === undefined) return answer(false, "cantNow", "unknown")
           const e = index.get(request.presentationId)
           if (e === undefined || e.expiresAt <= now) {
             enqueue(request.deviceId)
             return answer(false, "over", "unknown")
           }
           const device = deviceOf(request.deviceId)
-          const decision = device === undefined || !applies(e.target, device) ? undefined : decide(e, device, true)
+          const decision = device === undefined || !applies(e.target, device) ? undefined : decide(e, device, true, outputsFor(device, holder.conn))
           if (decision?.show !== true || !decision.interactive) {
             enqueue(request.deviceId)
             return answer(false, "cantNow", "unknown")
@@ -1096,7 +1303,7 @@ export const makePresentEngine = (options: PresentEngineOptions): Effect.Effect<
           } catch {
             return answer(false, "cantNow", "failed")
           }
-          if (row === undefined) return answer(false, "over", "unknown")
+          if (row === undefined || row.value.showId !== e.showId || row.value.ended === true) return answer(false, "over", "unknown")
           const v = row.value
           if (request.action === TICK_ACTION) {
             const ok = v.content.kind === "list" && v.content.style === "checklist" && typeof request.done === "boolean" && v.content.items.some((i) => i.id === request.item)
@@ -1160,10 +1367,18 @@ export const makePresentEngine = (options: PresentEngineOptions): Effect.Effect<
 
     // ---- Start
 
+    const jobRun = (safetyNet: boolean) => () =>
+      Effect.suspend(() => {
+        plannedAt = safetyNet ? "unknown" : undefined
+        return maintain
+      })
+    yield* jobs.handle(PRESENT_DUE_HANDLER, { payload: Schema.Struct({}), idempotent: true, timeoutMs: 50_000, run: jobRun(false) }).pipe(Effect.orDie)
+    yield* jobs.handle(PRESENT_HOURLY_HANDLER, { payload: Schema.Struct({}), idempotent: true, timeoutMs: 50_000, run: jobRun(true) }).pipe(Effect.orDie)
     yield* load
     yield* Effect.forkIn(loop, scope)
     yield* Effect.forkIn(workLoop, scope)
-    yield* Effect.forkIn(endsLoop, scope)
+    ensureHourly()
+    requestPlan()
 
     // ---- The module host's side
 
@@ -1176,8 +1391,8 @@ export const makePresentEngine = (options: PresentEngineOptions): Effect.Effect<
       }
       open.add(part.id)
       // The part's transient presentations end with it (its scope closes after its module was withdrawn and its calls
-      // in flight had their grace period).
-      Effect.runSync(Scope.addFinalizer(part.scope, Effect.sync(() => partClosed(moduleId, part.id))))
+      // in flight had their grace period): no longer eligible at that moment, removed by maintenance.
+      Effect.runSync(Scope.addFinalizer(part.scope, partClosed(moduleId, part.id)))
       const handle = (name: string, handler: PresentPressHandler): Effect.Effect<void, PresentError> =>
         Effect.suspend(() => {
           if (typeof name !== "string" || !PRESENT_HANDLER_NAME.test(name)) return Effect.fail(invalid(`a press handler's name must match ${PRESENT_HANDLER_NAME}`))
@@ -1207,9 +1422,13 @@ export const makePresentEngine = (options: PresentEngineOptions): Effect.Effect<
       reconcileAll: enqueueAll,
       press,
       fromResult,
-      holdsHash: (hash) => {
-        for (const by of held.values()) for (const h of by.items.values()) if (h.hash === hash) return true
-        return false
+      mediaFor: (token) => {
+        const t = tokens.get(token)
+        if (t === undefined) return undefined
+        const by = held.get(t.connId)
+        if (by === undefined || by.items.get(t.id)?.token !== token) return undefined
+        if (!connectionsOf(by.deviceId).some((c) => c.id === t.connId)) return undefined
+        return t.hash
       },
       busyAnswer: () => answer(false, "tooMany", "busy"),
       live: () =>
@@ -1225,9 +1444,12 @@ export const makePresentEngine = (options: PresentEngineOptions): Effect.Effect<
           expiresAt: e.expiresAt
         })),
       held: (deviceId) => [...held.entries()].filter(([, by]) => by.deviceId === deviceId).map(([connection, by]) => ({ connection, ids: [...by.items.keys()] })),
-      expireNow: Effect.ignore(sweepEnded),
+      maintainNow: maintain,
+      planNow,
+      plannedAt: () => (typeof plannedAt === "number" ? plannedAt : undefined),
+      loaded: () => loaded,
       settled: Effect.gen(function*() {
-        for (let i = 0; i < 5_000 && (working || writing || sweeping || all || dirty.size > 0 || work.length > 0 || pending.length > 0 || fetching.size > 0); i++) yield* Effect.yieldNow
+        for (let i = 0; i < 5_000 && (working || writing || planning || all || dirty.size > 0 || work.length > 0 || fetching.size > 0); i++) yield* Effect.yieldNow
       })
     }
     return engine

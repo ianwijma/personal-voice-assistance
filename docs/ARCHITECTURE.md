@@ -927,7 +927,7 @@ ActionPress   = { notificationId, actionId, key?, deviceId }        ActionAnswer
 DndState      = { on: boolean; until? }
 NotifyError   = { reason: "unavailable" | "invalid" | "limit" | "busy" | "failed", message }
 ModuleSpeech (ctx.speech) = { say(SpeechTarget, text (≤ 300), { cue?, owner? }?): Effect<SpeechHandle, SpeechError> }
-SpeechTarget  = { device } | { room } | "everywhere"
+SpeechTarget  = { device } | { room; except? } | "everywhere"     // text may be "" with { cue: true }: the chime alone
 SpeechHandle  = { id; deliveries: [{ deviceId, queued, why? }]; done: Effect<[{ deviceId, outcome: "spoken" | "stopped" | "skipped" | "failed", why? }], SpeechError>; stop: Effect<void> }
 SpeechError   = { reason: "unavailable" | "invalid" | "no-device" | "in-turn", message }
 // @pva/protocol (notifications.ts), shared with the web mock:
@@ -1008,7 +1008,7 @@ ModulePresent (ctx.present) = {
 Presentation  = (card { title, text?, facts? } | list { title, style?, items } | timer { label, endsAt } | image { url, alt, credit, caption? }
                  | weather { place, now, days? }) & { kind, spoken, sensitivity?: "household" | { personal }, buttons?, handler? }
 PresentHandle = { id; key?; outcome: ShowOutcome; update(Presentation): Effect<ShowOutcome | undefined, PresentError>; dismiss: Effect<boolean, PresentError> }
-ShowOutcome   = { devices: [{ deviceId, shown, why? }], note }       // the note for the model: what the server did
+ShowOutcome   = { devices: [{ deviceId, shown, why? }], note }       // the note for the model: what the server decided ("Showing on …")
 PresentResult = { forModel, present: Presentation, show?: ShowOptions }   // a tool's result; an action's outcome gains { present, show }
 PresentPress  = { presentationId, key?, deviceId, action: "tick" | <button id>, item?, done? }
 PresentError  = { reason: "unavailable" | "invalid" | "limit" | "busy" | "failed", message }
@@ -1020,40 +1020,69 @@ devicePresentFrom(settings, declared): DevicePresentOutputs = { display, kinds, 
 // present.action { requestId, id, action, item?, done? } (page → server) answered by result { say? }: additive within protocol 11
 PresentHook (ModuleHostOptions.present) = { forPart(part, runner): ModulePresent; fromResult(moduleId, principal, value) }
 PresentEngine = PresentHook & { reconcile(deviceId); reconcileAll(); press(PresentPressRequest): Effect<PresentPressAnswer>;
-                                holdsHash(hash); busyAnswer(); live(); held(deviceId); expireNow; settled }
-makePresentEngine({ store, devices, outputs(device): DevicePresentOutputs, privacy, outlet: () => PresentOutlet?, media?: () => MediaPort?,
-                    gateway, pageText, language, issues?, log?, newId?, onDecision?, observe?, now? }): Effect<PresentEngine, never, Scope>
+                                mediaFor(token): hash | undefined; busyAnswer(); live(); held(deviceId); maintainNow; planNow;
+                                plannedAt(); loaded(); settled }
+makePresentEngine({ store, scheduler, devices, outputs(device, declaredKinds?): DevicePresentOutputs, privacy, outlet: () => PresentOutlet?,
+                    media?: () => MediaPort?, gateway, pageText, language, issues?, log?, newId?, onDecision?, observe?, now?,
+                    writeRetryMs? }): Effect<PresentEngine, never, Scope>
+PresentOutlet = { connections(deviceId): [{ id, send(PresentMessage), kinds?(): Record<kind, version> | undefined }] }   // kinds: that page's own
 MediaPort     = { fetch(url): Effect<{ hash } | { refused: "type" | "size" | "busy" | "full" | "fetch" | "blocked" | "unavailable" }> }
 GatewayOptions.present = fromResult                                 // the gateway's split of { forModel, present }
+ActionCallOptions.onDecision({ risk?, refused?, presented? })      // P7's trace; P10 adds presented: true (TraceInfo.phrase.presented)
+// @pva/protocol: presentationProblem, showOptionsProblem, presentLifetime, presentWireContent (the server and the mock);
+// ImageState.ready = { token }: a page's own address /media/<token>, never a hash
 ```
 
-- **Where**: `Present.ts` (the contract, the bounds, the validation, the collection `core.present/presentations`,
-  `maxChars` 5,000: 5 rows a read), `PresentEngine.ts` (the engine), `PresentTexts.ts` (the stage's own words and the
-  answers, English and Dutch), `presentContract.ts` (`@pva/core/present-contract`, the contract suite and its world),
-  `apps/assistant/src/serve/media.ts` (the image cache and `/media/<hash>`).
-- **The index**: the live presentations without their content (module, key, part, lifetime, target, owner, kind,
-  handler, times) are kept in memory, loaded at start (transient and ended rows of an earlier process removed) and
-  changed only in the commit hooks of the engine's transactions; bounds, targets and the next end are read from it.
-- **Reconciliation is the only sender**, per connection, one synchronous step per device (index → decision → selection
-  → each chosen row read now → sends, withdrawals first), one pass at a time, yielding between devices; a failed pass is
-  repeated by the next trigger or a minute later. Triggers: every change of a row, an end, a part's close, the hub's
-  hello / close / declaration (with the notification service's), every settings commit (`reconcileAll`).
-- **Ends**: one fiber sleeps until the earliest end and removes what ended in transactions of a page. Dismissing, or a
-  newer transient taking a device, marks the row `ended` (an update) and the fiber removes ended rows ten seconds later.
-- **Parts**: `forPart` records the part as open and adds a finaliser to its scope; when it closes, its transient rows
-  are removed. A tool's `{ forModel, present }` belongs to the module's newest open part (`fromResult` refuses, with the
-  note, a module that has none: a version 1 module, or one stopping).
-- **Presses**: admitted only for a connection that holds the presentation and while the decision makes it interactive
-  there; claimed in memory (one per presentation); the handler runs through `PartRunner.inFlight` with the presentation
-  principal, admitted by `ExecutionGateway.principal` first, within 5 s. The hub sends every `present.action` through
-  its bounded admission (`busyAnswer()` at the bound).
+- **Where**: `Present.ts` (the contract, the bounds, the collection `core.present/presentations`, `maxChars` 5,000: 5
+  rows a read; a row carries its `showId` and, once it ended, `ended`), `PresentEngine.ts` (the engine),
+  `PresentTexts.ts` (the stage's own words and the answers, English and Dutch), `presentContract.ts`
+  (`@pva/core/present-contract`, the contract suite and its world: several tabs with their own kinds, a fault-injecting
+  store with a busy gate), `apps/assistant/src/serve/media.ts` (the image cache and `/media/<token>`).
+- **The index is the truth of what is eligible** (review round 1): the live presentations without their content (show
+  id, rev, module, key, part, lifetime, target, owner, kind, handler, times), loaded at start by a scan of the whole
+  collection in bounded steps with yields ("loaded" only at its end; until then nothing is shown or withdrawn and shows
+  are refused `busy`), and changed only from what a committed transaction wrote (the entry is derived from the committed
+  row). An end, a dismissal, a replacement and a stopped part take a presentation out of it at once and reconcile its
+  holders; removing its row (`doomed`: id, show id, when) is separate work, repeated until it succeeds. A key has one
+  stable id across accepted (`pendingKeys`) and committed shows; accepted shows hold their place in the bounds, those of
+  one id counted once, queued transients that replace one another too.
+- **Reconciliation is the only sender**, per connection, one synchronous step per device: first, from the index and the
+  decision alone, every connection's share (decided with the kinds its own page declared, `PresentConnection.kinds`) and
+  the withdrawal of everything outside it; then the content of what a connection lacks or holds at another rev, form or
+  language, read item by item (a failed read affects that item; the pass is repeated). One pass at a time, yielding
+  between devices; a failed pass is repeated by the next trigger or by maintenance a minute later. Triggers: every change
+  of a row, an end, a part's close, an image outcome, the hub's hello / close / declaration (a page's `device.caps` at
+  once), every settings commit (`reconcileAll`).
+- **Maintenance** (the notification service's pattern): `plan()` reads memory only (the earliest end, the earliest
+  removal, failed work a minute from now: a pass, an accepted write, an image outcome, the start-up read) and keeps the
+  one-shot `core.present/due` (key `due`) there, or none; it runs after every change, at the end of every run and at
+  start. `core.present/hourly` (cron `0 * * * *` in UTC) runs the same work. A run: the start-up read if it failed, ends
+  (out of the index, holders reconciled), accepted shows that no longer apply dropped, removals, failed accepted writes
+  and image outcomes written again, failed passes repeated; then `plan()`.
+- **Accepted shows** (way 1) are written by one writer off the turn's path; a write the store refuses is tried again
+  (`writeRetryMs`, then maintenance) until it is written or no longer applies, with the Health issue `core.present.write`
+  meanwhile.
+- **Images**: fetched when reconciliation is about to send an image presentation without its image to a page (never for
+  a target nobody would show it on); the outcome is written on the row of that show, or kept and written again by
+  maintenance. Each connection is given a token per image (`/media/<token>`, 24 random bytes); `mediaFor(token)` answers
+  the hash only while that connection is open and holds that image.
+- **Parts**: `forPart` records the part as open and adds a finaliser to its scope; when it closes, its transient
+  presentations leave the index at once (their rows removed by maintenance) and its accepted shows not written yet are
+  dropped. A tool's `{ forModel, present }` belongs to the module's newest open part.
+- **Presses**: admitted only for a connection that holds the presentation and while the decision (with that page's
+  kinds) makes it interactive there; claimed in memory (one per presentation); the handler runs through
+  `PartRunner.inFlight` with the presentation principal, admitted by `ExecutionGateway.principal` first, within 5 s. It
+  is not a tool call: no risk class or trace of its own (the gateway has no call kind for registered handlers), the
+  same as a notification's action. The hub sends every `present.action` through its bounded admission (`busyAnswer()`
+  at the bound). `NotifyEngine`'s origin knows the presentation principal.
 - **Turn path**: way 1 is a validation, the bounds read from memory, the decision for the origin device and one enqueue
   (the writer stores and reconciles off the turn); way 2 is one synchronous transaction and an enqueue. Measured:
   docs/PRESENTING.md "Latency".
 - **Serve mode** makes the engine after the notification service and before the module host (`serveMode.ts`), with the
-  device facts (`DeviceFacts.presentOf`), the hub's voice connections (outlet) and the image cache; `/media/` is answered
-  by the cache (`HttpOptions.media`) only for a hash a connection holds (`holdsHash`). The CLI modes have none:
-  `present.handle` succeeds, `show` fails `unavailable`, a result's presentation becomes the note that nothing is shown.
+  scheduler, the device facts (`DeviceFacts.presentOf(id, kind, declaredKinds?)`), the hub's voice connections with each
+  one's own declaration (`VoiceConnection.declared`) and the image cache; `/media/` is answered by the cache
+  (`HttpOptions.media`) for a page's own token (`mediaFor`). The CLI modes have none: `present.handle` succeeds, `show`
+  fails `unavailable`, a result's presentation becomes the note that nothing is shown.
 
 ### Phrase commands, the essential controls, the ringing window (docs/MODULES-PLAN.md §4 P7, first version; how to use it: [docs/PHRASES.md](PHRASES.md))
 

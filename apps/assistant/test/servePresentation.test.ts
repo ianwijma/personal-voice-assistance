@@ -7,6 +7,7 @@
 import { defineModule, makeTool, type ModulePresent, type Presentation } from "@pva/core"
 import { PRESENT_KIND_VERSIONS, type ServerMessage } from "@pva/protocol"
 import { Effect, Schema } from "effect"
+import { createHash } from "node:crypto"
 import { afterEach, describe, expect, it, vi } from "vitest"
 import { ScriptedClient, sleep } from "./support/scriptedClient.ts"
 import { controlledStt, fakeBuild, greeterModule, scriptedLlm, startTestServer, TEST_ADMIN_PASSWORD, type TestServer } from "./support/serveHarness.ts"
@@ -31,25 +32,36 @@ afterEach(async () => {
 })
 
 let present: ModulePresent | undefined
+const boards = new Map<string, ModulePresent>()
 const presses: Array<string> = []
 let handlerWait = 0
+/** While set, every handler waits for it (presses stay pending, holding their place in the hub's bound). */
+let handlerGate: Promise<void> | undefined
 let toolResult: unknown = "nothing"
-const board = defineModule({
-  apiVersion: 2,
-  id: "board",
-  name: "Board",
-  description: "Shows things.",
-  shared: (ctx) =>
-    Effect.gen(function*() {
-      present = ctx.present
-      yield* ctx.present.handle("answer", {
-        run: (p) => Effect.andThen(Effect.sleep(handlerWait), Effect.sync(() => (presses.push(`${p.action}:${p.item ?? ""}`), { say: "Ticked." })))
-      }).pipe(Effect.orDie)
-      return { value: undefined }
-    }),
-  start: () => Effect.succeed({ tools: [makeTool({ name: "board_show", description: "Show the board.", parameters: Schema.Struct({}), execute: () => Effect.sync(() => toolResult) })] })
-})
+const boardModule = (id: string) =>
+  defineModule({
+    apiVersion: 2,
+    id,
+    name: `Board ${id}`,
+    description: "Shows things.",
+    shared: (ctx) =>
+      Effect.gen(function*() {
+        if (id === "board") present = ctx.present
+        boards.set(id, ctx.present)
+        yield* ctx.present.handle("answer", {
+          run: (p) =>
+            Effect.andThen(
+              Effect.andThen(Effect.sleep(handlerWait), Effect.promise(() => handlerGate ?? Promise.resolve())),
+              Effect.sync(() => (presses.push(`${p.action}:${p.item ?? ""}`), { say: "Ticked." }))
+            )
+        }).pipe(Effect.orDie)
+        return { value: undefined }
+      }),
+    start: () => Effect.succeed({ tools: id === "board" ? [makeTool({ name: "board_show", description: "Show the board.", parameters: Schema.Struct({}), execute: () => Effect.sync(() => toolResult) })] : [] })
+  })
+const board = boardModule("board")
 
+const PNG = Uint8Array.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0, 0, 0, 13, 1, 2, 3, 4])
 const SCREEN = {
   v: 1,
   display: { class: "standard", widthPx: 800, heightPx: 600, dpr: 1, touch: "coarse", colour: true },
@@ -68,8 +80,18 @@ const checklist: Presentation = {
 const start = async (home?: Record<string, string>) => {
   presses.length = 0
   handlerWait = 0
+  handlerGate = undefined
   const stt = controlledStt()
-  server = await startTestServer({ build: fakeBuild({ stt: stt.stt, llm: scriptedLlm(() => "Ok.").llm }), catalog: [greeterModule, board] })
+  server = await startTestServer({
+    build: fakeBuild({ stt: stt.stt, llm: scriptedLlm(() => "Ok.").llm }),
+    catalog: [greeterModule, board, boardModule("board2"), boardModule("board3")],
+    mediaFetch: {
+      resolver: async () => ["93.184.216.34"],
+      connector: async () => ({ status: 200, headers: { "content-type": "image/png", "content-length": String(PNG.length) }, body: (async function*() {
+        yield PNG
+      })() })
+    }
+  })
   const admin = await ScriptedClient.connect({ url: server.url })
   clients.push(admin)
   await admin.admin(TEST_ADMIN_PASSWORD)
@@ -110,7 +132,7 @@ describe("presentation through the hub", () => {
     const old = await page("present-old-0001", { v: 1, display: SCREEN.display })
     await sleep(300)
     const h = await run(present!.show({ device: a.device.id }, checklist, { lifetime: "pinned" }))
-    expect(h.outcome.note).toMatch(/^Shown on "/)
+    expect(h.outcome.note).toMatch(/^Showing on "/)
     await until(() => holds(a).has(h.id) && holds(b).has(h.id))
     expect(holds(a).get(h.id)?.interactive).toBe(true)
     const older = await run(present!.show({ device: old.device.id }, checklist))
@@ -137,12 +159,45 @@ describe("presentation through the hub", () => {
     const refused = await tick(other, h.id)
     expect(refused).toMatchObject({ ok: false, say: "Dat kan ik nu niet doen." })
     expect(presses).toEqual(["tick:milk"])
-    // Over the hub's bound (4 pending per connection): refused with the Presenter's sentence in Dutch.
-    handlerWait = 300
-    const many = await Promise.all(Array.from({ length: 8 }, () => tick(a, h.id, "eggs")))
-    const busy = many.filter((r) => !r.ok && r.error?.code === "busy")
-    expect(busy.length).toBeGreaterThan(0)
-    for (const r of busy) expect(["Te veel tegelijk; probeer het zo opnieuw.", "Daar wordt al aan gewerkt."]).toContain(r.say)
+  })
+
+  it("b15: the hub's bound: four pending presses per connection on distinct presentations, the fifth refused with the Presenter's sentence; sixteen in all; slots given back", async () => {
+    await start({ HOME_LANGUAGE: "nl-NL" })
+    const pages = [] as Array<ScriptedClient>
+    for (let i = 0; i < 5; i++) pages.push(await page(`present-bound-0${i}`))
+    await sleep(300)
+    // Four distinct pinned presentations on each of five devices, from three modules (each within its bound).
+    const ids = new Map<ScriptedClient, Array<string>>()
+    let n = 0
+    for (const c of pages) {
+      const mine: Array<string> = []
+      for (let k = 0; k < 4; k++, n++) {
+        const h = await run(boards.get(["board", "board2", "board3"][n % 3]!)!.show({ device: c.device.id }, checklist, { lifetime: "pinned" }))
+        mine.push(h.id)
+      }
+      ids.set(c, mine)
+    }
+    const extra = await run(boards.get("board3")!.show({ device: pages[0]!.device.id }, checklist, { lifetime: "pinned" }))
+    await until(() => pages.every((c) => ids.get(c)!.every((id) => holds(c).has(id))) && holds(pages[0]!).has(extra.id))
+    let release: () => void = () => undefined
+    handlerGate = new Promise((resolve) => (release = resolve))
+    // One connection: four pending, the fifth (another presentation it holds) refused by the hub, not by a claim.
+    const first = ids.get(pages[0]!)!.map((id) => tick(pages[0]!, id))
+    await sleep(200)
+    const fifth = await tick(pages[0]!, extra.id)
+    expect(fifth).toMatchObject({ ok: false, error: { code: "busy" }, say: "Te veel tegelijk; probeer het zo opnieuw." })
+    // In all: three more connections fill sixteen; the fifth connection's first press is refused.
+    const more = pages.slice(1, 4).flatMap((c) => ids.get(c)!.map((id) => tick(c, id)))
+    await sleep(200)
+    const overall = await tick(pages[4]!, ids.get(pages[4]!)![0]!)
+    expect(overall).toMatchObject({ ok: false, error: { code: "busy" }, say: "Te veel tegelijk; probeer het zo opnieuw." })
+    release()
+    const answers = await Promise.all([...first, ...more])
+    expect(answers.every((r) => r.ok)).toBe(true)
+    expect(presses).toHaveLength(16)
+    // The slots were given back: the refused ones go through now.
+    expect(await tick(pages[0]!, extra.id)).toMatchObject({ ok: true })
+    expect(await tick(pages[4]!, ids.get(pages[4]!)![0]!)).toMatchObject({ ok: true })
   })
 
   it("an override that takes the display away ends the session; the page that comes back is shown nothing", async () => {
@@ -172,10 +227,60 @@ describe("presentation through the hub", () => {
     const result = await run(registry.run({ id: "c1", name: "board_show", input: {} }).pipe(
       Effect.provideService(CurrentTurn, { turnId: 1, conversationId: "c", source: "text", assistantId, deviceId: a.device.id })
     ))
-    expect(result.content).toBe("Two things.\n[Screen: Shown on \"" + (server!.handle.store.settings().devices[a.device.id]?.name ?? "") + "\".]")
+    expect(result.content).toBe("Two things.\n[Screen: Showing on \"" + (server!.handle.store.settings().devices[a.device.id]?.name ?? "") + "\".]")
     await until(() => [...holds(a).values()].some((p) => p.content.kind === "list"))
-    const res = await fetch(`${server!.url.replace(/^ws/, "http").replace(/\/ws$/, "")}/media/${"c".repeat(64)}`)
-    expect(res.status).toBe(404)
-    expect(res.headers.get("x-content-type-options")).toBe("nosniff")
+  })
+
+  it("b1: an image's address belongs to one page: served to it while it holds the image, never by its hash, not to another page, not after it lets go", async () => {
+    await start()
+    const a = await page("present-image-a1")
+    const b = await page("present-image-b1")
+    const sameDevice = await page("present-image-a1")
+    await sleep(300)
+    const http = server!.url.replace(/^ws/, "http").replace(/\/ws$/, "")
+    const h = await run(present!.show({ device: a.device.id }, { kind: "image", url: "https://img.example/a.png", alt: "A", credit: "C", spoken: "A." }, { lifetime: "pinned" }))
+    const tokenOf = (c: ScriptedClient) => {
+      const p = holds(c).get(h.id)
+      return p?.content.kind === "image" && p.content.image.state === "ready" ? p.content.image.token : undefined
+    }
+    await until(() => tokenOf(a) !== undefined && tokenOf(sameDevice) !== undefined)
+    const mine = tokenOf(a)!
+    expect(tokenOf(sameDevice)).not.toBe(mine)
+    expect(holds(b).has(h.id)).toBe(false)
+    const ok = await fetch(`${http}/media/${mine}`)
+    expect(ok.status).toBe(200)
+    expect(ok.headers.get("cache-control")).toBe("private, no-store")
+    expect(ok.headers.get("content-type")).toBe("image/png")
+    expect(new Uint8Array(await ok.arrayBuffer())).toEqual(PNG)
+    // Its hash is not an address, nor is a made-up token.
+    const hash = createHash("sha256").update(PNG).digest("hex")
+    expect((await fetch(`${http}/media/${hash}`)).status).toBe(404)
+    expect((await fetch(`${http}/media/${"x".repeat(32)}`)).status).toBe(404)
+    // The page goes: its address stops working; the other tab's still works until it is withdrawn.
+    a.close()
+    await sleep(300)
+    expect((await fetch(`${http}/media/${mine}`)).status).toBe(404)
+    expect((await fetch(`${http}/media/${tokenOf(sameDevice)!}`)).status).toBe(200)
+    await run(h.dismiss)
+    await until(() => !holds(sameDevice).has(h.id))
+    const other = tokenOf(sameDevice)
+    expect(other).toBeUndefined()
+  })
+
+  it("b3: an older tab beside a newer one of the same device is sent no presentation messages, in either order of connecting", async () => {
+    await start()
+    const oldFirst = await page("present-mixed-01", { v: 1, display: SCREEN.display })
+    const modern = await page("present-mixed-01")
+    const modernFirst = await page("present-mixed-02")
+    const oldSecond = await page("present-mixed-02", { v: 1, display: SCREEN.display })
+    await sleep(300)
+    const one = await run(present!.show({ device: "present-mixed-01" }, checklist, { lifetime: "pinned" }))
+    const two = await run(present!.show({ device: "present-mixed-02" }, checklist, { lifetime: "pinned" }))
+    await until(() => holds(modern).has(one.id) && holds(modernFirst).has(two.id))
+    await sleep(200)
+    for (const c of [oldFirst, oldSecond]) expect(c.messages.some((m) => m.type.startsWith("present."))).toBe(false)
+    // The old tab's page declares the kinds later (a reload into a newer build): it is sent them then.
+    oldFirst.send({ type: "device.caps", capabilities: SCREEN as never })
+    await until(() => holds(oldFirst).has(one.id))
   })
 })
