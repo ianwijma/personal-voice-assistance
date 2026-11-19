@@ -1,9 +1,10 @@
 // system-status through the real host: what the host's own view says, and what each kind of device is told.
 import { assert, describe, it } from "@effect/vitest"
 import { Devices, type HostView, type ModuleContextV2 } from "@pva/core"
-import { checkModule, startTestModule } from "@pva/core/testing"
+import { checkModule, startTestModule as startKit } from "@pva/core/testing"
 import { Effect } from "effect"
 import { problemsOf, systemStatusModule, texts } from "../src/systemStatus.ts"
+import { unchanged } from "./support.ts"
 
 const nl = { household: { home: { HOME_LANGUAGE: "nl-NL", HOME_TIME_ZONE: "Europe/Amsterdam" } } }
 
@@ -43,6 +44,9 @@ const troubled = (devices: "host" | "missing" | "unknown" = "host"): typeof syst
   }
 })
 const DISTINCTIVE = [/sk-live/, /192\.168/, /robin@/, /Robin/, /Weather|Lists|News|Music/, /vault|kluis/i, /engine|motor/i, /\d/]
+
+// A tool that returns a presentation answers `{ forModel, present }`: the tests read the unchanged `forModel` through `unchanged`.
+const startTestModule: typeof startKit = (definition, options) => Effect.map(startKit(definition, options), unchanged)
 
 describe("system-status", () => {
   it.effect("passes the conformance check, with its texts in both languages", () => checkModule(systemStatusModule, { texts }))

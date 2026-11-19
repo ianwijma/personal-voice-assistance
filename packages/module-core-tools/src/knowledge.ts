@@ -9,7 +9,7 @@ import { defineTexts, homeLanguage, isLine, type Language, say } from "@pva/modu
 import { contentTypes, safeFetch } from "@pva/net"
 import { Clock, Effect, Option, Schema } from "effect"
 import { agentOf, type NetDeps } from "./net.ts"
-import { cutFor, makeScreen, SCREEN } from "./screen.ts"
+import { cutFor, SCREEN, sliceAt } from "./screen.ts"
 
 export const texts = defineTexts({
   en: {
@@ -96,7 +96,7 @@ const endNicely = (text: string, max: number): string => {
   const stop = Math.max(text.lastIndexOf(". "), text.lastIndexOf("; "), text.endsWith(".") ? text.length - 1 : -1)
   if (stop > max / 2) return text.slice(0, stop + 1)
   const space = text.lastIndexOf(" ")
-  return `${(space > max / 2 ? text.slice(0, space) : text).slice(0, max - 1)}…`
+  return `${sliceAt(space > max / 2 ? text.slice(0, space) : text, max - 1)}…`
 }
 
 /** Outside text as one bounded plain line: cut to `max` first, then the markup taken out; a text that was cut ends nicely. */
@@ -266,7 +266,6 @@ export const makeKnowledge = (deps: NetDeps = {}) =>
           const list = asked !== undefined && LANG.test(asked) ? [asked, "en"] : own.length > 0 ? own : [lang, "en"]
           return [...new Set(list)].slice(0, 3)
         }
-        const screen = makeScreen(ctx.present)
         const note = (source: string, lang: Language) => say(texts, lang, "noteData", { source })
 
         const lookupSummary = (query: string, asked: string | undefined, budgetMs: number) =>
@@ -356,8 +355,11 @@ export const makeKnowledge = (deps: NetDeps = {}) =>
           execute: ({ query, kind, lang }) =>
             Effect.gen(function*() {
               const result = kind === "define" ? yield* lookupDefinition(query.trim(), lang) : yield* lookupSummary(query.trim(), lang, 8_000)
-              yield* screen(result.ok && kind !== "define" && "extract" in result.value ? cardOf(result.value, homeLanguage(ctx.host.view())) : undefined)
-              return yield* (result.ok ? Effect.succeed(result.value) : Effect.fail(new ToolError({ message: result.message })))
+              if (!result.ok) return yield* Effect.fail(new ToolError({ message: result.message }))
+              // A summary comes with its card (shown by the Presenter when the turn is committed); nothing else does.
+              return kind !== "define" && "extract" in result.value
+                ? { forModel: result.value, present: cardOf(result.value, homeLanguage(ctx.host.view())) }
+                : result.value
             })
         })
 
@@ -371,12 +373,16 @@ export const makeKnowledge = (deps: NetDeps = {}) =>
           offerAsTool: false,
           // The action has 5 s: one search and one summary, 1.5 s each at most, 3.5 s in all.
           run: ({ query }) =>
-            Effect.flatMap(lookupSummary(query, undefined, 3_500), (r) => Effect.flatMap(screen(r.ok && "extract" in r.value ? cardOf(r.value, homeLanguage(ctx.host.view())) : undefined), () => {
+            Effect.flatMap(lookupSummary(query, undefined, 3_500), (r) => {
               if (!r.ok) return Effect.fail(new ActionError({ message: r.message }))
               // No model follows an action: outside text is never said as the assistant's own words, only as Wikipedia's.
               const lang = homeLanguage(ctx.host.view())
-              return Effect.succeed({ say: "extract" in r.value ? say(texts, lang, "according", { text: firstSentences(r.value.extract) }) : r.value.spoken })
-            }))
+              return Effect.succeed(
+                "extract" in r.value
+                  ? { say: say(texts, lang, "according", { text: firstSentences(r.value.extract) }), present: cardOf(r.value, lang) }
+                  : { say: r.value.spoken }
+              )
+            })
         })
 
         return {
@@ -396,7 +402,7 @@ const firstSentences = (extract: string): string => {
     out = out === "" ? part : `${out} ${part}`
     if (out.length >= 150) break
   }
-  return out.length > 320 ? endNicely(out.slice(0, 300), 300) : out
+  return out.length > 320 ? endNicely(sliceAt(out, 300), 300) : out
 }
 
 export const knowledgeModule = makeKnowledge()

@@ -41,25 +41,28 @@ answering:
 
 ## On the screen
 
-When the answer names problems, they are also shown as a **transient `list`** (bullets, titled "Problems" / "Problemen")
-on the screen of the device that asked, for the tool and for the typed action: one item per problem the answer named
-(at most three, worst first), then "And 3 more." / "En nog 3." when there are more. The items are the answer's own
-sentences ("Weather has stopped with an error.", "The speech engines are stopped with an error."); the vault's is its short
-form ("The key vault is locked."), and a module's name is cut to fit an item (80 characters) at a code point boundary, so
-no sentence is cut in the middle.
+When the answer names problems to a device that may be told them, they come with a **transient `list`** (bullets, titled
+"Problems as just answered" / "Problemen zoals net gemeld") for the screen: one item per problem the answer named (at most
+three, worst first), then "And 3 more." / "En nog 3." when there are more. The items are the answer's own sentences
+("Weather has stopped with an error."); the vault's is its short form ("The key vault is locked."), and a module's name is
+cut to fit an item (80 characters) at a code point boundary, so no sentence is cut in the middle.
 
-- **Shows what that device was told, nothing more.** The list is built from the same view and the same detail decision
-  as the answer (`public`, unknown or no device: none): a public device, a device the host does not know and a turn with
-  no device are shown **no list at all** (they are told only whether things are fine); a shared and a private device
-  get the same list, which carries no device name, no count of devices and never a module's error text or reason.
-  A question about the devices only (`about: "devices"`) names no problem, so it shows none.
-- **Follows the answer.** It is a transient: it ends by itself after 30 seconds, a newer list on that device replaces
-  it, and an answer with no problem to show (everything fine, devices only, a public device's) takes the earlier list of
-  that device down. The newest handle of each asking device is kept in memory; a restart forgets them and a stopped
-  module's lists are withdrawn with it. A device without a display, or no Presenter (the CLI modes), changes nothing
-  about the answer.
-- No buttons and no handler. What a device that shows nothing is told to say is the problems' sentences joined (at
-  most 300 characters).
+- **Returned with the answer, never shown from inside the tool.** The tool answers `{ forModel, present }` and the action
+  `{ say, present }`, with `forModel` and `say` exactly what they were. The module shows and withdraws nothing itself and
+  keeps no handle: a tool may run before its turn is committed, and the Presenter shows what a speculative tool returned
+  only once the turn is promoted.
+- **Only where the detailed answer may stay.** Whether a device is told details depends on its kind *when it is asked*; a
+  list could later be in front of a device that became public. So the list is **personal to the person asking** (the
+  turn's known person: the device's default person, the voice or the chosen speaker), and the Presenter decides it again
+  for each device at each moment and withdraws it from one that no longer qualifies. With **no known person** there is no
+  list at all (the answer is still spoken as before); a public device, an unknown device and no device are told only
+  whether things are fine and get no list; `about: "devices"` and a house with no problems have none either. It carries no
+  device name, no device count and never a module's error text or reason.
+- **A snapshot.** The list is the problems as just answered: it is not updated when the house recovers within its 30
+  seconds, and a later answer with nothing to show does **not** take it down. It ends by itself after 30 seconds, or when
+  the next presentation on that device replaces it; a stopped module's lists are withdrawn with it. No live updating.
+- No buttons and no handler. What a device that shows nothing is told to say is the problems' sentences joined (at most
+  300 characters).
 
 ## Settings
 

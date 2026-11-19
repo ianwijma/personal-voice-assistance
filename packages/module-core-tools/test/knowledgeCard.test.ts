@@ -19,15 +19,21 @@ const EIFFEL = "The Eiffel Tower is a wrought-iron lattice tower on the Champ de
 const EMOJI_TITLE = `${"a".repeat(58)}😀${"b".repeat(30)}`
 const EMOJI_TEXT = `${"word ".repeat(55)}${"x".repeat(5)}😀😀😀 and ${"y".repeat(120)}.`
 
+// The extract's 299th and 300th units are the two halves of an emoji, and more text follows (the reviewer's case).
+const BOUNDARY = `${"a".repeat(298)}😀${"b".repeat(40)}`
+const LONE = /[\ud800-\udbff](?![\udc00-\udfff])|(?<![\ud800-\udbff])[\udc00-\udfff]/
+
 const fixtures = {
   "https://en.wikipedia.org/w/api.php": (request: { readonly url: URL }) => {
     const s = request.url.searchParams.get("srsearch")
-    return search(s === "Eiffel Tower" ? "Eiffel Tower" : s === "Mercury" ? "Mercury" : s === "Emoji" ? "Emoji" : "")
+    return search(s === "Eiffel Tower" ? "Eiffel Tower" : s === "Mercury" ? "Mercury" : s === "Emoji" ? "Emoji" : s === "Boundary" ? "Boundary" : "")
   },
   "https://en.wikipedia.org/api/rest_v1/page/summary/Eiffel_Tower": page("Eiffel Tower", EIFFEL),
   "https://en.wikipedia.org/api/rest_v1/page/summary/Mercury": { body: { type: "disambiguation", title: "Mercury", extract: "Mercury may refer to:" }, headers: json },
   "https://en.wikipedia.org/api/rest_v1/page/summary/Emoji": page(EMOJI_TITLE, EMOJI_TEXT),
-  "https://nl.wikipedia.org/w/api.php": (request: { readonly url: URL }) => search(request.url.searchParams.get("srsearch") === "de Eiffeltoren" ? "Eiffeltoren" : ""),
+  "https://en.wikipedia.org/api/rest_v1/page/summary/Boundary": page("Boundary", BOUNDARY),
+  "https://nl.wikipedia.org/w/api.php": (request: { readonly url: URL }) => search(request.url.searchParams.get("srsearch") === "de Eiffeltoren" ? "Eiffeltoren" : request.url.searchParams.get("srsearch") === "Boundary" ? "Boundary" : ""),
+  "https://nl.wikipedia.org/api/rest_v1/page/summary/Boundary": page("Boundary", BOUNDARY),
   "https://nl.wikipedia.org/api/rest_v1/page/summary/Eiffeltoren": { body: { type: "standard", title: "Eiffeltoren", extract: "De Eiffeltoren is een toren in Parijs. Hij werd gebouwd in 1889.", content_urls: { desktop: { page: "https://nl.wikipedia.org/wiki/Eiffeltoren" } } }, headers: json },
   "https://en.wiktionary.org/api/rest_v1/page/definition/house": { body: { en: [{ partOfSpeech: "Noun", language: "English", definitions: [{ definition: "A building for human habitation." }] }] } }
 }
@@ -50,8 +56,8 @@ describe("knowledge: the card", () => {
       const k = yield* start()
       for (const device of ["kitchen-display", "robins-phone", "hall-screen"]) {
         const r = yield* k.tool("lookup", { query: "Eiffel Tower" }, asking(device))
-        // The tool's answer is what it was: no screen note, no change of shape.
-        assert.deepStrictEqual(Object.keys(r.value as object).sort(), ["extract", "lang", "note", "source", "title", "url"])
+        // The model gets the answer with the same fields as before, then the note of what the server decided.
+        assert.deepStrictEqual(Object.keys(JSON.parse(r.content.replace(/\n\[Screen: [\s\S]*\]$/, ""))).sort(), ["extract", "lang", "note", "source", "title", "url"])
         yield* k.present.settle
         const [card, ...more] = k.present.shown(device)
         assert.strictEqual(more.length, 0, device)
@@ -84,20 +90,37 @@ describe("knowledge: the card", () => {
       assert.strictEqual(cardOf({ title: "Eiffeltoren", extract: "De Eiffeltoren is een toren in Parijs. Hij werd gebouwd in 1889.", source: "Wikipedia (nl)" }, "nl").spoken, (said as { say: string }).say)
     }))
 
-  it.effect("what is not a summary shows no card and takes the earlier one down: a definition, an ambiguous name, nothing found", () =>
+  it.effect("what is not a summary comes with no card; an earlier card is not taken down by it, only replaced by the next one or ended by its lifetime", () =>
     Effect.gen(function*() {
       const k = yield* start()
+      yield* k.tool("lookup", { query: "Eiffel Tower" }, asking("kitchen-display"))
+      yield* k.present.settle
+      const [first] = k.present.shown("kitchen-display")
       for (const next of [{ query: "house", kind: "define" }, { query: "Mercury" }, { query: "Nothing at all" }] as const) {
-        yield* k.tool("lookup", { query: "Eiffel Tower" }, asking("kitchen-display"))
+        const r = yield* k.tool("lookup", next, asking("kitchen-display"))
+        // The result carries no presentation: nothing in it asks to show anything.
+        assert.notInclude(r.content, "[Screen")
         yield* k.present.settle
-        assert.strictEqual(k.present.shown("kitchen-display").length, 1)
-        yield* k.tool("lookup", next, asking("kitchen-display"))
-        yield* k.present.settle
-        assert.deepStrictEqual(k.present.shown("kitchen-display"), [], JSON.stringify(next))
+        assert.deepStrictEqual(k.present.shown("kitchen-display").map((c) => c.id), [first!.id], JSON.stringify(next))
       }
-      // A new summary replaces the old card: one at a time.
-      yield* k.tool("lookup", { query: "Eiffel Tower" }, asking("kitchen-display"))
-      yield* k.tool("lookup", { query: "Eiffel Tower" }, asking("kitchen-display"))
+      // A new summary replaces it: one at a time.
+      yield* k.tool("lookup", { query: "Boundary" }, asking("kitchen-display"))
+      yield* k.present.settle
+      const now = k.present.shown("kitchen-display")
+      assert.strictEqual(now.length, 1)
+      assert.notStrictEqual(now[0]!.id, first!.id)
+    }))
+
+  it.effect("the model's own calls all run: the same summary twice in one turn answers twice and shows its card", () =>
+    Effect.gen(function*() {
+      const k = yield* start()
+      const sameTurn = { device: "kitchen-display", turnId: 7 } as never
+      const a = yield* k.tool("lookup", { query: "Eiffel Tower" }, sameTurn)
+      const b = yield* k.tool("lookup", { query: "Eiffel Tower" }, sameTurn)
+      assert.isTrue(a.ok && b.ok)
+      assert.strictEqual(a.content, b.content)
+      assert.include(a.content, "[Screen")
+      assert.include(b.content, "[Screen")
       yield* k.present.settle
       assert.strictEqual(k.present.shown("kitchen-display").length, 1)
     }))
@@ -113,6 +136,7 @@ describe("knowledge: the card", () => {
       yield* k.tool("lookup", { query: "Eiffel Tower" }, asking("kitchen-display"))
       yield* k.present.settle
       yield* k.stop
+      yield* k.advance(10_000)
       assert.deepStrictEqual(k.present.shown("kitchen-display"), [])
     }))
 
@@ -130,6 +154,26 @@ describe("knowledge: the card", () => {
       assert.isAtMost(c.spoken.length, 300)
       for (const t of [c.title, c.text, c.spoken]) assert.notMatch(t, /[\ud800-\udbff](?![\udc00-\udfff])|(?<![\ud800-\udbff])[\udc00-\udfff]/)
       assert.isTrue(c.title.endsWith("…"))
+    }))
+
+  it.effect("an extract with an emoji across the 300th unit is a valid card, in English and in Dutch (never a lone surrogate)", () =>
+    Effect.gen(function*() {
+      for (const home of [undefined, nl.household.home]) {
+        const k = yield* startTestModule(makeKnowledge(netWith(fixtures).deps), { household: { ...household, ...(home === undefined ? {} : { home }) } })
+        const r = yield* k.tool("lookup", { query: "Boundary" }, asking("kitchen-display"))
+        assert.isTrue(r.ok)
+        assert.include(r.content, "[Screen: Showing on")
+        yield* k.present.settle
+        const [card] = k.present.shown("kitchen-display")
+        assert.isDefined(card, "the card is accepted")
+        const c = card!.content as { title: string; text: string }
+        assert.isAtMost(c.text.length, 300)
+        assert.notMatch(c.text, LONE)
+        assert.isTrue(c.text.startsWith("a".repeat(297)))
+        // The action's spoken sentence and the card's fallback are cut the same way.
+        const said = yield* k.action("lookup", { query: "Boundary" }, asking("kitchen-display"))
+        assert.notMatch((said as { say: string }).say, LONE)
+      }
     }))
 
   it.effect("showing costs the answer almost nothing", () =>
