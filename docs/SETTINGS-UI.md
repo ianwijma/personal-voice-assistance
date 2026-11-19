@@ -709,16 +709,17 @@ each file with `util.parseEnv(readFileSync(path))` (available in this Node **[ru
 2. Rewrite the file: back it up as `.env.bak-<timestamp>` (0600), replace the line with
    `# KEY moved to the settings UI on 2026-11-14` (never echo the value), and write atomically (temp + rename, keeping
    the file mode).
-3. `envView.release(key)` → forms re-resolve. The field unlocks and now shows `source: "saved"`/`"vault"`. Broadcast
-   `section.changed`/`module.changed`.
+3. Only after every rewrite of the move has succeeded and been checked, release all its keys from `envView` →
+   forms re-resolve. The fields unlock and now show `source: "saved"`/`"vault"`. Broadcast `section.changed`/`module.changed`.
+   If any rewrite or check fails, every key of the move stays locked, no move announcement is sent, and the answer says
+   to retry. This order applies to every kind of key, both a single Move and Move all.
 4. If a released key is a reload field, set `reloadPending`. The running engines keep the old value until the reload,
    so nothing changes mid-turn.
 
-For configurable risk keys and `HOME_LANGUAGE` (the policy's sentence language), the move first reads every loaded
-file and compares its parsed values for those keys with the declarations captured at startup (or after this mover's
-own successful rewrites). A changed declaration or unreadable file refuses the move before any settings are saved;
+For every kind of key, the move first reads every loaded file and compares its parsed values for the moved keys
+with the declarations captured at startup (or after this mover's own successful rewrites). A changed declaration or unreadable file refuses the move before any settings are saved;
 restart the assistant to reload the `.env` files, then retry. The override and field lock stay in place until the value
-is saved and every loaded file has been checked with Node's parser to contain no assignment for the moved key.
+is saved and every loaded file has been checked with Node's parser to contain no assignment for any key of the move.
 After saving, the mover rereads every loaded file and compares its full text with the pre-save check; the rewrite
 also rereads its file immediately before replacement. A changed or unreadable file keeps the override locked and
 returns the retry sentence; hand edits require restarting the assistant to reload the files first. The line scanner
@@ -729,6 +730,9 @@ declarations in place, the override effective and the field locked. The value is
 finishes the remaining rewrites. A completed rewrite whose verification read failed is remembered: Retry accepts the
 key's verified absence, but refuses an unexpected replacement value. File rewrites, release and the section
 announcement finish without caller interruption between them. An unrelated Home save does not write `HOME_LANGUAGE`.
+
+A move rewrites the file it has just read, so the files must not be edited by hand while a move runs; an edit made
+in the instant between that read and the rewrite can be lost.
 
 The Overrides page (Keys & access › Settings from outside) is derived client-side from every form's `locked` fields,
 plus a server-provided list of known `.env` keys that match no field (`unusedEnvKeys`, so typos like

@@ -39,7 +39,7 @@ export function OverridesPage() {
       note: "The assistant knows these and does not read them from the environment; each says why. Remove them.",
       entries: env.entries.filter((e) => e.refused !== undefined)
     },
-    { id: "movable", title: "In .env, can move into the settings", note: "Move puts the value in the settings (a key goes into the vault) and comments the line out of .env.", entries: movable },
+    { id: "movable", title: "In .env, can move into the settings", note: "Move puts the value in the settings (a key goes into the vault) and comments the line out of .env. A move rewrites the file it has just read. Do not edit the files by hand while a move runs: an edit made between that read and the rewrite can be lost.", entries: movable },
     {
       id: "process",
       title: "From the process environment",

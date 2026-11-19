@@ -1,6 +1,5 @@
 import type { ModuleDefinition, ModuleHost, Setting, SettingsSpec } from "@pva/core"
 import type { HostResult } from "@pva/core"
-import { RISK_POLICY_KEYS } from "@pva/protocol"
 import type { EnvEntry, EnvInfo, EnvKind, SettingsGroup, SettingsPatch, SettingValue } from "@pva/protocol"
 import { Effect } from "effect"
 import { readFile } from "node:fs/promises"
@@ -262,10 +261,9 @@ export const makeEnvMover = (options: {
 }): EnvMover => {
   const envCatalog = makeEnvCatalog(options.catalog)
   const commentOut = options.commentOut ?? commentOutKeys
-  const policyInput = (key: string) => key === "HOME_LANGUAGE" || Object.values(RISK_POLICY_KEYS).some((k) => k === key)
-  // Advance only after our own verified rewrites, so a partial move can still be retried. Retain no secrets.
+  // Advance only after our own verified rewrites, so a partial move can still be retried.
   const expectedFiles = new Map(options.view.files.map((file) => [file, Object.fromEntries(
-    Object.entries(options.view.fileValues(file)).filter(([key]) => policyInput(key))
+    Object.entries(options.view.fileValues(file)).filter(([key]) => envCatalog.kind(key) === "setting")
   )]))
   const pendingFiles = new Map<string, Set<string>>()
   let busy = false
@@ -299,30 +297,29 @@ export const makeEnvMover = (options: {
 
       busy = true
       try {
-        const policyKeys = planned.filter((p) => policyInput(p.key)).map((p) => p.key)
+        const plannedKeys = planned.map((p) => p.key)
         const checkedFiles = new Map<string, string>()
-        if (policyKeys.length > 0) {
-          for (const file of options.view.files) {
-            const current = yield* Effect.tryPromise(async () => {
-              const text = await readFile(file, "utf8")
-              return { text, values: parseEnv(text) }
-            }).pipe(Effect.result)
-            if (current._tag === "Success") {
-              // A rename can succeed before its verification read fails. Absence on Retry completes that check.
-              for (const key of pendingFiles.get(file) ?? []) {
-                if (current.success.values[key] === undefined) {
-                  delete expectedFiles.get(file)![key]
-                  pendingFiles.get(file)!.delete(key)
-                }
+        for (const file of options.view.files) {
+          const current = yield* Effect.tryPromise(async () => {
+            const text = await readFile(file, "utf8")
+            return { text, values: parseEnv(text) }
+          }).pipe(Effect.result)
+          if (current._tag === "Success") {
+            // A rename can succeed before its verification read fails. Absence on Retry completes that check.
+            for (const key of pendingFiles.get(file) ?? []) {
+              if (current.success.values[key] === undefined) {
+                delete expectedFiles.get(file)![key]
+                pendingFiles.get(file)!.delete(key)
               }
-              checkedFiles.set(file, current.success.text)
             }
-            if (current._tag === "Failure" || policyKeys.some((key) => current.success.values[key] !== expectedFiles.get(file)?.[key])) {
-              return fail("invalid_settings", `${file} changed or could not be read: restart the assistant to reload .env files before moving these settings`)
-            }
+            checkedFiles.set(file, current.success.text)
+          }
+          if (current._tag === "Failure" || plannedKeys.some((key) => current.success.values[key] !== expectedFiles.get(file)?.[key])) {
+            return fail("invalid_settings", `${file} changed or could not be read: restart the assistant to reload .env files before moving these settings`)
           }
         }
         const moved: Array<Planned> = []
+        const released: Array<string> = []
         for (const p of planned) {
           const secret = isSecretTarget(p.target, p.key)
           // The value is checked like one typed on the page (no value in the message).
@@ -333,13 +330,9 @@ export const makeEnvMover = (options: {
               continue
             }
           }
-          // Keep policy inputs effective and locked through saving AND removing every file declaration.
-          // Home language is published with the policy, so it needs the same ordering as the risk keys.
-          const retained = policyInput(p.key)
-          if (!retained) options.view.release(p.key)
-          const saved = yield* retained ? Effect.uninterruptible(save(p, secret)) : save(p, secret)
+          // Every key stays effective and locked until every rewrite of this move is verified.
+          const saved = yield* Effect.uninterruptible(save(p, secret))
           if (!saved.ok) {
-            if (!retained) options.view.restore(p.key, p.text, p.origin)
             problems.push(`${p.key}: ${saved.message}`)
             continue
           }
@@ -359,9 +352,7 @@ export const makeEnvMover = (options: {
             // declarations of that key in place: even a restart during this step still reads the chosen value.
             const byFile = new Map<string, Array<string>>()
             for (const file of [...options.view.files].reverse()) {
-              const fileKeys = moved.filter((p) => policyInput(p.key)
-                ? expectedFiles.get(file)?.[p.key] !== undefined
-                : p.origin.path === file).map((p) => p.key)
+              const fileKeys = moved.filter((p) => expectedFiles.get(file)?.[p.key] !== undefined).map((p) => p.key)
               if (fileKeys.length > 0) byFile.set(file, fileKeys)
             }
             const failedKeys = new Set<string>()
@@ -371,7 +362,7 @@ export const makeEnvMover = (options: {
               const result = yield* Effect.tryPromise(async () => {
                 const rewritten = await commentOut(file, fileKeys, (options.now ?? (() => new Date()))(), checkedFiles.get(file))
                 const pending = pendingFiles.get(file) ?? new Set<string>()
-                for (const key of fileKeys.filter(policyInput)) pending.add(key)
+                for (const key of fileKeys) pending.add(key)
                 pendingFiles.set(file, pending)
                 // A completed write is not proof that the line scanner removed every Node-readable assignment.
                 const remaining = parseEnv(await readFile(file, "utf8"))
@@ -398,26 +389,30 @@ export const makeEnvMover = (options: {
               }
             }
             // Even a path with no original declaration must be free of the moved key before unlocking.
-            const movedPolicyKeys = moved.filter((p) => policyInput(p.key) && !failedKeys.has(p.key)).map((p) => p.key)
-            if (movedPolicyKeys.length > 0) for (const file of options.view.files) {
+            const movedKeys = moved.filter((p) => !failedKeys.has(p.key)).map((p) => p.key)
+            if (movedKeys.length > 0) for (const file of options.view.files) {
               const remaining = yield* Effect.tryPromise(async () => parseEnv(await readFile(file, "utf8"))).pipe(Effect.result)
-              const unverified = movedPolicyKeys.filter((key) => remaining._tag === "Failure" || Object.hasOwn(remaining.success, key))
+              const unverified = movedKeys.filter((key) => remaining._tag === "Failure" || Object.hasOwn(remaining.success, key))
               if (unverified.length > 0) {
                 for (const key of unverified) failedKeys.add(key)
                 problems.push(`${unverified.join(", ")} saved, but ${file} could not be verified: retry the move; if the file was edited by hand, restart the assistant to reload .env files first`)
               }
             }
-            for (const p of moved) if (policyInput(p.key) && !failedKeys.has(p.key)) options.view.release(p.key)
-            if (moved.some((p) => !failedKeys.has(p.key))) {
+            if (failedKeys.size === 0) {
+              for (const p of moved) {
+                options.view.release(p.key)
+                released.push(p.key)
+              }
+              if (moved.some((p) => p.target.kind === "module")) yield* options.host.refresh
               options.sections.announceAll()
               options.onMoved()
             }
           }))
         }
         if (problems.length > 0) {
-          return { ...fail("invalid_settings", problems.join("; ")), moved: moved.map((p) => p.key) }
+          return { ...fail("invalid_settings", problems.join("; ")), moved: released }
         }
-        return { ok: true, moved: moved.map((p) => p.key) } as const
+        return { ok: true, moved: released } as const
       } finally {
         busy = false
       }
