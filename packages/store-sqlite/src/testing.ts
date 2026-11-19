@@ -1,6 +1,6 @@
 // For tests only: how the checkpoint worker starts a new write-ahead log, and pauses to put a main-thread write in
 // the window or behind the worker's lock (docs/STORING-DATA.md "The write-ahead log"). Nothing here runs in the app.
-import { checkpointerOf, type LogStarts } from "./files.ts"
+import { checkpointerOf, journalConversionHooks, type LogStarts } from "./files.ts"
 import type { SqliteHouseholdStore } from "./SqliteStore.ts"
 
 export type { LogStarts }
@@ -31,3 +31,12 @@ export const checkpointNow = (store: SqliteHouseholdStore, kind: "passive" | "tr
 
 /** The checkpoint worker connection's settings (`PRAGMA` values by name). */
 export const workerSettings = (store: SqliteHouseholdStore): Promise<Readonly<Record<string, number>>> => checkpointer(store).settings()
+
+/**
+ * The journal conversion of a backup's copy (made one file, on a thread of its own): a pause inside it (`pauseMs`),
+ * and something to do to the copy just before it (`before`, given the copy's path). Reset with `{ pauseMs: 0 }`.
+ */
+export const setBackupJournalHooks = (hooks: { readonly pauseMs: number; readonly before?: (file: string) => void }): void => {
+  journalConversionHooks.pauseMs = hooks.pauseMs
+  journalConversionHooks.before = hooks.before
+}
