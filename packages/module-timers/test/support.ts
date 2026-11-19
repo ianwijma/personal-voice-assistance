@@ -13,7 +13,11 @@ export interface Hooks {
   failAfterSend?: StoreFailure | undefined
   /** After the next successful send, every write fails with this until the test clears `writesFail`. */
   blockAfterSend?: StoreFailure | undefined
-  /** The `n`-th row write inside the next transaction throws this: it rolls back after a write. */
+  /** After the next successful `present.show`, the next transaction fails once with this. */
+  failAfterShow?: StoreFailure | undefined
+  /** After the next successful `present.show`, every write fails with this until the test clears `writesFail`. */
+  blockAfterShow?: StoreFailure | undefined
+  /** Right after the `n`-th row write inside the next transaction this is thrown: it rolls back after that write. */
   throwAtWrite?: { readonly n: number; readonly failure: StoreFailure } | undefined
   /** The next transaction waits for this to be completed first. */
   gate?: Deferred.Deferred<void> | undefined
@@ -86,7 +90,8 @@ const hookStore = (raw: ModuleStore, hooks: Hooks): ModuleStore => ({
           ...tx,
           collection: (c: any) => {
             const x = tx.collection(c)
-            return { ...x, insert: (v: any, o: any) => (count(), x.insert(v, o)), update: (id: string, g: any, o: any) => (count(), x.update(id, g, o)) }
+            const after = <A>(written: A): A => (count(), written)
+            return { ...x, insert: (v: any, o: any) => after(x.insert(v, o)), update: (id: string, g: any, o: any) => after(x.update(id, g, o)) }
           }
         } as typeof tx)
       )
@@ -150,7 +155,17 @@ export const hooked = <M extends ModuleDefinition<any>>(definition: M, hooks: Ho
           Effect.suspend(() =>
             hooks.showFail !== undefined
               ? Effect.fail(hooks.showFail)
-              : Effect.map(ctx.present.show(target, presentation, options), (handle: any) => ({
+              : Effect.map(Effect.tap(ctx.present.show(target, presentation, options), () =>
+                Effect.sync(() => {
+                  if (hooks.failAfterShow !== undefined) {
+                    hooks.txFail = { times: 1, failure: hooks.failAfterShow }
+                    hooks.failAfterShow = undefined
+                  }
+                  if (hooks.blockAfterShow !== undefined) {
+                    hooks.writesFail = hooks.blockAfterShow
+                    hooks.blockAfterShow = undefined
+                  }
+                })), (handle: any) => ({
                 ...handle,
                 dismiss: Effect.suspend(() => (hooks.dismissFail !== undefined ? Effect.fail(hooks.dismissFail) : handle.dismiss)),
                 update: handle.update

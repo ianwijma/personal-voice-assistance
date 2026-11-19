@@ -1,5 +1,5 @@
 import { type HostView, type Row, StoreError, type StoreFailure } from "@pva/core"
-import { formatDtstart, type LocalDate, nextOccurrence, normalizeTimeZone, speakDuration, speakList } from "@pva/language"
+import { type LocalDate, normalizeTimeZone, speakDuration, speakList } from "@pva/language"
 import { isLine, type Language } from "@pva/module-contracts"
 import { Effect } from "effect"
 
@@ -42,15 +42,6 @@ export const localOf = (instant: number, timeZone: string): { readonly date: Loc
 export interface ClockTime {
   readonly hour: number
   readonly minute: number
-}
-
-/**
- * The instant of a nominal local date and time in a zone, by `@pva/language`'s rules (a one-instance series: a time the
- * clocks skip is taken at the offset before the gap, a time that happens twice is the first), or `undefined`.
- */
-export const instantOf = (date: LocalDate, time: ClockTime, zone: string): number | undefined => {
-  const dtstart = formatDtstart({ ...date, hour: time.hour, minute: time.minute }, zone)
-  return dtstart === undefined ? undefined : nextOccurrence({ rrule: "FREQ=DAILY;COUNT=1", dtstart, timeZone: zone }, 0)
 }
 
 /**

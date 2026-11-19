@@ -276,55 +276,8 @@ describe("finding 3: a press whose outcome the notification service lost", () =>
     }))
 })
 
-describe("finding 4: Stop wins while a press is in flight", () => {
-  it.effect("timers: the press's write waits, Stop ends the ring, the press takes its follow-up back: no ring, no countdown, also after a restart", () =>
-    Effect.gen(function*() {
-      const hooks = makeHooks()
-      const registered = makeRegistered()
-      const kit = yield* timerKit(hooks, registered)
-      yield* kit.action("start", { duration: "1 minute", name: "tea" })
-      yield* kit.advance(MIN)
-      const [first] = ringing(kit)
-      const row = (yield* timerRows(kit))[0]!
-      const gate = yield* Deferred.make<void>()
-      hooks.gate = gate
-      const press = yield* Effect.forkChild(registered.presses.get("timer")!.run({ notificationId: first!.id, actionId: "more", key: `timer:${row.id}:1`, deviceId: "kitchen-display" }))
-      for (let i = 0; i < 20; i++) yield* Effect.yieldNow
-      assert.isTrue((yield* kit.notify.press(first!.id, "stop", { device: "kitchen-display" })).ok)
-      yield* Deferred.succeed(gate, undefined)
-      assert.deepStrictEqual(yield* Fiber.join(press), { say: "The ring was stopped, so tea timer will not ring again." })
-      yield* kit.present.settle
-      assert.deepStrictEqual(kit.present.shown("kitchen-display"), [])
-      yield* kit.restart
-      yield* kit.advance(10 * MIN)
-      assert.deepStrictEqual(ringing(kit), [])
-      yield* kit.present.settle
-      assert.deepStrictEqual(kit.present.shown("kitchen-display"), [])
-      assert.strictEqual((yield* timerRows(kit))[0]!.value.state, "cancelled")
-    }))
-
-  it.effect("alarms: the same: no snooze survives", () =>
-    Effect.gen(function*() {
-      const hooks = makeHooks()
-      const registered = makeRegistered()
-      const kit = yield* alarmKit(hooks, registered)
-      yield* kit.action("set", { when: "10:01" })
-      yield* kit.advance(MIN)
-      const [first] = ringing(kit)
-      const row = (yield* alarmRows(kit))[0]!
-      const gate = yield* Deferred.make<void>()
-      hooks.gate = gate
-      const press = yield* Effect.forkChild(registered.presses.get("alarm")!.run({ notificationId: first!.id, actionId: "more", key: `alarm:${row.id}:1`, deviceId: "kitchen-display" }))
-      for (let i = 0; i < 20; i++) yield* Effect.yieldNow
-      assert.isTrue((yield* kit.notify.press(first!.id, "stop", { device: "kitchen-display" })).ok)
-      yield* Deferred.succeed(gate, undefined)
-      assert.deepStrictEqual(yield* Fiber.join(press), { say: "The ring was stopped, so it will not ring again now." })
-      yield* kit.restart
-      yield* kit.advance(10 * MIN)
-      assert.deepStrictEqual(ringing(kit), [])
-      assert.isUndefined((yield* alarmRows(kit))[0]!.value.ring?.again)
-    }))
-})
+// Finding 4's check after a press, and its compensation, were removed in review round 2 (U4); review2.test.ts pins the
+// stated limit instead.
 
 describe("finding 5: withdrawing a ring that fails", () => {
   it.effect("timers: more time while ringing, with resolve failing: said as still being stopped; finished later, also after a restart", () =>
@@ -501,48 +454,7 @@ describe("finding 7: a snoozed or ringing alarm is listed and can be cancelled",
     }))
 })
 
-describe("finding 8: a change keeps the occurrence's nominal date", () => {
-  const nuuk = { household: { home: { HOME_LANGUAGE: "en-GB", HOME_TIME_ZONE: "America/Nuuk" } }, startAt: Date.UTC(2026, 2, 28, 12, 0) }
-
-  it.effect("Nuuk, the spring gap across midnight: only the next to 10 pm is Saturday 22:00", () =>
-    Effect.gen(function*() {
-      const kit = yield* alarmKit(makeHooks(), undefined, nuuk)
-      yield* kit.action("set", { when: "every Saturday at 11:30 pm" })
-      const series = (yield* alarmRows(kit))[0]!
-      assert.strictEqual(series.value.next?.date, "2026-03-28")
-      assert.strictEqual(said(yield* kit.action("change", { to: "10 pm", scope: "next" })), "The next alarm moves to today at ten o'clock at night; after that it rings every Saturday as before.")
-      const once = (yield* alarmRows(kit)).find((r) => r.value.rrule === undefined)!
-      // Saturday 28 March at 22:00, before the gap (UTC−2).
-      assert.strictEqual(once.value.next?.at, Date.UTC(2026, 2, 29, 0, 0))
-      assert.strictEqual(once.value.next?.date, "2026-03-28")
-    }))
-
-  it.effect("Nuuk: all of them to 10 pm: the next is Saturday 22:00", () =>
-    Effect.gen(function*() {
-      const kit = yield* alarmKit(makeHooks(), undefined, nuuk)
-      yield* kit.action("set", { when: "every Saturday at 11:30 pm" })
-      assert.strictEqual(said(yield* kit.action("change", { to: "10 pm", scope: "all" })), "The alarm now rings every Saturday; the next one is today at ten o'clock at night.")
-      assert.strictEqual((yield* alarmRows(kit))[0]!.value.next?.at, Date.UTC(2026, 2, 29, 0, 0))
-    }))
-
-  it.effect("Amsterdam: a time in the spring gap and one in the autumn fold keep their day", () =>
-    Effect.gen(function*() {
-      const spring = yield* alarmKit(makeHooks(), undefined, { startAt: Date.UTC(2026, 2, 28, 12, 0) })
-      yield* spring.action("set", { when: "every Sunday at 2:30" })
-      const s = (yield* alarmRows(spring))[0]!
-      assert.strictEqual(s.value.next?.date, "2026-03-29")
-      yield* spring.action("change", { to: "1:30 am", scope: "next" })
-      const once = (yield* alarmRows(spring)).find((r) => r.value.rrule === undefined)!
-      assert.strictEqual(once.value.next?.at, Date.UTC(2026, 2, 29, 0, 30))
-      const autumn = yield* alarmKit(makeHooks(), undefined, { startAt: Date.UTC(2026, 9, 24, 12, 0) })
-      yield* autumn.action("set", { when: "every Sunday at 2:30" })
-      yield* autumn.action("change", { to: "2:15 am", scope: "all" })
-      const a = (yield* alarmRows(autumn))[0]!
-      // The first 02:15 of 25 October (UTC+2): 00:15 UTC.
-      assert.strictEqual(a.value.next?.at, Date.UTC(2026, 9, 25, 0, 15))
-      assert.strictEqual(a.value.next?.date, "2026-10-25")
-    }))
-})
+// Finding 8's change tests went with `alarms_change` (review round 2, U1); the nominal date is pinned in review2.test.ts.
 
 describe("finding 9: a Home zone accepted with spaces around it", () => {
   it.effect("sets, lists and rings without a crash; exactly one alarm is stored", () =>
@@ -568,7 +480,7 @@ describe("finding 10: a missed alarm is worded from the day it is told", () => {
       yield* kit.advance(0)
       const missed = (yield* kit.notify.all).filter((n) => n.key?.startsWith("alarm-missed:"))
       assert.strictEqual(missed.length, 1)
-      assert.strictEqual(missed[0]!.text, "The alarm for Wednesday the eighteenth of November 2026 at ten oh one in the morning could not ring: I wasn't running then.")
+      assert.strictEqual(missed[0]!.text, "The alarm for Wednesday the eighteenth of November 2026 at ten oh one in the morning could not ring.")
     }))
 
   it.effect("a repeating one: the latest occurrence missed, said from today (yesterday's)", () =>
@@ -581,7 +493,7 @@ describe("finding 10: a missed alarm is worded from the day it is told", () => {
       yield* kit.advance(0)
       const missed = (yield* kit.notify.all).filter((n) => n.key?.startsWith("alarm-missed:"))
       assert.strictEqual(missed.length, 1)
-      assert.strictEqual(missed[0]!.text, "The alarm for yesterday at seven o'clock in the morning could not ring: I wasn't running then.")
+      assert.strictEqual(missed[0]!.text, "The alarm for yesterday at seven o'clock in the morning could not ring.")
       assert.strictEqual((yield* alarmRows(kit))[0]!.value.next?.at, at(20, 7))
     }))
 })

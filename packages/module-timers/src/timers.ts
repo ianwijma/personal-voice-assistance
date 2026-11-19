@@ -33,10 +33,14 @@ const Count = Schema.Int.check(Schema.isBetween({ minimum: 0, maximum: 1_000_000
 const Owed = Schema.Struct({ n: Count, at: Instant, attempts: Count, retryAt: Instant })
 /** The ring delivered last: its occurrence, its notification, when it was sent and when it stops by itself. */
 const Ring = Schema.Struct({ n: Count, notification: NOTE, at: Instant, until: Instant, pressed: Schema.optionalKey(NOTE) })
-/** A ring still to be withdrawn: its notification, when it stops by itself anyway, and when to try again. */
+/** The row's previous ring, still to be taken away: its notification, when it stops by itself anyway, and when to try again. */
 const Withdraw = Schema.Struct({ notification: NOTE, until: Instant, retryAt: Instant })
-/** The countdown on screen now: the instant it counts down to, and when it ends by itself. */
-const Screen = Schema.Struct({ endsAt: Instant, until: Instant })
+/**
+ * A countdown that may be on a screen: written before it is shown, kept until it is known to be gone (dismissed, replaced by
+ * its key and dismissed, or ended by its lifetime at `until`). `shown`: the countdown to `endsAt` is known to be shown;
+ * `earlier`: an earlier countdown of the timer may still be on a screen (this one is to replace it).
+ */
+const Screen = Schema.Struct({ endsAt: Instant, until: Instant, shown: Schema.Boolean, earlier: Schema.Boolean })
 
 /**
  * One timer: household data (no owner, no person). What it is (`state`, its due instant or what it has left) and what is
@@ -61,7 +65,8 @@ export const Timer = Schema.Struct({
   n: Count,
   owed: Schema.optionalKey(Owed),
   ring: Schema.optionalKey(Ring),
-  withdraw: Schema.Array(Withdraw).check(Schema.isMaxLength(3)),
+  /** At most one: a row never has two notifications of its own open (a new ring is sent only once this is gone). */
+  withdraw: Schema.optionalKey(Withdraw),
   screen: Schema.optionalKey(Screen),
   screenTries: Schema.optionalKey(Count),
   screenRetryAt: Schema.optionalKey(Instant),
@@ -110,13 +115,14 @@ const displayName = (value: Pick<Timer, "name" | "durationMs">, language: Langua
 
 const leftOf = (value: Timer, now: number): number => (value.state === "paused" ? (value.leftMs ?? 0) : Math.max(0, value.dueAt - now))
 
-type Shown = "active" | "ringing" | "waiting"
+type Shown = "active" | "ringing" | "waiting" | "cleanup"
 
 const itemOf = (row: Row<Timer>, shown: Shown, now: number, language: Language): string => {
   const name = displayName(row.value, language)
   const left = speakLeft(leftOf(row.value, now), language)
   if (shown === "ringing") return say(texts, language, "itemRinging", { name })
   if (shown === "waiting") return say(texts, language, "itemWaiting", { name })
+  if (shown === "cleanup") return say(texts, language, "itemCleanup", { name })
   if (row.value.state === "paused") return say(texts, language, "itemPaused", { name, left })
   if (row.value.snoozed === true) return say(texts, language, "itemSnoozed", { name, left })
   return say(texts, language, "itemLeft", { name, left })
@@ -139,7 +145,7 @@ const wantedScreen = (v: Timer): number | undefined => (v.state === "running" &&
 
 const screenOwed = (v: Timer): boolean => {
   const want = wantedScreen(v)
-  return want !== undefined ? v.screen?.endsAt !== want : v.screen !== undefined
+  return want !== undefined ? !(v.screen?.endsAt === want && v.screen.shown) : v.screen !== undefined
 }
 
 /** The next moment anything happens for the row, or `undefined`: nothing is left to do. */
@@ -148,7 +154,7 @@ export const nextAtOf = (v: Timer, now: number): number | undefined => {
   if (v.state === "running") at.push(v.dueAt)
   if (v.owed !== undefined) at.push(v.owed.retryAt)
   if (v.ring !== undefined) at.push(v.ring.until)
-  for (const w of v.withdraw) at.push(Math.min(w.retryAt, w.until))
+  if (v.withdraw !== undefined) at.push(Math.min(v.withdraw.retryAt, v.withdraw.until))
   if (screenOwed(v)) at.push(Math.max(now, v.screenRetryAt ?? now))
   if (v.screen !== undefined && wantedScreen(v) === undefined) at.push(v.screen.until)
   return at.length === 0 ? undefined : Math.max(0, Math.min(...at))
@@ -165,25 +171,39 @@ const advance = (v: Timer, now: number): Timer => {
     const { ring: _r, ...rest } = out
     out = rest
   }
-  if (out.withdraw.some((w) => w.until <= now)) out = { ...out, withdraw: out.withdraw.filter((w) => w.until > now) }
+  if (out.withdraw !== undefined && out.withdraw.until <= now) {
+    const { withdraw: _w, ...rest } = out
+    out = rest
+  }
   if (out.screen !== undefined && out.screen.until <= now) {
     const { screen: _x, ...rest } = out
     out = rest
   }
-  return out
+  return withScreenOwed(out, now)
 }
 
-/** A ring to withdraw, added to the row's list (at most 3: the oldest goes first; it stops by itself soon anyway). */
-const withdrawing = (v: Timer, ring: { readonly notification: string; readonly until: number }, now: number): Timer => ({
-  ...v,
-  withdraw: [...v.withdraw.filter((w) => w.notification !== ring.notification), { notification: ring.notification, until: ring.until, retryAt: now }].slice(-3)
-})
+/**
+ * The countdown the state wants, recorded as possibly on a screen before it is shown: written in the same step as the
+ * change that wants it, so a show whose outcome is not recorded is still known and taken away later (finding 11).
+ */
+export const withScreenOwed = (v: Timer, now: number): Timer => {
+  const want = wantedScreen(v)
+  // Not yet when a refused show is to be tried again later: it is recorded in the step that tries it.
+  if (want === undefined || v.screen?.endsAt === want || (v.screenRetryAt ?? 0) > now) return v
+  return { ...v, screen: { endsAt: want, until: Math.max(v.screen?.until ?? 0, want + SCREEN_GRACE_MS), shown: false, earlier: v.screen !== undefined } }
+}
 
-/** The row without its current ring, which is withdrawn. */
-const withoutRing = (v: Timer, now: number): Timer => {
-  if (v.ring === undefined) return v
-  const { ring, ...rest } = v
-  return withdrawing(rest, ring, now)
+/**
+ * The ring that is to be taken away. A row holds at most one: a new ring is sent only once the previous one is gone, so
+ * a second one never exists to be dropped (finding 3). Should it ever, the one already owed is kept and `undefined` says so.
+ */
+const withdrawing = (v: Timer, ring: { readonly notification: string; readonly until: number }, now: number): Timer | undefined =>
+  v.withdraw === undefined || v.withdraw.notification === ring.notification ? { ...v, withdraw: { notification: ring.notification, until: ring.until, retryAt: now } } : undefined
+
+/** A value without one optional member. */
+const withoutKey = <K extends "ring" | "withdraw" | "owed" | "screen">(v: Timer, key: K): Timer => {
+  const { [key]: _x, ...rest } = v
+  return rest as Timer
 }
 
 // ---------------------------------------------------------------------------------------------------------------------
@@ -245,7 +265,7 @@ export const timersModule = defineModule({
        * `timer:<id>`) for its `nextAt`, all in one transaction. A row with nothing left to do has its job cancelled after
        * the commit (a job left over finds nothing to do).
        */
-      const commitAll = (entries: ReadonlyArray<{ readonly row: Row<Timer> | undefined; readonly id: string; readonly value: Timer }>, actor?: Actor) =>
+      const commitAll = (entries: ReadonlyArray<{ readonly row: Row<Timer> | undefined; readonly id: string; readonly value: Timer }>, actor?: Actor, extra: ReadonlyArray<PreparedJob> = []) =>
         Effect.gen(function*() {
           const now = yield* Clock.currentTimeMillis
           const prepared: Array<{ readonly row: Row<Timer> | undefined; readonly id: string; readonly planned: Timer; readonly job: PreparedJob | undefined }> = []
@@ -257,17 +277,21 @@ export const timersModule = defineModule({
           const options = yield* actorNow(actor)
           const written = yield* ctx.store.transaction((tx) => {
             const c = tx.collection(timers)
-            return prepared.map((p) => {
+            const rows = prepared.map((p) => {
               const out = p.row === undefined ? c.insert(p.planned, { id: p.id, ...options }) : c.update(p.id, () => p.planned, { expectRev: p.row.rev, ...options })
               p.job?.writeIn(tx)
               return out
             })
+            // A job that goes with these writes (the Health report of a missed ring): both or neither.
+            for (const j of extra) j.writeIn(tx)
+            return rows
           })
           for (const p of prepared) if (p.job === undefined && p.row?.value.pending === true) yield* Effect.ignore(ctx.scheduler.cancel({ key: `timer:${p.id}` }))
           return written
         })
 
-      const commit = (row: Row<Timer> | undefined, id: string, value: Timer, actor?: Actor) => Effect.map(commitAll([{ row, id, value }], actor), (rows) => rows[0]!)
+      const commit = (row: Row<Timer> | undefined, id: string, value: Timer, actor?: Actor, extra: ReadonlyArray<PreparedJob> = []) =>
+        Effect.map(commitAll([{ row, id, value }], actor, extra), (rows) => rows[0]!)
 
       // -- what screens show -----------------------------------------------------------------------------------------------
 
@@ -310,23 +334,37 @@ export const timersModule = defineModule({
 
       // -- reconcile: the one function -------------------------------------------------------------------------------------
 
-      /** Send the owed ring (or record it missed when its ring time has passed). */
-      const deliver = (id: string, v: Timer, now: number): Effect.Effect<Timer> =>
+      /**
+       * Send the owed ring. First the row's previous ring is resolved: a row never has two of its own open (finding 5); while
+       * that fails the new ring stays owed and is tried again. When its whole ring time has passed it is given up, and the
+       * job that reports it on the Health page is written in the same transaction that gives it up (finding 12): when that
+       * job cannot be prepared, it is not given up.
+       */
+      const deliver = (id: string, v: Timer, now: number): Effect.Effect<{ readonly value: Timer; readonly jobs: ReadonlyArray<PreparedJob> }> =>
         Effect.gen(function*() {
           const owed = v.owed!
+          const later = (x: Timer) => ({ value: { ...x, owed: { ...owed, attempts: owed.attempts + 1, retryAt: now + RETRY_RING_MS } }, jobs: [] })
           if (now - owed.at >= ringMs()) {
-            // Refused until its whole ring time had passed: missed. A Health issue says so (a job that fails on purpose).
-            const { owed: _o, ...rest } = v
-            yield* Effect.ignore(ctx.scheduler.schedule({
+            const report = yield* Effect.result(ctx.scheduler.prepare({
               handler: "trouble",
               key: `trouble:${id}:${owed.n}`,
               inMs: 0,
               payload: { message: `A timer could not ring: the notification service refused it until its ring time had passed (${cut(displayName(v, "en"), 80)}).` }
             }))
-            return rest
+            if (report._tag === "Failure") return later(v)
+            const { owed: _o, ...rest } = v
+            return { value: rest, jobs: [report.success] }
           }
-          // A newer occurrence first withdraws the older ring of the same timer.
-          const out = v.ring !== undefined && v.ring.n < owed.n ? withoutRing(v, now) : v
+          let out = v
+          const previous = out.withdraw?.notification ?? out.ring?.notification
+          if (previous !== undefined) {
+            const gone = yield* Effect.result(ctx.notify.resolve(previous))
+            if (gone._tag === "Failure") {
+              const kept = out.ring !== undefined && out.withdraw === undefined ? withdrawing(withoutKey(out, "ring"), out.ring, now) ?? out : out
+              return later(kept.withdraw !== undefined ? { ...kept, withdraw: { ...kept.withdraw, retryAt: now + RETRY_CLEANUP_MS } } : kept)
+            }
+            out = withoutKey(withoutKey(out, "ring"), "withdraw")
+          }
           const lang = language()
           const name = displayName(out, lang)
           const duration = speakDuration(out.durationMs, lang) ?? ""
@@ -341,25 +379,18 @@ export const timersModule = defineModule({
             handler: "timer",
             target: "origin"
           }))
-          if (sent._tag === "Failure") return { ...out, owed: { ...owed, attempts: owed.attempts + 1, retryAt: now + RETRY_RING_MS } }
+          if (sent._tag === "Failure") return later(out)
           const { owed: _o, ...rest } = out
-          return { ...rest, ring: { n: owed.n, notification: sent.success.notification.id, at: now, until: sent.success.notification.expiresAt } }
+          return { value: { ...rest, ring: { n: owed.n, notification: sent.success.notification.id, at: now, until: sent.success.notification.expiresAt } }, jobs: [] }
         })
 
-      /** Withdraw the rings owed a withdrawal (a failure is tried again a minute later, until the ring stops by itself). */
+      /** Take away the row's previous ring (a failure is tried again a minute later, until the ring stops by itself). */
       const withdrawRings = (v: Timer, now: number, force = false): Effect.Effect<Timer> =>
         Effect.gen(function*() {
-          if (v.withdraw.length === 0) return v
-          const kept: Array<typeof Withdraw.Type> = []
-          for (const w of v.withdraw) {
-            if (w.retryAt > now && !force) {
-              kept.push(w)
-              continue
-            }
-            const done = yield* Effect.result(ctx.notify.resolve(w.notification))
-            if (done._tag === "Failure") kept.push({ ...w, retryAt: now + RETRY_CLEANUP_MS })
-          }
-          return { ...v, withdraw: kept }
+          const w = v.withdraw
+          if (w === undefined || (w.retryAt > now && !force)) return v
+          const done = yield* Effect.result(ctx.notify.resolve(w.notification))
+          return done._tag === "Failure" ? { ...v, withdraw: { ...w, retryAt: now + RETRY_CLEANUP_MS } } : withoutKey(v, "withdraw")
         })
 
       /** Make the screen match the state: show or replace the countdown, or take it down. */
@@ -370,11 +401,15 @@ export const timersModule = defineModule({
           const { screenTries: _t, screenRetryAt: _r, ...base } = v
           const tries = (v.screenTries ?? 0) + 1
           if (want !== undefined) {
+            // Recorded as possibly shown before this call (`withScreenOwed`, written in an earlier step); now known shown.
+            if (v.screen?.endsAt !== want) return v
             const shown = yield* Effect.result(showCountdown(id, v, want))
-            if (shown._tag === "Success") return { ...base, screen: { endsAt: want, until: want + SCREEN_GRACE_MS } }
-            // Not shown after a few tries: the timer runs and rings without it; what is on screen still is taken down.
-            if (tries >= SCREEN_TRIES) return { ...base, screenSkip: want }
-            return { ...base, screenTries: tries, screenRetryAt: now + RETRY_CLEANUP_MS }
+            if (shown._tag === "Success") return { ...base, screen: { ...v.screen, shown: true, earlier: false } }
+            // Refused: nothing new was shown. With no earlier countdown, nothing of it is on a screen (the record goes); an
+            // earlier one stays recorded, to be replaced or taken down. After a few tries the timer runs and rings without it.
+            const unshown = v.screen.earlier ? base : withoutKey(base, "screen")
+            if (tries >= SCREEN_TRIES) return { ...unshown, screenSkip: want }
+            return { ...unshown, screenTries: tries, screenRetryAt: now + RETRY_CLEANUP_MS }
           }
           const gone = yield* Effect.result(dismissCountdown(id, v))
           if (gone._tag === "Success") {
@@ -398,12 +433,17 @@ export const timersModule = defineModule({
           const first = advance(row.value, now)
           if (first !== row.value) row = yield* commit(row, id, first, actor)
           let v = row.value
+          let jobs: ReadonlyArray<PreparedJob> = []
           // A ring is sent only by the row's own job, whose origin is the row's device (where `target: "origin"` rings);
           // anything else that finds a ring owed leaves it to that job, planned for now.
-          if (own && v.owed !== undefined && v.owed.retryAt <= now) v = yield* deliver(id, v, now)
+          if (own && v.owed !== undefined && v.owed.retryAt <= now) {
+            const d = yield* deliver(id, v, now)
+            v = d.value
+            jobs = d.jobs
+          }
           v = yield* withdrawRings(v, now, force)
           v = yield* syncScreen(id, v, now, force)
-          if (v !== row.value || nextAtOf(v, now) !== (row.value.pending ? row.value.nextAt : undefined)) row = yield* commit(row, id, v, actor)
+          if (v !== row.value || jobs.length > 0 || nextAtOf(v, now) !== (row.value.pending ? row.value.nextAt : undefined)) row = yield* commit(row, id, v, actor, jobs)
           return row
         })
 
@@ -412,38 +452,49 @@ export const timersModule = defineModule({
       const readActive = scan<Timer>((q) => store.list({ where: { phase: "active" }, orderBy: { field: "createdAt", direction: "asc" }, ...q }), PAGE, SCAN_ACTIVE)
       const readPending = scan<Timer>((q) => store.list({ where: { pending: true }, orderBy: { field: "nextAt", direction: "asc" }, ...q }), PAGE, SCAN_PENDING)
 
-      /** Timers that came due: ringing now (their ring's notification is open), or with their ring owed and not sent yet. */
+      /**
+       * Timers that came due: ringing now (their ring's notification is open), or with their ring owed and not sent yet; and
+       * timers that ended but still owe clean-up (a ring or a countdown to take away), which only a cancel looks at.
+       */
       const readRinging = Effect.gen(function*() {
         const open = new Set((yield* ctx.notify.list()).map((n) => n.id))
         const pending = yield* readPending
         const ringing: Array<Row<Timer>> = []
         const waiting: Array<Row<Timer>> = []
+        const cleanup: Array<Row<Timer>> = []
         for (const row of pending.rows) {
-          if (row.value.phase !== "ended" || row.value.state !== "done") continue
-          if (row.value.owed !== undefined) waiting.push(row)
-          else if (row.value.ring !== undefined && open.has(row.value.ring.notification)) ringing.push(row)
+          if (row.value.phase !== "ended") continue
+          if (row.value.state === "done" && row.value.owed !== undefined) waiting.push(row)
+          else if (row.value.state === "done" && row.value.ring !== undefined && open.has(row.value.ring.notification)) ringing.push(row)
+          else if (row.value.withdraw !== undefined || row.value.screen !== undefined) cleanup.push(row)
         }
-        return { ringing, waiting, cut: pending.cut }
+        return { ringing, waiting, cleanup, cut: pending.cut }
       })
 
       const readAll = Effect.gen(function*() {
         const active = yield* readActive
         const r = yield* readRinging
-        return { active: active.rows, ringing: r.ringing, waiting: r.waiting, cut: active.cut || r.cut }
+        return { active: active.rows, ringing: r.ringing, waiting: r.waiting, cleanup: r.cleanup, cut: active.cut || r.cut }
       })
 
-      const candidatesOf = (all: { readonly active: ReadonlyArray<Row<Timer>>; readonly ringing: ReadonlyArray<Row<Timer>>; readonly waiting: ReadonlyArray<Row<Timer>> }, now: number) => [
+      /** What a request can mean: listed timers; for a cancel, also timers that still owe clean-up (finding 9). */
+      const candidatesOf = (
+        all: { readonly active: ReadonlyArray<Row<Timer>>; readonly ringing: ReadonlyArray<Row<Timer>>; readonly waiting: ReadonlyArray<Row<Timer>>; readonly cleanup: ReadonlyArray<Row<Timer>> },
+        now: number,
+        forCancel = false
+      ) => [
         ...all.ringing.map((row) => ({ row, shown: "ringing" as Shown })),
         ...all.waiting.map((row) => ({ row, shown: "waiting" as Shown })),
-        ...[...all.active].sort((x, y) => leftOf(x.value, now) - leftOf(y.value, now)).map((row) => ({ row, shown: "active" as Shown }))
+        ...[...all.active].sort((x, y) => leftOf(x.value, now) - leftOf(y.value, now)).map((row) => ({ row, shown: "active" as Shown })),
+        ...(forCancel ? all.cleanup.map((row) => ({ row, shown: "cleanup" as Shown })) : [])
       ]
 
       /** Which timer `name` means: by name; with no name, the only one; otherwise a question. Never the first of several. */
-      const resolve = (name: string | undefined, now: number): Effect.Effect<Target, ActionError> =>
+      const resolve = (name: string | undefined, now: number, forCancel = false): Effect.Effect<Target, ActionError> =>
         Effect.gen(function*() {
           const lang = language()
           const all = yield* readAll.pipe(Effect.mapError(unreadable))
-          const candidates = candidatesOf(all, now)
+          const candidates = candidatesOf(all, now, forCancel)
           const key = name === undefined ? "" : nameKey(name)
           const matches = key === "" ? candidates : candidates.filter((c) => c.row.value.name !== undefined && nameKey(c.row.value.name) === key)
           if (matches.length === 1) return { kind: "one", row: matches[0]!.row, shown: matches[0]!.shown }
@@ -480,7 +531,7 @@ export const timersModule = defineModule({
 
       /** Whether a ring of the row is still to be withdrawn, and whether its countdown is still to come down. */
       const leftovers = (row: Row<Timer> | undefined) => ({
-        ring: row !== undefined && row.value.withdraw.length > 0,
+        ring: row !== undefined && row.value.withdraw !== undefined,
         screen: row !== undefined && wantedScreen(row.value) === undefined && row.value.screen !== undefined
       })
 
@@ -511,7 +562,7 @@ export const timersModule = defineModule({
           }
           const id = randomUUID()
           const room = input.room !== undefined && input.room.length <= 60 && input.room.trim() !== "" ? input.room : undefined
-          const value: Timer = {
+          const value: Timer = withScreenOwed({
             ...(input.name !== undefined ? { name: input.name } : {}),
             durationMs: input.durationMs,
             deviceId: input.deviceId,
@@ -520,41 +571,61 @@ export const timersModule = defineModule({
             phase: "active",
             dueAt: now + input.durationMs,
             n: 0,
-            withdraw: [],
             pending: true,
             nextAt: now,
             endedAt: 0
-          }
+          }, now)
           const row = yield* commit(undefined, id, value)
-          // The countdown is owed work of the row: shown now, or tried again by the job.
-          const done = yield* reconcile(id)
+          // Committed: the timer is started (finding 10). Its countdown is owed work of the row (written above, before it is
+          // shown): shown now, or by the row's job when this fails; a failure here never turns the start into an error.
+          const done = yield* reconcile(id).pipe(Effect.catch(() => Effect.succeed(undefined)))
           return { kind: "started", id, value: (done ?? row).value } satisfies StartOutcome as StartOutcome
         }))
 
       /** A change of a timer, then everything owed after it done at once. Inside the lock. */
       const change = (row: Row<Timer>, value: Timer, actor?: Actor) => Effect.andThen(commit(row, row.id, value, actor), () => reconcile(row.id, actor, true))
 
-      /** A timer that came due given more time (`ms`): it runs again; its ring is withdrawn, or kept when it was this ring's own button. */
-      const rearmed = (v: Timer, now: number, ms: number, options: { readonly snoozed: boolean; readonly pressed?: string }): Timer => {
-        const { owed: _o, leftMs: _l, snoozed: _s, screenSkip: _k, ...rest } = v
-        const base: Timer = options.pressed !== undefined && rest.ring !== undefined ? { ...rest, ring: { ...rest.ring, pressed: options.pressed } } : withoutRing(rest, now)
-        return { ...base, state: "running", phase: "active", dueAt: now + ms, endedAt: 0, ...(options.snoozed ? { snoozed: true } : {}) }
-      }
-
       /**
-       * The timer cancelled: nothing more rings; its ring is withdrawn. A ring that was sent but not recorded (the write
-       * after the send failed) is found by its occurrence's key among the open notifications and withdrawn too.
+       * Let go of the row's current occurrence (finding 2): the one way cancel, more time, pause and a button's follow-up
+       * leave it. Its recorded ring becomes the ring to take away; an owed ring whose send may have succeeded before its
+       * record failed is looked for among the open notifications by its occurrence's key and becomes the ring to take away;
+       * only then is the owed delivery forgotten. Fails (and nothing is changed) when the open notifications cannot be read.
        */
-      const cancelled = (row: Row<Timer>, now: number) =>
+      const letGo = (id: string, v: Timer, now: number, keepRing = false) =>
         Effect.gen(function*() {
-          const { snoozed: _s, owed, ...rest } = row.value
-          let out = withoutRing({ ...rest, state: "cancelled", phase: "ended", endedAt: now }, now)
-          if (owed !== undefined) {
-            const open = yield* ctx.notify.list()
-            const sent = open.find((n) => n.key === `timer:${row.id}:${owed.n}`)
-            if (sent !== undefined) out = withdrawing(out, { notification: sent.id, until: sent.expiresAt }, now)
+          let out = v
+          if (out.ring !== undefined && !keepRing) out = withdrawing(withoutKey(out, "ring"), out.ring, now) ?? out
+          if (out.owed !== undefined) {
+            const key = `timer:${id}:${out.owed.n}`
+            const sent = (yield* ctx.notify.list()).find((n) => n.key === key)
+            if (sent !== undefined) {
+              const taken = withdrawing(out, { notification: sent.id, until: sent.expiresAt }, now)
+              if (taken === undefined) return yield* Effect.fail(new Error("a second ring to take away"))
+              out = taken
+            }
+            out = withoutKey(out, "owed")
           }
           return out
+        })
+
+      /**
+       * A timer that came due given more time (`ms`): it runs again. Its occurrence is let go; a button's own follow-up
+       * keeps its ring (the notification service resolves it with the press), to be resolved before the next ring is sent.
+       */
+      const rearmed = (id: string, v: Timer, now: number, ms: number, options: { readonly snoozed: boolean; readonly pressed?: string }) =>
+        Effect.gen(function*() {
+          const keep = options.pressed !== undefined && v.ring !== undefined
+          const left = yield* letGo(id, v, now, keep)
+          const { leftMs: _l, snoozed: _s, screenSkip: _k, ...rest } = left
+          const base: Timer = keep && rest.ring !== undefined ? { ...rest, ring: { ...rest.ring, pressed: options.pressed! } } : rest
+          return withScreenOwed({ ...base, state: "running", phase: "active", dueAt: now + ms, endedAt: 0, ...(options.snoozed ? { snoozed: true } : {}) }, now)
+        })
+
+      /** The timer cancelled: nothing more rings; its occurrence is let go. */
+      const cancelled = (row: Row<Timer>, now: number) =>
+        Effect.map(letGo(row.id, row.value, now), (v) => {
+          const { snoozed: _s, ...rest } = v
+          return { ...rest, state: "cancelled" as const, phase: "ended" as const, endedAt: row.value.phase === "ended" ? row.value.endedAt : now }
         })
 
       const ops: TimersOps = {
@@ -609,7 +680,7 @@ export const timersModule = defineModule({
               if (deltaMs <= 0) return say(texts, lang, "notPausedRinging", { Name })
               const active = yield* readActive.pipe(Effect.mapError(failure))
               if (active.cut || active.rows.length >= TIMERS_LIMITS.running) return yield* Effect.fail(fail(say(texts, lang, "full", { count: TIMERS_LIMITS.running })))
-              const after = yield* change(row, rearmed(row.value, now, deltaMs, { snoozed: false })).pipe(Effect.mapError(failure))
+              const after = yield* Effect.flatMap(rearmed(row.id, row.value, now, deltaMs, { snoozed: false }), (value) => change(row, value)).pipe(Effect.mapError(failure))
               return say(texts, lang, leftovers(after).ring ? "restartedPending" : "restarted", { Name, left: speakLeft(deltaMs, lang) })
             }
             const left = leftOf(row.value, now) + deltaMs
@@ -640,8 +711,10 @@ export const timersModule = defineModule({
               return say(texts, lang, leftovers(after).screen ? "pausedScreenPending" : "alreadyPaused", { Name, left })
             }
             const left = Math.max(1_000, row.value.dueAt - now)
-            const { snoozed: _s, ...rest } = row.value
-            const after = yield* change(row, { ...rest, state: "paused", leftMs: left }).pipe(Effect.mapError(failure))
+            const after = yield* Effect.flatMap(letGo(row.id, row.value, now), (v) => {
+              const { snoozed: _s, ...rest } = v
+              return change(row, { ...rest, state: "paused", leftMs: left })
+            }).pipe(Effect.mapError(failure))
             return say(texts, lang, leftovers(after).screen ? "pausedScreenPending" : "paused", { Name, left: speakLeft(left, lang) })
           })),
 
@@ -667,7 +740,8 @@ export const timersModule = defineModule({
             const now = yield* Clock.currentTimeMillis
             if (all) {
               const read = yield* readAll.pipe(Effect.mapError(unreadable))
-              const rows = [...read.active, ...read.ringing, ...read.waiting]
+              // Timers still owing clean-up are cancelled again too: their clean-up is tried now (finding 9).
+              const rows = [...read.active, ...read.ringing, ...read.waiting, ...read.cleanup]
               if (rows.length === 0) return say(texts, lang, "cancelledNone")
               // Every row in one transaction (all or none), then what is owed for each done.
               const values: Array<{ readonly row: Row<Timer>; readonly id: string; readonly value: Timer }> = []
@@ -682,27 +756,14 @@ export const timersModule = defineModule({
               if (pending) return say(texts, lang, "cancelledAllPending", { count: rows.length })
               return say(texts, lang, read.cut ? "cancelledAllCut" : "cancelledAll", { count: rows.length })
             }
-            const t = yield* resolve(name, now)
-            if (t.kind !== "one") {
-              // Nothing is set: a timer whose ring or countdown is still being taken away is finished now.
-              if (t.kind === "none") {
-                const leftover = (yield* readPending.pipe(Effect.mapError(unreadable))).rows.filter((r) => r.value.phase === "ended" && (leftovers(r).ring || leftovers(r).screen))
-                if (leftover.length > 0) {
-                  let still = false
-                  for (const row of leftover) {
-                    const after = yield* reconcile(row.id, undefined, true).pipe(Effect.mapError(failure))
-                    const l = leftovers(after)
-                    still ||= l.ring || l.screen
-                  }
-                  return say(texts, lang, still ? "stoppedPending" : "finished", { Name: capitalise(displayName(leftover[0]!.value, lang)) })
-                }
-              }
-              return notOne(t)
-            }
+            // A timer that is cancelled but still owes clean-up is a candidate too: cancelling it again finishes it.
+            const t = yield* resolve(name, now, true)
+            if (t.kind !== "one") return notOne(t)
             const row = t.row
             const Name = capitalise(displayName(row.value, lang))
             const after = yield* Effect.flatMap(cancelled(row, now), (value) => change(row, value)).pipe(Effect.mapError(failure))
             const l = leftovers(after)
+            if (t.shown === "cleanup") return say(texts, lang, l.ring || l.screen ? "stoppedPending" : "finished", { Name })
             if (l.ring) return say(texts, lang, "ringPending", { Name })
             if (l.screen) return say(texts, lang, "screenPending", { Name })
             return say(texts, lang, t.shown === "active" ? "cancelled" : "cancelledRinging", { Name })
@@ -773,8 +834,7 @@ export const timersModule = defineModule({
 
       // Snooze and "Five more minutes", beside the host's stop. They act on the row's ring of this notification only: a
       // press of any other notification (an older ring, one not recorded yet) is answered that the ring has ended and
-      // changes nothing. Idempotent by notification id (`ring.pressed`). After its write, a press looks at its notification
-      // once more: when something else (the host's Stop) ended it meanwhile, the follow-up is taken back.
+      // changes nothing. Idempotent by notification id (`ring.pressed`).
       yield* ctx.notify.handle("timer", {
         run: (press) =>
           locked(Effect.gen(function*() {
@@ -790,13 +850,12 @@ export const timersModule = defineModule({
             if (row.value.ring.pressed === press.notificationId) return { say: row.value.phase === "active" ? answer(row.value) : say(texts, lang, "ringEnded") }
             const active = yield* readActive
             if (active.cut || active.rows.length >= TIMERS_LIMITS.running) return { say: say(texts, lang, "full", { count: TIMERS_LIMITS.running }), keepOpen: true }
-            const after = yield* change(row, rearmed(row.value, now, snooze ? snoozeMs() : MORE_MINUTES * 60_000, { snoozed: snooze, pressed: press.notificationId }), actor)
-            const open = yield* Effect.result(ctx.notify.list())
-            if (open._tag === "Success" && !open.success.some((n) => n.id === press.notificationId) && after !== undefined) {
-              // Stopped while this press ran: no follow-up survives.
-              yield* change(after, yield* cancelled(after, now), actor)
-              return { say: say(texts, lang, "stoppedMeanwhile", { name: displayName(row.value, lang) }) }
-            }
+            const after = yield* Effect.flatMap(
+              rearmed(row.id, row.value, now, snooze ? snoozeMs() : MORE_MINUTES * 60_000, { snoozed: snooze, pressed: press.notificationId }),
+              (value) => change(row, value, actor)
+            )
+            // When Stop is pressed for this ring at the same moment, the card follows whichever the notification service
+            // recorded first, and the timer may still ring again once; saying stop or cancel again ends it (the pages say so).
             return { say: answer(after?.value ?? row.value) }
           })).pipe(Effect.catch((e) => Effect.succeed({ say: say(texts, language(), isBusy(e) ? "busy" : "failed"), keepOpen: true })))
       }).pipe(Effect.orDie)
