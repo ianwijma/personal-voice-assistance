@@ -51,7 +51,11 @@ ctx.present.handle(name, { run: (press) => Effect<{ say? } | void> })   // in sh
   being read, or has no device to show it on is not accepted, and the note says why; the turn never fails because of it.
   It is shown on the device the call came from (the turn's, the job's or the press's).
 - **Way 2** is one synchronous transaction and an enqueue, and answers with a typed refusal (`PresentError`): `invalid`,
-  `limit`, `busy` (the store was busy, or the stored presentations are still being read at start), `unavailable`.
+  `limit`, `busy` (the store was busy, or the stored presentations are still being read at start), `unavailable`. Its
+  times (when it was shown, when it ends) and the checks that depend on the clock (a timer's `endsAt`) are taken in the
+  attempt of the transaction that commits; a show that waited on a busy store for longer than it would have been shown
+  is refused `busy` rather than committed already ended (review round 2). An `update` likewise judges the end and the
+  timer with the clock of its committing attempt.
 - A tool of a hand-made registry, or in the CLI modes (no Presenter), still gives the model `forModel`, with the note
   `Not shown: nothing can be shown here; say it instead.`
 
@@ -63,11 +67,15 @@ ctx.present.handle(name, { run: (press) => Effect<{ say? } | void> })   // in sh
 | some do | `Showing on "A"; not on "B" (has no display).` |
 | none does | `Not showing it: "A" has no display.` |
 | not accepted (way 1) | `Not showing it: <why>.` (`the presentation was not valid (…)`, `too much is on screen (…)`, `this module cannot show things (…)`, `the screen's data is still being read`, `there is no device to show it on`, `this tool belongs to no module`) |
-| and when the asking device does not show it for a reason other than privacy (no display, a kind its page cannot draw, offline, or not accepted for a bound, a stopping module, the start-up read or no device) | ` Say this instead: <the presentation's spoken text>` (at most 300 characters, through the module's page boundary) |
+| and when the asking device does not show it for a reason other than privacy (no display, a kind its page cannot draw, offline, or not accepted for a bound, a stopping module or the start-up read), and the privacy rule allows the content on the asking device | ` Say this instead: <the presentation's spoken text>` (at most 300 characters, through the module's page boundary) |
 | and while its image is still to be fetched, when it is shown somewhere | ` Its image is being fetched; if that fails it shows without it.` |
 
 The reasons are: `is not connected`, `may not show this person's things`, `has no display`, `cannot show this kind of
-thing`. After a privacy refusal the note carries nothing of the content. Device names are quoted and cut
+thing`. After a privacy refusal the note carries nothing of the content. **Privacy comes first** (review round 2): one
+check decides, on every path, whether the spoken text may go into a note: household content always; personal content
+only when the asking device is known and `Privacy.mayReveal(owner, device)` says yes now. An offline asking device, a
+refusal for a bound, a stopping module or the start-up read never forward personal content the asking device could not
+be shown; no device, an invalid presentation or a tool of no module never forward anything. Device names are quoted and cut
 (`quotedName`). The whole note is at most 600 characters (`MAX_NOTE_CHARS`): the device part is cut first.
 
 ## The kinds and their bounds
@@ -131,10 +139,16 @@ rows.
   row whose `ended` mark and removal both failed before a crash comes back at the restart: durable state is the row.)
 - **Maintenance** uses the notification service's pattern: one one-shot scheduler job `core.present/due`, planned by
   `plan()` for the next thing due (the earliest end of a live presentation, a removal, failed work to repeat a minute
-  from now: a pass, an accepted write, an image's outcome, the start-up read; none when nothing is due), planned again
-  after every change, at the end of every run and at start; and `core.present/hourly` (cron `0 * * * *` in UTC), the
-  safety net that runs the same work. The Presenter has no timer of its own. So ends happen on time, and work that
-  failed is done at most a minute later, or an hour later after a lost plan.
+  from its failure: a pass, an accepted write, an image's outcome, the start-up read; none when nothing is due), planned
+  again after every change, at the end of every run and at start; and `core.present/hourly` (cron `0 * * * *` in UTC),
+  the safety net that runs the same work. A failure keeps the retry time it was given: planning again for other changes
+  never moves it later. The hourly job, if it could not be scheduled, is scheduled again with every change (a show, a
+  plan, a page's hello or a reconciliation), not only by maintenance. The Presenter has no timer of its own. So ends
+  happen on time, and work that failed is done at most a minute after its failure, or an hour later after a lost plan.
+- **Accepted work a newer show replaces is retired** (review round 2): an accepted tool result not yet written is dropped
+  when a newer show of the same key is accepted or committed, and, for a transient, when a newer transient on one of its
+  devices is; it is never written after the newer one, and what waits is checked again against the current show of its
+  id in the attempt that writes it.
 - **Start-up reads everything**: the whole collection, a page (5 rows) at a time with a yield between, the rows to remove
   noted as it goes. Until it has read to the end nothing is shown or withdrawn, a show is refused `busy` and a tool's
   presentation is not accepted (the note says so); a read that fails is tried again a minute later (Health:
@@ -167,7 +181,10 @@ transient the decision allows.
 
 - **The only sender.** `reconcile(device)` makes every voice connection of the device hold exactly what it should hold
   now, in one synchronous step. **It withdraws first** (review round 1, G2): from the index and the decision alone, with
-  no store read, it sends `present.dismiss` for everything a connection holds and may not hold now. Only then does it read
+  no store read, it sends `present.dismiss` for everything a connection holds and may not hold now; what a connection
+  holds is judged as the show it holds (its show id, owner and kind are remembered with it), so when a key is shown again
+  the content held is kept until the new content is read only while that held content itself is still allowed there
+  (review round 2). Only then does it read
   the content of what stays or is added, item by item: what a connection lacks (`present.show`) or holds at another
   revision, form or language (`present.update`). A failed read affects that item only, and the device's pass is repeated
   by the next trigger or a minute later. The bookkeeping is **per connection**: a withdrawal reaches every page that holds
@@ -216,7 +233,10 @@ transient the decision allows.
   image is not there yet, the Presenter asks the image cache to fetch it, off the turn's path; nothing is fetched while no
   device of its target would show it. The row says `loading` until the outcome is written (the content hash, or why
   not: shown without the image, with the server's sentence); an outcome whose write fails is written again a minute
-  later; an image left loading by a restart is fetched again when a page is to show it. None stays loading.
+  later; an image left loading by a restart is fetched again when a page is to show it. None stays loading. A fetch
+  belongs to its address: a key shown again with the same address while it is fetched gets that fetch's outcome; a
+  key shown again with another address fetches its own, and an outcome not yet written for an older address does not
+  hold it back (review round 2).
 - **The cache** fetches through `safeFetch` (public addresses only, redirects checked again; never the owner-configured
   helper, for anything a model or a page supplies) with its own image policy, checks the type the response says and the
   bytes it is against each other, and its size, keeps it as `data/media/<sha256>.<ext>` (directory `0700`, files `0600`,

@@ -10,7 +10,7 @@
  */
 import { assert, describe, it } from "@effect/vitest"
 import { type DevicePresentOutputs, MAX_PINNED_PER_DEVICE, PRESENT_KIND_VERSIONS, type PresentationWire } from "@pva/protocol"
-import { Cause, Deferred, Effect, Exit, Fiber, Schema, Scope } from "effect"
+import { Cause, Clock, Deferred, Effect, Exit, Fiber, Schema, Scope } from "effect"
 import { TestClock } from "effect/testing"
 import type { KnownDevice } from "./Devices.ts"
 import { makeEventBus } from "./EventBus.ts"
@@ -40,7 +40,8 @@ import {
 } from "./Present.ts"
 import { IMAGE_SENTENCE, makePresentEngine, type MediaOutcome, type PresentDecisionRecord, type PresentMessage, SPOKEN_PREFIX } from "./PresentEngine.ts"
 import { makePrivacy, type PrivacyPlace } from "./Privacy.ts"
-import { makeSchedulerEngine } from "./SchedulerEngine.ts"
+import { SchedulerError } from "./Scheduler.ts"
+import { makeSchedulerEngine, type SchedulerEngine } from "./SchedulerEngine.ts"
 import { schedulerStorage } from "./SchedulerJobs.ts"
 import { CurrentTurn, makeConnectionRef, type TurnContext } from "./TurnContext.ts"
 
@@ -70,6 +71,9 @@ const SPEAKER: DevicePresentOutputs = { display: false, kinds: {}, touch: false 
 
 const turnOn = (deviceId: string): TurnContext => ({ turnId: 1, conversationId: "c1", source: "voice", assistantId: "jeff", deviceId })
 
+/** A handler name of the longest form (`PRESENT_HANDLER_NAME`: 64 characters). */
+const LONGEST_HANDLER = "h".repeat(64)
+
 /** A module whose shared part keeps its `ctx.present` and registers the press handler `answer`; its tool returns `result`. */
 const boardModule = (
   id: string,
@@ -87,6 +91,8 @@ const boardModule = (
       Effect.gen(function*() {
         held.set(id, ctx.present)
         yield* ctx.present.handle("answer", { run: (p) => Effect.suspend(() => (presses.push(p), answer.current(p))) }).pipe(Effect.mapError((e) => new ModuleStartError({ message: e.message })))
+        // A handler name at its bound (64 characters), for the bounds case.
+        yield* ctx.present.handle(LONGEST_HANDLER, { run: () => Effect.void }).pipe(Effect.mapError((e) => new ModuleStartError({ message: e.message })))
         return { value: undefined }
       }),
     start: () =>
@@ -162,6 +168,8 @@ export const presentWorld = (
     /** Keep no record of messages and decisions (the latency test). */
     readonly unrecorded?: boolean
     readonly observe?: Parameters<typeof makePresentEngine>[0]["observe"]
+    /** What the Presenter is given as its scheduler (a test injects refusals); default the real one. */
+    readonly wrapScheduler?: (scheduler: SchedulerEngine) => SchedulerEngine
   } = {}
 ) =>
   Effect.gen(function*() {
@@ -183,7 +191,7 @@ export const presentWorld = (
       const scheduler = yield* makeSchedulerEngine({ store, issues, retryBaseMs: SECOND, outcomeRetryMs: [100, 200], gateway: () => hostRef?.gateway })
       const present = yield* makePresentEngine({
         store,
-        scheduler,
+        scheduler: o.wrapScheduler?.(scheduler) ?? scheduler,
         writeRetryMs: [100, 200],
         devices: () => devices,
         // A connection's own kinds stand in for the device's declaration; the owner's exclusions (the map's kinds) still apply.
@@ -1017,5 +1025,367 @@ export const presentContract = (name: string, open: OpenPresentStore) =>
         yield* next.advance(MINUTE)
         assert.isTrue(next.present.loaded())
         assert.deepStrictEqual(next.shownOn("kitchen-display").map((p) => p.id), [h.id])
+      }))
+    // ---- Review round 2 (R1 to R5): everything that waits carries its show id; privacy before any spoken text goes to
+    // the model; times from the committing attempt; a retry keeps its time and the hourly job is ensured on every change;
+    // every bound
+
+    const titlesOn = (world: { readonly shownOn: (d: string) => ReadonlyArray<PresentationWire> }, deviceId: string) =>
+      world.shownOn(deviceId).map((p) => (p.content as { readonly title?: string }).title)
+    const imageState = (world: { readonly shownOn: (d: string) => ReadonlyArray<PresentationWire> }, deviceId: string) =>
+      (world.shownOn(deviceId)[0]?.content as { readonly image?: { readonly state: string } } | undefined)?.image?.state
+
+    it.effect("r2-1: a same-key replacement for another person withdraws the held content the privacy rule no longer allows, although the replacement's read fails", () =>
+      Effect.gen(function*() {
+        const { faulty, world } = yield* faultyStart()
+        const personal = (title: string, who: string) => card(title, { sensitivity: { personal: who } } as Partial<Presentation>)
+        const sams = yield* world.showOn("kitchen-display", personal("Sam private content", "p-sam"), { lifetime: "pinned", key: "agenda" })
+        assert.deepStrictEqual(titlesOn(world, "kitchen-display"), ["Sam private content"])
+        // Sam may no longer be shown here, Robin may; Robin's card replaces Sam's under the same key while reads fail.
+        world.places.set("kitchen-display", { privacy: "shared", defaultPerson: "p-robin" })
+        faulty.faults.reads = 1_000
+        const robins = yield* world.showOn("kitchen-display", personal("Robin private content", "p-robin"), { lifetime: "pinned", key: "agenda" })
+        assert.strictEqual(robins.id, sams.id)
+        assert.deepStrictEqual(titlesOn(world, "kitchen-display"), [])
+        faulty.faults.reads = 0
+        yield* world.advance(MINUTE)
+        assert.deepStrictEqual(titlesOn(world, "kitchen-display"), ["Robin private content"])
+      }))
+
+    it.effect("r2-1: a same-key replacement whose read fails keeps the held content while that is still allowed", () =>
+      Effect.gen(function*() {
+        const { faulty, world } = yield* faultyStart()
+        yield* world.showOn("kitchen-display", card("Before"), { lifetime: "pinned", key: "agenda" })
+        faulty.faults.reads = 1_000
+        yield* world.showOn("kitchen-display", card("After"), { lifetime: "pinned", key: "agenda" })
+        assert.deepStrictEqual(titlesOn(world, "kitchen-display"), ["Before"])
+        faulty.faults.reads = 0
+        yield* world.advance(MINUTE)
+        assert.deepStrictEqual(titlesOn(world, "kitchen-display"), ["After"])
+      }))
+
+    it.effect("r2-2: no refusal hands personal spoken text to the model where privacy does not allow it; household text and allowed personal text still go", () =>
+      Effect.gen(function*() {
+        const { world } = yield* start({ modules: ["board", "other"], connected: ["kitchen-display", "robins-phone", "hall-screen", "office-speaker"] })
+        const personal = (who: string) => card("Appointment", { spoken: "Private medical appointment at noon.", sensitivity: { personal: who } } as Partial<Presentation>)
+        // The asking device is offline: the decision says "offline" before it asks privacy (the kitchen tablet has no
+        // default person, so Robin's things may not be shown there).
+        const offline = yield* world.toolOn("kitchen-tablet", { forModel: "Safe answer.", present: personal("p-robin") }, "other")
+        assert.match(offline.content, /^Safe answer\.\n\[Screen: Not showing it: "Kitchen tablet" [^\]]*\.\]$/)
+        assert.notInclude(offline.content, "Private medical")
+        const offlineHousehold = yield* world.toolOn("kitchen-tablet", { forModel: "Safe answer.", present: card() }, "other")
+        assert.include(offlineHousehold.content, `${SPOKEN_PREFIX}Bins out.`)
+        // The module's live bound is reached: refused before any decision.
+        for (let i = 0; i < MAX_LIVE_PER_MODULE; i++) yield* world.showOn("hall-screen", card(`C${i}`), { lifetime: "pinned" }, "board", { device: "hall-screen" })
+        const robin = yield* world.toolOn("kitchen-display", { forModel: "Safe answer.", present: personal("p-robin") })
+        assert.match(robin.content, /^Safe answer\.\n\[Screen: Not showing it: too much is on screen \(.*\)\.\]$/)
+        assert.notInclude(robin.content, "Private medical")
+        // Sam is this shared display's default person: allowed, so the fallback goes.
+        const sam = yield* world.toolOn("kitchen-display", { forModel: "Safe answer.", present: personal("p-sam") })
+        assert.include(sam.content, `${SPOKEN_PREFIX}Private medical appointment at noon.`)
+        const household = yield* world.toolOn("kitchen-display", { forModel: "Safe answer.", present: card() })
+        assert.include(household.content, `${SPOKEN_PREFIX}Bins out.`)
+      }))
+
+    /** The Presenter's scheduler, refusing (busy) `hourly` while `refuse.hourly` is set and the next `refuse.due` `due` plans. */
+    const refusing = (refuse: { hourly: boolean; due: number }, attempts: Array<string>) =>
+      (s: SchedulerEngine): SchedulerEngine => ({
+        ...s,
+        forCore: (owner) => {
+          const jobs = s.forCore(owner)
+          if (owner !== PRESENT_OWNER) return jobs
+          return {
+            ...jobs,
+            schedule: (r) =>
+              Effect.suspend(() => {
+                attempts.push(r.handler)
+                const refused = r.handler === "hourly" ? refuse.hourly : r.handler === "due" && refuse.due > 0 && refuse.due-- > 0
+                return refused ? Effect.fail(new SchedulerError({ reason: "busy", message: "injected: busy" })) : jobs.schedule(r)
+              })
+          }
+        }
+      })
+
+    it.effect("r2-3: an hourly job that could not be scheduled at the start is scheduled with the next change, so an end is kept although the due plan failed too", () =>
+      Effect.gen(function*() {
+        const attempts: Array<string> = []
+        const refuse = { hourly: true, due: 0 }
+        const { world } = yield* start({ wrapScheduler: refusing(refuse, attempts) })
+        assert.isTrue(world.issues.all().some((i) => i.id === "core.present.hourly"))
+        // From now on the scheduler would accept the hourly job; the show's own due plan is refused once.
+        refuse.hourly = false
+        refuse.due = 1
+        const before = attempts.filter((h) => h === "hourly").length
+        yield* world.showOn("kitchen-display", card("Three seconds"), { expiresInMs: 3 * SECOND })
+        assert.deepStrictEqual(titlesOn(world, "kitchen-display"), ["Three seconds"])
+        assert.strictEqual(attempts.filter((h) => h === "hourly").length, before + 1)
+        assert.strictEqual(refuse.due, 0)
+        yield* world.advance(HOUR + 1)
+        assert.deepStrictEqual(titlesOn(world, "kitchen-display"), [])
+        assert.deepStrictEqual(world.present.live(), [])
+        assert.isFalse(world.issues.all().some((i) => i.id === "core.present.hourly"))
+      }))
+
+    it.effect("r2-3: a page's hello schedules an hourly job that could not be scheduled before", () =>
+      Effect.gen(function*() {
+        const attempts: Array<string> = []
+        const refuse = { hourly: true, due: 0 }
+        const { world } = yield* start({ connected: [], wrapScheduler: refusing(refuse, attempts) })
+        refuse.hourly = false
+        const before = attempts.filter((h) => h === "hourly").length
+        yield* world.open("kitchen-display")
+        assert.strictEqual(attempts.filter((h) => h === "hourly").length, before + 1)
+        assert.isFalse(world.issues.all().some((i) => i.id === "core.present.hourly"))
+      }))
+
+    it.effect("r2-4: a failed accepted result under a key never overwrites the newer show of that key (way 2 after way 1)", () =>
+      Effect.gen(function*() {
+        const { faulty, world } = yield* faultyStart()
+        faulty.faults.writes = 1_000
+        yield* world.toolOn("kitchen-display", { forModel: "x", present: card("Old accepted"), show: { lifetime: "pinned", key: "same" } })
+        yield* world.advance(SECOND)
+        faulty.faults.writes = 0
+        const newer = yield* world.showOn("kitchen-display", card("New explicit"), { lifetime: "pinned", key: "same" })
+        yield* world.advance(2 * MINUTE)
+        assert.deepStrictEqual(titlesOn(world, "kitchen-display"), ["New explicit"])
+        assert.isDefined(yield* newer.update(card("New, updated")))
+        yield* world.settle
+        assert.deepStrictEqual(titlesOn(world, "kitchen-display"), ["New, updated"])
+        assert.isFalse(world.issues.all().some((i) => i.id === "core.present.write"))
+      }))
+
+    it.effect("r2-4: a failed accepted result under a key is retired by a newer accepted result of that key (way 1 after way 1)", () =>
+      Effect.gen(function*() {
+        const { faulty, world } = yield* faultyStart()
+        faulty.faults.writes = 1_000
+        yield* world.toolOn("kitchen-display", { forModel: "x", present: card("Old"), show: { lifetime: "pinned", key: "same" } })
+        yield* world.advance(SECOND)
+        faulty.faults.writes = 0
+        yield* world.toolOn("kitchen-display", { forModel: "x", present: card("New"), show: { lifetime: "pinned", key: "same" } })
+        yield* world.advance(2 * MINUTE)
+        assert.deepStrictEqual(titlesOn(world, "kitchen-display"), ["New"])
+        assert.strictEqual((yield* world.rows).length, 1)
+      }))
+
+    it.effect("r2-4: a failed accepted transient is retired by a newer transient on its device (different ids)", () =>
+      Effect.gen(function*() {
+        const { faulty, world } = yield* faultyStart()
+        faulty.faults.writes = 1_000
+        yield* world.toolOn("kitchen-display", { forModel: "x", present: card("Old transient"), show: { expiresInMs: 5 * MINUTE } })
+        yield* world.advance(SECOND)
+        faulty.faults.writes = 0
+        yield* world.showOn("kitchen-display", card("New transient"), { expiresInMs: 5 * MINUTE })
+        yield* world.advance(MINUTE)
+        assert.deepStrictEqual(titlesOn(world, "kitchen-display"), ["New transient"])
+        assert.deepStrictEqual((yield* world.rows).map((r) => (r.value.content as { title?: string }).title), ["New transient"])
+      }))
+
+    const image = (url: string): Presentation => ({ kind: "image", url, alt: "A", credit: "C", spoken: "A." })
+
+    it.effect("r2-5: an image shown again under its key with the same address while it is fetched resolves on the newer show (one fetch)", () =>
+      Effect.gen(function*() {
+        const fetched: Array<string> = []
+        const gate = yield* Deferred.make<void>()
+        const { world } = yield* start({ media: (url) => Effect.as(Effect.andThen(Effect.sync(() => fetched.push(url)), Deferred.await(gate)), { hash: "d".repeat(64) }) })
+        const first = yield* world.showOn("kitchen-display", image("https://example.org/a.png"), { lifetime: "pinned", key: "photo" })
+        const second = yield* world.showOn("kitchen-display", image("https://example.org/a.png"), { lifetime: "pinned", key: "photo" })
+        assert.strictEqual(second.id, first.id)
+        yield* Deferred.succeed(gate, undefined)
+        yield* world.advance(2 * MINUTE)
+        assert.strictEqual(imageState(world, "kitchen-display"), "ready")
+        assert.deepStrictEqual(fetched, ["https://example.org/a.png"])
+      }))
+
+    it.effect("r2-5: an outcome not yet written for an older address does not stop the newer show's own address being fetched", () =>
+      Effect.gen(function*() {
+        const opened = yield* open()
+        const faulty = presentFaultyStore(yield* prepared(opened.store))
+        const fetched: Array<string> = []
+        const gate = yield* Deferred.make<void>()
+        const world = yield* presentWorld(faulty.store, { media: (url) => Effect.as(Effect.andThen(Effect.sync(() => fetched.push(url)), Deferred.await(gate)), { hash: (url.endsWith("a.png") ? "a" : "b").repeat(64) }) })
+        yield* world.settle
+        yield* world.showOn("kitchen-display", image("https://example.org/a.png"), { lifetime: "pinned", key: "photo" })
+        faulty.faults.writes = 1
+        yield* Deferred.succeed(gate, undefined)
+        yield* world.settle
+        assert.strictEqual(imageState(world, "kitchen-display"), "loading")
+        yield* world.showOn("kitchen-display", image("https://example.org/different.png"), { lifetime: "pinned", key: "photo" })
+        yield* world.advance(2 * MINUTE)
+        assert.deepStrictEqual(fetched, ["https://example.org/a.png", "https://example.org/different.png"])
+        assert.strictEqual(imageState(world, "kitchen-display"), "ready")
+        const [row] = yield* world.rows
+        assert.strictEqual((row?.value.content as { hash?: string }).hash, "b".repeat(64))
+      }))
+
+    /** `show` from a turn on `deviceId`, forked behind a store that is busy until `wait` is completed. */
+    const gatedShow = (world: { readonly board: (id?: string) => ModulePresent }, faulty: ReturnType<typeof presentFaultyStore>, p: Presentation, o?: Parameters<ModulePresent["show"]>[2]) =>
+      Effect.gen(function*() {
+        const wait = yield* Deferred.make<void>()
+        faulty.gate.wait = wait
+        const fiber = yield* Effect.forkChild(Effect.exit(world.board().show("origin", p, o).pipe(Effect.provideService(CurrentTurn, turnOn("kitchen-display")))))
+        yield* Effect.yieldNow
+        return { wait, fiber }
+      })
+
+    it.effect("r2-6: a show that waited on a busy store longer than it would have been shown is refused busy, never committed already ended", () =>
+      Effect.gen(function*() {
+        const { faulty, world } = yield* faultyStart()
+        const { wait, fiber } = yield* gatedShow(world, faulty, card("Three seconds"), { expiresInMs: 3 * SECOND })
+        yield* TestClock.adjust(4 * SECOND)
+        yield* Deferred.succeed(wait, undefined)
+        assert.strictEqual(reasonOf(yield* Fiber.join(fiber)), "busy")
+        yield* world.settle
+        assert.deepStrictEqual(yield* world.rows, [])
+        assert.deepStrictEqual(world.firstTab("kitchen-display")!.messages, [])
+      }))
+
+    it.effect("r2-6: a show that waited on a busy store takes its times from the attempt that commits", () =>
+      Effect.gen(function*() {
+        const { faulty, world } = yield* faultyStart()
+        const t0 = yield* Clock.currentTimeMillis
+        const { wait, fiber } = yield* gatedShow(world, faulty, card("Thirty seconds"))
+        yield* TestClock.adjust(4 * SECOND)
+        yield* Deferred.succeed(wait, undefined)
+        assert.isTrue(Exit.isSuccess(yield* Fiber.join(fiber)))
+        yield* world.settle
+        const [row] = yield* world.rows
+        assert.strictEqual(row?.value.shownAt, t0 + 4 * SECOND)
+        assert.strictEqual(row?.value.expiresAt, t0 + 34 * SECOND)
+        yield* world.advance(27 * SECOND)
+        assert.deepStrictEqual(titlesOn(world, "kitchen-display"), ["Thirty seconds"])
+        yield* world.advance(4 * SECOND)
+        assert.deepStrictEqual(titlesOn(world, "kitchen-display"), [])
+      }))
+
+    it.effect("r2-6: a timer valid when called but past its earliest end when the busy store lets it commit is refused invalid", () =>
+      Effect.gen(function*() {
+        const { faulty, world } = yield* faultyStart()
+        yield* world.advance(HOUR)
+        const t0 = yield* Clock.currentTimeMillis
+        const timer: Presentation = { kind: "timer", label: "Eggs", endsAt: t0 - 59 * SECOND, spoken: "Eggs." }
+        const { wait, fiber } = yield* gatedShow(world, faulty, timer)
+        yield* TestClock.adjust(2 * SECOND)
+        yield* Deferred.succeed(wait, undefined)
+        assert.strictEqual(reasonOf(yield* Fiber.join(fiber)), "invalid")
+        assert.deepStrictEqual(yield* world.rows, [])
+      }))
+
+    it.effect("r2-6: an update that waited on a busy store is validated with the clock of the attempt that commits", () =>
+      Effect.gen(function*() {
+        const { faulty, world } = yield* faultyStart()
+        yield* world.advance(HOUR)
+        const t0 = yield* Clock.currentTimeMillis
+        const h = yield* world.showOn("kitchen-display", { kind: "timer", label: "Eggs", endsAt: t0 + 10 * MINUTE, spoken: "Eggs." })
+        const wait = yield* Deferred.make<void>()
+        faulty.gate.wait = wait
+        const fiber = yield* Effect.forkChild(Effect.exit(h.update({ kind: "timer", label: "Eggs", endsAt: t0 - 59 * SECOND, spoken: "Eggs." })))
+        yield* Effect.yieldNow
+        yield* TestClock.adjust(2 * SECOND)
+        yield* Deferred.succeed(wait, undefined)
+        assert.strictEqual(reasonOf(yield* Fiber.join(fiber)), "invalid")
+        const [row] = yield* world.rows
+        assert.strictEqual((row?.value.content as { endsAt?: number }).endsAt, t0 + 10 * MINUTE)
+      }))
+
+    it.effect("r2-6: an accepted transient whose write waited past its end is not written", () =>
+      Effect.gen(function*() {
+        const { faulty, world } = yield* faultyStart()
+        const wait = yield* Deferred.make<void>()
+        faulty.gate.wait = wait
+        yield* world.toolOn("kitchen-display", { forModel: "x", present: card("Late"), show: { expiresInMs: 3 * SECOND } })
+        yield* Effect.yieldNow
+        yield* TestClock.adjust(4 * SECOND)
+        yield* Deferred.succeed(wait, undefined)
+        yield* world.settle
+        assert.deepStrictEqual(yield* world.rows, [])
+        assert.isFalse(world.firstTab("kitchen-display")!.messages.some((m) => m.type === "present.show"))
+      }))
+
+    it.effect("r2-7: unrelated successful shows do not postpone the retry of a failed accepted write (a minute from the failure)", () =>
+      Effect.gen(function*() {
+        const { faulty, world } = yield* faultyStart()
+        faulty.faults.writes = 1_000
+        yield* world.toolOn("kitchen-display", { forModel: "x", present: card("Waiting"), show: { lifetime: "pinned" } })
+        yield* world.advance(SECOND)
+        faulty.faults.writes = 0
+        for (let i = 0; i < 3; i++) {
+          yield* world.showOn("robins-phone", card(`Other ${i}`), { lifetime: "pinned", key: "other" })
+          yield* world.advance(30 * SECOND)
+        }
+        assert.deepStrictEqual(titlesOn(world, "kitchen-display"), ["Waiting"])
+        assert.isFalse(world.issues.all().some((i) => i.id === "core.present.write"))
+      }))
+
+    it.effect("r2-7: unrelated successful shows do not postpone the repeat of a failed pass", () =>
+      Effect.gen(function*() {
+        const { faulty, world } = yield* faultyStart()
+        faulty.faults.reads = 1
+        yield* world.showOn("kitchen-display", card("Waiting"), { lifetime: "pinned" })
+        assert.deepStrictEqual(titlesOn(world, "kitchen-display"), [])
+        for (let i = 0; i < 3; i++) {
+          yield* world.showOn("robins-phone", card(`Other ${i}`), { lifetime: "pinned", key: "other" })
+          yield* world.advance(30 * SECOND)
+        }
+        assert.deepStrictEqual(titlesOn(world, "kitchen-display"), ["Waiting"])
+      }))
+
+    it.effect("r2-8: every bound of a presentation and its options: at its bound it is shown, one past it it is refused invalid (all else valid)", () =>
+      Effect.gen(function*() {
+        const { world } = yield* start()
+        yield* TestClock.adjust(HOUR)
+        const now = yield* Clock.currentTimeMillis
+        const x = (n: number) => "x".repeat(n)
+        const cardOf = (extra: object = {}) => ({ kind: "card", title: "T", spoken: "S.", ...extra })
+        const listOf = (extra: object = {}) => ({ kind: "list", title: "T", items: [{ id: "a", text: "A" }], spoken: "S.", ...extra })
+        const timerOf = (extra: object = {}) => ({ kind: "timer", label: "L", endsAt: now + MINUTE, spoken: "S.", ...extra })
+        const imageOf = (extra: object = {}) => ({ kind: "image", url: "https://example.org/a.png", alt: "A", credit: "C", spoken: "S.", ...extra })
+        const day = (extra: object = {}) => ({ label: "Mon", high: "14", low: "6", icon: "sun", ...extra })
+        const weatherOf = (extra: object = {}, now2: object = {}) => ({ kind: "weather", place: "Utrecht", now: { temperature: "12", condition: "Rain", icon: "rain", ...now2 }, spoken: "S.", ...extra })
+        const transient = { lifetime: "transient" } as const
+        type Case = readonly [name: string, at: (n: number) => readonly [unknown, unknown?], bound: number, past: number]
+        const upper = (name: string, at: (n: number) => readonly [unknown, unknown?], max: number): Case => [name, at, max, max + 1]
+        const cases: ReadonlyArray<Case> = [
+          upper("card title", (n) => [cardOf({ title: x(n) })], 60),
+          upper("card text", (n) => [cardOf({ text: x(n) })], 300),
+          upper("card facts", (n) => [cardOf({ facts: Array.from({ length: n }, () => ({ label: "l", value: "v" })) })], 6),
+          upper("fact label", (n) => [cardOf({ facts: [{ label: x(n), value: "v" }] })], 30),
+          upper("fact value", (n) => [cardOf({ facts: [{ label: "l", value: x(n) }] })], 60),
+          upper("list title", (n) => [listOf({ title: x(n) })], 60),
+          upper("list items", (n) => [listOf({ items: Array.from({ length: n }, (_, i) => ({ id: `i${i}`, text: "x" })) })], 12),
+          upper("list item text", (n) => [listOf({ items: [{ id: "a", text: x(n) }] })], 80),
+          upper("list item id", (n) => [listOf({ items: [{ id: x(n), text: "A" }] })], 40),
+          upper("timer label", (n) => [timerOf({ label: x(n) }), transient], 40),
+          upper("timer end ahead (ms from now)", (n) => [timerOf({ endsAt: now + n }), transient], 24 * HOUR),
+          ["timer end behind (ms before now)", (n) => [timerOf({ endsAt: now - n }), transient], MINUTE, MINUTE + 1],
+          upper("image url", (n) => [imageOf({ url: `https://example.org/${"a".repeat(n - 20)}` })], 2_000),
+          upper("image alt", (n) => [imageOf({ alt: x(n) })], 200),
+          upper("image credit", (n) => [imageOf({ credit: x(n) })], 120),
+          upper("image caption", (n) => [imageOf({ caption: x(n) })], 200),
+          upper("weather place", (n) => [weatherOf({ place: x(n) })], 40),
+          upper("weather temperature", (n) => [weatherOf({}, { temperature: x(n) })], 12),
+          upper("weather condition", (n) => [weatherOf({}, { condition: x(n) })], 40),
+          upper("weather days", (n) => [weatherOf({ days: Array.from({ length: n }, () => day()) })], 5),
+          upper("weather day label", (n) => [weatherOf({ days: [day({ label: x(n) })] })], 12),
+          upper("weather day high", (n) => [weatherOf({ days: [day({ high: x(n) })] })], 12),
+          upper("weather day low", (n) => [weatherOf({ days: [day({ low: x(n) })] })], 12),
+          upper("spoken", (n) => [cardOf({ spoken: x(n) })], 300),
+          upper("buttons", (n) => [cardOf({ handler: "answer", buttons: Array.from({ length: n }, (_, i) => ({ id: `b${i}`, label: "B" })) })], 3),
+          upper("button label", (n) => [cardOf({ handler: "answer", buttons: [{ id: "b", label: x(n) }] })], 20),
+          upper("button id", (n) => [cardOf({ handler: "answer", buttons: [{ id: "b".repeat(n), label: "B" }] })], 32),
+          upper("handler name", (n) => [cardOf({ handler: "h".repeat(n) })], 64),
+          upper("personal owner id", (n) => [cardOf({ sensitivity: { personal: "p".repeat(n) } })], 40),
+          upper("key", (n) => [cardOf(), { key: "k".repeat(n) }], 64),
+          upper("transient expiresInMs", (n) => [cardOf(), { expiresInMs: n }], 5 * MINUTE),
+          ["transient expiresInMs (least)", (n) => [cardOf(), { expiresInMs: n }], 3 * SECOND, 3 * SECOND - 1],
+          upper("pinned expiresInMs", (n) => [cardOf(), { lifetime: "pinned", expiresInMs: n }], 24 * HOUR)
+        ]
+        for (const [name, at, bound, past] of cases) {
+          const [ok, okOptions] = at(bound)
+          const shown = yield* Effect.exit(world.showOn("kitchen-display", ok as Presentation, okOptions as never))
+          assert.isTrue(Exit.isSuccess(shown), `${name} at ${bound}: ${Exit.isFailure(shown) ? Cause.pretty(shown.cause) : ""}`)
+          if (Exit.isSuccess(shown)) yield* shown.value.dismiss
+          const [bad, badOptions] = at(past)
+          assert.strictEqual(reasonOf(yield* Effect.exit(world.showOn("kitchen-display", bad as Presentation, badOptions as never))), "invalid", `${name} at ${past}`)
+        }
       }))
   })
