@@ -41,7 +41,6 @@ export const texts = defineTexts({
     noDevices: "I can't see the house's devices, so nothing was announced.",
     unavailable: "I can't announce anything on this installation.",
     unsent: "I could not announce that.",
-    chimeWord: "Attention.",
     cardTitle: "Announcement",
     cardTitleRoom: "Announcement for {room}",
     cardFrom: "From"
@@ -85,7 +84,6 @@ export const texts = defineTexts({
     noDevices: "Ik kan de apparaten in huis niet zien, dus er is niets omgeroepen.",
     unavailable: "Ik kan hier niets omroepen.",
     unsent: "Dat kon ik niet omroepen.",
-    chimeWord: "Aandacht.",
     cardTitle: "Mededeling",
     cardTitleRoom: "Mededeling voor {room}",
     cardFrom: "Van"

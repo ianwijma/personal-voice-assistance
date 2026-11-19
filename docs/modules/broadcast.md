@@ -26,8 +26,9 @@ not, and why, from what the service decided for each device (`SpeechHandle.deliv
   A card goes to a screen where the message is queued, and to a screen that cannot speak it (a display with no
   speaker); never to a device that is not connected. **Do not disturb is read again immediately before each card is
   started**: while it is on, no card is started on any device (and the answer counts the screens that got none).
-  A card that was already showing when do not disturb came on stays until its 30 seconds end, and a page that
-  reconnects within them is given it again by the Presenter (the module does not manage the card after showing it). A
+  A card that was already showing when do not disturb came on stays until its 30 seconds end. A page that lost its connection clears what it showed and is given what still applies
+  after its next welcome, never a card that has ended; so a card can come back after a reconnect inside its 30
+  seconds, even under do not disturb (the module does not manage the card after showing it). A
   device's card is replaced in place by the next broadcast (one `key` per device). At most 8 cards are made per
   broadcast, the most the Presenter lets one module hold live; **screens beyond the eight are counted and said**, as
   are refusals. A setting turns cards off.
@@ -49,7 +50,10 @@ not, and why, from what the service decided for each device (`SpeechHandle.deliv
   "the house", "iedereen", "overal" and similar mean no room.
 - **Nobody else there.** If the asking device is the only one in the room (or in the house), nothing is announced and
   it says so.
-- **At most 64 devices** are queued per broadcast (one enqueue each); a house with more says how many it left out.
+- **How the speech calls are made.** A room broadcast is one `ctx.speech.say({ room, except: <the asking device> })` per spelling of
+  the room's name, so the speech service leaves the asking device out and reports what it decided for each device; the
+  whole house has no such target, so it is one call per device, the asking device never among them. At most 64 devices
+  are queued per whole-house broadcast (one enqueue each); a house with more says how many it left out.
 - **The message is what the person said**: one line, 1 to 200 characters, never reworded. It is the sender's own
   content, so **household content, not personal**: it is announced and shown on every device the delivery decision
   allows, **including a public device**, exactly like any other broadcast. Nothing about the sender's person is
@@ -73,9 +77,8 @@ never go to the device that asked, so nothing was announced."; "What should I an
 failed is listed as "(failed)". Every sentence is in English and Dutch (`src/texts.ts`); lists go through
 `@pva/language`.
 
-**The chime alone is not built.** `ctx.speech.say` refuses an empty line (a chime is only played with one), so
-`broadcast_chime` plays the chime and **one word** after it ("Attention." / "Aandacht."). Its description says so, so
-the model is not told otherwise. No card is shown for a chime.
+**The chime alone** is a cue with no text (`ctx.speech.say("", { cue: true })`): no word follows it, and no card is shown
+for it.
 
 ### Typed actions and phrase commands (no model)
 
@@ -124,7 +127,7 @@ Off by default; with it off nothing changes for anyone.
 ## Latency and bounds
 
 A broadcast reads the device list once (a cached snapshot), matches a room by words over the devices' rooms, makes one
-`speech.say` per device (a synchronous enqueue in the notification service), at most 64, and one `present.show` per
+`speech.say` per room spelling, or per device for the whole house (a synchronous enqueue in the notification service), at most 64 devices, and one `present.show` per
 screen, at most 8: each of those is the core's one synchronous store transaction and an enqueue (PRESENTING.md, way 2),
 which may be refused (`busy`, `limit`) and is then said. The module itself has no collection, no job and makes no
 network call, and nothing runs through `offThread`. The announcement is never waited for. No latency number is claimed
@@ -143,9 +146,8 @@ Because the preparation parts' first versions do not have it:
 - **A message of more than eight words as a phrase command** ([PHRASES.md](../PHRASES.md): a text slot is at most
   eight words): it goes to the assistant, which calls `broadcast_send`.
 - **Phrase commands for one room**: left out on purpose (a phrase never widens the audience, above).
-- **Do not disturb for a card already showing**, and a card after a reconnect while do not disturb is on: the
+- **Do not disturb for a card already showing**, and a card given again after a reconnect while do not disturb is on: the
   Presenter has no do-not-disturb rule, so this module only declines to start cards under it.
-- **The chime alone** (above).
 
 By the plan's row: the speaker's own voice, voice messages, scheduled broadcasts and phones.
 

@@ -13,6 +13,7 @@ import {
   type ModuleServicesV2,
   Param,
   type Presentation,
+  type SpeechTarget,
   Setting,
   ToolError
 } from "@pva/core"
@@ -159,8 +160,9 @@ const broadcast = (
     const lang = homeLanguage(ctx.host.view())
     const origin = yield* originDevice
     const chime = input.message === undefined
-    const message = chime ? say(texts, lang, "chimeWord") : input.message.trim()
-    if (message === "") return { kind: "asked", text: say(texts, lang, "noMessage") } as const
+    // A chime is a cue with no text (the speech service plays the chime alone).
+    const message = chime ? "" : input.message.trim()
+    if (!chime && message === "") return { kind: "asked", text: say(texts, lang, "noMessage") } as const
     // A tool's schema has checked this already; an action's words have not been (one line, at most the bound).
     if (!isLine(message, MESSAGE_MAX)) return { kind: "asked", text: say(texts, lang, "badMessage", { max: MESSAGE_MAX }) } as const
     // Said for the whole house (a phrase command): words that open a destination are not a message for everyone.
@@ -201,17 +203,27 @@ const deliver = (
       if (targets.length === 0) return { kind: "said", text: say(texts, lang, "aloneInRoom", { room: cutName(match.label) }) } as const
     }
     const ordered = [...targets].sort((a, b) => a.name.localeCompare(b.name) || a.id.localeCompare(b.id))
-    const beyond = Math.max(0, ordered.length - MAX_TARGETS)
-    const chosen = ordered.slice(0, MAX_TARGETS)
     const nameOf = (id: string): string => all.find((d) => d.id === id)?.name ?? id
 
-    // The announcement, one device at a time: the origin is never in the list, and `ctx.speech` decides each device now.
+    // The announcement. A room: one call per spelling of its name, `{ room, except: origin }`, so the speech service
+    // leaves the origin out and says what it decided for each device. The whole house has no such target, so it is one
+    // call per device (at most 64), the origin never among them. `ctx.speech` decides each device now.
     const deliveries: Array<Delivery> = []
-    for (const d of chosen) {
-      const result: ReadonlyArray<Delivery> | "unavailable" = yield* ctx.speech.say({ device: d.id }, message, { cue: true }).pipe(
+    const calls: Array<{ readonly target: SpeechTarget; readonly devices: ReadonlyArray<KnownDevice> }> = []
+    let beyond = 0
+    if (spokenRoom === undefined) {
+      beyond = Math.max(0, ordered.length - MAX_TARGETS)
+      for (const d of ordered.slice(0, MAX_TARGETS)) calls.push({ target: { device: d.id }, devices: [d] })
+    } else {
+      const bySpelling = new Map<string, Array<KnownDevice>>()
+      for (const d of ordered) bySpelling.set(d.room!.trim().toLowerCase(), [...(bySpelling.get(d.room!.trim().toLowerCase()) ?? []), d])
+      for (const devices of bySpelling.values()) calls.push({ target: { room: devices[0]!.room!, except: origin }, devices })
+    }
+    for (const call of calls) {
+      const result: ReadonlyArray<Delivery> | "unavailable" = yield* ctx.speech.say(call.target, message, { cue: true }).pipe(
         Effect.map((handle): ReadonlyArray<Delivery> | "unavailable" => handle.deliveries),
         Effect.catchTag("SpeechError", (e): Effect.Effect<ReadonlyArray<Delivery> | "unavailable"> =>
-          Effect.succeed(e.reason === "unavailable" ? "unavailable" : [{ deviceId: d.id, queued: false, why: "failed" }])
+          Effect.succeed(e.reason === "unavailable" ? "unavailable" : call.devices.map((d) => ({ deviceId: d.id, queued: false, why: "failed" })))
         )
       )
       if (result === "unavailable") return { kind: "failed", text: say(texts, lang, "unavailable") } as const
@@ -314,7 +326,7 @@ export const broadcastModule = defineModule({
         makeTool({
           name: "broadcast_chime",
           description:
-            "Ring the announcement chime on every other device in the house or only in one room. The chime cannot be played without a line after it, so it is followed by one word (\"Attention.\"). Never on the device that asked.",
+            "Ring the announcement chime on every other device in the house or only in one room. It is the chime alone, with no words. Never on the device that asked.",
           parameters: Schema.Struct({ room: Schema.optionalKey(RoomName) }),
           risk: "change",
           latency: "quick",
@@ -347,7 +359,7 @@ export const broadcastModule = defineModule({
         defineAction({
           id: "chime",
           label: "Ring the chime for everyone in the house",
-          description: "Play the announcement chime (followed by one word) on every other device in the house. For one room the assistant calls broadcast_chime with the room.",
+          description: "Play the announcement chime alone on every other device in the house. For one room the assistant calls broadcast_chime with the room.",
           examples: ["ring the bell for everyone", "sound the chime for everyone", "bel de gong voor iedereen"],
           params: {},
           phrases: {

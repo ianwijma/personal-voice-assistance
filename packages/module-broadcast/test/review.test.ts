@@ -266,4 +266,48 @@ describe("review round 1", () => {
       assert.deepStrictEqual(where(kit), ["a-tablet", "c-tablet", "d-tablet"])
       assert.strictEqual(said(r), "Announcing on A tablet, C tablet and 1 more. Not announced on B tablet (failed). Also showing it on A tablet and D tablet. I could not put it on 1 of the screens.")
     }))
+
+  it.effect("after the base's fix round: a room broadcast asks the speech service to leave the origin out, and the chime is a cue with no text", () =>
+    Effect.gen(function*() {
+      const targets: Array<unknown> = []
+      const texts: Array<string> = []
+      const kit = yield* startTestModule(
+        probed({ jobResults: [] }, { speech: (real) => ({ say: (t, x, o) => (targets.push(t), texts.push(x), real.say(t, x, o)) }) }),
+        { household: { devices: [dev("kitchen-display", "Kitchen display", "Kitchen"), dev("kitchen-speaker", "Kitchen speaker", "Kitchen"), dev("study-tablet", "Study tablet", "Study")] } }
+      )
+      const r = yield* kit.tool("broadcast_send", { message: "Coming", room: "kitchen" }, { device: "kitchen-display" })
+      assert.deepStrictEqual(targets, [{ room: "Kitchen", except: "kitchen-display" }])
+      assert.strictEqual(said(r), "Announcing on Kitchen speaker. Also showing it on Kitchen speaker.")
+      yield* kit.advance(5_000)
+      assert.deepStrictEqual(where(kit), ["kitchen-speaker"])
+      targets.length = 0
+      yield* kit.tool("broadcast_chime", {}, { device: "kitchen-display" })
+      yield* kit.tool("broadcast_chime", { room: "study" }, { device: "kitchen-display" })
+      assert.deepStrictEqual(texts.slice(-2), ["", ""])
+      yield* kit.advance(5_000)
+      assert.deepStrictEqual(kit.notify.announced.filter((a) => a.text === "").map((a) => [a.deviceId, a.cue]), [["kitchen-speaker", true], ["study-tablet", true], ["study-tablet", true]])
+    }))
+
+  it.effect("after the base's fix round: a page that lost its connection is not given an ended card back, and gets what applies after its welcome", () =>
+    Effect.gen(function*() {
+      const kit = yield* startTestModule(probed({ jobResults: [] }), { household: { devices: HOUSE } })
+      yield* kit.tool("broadcast_send", { message: "Dinner" }, { device: "kitchen-display" })
+      yield* kit.present.settle
+      assert.strictEqual(kit.present.shown("study-tablet").length, 1)
+      // The page loses its connection: it holds nothing; the card ends while it is away.
+      yield* kit.notify.disconnect("study-tablet")
+      assert.deepStrictEqual(kit.present.shown("study-tablet"), [])
+      yield* kit.advance(31_000)
+      yield* kit.notify.connect("study-tablet")
+      yield* kit.present.settle
+      assert.deepStrictEqual(kit.present.shown("study-tablet"), [])
+      // A card that still applies at the next welcome is given.
+      yield* kit.tool("broadcast_send", { message: "Later" }, { device: "kitchen-display" })
+      yield* kit.present.settle
+      yield* kit.notify.disconnect("study-tablet")
+      yield* kit.notify.connect("study-tablet")
+      yield* kit.present.settle
+      const card = kit.present.shown("study-tablet")[0]
+      assert.strictEqual(card?.content.kind === "card" ? card.content.text : "", "Later")
+    }))
 })

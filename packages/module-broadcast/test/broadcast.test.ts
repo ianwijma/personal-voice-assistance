@@ -170,12 +170,12 @@ describe("broadcast", () => {
       assert.deepStrictEqual(yield* kit.jobs, [])
     }))
 
-  it.effect("the chime: sent to the other devices with one word after it, honestly said, and no card", () =>
+  it.effect("the chime: sent to the other devices alone (a cue and no words), honestly said, and no card", () =>
     Effect.gen(function*() {
       const kit = yield* startTestModule(broadcastModule, { household: HOUSE_ONLY_TWO })
       const r = yield* kit.tool("broadcast_chime", {}, { device: "kitchen-display" })
       yield* kit.advance(5_000)
-      assert.deepStrictEqual(kit.notify.announced.map((a) => [a.deviceId, a.text, a.cue]), [["study-tablet", "Attention.", true]])
+      assert.deepStrictEqual(kit.notify.announced.map((a) => [a.deviceId, a.text, a.cue]), [["study-tablet", "", true]])
       assert.strictEqual(said(r), "Announcing on Study tablet.")
       yield* kit.present.settle
       assert.deepStrictEqual(kit.present.shown("study-tablet"), [])
@@ -191,7 +191,7 @@ describe("broadcast", () => {
       const chime = yield* kit.action("chime", {}, { device: "kitchen-display" })
       assert.deepStrictEqual(chime, { ok: true, say: "Announcing on Study tablet." })
       yield* kit.advance(5_000)
-      assert.deepStrictEqual(kit.notify.announced.map((a) => a.text), ["dinner is ready", "Attention."])
+      assert.deepStrictEqual(kit.notify.announced.map((a) => a.text), ["dinner is ready", ""])
       // An action is not also a tool of the same name: the model has the two tools.
       assert.deepStrictEqual(kit.toolNames().sort(), ["broadcast_chime", "broadcast_send"])
       const blank = yield* kit.action("send", { message: "   " }, { device: "kitchen-display" })
@@ -293,7 +293,7 @@ describe("broadcast", () => {
       // The chime for everyone.
       yield* kit.phrases.say("ring the bell for everyone", { device: "kitchen-display" })
       yield* kit.advance(5_000)
-      assert.isTrue(kit.notify.announced.some((a) => a.text === "Attention."))
+      assert.isTrue(kit.notify.announced.some((a) => a.text === ""))
       // Neighbours that name a destination, or none, are not taken: they go to the assistant, whose tool names the room.
       const sent = kit.notify.announced.length
       for (const words of [
@@ -325,7 +325,7 @@ describe("broadcast", () => {
       yield* kit.phrases.say("bel de gong voor iedereen", { device: "kitchen-display" })
       yield* kit.advance(5_000)
       const texts = new Set(kit.notify.announced.map((a) => a.text))
-      assert.deepStrictEqual([...texts].sort(), ["Aandacht.", "het eten is klaar", "het eten klaar is"])
+      assert.deepStrictEqual([...texts].sort(), ["", "het eten is klaar", "het eten klaar is"])
       const sent = kit.notify.announced.length
       for (const words of ["omroepen in Study dat eten klaar", "omroepen het eten is klaar", "zeg tegen de keuken dat ik eraan kom", "omroepen in de studeerkamer dat eten klaar is", "bel de gong", "bel de gong in de keuken"]) {
         assert.deepStrictEqual(yield* kit.phrases.say(words, { device: "kitchen-display" }), { taken: false }, words)
@@ -355,7 +355,7 @@ describe("broadcast", () => {
       assert.strictEqual(said(yield* kit.tool("broadcast_send", { message: "Hoi", room: "Study" }, { device: "study-tablet" })), "Study heeft alleen dit apparaat, en omroepen gaan nooit naar het apparaat dat erom vroeg, dus er is niets omgeroepen.")
       assert.strictEqual(said(yield* kit.tool("broadcast_chime", {}, { device: "study-tablet" })).startsWith("Ik roep het om op"), true)
       yield* kit.advance(5_000)
-      assert.include(kit.notify.announced.map((a) => a.text), "Aandacht.")
+      assert.include(kit.notify.announced.map((a) => a.text), "")
       assert.deepStrictEqual(yield* kit.action("send", { message: "  " }, { device: "kitchen-display" }), { ok: true, say: "Wat moet ik omroepen?" })
       const bedrooms = yield* startTestModule(broadcastModule, {
         household: { devices: [{ id: "kitchen-display", name: "K", room: "Kitchen", capabilities: PAGE }, { id: "master-bed", name: "M", room: "Master bedroom", capabilities: PAGE }, { id: "guest-bed", name: "G", room: "Guest bedroom", capabilities: PAGE }], home }
