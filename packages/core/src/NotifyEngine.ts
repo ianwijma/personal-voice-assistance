@@ -881,6 +881,8 @@ export const makeNotifyEngine = (options: NotifyEngineOptions): Effect.Effect<No
       if (job?.deviceId !== undefined) return job.deviceId
       const principal = yield* CurrentPrincipal
       if (principal?._tag === "notification") return principal.notification.deviceId
+      // P10: a press on a presentation (its handler may send to "origin": the device it was pressed on).
+      if (principal?._tag === "presentation") return principal.presentation.deviceId
       return undefined
     })
 
