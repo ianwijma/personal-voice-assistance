@@ -1,43 +1,45 @@
+import { decideRisk, DEFAULT_RISK_POLICY, riskReason } from "@pva/protocol"
 import type { ToolRisk } from "./Module.ts"
 
 /**
- * The risk policy (docs/MODULES-PLAN.md §2 row 5, §4 P1 and P8): what the execution gateway does with a call of each
- * risk class. `allow` runs it; `confirm` and `deny` both refuse it, each with its own sentence for the model (the
- * gateway's "Not run: …"). A tool or action whose every declared class is refused is left out of a turn's tool list
- * and action catalogue (`ExecutionGateway.offers`), and every call is checked again with its validated input, on every
- * path (a model's tool call, a typed action, `host.actions.run`, a job, a notification's action).
+ * The risk policy (docs/MODULES-PLAN.md §2 rows 5 and 6, §4 P8 "First version"; docs/MODULES.md §4). Since P8 it is a
+ * household setting (the admin's Shared settings › Risk policy; flat keys `RISK_READ`, `RISK_CHANGE`, `RISK_MESSAGE`),
+ * and its one decision is `decideRisk` in `@pva/protocol`, a pure function of the saved policy, the classes a tool or
+ * action declares and the class its risk function gave for the validated input. The execution gateway reads the policy
+ * at every decision (`GatewayOptions.policy`) and uses `decideRisk` on every path and for every tool of a turn's list
+ * (`riskOffered`). The server, the CLI modes, the module test kit and the web mock use the same functions.
  */
+export {
+  decideRisk,
+  decodeRiskPolicy,
+  DEFAULT_RISK_POLICY,
+  FIXED_RISK_CLASSES,
+  RISK_CLASSES,
+  RISK_OUTCOMES,
+  RISK_POLICY_KEYS,
+  type RiskDecision,
+  type RiskLanguage,
+  riskLanguageOf,
+  riskOffered,
+  type RiskOutcome,
+  type RiskPolicy,
+  riskPolicyKey,
+  riskPolicyOf,
+  riskReason,
+  riskSpoken,
+  riskWithheld,
+  SETTABLE_RISK_CLASSES
+} from "@pva/protocol"
+
+/** P1's form of a policy's answer for one class: `allow`, or a refusal with its English reason for the model. */
 export type RiskVerdict = { readonly outcome: "allow" } | { readonly outcome: "confirm" | "deny"; readonly reason: string }
 
-export type RiskPolicy = (risk: ToolRisk) => RiskVerdict
-
-const ALLOWED: RiskVerdict = { outcome: "allow" }
-const MESSAGE: RiskVerdict = {
-  outcome: "confirm",
-  reason: "it would send a message in the owner's name, which needs the owner's confirmation, and this assistant cannot ask for it yet."
-}
-const MONEY: RiskVerdict = { outcome: "deny", reason: "it would spend money, which this assistant never does." }
-const SECURITY: RiskVerdict = { outcome: "deny", reason: "it would act on a lock, an alarm, a door or a gate, which this assistant never does." }
-
 /**
- * The household's default and, in this stack, only policy: `read` and `change` are allowed; `message` needs
- * confirmation, which is not built, so it is refused; `money` and `security` are denied everywhere (a device is not
- * authenticated, so none can be trusted with them). Serve mode, the CLI modes and the module test kit give it to the
- * module host (`ModuleHostOptions.gatewayHooks.riskPolicy`). P8 makes `message` a household setting.
+ * P1's default policy as a function of one class, kept for callers that judged a bare class: exactly
+ * `decideRisk(DEFAULT_RISK_POLICY, [risk], risk)` with its English reason (`read` and `change` allowed, `message`
+ * refused as needing confirmation, `money`, `security` and a string that is no class denied).
  */
-export const defaultRiskPolicy: RiskPolicy = (risk) => {
-  switch (risk) {
-    case "read":
-    case "change":
-      return ALLOWED
-    case "message":
-      return MESSAGE
-    case "money":
-      return MONEY
-    case "security":
-      return SECURITY
-    default:
-      // A class this stack does not know (a module's typo that slipped past its start check) is never allowed.
-      return { outcome: "deny", reason: "what it would do is not a risk class this assistant knows." }
-  }
+export const defaultRiskPolicy = (risk: ToolRisk): RiskVerdict => {
+  const decision = decideRisk(DEFAULT_RISK_POLICY, [risk], risk)
+  return decision.outcome === "allow" ? { outcome: "allow" } : { outcome: decision.outcome, reason: riskReason("en", decision)! }
 }

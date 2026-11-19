@@ -1,5 +1,6 @@
 import {
   CurrentTurn,
+  CurrentTurnTrace,
   type Agent,
   type AgentEvent,
   AgentError,
@@ -365,10 +366,13 @@ export const makeClaudeAgent = async (options: ClaudeAgentOptions): Promise<Clau
     Stream.callback<AgentEvent, AgentError>((queue) =>
       Effect.gen(function*() {
         const controller = new AbortController()
-        // The SDK calls tools from outside this fiber: the turn's context is captured here and given to each call.
+        // The SDK calls tools from outside this fiber: the turn's context is captured here and given to each call, with
+        // the turn's trace (the execution gateway records its risk decisions there).
         const currentTurn = yield* CurrentTurn
-        const runTool = (call: ToolCall) =>
-          currentTurn === undefined ? input.tools.run(call) : Effect.provideService(input.tools.run(call), CurrentTurn, currentTurn)
+        const runTool = (call: ToolCall) => {
+          const traced = Effect.provideService(input.tools.run(call), CurrentTurnTrace, input.trace)
+          return currentTurn === undefined ? traced : Effect.provideService(traced, CurrentTurn, currentTurn)
+        }
         let session: ClaudeSession | undefined
         let settled = false
         let emittedText = false

@@ -1,6 +1,7 @@
 import { MAX_NOTIFICATION_CARDS, sameRoom, type ServerMessageOf } from "@pva/protocol"
 import { Cause, Clock, Deferred, Effect, Exit, Fiber, Queue, Schema, Scope } from "effect"
 import type { KnownDevice } from "./Devices.ts"
+import { metadataProblem } from "./Module.ts"
 import { asPrincipal, type ExecutionGateway } from "./Gateway.ts"
 import { HOUSEHOLD_SCOPE, type HouseholdStore, type Row, type StoreFailure, type StoreTx, type TxCollection, type TxResult } from "./HouseholdStore.ts"
 import type { IssueRegistry } from "./Issues.ts"
@@ -1168,13 +1169,19 @@ export const makeNotifyEngine = (options: NotifyEngineOptions): Effect.Effect<No
           }
         }
         const pressInfo: ActionPress = { notificationId: row.id, actionId: request.actionId, ...(v.key !== undefined ? { key: v.key } : {}), deviceId: request.deviceId }
+        /** P8: the household's risk policy refused the press (its spoken sentence); the handler did not run. */
+        let refusedSay: string | undefined
         const body = asPrincipal(
           principal,
           Effect.gen(function*() {
             const gateway = options.gateway()
             if (gateway !== undefined) {
-              const admittedBy = yield* gateway.principal
-              if ("refused" in admittedBy) return yield* Effect.fail(new NotifyError({ reason: "invalid", message: `Not run: ${admittedBy.refused}` }))
+              // The principal's checks, then the risk policy on the handler's declared class (P8), recorded.
+              const refused = yield* gateway.handler(v.module, v.handler!, entry.handler, pressInfo)
+              if (refused !== undefined) {
+                refusedSay = refused.spoken
+                return yield* Effect.fail(new NotifyError({ reason: "invalid", message: `Not run: ${refused.refused}` }))
+              }
             }
             return yield* Effect.suspend(() => entry.handler.run(pressInfo))
           })
@@ -1192,6 +1199,7 @@ export const makeNotifyEngine = (options: NotifyEngineOptions): Effect.Effect<No
             if (mine(now)) t.n.update(row.id, (x) => withIndexes(withoutClaim(fieldsOf(x))), { expectRev: now.rev })
             afterOutcome(t.tx, row.id)
           }))
+          if (refusedSay !== undefined) return { ok: false, say: refusedSay, code: "refused" } satisfies PressAnswer
           return stopped ? answer(false, "cantNow", "not_running") : answer(false, "failed", "failed")
         }
         const said = exit.value as ActionAnswer | void
@@ -1426,6 +1434,8 @@ export const makeNotifyEngine = (options: NotifyEngineOptions): Effect.Effect<No
         Effect.suspend(() => {
           if (typeof name !== "string" || !NOTIFY_HANDLER_NAME.test(name)) return Effect.fail(invalid(`an action handler's name must match ${NOTIFY_HANDLER_NAME}`))
           if (typeof handler !== "object" || handler === null || typeof handler.run !== "function") return Effect.fail(invalid("an action handler has a run function"))
+          const riskProblem = metadataProblem(`the action handler "${name}"`, handler)
+          if (riskProblem !== undefined) return Effect.fail(invalid(riskProblem))
           const key = `${moduleId}/${name}`
           const entry: PublishedHandler = { moduleId, name, handler, runner }
           const registered = part.register({

@@ -516,7 +516,9 @@ export const makeConversationWithSetup = Effect.fnUntraced(function*(options: Co
     }
     const { agents, perRegistry } = forLlm
     const known = perRegistry.get(registry)
-    if (known !== undefined) return known
+    // P8: a registry's actions are those the risk policy offers when they are read; a list made for other actions
+    // (a policy saved since) is made again, so a turn never offers what the policy of its start refuses.
+    if (known !== undefined && (registry.actions === undefined || known.actions === registry.actions)) return known
     // A hand-made registry may have no action lookup (or no specs): then it offers no actions.
     const actionFor = registry.actionFor
     const actions = registry.actions ?? (actionFor === undefined ? [] : (registry.specs ?? []).flatMap((spec) => {
@@ -548,11 +550,19 @@ const turnContextOf = (
 ): TurnContext | undefined =>
   setup?.turnContext === undefined ? undefined : makeTurnContext({ turnId: trace.id, conversationId, source }, setup.turnContext)
 
-const withCurrentTurn = <A, E, R>(effect: Effect.Effect<A, E, R>, turn: TurnContext | undefined): Effect.Effect<A, E, R> =>
-  turn === undefined ? effect : Effect.provideService(effect, CurrentTurn, turn)
+/**
+ * The turn (`CurrentTurn`, when its setup names its origin) and its trace (`CurrentTurnTrace`: P8, the execution
+ * gateway records each decision of the risk policy in it) around a turn's tool calls and action runs.
+ */
+const withCurrentTurn = <A, E, R>(effect: Effect.Effect<A, E, R>, turn: TurnContext | undefined, trace: Trace): Effect.Effect<A, E, R> => {
+  const traced = Effect.provideService(effect, CurrentTurnTrace, trace)
+  return turn === undefined ? traced : Effect.provideService(traced, CurrentTurn, turn)
+}
 
-const withCurrentTurnStream = <A, E, R>(stream: Stream.Stream<A, E, R>, turn: TurnContext | undefined): Stream.Stream<A, E, R> =>
-  turn === undefined ? stream : Stream.provideService(stream, CurrentTurn, turn)
+const withCurrentTurnStream = <A, E, R>(stream: Stream.Stream<A, E, R>, turn: TurnContext | undefined, trace: Trace): Stream.Stream<A, E, R> => {
+  const traced = Stream.provideService(stream, CurrentTurnTrace, trace)
+  return turn === undefined ? traced : Stream.provideService(traced, CurrentTurn, turn)
+}
 
 /** A conversation answered by agents, routed per turn (docs/AGENTS-AND-INTENTS.md §1.3). */
 export const makeAgentConversation = (options: AgentConversationOptions) => makeConversationCore(options, false)
@@ -769,7 +779,8 @@ const makeConversationCore = Effect.fnUntraced(function*(options: AgentConversat
             orElse: () => Effect.fail(new ActionError({ message: `${def.label} did not finish within ${ACTION_TIMEOUT_MS / 1000} seconds.` }))
           })
         ),
-        turnContextOf(setup, trace, conversationId)
+        turnContextOf(setup, trace, conversationId),
+        trace
       )
       record.fiber = yield* Effect.forkDetach(Effect.interruptible(work).pipe(
         Effect.exit,
@@ -1214,7 +1225,7 @@ const makeConversationCore = Effect.fnUntraced(function*(options: AgentConversat
 
         const head = plan.notice === undefined ? Stream.empty : unrecorded(turnId, plan.notice, true, log)
         return head.pipe(Stream.concat(run(plan.agent!, 0)))
-      })), current)
+      })), current, trace)
     })
 
   // -------------------------------------------------------------------------

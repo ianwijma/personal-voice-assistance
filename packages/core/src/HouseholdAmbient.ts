@@ -1,7 +1,7 @@
 import { Clock, Effect } from "effect"
 import { type Collection, type HouseholdStore, MAX_AMBIENT_ROWS, type Row, type ScopeRef } from "./HouseholdStore.ts"
 import type { ContextProvider } from "./Module.ts"
-import type { ToolRegistry } from "./ToolRegistry.ts"
+import { registryWith, type ToolRegistry } from "./ToolRegistry.ts"
 import { CurrentTurn, type TurnContext } from "./TurnContext.ts"
 
 /**
@@ -139,10 +139,10 @@ export const makeAmbientFacts = (options: AmbientOptions): ContextProvider => ({
 })
 
 /** A registry whose per-turn context also has `provider`'s output (after the modules' sections). */
-export const withContextProvider = (registry: ToolRegistry["Service"], provider: ContextProvider): ToolRegistry["Service"] => ({
-  ...registry,
-  context: Effect.map(
-    Effect.all([registry.context, Effect.map(provider.get, (text) => (text.length === 0 ? "" : `## ${provider.name}\n${text}`))], { concurrency: "unbounded" }),
-    ([modules, mine]) => [modules, mine].filter((s) => s.length > 0).join("\n\n")
-  )
-})
+export const withContextProvider = (registry: ToolRegistry["Service"], provider: ContextProvider): ToolRegistry["Service"] =>
+  registryWith(registry, {
+    context: Effect.map(
+      Effect.all([registry.context, Effect.map(provider.get, (text) => (text.length === 0 ? "" : `## ${provider.name}\n${text}`))], { concurrency: "unbounded" }),
+      ([modules, mine]) => [modules, mine].filter((s) => s.length > 0).join("\n\n")
+    )
+  })

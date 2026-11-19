@@ -28,6 +28,7 @@ import {
 } from "@pva/protocol"
 import { Cause, Clock, Effect, Exit, Queue, Scope } from "effect"
 import type { KnownDevice } from "./Devices.ts"
+import { metadataProblem } from "./Module.ts"
 import { asPrincipal, type ExecutionGateway } from "./Gateway.ts"
 import { HOUSEHOLD_SCOPE, type HouseholdStore, type Row, type StoreFailure, type TxCollection, type TxResult } from "./HouseholdStore.ts"
 import type { IssueRegistry } from "./Issues.ts"
@@ -1136,18 +1137,25 @@ export const makePresentEngine = (options: PresentEngineOptions): Effect.Effect<
           action: request.action,
           ...(request.action === TICK_ACTION ? { item: request.item!, done: request.done! } : {})
         }
+        /** P8: the household's risk policy refused the press (its spoken sentence); the handler did not run. */
+        let refusedSay: string | undefined
         const body = asPrincipal(
           principal,
           Effect.gen(function*() {
             const gateway = options.gateway()
             if (gateway !== undefined) {
-              const admittedBy = yield* gateway.principal
-              if ("refused" in admittedBy) return yield* Effect.fail(new PresentError({ reason: "invalid", message: `Not run: ${admittedBy.refused}` }))
+              // The principal's checks, then the risk policy on the handler's declared class (P8), recorded.
+              const refused = yield* gateway.handler(v.module, v.handler!, entry.handler, info)
+              if (refused !== undefined) {
+                refusedSay = refused.spoken
+                return yield* Effect.fail(new PresentError({ reason: "invalid", message: `Not run: ${refused.refused}` }))
+              }
             }
             return yield* Effect.suspend(() => entry.handler.run(info))
           })
         ).pipe(Effect.timeoutOrElse({ duration: PRESENT_ACTION_TIMEOUT_MS, orElse: () => Effect.fail(new PresentError({ reason: "failed", message: "the handler did not finish in time" })) }))
         const exit = yield* Effect.exit(entry.runner.inFlight(() => body))
+        if (Exit.isFailure(exit) && refusedSay !== undefined) return { ok: false, say: refusedSay, code: "refused" } satisfies PresentPressAnswer
         if (Exit.isFailure(exit)) {
           const stopped = exit.cause.reasons.some((r) => (Cause.isFailReason(r) && isModuleStopped(r.error)) || (Cause.isDieReason(r) && isModuleStopped(r.defect)))
           log(`Presentations: the press ${request.action} on a presentation of ${v.module} ${stopped ? "could not run: its module stopped" : `failed: ${Cause.pretty(exit.cause).split("\n")[0]}`}`)
@@ -1182,6 +1190,8 @@ export const makePresentEngine = (options: PresentEngineOptions): Effect.Effect<
         Effect.suspend(() => {
           if (typeof name !== "string" || !PRESENT_HANDLER_NAME.test(name)) return Effect.fail(invalid(`a press handler's name must match ${PRESENT_HANDLER_NAME}`))
           if (typeof handler !== "object" || handler === null || typeof handler.run !== "function") return Effect.fail(invalid("a press handler has a run function"))
+          const riskProblem = metadataProblem(`the press handler "${name}"`, handler)
+          if (riskProblem !== undefined) return Effect.fail(invalid(riskProblem))
           const key = `${moduleId}/${name}`
           const entry: PublishedHandler = { moduleId, handler, runner }
           const registered = part.register({

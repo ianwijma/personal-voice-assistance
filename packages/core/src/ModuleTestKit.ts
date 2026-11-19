@@ -41,7 +41,8 @@ import type { Registrar, StartedPart } from "./ModuleRegistrations.ts"
 import { takeUnprogrammedStubCalls, UnprogrammedStubCall } from "./ModuleStubs.ts"
 import { type Diet, EMPTY_DIET, effectiveDiet, findPerson, People, type PeopleService, type Person, peopleError } from "./People.ts"
 import { makePrivacy, Privacy } from "./Privacy.ts"
-import { defaultRiskPolicy } from "./RiskPolicy.ts"
+import type { GatewayDecisionRecord } from "./Gateway.ts"
+import { DEFAULT_RISK_POLICY, riskLanguageOf, type RiskPolicy, riskPolicyOf } from "./RiskPolicy.ts"
 import type { JobRow, ModuleScheduler, SchedulerHook } from "./Scheduler.ts"
 import { NOT_ONE_LINE } from "./SettingsExtra.ts"
 import { makeToolRegistry, withoutOffTools } from "./ToolRegistry.ts"
@@ -100,6 +101,12 @@ export interface TestHouseholdInput {
   readonly householdDiet?: Partial<Diet>
   /** The Home section's values (`host.view().home`): `HOME_LANGUAGE`, `HOME_TIME_ZONE`, `HOME_UNITS`, … */
   readonly home?: Readonly<Record<string, SettingValue>>
+  /**
+   * P8: the household's risk policy, as the owner saved it on Shared settings › Risk policy (absent classes: the
+   * default, `DEFAULT_RISK_POLICY`). Read through serve mode's decoder, so `money` and `security` are `deny` whatever is
+   * given. `harness.setRiskPolicy` changes it during a test.
+   */
+  readonly risk?: Partial<RiskPolicy>
 }
 
 /**
@@ -107,7 +114,7 @@ export interface TestHouseholdInput {
  * Sam, Robin's private phone, and a public hall screen. Alex is nobody's default person, so Alex's personal content is
  * revealed on no shared device. One assistant, `jeff`, on all three devices. English, Amsterdam.
  */
-export const DEFAULT_TEST_HOUSEHOLD: Required<Omit<TestHouseholdInput, "householdDiet">> = {
+export const DEFAULT_TEST_HOUSEHOLD: Required<Omit<TestHouseholdInput, "householdDiet" | "risk">> = {
   people: [{ id: "p-sam", name: "Sam" }, { id: "p-robin", name: "Robin" }, { id: "p-alex", name: "Alex" }],
   devices: [
     { id: "kitchen-display", name: "Kitchen display", room: "Kitchen", privacy: "shared", defaultPerson: "p-sam" },
@@ -504,8 +511,10 @@ export interface TestToolResult {
 /**
  * Start `definition` in the real module host, as serve mode runs it: demanded by the test household's assistants (the
  * module and every stand-in on for each, unless an assistant switches it off), with the gateway's access checks and
- * serve mode's risk policy (`defaultRiskPolicy`), `localPrincipal: false`, the core services over the household, and
- * the scheduler engine on the in-memory store. Inside `it.effect`.
+ * serve mode's risk policy (the household's `risk`, decoded and decided by the same functions, read at every decision;
+ * its refusals in the Home language; `personal` results checked with the household's privacy rule; every decision
+ * recorded in `riskDecisions`), `localPrincipal: false`, the core services over the household, and the scheduler
+ * engine on the in-memory store. Inside `it.effect`.
  */
 export const startTestModule = (definition: ModuleDefinition<any>, options: StartTestModuleOptions = {}) =>
   Effect.gen(function*() {
@@ -727,6 +736,9 @@ export const startTestModule = (definition: ModuleDefinition<any>, options: Star
     }
     // Home-linked defaults exactly as serve mode resolves them (`linkedModuleDefaults` over the Home values).
     const homeDefaults = (moduleId: string) => linkedModuleDefaults(homeValuesOf((key) => home[key]))[moduleId]
+    /** P8: the household's risk policy now (serve mode's saved setting), through serve mode's decoder. */
+    let riskPolicy: RiskPolicy = riskPolicyOf(input.risk)
+    const riskDecisions: Array<GatewayDecisionRecord> = []
     const host = yield* makeModuleHost({
       catalog,
       defaults: homeDefaults,
@@ -743,7 +755,14 @@ export const startTestModule = (definition: ModuleDefinition<any>, options: Star
       coreServices: people.coreServices,
       issues,
       localPrincipal: false,
-      gatewayHooks: { riskPolicy: defaultRiskPolicy },
+      // P8: serve mode's hooks over the kit's household: the policy read at every decision, its sentences in the Home
+      // language, `personal` results asked of the privacy rule for the call's device, every decision recorded.
+      gatewayHooks: {
+        policy: () => riskPolicy,
+        language: () => riskLanguageOf(home.HOME_LANGUAGE),
+        mayReveal: (owner, deviceId) => people.privacy.mayReveal(owner, deviceId),
+        onDecision: (record) => void riskDecisions.push(record)
+      },
       ...(options.graceMs !== undefined ? { graceMs: options.graceMs } : {}),
       ...(options.registrars !== undefined ? { registrars: options.registrars } : {}),
       access: {
@@ -825,6 +844,16 @@ export const startTestModule = (definition: ModuleDefinition<any>, options: Star
        * the tools it switched off, and without those the risk policy refuses.
        */
       toolNames: (as?: TurnContext | TestTurnInput) => offeredFor(asTurn(as)).specs.map((s) => s.name),
+      /**
+       * P8: the household's risk policy now, and a change of it, as a save on the admin page makes one: read through
+       * serve mode's decoder (so `money` and `security` stay `deny`), it applies to the next call and the next tool list.
+       */
+      riskPolicy: (): RiskPolicy => riskPolicy,
+      setRiskPolicy: (next: Partial<RiskPolicy>) => {
+        riskPolicy = riskPolicyOf(next)
+      },
+      /** P8: every decision of the risk policy so far, on every path (turns, jobs, presses), in order. */
+      riskDecisions: (): ReadonlyArray<GatewayDecisionRecord> => riskDecisions.slice(),
       /**
        * Call a tool as the model's tool loop does, through the assistant's registry and the real gateway, as the turn
        * (`TurnContext`, or a `TestTurnInput` resolved against the household; default the first device's). A tool the
@@ -1088,7 +1117,7 @@ export const expectOffByDefault = (catalog: ReadonlyArray<ModuleDefinition<any>>
     const problems: Array<string> = []
     for (const def of catalog) if (def.enabledByDefault) problems.push(`${def.id}: enabledByDefault must be false`)
     // The CLI modes: no saved switch, no demand.
-    const cli = yield* makeModuleHost({ catalog, persistence: readOnlyPersistence(), env: {}, localPrincipal: true, gatewayHooks: { riskPolicy: defaultRiskPolicy } })
+    const cli = yield* makeModuleHost({ catalog, persistence: readOnlyPersistence(), env: {}, localPrincipal: true, gatewayHooks: { policy: () => DEFAULT_RISK_POLICY } })
     yield* cli.startEnabled
     for (const m of cli.modules()) {
       if (m.enabled || m.state !== "disabled") problems.push(`${m.id}: in the CLI modes it is ${m.enabled ? "on" : "off"} and ${m.state}, not off and disabled`)
@@ -1102,7 +1131,7 @@ export const expectOffByDefault = (catalog: ReadonlyArray<ModuleDefinition<any>>
       env: {},
       demand: () => new Map(catalog.map((d) => [d.id, []])),
       localPrincipal: false,
-      gatewayHooks: { riskPolicy: defaultRiskPolicy },
+      gatewayHooks: { policy: () => DEFAULT_RISK_POLICY },
       access: { moduleOn: () => false, toolOff: () => false }
     })
     yield* serve.startEnabled
