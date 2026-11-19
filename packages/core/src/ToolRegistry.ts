@@ -91,21 +91,34 @@ export const withoutOffTools = (module: AssistantModule, offTools: ReadonlyArray
   return { ...module, tools: (module.tools ?? []).filter((t) => !off.has(t.name)), ...(intentActions !== undefined ? { intentActions } : {}) }
 }
 
+/**
+ * The actions a registry of `modules` offers (`ToolRegistry.actions`), without building one: those of its generated
+ * action tools and its intent-only actions that the gateway offers (the risk policy allows a class), in module order.
+ * P7's phrase sets read an assistant's actions with it, by the same rule as its turns.
+ */
+export const offeredActions = (modules: ReadonlyArray<AssistantModule>, gateway: ExecutionGateway = defaultGateway): Array<RegisteredAction> => {
+  const out: Array<RegisteredAction> = []
+  for (const module of modules) {
+    for (const tool of module.tools ?? []) if (tool.action !== undefined && gateway.offers(tool.action.definition)) out.push(tool.action)
+    out.push(...(module.intentActions ?? []).filter((a) => gateway.offers(a.definition)))
+  }
+  return out
+}
+
 /** A registry of `modules`' tools; each tool belongs to the module whose `name` lists it (the module host names parts by module id). */
 export const makeToolRegistry = (modules: ReadonlyArray<AssistantModule>, options: ToolRegistryOptions = {}): ToolRegistry["Service"] => {
   const gateway = options.gateway ?? defaultGateway
   const tools = new Map<string, { readonly tool: Tool; readonly moduleId: string }>()
   const providers: Array<ContextProvider> = []
-  const actions: Array<RegisteredAction> = []
+  // The same rule as `offeredActions` (P7's phrase sets read it without a registry).
+  const actions = offeredActions(modules, gateway)
   for (const module of modules) {
     for (const tool of module.tools ?? []) {
       if (tools.has(tool.name)) throw new Error(`Duplicate tool name "${tool.name}" (module ${module.name})`)
       tools.set(tool.name, { tool, moduleId: module.name })
       // The input decoder is made here, once per tool (cached across registries), never on a call.
       prepareTool(tool)
-      if (tool.action !== undefined && gateway.offers(tool.action.definition)) actions.push(tool.action)
     }
-    actions.push(...(module.intentActions ?? []).filter((a) => gateway.offers(a.definition)))
     providers.push(...(module.context ?? []))
   }
   const specs = Array.from(tools.values()).filter(({ tool }) => gateway.offers(tool.action?.definition ?? tool)).map(({ tool }) => toolSpec(tool))

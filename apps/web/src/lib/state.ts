@@ -710,6 +710,8 @@ const server: ServerHandlers = {
     // would be a live ring lost without a word.
     return { ...s, notifications: [...rest, card].sort((a, b) => a.sentAt - b.sentAt) }
   },
+  // P7: the reply volume reaches the audio graph (`connection.ts`); nothing on the page shows it.
+  "output.volume": (s) => s,
   "notification.resolved": (s, m) => (s.notifications.some((n) => n.id === m.id) ? { ...s, notifications: s.notifications.filter((n) => n.id !== m.id) } : s),
   // P10: a presentation held (or replaced in place), and one taken down. Never cut: the server bounds what a page holds.
   "present.show": (s, m) => withPresentation(s, m.presentation),

@@ -2,6 +2,7 @@ import type { Presentation, ShowOptions } from "./Present.ts"
 import { Effect, Schema } from "effect"
 import { ToolError } from "./Errors.ts"
 import { makeTool, type RiskByInput, type Tool, type ToolMetadata } from "./Module.ts"
+import type { ActionPhrases } from "./Phrases.ts"
 import { editDistance, normalizePhrase, phoneticKey } from "./TextMatching.ts"
 import { parseDuration } from "./ValueParsing.ts"
 
@@ -186,6 +187,18 @@ export interface ActionDefinition<P extends ActionParams = ActionParams> extends
    */
   readonly announce?: (params: ParamValues<P>) => string
   /**
+   * P7 (docs/PHRASES.md): phrase commands that run this action without the language model, per language, after the
+   * wake phrase or in a follow-up window: words and `{param}` slots ("set a timer for {duration}"), at most
+   * `PHRASE_LIMITS` (8 a language, 8 words, 2 slots, every required parameter a slot; the host's own phrases are
+   * reserved). Checked when the module starts: a phrase outside the rules refuses the start, naming it.
+   */
+  readonly phrases?: ActionPhrases
+  /**
+   * P7: run by a phrase that interrupted a reply, the action is meant to end that reply (default false: the interrupted
+   * reply is spoken again after the action's answer, as after "louder").
+   */
+  readonly endsReply?: boolean
+  /**
    * Do it. Must finish well within 5 s (the intent agent's limit); it is not interrupted once started. Read the turn
    * it runs in with `yield* CurrentTurn` (`undefined` when run outside a turn: a routine from a job, a test).
    */
@@ -281,8 +294,14 @@ const paramSchema = (param: ActionParam): Schema.Codec<unknown, unknown> => {
 }
 
 /** Check and convert one tool input value to what `run` expects. */
+/**
+ * What a parameter that was not given receives, on every path (a tool call, a typed action, a phrase command): its
+ * declared default, `false` for a yes/no parameter, else `undefined`.
+ */
+export const omittedParamValue = (param: ActionParam): unknown => (param.kind === "boolean" ? false : "default" in param ? param.default : undefined)
+
 const toParamValue = (name: string, param: ActionParam, value: unknown): unknown => {
-  if (value === undefined) return param.kind === "boolean" ? false : "default" in param ? param.default : undefined
+  if (value === undefined) return omittedParamValue(param)
   switch (param.kind) {
     case "choice":
       return value
