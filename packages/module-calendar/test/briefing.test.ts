@@ -4,6 +4,10 @@ import type { TestHouseholdInput } from "@pva/core/testing"
 import { BRIEFING_LIMITS, type BriefingRequest, type BriefingSectionResult, BriefingSections } from "@pva/module-contracts"
 import { Effect, Exit } from "effect"
 import { advanceAndRefresh, allFixtures, AMS, calendar, everyone, ics, served, startCalendar } from "./fixtures.ts"
+import { vi } from "vitest"
+
+// Several test households are started per test here: on a loaded CI machine one test can pass the default 5 s.
+vi.setConfig({ testTimeout: 30_000 })
 
 const sentencesOf = (r: BriefingSectionResult) => (r._tag === "section" ? r.sentences : [])
 
