@@ -158,8 +158,9 @@ describe("routines: what it says fits where it is said", () => {
     const name = "N".repeat(40)
     for (const lang of ["en", "nl"] as const) {
       for (const [key, text] of Object.entries(texts[lang])) {
-        if (key === "stoppedAt" || key === "stoppedFailed") continue // composed: the test below fills them at their worst
-        const filled = text.replaceAll("{name}", name).replaceAll("{step}", "20").replaceAll("{steps}", "steps 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19 and 20").replaceAll("{list}", `${name}, ${name} or ${name}`)
+        if (key === "stoppedAt" || key === "stoppedFailed") continue // composed: the test below samples progress partitions
+        const filled = text.replaceAll("{name}", name).replaceAll("{other}", name).replaceAll("{done}", "20").replaceAll("{total}", "20").replaceAll("{count}", "12").replaceAll("{step}", "20").replaceAll("{steps}", "steps 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19 and 20").replaceAll("{list}", `${name}, ${name} or ${name}`)
+        assert.notInclude(filled, "{", `${lang}.${key}`)
         assert.isAtMost(filled.length, 300, `${lang}.${key}`)
       }
     }
@@ -179,7 +180,7 @@ describe("routines: what it says fits where it is said", () => {
       }
     }))
 
-  it("what a run says when it stops fits an announcement whole at the worst: 20 steps, the longest name, every split of done and unconfirmed", () => {
+  it("what a run says when it stops fits at 20 steps and the longest name for four representative progress partitions", () => {
     const name = "N".repeat(40)
     const steps = Array.from({ length: 19 }, (_, i) => i + 1)
     for (const lang of ["en", "nl"] as const) {
@@ -194,4 +195,24 @@ describe("routines: what it says fits where it is said", () => {
       }
     }
   })
+})
+
+
+describe("routines: review round 2 target validation", () => {
+  it.effect("R2.4: invalid provider IDs and combined action names are refused at settings save", () =>
+    Effect.gen(function*() {
+      const kit = yield* startTestModule(routinesModule)
+      for (const target of ["2lamp.switch", `${"a".repeat(41)}.switch`, `${"a".repeat(40)}.${"b".repeat(24)}`]) {
+        const row = routine("Lights", [{ call: target }])
+        assert.isString(parseSteps(row.steps), target)
+        assert.notStrictEqual(save([row]), "ok", target)
+        assert.isFalse((yield* kit.configure({ routines: [row] })).ok, target)
+      }
+      for (const target of ["helper.lamp", "living-room.switch", `${"a".repeat(40)}.${"b".repeat(23)}`, `${"a".repeat(23)}.${"b".repeat(40)}`]) {
+        const row = routine("Lights", [{ call: target }])
+        assert.isArray(parseSteps(row.steps), target)
+        assert.strictEqual(save([row]), "ok", target)
+        assert.isTrue((yield* kit.configure({ routines: [row] })).ok, target)
+      }
+    }))
 })

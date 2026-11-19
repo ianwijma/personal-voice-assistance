@@ -5,7 +5,7 @@
 import { assert, describe, it } from "@effect/vitest"
 import { ActionError, CurrentTurn, CurrentTurnTrace, defineAction, defineModule, Param, type Trace, type TurnContext } from "@pva/core"
 import { checkModule, startTestModule, type TestHouseholdInput } from "@pva/core/testing"
-import { Effect } from "effect"
+import { Deferred, Effect } from "effect"
 import { vi } from "vitest"
 import { catalog, routinesModule, routinesOf, texts } from "../src/index.ts"
 import { makeRunner } from "../src/run.ts"
@@ -497,7 +497,7 @@ describe("routines: one at a time, and a phrase heard once starts once", () => {
       assert.isTrue((yield* kit.phrases.say("good night", { device: "robins-phone" })).taken)
       assert.deepStrictEqual(kit.phrases.spoken.map((s) => s.text), ["Good night is already running."])
       const listed = yield* kit.tool("routines_list", {})
-      assert.deepStrictEqual(listed.value, { count: 1, routines: [{ name: "Good night", phrases: ["good night"], steps: 2, running: true }] })
+      assert.deepStrictEqual(listed.value, { count: 1, omitted: 0, routines: [{ name: "Good night", phrases: ["good night"], omittedPhrases: 0, steps: 2, running: true }] })
       yield* kit.advance(10_000)
       assert.strictEqual(seen.length, 1)
       assert.isTrue((yield* kit.phrases.say("good night", { device: "robins-phone" })).taken)
@@ -747,17 +747,17 @@ describe("routines: the tools", () => {
       assert.deepStrictEqual(yield* runner.start(good!, "nl"), { kind: "refused", refusal: { kind: "noDevice" }, text: "Ik kan een routine alleen vanaf een apparaat uitvoeren." })
     }))
 
-  it.effect("routines_list names every routine with its phrases in the household's language; none says so", () =>
+  it.effect("routines_list counts every routine and shows three entries with phrase examples; none says so", () =>
     Effect.gen(function*() {
       const kit = yield* start([], ROUTINES, { goodMorning: true })
       const listed = yield* kit.tool("routines_list", {})
       assert.deepStrictEqual(listed.value, {
         count: 4,
+        omitted: 1,
         routines: [
-          { name: "Good night", phrases: ["good night"], steps: 2 },
-          { name: "Good night kids", phrases: ["kids to bed"], steps: 1 },
-          { name: "Bedtime", phrases: ["bedtime"], steps: 1 },
-          { name: "Good morning", phrases: ["good morning"], steps: 1 }
+          { name: "Good night", phrases: ["good night"], omittedPhrases: 0, steps: 2 },
+          { name: "Good night kids", phrases: ["kids to bed"], omittedPhrases: 0, steps: 1 },
+          { name: "Bedtime", phrases: ["bedtime"], omittedPhrases: 0, steps: 1 }
         ]
       })
       const empty = yield* start([], [])
@@ -837,7 +837,7 @@ describe("routines: review round 1 regressions", () => {
       assert.deepStrictEqual(texts_(kit), ["Check stopped at step 2: I'm not allowed to do that. Step 1 is done."])
     }))
 
-  it.effect("R4: a routine's off switch follows its normalized name across reordering, and a renamed routine starts enabled", () =>
+  it.effect("R4: an injected offTools entry follows its ID across reordering and renaming back; an unused name defaults on", () =>
     Effect.gen(function*() {
       const a = routine("日本", [{ say: "Japanese." }])
       const b = routine("中文", [{ say: "Chinese." }])
@@ -851,6 +851,9 @@ describe("routines: review round 1 regressions", () => {
       assert.deepStrictEqual(texts_(kit), ["Chinese."])
       assert.isTrue((yield* kit.configure({ routines: [{ ...a, name: "日本語" }] })).ok)
       assert.deepStrictEqual((yield* kit.tool("routines_run", { name: "日本語" })).value, { spoken: "Starting 日本語." })
+      yield* kit.advance(10_000)
+      assert.isTrue((yield* kit.configure({ routines: [a] })).ok)
+      assert.deepStrictEqual((yield* kit.tool("routines_run", { name: a.name })).value, { spoken: "I can't run 日本 here." })
     }))
 
   it.effect("R5: a replayed phrase cancellation returns its first outcome and leaves a different run alone; model calls cancel anew", () =>
@@ -977,5 +980,88 @@ describe("routines: review round 1 regressions", () => {
       assert.deepStrictEqual((yield* kit.tool("routines_run", { name: "the evening one" })).value, { spoken: "Starting Evening lights." })
       yield* kit.advance(10_000)
       assert.deepStrictEqual((yield* kit.tool("routines_run", { name: "one" })).value, { spoken: "Starting One." })
+    }))
+})
+
+
+describe("routines: review round 2 regressions", () => {
+  it.effect("R2.1: cancellation during the live catalogue lookup prevents dispatch after the lookup resumes", () =>
+    Effect.gen(function*() {
+      const reading = yield* Deferred.make<void>()
+      const resume = yield* Deferred.make<void>()
+      let reads = 0
+      const gated: typeof routinesModule = {
+        ...routinesModule,
+        shared: (ctx) => routinesModule.shared!({
+          ...ctx,
+          host: {
+            ...ctx.host,
+            actions: {
+              ...ctx.host.actions,
+              list: Effect.gen(function*() {
+                if (++reads === 2) {
+                  yield* Deferred.succeed(reading, undefined)
+                  yield* Deferred.await(resume)
+                }
+                return yield* ctx.host.actions.list
+              })
+            }
+          }
+        })
+      }
+      const seen: Array<Seen> = []
+      const kit = yield* startTestModule(gated, {
+        settings: { routines: [routine("Lights", [{ call: "lamp.quiet" }])] }, others: helpers(seen)
+      })
+      assert.deepStrictEqual((yield* kit.tool("routines_run", { name: "Lights" })).value, { spoken: "Starting Lights." })
+      yield* Deferred.await(reading)
+      assert.strictEqual((yield* kit.tool("routines_stop", {})).value, "I stopped Lights; it had finished 0 of its 1 steps.")
+      assert.deepStrictEqual(seen, [])
+      yield* Deferred.succeed(resume, undefined)
+      yield* kit.advance(10_000)
+      assert.deepStrictEqual(seen, [])
+      assert.deepStrictEqual(texts_(kit), [])
+      assert.isFalse(kit.riskDecisions().some((d) => d.moduleId === "lamp"))
+    }))
+
+  for (const how of ["disable", "restart", "settings save"] as const) {
+    it.effect(`R2.2: ${how} immediately after an accepted start reports cut short with zero steps finished`, () =>
+      Effect.gen(function*() {
+        const seen: Array<Seen> = []
+        const rows = [routine("Bedtime", [{ say: "Good night." }]), GOOD_NIGHT]
+        const kit = yield* start(seen, rows)
+        assert.deepStrictEqual((yield* kit.tool("routines_run", { name: "Bedtime" })).value, { spoken: "Starting Bedtime." })
+        if (how === "settings save") assert.isTrue((yield* kit.configure({ routines: rows.slice(0, 1) })).ok)
+        else if (how === "restart") yield* kit.restart
+        else yield* kit.stop
+        yield* kit.advance(10_000)
+        assert.deepStrictEqual(texts_(kit), ["Bedtime was cut short when the routines module stopped; it had finished 0 of its 1 steps."])
+        assert.deepStrictEqual(lineDecisions(kit), [])
+        assert.deepStrictEqual(seen, [])
+      }))
+  }
+
+  it.effect("R2.5: routines_list bounds a full configuration to three complete entries and two phrase examples with omission counts", () =>
+    Effect.gen(function*() {
+      const rows = Array.from({ length: 15 }, (_, i) => routine(
+        `Routine ${String(i).padStart(2, "0")}${"n".repeat(30)}`,
+        [{ say: "Hello." }],
+        Array.from({ length: 8 }, (_, j) => `${"x".repeat(74)} ${String(i).padStart(2, "0")} ${String(j).padStart(2, "0")}`),
+        Array.from({ length: 8 }, (_, j) => `${"y".repeat(74)} ${String(i).padStart(2, "0")} ${String(j).padStart(2, "0")}`)
+      ))
+      for (const language of ["en-GB", "nl-NL"]) {
+        const kit = yield* start([], rows, { household: { home: { HOME_LANGUAGE: language } } })
+        const listed = yield* kit.tool("routines_list", {})
+        assert.isTrue(listed.ok)
+        assert.deepStrictEqual(listed.value, {
+          count: 15,
+          omitted: 12,
+          routines: rows.slice(0, 3).map((r) => ({
+            name: r.name, phrases: (language === "en-GB" ? r.phrasesEn : r.phrasesNl).slice(0, 2), omittedPhrases: 6, steps: 1
+          }))
+        })
+        assert.isAtMost(listed.content.length, 2_000)
+        assert.notInclude(listed.content, rows[3]!.name)
+      }
     }))
 })

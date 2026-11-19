@@ -122,7 +122,7 @@ export const routinesModule = defineModule({
 
       const list = makeTool({
         name: "routines_list",
-        description: "List the owner's routines: each one's name, the phrases that start it in the household's language, how many steps it has, and whether it is running now.",
+        description: "List the total and up to three routines, with at most two phrase examples in the household's language, step counts and running state. Omitted routines and phrases are counted.",
         parameters: Schema.Struct({}),
         speculative: true,
         execute: () =>
@@ -132,9 +132,11 @@ export const routinesModule = defineModule({
             const now = ctx.shared.running()
             return {
               count: routines.length,
-              routines: routines.map((r) => ({
+              omitted: Math.max(0, routines.length - 3),
+              routines: routines.slice(0, 3).map((r) => ({
                 name: nameIn(r.name, lang),
-                phrases: [...r.phrases[lang]],
+                phrases: r.phrases[lang].slice(0, 2),
+                omittedPhrases: Math.max(0, r.phrases[lang].length - 2),
                 steps: r.steps.length,
                 ...(now.has(r.key) ? { running: true } : {})
               }))

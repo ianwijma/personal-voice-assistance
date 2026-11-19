@@ -184,6 +184,7 @@ export const makeRunner = (deps: { readonly host: ModuleHostApi; readonly speech
           continue
         }
         const catalogue = yield* asStep(host.actions.list)
+        if (state.cancelled) return
         // Every dispatched step is a gateway call: a `say` through our line action, a `call` through the action named.
         const request = step.kind === "say"
           ? { moduleId: deps.moduleId, actionId: LINE_ACTION, params: { run: state.runId, step: i + 1 } }
@@ -209,6 +210,9 @@ export const makeRunner = (deps: { readonly host: ModuleHostApi; readonly speech
           return
         }
         if (!result.ok) {
+          // The host withdraws our instance before closing the shared scope. Its missing line action means this
+          // run is being stopped too: use the same cleanup now, before a failed step can announce completion.
+          if (step.kind === "say" && result.code === "not_running") return yield* Effect.interrupt
           state.finished = i + 1
           // Refused now (the policy, the assistant's switches or the device changed), or values that do not fit: stop here.
           if (result.code === "refused" || result.code === "needs_confirmation") return yield* stopAt(i + 1, "whyRefused")

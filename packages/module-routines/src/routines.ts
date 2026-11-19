@@ -28,7 +28,7 @@ export const PARAM_TEXT_CHARS = 200
 export const CANCEL_PHRASES = { en: ["cancel the routine"], nl: ["annuleer de routine"] } as const
 
 /** `<moduleId>.<actionId>`, as an action's identity is written (docs/MODULES.md §10). */
-const CALL_ID = /^([a-z0-9][a-z0-9-]{0,63})\.([a-z][a-z0-9_]{0,39})$/
+const CALL_ID = /^([a-z][a-z0-9-]{0,39})\.([a-z][a-z0-9_]{0,39})$/
 const PARAM_NAME = /^[A-Za-z][A-Za-z0-9_]{0,39}$/
 
 // ---------------------------------------------------------------------------------------------------------------------
@@ -39,7 +39,7 @@ const line = (max: number, what: string) => Schema.String.check(Schema.makeFilte
 const SayStep = Schema.Struct({ say: line(SAY_CHARS, "say") })
 const ParamValue = Schema.Union([line(PARAM_TEXT_CHARS, "a text value"), Schema.Finite, Schema.Boolean])
 const CallStep = Schema.Struct({
-  call: Schema.String.check(Schema.makeFilter((t: string) => CALL_ID.test(t) || "call: an action written module.action, such as lamp.switch")),
+  call: Schema.String.check(Schema.makeFilter((t: string) => (t.length <= 64 && CALL_ID.test(t)) || "call: an action written module.action, such as lamp.switch")),
   params: Schema.optionalKey(
     Schema.Record(Schema.String.check(Schema.makeFilter((k: string) => PARAM_NAME.test(k) || "a parameter name is a letter, then letters, digits or _")), ParamValue).check(
       Schema.makeFilter((r: Readonly<Record<string, unknown>>) => Object.keys(r).length <= MAX_PARAMS || `params: at most ${MAX_PARAMS}`)
