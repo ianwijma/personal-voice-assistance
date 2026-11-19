@@ -4,8 +4,9 @@ import { Effect, Schema } from "effect"
 import { makeBriefingSection } from "./briefing.ts"
 import { LINK_SLOTS, refreshCron, settings } from "./config.ts"
 import { makeReader, type Reader } from "./read.ts"
+import { makeScreen, type Screen } from "./screen.ts"
 import { type CalendarDeps, makeRefresh } from "./refresh.ts"
-import { occurrences, sources } from "./store.ts"
+import { allStates, occurrences, sources } from "./store.ts"
 import { makeTools } from "./tools.ts"
 
 /**
@@ -59,6 +60,13 @@ export const calendarModuleWith = (deps: CalendarDeps = {}) =>
       }),
     shared: (ctx) =>
       Effect.gen(function*() {
+        const screen = makeScreen()
+        const sourceRows = ctx.store.collection(sources)
+        /** Which generation, error and unreadable count each calendar has: what a refresh may change in an answer. */
+        const fingerprint = Effect.map(
+          allStates((q) => sourceRows.list(q)),
+          (rows) => rows.map((r) => `${r.id}:${r.value.gen ?? ""}:${r.value.error ?? ""}:${r.value.unreadable ?? 0}`).sort().join(",")
+        )
         const refresh = yield* makeRefresh({ store: ctx.store, host: ctx.host, settings: ctx.settings }, deps)
         // One handler for both jobs; idempotent (a second run reads the calendars again and writes the same rows).
         yield* ctx.scheduler.handle("refresh", {
@@ -72,7 +80,12 @@ export const calendarModuleWith = (deps: CalendarDeps = {}) =>
               if (job === undefined) return yield* Effect.die(new Error("refresh runs only as a job"))
               // The run at start never fails (its Health issue would stay until dismissed); the repeating one does, so a
               // calendar that cannot be read shows on the Health page until a refresh succeeds.
-              yield* refresh.run({ kind: "job", jobId: job.jobId }, report !== false)
+              // What a screen shows follows the calendars: when a refresh changed what they say, the lists and cards
+              // this module showed are taken down (a transient one ends by itself after 30 seconds anyway).
+              const before = yield* fingerprint
+              yield* refresh.run({ kind: "job", jobId: job.jobId }, report !== false).pipe(
+                Effect.ensuring(Effect.flatMap(Effect.orElseSucceed(fingerprint, () => before), (after) => (after === before ? Effect.void : screen.dismissAll)))
+              )
             })
         }).pipe(Effect.orDie)
         // The CLI modes have no scheduler (every call but `handle` is `unavailable`): there the tools answer from the
@@ -82,12 +95,12 @@ export const calendarModuleWith = (deps: CalendarDeps = {}) =>
         // Read once now: after a start or a change of the settings the cache is brought up to date at once.
         yield* orCli(ctx.scheduler.schedule({ handler: "refresh", key: "refresh-start", inMs: 0, payload: { report: false } }))
         const reader = makeReader({ host: ctx.host, store: ctx.store, settings: () => ctx.settings, language: () => homeLanguage(ctx.host.view()) })
-        return { value: { reader }, contributions: [BriefingSections.of(makeBriefingSection(reader))] }
+        return { value: { reader, screen }, contributions: [BriefingSections.of(makeBriefingSection(reader))] }
       }),
     start: (ctx) =>
       Effect.sync(() => {
-        const { reader } = ctx.shared as { readonly reader: Reader }
-        const { tools, actions } = makeTools(reader)
+        const { reader, screen } = ctx.shared as { readonly reader: Reader; readonly screen: Screen }
+        const { tools, actions } = makeTools(reader, (presentation) => screen.show(ctx.present, presentation))
         return {
           tools,
           actions,

@@ -5,7 +5,7 @@
 // the reviewer's refresh inputs also in the kit, as the module runs there.
 import { join } from "node:path"
 import { assert, describe, it } from "@effect/vitest"
-import type { ModuleHostApi } from "@pva/core"
+import { type ModuleHostApi, presentationProblem, type Presentation } from "@pva/core"
 import { makeOfflineNet, offThreadWorkers } from "@pva/core/testing"
 import { Effect } from "effect"
 import { TestClock } from "effect/testing"
@@ -41,7 +41,7 @@ const countRows = (kit: Effect.Success<ReturnType<typeof startCalendar>>["kit"])
   })
 
 /** A calendar module's store on SQLite in a file on a real disk, its refresh and its tools (as `shared` and `start` make them). */
-const onSqlite = (body: () => string) =>
+const onSqlite = (body: () => string, show?: (presentation: Presentation) => Effect.Effect<void>) =>
   Effect.gen(function*() {
     yield* TestClock.setTime(Date.UTC(2026, 10, 18, 9, 0))
     const sqlite = yield* makeSqliteStore({ filename: join(latencyDir("pva-calendar"), "household.db") })
@@ -51,7 +51,7 @@ const onSqlite = (body: () => string) =>
     const host = { view: () => ({ home: { HOME_TIME_ZONE: AMS } }), service: () => undefined } as unknown as ModuleHostApi
     const settings = { calendars: [calendar("Family", "https://cal.example.org/family.ics") as never] }
     const refresh = yield* makeRefresh({ store, host, settings }, { resolver: net.resolver, connector: net.connector })
-    const { tools, actions } = makeTools(makeReader({ host, store, settings: () => settings, language: () => "en" }))
+    const { tools, actions } = makeTools(makeReader({ host, store, settings: () => settings, language: () => "en" }), show)
     return { store, refresh, tools, actions }
   })
 
@@ -129,6 +129,36 @@ describe("calendar: the main thread while a turn reads the calendars, on SQLite 
       }
       for (const [name, times] of worst) bench(`calendar (SQLite, turn): ${name}: longest stop ${times.map((t) => t.toFixed(1)).join(", ")} ms`)
       for (const [name, times] of worst) for (const t of times) assert.isBelow(t, bound(10), `${name} held the main thread ${t.toFixed(1)} ms`)
+    })), 120_000)
+})
+
+describe("calendar: the answer with its presentation", () => {
+  const crowded = ics(Array.from({ length: 2_800 }, (_, i) => {
+    const d = new Date(Date.UTC(2026, 10, 19 + (i % 14)))
+    const ymd = `${d.getUTCFullYear()}${String(d.getUTCMonth() + 1).padStart(2, "0")}${String(d.getUTCDate()).padStart(2, "0")}`
+    return { uid: String(i), summary: "😀".repeat(50), start: `${ymd}T090000Z`, end: `${ymd}T093000Z` }
+  }))
+
+  it.effect("the agenda over 14 days, its list built and checked as the Presenter checks it: no stop over the bound, the list at its bound", () =>
+    Effect.scoped(Effect.gen(function*() {
+      const shown: Array<Presentation> = []
+      const { refresh, tools } = yield* onSqlite(() => crowded, (p) => Effect.sync(() => void shown.push(p)))
+      yield* refresh.run({ kind: "job", jobId: "test" }, true)
+      const agenda = tools.find((t) => t.name === "calendar_agenda")!
+      const worst: Array<number> = []
+      for (let run = 0; run < 4; run++) {
+        const { value, longest } = yield* heartbeat(agenda.execute({ day: "tomorrow", days: 14 } as never) as Effect.Effect<unknown, unknown, never>)
+        assert.strictEqual((value as { more: number }).more, 2_800 - 12)
+        worst.push(longest)
+      }
+      bench(`calendar (SQLite, turn): calendar_agenda over 14 days with its list: longest stop ${worst.map((t) => t.toFixed(1)).join(", ")} ms`)
+      for (const t of worst) assert.isBelow(t, bound(10), `the agenda with its list held the main thread ${t.toFixed(1)} ms`)
+      assert.strictEqual(shown.length, 4)
+      const p = shown[0]!
+      assert.isUndefined(presentationProblem(p, Date.UTC(2026, 10, 18, 9, 0)))
+      assert.strictEqual(p.kind === "list" ? p.items.length : 0, 12)
+      assert.strictEqual(p.kind === "list" ? p.items.at(-1)?.text : "", "and 2789 more")
+      assert.isAtMost(p.spoken.length, 300)
     })), 120_000)
 })
 

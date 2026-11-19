@@ -1,10 +1,11 @@
-import { ActionError, CurrentTurn, defineAction, makeTool, Param, type Row, type Sensitivity, ToolError } from "@pva/core"
+import { ActionError, CurrentTurn, defineAction, makeTool, Param, type Presentation, type Row, type Sensitivity, ToolError } from "@pva/core"
 import { speakList } from "@pva/language"
 import { isLine, say, StoredText } from "@pva/module-contracts"
 import { Effect, Schema } from "effect"
 import { yieldToLoop } from "./answer.ts"
-import { capital, FIND_ROWS, identityOf, type Moment, NEXT_ROWS, type Notes, noteList, type Reader, resolveDay, type Spoken, type View, type Who } from "./read.ts"
+import { capital, FIND_ROWS, identityOf, isMe, type Moment, NEXT_ROWS, type Notes, noteList, type Reader, resolveDay, type Spoken, type View, type Who } from "./read.ts"
 import { WINDOW_DAYS } from "./refresh.ts"
+import { type AgendaLine, agendaPresentation, nextPresentation } from "./screen.ts"
 import { type Occurrence, ROWS_PAGE } from "./store.ts"
 import { texts } from "./texts.ts"
 import { addDays, dateOf, daysBetween, instantOf, type LocalDate, parseClock, startOfDay } from "./time.ts"
@@ -56,12 +57,15 @@ const spokenWith = (first: string, notes: Notes): Spoken => ({ spoken: [first, .
 /** The answer of "next": an event shown, one reduced to busy time, none, or a question; with its notes. */
 type NextAnswer =
   | { readonly kind: "spoken"; readonly spoken: Spoken }
-  | { readonly kind: "shown"; readonly v: View; readonly r: Row<Occurrence>; readonly notes: Notes }
-  | { readonly kind: "reduced"; readonly v: View; readonly r: Row<Occurrence>; readonly notes: Notes }
+  | { readonly kind: "shown"; readonly v: View; readonly r: Row<Occurrence>; readonly notes: Notes; readonly screen: ReadonlyArray<string> }
+  | { readonly kind: "reduced"; readonly v: View; readonly r: Row<Occurrence>; readonly notes: Notes; readonly screen: ReadonlyArray<string> }
   /** None found: `cut` when the scan stopped short; `through`, the last day it read whole (none: not even today). */
-  | { readonly kind: "none"; readonly v: View; readonly cut: boolean; readonly through?: LocalDate; readonly notes: Notes }
+  | { readonly kind: "none"; readonly v: View; readonly cut: boolean; readonly through?: LocalDate; readonly notes: Notes; readonly screen: ReadonlyArray<string> }
 
-export const makeTools = (reader: Reader) => {
+/** What shows a presentation on the device the turn came from (a screen that cannot show it changes nothing). */
+export type ShowOnScreen = (presentation: Presentation) => Effect.Effect<void>
+
+export const makeTools = (reader: Reader, show: ShowOnScreen = () => Effect.void) => {
   const failedTool = () => Effect.map(reader.moment(undefined), (m) => new ToolError({ message: say(texts, m.lang, "unreadable") }))
   const asToolError = <A, E, R>(e: Effect.Effect<A, E, R>) => e.pipe(Effect.catch(() => Effect.flatMap(failedTool(), Effect.fail)))
 
@@ -90,6 +94,7 @@ export const makeTools = (reader: Reader) => {
       const seen = new Set<string>()
       const withheld = new Set<string>()
       const shownRows: Array<Row<Occurrence>> = []
+      const onScreen: Array<AgendaLine> = []
       let continuesAfter: LocalDate | undefined
       let more = 0
       let moreBusy = 0
@@ -114,8 +119,11 @@ export const makeTools = (reader: Reader) => {
               continue
             }
             events.push(v.shown(r))
-          } else if (busy.length < REDUCED_ITEMS) busy.push({ day: v.dayWords(d), ...v.reduced(d, r) })
-          else {
+            onScreen.push({ day: d, row: r, how: "show" })
+          } else if (busy.length < REDUCED_ITEMS) {
+            busy.push({ day: v.dayWords(d), ...v.reduced(d, r) })
+            onScreen.push({ day: d, row: r, how: "reduce" })
+          } else {
             moreBusy++
             continue
           }
@@ -123,12 +131,29 @@ export const makeTools = (reader: Reader) => {
         }
         if (events.length > 0) days.push({ day: v.dayWords(d), events })
       }
-      const notes = v.coverage(covered, { cut: reads.some((r) => r.cut), withheld: withheld.size, ...(continuesAfter !== undefined ? { continuesAfter } : {}) })
+      const extra = { cut: reads.some((r) => r.cut), withheld: withheld.size, ...(continuesAfter !== undefined ? { continuesAfter } : {}) }
+      const notes = v.coverage(covered, extra)
+      // What the answer says, on the screen of the device that asked: events first, then busy times; an empty answer shows
+      // as an empty list, so a list of an earlier answer does not stay.
+      const onScreenNow = (nothing: string) =>
+        show(agendaPresentation(v, {
+          first,
+          count,
+          lines: [...onScreen.filter((l) => l.how === "show"), ...onScreen.filter((l) => l.how === "reduce")],
+          counted: more + moreBusy,
+          cut: extra.cut,
+          withheld: extra.withheld,
+          nothing,
+          covered,
+          ...(continuesAfter !== undefined ? { continuesAfter } : {})
+        }))
       if (days.length === 0 && busy.length === 0) {
         const when = count === 1 ? v.dayWords(first) : `${v.dayWords(first)} – ${v.dayWords(addDays(first, count - 1))}`
         const nothing = who.kind === "person" ? say(texts, m.lang, "nothingOnFor", { name: who.name, Day: capital(when) }) : say(texts, m.lang, "nothingOn", { Day: capital(when) })
+        yield* onScreenNow(nothing)
         return spokenWith(nothing, notes)
       }
+      yield* onScreenNow("")
       const owner = ownerAmong(shownRows)
       return {
         ...(count === 1 ? { day: v.dayWords(first), events: days[0]?.events ?? [] } : { days }),
@@ -210,23 +235,30 @@ export const makeTools = (reader: Reader) => {
       const found = decideNext(v, rows, who, input.match)
       const notSearched = input.match !== undefined && v.unsearched(covered)
       // Read only in part where it stopped: an unread event may come first, so no event is called the next one.
-      if (scan.cut) return { kind: "none", v, cut: true, ...(scan.through !== undefined ? { through: scan.through } : {}), notes: v.coverage(covered, { withheld: found.withheld, notSearched }) } as NextAnswer
+      if (scan.cut) {
+        return { kind: "none", v, cut: true, ...(scan.through !== undefined ? { through: scan.through } : {}), notes: v.coverage(covered, { withheld: found.withheld, notSearched }), screen: v.screenNotes(covered, { withheld: found.withheld }) } as NextAnswer
+      }
       if (found.hit === undefined) {
         // Stopped at an event that is not one now (it changed while reading): the read was not complete either.
         const cut = scan.cut || scan.stopped
-        return { kind: "none", v, cut, notes: v.coverage(covered, { withheld: found.withheld, notSearched }) } as NextAnswer
+        return { kind: "none", v, cut, notes: v.coverage(covered, { withheld: found.withheld, notSearched }), screen: v.screenNotes(covered, { withheld: found.withheld }) } as NextAnswer
       }
       const beyond = v.beyondDay(found.hit)
       const notes = v.coverage(covered, { withheld: found.withheld, notSearched, ...(beyond !== undefined ? { continuesAfter: beyond } : {}) })
-      return { kind: found.reduced ? "reduced" : "shown", v, r: found.hit, notes } as NextAnswer
+      const screen = v.screenNotes(covered, { withheld: found.withheld, ...(beyond !== undefined ? { continuesAfter: beyond } : {}) })
+      return { kind: found.reduced ? "reduced" : "shown", v, r: found.hit, notes, screen } as NextAnswer
     })
 
   /** When the next event is, as a phrase: its start, and its end when that is on another day or after the days kept. */
+  const nextStart = (v: View, r: Row<Occurrence>) => {
+    const val = r.value
+    return val.allDay ? `${v.dayWords(dateOf(val.start, v.m.zone))}, ${say(texts, v.m.lang, "allDayBusy")}` : v.momentWords(val.start)
+  }
   const nextWhen = (v: View, r: Row<Occurrence>) => {
     const val = r.value
     const first = dateOf(val.start, v.m.zone)
     const last = dateOf(val.end > val.start ? val.end - 1 : val.start, v.m.zone)
-    const start = val.allDay ? `${v.dayWords(first)}, ${say(texts, v.m.lang, "allDayBusy")}` : v.momentWords(val.start)
+    const start = nextStart(v, r)
     const beyond = v.beyondDay(r)
     if (beyond !== undefined) return say(texts, v.m.lang, "untilAfter", { when: start, day: v.dayWords(beyond) })
     if (daysBetween(first, last) === 0) return start
@@ -248,8 +280,23 @@ export const makeTools = (reader: Reader) => {
     return match === undefined ? say(texts, lang, "nextNone", { days: WINDOW_DAYS }) : say(texts, lang, "nextNoneMatching", { match, days: WINDOW_DAYS })
   }
 
+  /**
+   * The card for "my next appointment": the asking person's own next event ("me", no words), or that there is none,
+   * with the answer's notes. Never for an event reduced to busy time, a question or a refusal (nothing of them is shown).
+   */
+  const cardOf = (a: NextAnswer, input: { readonly match?: string; readonly who?: string }): Presentation | undefined => {
+    if (!isMe(input.who) || input.match !== undefined) return undefined
+    if (a.kind === "shown") return nextPresentation(a.v, { row: a.r, when: nextWhen(a.v, a.r), whenShort: nextStart(a.v, a.r), notes: a.screen })
+    if (a.kind === "none") return nextPresentation(a.v, { noneSentence: noneSentence(a, input.match), notes: a.screen })
+    return undefined
+  }
+  const showCard = (a: NextAnswer, input: { readonly match?: string; readonly who?: string }) => {
+    const card = cardOf(a, input)
+    return card === undefined ? Effect.void : show(card)
+  }
+
   const nextResult = (input: { readonly match?: string; readonly who?: string }) =>
-    Effect.map(nextAnswer(input), (a) => {
+    Effect.tap(nextAnswer(input), (a) => showCard(a, input)).pipe(Effect.map((a) => {
       if (a.kind === "spoken") return a.spoken
       const lang = a.v.m.lang
       if (a.kind === "none") return spokenWith(noneSentence(a, input.match), a.notes)
@@ -262,7 +309,7 @@ export const makeTools = (reader: Reader) => {
         untrusted: say(texts, lang, "untrusted"),
         ...(val.owner !== undefined ? { owner: val.owner } : {})
       }
-    })
+    }))
 
   const find = (input: { readonly text: string; readonly who?: string }) =>
     Effect.gen(function*() {
@@ -475,7 +522,7 @@ export const makeTools = (reader: Reader) => {
   const asAction = (e: Effect.Effect<string, unknown>) => e.pipe(Effect.map((s) => ({ say: s })), Effect.catch(() => Effect.flatMap(failedAction(), Effect.fail)))
 
   const nextSentence = (input: { readonly match?: string; readonly who?: string }) =>
-    Effect.map(nextAnswer(input), (a) => {
+    Effect.tap(nextAnswer(input), (a) => showCard(a, input)).pipe(Effect.map((a) => {
       if (a.kind === "spoken") return a.spoken.spoken
       const lang = a.v.m.lang
       if (a.kind === "none") return spokenWith(noneSentence(a, input.match), a.notes).spoken
@@ -485,7 +532,7 @@ export const makeTools = (reader: Reader) => {
         return spokenWith(say(texts, lang, "busy", { name: red.busy, when: `${a.v.dayWords(d)} ${say(texts, lang, "busyFromTo", { from: red.from, to: red.to })}` }), a.notes).spoken
       }
       return spokenWith(say(texts, lang, "nextIs", { title: a.v.titleOf(a.r), when: nextWhen(a.v, a.r) }), a.notes).spoken
-    })
+    }))
 
   const actions = [
     defineAction({

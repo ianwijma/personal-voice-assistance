@@ -202,6 +202,50 @@ that are never found 1.2 to 2.4 ms, a search 1.7 to 4.0 ms, free time 1.0 to 1.7
 yields between pages); the tests fail above 10 ms (30 ms on CI). The worker's own start-up
 (docs/MODULES.md §15) is paid on its thread, once per calendar per refresh.
 
+## On a screen
+
+Two things go to the screen of the device that asked, when it has one (docs/PRESENTING.md); both are transient (30
+seconds, the newest of a device takes its place) and neither changes the answer: the tool's result and every sentence
+are exactly as without a screen, on a device that has none, and where nothing can be shown (the command-line modes).
+They are made with `ctx.present.show("origin", …)` from the tool or action, not as a result with a `present` part, so
+the model is given no note about the screen.
+
+| What | Shown for | Example |
+|---|---|---|
+| A **list** (`list`, bullets) of the agenda: a line per event in the order the tool gives them ("Standup at half past nine"; with several days, "tomorrow: Bins out, all day"), then a line per busy time ("Robin is busy from two o'clock to three o'clock") | `calendar_agenda` (the model asks it for "what do we have this weekend?", "what's on Friday?"). An answer with nothing in it is an empty list titled "Friday: nothing on the calendar.", so an earlier list does not stay | "What do we have this weekend?" |
+| A **card** (`card`): the event as the title, "When", "Where" and "Calendar" as facts, the notes as its text; or, with nothing coming up, "My next appointment" and the sentence that says so | "My next appointment": the action `calendar.my_next` and `calendar_next` for "me" without words. Not for the household's next event, a named event ("when is the dentist"), a busy time, a question ("Whose calendar?") or a refusal | "When is my next appointment?", "wat is mijn volgende afspraak" |
+
+The typed actions "what's on today" and "what's on tomorrow" show nothing yet (they speak at most five events and three
+busy times; a list of them would show more than they said).
+
+**The same decision as the answer.** Only what the asking turn may see is built into either: a title only of an event
+shown in full, "Robin is busy from two o'clock to three o'clock" only where the answer reduces (a shared device that is
+not Robin's), and for what is withheld only a count ("Personal events not shown here: 2."). A presentation with the events
+of a member is marked as that member's: the Presenter asks `Privacy.mayReveal` for the device again each time it would show
+it, and withdraws it where the answer is no. One presentation holds the events of one member at most (the first member's
+events the answer shows, in start order): another's events on a private device are counted ("Events of other people not
+shown here: 1.") and not listed, so the mark is true of everything on it. On the public hall screen a list holds the
+household's events and the count.
+
+**The same notes.** What the answer says beside its events (`coverage`) is on the screen as short lines built from it, in
+its order, naming no calendar: "Not refreshed since today at ten o'clock.", "Some events could not be read: 1.", "Some
+calendars have not been read yet.", "Read in part; there may be more.", "Some go on after Friday.", the withheld count. A
+list that does not hold every event says "and 19 more" (the true count), or "and at least 190 more" when the scan was cut.
+
+**Bounds.** Whole lines are chosen before anything is drawn: at most twelve lines, the notes keep their places and the
+events share the rest with "and N more"; a title is cut at a code point boundary inside the limit (80 characters a line,
+60 a title, 60 a fact, 300 a text) and marked with "…"; notes that do not fit a card or the spoken text are kept whole or
+replaced by "There are more notes; ask me aloud.". Every presentation has a spoken text (at most 300 characters: the events
+as far as they fit with the true total, then the notes) for where the page cannot show it.
+
+**When it goes away.** A newer answer, or an empty one, takes the device's place; a transient one ends by itself after 30
+seconds and when the module stops. A refresh that changes what the calendars say (a new generation, a calendar that fails
+or is read in part) takes down every list and card this module showed, on every device, in the same step; a refresh that
+changes nothing (the server says not modified) leaves them. After a restart there are none: no transient presentation
+survives one.
+
+Nothing of this has a button, a tick or a notification, so there is no press handler to register.
+
 ## What it needs
 
 - `requires`: `{ network: "internet" }` (the ICS addresses), with a `health` check.
@@ -213,10 +257,10 @@ yields between pages); the tests fail above 10 ms (30 ms on CI). The worker's ow
 
 ## What was left out
 
-**For wave B** (needs P7, P9 or P10, which do not exist yet):
+**For wave B** (reminders need notifications; the phrase commands need the phrase matcher):
 
 - Reminders before events (the research's reminder planner): notifications, P9.
-- The agenda as a list or a week table on screens, the created-event card: presentations, P10.
+- A week table on screens and the created-event card (there is no calendar to add to): presentations, P10. The agenda as a list and the next appointment as a card are done: see "On a screen".
 - Phrase commands for "what's on today": P7. The typed actions above serve the intent path meanwhile.
 - "And after that?" continuing a read agenda: conversation state of the reading session.
 
