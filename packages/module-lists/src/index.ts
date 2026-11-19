@@ -3,9 +3,10 @@ import { listsModule } from "./module.ts"
 
 /**
  * Shopping and to-do lists (docs/modules/lists.md; docs/MODULES-PLAN.md §5.1 row 5, wave A): household lists in the
- * module's own store, the ten `lists_*` tools (seven of them typed actions that run without the model), splitting
- * on "and", quantities, merging an item said again, one level of undo per conversation, and the `Lists` service the
- * kitchen module uses for the shopping list.
+ * module's own store, the twelve `lists_*` tools (nine of them typed actions that run without the model, two of those
+ * also phrase commands), splitting on "and", quantities, merging an item said again, one level of undo per
+ * conversation, the checklist of a list's open items pinned on a screen, and the `Lists` service the kitchen module
+ * uses for the shopping list.
  */
 export { listsModule, settings } from "./module.ts"
 export { Item, items, ListRow, lists, MAX_CLEAR, MAX_LISTS, MAX_LIVE_LISTS, MAX_OPEN, MAX_PER_REQUEST, SHOPPING, TODO, undo, UndoEntry, undoIdOf, UNDO_WINDOW_MS } from "./data.ts"
