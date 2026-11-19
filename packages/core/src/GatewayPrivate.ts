@@ -62,6 +62,15 @@ const registryGateways = new WeakMap<object, object>()
 export const registerConfirmedRunner = (gateway: object, run: ConfirmedRunner) => void confirmedRunners.set(gateway, run)
 export const registerRegistryGateway = (registry: object, gateway: object) => void registryGateways.set(registry, gateway)
 
+/**
+ * P8 (review round 1, H6): a registry wrapper (`registryWith`) carries its base's gateway, so the confirmed path of a
+ * wrapped registry runs through the same gateway (and its risk policy), never the policy-free fallback.
+ */
+export const carryRegistryGateway = (from: object, to: object) => {
+  const gateway = registryGateways.get(from)
+  if (gateway !== undefined) registryGateways.set(to, gateway)
+}
+
 /** The confirmed runner of the gateway a registry runs through (`undefined`: a registry made without one). */
 export const confirmedRunnerOf = (registry: object | undefined, fallback: object): ConfirmedRunner | undefined => {
   const gateway = (registry === undefined ? undefined : registryGateways.get(registry)) ?? fallback

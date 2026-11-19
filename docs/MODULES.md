@@ -349,8 +349,8 @@ needing a confirmation the assistant cannot ask for yet, `money` and `security` 
 still off, so `confirm` refuses too, with its own sentence.
 
 What the gateway does, in order, on every path that runs a tool, an action or a press handler (a model's tool call, the
-Claude Code bridge, a generated action tool, the intent agent, a routine step or tool through `host.actions.run`, a job,
-a press on a presentation or a notification, core's confirmed path, the CLI modes): checks the principal (§3), that the
+Claude Code bridge, a generated action tool, the intent agent, a phrase command, a routine step or tool through
+`host.actions.run`, a job, a press on a presentation or a notification, core's confirmed path, the CLI modes): checks the principal (§3), that the
 assistant has the module on and the tool is not switched off, runs the risk function on the validated input, then
 decides with **one function**, `decideRisk(policy, declared classes, class of this input)` (`@pva/protocol`), on the
 policy **as saved at that moment**: a save applies to the next call, without a restart. An action declared `confirm:
@@ -363,7 +363,8 @@ run with no principal: a call they make is refused before any decision.
   `security`. A list made before a change and a call after it may disagree; the call's check wins and the model gets
   the refusal.
 - A refusal comes back to the model as a tool result ("Not run: …", in Dutch "Niet uitgevoerd: …", by the Home
-  language), a typed action says it in a sentence for speech ("I can't do that: …"), a press is answered with that
+  language), a typed action and a phrase command say it in a sentence for speech ("I can't do that: …"; the host's
+  controls, "stop", "never mind", "repeat", "louder", "quieter", are never refused), a press is answered with that
   sentence on the page, `host.actions.run` answers `{ ok: false, code: "refused", message }`; `confirm` and `deny` have
   different sentences, and the module's code never runs.
 - Every decision is recorded: a turn's on its trace (`Trace.calls`, the latency line's `risk:` part), every one through
@@ -374,9 +375,17 @@ run with no principal: a call they make is refused before any decision.
 
 `sensitivity` (`household`, `personal` with an owner, or a function of the result) says whose a result is. **The
 gateway enforces it for a tool's result on its way back to the model**: a `personal` result is passed through
-`Privacy.mayReveal` for the asking device at that moment; where it may not be revealed, the model gets a fixed sentence
-("Withheld: …") and nothing of the result, and nothing of it is presented. `personal` without a known owner is someone
-else's. A job, a route and `host.actions.run` hand results to module code, not to a model, and a job has no asking
+`Privacy.mayReveal` for the asking device at the moment the tool finishes; where it may not be revealed, the model gets
+a fixed sentence ("Withheld: …") and nothing of the result, and nothing of it is presented. For an action called as a
+tool, the classifier receives **the action's own outcome** (`ActionOutcome`: its `say`, `present`, …), before it is
+formatted or shown. **A failure is covered too**: a `ToolError`, an `ActionError` or a defect of a tool or action whose
+results are fixed `personal` is withheld where such a result would be ("Withheld: …", still an error result); a
+classifier of the result cannot be asked about a failure, so a failure of a tool with a classifier is always withheld
+from the model. Write failure messages that help the person, and expect them to be withheld from shared and public
+devices. `personal` without a known owner (`sensitivity: "personal"`, or a classifier that throws or answers nonsense)
+is someone else's: it is withheld everywhere, also on a private device. A result is decided once, when its tool
+finishes; it is not checked again while it waits for sibling tools (serve ends a device's session when its privacy
+changes). A job, a route and `host.actions.run` hand results to module code, not to a model, and a job has no asking
 device: there the module checks privacy itself, on the device that will speak or show it (§7), as it always did. Keep
 checking in your own code where you build a result from several people's data (the gateway sees one sensitivity per
 result). `latency` (`instant`, `quick`, `slow`, `background`) is metadata.

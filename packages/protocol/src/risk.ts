@@ -99,6 +99,17 @@ export const riskPolicyValueProblem = (key: string, value: unknown): string | un
   return isOutcome(value) ? undefined : "Choose one of the options."
 }
 
+/**
+ * THE save check of the policy (review round 1, H5): every problem of a patch's values for the policy's keys, in the
+ * patch's order, as `{ key, message }` (empty: nothing to refuse for the policy). The real section runs it before its
+ * generic form checks, and the web mock runs it too, so both answer a patch the same way; a refused save writes nothing.
+ */
+export const riskPolicyPatchProblems = (values: Readonly<Record<string, unknown>>): ReadonlyArray<{ readonly key: string; readonly message: string }> =>
+  Object.entries(values).flatMap(([key, value]) => {
+    const problem = riskPolicyValueProblem(key, value)
+    return problem === undefined ? [] : [{ key, message: problem }]
+  })
+
 /** Why `money` and `security` cannot be changed (the admin page shows it on their rows). */
 export const FIXED_REASON = "Fixed at Refuse: devices are not authenticated yet (a page names its own device), so no device can be trusted to spend money or to work locks, alarms, doors or gates."
 

@@ -396,7 +396,8 @@ CurrentPrincipal: Context.Reference<Principal | undefined>       // the admitted
   riskPolicyKey(policy): string                            // changes exactly when riskOffered can change
   decodeRiskPolicy(value: (key) => unknown): RiskPolicy    // flat keys; a bad value is its default; money/security deny
   riskPolicyOf(partial): RiskPolicy                        // the same decoder over an object (the kit)
-  riskPolicyValueProblem(key, value): string | undefined   // the save check (server section, mock)
+  riskPolicyValueProblem(key, value): string | undefined   // one value's save check
+  riskPolicyPatchProblems(values): ReadonlyArray<{ key, message }>  // THE save check: the real section (checkPatch) and the mock
   riskReason / riskSpoken(language, decision), riskRefusalPrefix(language), riskWithheld(language), riskLanguageOf(HOME_LANGUAGE)
   ```
 
@@ -411,10 +412,28 @@ CurrentPrincipal: Context.Reference<Principal | undefined>       // the admitted
   the intent agent says `spoken`; a refused press is answered `{ ok: false, say: spoken, code: "refused" }`. A turn's
   decisions are on its `Trace.calls` (`TraceCall`: name, outcome, by, withheld; the latency line's `risk:` part):
   `Conversation` provides `CurrentTurnTrace` around its tool calls and action runs, and the Claude Code bridge gives
-  each SDK call the turn's trace. A registry wrapper keeps reading the list through (`registryWith`). Measured
-  (`RiskLatency.test.ts`): 61 ns per decision, 0.5 µs added to a gateway call, 5.5 µs to read a 64-tool list after a
-  change and 0.4 µs otherwise; a turn's end of turn → playback start 10.725 ms without a saved policy and 10.710 ms with
-  one.
+  each SDK call the turn's trace. A registry wrapper keeps reading the list through and carries the registry's gateway
+  association (`registryWith`, so core's confirmed path never falls back to a gateway without the policy).
+
+  **Serve's reader** (review round 1, H1): `effectiveRiskPolicy({ stored, env })` (`apps/assistant/src/serve/riskPolicy.ts`)
+  resolves the `risk` section's own fields exactly as every settings reader does (the environment trimmed and checked
+  against the choices, a saved value of the wrong type or outside them read as the field's default) and decodes them.
+  `Sections` publish its result into an in-memory record when they are made, inside every committed save (the same
+  uninterruptible step as the write, before the save is answered) and on `announceAll`; the gateway hook
+  (`servePolicyReader`) reads that record as a field: no section definitions are built and no file is touched on a
+  call. The settings `ConfigProvider` serves the policy's keys as the reader resolves them, and the CLI start runs the
+  same function over what it reads. **What is checked when:** the policy at every decision (each call, each held
+  action's second admission) and each tool-list read; `sensitivity` once, when a tool finishes (its result, or its
+  failure, H3), before it is formatted or presented (H2). A completed result that waits for sibling tools is not checked
+  again at dispatch: a result is decided once, when its tool finishes; serve fences and discards a device's session on
+  a committed boundary change (its turn is cancelled, `serveRiskWait.test.ts`).
+
+  **Measured** (the shared `bound()`, latency project): `decideRisk` 61 ns per decision; a 64-tool list read 5.4 µs
+  after a change and 0.4 µs otherwise (`packages/core/test/RiskLatency.test.ts`); with serve's production reader over a
+  real settings store (`apps/assistant/test/riskLatency.test.ts`): a policy read 3.5 ns, the first read after a
+  committed save 1.1 µs at the median, a gateway tool call 3.95 µs without a policy and 4.38 µs with serve's reader and
+  the decision (0.43 µs added); a turn's end of turn → playback start (`TurnTrace`, a tool round, 80 turns × 4
+  counterbalanced runs) 10.814 ms with nothing saved and 10.762 ms with a saved policy.
 - **Availability.** `requires`, `platforms` and `apiVersion` are judged before anything starts, from the app's probes
   (`apps/assistant/src/requirements.ts`). Two kinds of requirement: a **program on the server** (`{ tool, version?,
   why }`) and the **network** (`{ network }`, not probed yet: `unchecked`). One program registry (argv and a version
