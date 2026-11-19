@@ -47,7 +47,8 @@ const statefulLists = () => {
 const withLists = (lists: ReturnType<typeof listsStub>, extra: Parameters<typeof startTestModule>[1] = {}) =>
   startTestModule(kitchenModule, { ...extra, provide: [provide("lists", { services: [Lists.of(lists.service)] })] })
 
-const said = (r: { readonly value: unknown }) => r.value as string
+// The tool's answer without the host's note of what it did with the screen (a line after it, only for `stock_low`).
+const said = (r: { readonly value: unknown }) => (r.value as string).split("\n[Screen:")[0]!
 /** What an action said, or why it did not run. */
 const spoken = (r: { readonly ok: boolean; readonly say?: string | undefined; readonly message?: string }) => (r.ok ? r.say : `not run: ${r.message}`)
 const dutch = { household: { home: { HOME_LANGUAGE: "nl-NL" } } }
@@ -501,8 +502,6 @@ describe("kitchen: every advertised example, through the real extraction (findin
         ["stock_low", "what are we running low on", "Nothing is running low."],
         ["stock_low", "what do we need", "Nothing is running low."],
         ["stock_low", "what's running out", "Nothing is running low."],
-        ["keep_low", "keep the low list on the screen", "Nothing is running low."],
-        ["keep_low", "keep what we are low on on the screen", "Nothing is running low."],
         ["keep_minimum", "always keep two kilos of rice", "Okay, I'll keep at least 2 kilograms of rice in stock. Rice is below your minimum of 2 kilograms, so it's on the shopping list."],
         ["keep_minimum", "keep at least six eggs in the house", "Okay, I'll keep at least 6 eggs in stock. Eggs is below your minimum of 6 pieces, so it's on the shopping list."],
         ["stock_out", "we're out of rice", "Okay, no rice left. Rice is on the shopping list."],
@@ -534,7 +533,6 @@ describe("kitchen: every advertised example, through the real extraction (findin
         ["stock_query", "wat is er in de voorraad", "In de voorraad: 2 liter melk en rijst (het laatste dat ik wist: ongeveer 1 kilo)."],
         ["stock_low", "wat is er bijna op", "Er is niets bijna op."],
         ["stock_low", "wat moeten we kopen", "Er is niets bijna op."],
-        ["keep_low", "houd het lijstje met wat bijna op is op het scherm", "Er is niets bijna op."],
         ["keep_minimum", "houd altijd twee kilo rijst in huis", "Oké, ik zorg dat er minstens 2 kilo rijst is. Rijst is onder je minimum van 2 kilo, dus het staat op het boodschappenlijstje."],
         ["stock_add", "ik heb zes eieren gekocht", "6 eieren toegevoegd; eieren is nieuw in de voorraad."],
         ["keep_minimum", "zorg dat er altijd zes eieren zijn", "Oké, ik zorg dat er minstens 6 eieren is."],

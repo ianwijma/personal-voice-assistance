@@ -10,7 +10,7 @@ import {
   amountText, book, createProduct, drainForgotten, fits, FORGET_NOW, lastKnownText, listText, lowOf, overviewText, type Pantry, type PantrySettings, PRODUCT_PAGE,
   PRODUCT_SCAN, removeProduct, round, saidText, stockSentence, stockText, storeFailureText, undoable
 } from "./pantry.ts"
-import { lowSay } from "./lowScreen.ts"
+import { lowPresentation, lowSay } from "./lowScreen.ts"
 import { texts, type TextKey, unitWords } from "./texts.ts"
 import { cleanPhrase, KEY_CHARS, keyOf, readPhrase } from "./words.ts"
 
@@ -104,8 +104,6 @@ export const pantryActions = (deps: PantryDeps) => {
       }
       // A product made by this call was not on the list before it.
       const list = yield* pantry.followList(outcome.id, outcome.created ? undefined : outcome.before, outcome.after.name, settings, l)
-      // A list of what is low that is on a screen follows the stock (it never changes the answer).
-      if (pantry.screens !== undefined) yield* pantry.screens.refresh
       return { say: list === undefined ? outcome.main : `${outcome.main} ${list}` }
     })
 
@@ -322,21 +320,6 @@ export const pantryActions = (deps: PantryDeps) => {
       })
   })
 
-  const lowAnswer = (keep: boolean) =>
-    Effect.gen(function*() {
-        const l = lang()
-        const device = yield* deviceOf
-        const { rows, cut } = yield* pantry.low().pipe(Effect.mapError(() => new ActionError({ message: say(texts, l, "unreadable") })))
-        if (rows.length === 0) {
-          // Nothing is low any more: a list this device still shows is taken down.
-          if (device !== undefined && pantry.screens !== undefined) yield* pantry.screens.clear(device)
-          return { say: say(texts, l, "lowNone") }
-        }
-        // Shown as the answer says it, and never instead of it: a device that cannot show it changes nothing here.
-        if (device !== undefined && pantry.screens !== undefined) yield* pantry.screens.show(device, rows, cut, keep, l)
-        return { say: lowSay(rows, cut, l) }
-      })
-
   const low = defineAction({
     id: "stock_low",
     label: "What is running low",
@@ -344,17 +327,15 @@ export const pantryActions = (deps: PantryDeps) => {
     examples: ["what are we running low on", "what do we need", "what's running out", "wat is er bijna op", "wat moeten we kopen"],
     params: {},
     speculative: true,
-    run: () => lowAnswer(false)
-  })
-
-  const keepLow = defineAction({
-    id: "keep_low",
-    label: "Keep what is running low on the screen",
-    description: "Show what is running low as a checklist on this device's screen and keep it there until it is dismissed (stock_low shows it for a short while only). Only when someone asks to keep the list on the screen.",
-    examples: ["keep the low list on the screen", "keep what we are low on on the screen", "houd het lijstje met wat bijna op is op het scherm"],
-    params: {},
-    speculative: true,
-    run: () => lowAnswer(true)
+    run: () =>
+      Effect.gen(function*() {
+        const l = lang()
+        const { rows, cut } = yield* pantry.low().pipe(Effect.mapError(() => new ActionError({ message: say(texts, l, "unreadable") })))
+        if (rows.length === 0) return { say: say(texts, l, "lowNone") }
+        // The answer, unchanged, and with it a plain list of exactly what it names: the host shows it when the turn is
+        // promoted (this run may be speculative), and it ends by itself. A device that cannot show it changes nothing.
+        return { say: lowSay(rows, cut, l), present: lowPresentation(rows, cut, l) }
+      })
   })
 
   const undo = defineAction({
@@ -423,7 +404,7 @@ export const pantryActions = (deps: PantryDeps) => {
       })
   })
 
-  return [add, use, out, set, query, low, keepLow, undo, keepMinimum]
+  return [add, use, out, set, query, low, undo, keepMinimum]
 }
 
 /** The product settings tools, for the model: change a product's minimum, package size or names, or forget it. */
@@ -511,7 +492,6 @@ export const productTools = (deps: PantryDeps) => {
         const { id, before, after, details } = result.booked
         const main = say(texts, l, "productSaved", { item: after.name.charAt(0).toUpperCase() + after.name.slice(1), details: speakList(details, l, { max: 4 }) ?? "" })
         const list = yield* pantry.followList(id, before, after.name, settings, l)
-        if (pantry.screens !== undefined) yield* pantry.screens.refresh
         return { spoken: list === undefined ? main : `${main} ${list}` }
       })
   })
@@ -537,7 +517,6 @@ export const productTools = (deps: PantryDeps) => {
           return { spoken: suggestion !== undefined ? say(texts, l, "unknownMaybe", { item, suggestion }) : say(texts, l, "unknown", { item }) }
         }
         if (gone.left) yield* drainForgotten(store, gone.id, FORGET_NOW).pipe(Effect.orElseSucceed(() => ({ removed: 0, done: false })))
-        if (pantry.screens !== undefined) yield* pantry.screens.refresh
         return { spoken: say(texts, l, "forgotten", { item: gone.name.charAt(0).toUpperCase() + gone.name.slice(1) }) }
       })
   })
