@@ -68,7 +68,7 @@ import { type CommandSet, hostCommandSet, phraseLanguageOf } from "./Phrases.ts"
 import { makePhraseSets } from "./PhraseSets.ts"
 import { Playback } from "./Playback.ts"
 import { DeviceControl, SessionControl } from "./SessionControl.ts"
-import { ECHO_TAIL_MS } from "./EchoGate.ts"
+import { type EchoGate, makeEchoGate } from "./EchoGate.ts"
 import type { RouteTarget } from "./RouteGate.ts"
 import type { RegisteredAction } from "./Actions.ts"
 
@@ -394,11 +394,24 @@ const letRun = (fiber: Fiber.Fiber<unknown, unknown>) =>
  * clock to the next pending timer. A wait that has not finished after `KIT_WAIT_CAP_MS` of test-clock time, or that
  * waits on nothing the clock can move, fails the test naming `what`; the unfinished work is interrupted without being
  * waited for. A wait that finishes at once never sees the clock move.
+ *
+ * `owned` (a phrase run, review round 2, a5): the work is the caller's, as `runTaken` is its caller's in serve mode, so
+ * interrupting the caller interrupts it too; its clean-up is given the moments `letRun` gives (it is not waited for
+ * beyond them). Without it (lifecycle requests) the work goes on as a request already made does.
  */
-const driven = <A, E>(what: string, effect: Effect.Effect<A, E>): Effect.Effect<A, E> =>
+const driven = <A, E>(what: string, effect: Effect.Effect<A, E>, options: { readonly owned?: boolean } = {}): Effect.Effect<A, E> =>
   Effect.gen(function*() {
     // Detached: a wait that is given up must not hold the test's own fiber when it ends.
     const fiber = yield* Effect.forkDetach(effect)
+    if (options.owned === true) {
+      return yield* follow(what, fiber).pipe(Effect.onInterrupt(() => Effect.andThen(Effect.sync(() => fiber.interruptUnsafe()), letRun(fiber))))
+    }
+    return yield* follow(what, fiber)
+  })
+
+/** `driven`'s wait: the clock moved to the next timer until `fiber` is done, within `KIT_WAIT_CAP_MS`. */
+const follow = <A, E>(what: string, fiber: Fiber.Fiber<A, E>): Effect.Effect<A, E> =>
+  Effect.gen(function*() {
     const startedAt = yield* Clock.currentTimeMillis
     for (;;) {
       yield* letRun(fiber)
@@ -624,20 +637,32 @@ export const startTestModule = (definition: ModuleDefinition<any>, options: Star
     const replying = new Map<string, Deferred.Deferred<void>>()
     /** The announcement being played on a device: its cut, by a reply or by the device's page going. */
     const playing = new Map<string, Deferred.Deferred<"reply" | "disconnected">>()
-    /** P7: when the device's last reply or announcement ended plus the echo tail: audible until then (test clock). */
-    const quietFrom = new Map<string, number>()
+    /**
+     * P7: whether the device is audible, by serve mode's own rule (`EchoGate.audible`: playing, or within `ECHO_TAIL_MS`
+     * of the end of what played): every reply, announcement and canned line the kit plays starts and ends on it.
+     */
+    const audibleGates = new Map<string, EchoGate>()
+    const audibleGate = (deviceId: string) => {
+      let gate = audibleGates.get(deviceId)
+      if (gate === undefined) {
+        gate = makeEchoGate()
+        audibleGates.set(deviceId, gate)
+      }
+      return gate
+    }
     /** A reply starts (`true`) or ends on the device: announcements wait for it, one playing is cut (as serve mode's lease). */
     const setReplying = (deviceId: string, on: boolean) =>
       Effect.flatMap(Clock.currentTimeMillis, (at) => Effect.sync(() => {
         const d = replying.get(deviceId)
         if (on && d === undefined) replying.set(deviceId, Deferred.makeUnsafe<void>())
+        if (on) audibleGate(deviceId).playbackStarted(at)
         if (on) {
           const cut = playing.get(deviceId)
           if (cut !== undefined) Deferred.doneUnsafe(cut, Effect.succeed("reply" as const))
         }
         if (!on && d !== undefined) {
           replying.delete(deviceId)
-          quietFrom.set(deviceId, at + ECHO_TAIL_MS)
+          audibleGate(deviceId).playbackEnded(at)
           Deferred.doneUnsafe(d, Effect.void)
         }
       }))
@@ -678,12 +703,13 @@ export const startTestModule = (definition: ModuleDefinition<any>, options: Star
             const cut = Deferred.makeUnsafe<"reply" | "disconnected">()
             playing.set(deviceId, cut)
             playingNow = true
+            audibleGate(deviceId).playbackStarted(record.startedAt)
             const how = yield* Effect.raceFirst(Effect.as(Effect.sleep(speechMs), "played" as const), Deferred.await(cut)).pipe(
               Effect.onInterrupt(() => Effect.sync(() => void (record.outcome = "stopped"))),
               Effect.ensuring(Effect.flatMap(Clock.currentTimeMillis, (at) => Effect.sync(() => {
                 if (playing.get(deviceId) === cut) playing.delete(deviceId)
                 // P7: the device is audible until its echo tail is over (the ringing window stays closed meanwhile).
-                quietFrom.set(deviceId, at + ECHO_TAIL_MS)
+                audibleGate(deviceId).playbackEnded(at)
               })))
             )
             if (how === "reply") {
@@ -818,12 +844,21 @@ export const startTestModule = (definition: ModuleDefinition<any>, options: Star
     const firstAssistant = (deviceId: string) => people.assistantsOn(deviceId)[0]
     /** A reply as the kit keeps it: serve mode's rule (`keptReplyText`) over its sentences as clauses. */
     const kept = (assistant: string, text: string): KeptReply => ({ assistant, text: keptReplyText(text.split(/(?<=[.!?])\s+/)) })
+    /**
+     * A canned line the kit speaks (a command's answer, the interrupted reply said again, a repeat): it plays and finishes
+     * at once, and leaves the device audible for serve mode's echo tail (review round 2, a6), as a real reply's end does.
+     */
     const kitSay = (deviceId: string, assistant: string | undefined, text: string) =>
-      Effect.sync(() => {
-        spoken.push({ deviceId, assistant, text })
-        lastReplies.set(deviceId, kept(assistant ?? firstAssistant(deviceId) ?? "jeff", text))
-        return "done" as const
-      })
+      Effect.flatMap(Clock.currentTimeMillis, (at) =>
+        Effect.sync(() => {
+          spoken.push({ deviceId, assistant, text })
+          lastReplies.set(deviceId, kept(assistant ?? firstAssistant(deviceId) ?? "jeff", text))
+          const gate = audibleGate(deviceId)
+          gate.playbackStarted(at)
+          // Still audible when a reply of the device plays on (an announcement or `replying`): it ends with that.
+          if (!replying.has(deviceId) && !playing.has(deviceId)) gate.playbackEnded(at)
+          return "done" as const
+        }))
     const kitVolume = (deviceId: string, change: "louder" | "quieter" | { readonly to: number }) =>
       Effect.sync(() => {
         const t = changeReplyVolume(volumes, deviceId, change)
@@ -831,14 +866,19 @@ export const startTestModule = (definition: ModuleDefinition<any>, options: Star
         volumeSends.push(...t.sends)
         return t.change
       })
+    /** Cancellations per device (stop, cancel, a new conversation): a pending settlement compares them with its start's (b1). */
+    const cancellations = new Map<string, number>()
+    const cancelledOn = (deviceId: string) => void cancellations.set(deviceId, (cancellations.get(deviceId) ?? 0) + 1)
     const kitStopReply = (deviceId: string) =>
       Effect.suspend(() => {
+        cancelledOn(deviceId)
         sessionCalls.push({ deviceId, call: "stop" })
         const was = replying.has(deviceId)
         return Effect.as(setReplying(deviceId, false), was)
       })
     const kitCancel = (deviceId: string) =>
       Effect.suspend(() => {
+        cancelledOn(deviceId)
         sessionCalls.push({ deviceId, call: "cancel" })
         const was = replying.has(deviceId)
         return Effect.as(setReplying(deviceId, false), was)
@@ -852,7 +892,12 @@ export const startTestModule = (definition: ModuleDefinition<any>, options: Star
             const last = lastReplies.get(deviceId)
             return last === undefined ? Effect.succeed(false) : Effect.as(kitSay(deviceId, last.assistant, last.text), true)
           }),
-        newConversation: (deviceId) => Effect.sync(() => (deviceIds.has(deviceId) ? `kit-conversation-${++conversations}` : undefined))
+        newConversation: (deviceId) =>
+          Effect.sync(() => {
+            if (!deviceIds.has(deviceId)) return undefined
+            cancelledOn(deviceId)
+            return `kit-conversation-${++conversations}`
+          })
       }),
       DeviceControl.of({ replyVolume: (deviceId) => replyVolumeOf(volumes, deviceId), changeReplyVolume: kitVolume })
     ]
@@ -950,9 +995,10 @@ export const startTestModule = (definition: ModuleDefinition<any>, options: Star
         const assistant = as.assistant ?? firstAssistant(deviceId) ?? "jeff"
         const wake = as.wake !== false
         const route: RouteTarget = wake ? { assistant, by: "phrase", phrase: "hey jeff" } : { by: "dropped", reason: "asleep" }
-        // Closed while a reply or an announcement is audible there, or in its echo tail (its own line may be what was
-        // heard), and by the device's setting.
-        const audible = replying.has(deviceId) || playing.has(deviceId) || at < (quietFrom.get(deviceId) ?? 0)
+        // Closed while a reply, an announcement or a canned line is audible there, or in its echo tail (its own line may
+        // be what was heard), when the utterance interrupted a reply (`interrupting`: one was playing as it began), and by
+        // the device's setting.
+        const audible = replying.has(deviceId) || playing.has(deviceId) || audibleGate(deviceId).audible(at) || as.interrupting !== undefined
         const open = !audible && ringingWithoutWake(people.devices.get(deviceId)?.place)
         const d = decideUtterance({
           final: { _tag: "EndOfTurn", text },
@@ -965,7 +1011,9 @@ export const startTestModule = (definition: ModuleDefinition<any>, options: Star
         })
         return { deviceId, taken: d.taken }
       })
-    const phrasePorts = (deviceId: string, as: KitPhraseInput): PhrasePorts => ({
+    const phrasePorts = (deviceId: string, as: KitPhraseInput): PhrasePorts => {
+      const cancelledAtStart = cancellations.get(deviceId) ?? 0
+      return {
       deviceId,
       language,
       notify: () => notify,
@@ -978,6 +1026,7 @@ export const startTestModule = (definition: ModuleDefinition<any>, options: Star
         cancelPending: kitCancel(deviceId),
         lastReply: () => lastReplies.get(deviceId),
         interruptedReply: Effect.sync(() => (as.interrupting === undefined ? undefined : kept(as.interruptedBy ?? as.assistant ?? firstAssistant(deviceId) ?? "jeff", as.interrupting))),
+        replyCancelled: () => (cancellations.get(deviceId) ?? 0) !== cancelledAtStart,
         answering: () => firstAssistant(deviceId),
         say: (assistant, text) => kitSay(deviceId, assistant, text)
       },
@@ -989,9 +1038,10 @@ export const startTestModule = (definition: ModuleDefinition<any>, options: Star
       isPublished,
       pageText: (moduleId, text, max) => host.pageText(moduleId, text, max),
       trace: (t) => void phraseTraces.push({ ...t, deviceId })
-    })
+      }
+    }
     const runPhrase = (taken: Taken, deviceId: string, as: KitPhraseInput, text: string) =>
-      Effect.andThen(Effect.andThen(settle, driven(`the phrase "${text}"`, runTaken(taken, phrasePorts(deviceId, as)))), (outcome) => {
+      Effect.andThen(Effect.andThen(settle, driven(`the phrase "${text}"`, runTaken(taken, phrasePorts(deviceId, as)), { owned: true })), (outcome) => {
         outcomes.push({ deviceId, text, outcome })
         return Effect.as(settle, outcome)
       })

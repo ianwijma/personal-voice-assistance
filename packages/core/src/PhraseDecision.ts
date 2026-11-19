@@ -64,7 +64,8 @@ export interface UtteranceFacts {
   readonly commandsFor: (assistant: string | undefined) => CommandSet
   /**
    * The utterance was cancelled between its first events and its final (the page's Stop, a new conversation): nothing
-   * takes it (review round 1, E5); its final goes through the gates as before, and the conversations swallow it.
+   * takes it (review round 1, E5); its final goes through the gates as before, and the voice session sends it to the
+   * dispatcher with no words (review round 2, b2), so no conversation turns it into a turn.
    */
   readonly cancelled?: boolean
 }

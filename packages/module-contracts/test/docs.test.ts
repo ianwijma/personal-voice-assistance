@@ -7,6 +7,7 @@ import { describe, expect, it } from "vitest"
 
 const root = join(import.meta.dirname, "..", "..", "..")
 const guide = join(root, "docs", "MODULES.md")
+const architecture = join(root, "docs", "ARCHITECTURE.md")
 const MARK = /<!-- region: ([^#\s]+)#([a-z0-9-]+) -->\n```ts\n([\s\S]*?)```/g
 
 const regionOf = (file: string, name: string): string => {
@@ -40,6 +41,15 @@ describe("docs/MODULES.md", () => {
     for (const stale of ["(later `SessionControl`, `DeviceControl`)", "a phrase command or a presentation (P7, P10): they do not exist yet", "Phrase commands and\n> presentations"]) {
       expect(text.includes(stale), stale).toBe(false)
     }
+  })
+
+  it("the architecture guide says phrase commands exist: a present caller of the gateway, declared by the returned instance (P7 review round 2, a7)", () => {
+    const text = readFileSync(architecture, "utf8").replace(/\s+/g, " ")
+    for (const stale of ["later phrase commands", "later phrase commands and notification action handlers", "phrase commands, taps and routine steps"]) {
+      expect(text.includes(stale), stale).toBe(false)
+    }
+    expect(text).toContain("`host.actions.run`, and phrase commands (P7: `runTaken`")
+    expect(text).toContain("P7's phrase commands, the `phrases` of the actions an instance returns")
   })
 
   it("quotes the regions of the files it names, exactly", () => {

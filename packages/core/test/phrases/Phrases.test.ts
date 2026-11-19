@@ -5,6 +5,7 @@ import { describe, expect, it } from "vitest"
 import {
   type ActionPhrases,
   buildCommandSet,
+  compileActionPhrases,
   defineAction,
   HOST_CONTROL_PHRASES,
   HOST_CONTROLS,
@@ -18,6 +19,7 @@ import {
   phraseConflictIssues,
   phraseLanguageOf,
   phraseProblems,
+  PREPARE_STEP_WORK,
   registerActions,
   reservedFor
 } from "../../src/index.ts"
@@ -363,6 +365,91 @@ describe("slots are read from the characters said (E2, a2)", () => {
     ["wait minus five minutes", "a negative duration in words"]
   ])("%j does not match (%s)", (said) => {
     expect(matchCommand(set, said)).toBeUndefined()
+  })
+})
+
+describe("review round 2, a1: a leading decimal comma is the number's; a number covers every mark of its slot", () => {
+  const actions = actionsOf("r", [
+    { id: "num", label: "N", description: "N.", params: { n: Param.number({ label: "N" }) }, phrases: { en: ["set {n}", "set {n} now"], nl: ["zet {n}", "zet {n} nu"] }, run: () => Effect.void },
+    { id: "pct", label: "P", description: "P.", params: { p: Param.number({ label: "P", unit: "percent" }) }, phrases: { en: ["dim {p}", "dim {p} now"] }, run: () => Effect.void },
+    { id: "wait", label: "W", description: "W.", params: { d: Param.duration({ label: "D" }) }, phrases: { en: ["wait {d}", "wait {d} now"], nl: ["wacht {d}"] }, run: () => Effect.void },
+    { id: "note", label: "T", description: "T.", params: { t: Param.text({ label: "T", after: [] }) }, phrases: { en: ["note {t}", "note {t} now"] }, run: () => Effect.void }
+  ])
+  const en = buildCommandSet("en", actions)
+  const nl = buildCommandSet("nl", actions)
+  it.each([
+    [en, "set ,5", { n: 0.5 }],
+    [en, "set ,5.", { n: 0.5 }],
+    [en, "set ,5 now", { n: 0.5 }],
+    [en, "set, ,5 now", { n: 0.5 }],
+    [en, "set ,25 now", { n: 0.25 }],
+    [en, "dim ,5% now", { p: 0.5 }],
+    [nl, "zet ,5", { n: 0.5 }],
+    [nl, "zet ,5 nu", { n: 0.5 }],
+    [en, "set, 5", { n: 5 }],
+    [en, "set 5, now", { n: 5 }],
+    [en, "set -5 now", { n: -5 }],
+    [en, "dim 40% now", { p: 40 }],
+    [en, "note ,5 now", { t: ",5" }],
+    [en, "note #5", { t: "#5" }]
+  ])("%#: %j reads %j", (set, said, values) => {
+    expect(matchCommand(set, said)).toMatchObject({ values })
+  })
+  it.each([
+    [en, "wait ,5 minutes", "a decimal comma before a duration"],
+    [en, "wait ,5 minutes now", "a decimal comma before a duration, between literal words"],
+    [nl, "wacht ,5 minuten", "a decimal comma before a duration (Dutch)"],
+    [en, "set #5", "a number sign"],
+    [en, "set $5", "a currency sign"],
+    [en, "set €5 now", "a currency sign, between literal words"],
+    [en, "set 5+", "a plus after it"],
+    [en, "set +5", "a plus before it (no sign the value parser reads)"],
+    [en, "set 5/", "a slash after it"],
+    [en, "set 5/ now", "a slash after it, between literal words"],
+    [en, "set (5)", "brackets"],
+    [en, "set 5 % % now", "a second percent sign"],
+    [en, "wait 5 minutes+", "a plus after a duration"],
+    [nl, "zet #5 nu", "a number sign (Dutch)"]
+  ])("%#: %j does not match (%s)", (set, said) => {
+    expect(matchCommand(set, said)).toBeUndefined()
+  })
+})
+
+describe("review round 2, a2: a choice's name budget, its keys made once, and none made by the check", () => {
+  const name = (s: string, n: number = PHRASE_LIMITS.choiceNameChars) => `${s} ${"x".repeat(n)}`.slice(0, n)
+  /** 32 options, a value and a label each, and `aliases` aliases spread over them; names of `chars` characters. */
+  const choice = (aliases: number, chars: number = PHRASE_LIMITS.choiceNameChars) =>
+    Param.choice({
+      label: "C",
+      options: Array.from({ length: 32 }, (_, i) => ({ value: name(`v${i}`, chars), label: name(`label ${i}`, chars), aliases: i < aliases ? [name(`alias ${i}`, chars)] : [] }))
+    })
+  const declared = (param: ReturnType<typeof choice>, id = "go") => ({ id, label: "Go", description: "Go.", params: { c: param }, phrases: { en: Array.from({ length: 8 }, (_, v) => `go variant${v} to {c}`) }, run: () => Effect.void })
+
+  it("96 names of 40 characters are read; a 97th name, or a name of 41 characters, refuses the start with a sentence that says so", () => {
+    expect(phraseProblems("m", [defineAction(declared(choice(32)))])).toEqual([])
+    const full = choice(32)
+    const one = Param.choice({ label: "C", options: [...full.options.slice(0, 31), { ...full.options[31]!, aliases: [name("one"), name("two")] }] })
+    const over = phraseProblems("m", [defineAction(declared(one))])
+    expect(over).toHaveLength(8)
+    expect(over[0]).toContain("is a choice of 97 names (values, labels and aliases counted); a phrase reads at most 96")
+    const long = phraseProblems("m", [defineAction(declared(choice(0, 41)))])
+    expect(long[0]).toContain("of more than 40 characters")
+    expect(long).toHaveLength(8)
+  })
+
+  it("a choice's keys are made once, when a set is compiled, and reused by every phrase and action that reads it; the check makes none", () => {
+    const shared = choice(32)
+    const defs = [defineAction(declared(shared, "one")), defineAction(declared(shared, "two"))]
+    expect(phraseProblems("m", defs)).toEqual([])
+    const [one, two] = registerActions("m", defs)
+    const work = { units: 0 }
+    expect(compileActionPhrases("en", one!, work)).toHaveLength(8)
+    // 8 phrases, and the choice's 96 names once (the check before made none).
+    expect(work.units).toBe(8 + PHRASE_LIMITS.choiceNames)
+    work.units = 0
+    expect(compileActionPhrases("en", two!, work)).toHaveLength(8)
+    expect(work.units).toBe(8)
+    expect(PREPARE_STEP_WORK).toBeLessThan(PHRASE_LIMITS.choiceNames * 4)
   })
 })
 
