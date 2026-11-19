@@ -121,10 +121,13 @@ export const planOf = (r: Reminder): number | undefined => {
   return min
 }
 
+/** A resend retains its delivered ring's effective due time while `owed.from` starts the new lateness window. */
+export const owedDueAt = (r: Reminder, o: Owed): number => r.ring?.at === o.at ? r.ring.from ?? r.ring.at : o.from
+
 /** The moment a reminder next speaks (its owed occurrence, its snooze, its next occurrence); absent when it only waits for an answer. */
 export const speaksAt = (r: Reminder): number | undefined => {
   let min: number | undefined
-  for (const t of [r.owed?.from, r.ring?.snoozeUntil, r.dueAt]) if (t !== undefined && (min === undefined || t < min)) min = t
+  for (const t of [r.owed === undefined ? undefined : owedDueAt(r, r.owed), r.ring?.snoozeUntil, r.dueAt]) if (t !== undefined && (min === undefined || t < min)) min = t
   return min
 }
 
@@ -209,7 +212,7 @@ export const endOfToday = (now: number, zone: string): number =>
 /** The household's zone: `HOME_TIME_ZONE`, and when it is empty (the default), this machine's. */
 export const homeZone = (home: Readonly<Record<string, unknown>>): string => {
   const zone = home.HOME_TIME_ZONE
-  return typeof zone === "string" && zone.trim() !== "" ? zone : Intl.DateTimeFormat().resolvedOptions().timeZone
+  return typeof zone === "string" && zone.trim() !== "" ? zone.trim() : Intl.DateTimeFormat().resolvedOptions().timeZone
 }
 
 // ---- words ---------------------------------------------------------------------------------------------------------

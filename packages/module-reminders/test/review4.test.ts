@@ -122,18 +122,49 @@ describe("GPT review Round 2", () => {
     yield* k.advance(MIN)
     assert.deepStrictEqual(yield* openNotes(k), [])
   }))
-  for (const deferred of [false, true]) it.effect(`5: yesterday's Done preserves today's card${deferred ? " after deferred cleanup" : ""}`, () => Effect.gen(function*() {
+  it.effect("5: yesterday's Done preserves today's card", () => Effect.gen(function*() {
     const f = nofaults(), k = yield* startTestModule(faulty(f), { settings: { priority: "normal" } })
     const { old, fresh } = yield* overlapping(k, f, "write")
     const card = k.present.shown(SAM)[0]!
-    if (deferred) f.dismissFails = 1
     yield* k.notify.press(old.id, "done", as)
     yield* k.present.settle
     assert.deepStrictEqual(k.present.shown(SAM).map(c => c.id), [card.id])
     assert.deepStrictEqual((yield* openNotes(k)).map(n => n.id), [fresh!.id])
-    yield* k.advance(5_100)
+  }))
+  it.effect("5: yesterday's Done preserves today's card after deferred cleanup", () => Effect.gen(function*() {
+    const f = nofaults(), k = yield* startTestModule(faulty(f), { settings: { priority: "normal" } })
+    yield* k.tool("reminders_set", { text: "pills", when: "every day at 11 am", scope: "household" }, as)
+    const first = (yield* theRow(k)).value.dueAt!
+    yield* k.stop
+    yield* k.advance(first - (yield* k.now) + 60 * MIN)
+    yield* k.start
+    yield* k.advance(1_000)
     yield* k.present.settle
+    const old = (yield* openNotes(k))[0]!
+    yield* k.advance(first + DAY - (yield* k.now) - 2_000)
+    f.dismissFails = 1
+    yield* k.notify.press(old.id, "done", as)
+    assert.strictEqual(f.dismissFails, 0, "the dismissal failure must have been consumed")
+    const pending = (yield* theRow(k)).value.stop!
+    assert.isDefined(pending, "cleanup must actually be pending")
+    assert.strictEqual(pending.cardAt, first)
+    assert.strictEqual(pending.tryAt, (yield* k.now) + 5_000)
+    yield* assertJob(k, (yield* theRow(k)).id, { future: true })
+    // Today sends before the old cleanup retries; fail only its recording write so the cleanup remains pending.
+    crash(f)
+    yield* k.advance(4_000)
+    yield* k.present.settle
+    assert.strictEqual((yield* theRow(k)).value.stop?.cardAt, first)
+    const card = k.present.shown(SAM)[0]!
+    const fresh = (yield* openNotes(k))[0]!
+    assert.strictEqual(fresh.key?.endsWith(`:${first + DAY}`), true)
+    const runs = f.runs.due!
+    yield* k.advance(2_000)
+    yield* k.present.settle
+    assert.isAbove(f.runs.due!, runs, "the scheduled cleanup must have run")
+    assert.isUndefined((yield* theRow(k)).value.stop)
     assert.deepStrictEqual(k.present.shown(SAM).map(c => c.id), [card.id])
+    assert.deepStrictEqual((yield* openNotes(k)).map(n => n.id), [fresh.id])
   }))
   for (const entry of ["named", "unnamed", "action"]) it.effect(`6: ${entry} preserves a privacy refusal without claiming Done`, () => Effect.gen(function*() {
     const f = nofaults(), k = yield* startTestModule(faulty(f))
