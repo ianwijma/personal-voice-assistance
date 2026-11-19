@@ -7,6 +7,10 @@ import { Effect } from "effect"
 import { occurrences, sources } from "../src/index.ts"
 import { batchOf } from "../src/store.ts"
 import { advanceAndRefresh, allFixtures, AMS, controlledStore, everyone, ics, mutablePeople, sayOf, served, startCalendar } from "./fixtures.ts"
+import { vi } from "vitest"
+
+// Several test households are started per test here: on a loaded CI machine one test can pass the default 5 s.
+vi.setConfig({ testTimeout: 30_000 })
 
 const kitchen = { device: "kitchen-display" }
 const phone = { device: "robins-phone" }
