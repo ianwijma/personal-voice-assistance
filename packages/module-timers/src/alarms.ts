@@ -1,5 +1,5 @@
 import { type Actor, ActionError, CurrentJob, CurrentTurn, defineAction, defineCollection, defineModule, Devices, Param, type PreparedJob, type Row, Setting } from "@pva/core"
-import { describeRRule, nextOccurrence, parseDateTime, parseDtstart, parseRecurrence, parseTimeOfDay, speakMoment, speakTime } from "@pva/language"
+import { type DateOptions, describeRRule, nextOccurrence, parseDateTime, parseDtstart, parseNumber, parseRecurrence, parseTimeOfDay, speakMoment, speakTime } from "@pva/language"
 import { homeLanguage, type Language, say, StoredText } from "@pva/module-contracts"
 import { Clock, DateTime, Effect, Schema, Semaphore } from "effect"
 import { randomUUID } from "node:crypto"
@@ -120,6 +120,21 @@ const MORE_MINUTES = 5
 // Words and dates
 
 const timeWords = (time: ClockTime, language: Language): string => speakTime(time, language, { style: "12h", period: true }) ?? timeText(time)
+
+/** Probe the reader's vocabulary in minimal date/clock contexts, not a second list of day/time spellings.
+ * Called only for a matching name (at most NAME_CHARS), never once per alarm in a scan.
+ */
+const hasTemporalWord = (text: string, lang: Language, options: DateOptions): boolean =>
+  (text.match(/[\p{L}\p{N}]+(?:['’][\p{L}]+)*/gu) ?? []).some((word) =>
+    /\p{N}/u.test(word)
+    || /^(?:before|after|until|by|from|between|this|next|coming|at|on|in|past|to|of|and|half|quarter|oh|o'clock|oclock|voor|na|tot|tegen|vanaf|van|tussen|deze|dit|volgende|komende|aanstaande|op|om|over|en|kwart)$/iu.test(word)
+    || parseNumber(word, lang).kind !== "not-understood"
+    || parseNumber(`${lang === "nl" ? "een" : "one"} ${word}`, lang).kind !== "not-understood"
+    || [word, `1 ${word}`, `7 ${word}`, `${lang === "nl" ? "morgen" : "tomorrow"} ${word}`, `${lang === "nl" ? "over" : "in"} 1 ${word}`, ...(lang === "nl" ? [`7 's ${word}`] : [])]
+      .some((part) => parseDateTime(part, lang, options).kind !== "not-understood")
+    || parseRecurrence(word, lang, options).kind !== "not-understood"
+    || parseRecurrence(`${lang === "nl" ? "elke" : "every"} ${word}`, lang, options).kind !== "not-understood")
+
 
 /** "tomorrow at quarter to seven in the morning": a nominal date and time, said relative to `now` in the zone. */
 const momentOf = (date: string, time: string, now: number, zone: string, language: Language): string =>
@@ -556,10 +571,14 @@ export const alarmsModule = defineModule({
             if (read.rows.length === 0) return read.cut ? yield* Effect.fail(unreadable()) : answer(say(texts, lang, "none"))
             return ask(read.rows, read.cut)
           }
-          const time = named ? undefined : parseTimeOfDay(which, lang, { band: ALARM_BAND })
-          // Dates take precedence over names; unsupported calendar spans ask as well.
-          if (!named && time?.kind !== "ok" && (parseDateTime(which, lang, { now, timeZone: zone(), band: ALARM_BAND }).kind !== "not-understood"
-            || /\b(?:days?|weeks?|weekends?|months?|years?|dag|dagen|weken|weekenden|maand|maanden|jaar|jaren)\b/iu.test(which))) return answer(say(texts, lang, "dateTarget"))
+          const byName = read.rows.filter((r) => r.value.deviceId === here && r.value.name !== undefined && (named ? nameKey(r.value.name) === key : r.value.name.trim().toLowerCase() === implicitName))
+          const temporalQuestion = () => answer(say(texts, lang, byName.length === 0 ? "dateTarget" : "targetAmbiguous", {
+            list: listOf(byName.map((r) => itemOf(r, here, read.open, now, lang)), lang), words: cut(which!, NAME_CHARS)
+          }))
+          const options = { now, timeZone: zone(), band: ALARM_BAND }
+          const time = named ? undefined : parseTimeOfDay(which, lang, options)
+          // A whole date/time takes precedence; an unresolved temporal name must ask, never cancel by name alone.
+          if (!named && time?.kind !== "ok" && parseDateTime(which, lang, options).kind !== "not-understood") return temporalQuestion()
           // A time request matches times, even when a local name has the same words.
           if (time?.kind === "ok") {
             const at = read.rows.filter((r) => timesOf(r, read.open, now).some((t) => t.hour === time.value.hour && t.minute === time.value.minute))
@@ -577,8 +596,7 @@ export const alarmsModule = defineModule({
             const words = timeWords({ hour: time.value.hour, minute: time.value.minute }, lang)
             return read.cut ? yield* Effect.fail(unreadable()) : answer(say(texts, lang, "noTimeMatch", { time: words }))
           }
-          if (clock) return answer(say(texts, lang, "whenAmbiguous"))
-          const byName = read.rows.filter((r) => r.value.deviceId === here && r.value.name !== undefined && (named ? nameKey(r.value.name) === key : r.value.name.trim().toLowerCase() === implicitName))
+          if (clock || !named && byName.length > 0 && hasTemporalWord(which, lang, options)) return temporalQuestion()
           if (byName.length === 1) return one(byName[0]!)
           if (byName.length > 1) return ask(byName, false)
           return read.cut ? yield* Effect.fail(unreadable()) : answer(say(texts, lang, "dateTarget"))
