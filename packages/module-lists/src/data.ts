@@ -53,7 +53,9 @@ export const ListRow = Schema.Struct({
   open: Schema.Int.check(Schema.isBetween({ minimum: 0, maximum: MAX_OPEN })),
   done: Schema.Int.check(Schema.isBetween({ minimum: 0, maximum: 1_000_000_000 })),
   /** Set when it was deleted: hidden, and removed with its items once the undo window has passed. */
-  deletedAt: Schema.optionalKey(EPOCH_MS)
+  deletedAt: Schema.optionalKey(EPOCH_MS),
+  /** Pins at or before this store revision were cancelled by a deletion; undo keeps the cancellation. */
+  pinsCancelledThrough: Schema.optionalKey(Schema.Int.check(Schema.isBetween({ minimum: 0, maximum: Number.MAX_SAFE_INTEGER })))
 })
 export type ListRow = typeof ListRow.Type
 
@@ -61,8 +63,8 @@ export const lists = defineCollection({
   name: "lists",
   scope: "household",
   schema: ListRow,
-  // The worst legal list is 167 characters of JSON (checkModule computes it): one read takes all MAX_LISTS.
-  maxChars: 200
+  // The worst legal list is 207 characters of JSON (checkModule computes it): one read takes all MAX_LISTS.
+  maxChars: 240
 })
 
 // ---------------------------------------------------------------------------------------------------------------------

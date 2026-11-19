@@ -1,4 +1,4 @@
-import { ActionError, type Collection, CurrentTurn, type ModuleStore, type ParamOption, resolveOption, type Row, type StoreFailure, type StoreTx, type TxCollection, type WriteOptions } from "@pva/core"
+import { ActionError, type Actor, type Collection, CurrentTurn, type ModuleStore, type ParamOption, resolveOption, type Row, type StoreFailure, type StoreTx, type TxCollection, type WriteOptions } from "@pva/core"
 import { convertAmount, type UnitId } from "@pva/language"
 import { type Language, LISTS_LIMITS, say } from "@pva/module-contracts"
 import { Deferred, Effect, Exit, Semaphore } from "effect"
@@ -157,7 +157,11 @@ export const makeEngine = (rawStore: ModuleStore) => {
     collection: (c) => rawStore.collection(c),
     transaction: (f) => {
       const touched = new Set<string>()
-      return Effect.tap(rawStore.transaction((tx) => f(watched(tx, touched))), () => Effect.sync(() => onChange(touched)))
+      return rawStore.transaction((tx) => {
+        const result = f(watched(tx, touched))
+        tx.afterCommit(() => onChange(touched))
+        return result
+      })
     }
   }
   const listStore = store.collection(lists)
@@ -182,10 +186,10 @@ export const makeEngine = (rawStore: ModuleStore) => {
    * outside a turn there is no identity. One bounded record: finished operations are forgotten oldest first, and an
    * operation still running is never forgotten.
    */
-  const once = (operation: string, asked: string, run: Effect.Effect<{ readonly say: string }, ActionError>, aborted: string): Effect.Effect<{ readonly say: string }, ActionError> =>
+  const once = (operation: string, asked: string, run: (complete: (effect: Effect.Effect<{ readonly say: string }, ActionError>) => Effect.Effect<{ readonly say: string }, ActionError>) => Effect.Effect<{ readonly say: string }, ActionError>, aborted: string): Effect.Effect<{ readonly say: string }, ActionError> =>
     Effect.gen(function*() {
       const turn = yield* CurrentTurn
-      if (turn === undefined || turn.source !== "phrase") return yield* run
+      if (turn === undefined || turn.source !== "phrase") return yield* run((effect) => effect)
       const key = [operation, turn.assistantId, turn.conversationId, turn.turnId, turn.deviceId, asked].join("\u0000")
       const kept = records.get(key)
       if (kept !== undefined) {
@@ -204,8 +208,16 @@ export const makeEngine = (rawStore: ModuleStore) => {
         mine.finished = true
         return Deferred.succeed(mine.deferred, outcome)
       })
-      return yield* run.pipe(
+      const completed = (exit: Exit.Exit<{ readonly say: string }, ActionError>) => {
+        if (Exit.isSuccess(exit)) return finish({ say: exit.value.say })
+        const failure = exit.cause.reasons.find((r) => r._tag === "Fail")
+        return finish({ fail: failure !== undefined ? (failure.error as ActionError).message : aborted })
+      }
+      // Only the bounded write and its reply are protected; reads and waiting for the permit can still be interrupted.
+      // Finish the replay record inside that protection, before a pending interruption reaches the caller.
+      return yield* run((effect) => Effect.uninterruptible(Effect.onExit(effect, completed))).pipe(
         Effect.onExit((exit) => {
+          if (mine.finished) return Effect.void
           if (Exit.isSuccess(exit)) return finish({ say: exit.value.say })
           const failure = exit.cause.reasons.find((r) => r._tag === "Fail")
           if (failure !== undefined && exit.cause.reasons.length === 1) return finish({ fail: (failure.error as ActionError).message })
@@ -525,7 +537,7 @@ export const makeEngine = (rawStore: ModuleStore) => {
     })
 
   /** Tick off or remove rows found before (each still at the rev it was read at, or the whole change is a conflict). */
-  const setStatus = (list: string, rows: ReadonlyArray<Row<Item>>, to: "done" | "removed", op: "complete" | "remove" | "clear", key: UndoKey, now: number) =>
+  const setStatus = (list: string, rows: ReadonlyArray<Row<Item>>, to: "done" | "removed", op: "complete" | "remove" | "clear", key: UndoKey, now: number, actor?: Actor) =>
     refusable(store, (tx) => {
       if (ensureList(tx, list) === undefined) throw new Refusal("gone")
       const t = tx.collection(items)
@@ -538,14 +550,14 @@ export const makeEngine = (rawStore: ModuleStore) => {
         const from = r.value.status
         if (from === to) continue
         const at = now + order++
-        const row = t.update(r.id, (v) => withStatus(v, to, at), { expectRev: r.rev })
+        const row = t.update(r.id, (v) => withStatus(v, to, at), { expectRev: r.rev, ...(actor !== undefined ? { actor } : {}) })
         steps.push({ id: row.id, rev: row.rev, from, since: r.value.since })
         if (from === "open") open--
         if (from === "done") done--
         if (to === "done") done++
       }
       if (steps.length === 0) return 0
-      const after = bump(tx, list, open, done)
+      const after = bump(tx, list, open, done, actor !== undefined ? { actor } : undefined)
       remember(tx, key, { at: now, op, list, listRev: after.rev, steps })
       return steps.length
     })
@@ -641,7 +653,10 @@ export const makeEngine = (rawStore: ModuleStore) => {
       const result = yield* refusable(store, (tx) => {
         const row = ensureList(tx, list)
         if (row === undefined) throw new Refusal("gone")
-        const after = tx.collection(lists).update(list, (v) => ({ ...v, deletedAt: now }), { expectRev: row.rev })
+        const deleted = tx.collection(lists).update(list, (v) => ({ ...v, deletedAt: now }), { expectRev: row.rev })
+        // A durable cutoff cancels pins that existed at deletion, even if undo restores the list before the worker reads it.
+        // A later explicit show writes a newer pin and establishes new intent. No pin scan is added to this turn.
+        const after = tx.collection(lists).update(list, (v) => ({ ...v, pinsCancelledThrough: deleted.rev }))
         remember(tx, key, { at: now, op: "delete", list, listRev: after.rev, steps: [] })
         return after
       })

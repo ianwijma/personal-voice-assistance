@@ -89,9 +89,9 @@ export const listsModule = defineModule({
   description: "Shopping and to-do lists: add, read, tick off and remove items.",
   enabledByDefault: false,
   settings,
-  // Version 2: an item's `match` holds its status too (indexed with `since`), so a name finds the open item first.
-  // The pins (where a list is shown as a checklist) are a new collection: the existing ones are as they were.
-  storage: { version: 2, collections: [lists, items, undo, pins] },
+  // Version 2 added status to an item's `match`, and pins. Version 3 adds an optional deletion cutoff to lists:
+  // existing values stay as they are; undo preserves that cutoff so it cannot resurrect cancelled pins.
+  storage: { version: 3, collections: [lists, items, undo, pins] },
   shared: (ctx) =>
     Effect.gen(function*() {
       const engine = makeEngine(ctx.store)
@@ -193,10 +193,11 @@ export const listsModule = defineModule({
         latency: "instant",
         // A phrase command runs once per invocation: a repeat of the same one gets its first outcome (`engine.once`).
         run: ({ items: text, list: value }) =>
-          engine.once("add", JSON.stringify([text, value ?? null]), serial(Effect.gen(function*() {
+          engine.once("add", JSON.stringify([text, value ?? null]), (complete) => serial(Effect.gen(function*() {
             const l = lang()
             yield* engine.loadLists.pipe(Effect.mapError((e) => actionError(storeSentence(l, e, true))))
-            const picked = chosen(value)
+            const turn = yield* CurrentTurn
+            const picked = chosen(turn?.source === "phrase" ? SHOPPING : value)
             // The typed path hands over the rest of the sentence: "milk to the shopping list", "melk op mijn lijstje".
             const named = picked.list === undefined ? takeListSuffix(text.replace(/\s+/g, " ").trim(), LIST_MARKERS, (w) => engine.resolveList(w, l)) : { text, list: picked.list, mine: picked.mine }
             // A list said the way a list is named, that the household does not have: refused, nothing written elsewhere.
@@ -206,17 +207,19 @@ export const listsModule = defineModule({
             if (typeof things === "string") return yield* Effect.fail(actionError(things))
             const now = yield* Clock.currentTimeMillis
             const key = yield* undoKey
-            const result = yield* engine.add(target, things, merge, key, now, l).pipe(Effect.mapError((e) => actionError(storeSentence(l, e, false))))
-            const plain = engine.phraseOf(target, l)
-            if (isRefusal(result)) {
-              return yield* Effect.fail(actionError(result.reason === "full" ? speak(l, "full", { list: plain, count: MAX_OPEN }) : speak(l, "unknownList", { name: plain, items: listOf(engine.listNames(l), l, 8) })))
-            }
-            // "My shopping list": there are no personal lists, so it went on the household's, and the answer says so.
-            const shared = named.mine === true
-            const phrase = shared ? say(texts, l, "householdsList", { name: l === "en" ? plain.replace(/^the /, "") : plain }) : plain
-            if (result.added.length === 0) return { say: speak(l, shared ? "alreadyShared" : "already", { list: phrase, items: listOf(result.already, l) }) }
-            if (result.already.length === 0) return { say: speak(l, shared ? "addedShared" : "added", { list: phrase, items: listOf(result.added, l) }) }
-            return { say: speak(l, shared ? "addedAndAlreadyShared" : "addedAndAlready", { list: phrase, items: listOf(result.added, l), already: listOf(result.already, l) }) }
+            return yield* complete(Effect.gen(function*() {
+              const result = yield* engine.add(target, things, merge, key, now, l).pipe(Effect.mapError((e) => actionError(storeSentence(l, e, false))))
+              const plain = engine.phraseOf(target, l)
+              if (isRefusal(result)) {
+                return yield* Effect.fail(actionError(result.reason === "full" ? speak(l, "full", { list: plain, count: MAX_OPEN }) : speak(l, "unknownList", { name: plain, items: listOf(engine.listNames(l), l, 8) })))
+              }
+              // "My shopping list": there are no personal lists, so it went on the household's, and the answer says so.
+              const shared = named.mine === true
+              const phrase = shared ? say(texts, l, "householdsList", { name: l === "en" ? plain.replace(/^the /, "") : plain }) : plain
+              if (result.added.length === 0) return { say: speak(l, shared ? "alreadyShared" : "already", { list: phrase, items: listOf(result.already, l) }) }
+              if (result.already.length === 0) return { say: speak(l, shared ? "addedShared" : "added", { list: phrase, items: listOf(result.added, l) }) }
+              return { say: speak(l, shared ? "addedAndAlreadyShared" : "addedAndAlready", { list: phrase, items: listOf(result.added, l), already: listOf(result.already, l) }) }
+            }))
           })), speak(lang(), "unsaved"))
       })
 
@@ -393,7 +396,7 @@ export const listsModule = defineModule({
               case "gone":
                 return yield* Effect.fail(actionError(speak(l, "unknownList", { name: phrase, items: listOf(engine.listNames(l), l, 8) })))
               case "limit":
-                return yield* Effect.fail(actionError(speak(l, "tooManyPins")))
+                return yield* Effect.fail(actionError(speak(l, "screenCapacity")))
               case "failed":
                 return yield* Effect.fail(actionError(speak(l, "showFailed", { list: phrase })))
               case "not-shown":

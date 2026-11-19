@@ -98,6 +98,7 @@ describe("one pin per device, found by its id (finding 1)", () => {
       yield* kit.action("add", { items: "milk" })
       // Another device's checklist, which no amount of work on the kitchen display may hide from its own close.
       yield* kit.action("show", {}, { device: "hall-screen" })
+      yield* kit.present.settle
       for (const name of names) {
         yield* kit.action("show", { list: name }, { device: "kitchen-display" })
         refuse.on = true
@@ -296,7 +297,7 @@ describe("a live pin until its actual end (finding 7)", () => {
 // Review round 2 (reports/modules/follow-lists-r2.md): the row is written before the screen is touched, and a new
 // signal is never erased by an older lookup.
 describe("review round 2", () => {
-  it.effect("a first show is owed before it is shown: interrupted right after the host accepted it, a restart finishes it and the checklist follows its list and closes", () =>
+  it.effect("a first show is owed before it is shown: interrupted right after acceptance, the worker finishes it and a restart keeps it following its list and closing", () =>
     Effect.gen(function*() {
       const accepted = yield* Deferred.make<void>()
       let interruptNext = true
@@ -318,11 +319,12 @@ describe("review round 2", () => {
       yield* kit.action("add", { items: "milk" })
       const pending = yield* Effect.forkScoped(kit.action("show", {}, { device: "kitchen-display" }))
       yield* Deferred.await(accepted)
+      assert.deepStrictEqual((yield* pinRows(kit)).map((r) => [r.value.device, r.value.owed]), [["kitchen-display", "show"]])
       yield* Fiber.interrupt(pending)
       yield* kit.present.settle
-      // On the screen, and a row that says a show is owed.
+      // The committed intent woke the worker, which completed the show without needing a restart.
       assert.deepStrictEqual(textsOn(kit, "kitchen-display"), ["milk"])
-      assert.deepStrictEqual((yield* pinRows(kit)).map((r) => [r.value.device, r.value.owed]), [["kitchen-display", "show"]])
+      assert.deepStrictEqual((yield* pinRows(kit)).map((r) => [r.value.device, r.value.owed]), [["kitchen-display", undefined]])
       yield* kit.restart
       yield* kit.present.settle
       assert.deepStrictEqual((yield* pinRows(kit)).map((r) => [r.value.device, r.value.owed]), [["kitchen-display", undefined]])

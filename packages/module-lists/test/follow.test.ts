@@ -397,7 +397,7 @@ describe("the checklist", () => {
       yield* kit.present.settle
       const refused = yield* kit.action("show", {}, { device: "screen-9" })
       assert.isFalse(refused.ok)
-      assert.strictEqual(refused.message, "Too many lists are on screens already; close one first.")
+      assert.strictEqual(refused.message, "There isn't room to show this list right now; close something on a screen first.")
       assert.deepStrictEqual(kit.present.shown("screen-9"), [])
       assert.strictEqual((yield* kit.moduleStore().collection(pins).list({})).length, 8)
     }))
@@ -475,6 +475,8 @@ describe("a tick on the checklist", () => {
       yield* kit.moduleStore().transaction((tx) => void tx.collection(items).update(milk.id, (v) => withStatus(v, "removed", 5)))
       const r = yield* kit.present.press(presentation, "tick", { device: "kitchen-display", item: id("milk"), done: true })
       assert.deepStrictEqual(r, { ok: true, say: "That isn't on the list any more." })
+      yield* kit.present.settle
+      assert.deepStrictEqual(textsOf(checklistOf(kit, "kitchen-display")), ["eggs", "bread"])
     }))
 })
 
@@ -484,6 +486,7 @@ describe("the pin and what it stores", () => {
       const kit = yield* startTestModule(listsModule, { household: HOUSEHOLD })
       yield* kit.action("add", { items: "secret milk" })
       yield* kit.action("show", {}, { device: "robins-phone" })
+      yield* kit.present.settle
       const rows = yield* kit.moduleStore().collection(pins).list({})
       assert.strictEqual(rows.length, 1)
       assert.deepStrictEqual(Object.keys(rows[0]!.value).sort(), ["device", "key", "list", "shown", "until"])
