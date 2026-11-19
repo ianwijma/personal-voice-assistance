@@ -1,5 +1,5 @@
 import { type HostView, type Row, StoreError, type StoreFailure } from "@pva/core"
-import { type LocalDate, speakDuration, speakList } from "@pva/language"
+import { formatDtstart, type LocalDate, nextOccurrence, normalizeTimeZone, speakDuration, speakList } from "@pva/language"
 import { isLine, type Language } from "@pva/module-contracts"
 import { Effect } from "effect"
 
@@ -8,10 +8,15 @@ import { Effect } from "effect"
  * the bounded scan of a collection, and how a store failure is worded. Pure helpers; nothing here keeps state.
  */
 
-/** The household's zone: `HOME_TIME_ZONE`, and when it is empty (the default), this machine's (docs/MODULES.md §6). */
+/**
+ * The household's zone, canonical: `HOME_TIME_ZONE` trimmed and read by `@pva/language`'s `normalizeTimeZone` (the Home
+ * section accepts it with spaces around it), and when it is empty or not a zone this machine knows, this machine's
+ * (docs/MODULES.md §6). Every parse and every formatter of the package takes its zone from here.
+ */
 export const homeZone = (view: Pick<HostView, "home">): string => {
   const zone = view.home.HOME_TIME_ZONE
-  return typeof zone === "string" && zone.trim() !== "" ? zone : Intl.DateTimeFormat().resolvedOptions().timeZone
+  const named = typeof zone === "string" && zone.trim() !== "" ? normalizeTimeZone(zone.trim()) : undefined
+  return named ?? normalizeTimeZone(Intl.DateTimeFormat().resolvedOptions().timeZone) ?? "UTC"
 }
 
 // The formatter of the last zone asked for: the household has one zone, so this is made once, not on every read.
@@ -32,6 +37,41 @@ export const localOf = (instant: number, timeZone: string): { readonly date: Loc
   const n = (type: string) => Number(parts.find((p) => p.type === type)?.value ?? "0")
   return { date: { year: n("year"), month: n("month"), day: n("day") }, time: { hour: n("hour"), minute: n("minute") } }
 }
+
+/** A clock time: hour 0–23, minute 0–59. */
+export interface ClockTime {
+  readonly hour: number
+  readonly minute: number
+}
+
+/**
+ * The instant of a nominal local date and time in a zone, by `@pva/language`'s rules (a one-instance series: a time the
+ * clocks skip is taken at the offset before the gap, a time that happens twice is the first), or `undefined`.
+ */
+export const instantOf = (date: LocalDate, time: ClockTime, zone: string): number | undefined => {
+  const dtstart = formatDtstart({ ...date, hour: time.hour, minute: time.minute }, zone)
+  return dtstart === undefined ? undefined : nextOccurrence({ rrule: "FREQ=DAILY;COUNT=1", dtstart, timeZone: zone }, 0)
+}
+
+/**
+ * The nominal local date of an instant that a rule made for the clock time `time`: the date whose `time` it stands for.
+ * Most days that is the instant's own local date; when the clocks skipped `time` the instant lies after the gap (23:30 in
+ * Nuuk's spring gap is 00:30 the next day), and the nominal date is the one before the shift.
+ */
+export const nominalDateOf = (instant: number, time: ClockTime, zone: string): LocalDate => {
+  const local = localOf(instant, zone).time
+  let diff = local.hour * 60 + local.minute - (time.hour * 60 + time.minute)
+  if (diff > 720) diff -= 1440
+  if (diff <= -720) diff += 1440
+  return localOf(instant - diff * 60_000, zone).date
+}
+
+/** "2026-11-18" ⇄ a local date. */
+export const dateText = (d: LocalDate): string => `${String(d.year).padStart(4, "0")}-${String(d.month).padStart(2, "0")}-${String(d.day).padStart(2, "0")}`
+export const dateOf = (text: string): LocalDate => ({ year: Number(text.slice(0, 4)), month: Number(text.slice(5, 7)), day: Number(text.slice(8, 10)) })
+/** "06:45" ⇄ a clock time. */
+export const timeText = (t: ClockTime): string => `${String(t.hour).padStart(2, "0")}:${String(t.minute).padStart(2, "0")}`
+export const timeOf = (text: string): ClockTime => ({ hour: Number(text.slice(0, 2)), minute: Number(text.slice(3, 5)) })
 
 /** The longest name of a timer or an alarm (the `Timers` contract's `labelChars`). */
 export const NAME_CHARS = 60

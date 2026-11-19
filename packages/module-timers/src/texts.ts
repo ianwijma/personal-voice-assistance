@@ -44,6 +44,7 @@ export const timerTexts = defineTexts({
     cancelledAll: "Cancelled {count} timers.",
     cancelledAllCut: "Cancelled {count} timers; there are more, so say it again.",
     cancelledNone: "There were no timers to cancel.",
+    cancelledAllPending: "Cancelled {count} timers; a ring or a countdown is still being taken away, and I keep trying.",
     busy: "The timers are busy just now; try again in a moment.",
     failed: "That didn't work with the timers; try again.",
     unreadable: "I couldn't read the timers just now.",
@@ -58,6 +59,16 @@ export const timerTexts = defineTexts({
     gone: "That timer is gone.",
     spoken: "{Name}: {left}.",
     timerWord: "Timer",
+    ringEnded: "That ring has ended.",
+    stoppedMeanwhile: "The ring was stopped, so {name} will not ring again.",
+    ringPending: "{Name} cancelled; its ring is still being stopped, and I keep trying.",
+    stoppedPending: "{Name}: its ring is still being stopped, and I keep trying.",
+    screenPending: "{Name} cancelled; its countdown is still being taken off the screen, and I keep trying.",
+    restartedPending: "{Name} runs again: {left}. Its old ring is still being stopped.",
+    pausedScreenPending: "{Name} paused with {left} left; its countdown is still being taken off the screen.",
+    finished: "{Name} is stopped now.",
+    itemWaiting: "{name} is done and waiting to ring",
+    oneWaiting: "{Name} is done; its ring could not be sent yet, and I keep trying.",
     ambient: "Timers running (most recently changed): {list}{more}."
   },
   nl: {
@@ -99,6 +110,7 @@ export const timerTexts = defineTexts({
     cancelledAll: "{count} timers geannuleerd.",
     cancelledAllCut: "{count} timers geannuleerd; er zijn er meer, zeg het nog eens.",
     cancelledNone: "Er waren geen timers om te annuleren.",
+    cancelledAllPending: "{count} timers geannuleerd; een afgaan of aftellen wordt nog weggehaald, ik blijf het proberen.",
     busy: "De timers zijn even bezet; probeer het zo nog eens.",
     failed: "Dat lukte niet met de timers; probeer het nog eens.",
     unreadable: "Ik kon de timers nu niet lezen.",
@@ -113,6 +125,16 @@ export const timerTexts = defineTexts({
     gone: "Die timer is er niet meer.",
     spoken: "{Name}: {left}.",
     timerWord: "Timer",
+    ringEnded: "Dat afgaan is al voorbij.",
+    stoppedMeanwhile: "Het afgaan is gestopt, dus {name} gaat niet nog eens af.",
+    ringPending: "{Name} geannuleerd; het afgaan wordt nog gestopt, ik blijf het proberen.",
+    stoppedPending: "{Name}: het afgaan wordt nog gestopt, ik blijf het proberen.",
+    screenPending: "{Name} geannuleerd; het aftellen gaat nog van het scherm, ik blijf het proberen.",
+    restartedPending: "{Name} loopt weer: {left}. Het oude afgaan wordt nog gestopt.",
+    pausedScreenPending: "{Name} gepauzeerd, nog {left}; het aftellen gaat nog van het scherm.",
+    finished: "{Name} is nu gestopt.",
+    itemWaiting: "{name} is klaar en wacht om af te gaan",
+    oneWaiting: "{Name} is klaar; het afgaan kon nog niet worden verstuurd, ik blijf het proberen.",
     ambient: "Lopende timers (laatst veranderd eerst): {list}{more}."
   }
 })
@@ -171,6 +193,16 @@ export const alarmTexts = defineTexts({
     more: "Five more minutes",
     snoozed: "It rings again in {left}.",
     moreDone: "Five more minutes.",
+    ringEnded: "That ring has ended.",
+    stoppedMeanwhile: "The ring was stopped, so it will not ring again now.",
+    alarmWord: "the alarm",
+    alarmOn: "the alarm on {device}",
+    itemAgain: "{what}, ringing again {moment}",
+    itemRinging: "{what}, ringing now",
+    cancelledAgain: "The snoozed alarm is cancelled.",
+    cancelledAgainNext: "The snoozed alarm is cancelled; the next one is {next}.",
+    ringPending: "The alarm is cancelled; its ring is still being stopped, and I keep trying.",
+    finished: "The alarm's ring is stopped now.",
     gone: "That alarm is gone."
   },
   nl: {
@@ -225,6 +257,16 @@ export const alarmTexts = defineTexts({
     more: "Nog vijf minuten",
     snoozed: "Hij gaat over {left} weer af.",
     moreDone: "Nog vijf minuten.",
+    ringEnded: "Dat afgaan is al voorbij.",
+    stoppedMeanwhile: "Het afgaan is gestopt, dus hij gaat nu niet nog eens af.",
+    alarmWord: "de wekker",
+    alarmOn: "de wekker op {device}",
+    itemAgain: "{what}, gaat weer af {moment}",
+    itemRinging: "{what}, gaat nu af",
+    cancelledAgain: "De gesnoozede wekker is geannuleerd.",
+    cancelledAgainNext: "De gesnoozede wekker is geannuleerd; de volgende is {next}.",
+    ringPending: "De wekker is geannuleerd; het afgaan wordt nog gestopt, ik blijf het proberen.",
+    finished: "Het afgaan van de wekker is nu gestopt.",
     gone: "Die wekker is er niet meer."
   }
 })

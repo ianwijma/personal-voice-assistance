@@ -7,8 +7,8 @@ import { timersModule } from "./timers.ts"
  * have one without the other. Both keep household data in their own collection, ring through the notification service
  * with one scheduler job per timer or alarm, and say every sentence in English and Dutch.
  */
-export { ALARM_BAND, type Alarm, alarms, alarmsModule, type AlarmsOps, DELIVER_WITHIN_MS, MAX_ALARMS } from "./alarms.ts"
-export { type Timer, timers, timersModule, type TimersOps } from "./timers.ts"
+export { ALARM_BAND, type Alarm, alarms, alarmsModule, type AlarmsOps, DELIVER_WITHIN_MS, MAX_ALARMS, RETRY_RING_MS as ALARM_RETRY_RING_MS } from "./alarms.ts"
+export { RETRY_CLEANUP_MS, RETRY_RING_MS, type Timer, timers, timersModule, type TimersOps } from "./timers.ts"
 export { alarmTexts, timerTexts } from "./texts.ts"
 
 /**

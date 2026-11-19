@@ -27,7 +27,7 @@ describe("starting and asking", () => {
       assert.strictEqual(said(yield* kit.action("start", { duration: "90 seconds" })), "Timer set for a minute and a half.")
       const rows = yield* kit.moduleStore().collection(timers).list({})
       assert.strictEqual(rows.length, 2)
-      const jobs = (yield* kit.jobs).filter((j) => j.handler === "ring" && j.state === "scheduled")
+      const jobs = (yield* kit.jobs).filter((j) => j.handler === "due" && j.state === "scheduled")
       assert.strictEqual(jobs.length, 2)
       // The job rings on the device that asked: its origin.
       assert.isTrue(jobs.every((j) => j.origin.deviceId === "kitchen-display"))
@@ -76,7 +76,7 @@ describe("which timer", () => {
       assert.strictEqual(said(yield* kit.action("pause", {})), "Pasta timer paused with 10 minutes left.")
       yield* kit.advance(1_000)
       yield* kit.action("start", { duration: "6 minutes", name: "eggs" })
-      assert.strictEqual(said(yield* kit.action("cancel", {})), "There are 2 timers: pasta timer paused with 10 minutes left and eggs timer with 6 minutes left. Which one?")
+      assert.strictEqual(said(yield* kit.action("cancel", {})), "There are 2 timers: eggs timer with 6 minutes left and pasta timer paused with 10 minutes left. Which one?")
       // Nothing was cancelled by the question.
       assert.strictEqual((yield* kit.moduleStore().collection(timers).list({ where: { phase: "active" } })).length, 2)
       assert.strictEqual(said(yield* kit.action("cancel", { name: "eggs" })), "Eggs timer cancelled.")
@@ -92,7 +92,7 @@ describe("adjust, pause, resume, cancel", () => {
       assert.strictEqual(said(yield* kit.action("adjust", { amount: "5 minutes" })), "Pasta timer: a quarter of an hour left.")
       assert.strictEqual(said(yield* kit.action("adjust", { amount: "20 minutes", change: "remove" })), "That would end it now: pasta timer has only a quarter of an hour left.")
       assert.strictEqual(said(yield* kit.action("adjust", { amount: "3 minutes", change: "remove" })), "Pasta timer: 12 minutes left.")
-      const live = (yield* kit.jobs).filter((j) => j.handler === "ring" && j.state === "scheduled")
+      const live = (yield* kit.jobs).filter((j) => j.handler === "due" && j.state === "scheduled")
       assert.strictEqual(live.length, 1)
       assert.strictEqual(live[0]!.dueAt, (yield* kit.now) + 12 * MIN)
       yield* kit.present.settle
@@ -139,7 +139,7 @@ describe("adjust, pause, resume, cancel", () => {
       for (const name of ["a", "b", "c"]) yield* kit.action("start", { duration: "10 minutes", name })
       assert.strictEqual(said(yield* kit.action("cancel", { all: true })), "Cancelled 3 timers.")
       assert.strictEqual(said(yield* kit.action("cancel", { all: true })), "There were no timers to cancel.")
-      assert.deepStrictEqual((yield* kit.jobs).filter((j) => j.handler === "ring" && j.state === "scheduled"), [])
+      assert.deepStrictEqual((yield* kit.jobs).filter((j) => j.handler === "due" && j.state === "scheduled"), [])
     }))
 })
 
@@ -196,7 +196,7 @@ describe("ringing", () => {
       const [ring] = kit.notify.engine.ringingOn("kitchen-display")
       assert.isTrue((yield* kit.notify.press(ring!.id, "stop", { device: "kitchen-display" })).ok)
       assert.strictEqual(said(yield* kit.action("list", {})), "No timers are running.")
-      assert.strictEqual((yield* kit.moduleStore().collection(timers).list({})).at(0)?.value.state, "rang")
+      assert.strictEqual((yield* kit.moduleStore().collection(timers).list({})).at(0)?.value.state, "done")
     }))
 
   it.effect("a timer given more time while it rings runs again for that long", () =>
@@ -219,7 +219,7 @@ describe("where it rings and shows", () => {
       const kit = yield* startTestModule(timersModule, { household })
       yield* kit.action("start", { duration: "2 minutes", name: "eggs" }, { device: "kitchen-tablet" })
       assert.strictEqual(said(yield* kit.action("adjust", { amount: "1 minute", change: "remove" }, { device: "robins-phone", conversationId: "c-robin" })), "Eggs timer: 1 minute left.")
-      const jobs = (yield* kit.jobs).filter((j) => j.handler === "ring" && j.state === "scheduled")
+      const jobs = (yield* kit.jobs).filter((j) => j.handler === "due" && j.state === "scheduled")
       assert.deepStrictEqual(jobs.map((j) => j.origin.deviceId), ["kitchen-tablet"])
       yield* kit.advance(MIN)
       assert.deepStrictEqual(kit.notify.engine.ringingOn("robins-phone"), [])
@@ -273,7 +273,7 @@ describe("phrase commands", () => {
         "Timer gezet op 10 minuten.",
         "Timer eieren, 6 minuten.",
         "Timer eieren: nog 6 minuten.",
-        "Er zijn 2 timers: timer van 10 minuten met nog 9 minuten 59 seconden en timer eieren met nog 6 minuten. Welke bedoel je?"
+        "Er zijn 2 timers: timer eieren met nog 6 minuten en timer van 10 minuten met nog 9 minuten 59 seconden. Welke bedoel je?"
       ])
     }))
 })

@@ -2,7 +2,8 @@
 // repeating alarms, "only the next" or "all" (asked when not said), an alarm's name only on its own device, ringing with
 // snooze and five more minutes, a repeating alarm across an outage and a restart, store failures, paging and Dutch.
 import { assert, describe, it } from "@effect/vitest"
-import { type JobRow, type ModuleStore, type NotifyActionHandler, StoreError, type StoreFailure } from "@pva/core"
+import { type JobRow, type ModuleStore, type Row, StoreError } from "@pva/core"
+import { hooked, type Hooks, makeHooks, makeRegistered } from "./support.ts"
 import { startTestModule } from "@pva/core/testing"
 import { Effect } from "effect"
 import { type Alarm, alarms, alarmsModule, MAX_ALARMS } from "../src/index.ts"
@@ -14,9 +15,23 @@ const DAY = 24 * HOUR
 // The kit's clock starts on Wednesday 18 November 2026, 10:00 in Amsterdam (09:00 UTC).
 const at = (day: number, hour: number, minute = 0) => Date.UTC(2026, 10, day, hour - 1, minute)
 
-const rows = (kit: { moduleStore: () => ModuleStore }) => kit.moduleStore().collection(alarms).list({ limit: 13 })
-const setRows = (kit: { moduleStore: () => ModuleStore }) => kit.moduleStore().collection(alarms).list({ where: { phase: "set" }, orderBy: { field: "next" }, limit: 13 })
-const liveJobs = (kit: { jobs: Effect.Effect<ReadonlyArray<JobRow>> }, handler = "ring") =>
+/** Every row of a list, page by page (10 a page). */
+const allOf = (list: (q: { readonly limit: number; readonly after?: Row<Alarm> }) => Effect.Effect<ReadonlyArray<Row<Alarm>>, unknown>) =>
+  Effect.gen(function*() {
+    const out: Array<Row<Alarm>> = []
+    let after: Row<Alarm> | undefined
+    for (;;) {
+      const page = yield* Effect.orDie(list({ limit: 10, ...(after !== undefined ? { after } : {}) }))
+      out.push(...page)
+      if (page.length < 10) return out
+      after = page.at(-1)
+    }
+  })
+const rows = (kit: { moduleStore: () => ModuleStore }) => allOf((q) => kit.moduleStore().collection(alarms).list({ orderBy: { field: "createdAt", direction: "asc" }, ...q }))
+/** The set alarms, the next to ring first. */
+const setRows = (kit: { moduleStore: () => ModuleStore }) =>
+  Effect.map(allOf((q) => kit.moduleStore().collection(alarms).list({ where: { phase: "set" }, ...q })), (rs) => [...rs].sort((a, b) => (a.value.next?.at ?? 0) - (b.value.next?.at ?? 0)))
+const liveJobs = (kit: { jobs: Effect.Effect<ReadonlyArray<JobRow>> }, handler = "due") =>
   Effect.map(kit.jobs, (jobs) => jobs.filter((j) => j.handler === handler && (j.state === "scheduled" || j.state === "running")))
 
 describe("setting alarms", () => {
@@ -27,7 +42,7 @@ describe("setting alarms", () => {
       assert.strictEqual(said(yield* kit.action("set", { when: "6:45" })), "Alarm set for tomorrow at quarter to seven in the morning.")
       assert.strictEqual(said(yield* kit.action("set", { when: "8 pm", name: "bins" })), "Bins alarm set for today at eight o'clock in the evening.")
       const [first] = yield* setRows(kit)
-      assert.strictEqual(first?.value.next, at(18, 20))
+      assert.strictEqual(first?.value.next?.at, at(18, 20))
       const jobs = yield* liveJobs(kit)
       assert.strictEqual(jobs.length, 3)
       assert.isTrue(jobs.every((j) => j.origin.deviceId === "kitchen-display"))
@@ -103,7 +118,7 @@ describe("which alarm, and only the next or all", () => {
       // Only the next: tomorrow (Thursday) is skipped; the next is Friday.
       assert.strictEqual(said(yield* kit.action("cancel", { which: "6:45", scope: "next" })), "The alarm for tomorrow at quarter to seven in the morning is skipped; the next one is Friday at quarter to seven in the morning.")
       const series = (yield* setRows(kit)).find((r) => r.value.rrule !== undefined)!
-      assert.strictEqual(series.value.next, at(20, 6, 45))
+      assert.strictEqual(series.value.next?.at, at(20, 6, 45))
       assert.strictEqual(said(yield* kit.action("cancel", { which: "nine" })), "The alarm for tomorrow at nine o'clock in the morning is cancelled.")
       assert.strictEqual(said(yield* kit.action("cancel", { scope: "all" })), "The alarm every weekday is cancelled.")
       assert.strictEqual(said(yield* kit.action("cancel", {})), "No alarms are set.")
@@ -122,7 +137,7 @@ describe("which alarm, and only the next or all", () => {
       assert.strictEqual(said(yield* kit.action("change", { to: "7:15", scope: "all" })), "The alarm now rings every weekday; the next one is tomorrow at quarter past seven in the morning.")
       assert.strictEqual(said(yield* kit.action("change", { to: "8:00", scope: "next" })), "The next alarm moves to tomorrow at eight o'clock in the morning; after that it rings every weekday as before.")
       const set = yield* setRows(kit)
-      assert.deepStrictEqual(set.map((r) => [r.value.next, r.value.rrule !== undefined]), [[at(19, 8), false], [at(20, 7, 15), true]])
+      assert.deepStrictEqual(set.map((r) => [r.value.next?.at, r.value.rrule !== undefined]), [[at(19, 8), false], [at(20, 7, 15), true]])
       assert.strictEqual((yield* liveJobs(kit)).length, 2)
       assert.strictEqual(said(yield* kit.action("change", { which: "8:00", to: "soon-ish" })), "I didn't understand the new time.")
     }))
@@ -139,7 +154,7 @@ describe("ringing", () => {
       assert.deepStrictEqual(ring?.actions.map((a) => [a.id, a.label]), [["snooze", "Snooze"], ["more", "Five more minutes"]])
       assert.strictEqual((yield* kit.notify.all).at(-1)?.text, "It is seven o'clock in the morning.")
       // The next occurrence is planned at once.
-      assert.strictEqual((yield* setRows(kit))[0]?.value.next, at(20, 7))
+      assert.strictEqual((yield* setRows(kit))[0]?.value.next?.at, at(20, 7))
       assert.deepStrictEqual(yield* kit.notify.press(ring!.id, "snooze", { device: "kitchen-display" }), { ok: true, say: "It rings again in 9 minutes." })
       yield* kit.advance(9 * MIN)
       const [again] = kit.notify.engine.ringingOn("kitchen-display")
@@ -181,7 +196,7 @@ describe("ringing", () => {
       assert.strictEqual(missed.length, 1)
       assert.strictEqual(missed[0]!.priority, "normal")
       assert.strictEqual(missed[0]!.text, "The alarm for today at seven o'clock in the morning could not ring: I wasn't running then.")
-      assert.strictEqual((yield* setRows(kit))[0]?.value.next, at(21, 7))
+      assert.strictEqual((yield* setRows(kit))[0]?.value.next?.at, at(21, 7))
       yield* kit.advance(at(21, 7) - (yield* kit.now))
       assert.strictEqual(kit.notify.engine.ringingOn("kitchen-display").length, 1)
     }))
@@ -201,75 +216,42 @@ describe("ringing", () => {
 })
 
 describe("a store that is busy or fails", () => {
-  interface Hooks {
-    writesFail?: StoreFailure | undefined
-    /** The ring job's next-occurrence transaction fails this many times. */
-    transactionsFail?: { times: number; readonly failure: StoreFailure } | undefined
-  }
-  const hookStore = (raw: ModuleStore, hooks: Hooks): ModuleStore => ({
-    moduleId: raw.moduleId,
-    readOnly: raw.readOnly,
-    collection: (c) => {
-      const h = raw.collection(c)
-      return {
-        ...h,
-        insert: (v, o) => (hooks.writesFail !== undefined ? Effect.fail(hooks.writesFail) : h.insert(v, o)),
-        update: (id, f, o) => (hooks.writesFail !== undefined ? Effect.fail(hooks.writesFail) : h.update(id, f, o))
-      } as typeof h
-    },
-    transaction: (f) =>
-      Effect.suspend(() => {
-        if (hooks.writesFail !== undefined) return Effect.fail(hooks.writesFail)
-        const t = hooks.transactionsFail
-        if (t !== undefined && t.times > 0) {
-          t.times--
-          return Effect.fail(t.failure)
-        }
-        return raw.transaction(f)
-      })
-  })
-  const handlers = new Map<string, NotifyActionHandler>()
-  const hooked = (hooks: Hooks): typeof alarmsModule => ({
-    ...alarmsModule,
-    shared: (ctx) =>
-      alarmsModule.shared!({
-        ...ctx,
-        store: hookStore(ctx.store, hooks),
-        notify: { ...ctx.notify, handle: (name: string, handler: NotifyActionHandler) => Effect.andThen(Effect.sync(() => void handlers.set(name, handler)), ctx.notify.handle(name, handler)) }
-      })
-  })
+  const registered = makeRegistered()
+  const hookedAlarms = (hooks: Hooks) => hooked(alarmsModule, hooks, registered)
 
   it.effect("busy: the busy sentence, nothing stored; the ring retried after a failed write rings once and plans once", () =>
     Effect.gen(function*() {
-      const hooks: Hooks = { writesFail: new StoreError({ reason: "busy", message: "test: busy" }) }
-      const kit = yield* startTestModule(hooked(hooks))
+      const hooks: Hooks = { ...makeHooks(), writesFail: new StoreError({ reason: "busy", message: "test: busy" }) }
+      const kit = yield* startTestModule(hookedAlarms(hooks))
       assert.deepStrictEqual(yield* kit.action("set", { when: "seven" }), { ok: false, code: "failed", message: "The alarms are busy just now; try again in a moment." })
       assert.deepStrictEqual(yield* rows(kit), [])
       hooks.writesFail = undefined
       yield* kit.action("set", { when: "every day at 7" })
-      hooks.transactionsFail = { times: 1, failure: new StoreError({ reason: "busy", message: "test: busy" }) }
+      hooks.failAfterSend = new StoreError({ reason: "busy", message: "test: busy" })
       yield* kit.advance(at(19, 7) - (yield* kit.now))
       yield* kit.advance(10_000)
       const rings = (yield* kit.notify.all).filter((n) => n.key?.startsWith("alarm:"))
       assert.strictEqual(rings.length, 1)
-      assert.strictEqual((yield* setRows(kit))[0]?.value.next, at(20, 7))
+      assert.strictEqual((yield* setRows(kit))[0]?.value.next?.at, at(20, 7))
       assert.strictEqual((yield* liveJobs(kit)).length, 1)
     }))
 
   it.effect("the snooze handler run twice for one notification snoozes once", () =>
     Effect.gen(function*() {
-      const kit = yield* startTestModule(hooked({}))
+      const kit = yield* startTestModule(hookedAlarms(makeHooks()))
       yield* kit.action("set", { when: "seven" })
       yield* kit.advance(at(19, 7) - (yield* kit.now))
       const [ring] = kit.notify.engine.ringingOn("kitchen-display")
       const id = (yield* rows(kit))[0]!.id
-      const press = { notificationId: ring!.id, actionId: "snooze", key: `alarm:${id}`, deviceId: "kitchen-display" }
-      assert.deepStrictEqual(yield* handlers.get("alarm")!.run(press), { say: "It rings again in 9 minutes." })
+      const press = { notificationId: ring!.id, actionId: "snooze", key: `alarm:${id}:1`, deviceId: "kitchen-display" }
+      assert.deepStrictEqual(yield* registered.presses.get("alarm")!.run(press), { say: "It rings again in 9 minutes." })
       const once = (yield* rows(kit))[0]!
-      assert.deepStrictEqual(yield* handlers.get("alarm")!.run(press), { say: "It rings again in 9 minutes." })
+      assert.deepStrictEqual(yield* registered.presses.get("alarm")!.run(press), { say: "It rings again in 9 minutes." })
       assert.strictEqual((yield* rows(kit))[0]!.rev, once.rev)
-      assert.strictEqual((yield* liveJobs(kit, "again")).length, 1)
-      assert.deepStrictEqual(yield* handlers.get("alarm")!.run({ ...press, notificationId: "n-other" }), { say: "That alarm is gone." })
+      assert.strictEqual(once.value.ring?.again, at(19, 7, 9))
+      assert.strictEqual((yield* liveJobs(kit)).length, 1)
+      assert.deepStrictEqual(yield* registered.presses.get("alarm")!.run({ ...press, notificationId: "n-other" }), { say: "That ring has ended." })
+      assert.strictEqual((yield* rows(kit))[0]!.rev, once.rev)
     }))
 })
 
@@ -277,18 +259,21 @@ describe("data and settings", () => {
   it.effect("a row with every indexed field at its largest is stored", () =>
     Effect.gen(function*() {
       const kit = yield* startTestModule(alarmsModule)
+      const note = "\"".repeat(40)
       const largest: Alarm = {
         name: "\"".repeat(60),
         deviceId: "\\".repeat(64),
-        phase: "ended",
-        next: 8_640_000_000_000_000,
+        timeZone: "\"".repeat(64),
         rrule: "\"".repeat(200),
         dtstart: "\"".repeat(80),
-        timeZone: "\"".repeat(64),
-        job: "\"".repeat(64),
-        again: "\"".repeat(64),
-        notification: "\"".repeat(64),
-        press: "\"".repeat(64),
+        next: { date: "9999-12-31", time: "23:59", at: 8_640_000_000_000_000 },
+        n: 1_000_000,
+        owed: { n: 1_000_000, date: "9999-12-31", time: "23:59", at: 8_640_000_000_000_000, attempts: 1_000_000, retryAt: 8_640_000_000_000_000 },
+        ring: { n: 1_000_000, notification: note, at: 8_640_000_000_000_000, until: 8_640_000_000_000_000, again: 8_640_000_000_000_000, pressed: note },
+        withdraw: [0, 1, 2].map(() => ({ notification: note, until: 8_640_000_000_000_000, retryAt: 8_640_000_000_000_000 })),
+        phase: "ended",
+        pending: true,
+        nextAt: 8_640_000_000_000_000,
         endedAt: 8_640_000_000_000_000
       }
       yield* kit.moduleStore().collection(alarms).insert(largest)
@@ -297,29 +282,21 @@ describe("data and settings", () => {
       assert.strictEqual((yield* rows(kit)).length, 2)
     }))
 
-  it.effect("the daily clean-up removes ended alarms older than a day, as the job", () =>
+  it.effect("the hourly sweep removes ended alarms older than a day with nothing owed, as the job; one with something owed stays", () =>
     Effect.gen(function*() {
       const kit = yield* startTestModule(alarmsModule)
       yield* kit.action("set", { when: "seven", name: "old" })
       yield* kit.action("cancel", {})
+      const owing: Alarm = { deviceId: "kitchen-display", timeZone: "Europe/Amsterdam", n: 1, withdraw: [{ notification: "n-x", until: 8_640_000_000_000_000, retryAt: 8_640_000_000_000_000 }], phase: "ended", pending: true, nextAt: 8_640_000_000_000_000, endedAt: 1 }
+      yield* kit.moduleStore().collection(alarms).insert(owing)
       yield* kit.advance(25 * HOUR)
       yield* kit.action("set", { when: "seven", name: "fresh" })
-      const job = (yield* kit.jobs).find((j) => j.handler === "cleanup" && j.state === "scheduled")
-      assert.strictEqual(job?.cron, "23 4 * * *")
-      yield* kit.runJob(job!.id)
-      assert.deepStrictEqual((yield* rows(kit)).map((r) => r.value.name), ["fresh"])
-      assert.isTrue(kit.events.some((e) => e.type === "alarms.alarms.changed" && e.actor?.kind === "job" && e.actor.jobId === job!.id))
-    }))
-
-  it.effect("the clean-up keeps an ended alarm whose snooze is still to ring", () =>
-    Effect.gen(function*() {
-      const kit = yield* startTestModule(alarmsModule)
-      const old: Alarm = { deviceId: "kitchen-display", phase: "ended", next: 1, endedAt: 1 }
-      yield* kit.moduleStore().collection(alarms).insert({ ...old, again: "job_pending" })
-      yield* kit.moduleStore().collection(alarms).insert(old)
-      const job = (yield* kit.jobs).find((j) => j.handler === "cleanup" && j.state === "scheduled")
-      yield* kit.runJob(job!.id)
-      assert.deepStrictEqual((yield* rows(kit)).map((r) => r.value.again), ["job_pending"])
+      const job = (yield* kit.jobs).find((j) => j.handler === "sweep" && j.key === "sweep" && j.state === "scheduled")
+      assert.strictEqual(job?.cron, "23 * * * *")
+      yield* kit.advance(HOUR)
+      assert.deepStrictEqual((yield* rows(kit)).map((r) => r.value.name ?? "owing"), ["owing", "fresh"])
+      const sweeps = new Set((yield* kit.jobs).filter((j) => j.handler === "sweep").map((j) => j.id))
+      assert.isTrue(kit.events.some((e) => e.type === "alarms.alarms.changed" && e.actor?.kind === "job" && sweeps.has(e.actor.jobId)))
     }))
 
   it.effect("changed from another device, it still rings on its own device", () =>
@@ -358,7 +335,7 @@ describe("Dutch", () => {
       assert.strictEqual(ring?.title, "Wekker Sport")
       assert.deepStrictEqual(ring?.actions.map((a) => a.label), ["Snooze", "Nog vijf minuten"])
       assert.deepStrictEqual(yield* kit.notify.press(ring!.id, "snooze", { device: "kitchen-display" }), { ok: true, say: "Hij gaat over 9 minuten weer af." })
-      assert.strictEqual(said(yield* kit.action("cancel", { which: "sport", scope: "next" })), "De wekker voor morgen om kwart voor zeven 's ochtends wordt overgeslagen; de volgende is maandag om kwart voor zeven 's ochtends.")
+      assert.strictEqual(said(yield* kit.action("cancel", { which: "sport", scope: "next" })), "De gesnoozede wekker is geannuleerd; de volgende is morgen om kwart voor zeven 's ochtends.")
       void DAY
     }))
 })
