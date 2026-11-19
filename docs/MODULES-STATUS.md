@@ -1,7 +1,7 @@
 # Modules: where the work stands
 
 Status of the work planned in [MODULES-PLAN.md](MODULES-PLAN.md), kept here so it does not depend on any one working
-session. Updated 2026-11-19, 16:00. Nothing below is merged into `main`; the owner merges.
+session. Updated 2026-11-19, 17:10. Nothing below is merged into `main`; the owner merges.
 
 ## The stack
 
@@ -20,7 +20,7 @@ findings fixed; it does not mean merged.
 | P11 scaffold, contracts, test kit, guide | #94 | `t3/modules-11-scaffold` | `5bfeca0d` | closed; CI green |
 | P9 notifications, speech, ringing | #106 | `t3/modules-09-notify` | `a7fccff9` | closed after three review rounds; carries the scaffold's last store fix |
 | P7 phrase commands, essential controls | #107 | `t3/modules-07-phrases` | `3ce75007` | closed after two review rounds (24, then 8 findings, all fixed); CI was green at `86ab9161`; the head adds a merge of P9 and one test fix (a wall-clock limit that failed on a loaded CI machine) |
-| P10 presentation | #108 | `t3/modules-10-present` | `d6f7034d` | first review found 30 problems, fixed (CI green at this head); the two deciding reviews found 8 and 7 more; a second, small fix round is running, with one added rule: nothing a speculative turn asks for reaches a screen before the turn is promoted |
+| P10 presentation | #108 | `t3/modules-10-present` | `ae20348a` | three rounds so far: 30 findings, then 15, all addressed; the second round also added the rule that nothing a speculative turn asks for reaches a screen before the turn is promoted. A third-round check is running |
 | P8 risk policy in admin | #115 | `t3/modules-08-risk` | `d5601c95` | first review found 7 problems and 2 notes, all addressed; the fixed P10 is merged in; a press and a phrase command are decided by the policy; deciding review running. It takes in P10's second round when that lands |
 
 **Fixes to P1 to P6 code found later live on the scaffold branch**, not on their own branches: the worker-thread
@@ -51,11 +51,11 @@ its own pull request on the scaffold.
 
 CI is green on all eleven at these heads. They carry the whole scaffold (`5bfeca0d`); their heads moved with that merge (see each pull request).
 
-**Integration branch**: `t3/modules-12-wave-a`, pull request #116 (`33ea5b77`): the presentation branch (P10, after its
-fix round) with the eleven module branches merged in, merges only, no conflict. `pnpm check` passes; the full local
-test run had 9,143 passing and one failing (the calendar latency test could not read its store in the parallel run; it
-passes alone, three times out of three). It is the base for the follow-up pull requests below. P8 is merged into it
-when it closes, and it is then retargeted to the top of the stack.
+**Integration branch**: `t3/modules-12-wave-a`, pull request #116 (`d19e7944`): the presentation branch (P10, after its
+second fix round) with the eleven module branches merged in, merges only. `pnpm check` passes; in the full local run
+one test fails under load and passes alone (the calendar module's latency test cannot read its store when the whole
+suite runs beside it; CI runs latency tests one at a time and has passed it). It is the base for the follow-up pull
+requests. P8 is merged into it when it closes, and it is then retargeted to the top of the stack.
 
 ## Wave B: the modules that need P7 to P10
 
@@ -68,9 +68,9 @@ Each sits on the newest part it needs for now and moves on top of P8 at the end.
 | images and photos | #111 | `t3/module-images` | `4965a03d` | closed: two reviews (15, then 3 findings), all fixed, CI green |
 | broadcast | #112 | `t3/module-broadcast` | `5e84f110` | closed: reviewed (8 findings and a note), fixed, adapted to P10's fix round |
 | music | #113 | `t3/module-music` | `081edbdb` | closed: two reviews (16, then 4 findings), all fixed, CI green |
-| reminders | #114 | `t3/module-reminders` | `9a328183` | reviewed (22 findings), rebuilt around one state and one job per reminder (CI green); deciding review running |
-| timers and alarms | #117 | `t3/module-timers` | `cc2788e3` | reviewed (14 findings), rebuilt around one state and one job per timer and alarm; deciding review running |
-| routines and automations | #129 | `t3/module-routines` | `49bc910c` | built on `t3/modules-08-risk`; first review running |
+| reminders | #114 | `t3/module-reminders` | `9a328183` | two reviews (22, then 9 findings); rebuilt around one state and one job per reminder; second fix round running |
+| timers and alarms | #117 | `t3/module-timers` | `cc2788e3` | two reviews (14, then 13 findings); rebuilt around one state and one job per timer and alarm; second fix round running (changing an alarm is cut: cancel and set again; one ring per timer or alarm at a time) |
+| routines and automations | #129 | `t3/module-routines` | `49bc910c` | first review found 8 problems; fix round running. The contract changed where the host offers nothing to build on: a routine is checked step by step and stops, with a true sentence, where a step is refused; a called action's answer is not read out; it gets its own way to be cancelled |
 
 ## What is left, in order
 
@@ -83,12 +83,13 @@ Each sits on the newest part it needs for now and moves on top of P8 at the end.
    `t3/modules-12-wave-a` (#116), branches `t3/follow-<module>`, each reviewed and fixed. Started 2026-11-19 on the
    fixed P10: lists, kitchen, smart home, calendar, memory and local info are being built; presence, briefing, news,
    web search and core tools start as those report.
-   State: all eleven have a pull request and a first review. Closed: briefing #118. Fixed after review, waiting for
-   P10's second round (a small adaptation, then a short check): memory #119, presence #121, kitchen #120 (cut down to
-   the phrase and a plain list), web search #124 (its list is held back until P10's rule exists). Fix round running:
-   lists #122 (the pinned checklist rebuilt as one state per device), calendar #123, smart home #125 (cut down to
-   the room-less phrases and a snapshot list), news #127, local info #128. Core tools #126: fixed, and in a complete
-   review because the first one was cut short by the review provider.
+   State: all eleven have a pull request and a first review; every one had findings. Closed: briefing #118.
+   Fixed, and now taking in P10's rule about speculative turns (the list or card is returned with the answer and is a
+   snapshot of it), each with a short check to follow: memory #119, kitchen #120 (cut down to the phrase and a plain
+   list), presence #121 (a list only for one person or the reduced form), calendar #123, web search #124 (its list
+   comes back now that the rule exists), smart home #125 (cut down to the room-less phrases and a snapshot list),
+   core tools #126 (complete second review done, one test fix), news #127. Lists #122: the pinned checklist rebuilt as
+   one saved state per device, deciding review running. Local info #128: fix round running.
 6. Deferred, with a plan of their own ([MODULES-DEFERRED-PLAN.md](MODULES-DEFERRED-PLAN.md): sixteen pull requests in order, with eighteen decisions for the owner and a recommendation for each): google, t3-code, mcp-client, calls and intercom, CalDAV; connections and
    OAuth (the rest of P8); streaming and WebSocket to an owner-typed address.
 
@@ -102,6 +103,11 @@ Each sits on the newest part it needs for now and moves on top of P8 at the end.
   were not measured.
 - **A main-thread write right behind the store's checkpoint worker** waits about 24 ms on a desktop disk (a few
   hundred on an SD card), on a timer, without blocking the event loop (`docs/STORING-DATA.md` on the scaffold).
+- **Smart home at its largest**: with 2,000 lights in a single room the first-wave module's own status read stops
+  the main thread 8 to 15 ms and "lights off" 13 to 17 ms, over the 10 ms bound at that extreme (measured while
+  reviewing its follow-up, whose own work is under 1 ms).
+- **Two tests that depend on the machine's load**: the calendar module's latency test (above) and the bin-day test
+  that looks at the Health page right after a job (being fixed in the local-info follow-up).
 - **The order of P7 to P10 and the two waves** was the lead's decision, reported to the owner and not confirmed.
 
 ## Found by the wave B reviews, for one follow-up below the modules
@@ -114,6 +120,10 @@ Each sits on the newest part it needs for now and moves on top of P8 at the end.
   carry a fixed value or take a parameter whose values the module supplies** (briefing, smart home); **a press
   carries no id**, and there is no handle for a presentation returned with a result (kitchen's kept, ticked
   checklist was cut for this).
+- **For a module that runs steps in the background** (routines): asking whether a call would be refused without
+  making it; a device's "stop" delivered to the module; a trace for a step that runs after its turn ended; whose
+  content an action's answer is; the action catalogue outside a turn (to check a routine when it is saved).
+- **Raising a Health issue from module code** (reminders, timers and alarms use a job that fails on purpose).
 - **Repeated calls.** The gateway hands a tool or an action no per-call id (the model's tool-call id stops at the
   registry), so a module cannot tell a replay from a second deliberate call in one turn. Decided for now: a phrase
   command heard once acts once; the assistant's own calls always run ("skip two songs" as two calls skips twice).
