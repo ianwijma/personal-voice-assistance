@@ -205,6 +205,8 @@ const ISSUE_SOURCE = "core.present"
 /** A read of every live row never reads more than this many (a corrupt store cannot make it unbounded). */
 const SWEEP_ROWS = 4 * MAX_LIVE_TOTAL
 const RETRY_AFTER_MS = 60_000
+/** Rows marked ended (dismissed, or ended by a newer transient) are removed this long after the first of them, together. */
+const PURGE_AFTER_MS = 10_000
 
 /** What the engine keeps in memory of a live presentation (everything but the content). */
 interface Entry {
@@ -646,6 +648,29 @@ export const makePresentEngine = (options: PresentEngineOptions): Effect.Effect<
     function wakeEnds() {
       void Queue.offerUnsafe(endsWake, undefined)
     }
+    /** Rows marked ended, removed together `PURGE_AFTER_MS` after the first (never on a caller's path). */
+    const tombstones = new Set<string>()
+    let purgeAt: number | "soon" | undefined
+    function entombed(id: string) {
+      tombstones.add(id)
+      if (purgeAt === undefined) purgeAt = "soon"
+      wakeEnds()
+    }
+    const purge: Effect.Effect<void, PresentError> = Effect.gen(function*() {
+      const ids = [...tombstones]
+      for (let i = 0; i < ids.length; i += PRESENT_PAGE) {
+        const page = ids.slice(i, i + PRESENT_PAGE)
+        yield* tx((p) => {
+          for (const id of page) {
+            const row = p.get(id)
+            if (row !== undefined && row.value.ended === true && !index.has(id)) p.remove(id)
+          }
+        }, () => {
+          for (const id of page) tombstones.delete(id)
+        })
+        yield* Effect.yieldNow
+      }
+    })
     let sweeping = false
     const sweepEnded: Effect.Effect<void, PresentError> = Effect.gen(function*() {
       const now = yield* wallNow
@@ -658,6 +683,8 @@ export const makePresentEngine = (options: PresentEngineOptions): Effect.Effect<
         let next: number | undefined
         for (const e of index.values()) next = next === undefined ? e.expiresAt : Math.min(next, e.expiresAt)
         if (!loaded && (next === undefined || next > now + RETRY_AFTER_MS)) next = now + RETRY_AFTER_MS
+        if (purgeAt === "soon") purgeAt = now + PURGE_AFTER_MS
+        if (typeof purgeAt === "number") next = next === undefined ? purgeAt : Math.min(next, purgeAt)
         if (retryAt !== undefined && failed.size > 0) next = next === undefined ? retryAt : Math.min(next, retryAt)
         if (next === undefined) yield* Queue.take(endsWake)
         else if (next > now) yield* Effect.raceFirst(Effect.asVoid(Effect.sleep(next - now)), Queue.take(endsWake))
@@ -669,7 +696,13 @@ export const makePresentEngine = (options: PresentEngineOptions): Effect.Effect<
           retryAt = undefined
           if (failed.size > 0) kick()
         }
-        const exit = yield* Effect.exit(sweepEnded)
+        const exit = yield* Effect.exit(Effect.andThen(sweepEnded, Effect.suspend(() => {
+          if (typeof purgeAt !== "number" || purgeAt > at) return Effect.void
+          purgeAt = undefined
+          return Effect.tap(purge, () => Effect.sync(() => {
+            if (tombstones.size > 0 && purgeAt === undefined) purgeAt = "soon"
+          }))
+        })))
         sweeping = false
         if (Exit.isFailure(exit)) {
           log("Presentations: what has ended could not be removed; tried again in a minute")
@@ -692,7 +725,7 @@ export const makePresentEngine = (options: PresentEngineOptions): Effect.Effect<
           after = page[page.length - 1]
         }
         const now = yield* wallNow
-        const stale = rows.filter((r) => r.value.lifetime === "transient" || r.value.expiresAt <= now).map((r) => r.id)
+        const stale = rows.filter((r) => r.value.lifetime === "transient" || r.value.ended === true || r.value.expiresAt <= now).map((r) => r.id)
         for (let i = 0; i < stale.length; i += PRESENT_PAGE) {
           const page = stale.slice(i, i + PRESENT_PAGE)
           yield* core.transaction((t) => {
@@ -719,7 +752,9 @@ export const makePresentEngine = (options: PresentEngineOptions): Effect.Effect<
     const pending: Array<PendingShow> = []
     /** Why one more presentation would pass a bound, or `undefined`. `replacing`: the id a key replaces. */
     const boundProblem = (module: string, lifetime: "transient" | "pinned", target: Entry["target"], replacing: string | undefined, now: number): string | undefined => {
-      const live = [...index.values()].filter((e) => e.id !== replacing && e.expiresAt > now)
+      // A transient one ends the transient ones it would share a device with: those do not count against it.
+      const ending = new Set(lifetime === "transient" ? overlapping(target, replacing).map((e) => e.id) : [])
+      const live = [...index.values()].filter((e) => e.id !== replacing && !ending.has(e.id) && e.expiresAt > now)
       const waiting = pending.map((p) => p.entry).filter((e) => e.id !== replacing)
       const every = [...live, ...waiting]
       if (every.length >= MAX_LIVE_TOTAL) return `${MAX_LIVE_TOTAL} presentations are live already`
@@ -764,7 +799,7 @@ export const makePresentEngine = (options: PresentEngineOptions): Effect.Effect<
         // Written only if the row still shows that address (an update may have changed it meanwhile).
         const exit = yield* Effect.exit(tx((p) => {
           const row = p.get(id)
-          if (row === undefined || row.value.content.kind !== "image" || row.value.content.url !== url) return false
+          if (row === undefined || row.value.ended === true || row.value.content.kind !== "image" || row.value.content.url !== url) return false
           const { hash: _h, failed: _f, ...content } = row.value.content
           p.update(id, (v) => ({ ...v, content: { ...content, ...("hash" in outcome ? { hash: outcome.hash } : { failed: outcome.refused }) } }), { expectRev: row.rev })
           return true
@@ -827,10 +862,12 @@ export const makePresentEngine = (options: PresentEngineOptions): Effect.Effect<
         shownAt: e.shownAt,
         expiresAt: e.expiresAt
       }
+      // A key shown again replaces its row whole (an ended mark too).
       if (p.get(e.id) !== undefined) p.update(e.id, () => value)
       else p.insert(value, { id: e.id })
+      // Ended, not removed: an update in the caller's transaction (the removal comes later, off its path).
       const removed = e.lifetime === "transient" ? overlapping(e.target, e.id) : []
-      for (const old of removed) if (p.get(old.id) !== undefined) p.remove(old.id)
+      for (const old of removed) if (p.get(old.id) !== undefined) p.update(old.id, (v) => ({ ...v, ended: true as const }))
       return { removed }
     }
 
@@ -838,6 +875,7 @@ export const makePresentEngine = (options: PresentEngineOptions): Effect.Effect<
       for (const old of removed) {
         drop(old.id)
         touch(old.id, old.target)
+        entombed(old.id)
       }
       put(e)
       touch(e.id, e.target)
@@ -928,7 +966,7 @@ export const makePresentEngine = (options: PresentEngineOptions): Effect.Effect<
         const next: Entry = { ...e, handler: presentation.handler }
         const wrote = yield* tx((p) => {
           const row = p.get(id)
-          if (row === undefined) return undefined
+          if (row === undefined || row.value.ended === true) return undefined
           const content = storedContentOf(presentation, row.value.content)
           const { handler: _h, ...rest } = row.value
           p.update(id, () => ({
@@ -953,12 +991,17 @@ export const makePresentEngine = (options: PresentEngineOptions): Effect.Effect<
         const e = index.get(id)
         if (e === undefined || e.module !== moduleId) return false
         return yield* tx((p) => {
-          if (p.get(id) === undefined) return false
-          p.remove(id)
+          const row = p.get(id)
+          if (row === undefined || row.value.ended === true) return false
+          // Ended, not removed: an update in the caller's transaction (the removal comes later, off its path).
+          p.update(id, (v) => ({ ...v, ended: true as const }), { expectRev: row.rev })
           return true
         }, (gone) => {
           drop(id)
-          if (gone) touch(id, e.target)
+          if (gone) {
+            touch(id, e.target)
+            entombed(id)
+          }
         })
       })
 

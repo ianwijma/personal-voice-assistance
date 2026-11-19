@@ -271,6 +271,8 @@ export const presentWorld = (
       board,
       showOn,
       toolOn,
+      /** What the modules' tools return from now on (the latency test's turns call them through the registry). */
+      toolResult: (value: unknown) => void (result.current = value),
       rows,
       open,
       close,
@@ -311,7 +313,8 @@ export const worstPresentationRow = (): StoredPresentation => {
     buttons: Array.from({ length: 3 }, (_, i) => ({ id: `b${i}`.padEnd(32, "x"), label: t(20) })),
     handler: "h".repeat(64),
     shownAt: 8_640_000_000_000_000,
-    expiresAt: 8_640_000_000_000_000
+    expiresAt: 8_640_000_000_000_000,
+    ended: true
   }
 }
 
@@ -449,7 +452,28 @@ export const presentContract = (name: string, open: OpenPresentStore) =>
         assert.deepStrictEqual(world.shownOn("kitchen-display").map((p) => p.id), [second.id])
         assert.deepStrictEqual(world.shownOn("kitchen-tablet").map((p) => p.id), [second.id])
         assert.isTrue(world.firstTab("kitchen-display")!.messages.some((m) => m.type === "present.dismiss" && m.id === first.id))
+        // The first is marked ended in the same transaction (an update) and removed ten seconds later, off the caller's path.
+        assert.deepStrictEqual((yield* world.rows).map((r) => [r.id, r.value.ended === true]), [[first.id, true], [second.id, false]])
+        yield* world.advance(10 * SECOND)
         assert.deepStrictEqual((yield* world.rows).map((r) => r.id), [second.id])
+      }))
+
+    it.effect("a dismissed presentation is marked ended at once (never shown again, its handle answers false) and its row removed ten seconds later; a restart removes it too", () =>
+      Effect.gen(function*() {
+        const { world, opened } = yield* start()
+        const h = yield* world.showOn("kitchen-display", card(), { lifetime: "pinned" })
+        assert.isTrue(yield* h.dismiss)
+        yield* world.settle
+        assert.deepStrictEqual(world.shownOn("kitchen-display"), [])
+        assert.deepStrictEqual((yield* world.rows).map((r) => r.value.ended), [true])
+        assert.isFalse(yield* h.dismiss)
+        // A restart before the removal: the ended row is not shown and is removed.
+        yield* world.stop
+        const store = yield* prepared(yield* opened.reopen)
+        const next = yield* presentWorld(store)
+        yield* next.settle
+        assert.deepStrictEqual(next.shownOn("kitchen-display"), [])
+        assert.deepStrictEqual(yield* next.rows, [])
       }))
 
     it.effect("a transient one ends on time (30 s by default): taken down from every page and removed", () =>

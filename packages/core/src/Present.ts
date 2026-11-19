@@ -437,9 +437,11 @@ export const StoredContent = Schema.Union([
 export type StoredContent = typeof StoredContent.Type
 
 /**
- * One live presentation. Rows exist only while it is live: dismissing it or its end removes the row, and so does the
- * stop of the part that made a transient one. `part` is the part's id in this process (transient rows left by an
- * earlier process are removed when the service starts).
+ * One live presentation. Rows exist only while it is live: its end removes the row, and so does the stop of the part
+ * that made a transient one. Dismissing it, or a newer transient that takes its device, marks the row `ended` in the
+ * caller's transaction (an update: no removal, so no log checkpoint on a turn's path), and the service removes ended
+ * rows ten seconds later, off every caller's path; an ended row is never shown and is removed at start. `part` is the
+ * part's id in this process (transient rows left by an earlier process are removed when the service starts).
  */
 export const StoredPresentation = Schema.Struct({
   module: ModuleIdText,
@@ -455,7 +457,8 @@ export const StoredPresentation = Schema.Struct({
   ),
   handler: Schema.optionalKey(Schema.String.check(Schema.isPattern(PRESENT_HANDLER_NAME))),
   shownAt: Time,
-  expiresAt: Time
+  expiresAt: Time,
+  ended: Schema.optionalKey(Schema.Literal(true))
 })
 export type StoredPresentation = typeof StoredPresentation.Type
 
