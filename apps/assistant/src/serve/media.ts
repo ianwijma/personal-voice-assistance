@@ -4,6 +4,7 @@ import { MEDIA_HASH, MEDIA_TOKEN } from "@pva/protocol"
 import { Deferred, Effect, Exit, type Scope } from "effect"
 import { createHash, randomBytes } from "node:crypto"
 import { chmodSync, mkdirSync, readdirSync, readFileSync, renameSync, statSync, unlinkSync, utimesSync, writeFileSync } from "node:fs"
+import { chmod, mkdir, opendir, readFile, stat, unlink as unlinkAsync } from "node:fs/promises"
 import type http from "node:http"
 import { join } from "node:path"
 
@@ -70,6 +71,12 @@ interface Kept {
 
 /** The file operations the cache uses (tests inject failures). */
 export interface MediaFs {
+  readonly mkdir: typeof mkdir
+  readonly chmod: typeof chmod
+  readonly opendir: typeof opendir
+  readonly stat: (path: string) => Promise<{ readonly size: number; readonly mtimeMs: number; isFile(): boolean }>
+  readonly readFile: (path: string) => Promise<Buffer>
+  readonly unlink: (path: string) => Promise<void>
   readonly mkdirSync: typeof mkdirSync
   readonly chmodSync: typeof chmodSync
   readonly readdirSync: (path: string) => ReadonlyArray<string>
@@ -80,7 +87,7 @@ export interface MediaFs {
   readonly renameSync: typeof renameSync
   readonly unlinkSync: typeof unlinkSync
 }
-const NODE_FS: MediaFs = { mkdirSync, chmodSync, readdirSync: (p) => readdirSync(p), statSync: (p) => statSync(p), readFileSync: (p) => readFileSync(p), writeFileSync, utimesSync, renameSync, unlinkSync }
+const NODE_FS: MediaFs = { mkdir, chmod, opendir, stat: (p) => stat(p), readFile: (p) => readFile(p), unlink: unlinkAsync, mkdirSync, chmodSync, readdirSync: (p) => readdirSync(p), statSync: (p) => statSync(p), readFileSync: (p) => readFileSync(p), writeFileSync, utimesSync, renameSync, unlinkSync }
 
 /** Entries one inventory looks at, at most (what it removes makes the next one shorter). */
 const MAX_INVENTORY_ENTRIES = 4_096
@@ -113,7 +120,7 @@ export interface MediaCache extends MediaPort {
    */
   readonly stats: () => { readonly files: number; readonly bytes: number; readonly inFlight: number; readonly sure: boolean }
   /** Remove what has expired now, or, while the cache is not sure, take an inventory (a fiber does both by itself). */
-  readonly sweep: () => void
+  readonly sweep: () => Promise<void>
 }
 
 export const MEDIA_PREFIX = "/media/"
@@ -140,6 +147,7 @@ export const makeMediaCache = (options: MediaCacheOptions): Effect.Effect<MediaC
     let sure = false
     let lastSweep = now()
     const code = (e: unknown) => String((e as { code?: unknown }).code ?? e)
+    let faultVersion = 0
     let issued = false
     const setSure = (value: boolean) => {
       sure = value
@@ -153,21 +161,11 @@ export const makeMediaCache = (options: MediaCacheOptions): Effect.Effect<MediaC
       }])
     }
     const fault = (why: string) => {
+      faultVersion++
       log(`Media: ${why}; no new image is kept until the image directory has been read completely`)
       setSure(false)
     }
     const fileOf = (k: Pick<Kept, "hash" | "type">) => join(options.dir, `${k.hash}.${MEDIA_TYPES[k.type]}`)
-    /** Remove a file; true when it is gone (removed, or not there). A failure is a fault. */
-    const unlink = (path: string): boolean => {
-      try {
-        fs.unlinkSync(path)
-        return true
-      } catch (e) {
-        if ((e as { code?: unknown }).code === "ENOENT") return true
-        fault(`${path} could not be removed (${code(e)})`)
-        return false
-      }
-    }
 
     /**
      * Read the directory as it is: remove temporary files, what is not one of its files, and what is past its age; then,
@@ -175,91 +173,107 @@ export const makeMediaCache = (options: MediaCacheOptions): Effect.Effect<MediaC
      * entry could be read and removed where it had to be, and what remains is inside the bounds. An unreadable entry is
      * never taken as absent: the inventory is then incomplete.
      */
-    const inventory = () => {
+    const inventory = async () => {
+      const version = faultVersion
+      setSure(false)
       let complete = true
-      let names: ReadonlyArray<string>
-      try {
-        fs.mkdirSync(options.dir, { recursive: true, mode: 0o700 })
-        fs.chmodSync(options.dir, 0o700)
-        names = fs.readdirSync(options.dir)
-      } catch (e) {
-        fault(`the image directory ${options.dir} could not be read (${code(e)})`)
-        return
-      }
-      if (names.length > MAX_INVENTORY_ENTRIES) {
-        complete = false
-        names = names.slice(0, MAX_INVENTORY_ENTRIES)
-      }
       const t = now()
       const found: Array<Kept> = []
-      for (const name of names) {
-        const path = join(options.dir, name)
-        const m = /^([0-9a-f]{64})\.([a-z]+)$/.exec(name)
-        const type = m === null ? undefined : EXTENSIONS[m[2]!]
-        if (m === null || type === undefined) {
-          // A temporary file (an interrupted write) or a foreign one.
-          if (!unlink(path)) complete = false
-          continue
-        }
-        let st: ReturnType<MediaFs["statSync"]>
-        try {
-          st = fs.statSync(path)
-        } catch (e) {
-          if ((e as { code?: unknown }).code === "ENOENT") continue
-          fault(`${path} could not be read (${code(e)})`)
+      const remove = async (path: string) => {
+        try { await fs.unlink(path); return true }
+        catch (e) {
+          if ((e as { code?: unknown }).code === "ENOENT") return true
+          fault(`${path} could not be removed (${code(e)})`)
           complete = false
-          continue
+          return false
         }
-        if (!st.isFile() || st.size > MAX_IMAGE_BYTES || st.mtimeMs + MEDIA_KEEP_MS <= t) {
-          if (!unlink(path)) complete = false
-          continue
-        }
-        found.push({ hash: m[1]!, type, bytes: st.size, at: st.mtimeMs })
       }
-      // Over the bounds (smaller bounds than the files were kept under): the oldest go first.
+      try {
+        await fs.mkdir(options.dir, { recursive: true, mode: 0o700 })
+        await fs.chmod(options.dir, 0o700)
+        // Streaming directory iteration bounds even the read itself. Only one entry's bytes are read at a time.
+        const directory = await fs.opendir(options.dir, { bufferSize: 16 })
+        let seen = 0
+        for await (const entry of directory) {
+          if (++seen > MAX_INVENTORY_ENTRIES) { complete = false; break }
+          const name = entry.name
+          const path = join(options.dir, name)
+          const m = /^([0-9a-f]{64})\.([a-z]+)$/.exec(name)
+          const type = m === null ? undefined : EXTENSIONS[m[2]!]
+          if (m === null || type === undefined) {
+            await remove(path)
+          } else {
+            try {
+              const st = await fs.stat(path)
+              if (!st.isFile() || st.size > MAX_IMAGE_BYTES || st.mtimeMs + MEDIA_KEEP_MS <= t) {
+                await remove(path)
+              } else {
+                const body = await fs.readFile(path)
+                // A filename and a stat are not proof of an image. Wrong suffixes (including duplicate hashes),
+                // truncated files and bytes with a different digest are removed before reopening admission.
+                if (body.length !== st.size || sniffImage(body) !== type || createHash("sha256").update(body).digest("hex") !== m[1]) await remove(path)
+                else found.push({ hash: m[1]!, type, bytes: body.length, at: st.mtimeMs })
+              }
+            } catch (e) {
+              if ((e as { code?: unknown }).code !== "ENOENT") {
+                fault(`${path} could not be read (${code(e)})`)
+                complete = false
+              }
+            }
+          }
+          // Each step is bounded by one image (2 MiB); a real yield also covers immediately resolved test ports.
+          await new Promise<void>((resolve) => setImmediate(resolve))
+        }
+      } catch (e) {
+        fault(`the image directory ${options.dir} could not be read (${code(e)})`)
+        complete = false
+      }
       found.sort((a, b) => a.at - b.at)
       let total = found.reduce((n, k) => n + k.bytes, 0)
       while (found.length > maxFiles || total > maxBytes) {
         const oldest = found[0]!
-        if (!unlink(fileOf(oldest))) {
-          complete = false
-          break
-        }
+        if (!await remove(fileOf(oldest))) break
         found.shift()
         total -= oldest.bytes
       }
-      if (complete) {
+      if (complete && version === faultVersion) {
         kept = new Map(found.map((k) => [k.hash, k]))
         bytes = total
         lastSweep = t
         setSure(true)
-        return
-      }
-      // Incomplete: what could be read is still served; nothing new is admitted.
-      for (const k of found) kept.set(k.hash, k)
-      setSure(false)
-    }
-
-    /** While sure: remove what has expired (a failure makes the cache not sure). While not sure: an inventory. */
-    const sweep = () => {
-      if (!sure) {
-        inventory()
       } else {
-        const t = now()
-        lastSweep = t
-        for (const k of [...kept.values()]) {
-          if (k.at + MEDIA_KEEP_MS > t) continue
-          // Not served from now on; if its file cannot be removed the cache is not sure until an inventory removes it.
-          kept.delete(k.hash)
-          bytes -= k.bytes
-          unlink(fileOf(k))
-        }
+        // An incomplete scan may serve what it read, but admits nothing and never calls an unreadable entry absent.
+        for (const k of found) kept.set(k.hash, k)
+        setSure(false)
       }
-      for (const [url, hash] of urls) if (!kept.has(hash)) urls.delete(url)
     }
 
-    // The directory: its own, private; what is there is read back (the cache survives a restart).
-    inventory()
+    let sweeping: Promise<void> | undefined
+    /** Serialize inventories and expiry cleanup; fetch completions wait for this off the turn path. */
+    const sweep = (): Promise<void> => {
+      if (sweeping !== undefined) return sweeping
+      sweeping = (async () => {
+        if (!sure) await inventory()
+        else {
+          const t = now()
+          lastSweep = t
+          for (const k of [...kept.values()]) {
+            if (k.at + MEDIA_KEEP_MS > t) continue
+            kept.delete(k.hash)
+            bytes -= k.bytes
+            try { await fs.unlink(fileOf(k)) }
+            catch (e) {
+              if ((e as { code?: unknown }).code !== "ENOENT") fault(`${fileOf(k)} could not be removed (${code(e)})`)
+            }
+          }
+        }
+        for (const [url, hash] of urls) if (!kept.has(hash)) urls.delete(url)
+      })().finally(() => { sweeping = undefined })
+      return sweeping
+    }
+
+    // Startup waits for the asynchronous inventory; no admission is possible while it is incomplete.
+    yield* Effect.promise(sweep)
 
     const refusalOf = (e: SafeFetchError): MediaRefusal =>
       e instanceof NetTooLarge ? "size" : e instanceof NetRefused ? (e.rule === "content-type" ? "type" : "blocked") : "fetch"
@@ -282,7 +296,7 @@ export const makeMediaCache = (options: MediaCacheOptions): Effect.Effect<MediaC
         const t = now()
         // What has expired is dealt with before the same bytes are matched against it (b5): an expired copy is a new
         // admission. While the cache is not sure (R6), this is an inventory; nothing new is admitted until one succeeds.
-        sweep()
+        yield* Effect.promise(sweep)
         if (!sure) return { refused: "unavailable" } satisfies MediaOutcome
         const already = kept.get(hash)
         if (already === undefined) {
@@ -377,8 +391,8 @@ export const makeMediaCache = (options: MediaCacheOptions): Effect.Effect<MediaC
 
     // Every minute: an inventory while the cache is not sure; what has expired goes every hour, not only when something
     // is fetched.
-    yield* Effect.forkScoped(Effect.forever(Effect.andThen(Effect.sleep(CHECK_EVERY_MS), Effect.sync(() => {
-      if (!sure || now() - lastSweep >= SWEEP_EVERY_MS) sweep()
+    yield* Effect.forkScoped(Effect.forever(Effect.andThen(Effect.sleep(CHECK_EVERY_MS), Effect.promise(async () => {
+      if (!sure || now() - lastSweep >= SWEEP_EVERY_MS) await sweep()
     }))))
 
     return {

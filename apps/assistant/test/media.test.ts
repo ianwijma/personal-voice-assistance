@@ -7,6 +7,7 @@ import type { ConnectRequest, ConnectResponse } from "@pva/net"
 import { Deferred, Effect, Exit, Fiber, Scope } from "effect"
 import { createHash } from "node:crypto"
 import { chmodSync, mkdtempSync, readdirSync, statSync, utimesSync, writeFileSync } from "node:fs"
+import { opendir, readFile, stat, unlink } from "node:fs/promises"
 import type http from "node:http"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
@@ -193,7 +194,7 @@ describe("the image cache (/media)", () => {
     // A day later: not served, and gone from the directory.
     w.clock.now += MEDIA_KEEP_MS
     expect(serveOnce(second.cache, `/media/${TOKEN}`, only(hash)).status).toBe(404)
-    second.cache.sweep()
+    await second.cache.sweep()
     expect(readdirSync(first.dir)).toEqual([])
     await run(second.close)
   })
@@ -224,6 +225,16 @@ describe("the image cache (/media)", () => {
       if (fail.has(op) && String(path).startsWith(dir)) throw Object.assign(new Error(`injected ${op} failure`), { code: "EIO" })
     }
     const fs: Partial<MediaFs> = {
+      opendir: async (p, o) => (eio("opendir", p), opendir(p, o)),
+      stat: async (p) => {
+        if (fail.has("stat") && String(p).startsWith(dir)) {
+          unreadable ??= String(p)
+          if (unreadable === String(p)) throw Object.assign(new Error("injected stat failure"), { code: "EIO" })
+        }
+        return stat(p)
+      },
+      readFile: (p) => readFile(p),
+      unlink: async (p) => (eio("unlink", p), unlink(p)),
       readdirSync: (p) => (eio("readdirSync", p), realReaddir(p)),
       statSync: (p) => {
         // A stat fault hits one entry only (the first it meets), like one unreadable file.
@@ -254,7 +265,8 @@ describe("the image cache (/media)", () => {
     expect("hash" in (await run(cache.fetch("https://img.example/0.png")))).toBe(true)
     w.clock.now += MEDIA_KEEP_MS + 1
     f.fail.add("unlinkSync")
-    cache.sweep()
+    f.fail.add("unlink")
+    await cache.sweep()
     expect(cache.stats()).toMatchObject({ files: 0, sure: false })
     // Not sure: refused, and the disk holds one file.
     expect(await run(cache.fetch("https://img.example/1.png"))).toEqual({ refused: "unavailable" })
@@ -292,6 +304,7 @@ describe("the image cache (/media)", () => {
     const { cache, close } = await run(open(w, dir, { files: 2 }, { fs: f.fs, issues }))
     f.fail.add("utimesSync")
     f.fail.add("unlinkSync")
+    f.fail.add("unlink")
     const outcomes = []
     for (let i = 0; i < 33; i++) outcomes.push(await run(cache.fetch(`https://img.example/${i}.png`)))
     // The first write fails (its temporary file stays); every later one is refused while the cache is not sure.
@@ -301,7 +314,7 @@ describe("the image cache (/media)", () => {
     expect(onDisk(dir).files).toBe(1)
     expect(issues.all().map((i) => i.id)).toEqual(["media.cache"])
     f.fail.clear()
-    cache.sweep()
+    await cache.sweep()
     expect(onDisk(dir).files).toBe(0)
     expect(cache.stats()).toMatchObject({ files: 0, bytes: 0, sure: true })
     expect(issues.all()).toEqual([])
@@ -324,7 +337,7 @@ describe("the image cache (/media)", () => {
       return name
     })
     const f = faulty(dir)
-    f.fail.add("statSync")
+    f.fail.add("stat")
     const { cache, close } = await run(open(w, dir, { files: 2 }, { fs: f.fs }))
     expect(cache.stats()).toMatchObject({ files: 1, sure: false })
     // The one it could not read is not taken as absent: nothing new is admitted.
@@ -345,12 +358,12 @@ describe("the image cache (/media)", () => {
     const { hash } = (await run(first.cache.fetch("https://img.example/heron.png"))) as { hash: string }
     await run(first.close)
     const f = faulty(first.dir)
-    f.fail.add("readdirSync")
+    f.fail.add("opendir")
     const second = await run(open(w, first.dir, undefined, { fs: f.fs }))
     expect(second.cache.stats()).toMatchObject({ files: 0, sure: false })
     expect(await run(second.cache.fetch("https://img.example/heron.png"))).toEqual({ refused: "unavailable" })
     f.fail.clear()
-    second.cache.sweep()
+    await second.cache.sweep()
     expect(second.cache.stats()).toMatchObject({ files: 1, sure: true })
     expect(serveOnce(second.cache, `/media/${TOKEN}`, only(hash)).status).toBe(200)
     await run(second.close)
@@ -366,14 +379,15 @@ describe("the image cache (/media)", () => {
     const { hash } = (await run(cache.fetch("https://img.example/heron.png"))) as { hash: string }
     w.clock.now += MEDIA_KEEP_MS + 1
     f.fail.add("unlinkSync")
+    f.fail.add("unlink")
     // The expired copy cannot be removed: the same bytes from another address are not admitted on top of it.
     expect(await run(cache.fetch("https://img.example/other.png"))).toEqual({ refused: "unavailable" })
     expect(serveOnce(cache, `/media/${TOKEN}`, only(hash)).status).toBe(404)
     f.fail.clear()
     // The next admission takes the inventory: the expired file goes, the same bytes are a new file, served.
     expect(await run(cache.fetch("https://img.example/other.png"))).toEqual({ hash })
-    cache.sweep()
-    cache.sweep()
+    await cache.sweep()
+    await cache.sweep()
     expect(onDisk(dir).names).toEqual([`${hash}.png`])
     expect(cache.stats()).toMatchObject({ files: 1, sure: true })
     expect(serveOnce(cache, `/media/${TOKEN}`, only(hash)).status).toBe(200)
@@ -396,8 +410,126 @@ describe("the image cache (/media)", () => {
     const again = serveOnce(cache, `/media/${TOKEN}`, only(hash))
     expect(again.status).toBe(200)
     expect(again.body).toEqual(Buffer.from(PNG))
-    cache.sweep()
+    await cache.sweep()
     expect(cache.stats()).toMatchObject({ files: 1, sure: true })
     await run(close)
   })
+})
+
+it("b2: recovery inventories asynchronously while unrelated work progresses, keeping admission closed", async () => {
+  const w = world()
+  const dir = mkdtempSync(join(tmpdir(), "pva-media-inventory-"))
+  for (let i = 0; i < 32; i++) {
+    const body = Buffer.from([...PNG, i])
+    const name = `${createHash("sha256").update(body).digest("hex")}.png`
+    writeFileSync(join(dir, name), body)
+    utimesSync(join(dir, name), w.clock.now / 1000, w.clock.now / 1000)
+  }
+  let broken = false
+  let recovering = false
+  let syncStats = 0
+  const sleeper = new Int32Array(new SharedArrayBuffer(4))
+  const { cache, close } = await run(open(w, dir, undefined, { fs: {
+    statSync: (p: string) => {
+      if (recovering) { syncStats++; Atomics.wait(sleeper, 0, 0, 1) }
+      return realStat(p)
+    },
+    readFileSync: (p: string) => {
+      if (broken) throw Object.assign(new Error("EIO"), { code: "EIO" })
+      return realReadFile(p)
+    }
+  } }))
+  try {
+    const name = readdirSync(dir)[0]!
+    broken = true
+    expect(serveOnce(cache, `/media/${TOKEN}`, only(name.slice(0, 64))).status).toBe(404)
+    broken = false
+    recovering = true
+    let heartbeat = false
+    let previous = performance.now()
+    let longest = 0
+    const beat = () => {
+      const t = performance.now()
+      longest = Math.max(longest, t - previous)
+      previous = t
+      heartbeat = true
+    }
+    const pulse = setInterval(beat, 1)
+    const immediate = setImmediate(beat)
+    try {
+      const recovery = cache.sweep()
+      expect(cache.stats().sure).toBe(false)
+      await recovery
+      expect(heartbeat).toBe(true)
+      expect(syncStats).toBe(0)
+      expect(cache.stats()).toMatchObject({ files: 32, sure: true })
+      console.log(`media recovery longest event-loop gap: ${longest.toFixed(2)} ms`)
+      expect(longest).toBeLessThan(10)
+    } finally { clearInterval(pulse); clearImmediate(immediate) }
+  } finally { await run(close) }
+})
+
+it("b3: restart inventory removes duplicate suffixes, truncated bytes and wrong digests before counting physical files", async () => {
+  const w = world()
+  const dir = mkdtempSync(join(tmpdir(), "pva-media-restored-"))
+  let first = ""
+  for (let i = 0; i < 255; i++) {
+    const body = Buffer.from([...PNG, i])
+    const hash = createHash("sha256").update(body).digest("hex")
+    if (i === 0) first = hash
+    const path = join(dir, `${hash}.png`)
+    writeFileSync(path, body)
+    utimesSync(path, w.clock.now / 1000, w.clock.now / 1000)
+  }
+  const duplicate = join(dir, `${first}.jpg`)
+  writeFileSync(duplicate, Buffer.from([...PNG, 0]))
+  utimesSync(duplicate, w.clock.now / 1000, w.clock.now / 1000)
+  const wrong = join(dir, `${"a".repeat(64)}.png`)
+  writeFileSync(wrong, PNG)
+  utimesSync(wrong, w.clock.now / 1000, w.clock.now / 1000)
+  const truncated = join(dir, `${"b".repeat(64)}.png`)
+  writeFileSync(truncated, Buffer.alloc(0))
+  utimesSync(truncated, w.clock.now / 1000, w.clock.now / 1000)
+  w.routes.set("img.example/new.png", () => reply(200, Uint8Array.from([...PNG, 255]), { "content-type": "image/png" }))
+  const { cache, close } = await run(open(w, dir))
+  try {
+    expect(readdirSync(dir)).toHaveLength(255)
+    expect(serveOnce(cache, `/media/${TOKEN}`, only("b".repeat(64))).status).toBe(404)
+    expect(cache.stats()).toMatchObject({ files: 255, sure: true })
+    expect("hash" in await run(cache.fetch("https://img.example/new.png"))).toBe(true)
+    expect(readdirSync(dir)).toHaveLength(256)
+  } finally { await run(close) }
+})
+
+it("a6: a fresh keyed image resolves a real cache after its file's day and serves a ready image again", async () => {
+  const { presentPrepared, presentWorld } = await import("@pva/core/present-contract")
+  const { makeMemoryHouseholdStore } = await import("@pva/core/testing")
+  await run(Effect.scoped(Effect.gen(function*() {
+    const w = world()
+    w.routes.set("img.example/heron.png", () => reply(200, PNG, { "content-type": "image/png" }))
+    const { cache, close } = yield* open(w)
+    yield* Effect.addFinalizer(() => close)
+    const presenter = yield* presentWorld(yield* presentPrepared(makeMemoryHouseholdStore()), { media: (url) => cache.fetch(url) })
+    const image = { kind: "image", url: "https://img.example/heron.png", alt: "A", credit: "C", spoken: "A" } as const
+    const showFresh = Effect.gen(function*() {
+      const h = yield* presenter.showOn("kitchen-display", image, { key: "photo", lifetime: "pinned", expiresInMs: MEDIA_KEEP_MS })
+      for (let i = 0; i < 1_000; i++) {
+        yield* presenter.settle
+        const content = presenter.shownOn("kitchen-display")[0]?.content
+        if (content?.kind === "image" && content.image.state === "ready") {
+          const response = serveOnce(cache, `/media/${content.image.token}`, presenter.present.mediaFor)
+          expect(response.status).toBe(200)
+          return h
+        }
+        yield* Effect.promise(() => new Promise<void>((resolve) => setImmediate(resolve)))
+      }
+      throw new Error("the fresh image did not resolve")
+    })
+    yield* showFresh
+    w.clock.now += 23 * 3_600_000
+    yield* showFresh
+    w.clock.now += 3_600_001
+    yield* showFresh
+    expect(w.requests).toHaveLength(2)
+  })))
 })
