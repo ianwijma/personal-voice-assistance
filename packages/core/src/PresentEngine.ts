@@ -256,6 +256,8 @@ interface Entry {
   readonly target: { readonly device: string } | { readonly room: string }
   readonly owner: string | undefined
   readonly kind: PresentKindName
+  /** The address this showing currently wants, checked before an image completion claims it. */
+  readonly imageUrl: string | undefined
   readonly handler: string | undefined
   readonly shownAt: number
   readonly expiresAt: number
@@ -352,6 +354,7 @@ const entryOf = (row: Row<StoredPresentation>): Entry => {
     target: v.target,
     owner: v.owner,
     kind: v.content.kind,
+    imageUrl: v.content.kind === "image" ? v.content.url : undefined,
     handler: v.handler,
     shownAt: v.shownAt,
     expiresAt: v.expiresAt
@@ -904,8 +907,9 @@ export const makePresentEngine = (options: PresentEngineOptions): Effect.Effect<
         completingImages++
         if ("refused" in outcome) log(`Presentations: an image was not kept (${outcome.refused})`)
         const waiters = [...ids].flatMap((id) => {
-          const showId = index.get(id)?.showId
-          if (showId === undefined) return []
+          const current = index.get(id)
+          if (current === undefined || current.imageUrl !== url) return []
+          const showId = current.showId
           const prior = imageOutcomes.get(id)
           // An older address's late completion must not displace another address's pending write or retry.
           if (prior?.showId === showId && prior.url !== url) return []
@@ -1206,6 +1210,7 @@ export const makePresentEngine = (options: PresentEngineOptions): Effect.Effect<
         target,
         owner: ownerOf(presentation.sensitivity),
         kind: presentation.kind,
+        imageUrl: presentation.kind === "image" ? presentation.url : undefined,
         handler: presentation.handler,
         shownAt: now,
         expiresAt

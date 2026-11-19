@@ -1049,17 +1049,16 @@ export const startTestModule = (definition: ModuleDefinition<any>, options: Star
       })
 
     let pendingPresses = 0
-    const pressesByDevice = new Map<string, number>()
+    const pressesByDevice = new Map<string, { pending: number }>()
     const admitPress = <A>(deviceId: string, work: Effect.Effect<A>, busy: () => A): Effect.Effect<A> => Effect.suspend(() => {
-      const count = pressesByDevice.get(deviceId) ?? 0
-      if (count >= 4 || pendingPresses >= 16) return Effect.succeed(busy())
-      pressesByDevice.set(deviceId, count + 1)
+      const connection = pressesByDevice.get(deviceId) ?? { pending: 0 }
+      if (connection.pending >= 4 || pendingPresses >= 16) return Effect.succeed(busy())
+      pressesByDevice.set(deviceId, connection)
+      connection.pending++
       pendingPresses++
       return work.pipe(Effect.ensuring(Effect.sync(() => {
         pendingPresses--
-        const left = (pressesByDevice.get(deviceId) ?? 1) - 1
-        if (left === 0) pressesByDevice.delete(deviceId)
-        else pressesByDevice.set(deviceId, left)
+        connection.pending--
       })))
     })
     const harness = {
@@ -1289,6 +1288,8 @@ export const startTestModule = (definition: ModuleDefinition<any>, options: Star
         disconnect: (deviceId: string) =>
           Effect.suspend(() => {
             connectedNow.delete(deviceId)
+            // Old calls retain their own counter; the next connection starts with four fresh slots.
+            pressesByDevice.delete(deviceId)
             // As serve mode: the connection is gone (`deviceOfConnection`, tool calls made with it), and what was being
             // spoken there fails with the audio client's disconnect.
             const cut = playing.get(deviceId)
