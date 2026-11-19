@@ -2,11 +2,11 @@
 // fixtures; unreachable, slow, too large and rubbish are each a sentence the person can act on, and a hostile answer
 // is bounded, marked and attributed.
 import { assert, describe, it } from "@effect/vitest"
-import { checkModule, startTestModule } from "@pva/core/testing"
+import { checkModule, startTestModule as startKit } from "@pva/core/testing"
 import { Effect, Fiber } from "effect"
 import { bound } from "../../store-sqlite/test/latencyBound.ts"
 import { BOUNDS, makeKnowledge, MAX_RESULT_CHARS, texts } from "../src/knowledge.ts"
-import { hangingNet, netWith } from "./support.ts"
+import { hangingNet, netWith, unchanged } from "./support.ts"
 
 const nl = { household: { home: { HOME_LANGUAGE: "nl-NL", HOME_TIME_ZONE: "Europe/Amsterdam" } } }
 
@@ -42,6 +42,9 @@ const hugeFixtures = {
   // Two entries of two senses, every text at its largest: just under the 256 KiB a response may be.
   "https://en.wiktionary.org/api/rest_v1/page/definition/big": { body: { en: [0, 1].map(() => ({ partOfSpeech: huge, definitions: [{ definition: huge }, { definition: huge }] })) } }
 }
+
+// A tool that returns a presentation answers `{ forModel, present }`: the tests read the unchanged `forModel` through `unchanged`.
+const startTestModule: typeof startKit = (definition, options) => Effect.map(startKit(definition, options), unchanged)
 
 describe("knowledge", () => {
   it.effect("passes the conformance check, with its texts in both languages", () => checkModule(makeKnowledge(netWith(fixtures).deps), { texts }))

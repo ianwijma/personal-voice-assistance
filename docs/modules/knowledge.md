@@ -46,6 +46,28 @@ too large, wrong type), "Wikipedia gave me an answer I couldn't read." (rubbish)
 Typed action: `knowledge.lookup` ("who was Annie M. G. Schmidt", "vertel me over de Eiffeltoren"): one search and one
 summary within 3.5 seconds, then "According to Wikipedia," and the first sentences of the extract, with no model.
 
+## On the screen
+
+A summary (the tool's `summary` kind and the typed action) comes with a **transient `card`** for the screen of the
+device that asked ("who was Annie M. G. Schmidt", "vertel me over de Eiffeltoren"): the title (cut to 60 characters), the
+first sentences of the extract as the text (at most 300, the same words the action speaks), and one fact, the source's
+name ("Source: Wikipedia (en)" / "Bron: Wikipedia (nl)"). No image and no second request: nothing is fetched for the card.
+
+- **Returned with the answer, never shown from inside the tool.** The tool answers `{ forModel, present }` and the action
+  `{ say, present }`, where `forModel` and `say` are exactly what the result and the sentence always were. The module
+  shows, replaces and withdraws nothing itself and keeps no handle: a tool may run before its turn is committed, and the
+  Presenter shows what a speculative tool returned only once the turn is promoted (a discarded turn shows nothing). A device without a display, or no
+  Presenter (the CLI modes), changes nothing about the answer.
+- **Same answer, same privacy.** The card says what the answer said and nothing more; it is public Wikipedia text and
+  nothing personal, so it is for a shared, a private and a public device alike, decided by the Presenter for that device.
+- **Cut honestly.** Every text is cut once, inside its limit, at a code point boundary (the first-sentences cut and the
+  final cut too: never between the halves of an emoji); a cut title ends with "…". What a device that shows nothing is told to say
+  is the action's own sentence ("According to Wikipedia, …", at most 300 characters).
+- **How long it stays.** A card ends by itself after 30 seconds, or when the next presentation on that device replaces it.
+  An answer that is not a summary (a definition, an ambiguous name, nothing found, Wikipedia unreachable) returns no card
+  and does **not** take an earlier one down. A stopped module's transient cards are withdrawn with it.
+- No buttons and no handler: nothing on the card can be pressed.
+
 ## Settings
 
 | Setting | Default | |
@@ -76,6 +98,7 @@ search API and the REST summary) and `en.wiktionary.org` (the REST definition), 
   takes about 400 ms and the English about 80 ms *synchronously*, which would block the audio thread. It needs a worker
   thread (or a prebuilt index). Left out; the dependency is installed and unused.
 - **SPARQL**, **translation** and **crypto** (the plan's "left for later").
-- **The `card` presentation** with the Wikipedia thumbnail and credit, and a spoken-source line outside a reply: wave B.
+- **The card's Wikipedia thumbnail and credit** (an `image` presentation, a second request) and a spoken-source line outside a reply. The card above has no image.
+- A card for a **definition** (`kind: "define"`): the senses are not a card's shape; only a summary has a card.
 - Wiktionary definitions come from the English edition only (Dutch entries there are thin); a word is looked up in the
   section of the language asked for only.
