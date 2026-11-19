@@ -17,11 +17,11 @@ findings fixed; it does not mean merged.
 | P4 household store, event bus | #91 | `t3/modules-04-store-bus` | `282ebb9` | closed |
 | P5 people, rooms, devices | #93 | `t3/modules-05-people-rooms` | `3e19fba` | closed |
 | P6 scheduler | #92 | `t3/modules-06-scheduler` | `c842653` | closed |
-| P11 scaffold, contracts, test kit, guide | #94 | `t3/modules-11-scaffold` | `5bfeca0d` | closed; CI green at `6aa6005c`, running on the head |
+| P11 scaffold, contracts, test kit, guide | #94 | `t3/modules-11-scaffold` | `5bfeca0d` | closed; CI green |
 | P9 notifications, speech, ringing | #106 | `t3/modules-09-notify` | `d177f3ec` | closed after three review rounds; CI green |
-| P7 phrase commands, essential controls | not opened yet | `t3/modules-07-phrases` | `77e36eca` | fix round done; deciding review running |
-| P10 presentation | not opened yet | `t3/modules-10-present` | (being built) | build started on top of P9; P7 is merged in when it closes |
-| P8 risk policy in admin | none | none | none | not started |
+| P7 phrase commands, essential controls | #107 | `t3/modules-07-phrases` | `77e36eca` | two review rounds done (24, then 8 findings); last fix round running |
+| P10 presentation | #108 | `t3/modules-10-present` | `3280b6ef` | built on top of P9; first review running; P7 is merged in when it closes, then the pull request's base becomes P7 |
+| P8 risk policy in admin | being built | `t3/modules-08-risk` | (being built) | build started on top of P10 |
 
 **Fixes to P1 to P6 code found later live on the scaffold branch**, not on their own branches: the worker-thread
 helper `offThread`; POST and typed loopback in `@pva/net`; the gateway no longer timing its own risk lookup (an
@@ -49,19 +49,18 @@ its own pull request on the scaffold.
 | kitchen | #104 | `t3/module-kitchen` | `8c194006` |
 | calendar (ICS only) | #105 | `t3/module-calendar` | `7050c33e` |
 
-CI was green on ten of them at these heads; local info was red once on a slow test and has a longer time limit since
-(`3304c422`). They carry the scaffold up to `6aa6005c`; the scaffold's last store change (`5bfeca0d`) still has to be
+CI is green on all eleven at these heads. They carry the scaffold up to `6aa6005c`; the scaffold's last store change (`5bfeca0d`) still has to be
 merged into each.
 
 ## What is left, in order
 
-1. P7: finish its deciding review, open its pull request (base `t3/modules-09-notify`).
-2. P10: finish the build, merge P7 into it, review, fix; pull request with base `t3/modules-07-phrases`.
-3. P8, first version: the risk policy as a household setting in admin.
+1. P7 (#107): finish the last fix round.
+2. P10 (#108): review, fix, merge P7 into it, make P7 its base.
+3. P8, first version (the risk policy as a household setting in admin): finish the build, review, fix.
 4. Wave B, one pull request per module on top of P8: timers and alarms, reminders, notifications, assistant controls,
    music, routines and automations, broadcast, images and photos; and the phrase commands and presentations wave A
    left out, one small pull request per module.
-5. Deferred, with a plan of their own: google, t3-code, mcp-client, calls and intercom, CalDAV; connections and
+5. Deferred, with a plan of their own ([MODULES-DEFERRED-PLAN.md](MODULES-DEFERRED-PLAN.md), being written): google, t3-code, mcp-client, calls and intercom, CalDAV; connections and
    OAuth (the rest of P8); streaming and WebSocket to an owner-typed address.
 
 ## Open points
