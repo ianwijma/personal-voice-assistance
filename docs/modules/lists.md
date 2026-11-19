@@ -235,7 +235,9 @@ stand in for a name:
   failure there never changes the answer. When the status write itself fails, the answer is "The lists are busy just
   now; try again in a moment." and nothing changed. It is idempotent by the item: an item that is already ticked off (by
   another device, or a second press) is not ticked again and the answer says "Already ticked off: eggs."; an item that
-  is gone says so (and the screen is brought up to date). A press records no undo entry (a press has no conversation).
+  is gone says so (and the screen is brought up to date). Each line carries a signature of its item's id, name and amount;
+  if the name or amount changed before the tap, nothing is ticked, the answer asks for another tap, and the worker refreshes
+  the checklist. Editing another item does not invalidate the tap. A press records no undo entry (a press has no conversation).
   A tick can only tick off: the checklist shows open items, and an untick answers "Here I can only tick things off." A
   device that does not hold the checklist, and a module that is stopped, are refused by the host ("I can't do that
   right now.") before any of this runs.

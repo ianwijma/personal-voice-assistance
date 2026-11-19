@@ -44,9 +44,13 @@ export const cutAt = (text: string, max: number): string => {
   return `${line.slice(0, end).trimEnd()}…`
 }
 
+/** Bind a line to its row, name and amount, within the press value's 40-character bound. */
+const tickId = (row: Row<Item>) => signatureOf(JSON.stringify([row.id, row.value.text, row.value.quantity?.amount, row.value.quantity?.unit]))
+
 /** What a checklist shows of a list now. */
 export interface Built {
   readonly presentation: Presentation
+  readonly itemIds: ReadonlyMap<string, string>
   /** What a screen holds of it (the title and the items), for comparing with what is shown (a change of either is an update). */
   readonly signature: string
   readonly open: number
@@ -111,7 +115,7 @@ export const makeChecklists = (ctx: {
     const lang = () => homeLanguage(ctx.host.view())
     const pinStore = engine.rawStore.collection(pins)
     /** This run's handle of each device's checklist (a restart forgets them; the host keeps what is pinned). */
-    const handles = new Map<string, { readonly handle: PresentHandle; readonly shown: string; readonly until: number; readonly closing?: boolean }>()
+    const handles = new Map<string, { readonly handle: PresentHandle; readonly shown: string; readonly until: number; readonly closing?: boolean; readonly itemIds?: ReadonlyMap<string, string> }>()
     /** Devices whose checklist this run took down while its row is still there (the row is removed next). */
     const dismissed = new Set<string>()
     /** Presenter refusals leave the old screen in place. The worker rolls back the recorded show intent. */
@@ -137,12 +141,12 @@ export const makeChecklists = (ctx: {
         const tail = more > 0 ? say(texts, l, "titleMore", { count: more }) : ""
         const title = `${cutAt(name, TITLE_CHARS - tail.length)}${tail}`
         const named = rows.map((r) => oneLine(sayItem(r.value.text, r.value.quantity, l)) || say(texts, l, "unnamedItem"))
-        const items = rows.map((r, i) => ({ id: r.id, text: cutAt(named[i]!, ITEM_CHARS), done: false }))
+        const items = rows.map((r, i) => ({ id: tickId(r), text: cutAt(named[i]!, ITEM_CHARS), done: false }))
         const phrase = engine.phraseOf(list, l)
         const total = Math.max(open, rows.length)
         const spoken = spokenList(named, total, l, readItems, phrase)
         const presentation: Presentation = { kind: "list", title, style: "checklist", items, spoken, handler: HANDLER }
-        return { presentation, signature: JSON.stringify([title, items]), open, cancelledThrough: row?.value.pinsCancelledThrough }
+        return { presentation, itemIds: new Map(rows.map((r, i) => [items[i]!.id, r.id])), signature: JSON.stringify([title, items]), open, cancelledThrough: row?.value.pinsCancelledThrough }
       })
 
 
@@ -328,7 +332,7 @@ export const makeChecklists = (ctx: {
           yield* oweUnsupportedDismissal(current.value, r.handle)
           return yield* reconcileLocked(device)
         }
-        handles.set(device, { handle: r.handle, shown, until })
+        handles.set(device, { handle: r.handle, shown, until, itemIds: built.itemIds })
         // Owed work done: cleared without touching the end.
         if (current.value.owed !== undefined) yield* write({ device, list: pin.list, key: pin.key, until, shown })
         return { next: until, down: false }
@@ -456,11 +460,20 @@ export const makeChecklists = (ctx: {
           return { say: speak(l, list?.value.deletedAt !== undefined ? "itemGone" : "pinGone") }
         }
         if (p.done !== true) return { say: speak(l, "tickOnly") }
-        const item = yield* engine.itemStore.get(p.item)
+        const id = handles.get(p.deviceId)?.itemIds?.get(p.item)
+        if (id === undefined) {
+          ask(p.deviceId)
+          return { say: speak(l, "itemChanged") }
+        }
+        const item = yield* engine.itemStore.get(id)
         if (item === undefined || item.value.list !== pin.list || item.value.status === "removed") {
           // The screen is behind its list: it is brought up to date by the worker.
           ask(p.deviceId)
           return { say: speak(l, "itemGone") }
+        }
+        if (tickId(item) !== p.item) {
+          ask(p.deviceId)
+          return { say: speak(l, "itemChanged") }
         }
         // Already ticked off (a second press, or another device's): nothing changes, and it says so.
         if (item.value.status === "done") return { say: speak(l, "alreadyTicked", { items: item.value.text }) }
@@ -520,7 +533,7 @@ export const makeChecklists = (ctx: {
             ask(device)
             return { kind: "not-shown", spoken, why: r.why } as const
           }
-          handles.set(device, { handle: r.handle, shown, until })
+          handles.set(device, { handle: r.handle, shown, until, itemIds: built.itemIds })
           dismissed.delete(device)
           failures.delete(device)
           // The committing intent already asked the worker. It clears the owed show without holding up this answer.

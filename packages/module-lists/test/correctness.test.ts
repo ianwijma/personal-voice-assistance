@@ -318,7 +318,7 @@ describe("correctness review round 1", () => {
     const card = kit.present.shown()[0]!
     const id = (card.content as { items: ReadonlyArray<{ id: string }> }).items[0]!.id
     assert.deepStrictEqual(yield* kit.present.press(card.id, "tick", { item: id, done: true }), { ok: true, say: "Ticked off milk on the shopping list." })
-    assert.deepStrictEqual((yield* kit.moduleStore().collection(items).get(id))!.updatedBy, { kind: "ui", deviceId: "kitchen-display" })
+    assert.deepStrictEqual((yield* kit.moduleStore().collection(items).list({}))[0]!.updatedBy, { kind: "ui", deviceId: "kitchen-display" })
     assert.deepStrictEqual((yield* kit.moduleStore().collection(lists).get("shopping"))!.updatedBy, { kind: "ui", deviceId: "kitchen-display" })
   }))
 
@@ -378,7 +378,7 @@ describe("correctness review round 2", () => {
       } else {
         assert.deepStrictEqual(yield* kit.present.press(card.id, "tick", { item: id, done: true }), { ok: true, say: operation === "press without undo" ? "That isn't on the list any more." : "That list isn't shown here any more." })
       }
-      assert.strictEqual((yield* kit.moduleStore().collection(items).get(id))!.value.status, "open")
+      assert.strictEqual((yield* kit.moduleStore().collection(items).list({}))[0]!.value.status, "open")
       yield* Deferred.succeed(release, undefined)
       yield* kit.advance(65_000)
       assert.isUndefined(screen(kit))
@@ -561,7 +561,7 @@ describe("correctness review round 3", () => {
         assert.isTrue((yield* kit.action("show", {})).ok)
         yield* kit.present.settle
         const card = kit.present.shown()[0]!
-        assert.include((card.content as { items: ReadonlyArray<{ id: string }> }).items.map((i) => i.id), item.id)
+        assert.include((card.content as { items: ReadonlyArray<{ text: string }> }).items.map((i) => i.text), label)
         delete capabilities.present.kinds.list
         const fallback = yield* kit.action("show", {})
         assert.isTrue(fallback.ok)
@@ -570,11 +570,13 @@ describe("correctness review round 3", () => {
           assert.include(fallback.say!, language === "en" ? "3 things" : "3 dingen")
           assert.notInclude(fallback.say!, mark[0]!)
         }
-        // Restore a screen and tick the item by its original item ID.
+        // Restore a screen and tick the displayed line.
         capabilities.present.kinds.list = KIT_PAGE_CAPABILITIES.present!.kinds.list!
         yield* kit.action("show", {})
         yield* kit.present.settle
-        yield* kit.present.press(kit.present.shown()[0]!.id, "tick", { item: item.id, done: true })
+        const restored = kit.present.shown()[0]!
+        const line = (restored.content as { items: ReadonlyArray<{ id: string; text: string }> }).items.find((i) => i.text === label)!
+        yield* kit.present.press(restored.id, "tick", { item: line.id, done: true })
         yield* kit.present.settle
         assert.strictEqual((yield* kit.moduleStore().collection(items).get(item.id))!.value.status, "done")
         assert.deepStrictEqual(screen(kit), ["milk", "bread"])
@@ -951,5 +953,46 @@ describe("correctness review round 6", () => {
     assert.strictEqual(owed, "dismiss")
     assert.isUndefined(screen(kit))
     assert.deepStrictEqual(yield* rows(kit), [])
+  }))
+})
+
+describe("correctness review round 7", () => {
+  it.effect("1: tapping milk after a phone renames it to rice leaves rice open and refreshes the checklist", () => Effect.gen(function*() {
+    const entered = yield* Deferred.make<void>()
+    const release = yield* Deferred.make<void>()
+    let pause = false
+    const kit = yield* startTestModule(wrap((ctx) => ({ ...ctx, store: { ...ctx.store,
+      collection: (c: { name: string }) => {
+        const h = ctx.store.collection(c)
+        return c.name !== "pins" ? h : { ...h, list: (q: { where?: { list?: string } }) => h.list(q).pipe(Effect.tap(() => Effect.gen(function*() {
+          if (!pause || q.where?.list === undefined) return
+          pause = false
+          yield* Deferred.succeed(entered, undefined)
+          yield* Deferred.await(release)
+        }))) }
+      }
+    } })))
+    yield* kit.action("add", { items: "milk" })
+    yield* kit.action("show", {})
+    yield* kit.present.settle
+    const card = kit.present.shown()[0]!
+    const line = (card.content as { items: ReadonlyArray<{ id: string; text: string }> }).items[0]!
+    assert.strictEqual(line.text, "milk")
+    pause = true
+    yield* kit.tool("lists_update", { item: "milk", rename: "rice" }, { device: "robins-phone" })
+    yield* Deferred.await(entered)
+    assert.deepStrictEqual(screen(kit), ["milk"])
+    assert.deepStrictEqual(yield* kit.present.press(card.id, "tick", { item: line.id, done: true }), {
+      ok: true, say: "That item has changed. Tap it again on the updated checklist."
+    })
+    assert.deepStrictEqual(yield* kit.action("read", {}), { ok: true, say: "The shopping list has one thing: rice." })
+    yield* Deferred.succeed(release, undefined)
+    yield* kit.present.settle
+    assert.deepStrictEqual(screen(kit), ["rice"])
+    const refreshed = kit.present.shown()[0]!
+    const rice = (refreshed.content as { items: ReadonlyArray<{ id: string }> }).items[0]!
+    assert.deepStrictEqual(yield* kit.present.press(refreshed.id, "tick", { item: rice.id, done: true }), {
+      ok: true, say: "Ticked off rice on the shopping list."
+    })
   }))
 })
