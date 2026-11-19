@@ -371,7 +371,7 @@ export const timersModule = defineModule({
           const late = now - owed.at
           const sent = yield* Effect.result(ctx.notify.send({
             title: out.name !== undefined ? say(texts, lang, "title", { Name: cut(capitalise(name), 40) }) : say(texts, lang, "titlePlain"),
-            text: late >= 60_000 ? say(texts, lang, "ringTextLate", { duration, late: speakLeft(late, lang) }) : say(texts, lang, "ringText", { duration }),
+            text: late > 0 ? say(texts, lang, "ringTextLate", { duration, late: speakLeft(late, lang) }) : say(texts, lang, "ringText", { duration }),
             priority: "ring",
             key: `timer:${id}:${owed.n}`,
             expiresInMs: ringMs(),
@@ -459,13 +459,18 @@ export const timersModule = defineModule({
       const readRinging = Effect.gen(function*() {
         const notifications = yield* ctx.notify.list()
         const open = new Set(notifications.map((n) => n.id))
+        const keys = new Set(notifications.map((n) => n.key))
         const pending = yield* readPending
         const ringing: Array<Row<Timer>> = []
         const waiting: Array<Row<Timer>> = []
         const cleanup: Array<Row<Timer>> = []
         for (const row of pending.rows) {
           if (row.value.phase !== "ended") continue
-          if (row.value.state === "done" && row.value.owed !== undefined) waiting.push(row)
+          if (row.value.state === "done" && row.value.owed !== undefined) {
+            // A send can have succeeded before its outcome write failed. Only this occurrence's key proves it rang.
+            if (keys.has(`timer:${row.id}:${row.value.owed.n}`)) ringing.push(row)
+            else waiting.push(row)
+          }
           else if (row.value.state === "done" && row.value.ring !== undefined && open.has(row.value.ring.notification)) ringing.push(row)
           else if (row.value.withdraw !== undefined || row.value.screen !== undefined) cleanup.push(row)
         }
@@ -682,7 +687,7 @@ export const timersModule = defineModule({
             const Name = capitalise(displayName(row.value, lang))
             if (t.shown !== "active") {
               // A timer that came due given more time runs again for that long; its ring is withdrawn.
-              if (deltaMs <= 0) return say(texts, lang, "notPausedRinging", { Name })
+              if (deltaMs <= 0) return say(texts, lang, t.shown === "waiting" ? "oneWaiting" : "notPausedRinging", { Name })
               const active = yield* readActive.pipe(Effect.mapError(failure))
               if (active.cut || active.rows.length >= TIMERS_LIMITS.running) return yield* Effect.fail(fail(say(texts, lang, "full", { count: TIMERS_LIMITS.running })))
               const after = yield* Effect.flatMap(rearmed(row.id, row.value, now, deltaMs, { snoozed: false }), (value) => change(row, value)).pipe(Effect.mapError(failure))
@@ -750,13 +755,20 @@ export const timersModule = defineModule({
               if (rows.length === 0) return say(texts, lang, "cancelledNone")
               // Every row in one transaction (all or none), then what is owed for each done.
               const values: Array<{ readonly row: Row<Timer>; readonly id: string; readonly value: Timer }> = []
-              for (const row of rows) values.push({ row, id: row.id, value: yield* cancelled(row, now, read.notifications).pipe(Effect.mapError(failure)) })
+              for (const row of rows) {
+                values.push({ row, id: row.id, value: yield* cancelled(row, now, read.notifications).pipe(Effect.mapError(failure)) })
+                if (values.length % PAGE === 0) yield* Effect.yieldNow
+              }
               yield* commitAll(values).pipe(Effect.mapError(failure))
               let pending = false
-              for (const row of rows) {
-                const after = yield* reconcile(row.id, undefined, true).pipe(Effect.mapError(failure))
-                const l = leftovers(after)
-                pending ||= l.ring || l.screen
+              for (let i = 0; i < rows.length; i++) {
+                const after = yield* Effect.result(reconcile(rows[i]!.id, undefined, true))
+                if (after._tag === "Failure") pending = true
+                else {
+                  const l = leftovers(after.success)
+                  pending ||= l.ring || l.screen
+                }
+                if ((i + 1) % PAGE === 0) yield* Effect.yieldNow
               }
               if (pending) return say(texts, lang, "cancelledAllPending", { count: rows.length })
               return say(texts, lang, read.cut ? "cancelledAllCut" : "cancelledAll", { count: rows.length })

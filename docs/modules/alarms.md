@@ -140,8 +140,8 @@ The ring goes only to its own device. The decision is made when answering, for t
 A snoozed alarm is part of its row: it is listed with its nominal time and when it rings again ("One alarm: tea today
 at ten oh one in the morning, ringing again today at ten past ten in the morning."), and a ringing one is listed as
 ringing. Either can be cancelled by voice, also after a
-restart: "The snoozed alarm is cancelled.". Ringing, waiting and withdrawing one-offs keep their nominal time in the
-list and selection question, including on other devices; their labels stay on their own device.
+restart: "The snoozed alarm is cancelled.". Ringing and waiting one-offs keep their nominal time in lists and cancellation choices, including on other devices;
+alarms still being withdrawn appear only in cancellation choices. Their labels stay on their own device.
 
 - From any device it can be cancelled by its time: the time it was set for, also when it rang late or next to a
   daylight-saving change.

@@ -53,6 +53,8 @@ const Ring = Schema.Struct({
   time: TimeText,
   at: Instant,
   until: Instant,
+  /** Effective due instant of a delivered snooze, retained for selection; `at` is when it was sent. */
+  snoozedAt: Schema.optionalKey(Instant),
   again: Schema.optionalKey(Instant),
   pressed: Schema.optionalKey(NOTE)
 })
@@ -209,11 +211,11 @@ const withoutKey = <K extends "ring" | "withdraw" | "owed" | "next">(v: Alarm, k
  */
 const withdrawing = (
   v: Alarm,
-  ring: { readonly notification: string; readonly until: number; readonly date: string; readonly time: string; readonly again?: number; readonly at?: number },
+  ring: { readonly notification: string; readonly until: number; readonly date: string; readonly time: string; readonly again?: number; readonly snoozedAt?: number },
   now: number
 ): Alarm | undefined =>
   v.withdraw === undefined || v.withdraw.notification === ring.notification
-    ? { ...v, withdraw: { notification: ring.notification, date: ring.date, time: ring.time, ...(ring.again !== undefined ? { at: ring.again } : ring.at !== undefined ? { at: ring.at } : {}), until: ring.until, retryAt: now } }
+    ? { ...v, withdraw: { notification: ring.notification, date: ring.date, time: ring.time, ...(ring.again !== undefined ? { at: ring.again } : ring.snoozedAt !== undefined ? { at: ring.snoozedAt } : {}), until: ring.until, retryAt: now } }
     : undefined
 
 /** What is due at `now` without an outside call: an occurrence or a snooze becomes an owed ring, the series moves on. */
@@ -322,9 +324,12 @@ export const alarmsModule = defineModule({
           const lang = language()
           const later = (x: Alarm) => ({ value: { ...x, owed: { ...owed, attempts: owed.attempts + 1, retryAt: now + RETRY_RING_MS } }, jobs: [] })
           if (now - owed.at > DELIVER_WITHIN_MS) {
+            const due = localOf(owed.at, v.timeZone)
+            const date = owed.snoozed === true ? dateText(due.date) : owed.date
+            const time = owed.snoozed === true ? timeText(due.time) : owed.time
             const missed = yield* Effect.result(ctx.notify.send({
               title: say(texts, lang, "missedTitle"),
-              text: say(texts, lang, "missedText", { time: momentOf(owed.date, owed.time, now, v.timeZone, lang) }),
+              text: say(texts, lang, "missedText", { time: momentOf(date, time, now, v.timeZone, lang) }),
               key: `alarm-missed:${id}:${owed.n}`,
               target: "origin"
             }))
@@ -333,7 +338,7 @@ export const alarmsModule = defineModule({
               handler: "trouble",
               key: `trouble:${id}:${owed.n}`,
               inMs: 0,
-              payload: { message: `An alarm could not ring, and the card saying so could not be sent either (${owed.date} ${owed.time}).` }
+              payload: { message: `An alarm could not ring, and the card saying so could not be sent either (${date} ${time}).` }
             }))
             if (report._tag === "Failure") return later(v)
             return { value: withoutKey(v, "owed"), jobs: [report.success] }
@@ -353,7 +358,7 @@ export const alarmsModule = defineModule({
           const late = now - owed.at
           const sent = yield* Effect.result(ctx.notify.send({
             title: v.name !== undefined ? say(texts, lang, "title", { Name: cut(capitalise(v.name), 40) }) : say(texts, lang, "titlePlain"),
-            text: late >= 60_000 ? say(texts, lang, "ringTextLate", { time, late: speakLeft(late, lang) }) : say(texts, lang, "ringText", { time }),
+            text: late > 0 ? say(texts, lang, "ringTextLate", { time, late: speakLeft(late, lang) }) : say(texts, lang, "ringText", { time }),
             priority: "ring",
             key: `alarm:${id}:${owed.n}`,
             expiresInMs: ringMs(),
@@ -362,7 +367,7 @@ export const alarmsModule = defineModule({
             target: "origin"
           }))
           if (sent._tag === "Failure") return later(out)
-          const ring = { n: owed.n, notification: sent.success.notification.id, date: owed.date, time: owed.time, at: now, until: sent.success.notification.expiresAt }
+          const ring = { n: owed.n, notification: sent.success.notification.id, date: owed.date, time: owed.time, at: now, until: sent.success.notification.expiresAt, ...(owed.snoozed === true ? { snoozedAt: owed.at } : {}) }
           return { value: { ...withoutKey(out, "owed"), ring }, jobs: [] }
         })
 
@@ -391,7 +396,7 @@ export const alarmsModule = defineModule({
             const owed = out.owed
             const sent = notifications.find((n) => n.key === `alarm:${id}:${owed.n}`)
             if (sent !== undefined) {
-              const taken = withdrawing(out, { notification: sent.id, until: sent.expiresAt, date: owed.date, time: owed.time, at: owed.at }, now)
+              const taken = withdrawing(out, { notification: sent.id, until: sent.expiresAt, date: owed.date, time: owed.time, ...(owed.snoozed === true ? { snoozedAt: owed.at } : {}) }, now)
               if (taken === undefined) return yield* Effect.fail(new Error("a second ring to take away"))
               out = taken
             }
@@ -431,7 +436,9 @@ export const alarmsModule = defineModule({
           return row
         })
 
-      const change = (row: Row<Alarm>, value: Alarm, actor?: Actor) => Effect.andThen(commit(row, row.id, value, actor), () => reconcile(row.id, actor, true))
+      // The mutation is committed even when its immediate cleanup cannot be read or written; its keyed job retries.
+      const change = (row: Row<Alarm>, value: Alarm, actor?: Actor) =>
+        Effect.flatMap(commit(row, row.id, value, actor), (committed) => reconcile(row.id, actor, true).pipe(Effect.catch(() => Effect.succeed(committed))))
 
       // -- reading ---------------------------------------------------------------------------------------------------------
 
@@ -442,13 +449,19 @@ export const alarmsModule = defineModule({
        * What a person can still act on: alarms set (with their snoozes), and ended ones whose ring is open now; for a cancel,
        * also ended ones whose ring is still being taken away (finding 9), which lists do not show.
        */
+      type Open = { readonly ids: ReadonlySet<string>; readonly keys: ReadonlySet<string | undefined> }
+      const ringingNow = (row: Row<Alarm>, open: Open): boolean => row.value.owed !== undefined
+        ? open.keys.has(`alarm:${row.id}:${row.value.owed.n}`)
+        : row.value.ring !== undefined && open.ids.has(row.value.ring.notification)
+
       const readLive = (forCancel = false) =>
         Effect.gen(function*() {
           const set = yield* readSet
-          const open = new Set((yield* ctx.notify.list()).map((n) => n.id))
+          const notifications = yield* ctx.notify.list()
+          const open: Open = { ids: new Set(notifications.map((n) => n.id)), keys: new Set(notifications.map((n) => n.key)) }
           const pending = yield* readPending
           const ended = pending.rows.filter((r) => r.value.phase === "ended")
-          const ringing = ended.filter((r) => r.value.ring !== undefined && open.has(r.value.ring.notification))
+          const ringing = ended.filter((r) => ringingNow(r, open))
           const cleanup = forCancel ? ended.filter((r) => !ringing.includes(r) && r.value.withdraw !== undefined) : []
           const all = [...set.rows, ...ringing, ...cleanup]
           const upcoming = (r: Row<Alarm>) => Math.min(r.value.next?.at ?? Infinity, r.value.ring?.again ?? Infinity, r.value.owed?.at ?? Infinity)
@@ -462,29 +475,24 @@ export const alarmsModule = defineModule({
        * One alarm in words, for the device `here`: its name only when it rings on `here`; elsewhere its time and device.
        * A snooze still to ring and a ring sounding now are said too.
        */
-      const itemOf = (row: Row<Alarm>, here: string | undefined, open: ReadonlySet<string>, now: number, lang: Language): string => {
+      const itemOf = (row: Row<Alarm>, here: string | undefined, open: Open, now: number, lang: Language): string => {
         const v = row.value
         const z = v.timeZone
         const mine = v.deviceId === here
         const device = deviceName(v.deviceId, lang)
         const rule = ruleWords(v, lang)
-        let what: string
-        if (v.next !== undefined) {
-          const moment = momentOf(v.next.date, v.next.time, now, z, lang)
-          const repeat = isRepeating(v)
-          what = !mine
-            ? say(texts, lang, repeat ? "itemElsewhereRepeat" : "itemElsewhere", { moment, rule, device })
-            : v.name !== undefined
-            ? say(texts, lang, repeat ? "itemNamedRepeat" : "itemNamed", { name: v.name, moment, rule })
-            : say(texts, lang, repeat ? "itemRepeat" : "item", { moment, rule })
-        } else {
-          const occurrence = v.owed ?? v.ring ?? v.withdraw
-          const moment = occurrence === undefined ? "" : momentOf(occurrence.date, occurrence.time, now, z, lang)
-          what = !mine ? say(texts, lang, "itemElsewhere", { moment, device }) : v.name !== undefined
-            ? say(texts, lang, "itemNamed", { name: v.name, moment }) : moment
-        }
+        const ringing = ringingNow(row, open)
+        // A current ring or snooze belongs to its own occurrence, even when the series already has a next date.
+        const occurrence = v.owed ?? (v.ring !== undefined && (v.ring.again !== undefined || ringing) ? v.ring : v.next) ?? v.withdraw
+        const moment = occurrence === undefined ? "" : momentOf(occurrence.date, occurrence.time, now, z, lang)
+        const repeat = isRepeating(v)
+        const what = !mine
+          ? say(texts, lang, repeat ? "itemElsewhereRepeat" : "itemElsewhere", { moment, rule, device })
+          : v.name !== undefined
+          ? say(texts, lang, repeat ? "itemNamedRepeat" : "itemNamed", { name: v.name, moment, rule })
+          : repeat ? say(texts, lang, "itemRepeat", { moment, rule }) : moment
         if (v.ring?.again !== undefined) return say(texts, lang, "itemAgain", { what, moment: instantWords(v.ring.again, now, z, lang) })
-        if (v.ring !== undefined && open.has(v.ring.notification)) return say(texts, lang, "itemRinging", { what })
+        if (ringing) return say(texts, lang, "itemRinging", { what })
         if (v.next === undefined && v.withdraw !== undefined) return say(texts, lang, "itemCleanup", { what })
         return what
       }
@@ -499,8 +507,8 @@ export const alarmsModule = defineModule({
       const timesOf = (v: Alarm): Array<ClockTime> => [
         ...(v.next !== undefined ? [timeOf(v.next.time)] : []),
         ...(v.ring?.again !== undefined ? [localOf(v.ring.again, v.timeZone).time] : []),
-        ...(v.owed !== undefined ? [timeOf(v.owed.time), localOf(v.owed.at, v.timeZone).time] : []),
-        ...(v.ring !== undefined ? [timeOf(v.ring.time)] : []),
+        ...(v.owed !== undefined ? [timeOf(v.owed.time), ...(v.owed.snoozed === true ? [localOf(v.owed.at, v.timeZone).time] : [])] : []),
+        ...(v.ring !== undefined ? [timeOf(v.ring.time), ...(v.ring.snoozedAt !== undefined ? [localOf(v.ring.snoozedAt, v.timeZone).time] : [])] : []),
         ...(v.withdraw !== undefined ? [timeOf(v.withdraw.time), ...(v.withdraw.at !== undefined ? [localOf(v.withdraw.at, v.timeZone).time] : [])] : [])
       ]
 

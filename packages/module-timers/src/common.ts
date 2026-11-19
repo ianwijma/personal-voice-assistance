@@ -50,11 +50,13 @@ export interface ClockTime {
  * Nuuk's spring gap is 00:30 the next day), and the nominal date is the one before the shift.
  */
 export const nominalDateOf = (instant: number, time: ClockTime, zone: string): LocalDate => {
-  const local = localOf(instant, zone).time
-  let diff = local.hour * 60 + local.minute - (time.hour * 60 + time.minute)
+  const local = localOf(instant, zone)
+  let diff = local.time.hour * 60 + local.time.minute - (time.hour * 60 + time.minute)
   if (diff > 720) diff -= 1440
   if (diff <= -720) diff += 1440
-  return localOf(instant - diff * 60_000, zone).date
+  // Undo the gap on the local calendar, without crossing the zone's offset change a second time.
+  const nominal = new Date(Date.UTC(local.date.year, local.date.month - 1, local.date.day, local.time.hour, local.time.minute) - diff * 60_000)
+  return { year: nominal.getUTCFullYear(), month: nominal.getUTCMonth() + 1, day: nominal.getUTCDate() }
 }
 
 /** "2026-11-18" ⇄ a local date. */

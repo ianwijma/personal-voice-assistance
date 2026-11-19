@@ -445,7 +445,7 @@ describe("finding 7: a snoozed or ringing alarm is listed and can be cancelled",
       yield* kit.action("set", { when: "every day at 10:01" })
       yield* kit.advance(MIN)
       yield* kit.notify.press(ringing(kit)[0]!.id, "more", { device: "kitchen-display" })
-      assert.strictEqual(said(yield* kit.action("list", {})), "One alarm: tomorrow at ten oh one in the morning, every day, ringing again today at ten oh six in the morning.")
+      assert.strictEqual(said(yield* kit.action("list", {})), "One alarm: today at ten oh one in the morning, every day, ringing again today at ten oh six in the morning.")
       assert.strictEqual(said(yield* kit.action("cancel", { scope: "next" })), "The snoozed alarm is cancelled; the next one is tomorrow at ten oh one in the morning.")
       yield* kit.advance(10 * MIN)
       assert.deepStrictEqual(ringing(kit), [])
