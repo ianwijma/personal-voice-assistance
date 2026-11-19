@@ -78,8 +78,8 @@ original handle and enqueues nothing else. Every dispatched `say` reaches the ga
 
 When steps before the stop were not all done, the sentence says which were and which could not be confirmed ("Step 1
 is done. I couldn't confirm step 2."). If none is confirmed but some are unconfirmed, it says only which could not
-be confirmed; it does not claim nothing was done. Every such sentence fits an announcement (300 characters) whole at
-the worst case: 20 steps, the longest name, any split of done and unconfirmed (a test fills it).
+be confirmed; it does not claim nothing was done. Every such sentence fits an announcement (300 characters) whole with
+20 steps and the longest name in the four representative done/unconfirmed partitions covered by the tests.
 
 **One at a time.** A second start of the same routine while it runs is refused, it does not join: "Good night is
 already running." (on any device). A start of another routine on a device that is already running one is refused too:
@@ -137,17 +137,23 @@ are the owner's household text, spoken on the starting device.
 | `routines.stop`, offered to the model as **`routines_stop`** | none | `change` | "cancel the routine" / "annuleer de routine" | "I stopped Good night; it had finished 1 of its 2 steps."; "I stopped Slowly during step 2; that step may still complete."; "No routine is running here." |
 | `routines.line` (internal: not a tool, no phrases) | `run`, `step` | `change` | a running routine's `say` step | nothing; "That line belongs to no routine running here." to anything else |
 | `routines_run` | `name`: the routine's name as the person said it | `change` | "run the bedtime routine" | "Starting Bedtime."; "Which one: Good night or Good night kids?" when the name fits several; "I don't know a routine by that name." (never repeating the name); the same refusal sentences as the phrase |
-| `routines_list` | none | `read` (speculative) | "what routines do I have?" | `{ count, routines: [{ name, phrases, steps, running? }] }`, phrases in the household's language; "There are no routines yet." |
+| `routines_list` | none | `read` (speculative) | "what routines do I have?" | `{ count, omitted, routines: [{ name, phrases, omittedPhrases, steps, running? }] }`, at most three complete entries and two phrase examples each, in the household's language; "There are no routines yet." |
 
 A routine's action is a **phrase command** (docs/PHRASES.md): its phrases are words only (no slots), matched exactly
 (case, accents and punctuation aside), in the household's language. It is declared `endsReply: true`: a routine
 started over a reply replaces it. Its examples are its phrases (or its name), for the intent agent.
 
+`routines_list` returns the total routine count, the first three entries in settings order, and the number of omitted
+routines (`omitted`). Each entry includes up to two complete phrase examples and the number of other phrases in that
+language (`omittedPhrases`); neither names nor phrase examples are cut mid-entry.
+
 A routine's action ID is derived only from its normalized name, with a stable hash suffix when the ASCII slug loses
-characters or is truncated. It stays within 40 characters. Reordering, adding or removing other routines keeps its
-assistant switches attached to that routine. Renaming it to a different normalized name gives it a new action ID:
-its switch starts enabled again, like a new routine. Case, accent or punctuation changes that keep the normalized
-name do not change its ID.
+characters or is truncated. It stays within 40 characters. An existing assistant `offTools` setting follows that ID
+across reordering, additions and removals. Renaming to an unused normalized name gives it a new ID, which defaults on;
+renaming back restores the original ID and its existing setting. Case, accent or punctuation changes that keep the
+normalized name do not change its ID. The assistant editor currently lists and validates only the published tools
+(`routines_run`, `routines_list`, `routines_stop`), so it cannot save a per-routine switch. The host needs a list of
+configurable action IDs, including phrase actions that are not model tools, for the editor to set these switches.
 
 `routines_run` finds a routine in this order, asking which when more than one fits at a level: a saved name exactly as
 said (its words: case, accents and punctuation do not count; so a routine named "A", "The", "My routine", "De",
@@ -165,7 +171,7 @@ routine's own command, or the line action, is not offered there); "I can only ru
 modes, which have no device; in serve mode the gateway refuses a turn without a device before the tool runs).
 
 Every sentence a routine's start, cancel and refusal can say fits a phrase command's spoken answer (300 characters,
-`PHRASE_ANSWER_CHARS`) whole, with the longest name (a test fills each one at its worst).
+`PHRASE_ANSWER_CHARS`) whole; the text-budget test fills their placeholders with maximum-length names and bounded counts.
 
 ## Settings
 
@@ -196,7 +202,9 @@ a saved list always starts):
 - a phrase the host would refuse otherwise (a `{slot}`, more than 8 words, over 80 characters), with the host's reason;
 - the steps are not valid: not JSON, not a list of 1 to 20, a step without exactly one of `say`, `call`,
   `stop_if_failed`, a key it does not use, a `say` that is not one line of 1 to 300 characters, a `call` not written
-  `module.action`, a parameter name outside a letter followed by letters, digits or `_` (at most 40 characters),
+  `module.action` with module ID `[a-z][a-z0-9-]{0,39}`, action ID `[a-z][a-z0-9_]{0,39}` and at most 64
+  characters combined (including the dot), a parameter name outside a letter followed by letters, digits or `_`
+  (at most 40 characters),
   more than 8 parameters on the submitted object, or a value that is not one line of text (≤ 200), a number or true or
   false, `stop_if_failed` first, or a `call` of a routine ("a routine does not start other routines"). The sentence
   names the routine and the step, never quoting the value.
@@ -254,6 +262,9 @@ Missing below (each with the smallest change that would provide it):
   outside a turn or a job `host.actions.list` lists nothing in serve mode; so a routine that the policy or the assistant
   would refuse is accepted when it is saved. Smallest change: `ActionCatalogue.listFor(assistantId)` callable from a
   module's own part, and a save hook that can refuse on its verdict (or, short of refusing, an `info()` warning).
+- **Configurable phrase-action IDs in the assistant editor.** Its tool list and save validator exclude actions with
+  `offerAsTool: false`, so an owner cannot set a per-routine switch there. Smallest change: a host list of configurable
+  action IDs that the editor and validator both use, while keeping phrase-only actions out of the model's tools.
 - **Whose content an action's answer is.** `ActionRunResult` is `{ ok, say }`; so a routine reads out no answer at
   all. Smallest change: `ActionRunResult` carries the result's sensitivity (`household`, or `personal` with its owner)
   for the execution that ran, so the routine can ask `Privacy.mayReveal` for its device.
