@@ -385,3 +385,50 @@ for (const modal of ["sheetOpen", "shortcutsOpen"] as const) {
     await expect(page.locator("#chat-input")).toHaveValue("Keep this draft")
   })
 }
+
+for (const width of [375, 768]) {
+  test(`r8 b1: a timer ringing over a silent reminder owns the visible Stop (width=${width})`, async ({ page, baseURL }, info) => {
+    await page.setViewportSize({ width, height: width === 375 ? 667 : 1024 })
+    await page.emulateMedia({ reducedMotion: "reduce" })
+    await page.goto(appUrl(baseURL))
+    await expect(page.getByTestId("start")).toBeVisible()
+    await page.evaluate(() => {
+      const client = (window as unknown as { __pva: AssistantClient }).__pva
+      client.store.dispatch({ type: "local/audio", phase: "running" })
+    })
+    const timer = serverExamples["notification.ring"]
+    const reminder = { ...timer, notification: { ...timer.notification, id: "n-reminder", title: "Laundry reminder", priority: "normal", sound: false, actions: [{ id: "stop", label: "Stop" }], sentAt: timer.notification.sentAt - 60_000 } }
+    await mock.send([reminder])
+    const strip = page.getByTestId("voice-notifications")
+    const region = strip.getByTestId("notification-cards")
+    await expect(strip.getByTestId("notification-card")).toHaveCount(1)
+    const before = await strip.boundingBox()
+    const settingsBefore = await page.getByTestId("settings-toggle").boundingBox()
+    await strip.screenshot({ path: info.outputPath("silent-reminder.png"), animations: "disabled" })
+    await mock.send([timer])
+    await expect(strip.getByTestId("notification-card")).toHaveCount(2)
+    const timerCard = strip.getByTestId("notification-card").filter({ has: page.getByRole("heading", { name: timer.notification.title, exact: true }) })
+    const stop = timerCard.getByRole("button", { name: "Stop", exact: true })
+    // Check the full target before clicking: Playwright must not scroll a hidden timer into view for us.
+    await expect.poll(() => stop.evaluate(tappable)).toBe(true)
+    await expect(region.getByTestId("notification-card").first()).toHaveAttribute("data-ringing", "true")
+    await expect(timerCard.getByTestId("notification-more")).toHaveText(`+1 ${timer.notification.texts.region}`)
+    expect(await timerCard.evaluate((card) => ["h2", "[data-testid=notification-more]"].every((selector) => {
+      const el = card.querySelector(selector)!
+      const r = el.getBoundingClientRect()
+      const bounds = card.closest("[data-testid=notification-cards]")!.getBoundingClientRect()
+      return r.top >= bounds.top && r.bottom <= bounds.bottom && el.contains(document.elementFromPoint(r.x + r.width / 2, r.y + r.height / 2))
+    }))).toBe(true)
+    expect(await region.evaluate((el) => el.scrollHeight > el.clientHeight)).toBe(true)
+    expect(await strip.boundingBox()).toEqual(before)
+    expect(await page.getByTestId("settings-toggle").boundingBox()).toEqual(settingsBefore)
+    await strip.screenshot({ path: info.outputPath("timer-over-reminder.png"), animations: "disabled" })
+    const point = await stop.evaluate((el) => { const r = el.getBoundingClientRect(); return { x: r.x + r.width / 2, y: r.y + r.height / 2 } })
+    await page.mouse.click(point.x, point.y)
+    await expect.poll(async () => (await mock.log()).messages.filter((m) => m.type === "notification.action").map((m) => ({ id: m.id, actionId: m.actionId }))).toEqual([{ id: timer.notification.id, actionId: "stop" }])
+    await mock.send([{ type: "notification.resolved", id: timer.notification.id, outcome: "stop" }])
+    await expect(strip.getByTestId("notification-card")).toHaveCount(1)
+    await expect(strip.getByRole("heading", { name: "Laundry reminder", exact: true })).toBeVisible()
+    await expect.poll(() => strip.getByRole("button", { name: "Stop", exact: true }).evaluate(tappable)).toBe(true)
+  })
+}
