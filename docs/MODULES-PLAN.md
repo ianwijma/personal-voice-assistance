@@ -514,6 +514,15 @@ The scheduler does one thing: it calls a module's handler at a time, once.
 - An utterance that is not taken goes through the gates exactly as today; the PR shows that with `TurnTrace`.
 - Not now: typed actions before the model, switching the assistant, sleep, microphone mute, earcons, wake-free
   control while a reply is audible.
+- **Decided after review round 1** (24 blocking findings): a phrase command is `phrases` on an existing action; a
+  slot is a number, a duration, a fixed choice of at most 32 declared values, or text, and never asks a module for a
+  list (matching against a module's list of names on the matching path stopped the main thread for over 200 ms; a
+  module that needs a room's name takes text and resolves it in its action); matching is exact and fails closed (a
+  search that used up its budget means the utterance is not taken); phrase sets are prepared ahead and a recogniser
+  final only reads a ready one; every taken utterance ends in one settlement (the command's answer in its own
+  assistant's voice, then the interrupted reply in its voice) and has an execution trace; a cancelled utterance runs
+  nothing; the host's controls are never refused as busy; "stop" picks the first of a ring, an announcement, the
+  reply, room media.
 
 The fast path the basics need: commands that run without the language model.
 
