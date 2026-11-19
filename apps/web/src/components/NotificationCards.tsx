@@ -1,5 +1,4 @@
 "use client"
-import { useEffect, useRef, useState } from "react"
 import { type ClientState, ringingCard } from "@/lib/state.ts"
 import { useClient, useClientState } from "./context.tsx"
 import { cx } from "./ui/controls.tsx"
@@ -12,9 +11,10 @@ import { cx } from "./ui/controls.tsx"
  * the viewport (every Stop reachable, long text wrapped), so every character keeps drawing exactly as before
  * (docs/CHARACTERS.md). A press goes to the server (`notification.action`):
  * Stop is always usable, a module action disables only its own button while it is pending, and an answer that comes
- * after the card is gone is ignored.
+ * after the card is gone is ignored. Pending actions and replies live with the held notification across placements;
+ * inside chat the region may shrink as well as scroll to leave the composer reachable.
  */
-export function NotificationCards() {
+export function NotificationCards({ inChat = false }: { readonly inChat?: boolean }) {
   const cards = useClientState((s) => s.notifications)
   const audioOn = useClientState((s) => s.audio.phase === "running")
   const shown = cards.filter((c) => c.show)
@@ -23,7 +23,7 @@ export function NotificationCards() {
     <section
       aria-label={shown[0]!.texts.region}
       data-testid="notification-cards"
-      className="flex max-h-[max(160px,min(42dvh,calc(100dvh-540px)))] min-h-0 w-full shrink-0 flex-col items-center gap-2 overflow-y-auto overscroll-contain"
+      className={cx("flex max-h-[max(160px,min(42dvh,calc(100dvh-540px)))] min-h-0 w-full flex-col items-center gap-2 overflow-y-auto overscroll-contain", inChat ? "shrink" : "shrink-0")}
     >
       {shown.map((card) => <Card key={card.id} card={card} audioOn={audioOn} />)}
     </section>
@@ -32,33 +32,15 @@ export function NotificationCards() {
 
 function Card({ card, audioOn }: { readonly card: ClientState["notifications"][number]; readonly audioOn: boolean }) {
   const client = useClient()
-  const [said, setSaid] = useState<string | undefined>(undefined)
-  const [pending, setPending] = useState<ReadonlySet<string>>(new Set())
-  const mounted = useRef(true)
-  useEffect(() => {
-    mounted.current = true
-    return () => {
-      mounted.current = false
-    }
-  }, [])
   const press = (actionId: string) => {
-    if (actionId !== "stop") setPending((p) => new Set(p).add(actionId))
-    client.store.dispatch({ type: "local/notification-pressed", id: card.id })
-    /** The answer applies only while this card is still shown (an answer after the server took it down is ignored). */
-    const current = () => mounted.current && client.store.get().notifications.some((n) => n.id === card.id)
-    const done = () => {
-      if (!mounted.current) return
-      setPending((p) => {
-        const next = new Set(p)
-        next.delete(actionId)
-        return next
-      })
-    }
-    // continuation(identity): shows this card's own answer, only while the card is still there.
+    if (actionId !== "stop" && card.pendingActions?.some((p) => p.actionId === actionId)) return
+    const press = { actionId }
+    client.store.dispatch({ type: "local/notification-pressed", id: card.id, press })
+    // The exact pending request belongs to this holding, even if chat moves its component. After withdrawal its
+    // completion is ignored, including when the server has shown the same notification id again in the meantime.
     void client.request({ type: "notification.action", id: card.id, actionId }).then((r) => {
-      done()
-      if (current()) setSaid(r.say ?? (r.ok ? undefined : r.error?.message))
-    }, done)
+      client.store.dispatch({ type: "local/notification-answered", id: card.id, press, answer: { say: r.say ?? (r.ok ? undefined : r.error?.message) } })
+    }, () => client.store.dispatch({ type: "local/notification-answered", id: card.id, press }))
   }
   const ringing = ringingCard(card)
   return (
@@ -74,7 +56,7 @@ function Card({ card, audioOn }: { readonly card: ClientState["notifications"][n
           <h2 className="text-[15px] font-medium [overflow-wrap:anywhere]">{card.title}</h2>
           {card.text !== undefined ? <p className="mt-0.5 text-[14px] text-ink-muted [overflow-wrap:anywhere]">{card.text}</p> : null}
           {ringing && !audioOn ? <p className="mt-1 text-[12px] text-ink-faint" data-testid="notification-silent-note">{card.texts.startAudio}</p> : null}
-          {said !== undefined ? <p className="mt-1 text-[13px] text-ink-muted [overflow-wrap:anywhere]" role="status">{said}</p> : null}
+          {card.said !== undefined ? <p className="mt-1 text-[13px] text-ink-muted [overflow-wrap:anywhere]" role="status">{card.said}</p> : null}
         </div>
       </div>
       <div className="mt-2 flex flex-wrap justify-end gap-2">
@@ -82,7 +64,7 @@ function Card({ card, audioOn }: { readonly card: ClientState["notifications"][n
           <button
             key={a.id}
             type="button"
-            disabled={a.id !== "stop" && pending.has(a.id)}
+            disabled={a.id !== "stop" && card.pendingActions?.some((p) => p.actionId === a.id)}
             data-action={a.id}
             onClick={() => press(a.id)}
             className={cx(

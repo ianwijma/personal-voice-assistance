@@ -84,3 +84,51 @@ it("r4 b2: narrow chat includes exactly one ringing Stop in its modal focus scop
   expect(screen.getByTestId("chat-panel").contains(stop)).toBe(true)
   expect(screen.getAllByTestId("notification-cards")).toHaveLength(1)
 })
+
+for (const settleInChat of [false, true]) {
+  it(`r5 b1: pending notification and its reply survive chat relocation (settleInChat=${settleInChat})`, async () => {
+    mocks.wide = false
+    const store = createStore(initialState, reducer)
+    let reply!: (r: { ok: boolean; say: string }) => void
+    const request = vi.fn(() => new Promise<{ ok: boolean; say: string }>((resolve) => { reply = resolve }))
+    mocks.client = { store, request, connect: () => () => undefined } as unknown as AssistantClient
+    render(<VoiceApp />)
+    act(() => store.dispatch(serverExamples["notification.ring"]))
+    fireEvent.click(screen.getByRole("button", { name: "Snooze" }))
+    expect((screen.getByRole("button", { name: "Snooze" }) as HTMLButtonElement).disabled).toBe(true)
+    act(() => store.dispatch({ type: "local/ui", patch: { chatOpen: true } }))
+    expect((screen.getByRole("button", { name: "Snooze" }) as HTMLButtonElement).disabled).toBe(true)
+    const { text: oldText, ...refreshed } = serverExamples["notification.ring"].notification
+    act(() => store.dispatch({ type: "notification.ring", notification: refreshed }))
+    expect(screen.queryByText(oldText!)).toBeNull()
+    expect((screen.getByRole("button", { name: "Snooze" }) as HTMLButtonElement).disabled).toBe(true)
+    fireEvent.click(screen.getByRole("button", { name: "Snooze" }))
+    expect(request).toHaveBeenCalledTimes(1)
+    expect((screen.getByRole("button", { name: "Stop" }) as HTMLButtonElement).disabled).toBe(false)
+    if (!settleInChat) act(() => store.dispatch({ type: "local/ui", patch: { chatOpen: false } }))
+    await act(async () => reply({ ok: true, say: "Snoozed for ten minutes." }))
+    expect(screen.getByText("Snoozed for ten minutes.")).toBeTruthy()
+    act(() => store.dispatch({ type: "local/ui", patch: { chatOpen: !settleInChat } }))
+    expect(screen.getByText("Snoozed for ten minutes.")).toBeTruthy()
+    expect((screen.getByRole("button", { name: "Snooze" }) as HTMLButtonElement).disabled).toBe(false)
+    act(() => store.dispatch({ type: "notification.resolved", id: serverExamples["notification.ring"].notification.id, outcome: "stop" }))
+    act(() => store.dispatch(serverExamples["notification.ring"]))
+    expect(screen.queryByText("Snoozed for ten minutes.")).toBeNull()
+  })
+}
+
+it("r5 b1: a withdrawn card's late answer cannot affect a new holding of the same notification", async () => {
+  mocks.wide = false
+  const store = createStore(initialState, reducer)
+  let reply!: (r: { ok: boolean; say: string }) => void
+  const request = vi.fn(() => new Promise<{ ok: boolean; say: string }>((resolve) => { reply = resolve }))
+  mocks.client = { store, request, connect: () => () => undefined } as unknown as AssistantClient
+  render(<VoiceApp />)
+  act(() => store.dispatch(serverExamples["notification.ring"]))
+  fireEvent.click(screen.getByRole("button", { name: "Snooze" }))
+  act(() => store.dispatch({ type: "notification.resolved", id: serverExamples["notification.ring"].notification.id, outcome: "stop" }))
+  act(() => store.dispatch(serverExamples["notification.ring"]))
+  await act(async () => reply({ ok: true, say: "Retired answer" }))
+  expect(screen.queryByText("Retired answer")).toBeNull()
+  expect((screen.getByRole("button", { name: "Snooze" }) as HTMLButtonElement).disabled).toBe(false)
+})

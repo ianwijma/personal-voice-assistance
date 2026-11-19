@@ -74,7 +74,7 @@ export function ChatPanel() {
             </button>
           </div>
         </div>
-        {modal ? <NotificationCards /> : null}
+        {modal ? <NotificationCards inChat /> : null}
         <ConversationNote />
         <MessageList key={`list-${sessionSeq}`} />
         <Composer key={`composer-${sessionSeq}`} />

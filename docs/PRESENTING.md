@@ -133,6 +133,8 @@ rows.
 ## Lifetimes, ownership and what happens when
 
 - **Transient** (the default; a timer defaults to pinned): a device shows one at a time, the newest. It ends by itself.
+  An accepted transient whose write waited rechecks current room membership and show order inside its committing
+  transaction; if it now overlaps a newer live transient, the older pending show is dropped.
 - **Pinned**: several per device, each shown until it is dismissed or ends; a page that reconnects is given them again.
 - **A presentation belongs to the module part that made it** (a tool's presentation to the module's newest open part).
   When that part's scope closes (its module stopped, after its calls in flight had their grace period) its **transient**
@@ -309,8 +311,10 @@ transient the decision allows.
 - P9's **notification cards are drawn first in the stage**, with their wire messages and behaviour unchanged; then the
   presentations, a transient one first, then the pinned ones oldest first. While narrow-screen chat is modal, ordinary
   presentations are hidden and inert; notification cards move inside the chat dialog so keyboard focus can reach ring
-  Stop. Desktop chat leaves presentations visible and notification cards in the stage. Settings and Help hide the
-  entire stage until they close, without clearing the held presentations.
+  Stop. Pending actions and the last reply stay with the held notification across that move and are cleared when it
+  is withdrawn. In chat, the notification region can shrink and scroll so the composer stays within the panel, including
+  with a six-line draft and the phone keyboard open. Desktop chat leaves presentations visible and notification cards
+  in the stage. Settings and Help hide the entire stage until they close, without clearing the held presentations.
 - One renderer per kind. Every text of a presentation passed the server's page boundary (`ModuleHost.pageText`) and is
   put on the page as text, never as markup; long text, button labels and weather values wrap. **Every word the host
   shows** (the region's name, "Loading the image…", "The image is not available.", the timer's "Done", "Image:", "High",
@@ -358,7 +362,8 @@ while the handler runs), and `engine` (`live`, `held`, `maintainNow`, `planNow`,
 Each reconnect gets a fresh connection ID for delivery and press-principal lookup, so hello restores live pins even
 when close reconciliation has not run yet. Reconnect starts four fresh press slots; old requests release their
 original connection’s slots, and all connections share the sixteen-slot global bound (notification Stop remains
-exempt). A kit
+exempt). Press helpers and helpers that synthesize a turn resolve the current connection when their Effect starts,
+then keep it fixed through settlement; explicitly supplied turn contexts are used as given. A kit
 device without `capabilities` declares this build's voice page on a tablet (`KIT_PAGE_CAPABILITIES`: a display with
 touch, every kind, a speaker, a microphone), so it is decided as serve mode decides for this build's page; give
 `capabilities` to model a speaker or an older page. `StartTestModuleOptions.media` gives the kit a fake image cache
@@ -376,12 +381,12 @@ boundary.
 
 | What | Number |
 |---|---|
-| end of turn → first audio (`TurnTrace`, the real `Conversation`, a tool round through the host's registry and gateway, zero-delay synthesis and output, the model's tokens 5 ms after each request; median of 80 turns × 4 counterbalanced runs; 31 other presentations live, 8 pinned on the turn's device) | without a presentation 10.838 ms (p95 11.369); with the worst legal presentation in the tool's result 11.097 ms (p95 11.817) |
-| `show` as a tool calls it (200 calls, a transient replacing the last) | median 0.494 ms, p95 0.563 ms, worst 0.966 ms; longest main-thread stop across the whole workload 1.43 ms |
-| a page saying hello with 9 presentations | longest main-thread stop 0.81 ms |
-| reconciling every device with real fan-out (64 devices in one room, 8 pinned and 1 transient room-wide, 64 fresh pages: 576 frames, 2.03 MiB encoded) | longest main-thread stop 2.02 ms |
+| end of turn → first audio (`TurnTrace`, the real `Conversation`, a tool round through the host's registry and gateway, zero-delay synthesis and output, the model's tokens 5 ms after each request; median of 80 turns × 4 counterbalanced runs; 31 other presentations live, 8 pinned on the turn's device) | without a presentation 10.695 ms (p95 11.683); with the worst legal presentation in the tool's result 11.202 ms (p95 12.234) |
+| `show` as a tool calls it (200 calls, a transient replacing the last) | median 0.503 ms, p95 0.587 ms, worst 0.776 ms; longest main-thread stop across the whole workload 1.66 ms |
+| a page saying hello with 9 presentations | longest main-thread stop 0.79 ms |
+| reconciling every device with real fan-out (64 devices in one room, 8 pinned and 1 transient room-wide, 64 fresh pages: 576 frames, 2.03 MiB encoded) | longest main-thread stop 1.62 ms |
 
-So a tool's presentation at the stated maximum moved the turn's first audio by a median 0.259 ms, not zero: the turn
+So a tool's presentation at the stated maximum moved the turn's first audio by a median 0.507 ms, not zero: the turn
 itself pays the validation, the decision and the note (way 1), and the writer and the reconciliation of the turn's device
 run on the same thread while the model thinks. The test asserts the difference stays under 2 ms and the longest stops
 under 10 ms.
