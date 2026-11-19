@@ -22,7 +22,7 @@ const house = {
       { id: "kitchen-display", name: "Kitchen display", room: "Kitchen", privacy: "shared" as const, defaultPerson: "p-sam" },
       { id: "robins-phone", name: "Robin's phone", privacy: "private" as const, defaultPerson: "p-robin" },
       { id: "hall-screen", name: "Hall screen", room: "Hall", privacy: "public" as const, defaultPerson: "p-sam" },
-      { id: "office-speaker", name: "Office speaker", room: "Office", privacy: "shared" as const, defaultPerson: "p-sam", capabilities: { v: 1, speaker: { media: ["speech"] } } }
+      { id: "office-speaker", name: "Office speaker", room: "Office", privacy: "shared" as const, defaultPerson: "p-sam", capabilities: { v: 1 as const, speaker: { media: ["speech" as const] } } }
     ]
   }
 }
@@ -405,7 +405,7 @@ interface Hooks {
   readonly failGet?: { on: boolean }
   readonly failShow?: { on: boolean }
   /** Called after the shared part's `memories.get` returns, before it answers (the first call only, then cleared). */
-  gateGet?: Effect.Effect<void>
+  gateGet?: Effect.Effect<void> | undefined
   readonly handlers?: Map<string, (press: any) => Effect.Effect<any, any>>
 }
 const withShared = (hooks: Hooks): typeof memoryModule => ({
