@@ -429,7 +429,9 @@ CurrentPrincipal: Context.Reference<Principal | undefined>       // the admitted
   call. The settings `ConfigProvider` serves the policy's keys as the reader resolves them, and the CLI start runs the
   same function over what it reads. **What is checked when:** the policy at every decision (each call, each held
   action's second admission) and each tool-list read; `sensitivity` once, when a tool finishes (its result, or its
-  failure, H3), before it is formatted or presented (H2). A completed result that waits for sibling tools is not checked
+  failure: H3, corrected after review 2: a fixed personal failure or defect where its result could be shown; with
+  per-result sensitivity a typed failure goes back as the module's own sentence and a defect is withheld), before it is
+  formatted or presented (H2). A completed result that waits for sibling tools is not checked
   again at dispatch: a result is decided once, when its tool finishes; serve fences and discards a device's session on
   a committed boundary change (its turn is cancelled, `serveRiskWait.test.ts`).
 

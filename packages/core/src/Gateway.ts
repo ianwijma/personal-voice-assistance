@@ -590,14 +590,15 @@ export const makeExecutionGateway = (options: GatewayOptions = {}): ExecutionGat
   }
 
   /**
-   * H3: whether an admitted executor's failure or defect may go back to the model, by the decision its result would have
-   * had: a fixed household sensitivity yes; a fixed personal one where its result could be shown; a classifier of the
-   * result cannot be asked about a failure, so no.
+   * H3' (after review 2): whether an admitted executor's failure may go back to the model. A fixed household sensitivity:
+   * yes. A fixed personal one: where its result could be shown. Decided per result: a typed failure (`ToolError`,
+   * `ActionError`) is the module's own sentence and goes back as it is (its author keeps personal content out of it), a
+   * defect (a crash) cannot be asked about, so no.
    */
-  const mayRevealFailure = (meta: ToolMetadata, call: Omit<GatewayCall, "risk">, record: GatewayDecisionRecord | undefined): boolean => {
+  const mayRevealFailure = (meta: ToolMetadata, call: Omit<GatewayCall, "risk">, record: GatewayDecisionRecord | undefined, typed: boolean): boolean => {
     if (mayReveal === undefined) return true
     const declared = declaredSensitivity(meta)
-    const ok = declared !== "per-result" && (declared.kind === "household" || mayRevealOwner(declared.owner, call))
+    const ok = declared === "per-result" ? typed : declared.kind === "household" || mayRevealOwner(declared.owner, call)
     if (!ok) markWithheld(record)
     return ok
   }
@@ -609,8 +610,8 @@ export const makeExecutionGateway = (options: GatewayOptions = {}): ExecutionGat
    */
   const guardedRun = <A>(meta: ToolMetadata, call: Omit<GatewayCall, "risk">, record: GatewayDecisionRecord | undefined, run: Effect.Effect<A, ToolError>): Effect.Effect<A, ToolError> =>
     mayReveal === undefined ? run : run.pipe(
-      Effect.catch((error) => (mayRevealFailure(meta, call, record) ? Effect.fail(error) : Effect.fail(new ToolError({ message: riskWithheld(languageNow()) })))),
-      Effect.catchDefect((defect) => (mayRevealFailure(meta, call, record) ? Effect.die(defect) : Effect.fail(new ToolError({ message: riskWithheld(languageNow()) }))))
+      Effect.catch((error) => (mayRevealFailure(meta, call, record, true) ? Effect.fail(error) : Effect.fail(new ToolError({ message: riskWithheld(languageNow()) })))),
+      Effect.catchDefect((defect) => (mayRevealFailure(meta, call, record, false) ? Effect.die(defect) : Effect.fail(new ToolError({ message: riskWithheld(languageNow()) }))))
     )
 
   /** What an action call's observer is told about an admission. */
