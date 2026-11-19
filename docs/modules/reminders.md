@@ -17,6 +17,7 @@ to put the bins out", "remind the house at six to tidy up". It is **time only**:
 `@pva/language` recurrence phrases: "every weekday at 7 am", "every second Tuesday at nine", "on the first of every
 month at ten"). Anything that is not clear is a question, never a guess: "At what time?" for "tomorrow" and for a repeat
 without a clock time ("every Monday"), "Say the day and the time." for something that could mean two moments.
+One-off requests and the duration action are limited to 366 days ahead; repeats may start later (for example the next February 29).
 
 - **Whose.** For the person asking (the asking device's default person; `scope: me`, the default when a person is
   known) or for the household (`scope: household`). A personal reminder has an owner and is delivered, read, listed,
@@ -83,17 +84,20 @@ case a reminder that was already stopped can ring once more; it can never ring z
 - **Done and snooze** are the same four ways: the notification's buttons, the card's buttons, the typed actions and the
   tools. **Done on a one-off** finishes it (also before it is due). **Done on a repeat that is ringing** answers that ring;
   the series goes on. **Done on a repeat that is not ringing skips its next time** ("Done: I'll skip the one today at
-  eight. The next one is tomorrow at eight."); the series goes on after it. Cancel ends a repeat for good.
+  eight. The next one is tomorrow at eight."); the series goes on after it. If cleanup from the answered ring is still owed, named Done retries that cleanup first. Cancel ends a repeat for good.
 - **Snooze** takes the notification and card down and rings the same time again after the setting's minutes (or a said
-  duration). The same button pressed again (the service may run a handler twice) does not push it further.
+  duration). The same button pressed again (the service may run a handler twice) does not push it further, even after redelivery; only the fresh delivery's own button can snooze it again.
 - A ring nobody answers stays as "was due …" in the list. Its notification expires after 30 minutes (a `normal` card after
   a day). **A week after it was delivered**, the daily clean-up ends it: a one-off is then finished (lapsed); a repeat
   goes on.
 
 ### Changing a reminder while it rings
 
-- **New words while it rings**: its notification and card are taken down and it is sent again at once with the new words,
-  for the same time: **it rings again**. Snoozed, it keeps its snooze and rings with the new words then.
+- **New words while it rings**: its notification and card are taken down and the new words wait for delivery by its job,
+  for the same time: **it rings again** after cleanup succeeds. The confirmation says the new words are waiting for delivery.
+  If a newer occurrence is already waiting for delivery, that occurrence is kept instead of resending the older ring.
+  A delivery already attempted also has its possibly open notification taken down before the new words are sent.
+  Snoozed, it keeps its snooze and rings with the new words then.
 - **A new time** ends the ring (notification and card go) and any delivery under way; the reminder waits for its new
   time (or its new repeat).
 - The confirmation is built from the reminder as written: a text change during a snooze says the snooze's time.
@@ -110,6 +114,11 @@ failed, and I've stopped trying; it ends by itself when it expires.", with no pr
 done again on a reminder with tries left finishes the clean-up instead of answering that nothing matches. A late
 delivery that is dropped after at least one try (it may have been sent: a write that failed afterwards) keeps its
 notification as clean-up owed, like any other.
+
+If all five attempts to stop an edited notification fail, a later send can deduplicate against the old words and
+record the replacement as delivered while those old words remain until the notification expires.
+If an earlier ring's five cleanup attempts fail, later cancellation can clear that failure status during card-only
+cleanup and give a plain cancellation reply while the notification remains until its expiry.
 
 ### What it says about priority and expiry
 
@@ -139,7 +148,7 @@ only one: the answer asks for the exact words and changes nothing. Exact words s
 **Secrets.** A reminder must not hold a secret. Refused on set, change and `remind_in`, without repeating the words and
 without storing anything: a credential word (password, passcode, PIN, code, door code, …; wachtwoord, pincode, deurcode,
 …) followed by "is", ":" or "=" and a value, whatever the value looks like ("my password is violet-badger", "PIN: 1234");
-or a credential word followed by text that is mostly digits ("door code 12 34"). A credential word beside a year or a
+or a credential word followed by text that is mostly Unicode decimal digits, including short values ("door code 12 34", "PIN 42", "door code １２３４"). The same refusal applies to lookup words before they can be repeated in a reply. A credential word beside a year or a
 number that is not the value is an ordinary reminder: "change my password", "change my password for the 2027 account" and
 "learn to code in Python 2027" are stored.
 
@@ -153,7 +162,7 @@ Typed actions (the intent agent runs them from their examples and phrases, witho
 | `reminders.ringing_snooze` `{ for? }` | "snooze the reminder", "snooze the reminder for {for}"; "stel de herinnering uit", "stel de herinnering {for} uit" | Puts the reminder that rang here off for a said duration (1 minute to a day), else the setting's. |
 
 While a reminder rings, the labels of its buttons ("Done", "Snooze"; "Klaar", "Uitstellen") are also accepted without the
-wake phrase (the host's ringing window). A reminder's own words are free text, so no phrase has the text as a slot;
+wake phrase (the host's ringing window). A reminder's own words are free text, so no answering phrase uses them as a lookup slot (the duration creation phrase does take new reminder text);
 "done" on its own is not a phrase of this module, because another module's "done" could meet it.
 
 **The list is a snapshot returned with the answer.** `reminders_list` is a read that may run speculatively, so its run
@@ -207,13 +216,17 @@ One collection, `reminders` (scope household; rows carry their owner), `storage.
 `maxChars` 2,000 (the worst legal row is computed by `checkModule`; one list reads 12 rows). Indexes `[state, nextAt]`
 (open reminders by their next moment: every list, every match, the briefing; finished ones with clean-up owed) and
 `[state, endedAt]` (the clean-up, oldest first). Every read on a turn is bounded: at most 17 pages of 12 (204 rows)
-per answer, with a yield between pages, and **says when there were more** ("I read the first 204 open reminders; there
+per open scan, with a yield between pages, and **says when there were more** ("I read the first 204 open reminders; there
 are more", "I found none in the first 204 …"); a failed read is a failure ("I couldn't read the reminders."), never an
 empty list.
+Matching also reads one page of twelve finished rows with cleanup pending per finished state; with more pending
+cleanups than that, an older exact name can be missed and a partial name can select a different reminder until
+those cleanup retries succeed or are exhausted (the remaining notifications then end by their own expiry).
 
 **Jobs** (the module's own, at most 200 live in all): `reminder:<id>`, one per open reminder (payload `{ id }`, for the
 row's next moment, runs however late, idempotent, five retries after a store failure); `problem:<id>`, a job that fails
 at once to raise a Health issue (above); and `tidy`, daily at 04:00. A reminder waiting only for an answer has no job.
+Admission counts live jobs and reserves a slot for each unanswered ring without a job, so answering an existing ring can always schedule cleanup; a Health report is omitted when it would consume that reserve.
 The clean-up looks at every open reminder, a page of 12 at a time with a yield between (at most 100 pages), and ends rings
 unanswered for a week; then it removes finished rows older than the setting, oldest first, a page per transaction with
 a yield between, skipping (and reading past) rows whose clean-up is still owed, until it reaches the cutoff. A job's
@@ -240,7 +253,7 @@ snoozes at once leave one snooze and one job.
   person's own that the asking device may not be told are counted anonymously ("2 personal reminders are not read out
   here") and cannot be changed or cancelled there, which is said.
 - A confirmation is revealing too: where the privacy rule says no for the asking device (a public screen whose default
-  person is the owner), the confirmation says "only for you" without the words, and that **this device does not ring
+  person is the owner), the confirmation says "Reminder set, only for you" without the words, time, weekday or first occurrence, and that **this device does not ring
   with your personal reminders**: a personal reminder rings only on the device it was set on, and only where it may be
   revealed there.
 - A personal reminder with nobody known asking asks whose and writes nothing; it is never stored as the household's.
@@ -278,6 +291,7 @@ devices instead, which would widen where a personal reminder goes.
 - **More than ten rings at once**: the notification service allows ten open notifications per module; an eleventh
   delivery fails, is tried five times as above, and is then given up visibly (a Health issue). Not built: a queue that
   waits for room.
+- **Delivery exhaustion after multiple faults**: if a notification was sent but its ring write failed, and all remaining sends also fail, delivery can lapse while that notification stays open until its normal expiry (30 minutes for a ring, one day for normal priority).
 - **Deduplicating "set" called twice with the same words**: two calls make two reminders.
 
 ## Missing below
