@@ -1,7 +1,7 @@
 # Modules: where the work stands
 
 Status of the work planned in [MODULES-PLAN.md](MODULES-PLAN.md), kept here so it does not depend on any one working
-session. Updated 2026-11-19, 19:28. Nothing below is merged into `main`; the owner merges.
+session. Updated 2026-11-19, 21:28. Nothing below is merged into `main`; the owner merges.
 
 **State: the work is done and waits for the owner.** Every preparation part, every module that was not deferred and
 every follow-up has an open pull request, has had at least one complete Sol review, and has its findings fixed. On
@@ -28,6 +28,14 @@ its owner (#114); a browser test did not know the new Risk policy page (#115).
 2026-11-19, 19:28). On the final head of the branch with everything, locally: `pnpm check` passes, `pnpm test` 10,095
 passed and none failed, the latency tests the way CI runs them pass (37 files, 420 tests), the browser tests pass
 (218 cases).
+
+**One thing is still to come: a GPT review cycle on six pull requests** (owner's instruction, 2026-11-19 evening). The
+last fix rounds of #108, #114, #115, #117, #122 and #129 were not reviewed. They get a review by GPT Astra; what it
+finds is fixed by GPT Sol on a separate branch `<branch>-gpt-review` with its own pull request "[GPT Review] …" into
+the reviewed branch; then Astra looks again, at most ten rounds. Everything for it is prepared (the briefs are under
+`briefs/gpt/` in the working notes). **It has not run yet: the reviewer's (Codex) allowance is used up**; the first
+attempt at 21:28 ended at once with "usage limit was reached". Until it has run, those six are as described under
+"Known gaps kept on purpose".
 
 **Two ways to merge.** Either #130 alone (it contains every commit of #87 to #129; the others can then be
 closed), or the stack one by one in the order of the tables below.
