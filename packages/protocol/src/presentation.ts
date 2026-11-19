@@ -162,6 +162,8 @@ export const PresentPageTexts = Schema.Struct({
   loading: Schema.String.check(Schema.isMinLength(1), Schema.isMaxLength(60)),
   /** An image that could not be fetched or was refused. */
   imageMissing: Schema.String.check(Schema.isMinLength(1), Schema.isMaxLength(60)),
+  /** A press without a server answer (optional for older servers). */
+  failed: Schema.optional(Schema.String.check(Schema.isMinLength(1), Schema.isMaxLength(60))),
   /** A timer at zero. */
   timerDone: Schema.String.check(Schema.isMinLength(1), Schema.isMaxLength(30)),
   /** Before a credit ("Image:"). */
@@ -298,7 +300,7 @@ export const selectPresentations = (candidates: ReadonlyArray<PresentCandidate>)
 // What a module shows, and its checks (the server and the web mock run the same ones)
 
 /** Line breaks, control characters and bidirectional overrides: never in a one-line value (the core's `NOT_ONE_LINE`). */
-const NOT_ONE_LINE = /[\p{Cc}\p{Zl}\p{Zp}\u202A-\u202E\u2066-\u2069]/u
+const NOT_ONE_LINE = /[\p{Cc}\p{Zl}\p{Zp}\p{Bidi_Control}]/u
 /**
  * Storable text: no control character other than tab, line feed, carriage return, backspace and form feed, and no lone
  * surrogate (the core's `NOTIFY_TEXT`), so each UTF-16 unit costs at most two characters of JSON.

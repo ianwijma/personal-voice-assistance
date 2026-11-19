@@ -120,3 +120,11 @@ it("refuses DEL and C1 controls in card text and spoken, while permitted whitesp
   }
   expect(presentationProblem({ kind: "card", title: "T", text: "Before\t\n\r\b\fAfter", spoken: "S" }, 0)).toBeUndefined()
 })
+
+it("a8: every Unicode Bidi_Control is refused in one-line titles", () => {
+  for (const code of [0x061c, 0x200e, 0x200f, 0x202a, 0x202b, 0x202c, 0x202d, 0x202e, 0x2066, 0x2067, 0x2068, 0x2069]) {
+    const title = `A${String.fromCodePoint(code)}B`
+    expect(presentationProblem({ kind: "card", title, spoken: "A" }, 0), code.toString(16)).toBeDefined()
+  }
+  expect(presentationProblem({ kind: "card", title: "مرحبا", spoken: "A" }, 0)).toBeUndefined()
+})

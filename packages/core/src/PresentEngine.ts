@@ -770,6 +770,7 @@ export const makePresentEngine = (options: PresentEngineOptions): Effect.Effect<
     // ---- Bounds, from the index and the accepted shows
 
     const pending: Array<PendingShow> = []
+    const work: Array<PendingShow> = []
     const releaseKey = (s: PendingShow) => {
       const e = s.entry
       if (e.key === undefined) return
@@ -779,6 +780,8 @@ export const makePresentEngine = (options: PresentEngineOptions): Effect.Effect<
     const dropPending = (s: PendingShow) => {
       const at = pending.indexOf(s)
       if (at >= 0) pending.splice(at, 1)
+      const queued = work.indexOf(s)
+      if (queued >= 0) work.splice(queued, 1)
       releaseKey(s)
       if (!pending.some((x) => x.failed)) setIssue("write", undefined)
     }
@@ -852,35 +855,37 @@ export const makePresentEngine = (options: PresentEngineOptions): Effect.Effect<
     // ---- Images: fetched once some page is to show one; the outcome written on the row, retried until it is
 
     /**
-     * Fetches under way, by the address fetched (review round 2, R1): the presentations waiting for it. A completion is
-     * written on whichever show of a waiting presentation still wants that address and has no outcome; a waiting
-     * presentation whose current show wants another address is woken (reconciled), so that show fetches its own.
+     * Fetches under way, by address: the presentations waiting for them. At completion, each outcome belongs to the
+     * waiter's showing then and is written only while that showing still wants the address unresolved. A stale write
+     * wakes reconciliation, so a replacement can resolve its own address.
      */
     const fetching = new Map<string, Set<string>>()
-    /** Outcomes not written yet (the write failed): by presentation, for that address, with their retry time (R4). */
-    const imageOutcomes = new Map<string, { readonly url: string; readonly outcome: MediaOutcome; readonly retryAt: number }>()
+    let completingImages = 0
+    /** Completed outcomes waiting on a write: by presentation and showing, with a retry time only after failure. */
+    const imageOutcomes = new Map<string, { readonly showId: string; readonly url: string; readonly outcome: MediaOutcome; readonly retryAt?: number }>()
     /** Write an outcome on the presentation's current show if it wants that address unresolved; else wake it. */
-    const writeImage = (id: string, w: { readonly url: string; readonly outcome: MediaOutcome }) =>
+    const writeImage = (id: string, w: { readonly showId: string; readonly url: string; readonly outcome: MediaOutcome }) =>
       tx((p): Row<StoredPresentation> | "stale" | undefined => {
         const row = p.get(id)
         if (row === undefined || row.value.ended === true) return undefined
         const c = row.value.content
-        if (c.kind !== "image" || c.url !== w.url) return "stale"
+        if (row.value.showId !== w.showId || c.kind !== "image" || c.url !== w.url) return "stale"
         if (c.hash !== undefined || c.failed !== undefined) return undefined
         const { hash: _h, failed: _f, ...content } = c
         p.update(id, (v) => ({ ...v, content: { ...content, ...("hash" in w.outcome ? { hash: w.outcome.hash } : { failed: w.outcome.refused }) } }), { expectRev: row.rev })
         return p.get(id)
       }, (row) => {
-        if (imageOutcomes.get(id)?.url === w.url) imageOutcomes.delete(id)
+        if (imageOutcomes.get(id)?.showId === w.showId && imageOutcomes.get(id)?.url === w.url) imageOutcomes.delete(id)
         if (row !== undefined && row !== "stale" && index.get(id)?.showId === row.value.showId) put(entryOf(row))
         // Written, or not wanted any more: whoever holds it (or would) is reconciled; a show that wants another address
         // fetches its own there.
         touch(id, index.get(id)?.target)
       })
     const fetchImage = (id: string, url: string) => {
-      if (index.get(id) === undefined) return
+      const current = index.get(id)
+      if (current === undefined) return
       const pendingOutcome = imageOutcomes.get(id)
-      if (pendingOutcome?.url === url) return
+      if (pendingOutcome?.showId === current.showId && pendingOutcome.url === url) return
       if (pendingOutcome !== undefined) imageOutcomes.delete(id)
       const waiting = fetching.get(url)
       if (waiting !== undefined) {
@@ -889,22 +894,36 @@ export const makePresentEngine = (options: PresentEngineOptions): Effect.Effect<
       }
       const ids = new Set([id])
       fetching.set(url, ids)
+      let completing = false
       fork(Effect.gen(function*() {
         const media = options.media?.()
         const outcome: MediaOutcome = media === undefined ? { refused: "unavailable" } : yield* media.fetch(url)
+        // URL sharing ends with the fetch; completed outcomes belong to individual showings.
+        if (fetching.get(url) === ids) fetching.delete(url)
+        completing = true
+        completingImages++
         if ("refused" in outcome) log(`Presentations: an image was not kept (${outcome.refused})`)
-        for (const waiter of ids) {
-          const w = { url, outcome }
-          const showId = index.get(waiter)?.showId
-          const priorOutcome = imageOutcomes.get(waiter)
+        const waiters = [...ids].flatMap((id) => {
+          const showId = index.get(id)?.showId
+          if (showId === undefined) return []
+          const prior = imageOutcomes.get(id)
+          // An older address's late completion must not displace another address's pending write or retry.
+          if (prior?.showId === showId && prior.url !== url) return []
+          const w = { showId, url, outcome }
+          imageOutcomes.set(id, w)
+          return [{ id, w }]
+        })
+        for (const { id: waiter, w } of waiters) {
+          ids.delete(waiter)
           const exit = yield* Effect.exit(writeImage(waiter, w))
-          if (Exit.isFailure(exit) && index.get(waiter)?.showId === showId && imageOutcomes.get(waiter) === priorOutcome && (priorOutcome === undefined || priorOutcome.url === url)) {
+          if (Exit.isFailure(exit) && index.get(waiter)?.showId === w.showId && imageOutcomes.get(waiter) === w) {
             imageOutcomes.set(waiter, { ...w, retryAt: (yield* wallNow) + PRESENT_RETRY_MS })
             requestPlan()
             log("Presentations: an image's outcome could not be written; maintenance writes it again")
           }
         }
       }).pipe(Effect.ensuring(Effect.sync(() => {
+        if (completing) completingImages--
         if (fetching.get(url) === ids) fetching.delete(url)
       }))))
     }
@@ -948,7 +967,7 @@ export const makePresentEngine = (options: PresentEngineOptions): Effect.Effect<
       // Failed work is due at the retry time it was given when it failed (R4): planning again never moves it later.
       for (const s of pending) consider(s.failed ? s.retryAt ?? now : s.entry.expiresAt)
       for (const t of failedPasses.values()) consider(t)
-      for (const w of imageOutcomes.values()) consider(w.retryAt)
+      for (const w of imageOutcomes.values()) if (w.retryAt !== undefined) consider(w.retryAt)
       if (!loaded) consider(loadRetryAt ?? now + PRESENT_RETRY_MS)
       return next
     }
@@ -1033,9 +1052,9 @@ export const makePresentEngine = (options: PresentEngineOptions): Effect.Effect<
       yield* Effect.ignore(removeDoomed(now))
       for (const s of [...pending]) if (s.failed && (s.retryAt ?? 0) <= now && pending.includes(s)) yield* writePending(s)
       for (const [id, w] of [...imageOutcomes]) {
-        if (w.retryAt > now) continue
+        if (w.retryAt === undefined || w.retryAt > now) continue
         if (Exit.isFailure(yield* Effect.exit(writeImage(id, w)))) {
-          imageOutcomes.set(id, { ...w, retryAt: now + PRESENT_RETRY_MS })
+          if (imageOutcomes.get(id) === w) imageOutcomes.set(id, { ...w, retryAt: now + PRESENT_RETRY_MS })
         }
       }
       if (failedPasses.size > 0) {
@@ -1105,7 +1124,7 @@ export const makePresentEngine = (options: PresentEngineOptions): Effect.Effect<
       })
 
     const resolveTarget = (target: PresentTarget, origin: string | undefined): Entry["target"] | string => {
-      if (target === "origin") return origin === undefined ? "this call has no origin device (a turn, a job or a press made for one): name a device or a room" : { device: origin }
+      if (target === "origin") return origin === undefined ? "this call has no origin device (a turn, a job or a press made for one): name a device or a room" : resolveTarget({ device: origin }, origin)
       if (typeof target === "object" && target !== null && "device" in target && typeof target.device === "string") {
         return deviceOf(target.device) === undefined ? `there is no device "${target.device.slice(0, 64)}"` : { device: target.device }
       }
@@ -1275,7 +1294,7 @@ export const makePresentEngine = (options: PresentEngineOptions): Effect.Effect<
           const at = timeIn(clock, now)
           const e = index.get(id)
           const row = p.get(id)
-          if (e === undefined || row === undefined || row.value.ended === true || e.showId !== showId || row.value.showId !== showId || row.value.module !== moduleId || e.expiresAt <= at) return undefined
+          if (e === undefined || row === undefined || row.value.ended === true || e.showId !== showId || row.value.showId !== showId || row.value.module !== moduleId || !partOpen(moduleId, e.part) || e.expiresAt <= at) return undefined
           const stale = presentationProblem(presentation, at)
           if (stale !== undefined) return { invalid: stale }
           if (presentation.kind !== row.value.content.kind) return { invalid: `an update keeps the kind (${row.value.content.kind}); show a new presentation for another` }
@@ -1327,7 +1346,6 @@ export const makePresentEngine = (options: PresentEngineOptions): Effect.Effect<
 
     // ---- Accepted shows (way 1): written off the turn's path, retried until written or no longer applying (G5)
 
-    const work: Array<PendingShow> = []
     let writing = false
     const workWake = yield* Queue.sliding<void>(1)
     const writePending = (s: PendingShow): Effect.Effect<void> =>
@@ -1627,7 +1645,7 @@ export const makePresentEngine = (options: PresentEngineOptions): Effect.Effect<
       plannedAt: () => (typeof plannedAt === "number" ? plannedAt : undefined),
       loaded: () => loaded,
       settled: Effect.gen(function*() {
-        for (let i = 0; i < 5_000 && (working || writing || planning || all || dirty.size > 0 || work.length > 0 || fetching.size > 0); i++) yield* Effect.yieldNow
+        for (let i = 0; i < 5_000 && (working || writing || planning || all || dirty.size > 0 || work.length > 0 || fetching.size > 0 || completingImages > 0); i++) yield* Effect.yieldNow
       })
     }
     return engine

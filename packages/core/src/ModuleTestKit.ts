@@ -23,6 +23,7 @@ import {
   type ReplyVolumes,
   replyVolumeOf,
   ringingWithoutWake,
+  STOP_ACTION,
   type DeviceCapabilities,
   type DevicePrivacy,
   devicePresentFrom,
@@ -1049,6 +1050,18 @@ export const startTestModule = (definition: ModuleDefinition<any>, options: Star
 
     let pendingPresses = 0
     const pressesByDevice = new Map<string, number>()
+    const admitPress = <A>(deviceId: string, work: Effect.Effect<A>, busy: () => A): Effect.Effect<A> => Effect.suspend(() => {
+      const count = pressesByDevice.get(deviceId) ?? 0
+      if (count >= 4 || pendingPresses >= 16) return Effect.succeed(busy())
+      pressesByDevice.set(deviceId, count + 1)
+      pendingPresses++
+      return work.pipe(Effect.ensuring(Effect.sync(() => {
+        pendingPresses--
+        const left = (pressesByDevice.get(deviceId) ?? 1) - 1
+        if (left === 0) pressesByDevice.delete(deviceId)
+        else pressesByDevice.set(deviceId, left)
+      })))
+    })
     const harness = {
       host,
       moduleId: id,
@@ -1249,13 +1262,14 @@ export const startTestModule = (definition: ModuleDefinition<any>, options: Star
          */
         press: (notificationId: string, actionId: string, as: { readonly device?: string } = {}): Effect.Effect<PressAnswer> => {
           const deviceId = as.device ?? deviceList[0]?.id ?? "kitchen-display"
-          return checked(
+          const work = checked(
             `after pressing ${actionId}`,
             Effect.andThen(
               Effect.andThen(settle, driven(`the press of ${actionId}`, notify.press({ notificationId, actionId, deviceId, connection: testConnectionOf(deviceId) }))),
               (a) => Effect.as(settle, a)
             )
           )
+          return actionId === STOP_ACTION ? work : admitPress(deviceId, work, notify.busyAnswer)
         },
         /**
          * A reply starts on the device (`true`) or has ended: announcements there wait for it, and one being spoken is
@@ -1314,13 +1328,9 @@ export const startTestModule = (definition: ModuleDefinition<any>, options: Star
         press: (presentationId: string, action: string, as: { readonly device?: string; readonly item?: string; readonly done?: boolean } = {}): Effect.Effect<PresentPressAnswer> => {
           const deviceId = as.device ?? deviceList[0]?.id ?? "kitchen-display"
           return Effect.suspend(() => {
-            const count = pressesByDevice.get(deviceId) ?? 0
-            if (count >= 4 || pendingPresses >= 16) return Effect.succeed(present.busyAnswer())
-            pressesByDevice.set(deviceId, count + 1)
-            pendingPresses++
-            return checked(`after pressing ${action}`, Effect.gen(function*() {
+            const revision = presentPages.get(deviceId)?.get(presentationId)?.revision ?? "missing"
+            return admitPress(deviceId, checked(`after pressing ${action}`, Effect.gen(function*() {
               yield* settle
-              const revision = presentPages.get(deviceId)?.get(presentationId)?.revision ?? "missing"
               const answer = yield* driven(`the press of ${action}`, present.press({
                 presentationId,
                 revision,
@@ -1332,12 +1342,7 @@ export const startTestModule = (definition: ModuleDefinition<any>, options: Star
               }))
               yield* settle
               return answer
-            })).pipe(Effect.ensuring(Effect.sync(() => {
-              pendingPresses--
-              const left = (pressesByDevice.get(deviceId) ?? 1) - 1
-              if (left === 0) pressesByDevice.delete(deviceId)
-              else pressesByDevice.set(deviceId, left)
-            })))
+            })), present.busyAnswer)
           })
         },
         settle
