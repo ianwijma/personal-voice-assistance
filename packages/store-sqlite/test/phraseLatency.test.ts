@@ -5,6 +5,9 @@
 //     and the reviewers' aligned worst case (256 two-slot shapes over two words, with number and duration slots, which
 //     spends the whole `slotReads` budget and is then not taken); each run's longest main-thread stop under `bound(10)`;
 // (2) a set prepared ahead, step by step, for 32 modules × 16 actions × 8 phrases (4,096 declarations): its longest stop;
+//     and the maximum choice-bearing module (review round 2, a2: 16 actions × 8 phrases, each phrase two slots that are
+//     32-option choices with the full name budget, 96 names of 40 characters, each action its own two choices, fresh
+//     objects every time as after a start): its declaration check (one synchronous step) and its preparation;
 // (3) the same scripted 24-word turn that is no command (the real Conversation, zero-delay synthesis and output, the
 //     model's first token at 5 ms) without and with the one decision at its final, the decision reading a set that was
 //     invalidated just before (the preparation running in the background while the turn runs): TurnTrace end of turn ->
@@ -16,12 +19,14 @@ import {
   decideUtterance,
   defineAction,
   hostCommandSet,
+  macrotask,
   makePhraseSets,
   makeToolRegistry,
   matchCommand,
   type MatchStats,
   Param,
   PHRASE_LIMITS,
+  phraseProblems,
   registerActions,
   type SttEvent,
   type Trace,
@@ -74,6 +79,27 @@ const maxSet = () => {
   expect(set.conflicts).toEqual([])
   return set
 }
+
+/** A name of exactly `choiceNameChars` characters. */
+const fullName = (s: string) => `${s} ${"x".repeat(PHRASE_LIMITS.choiceNameChars)}`.slice(0, PHRASE_LIMITS.choiceNameChars)
+/** A choice at its bound: 32 options, each a value, a label and an alias of 40 characters (96 names, `choiceNames`). */
+const fullChoice = (tag: string) =>
+  Param.choice({
+    label: "C",
+    options: Array.from({ length: PHRASE_LIMITS.choiceOptions }, (_, i) => ({ value: fullName(`${tag} value ${i}`), label: fullName(`${tag} label ${i}`), aliases: [fullName(`${tag} alias ${i}`)] }))
+  })
+/** The maximum choice-bearing module, new objects each call (a start): 16 actions × 8 phrases, two full choices per action. */
+const choiceModule = (round: number) =>
+  Array.from({ length: PHRASE_LIMITS.actionsPerModule }, (_, a) =>
+    defineAction({
+      id: `action_${a}`,
+      label: "A",
+      description: "A.",
+      params: { r: fullChoice(`r${round}.${a}`), s: fullChoice(`s${round}.${a}`) },
+      phrases: { en: Array.from({ length: PHRASE_LIMITS.phrasesPerAction }, (_, v) => `please action${a} variant${v} in {r} at {s}`) },
+      run: () => Effect.void
+    })
+  )
 
 /** A near miss of exactly 24 words: every phrase aligns "please set the …" and then fails on its last word. */
 const nearMiss = (i: number) => `please set the room number ${i % 32} and the area ${(i + 7) % 32} timer to ten minutes and thirty seconds then tell me when it is ready`
@@ -161,6 +187,55 @@ describe("phrase commands on the path of an utterance", () => {
     console.log(`preparing one assistant's set from 4,096 declarations (256 kept, the rest named past the bound): ${sets.stats().compiled} preparations, median ${ms(median(passes))} of wall time each; longest stop ${ms(stop)}`)
     expect(sets.stats().compiled).toBeGreaterThanOrEqual(10)
     expect(stop).toBeLessThan(bound(10))
+  }, 120_000)
+
+  it("the maximum choice-bearing module: its declaration check (one synchronous step) and its preparation in steps (bound(10))", async () => {
+    const first = choiceModule(0)
+    const names = first[0]!.params.r.options.flatMap((o) => [o.value, o.label, ...(o.aliases ?? [])])
+    expect([first.length, first[0]!.phrases!.en!.length, names.length, Math.max(...names.map((n) => n.length))]).toEqual([16, 8, PHRASE_LIMITS.choiceNames, PHRASE_LIMITS.choiceNameChars])
+    const checks: Array<number> = []
+    for (let r = 0; r < 30; r++) {
+      const declared = choiceModule(1000 + r)
+      const t = performance.now()
+      const problems = phraseProblems("choices", declared)
+      checks.push(performance.now() - t)
+      expect(problems).toEqual([])
+    }
+    let round = 0
+    const scope = Effect.runSync(Scope.make())
+    const steps: Array<number> = []
+    let stepStart = performance.now()
+    const yieldStep = Effect.sync(() => void steps.push(performance.now() - stepStart)).pipe(Effect.andThen(macrotask), Effect.andThen(Effect.sync(() => void (stepStart = performance.now()))))
+    let actions = registerActions("choices", choiceModule(round))
+    const sets = await Effect.runPromise(makePhraseSets({ language: () => "en", assistants: () => [{ id: "a", name: "A" }], inputKey: () => `${round}`, actionsOf: () => actions }, { yieldStep }).pipe(Scope.provide(scope)))
+    await Effect.runPromise(sets.settled)
+    steps.length = 0
+    const passes: Array<number> = []
+    const stop = await longestStop(async () => {
+      for (let i = 0; i < 10; i++) {
+        round++
+        actions = registerActions("choices", choiceModule(round))
+        const t = performance.now()
+        await Effect.runPromise(sets.settled)
+        passes.push(performance.now() - t)
+      }
+    })
+    const set = sets.ready("a")
+    await Effect.runPromise(Scope.close(scope, Exit.void))
+    expect(set?.phrases.filter((p) => p.owner.kind === "action")).toHaveLength(128)
+    // Prepared keys, read: a label and an alias of the newest start's choices.
+    expect(matchCommand(set!, `please action3 variant5 in ${fullName(`r${round}.3 label 7`)} at ${fullName(`s${round}.3 alias 9`)}`)).toMatchObject({
+      kind: "command",
+      values: { r: fullName(`r${round}.3 value 7`), s: fullName(`s${round}.3 value 9`) }
+    })
+    console.log(
+      `the maximum choice-bearing module (16 actions × 8 phrases, 2 slots each, 32 distinct choices of 96 names of 40 characters): ` +
+        `declaration check median ${ms(median(checks))}, worst ${ms(Math.max(...checks))} (one synchronous step); ` +
+        `preparation median ${ms(median(passes))} of wall time, ${steps.length} steps, longest step ${ms(Math.max(...steps))}; longest stop ${ms(stop)}`
+    )
+    expect(Math.max(...checks)).toBeLessThan(bound(10))
+    expect(stop).toBeLessThan(bound(10))
+    expect(Math.max(...steps)).toBeLessThan(bound(10))
   }, 120_000)
 
   it("a turn that is no command has the same timings with and without the decision, through an invalidated set (TurnTrace, counterbalanced)", async () => {

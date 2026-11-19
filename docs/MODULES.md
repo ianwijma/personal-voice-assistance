@@ -1435,7 +1435,7 @@ An action can be said **without the language model**: give it `phrases` per lang
 window, or on a device whose assistant answers without a phrase), an utterance that is one of the phrases of the
 household's language runs the action through the gateway as a `phrase` turn of that device, and its `say` is spoken as
 a canned reply: the utterance never becomes a turn and nothing of it enters the history. Words are matched exactly (case,
-accents and punctuation aside); a slot is a number, a duration, a fixed choice (at most 32 options) or text, read from the
+accents and punctuation aside); a slot is a number, a duration, a fixed choice (at most 32 options and 96 names of at most 40 characters) or text, read from the
 characters said by its parameter's own parser, and one that does not read means no match (a parameter whose options
 come from a callback cannot be a slot: take it as text and resolve it in `run`). A parameter the phrase leaves out gets
 its default, as on every path. The longest phrase wins. The host's essential controls ("stop", "never mind", "repeat", "louder", "quieter", with their

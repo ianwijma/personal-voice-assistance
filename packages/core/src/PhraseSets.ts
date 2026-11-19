@@ -1,21 +1,26 @@
 import { Deferred, Effect, type Scope } from "effect"
 import type { RegisteredAction } from "./Actions.ts"
 import {
+  actionPhraseTexts,
   actionsByModule,
   assembleCommandSet,
   type CommandSet,
   type CompiledPhrase,
-  compileActionPhrases,
+  compileActionPhrase,
   PHRASE_LIMITS,
   phraseConflictIssues,
-  type PhraseLanguage
+  type PhraseLanguage,
+  PREPARE_STEP_WORK,
+  type PhraseWork
 } from "./Phrases.ts"
 
 /**
  * Phrase sets prepared ahead of use (docs/PHRASES.md "Sets are prepared ahead"; review round 1, E3). A recogniser's
  * final only reads a set that is ready for exactly what it depends on now; building one happens here, when something it
- * depends on changed, in bounded steps (one module's phrases, at most `actionsPerModule × phrasesPerAction` = 128) with a
- * real yield to the event loop between steps, never on a final. A final whose set is not ready matches the host's
+ * depends on changed, in bounded steps with a real yield to the event loop between them, never on a final. A step is
+ * measured by the normalising it did (`PhraseWork`: one unit per phrase or choice name, each at most 80 characters), not
+ * by modules: it yields once `PREPARE_STEP_WORK` units are done (review round 2, a2), and a choice's names are prepared
+ * once, however many phrases read it, so one step is at most 256 units and one phrase's two new choices (2 × 96). A final whose set is not ready matches the host's
  * controls alone: they are reserved, so no module phrase can match the same words with more literal words, and the
  * answer is the one the full set would give whenever a control is said.
  *
@@ -95,18 +100,29 @@ export const makePhraseSets = (inputs: PhraseSetInputs, options: PhraseSetOption
       Deferred.doneUnsafe(was, Effect.void)
     }
 
-    /** One assistant's set, step by step: one module at a time, a yield after each. */
+    /** One assistant's set, step by step: a phrase at a time, a yield after every `PREPARE_STEP_WORK` units of work. */
     const prepare = (language: PhraseLanguage, actions: ReadonlyArray<RegisteredAction>) =>
       Effect.gen(function*() {
         const modules: Array<{ readonly moduleId: string; readonly phrases: ReadonlyArray<CompiledPhrase> }> = []
         const over: Array<string> = []
+        const work: PhraseWork = { units: 0 }
         let count = 0
         for (const m of actionsByModule(actions)) {
           if (over.length > 0) {
             if (m.actions.some((a) => a.definition.phrases?.[language] !== undefined)) over.push(m.moduleId)
             continue
           }
-          const phrases = m.actions.flatMap((a) => compileActionPhrases(language, a))
+          const phrases: Array<CompiledPhrase> = []
+          for (const a of m.actions) {
+            for (const text of actionPhraseTexts(language, a)) {
+              const compiled = compileActionPhrase(language, a, text, work)
+              if (compiled !== undefined) phrases.push(compiled)
+              if (work.units >= PREPARE_STEP_WORK) {
+                work.units = 0
+                yield* yieldStep
+              }
+            }
+          }
           if (phrases.length > 0) {
             if (count + phrases.length > PHRASE_LIMITS.phrasesPerAssistant) over.push(m.moduleId)
             else {
@@ -114,7 +130,6 @@ export const makePhraseSets = (inputs: PhraseSetInputs, options: PhraseSetOption
               modules.push({ moduleId: m.moduleId, phrases })
             }
           }
-          yield* yieldStep
         }
         return assembleCommandSet(language, modules, over)
       })
