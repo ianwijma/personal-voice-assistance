@@ -1137,7 +1137,8 @@ export const makeVoiceSession = (options: VoiceSessionOptions): Effect.Effect<Vo
           ...(t.risk !== undefined ? { risk: t.risk } : {}),
           ...(t.refused !== undefined ? { refused: t.refused.slice(0, 300) } : {}),
           ...(t.turn?.person !== undefined ? { person: t.turn.person.id.slice(0, 64) } : {}),
-          ...(t.actionMs !== undefined ? { actionMs: Math.max(0, Math.round(t.actionMs * 10) / 10) } : {})
+          ...(t.actionMs !== undefined ? { actionMs: Math.max(0, Math.round(t.actionMs * 10) / 10) } : {}),
+          ...(t.presented === true ? { presented: true } : {})
         }
       }
       options.onPhraseTrace?.(info)

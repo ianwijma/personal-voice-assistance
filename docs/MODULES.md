@@ -1523,7 +1523,7 @@ Its test, through the kit's `present` handles (what each page holds, a press as 
 const kit = yield* startTestModule(errandsModule)
 const shown = yield* kit.tool("errands_show", {}, { device: "kitchen-display" })
 // The model gets what the tool returned for it, and the note of what the server did.
-assert.strictEqual(shown.content, "{\"open\":[\"Bread\",\"Stamps\"]}\n[Screen: Shown on \"Kitchen display\".]")
+assert.strictEqual(shown.content, "{\"open\":[\"Bread\",\"Stamps\"]}\n[Screen: Showing on \"Kitchen display\".]")
 yield* kit.present.settle
 const [list] = kit.present.shown("kitchen-display")
 assert.strictEqual(list?.content.kind, "list")
