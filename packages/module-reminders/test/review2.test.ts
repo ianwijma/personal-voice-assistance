@@ -59,7 +59,7 @@ describe("finding 2: a row with work owed always has a job that can do it", () =
       yield* assertJob(kit, id)
       faults.resolveFails = 1
       const changed = yield* kit.tool("reminders_change", { which: "mum", text: "call dad" }, { device: SAM })
-      assert.include(spoken(changed), "It rings again now with the new words.")
+      assert.include(spoken(changed), "The new words are waiting for delivery.")
       assert.include(spoken(changed), "still being taken down")
       const row = (yield* theRow(kit)).value
       assert.isDefined(row.owed)
@@ -133,7 +133,8 @@ describe("finding 3: a card's button belongs to its occurrence", () => {
       assert.deepStrictEqual(yield* press(faults, old!, `due:${id}:${first}`, "snooze"), { say: "That one was already answered." })
       assert.deepStrictEqual(yield* allRows(kit), before)
       // The newer card's own button still works.
-      assert.include((yield* press(faults, old!, `due:${id}:${first + DAY}`)).say, "Done.")
+      const fresh = kit.present.shown(SAM)[0]!
+      assert.include((yield* kit.present.press(fresh.id, "done", { device: SAM })).say!, "Done.")
     }))
 })
 

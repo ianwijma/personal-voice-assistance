@@ -1,6 +1,6 @@
 import {
-  ActionError, type Actor, CurrentJob, CurrentTurn, defineAction, isPresentResult, defineModule, makeTool, type ModuleDefinition, Param, type PresentHandle,
-  type Presentation, Privacy, type Row, type ScheduleOrigin, Setting, StoreError, ToolError, type TurnContext
+  ActionError, type ActionDefinition, type ActionParams, type ActionOutcome, type Actor, CurrentJob, CurrentTurn, defineAction, isPresentResult, defineModule, makeTool, type JobRow, type ModuleDefinition, Param, type PresentHandle,
+  type Presentation, Privacy, type Row, type ScheduleOrigin, Setting, StoreError, type StoreFailure, ToolError, type TurnContext
 } from "@pva/core"
 import {
   describeRRule, type Language, parseDateTime, parseDtstart, parseRecurrence, speakDuration, speakList, speakNumber, speakTime
@@ -9,7 +9,7 @@ import { BriefingSectionError, BriefingSections, homeLanguage, isLine, say } fro
 import { Clock, Effect, Schema, Semaphore } from "effect"
 import { randomUUID } from "node:crypto"
 import {
-  blocked, cut, endOfToday, holdsSecret, homeZone, isRepeat, Line, localOf, matching, momentText, nextOf, type Owed, PAGE, planOf, Reminder, reminders,
+  blocked, cut, endOfToday, holdsSecret, homeZone, isRepeat, Line, localOf, matching, momentText, nextOf, owedDueAt, type Owed, PAGE, planOf, Reminder, reminders,
   SCAN_ROWS, scanRows, shortMoment, speaksAt, type Stop, STOP_NOTES, TEXT_CHARS, WHEN_CHARS, without
 } from "./model.ts"
 import { texts } from "./texts.ts"
@@ -99,27 +99,41 @@ const cardKey = (id: string, at: number) => `due:${id}:${at}`
 const CARD_KEY = /^due:([A-Za-z0-9_-]{1,40}):(\d{1,16})$/
 
 /** Cleanup owed, with more to take down: tried at once (`tryAt` now), notes merged, at most `STOP_NOTES` (an older one has expired by then). */
-const addStop = (stop: Stop | undefined, notes: ReadonlyArray<number>, card: boolean, now: number): Stop | undefined => {
+const addStop = (stop: Stop | undefined, notes: ReadonlyArray<number>, card: boolean, now: number, cardAt?: number): Stop | undefined => {
   const all = [...(stop?.notes ?? [])]
   for (const n of notes) if (!all.includes(n)) all.push(n)
   const kept = all.slice(-STOP_NOTES)
   const withCard = card || stop?.card === true
   if (kept.length === 0 && !withCard) return stop
-  return { notes: kept, card: withCard, attempts: stop?.attempts ?? 0, tryAt: now }
+  // Unscoped cleanup (cancel/change) takes down the current card; scoped answers retain their occurrence.
+  const target = !withCard || (stop?.card === true && stop.cardAt === undefined) || (card && cardAt === undefined)
+    ? undefined : Math.max(stop?.card === true ? stop.cardAt ?? 0 : 0, cardAt ?? 0)
+  return { notes: kept, card: withCard, ...(target !== undefined ? { cardAt: target } : {}), attempts: stop?.attempts ?? 0, tryAt: now }
 }
 const withStop = (value: Reminder, stop: Stop | undefined): Reminder => (stop === undefined ? without(value, "stop") : { ...without(value, "stopFailed"), stop })
+
+/** A successful answer carries its safe confirmation through to the outer reply boundary. */
+interface Reply {
+  readonly spoken: string
+  readonly owner?: string
+  readonly privateSpoken?: string
+  readonly keepOpen?: boolean
+}
 
 type Kind = "done" | "snooze"
 
 interface By {
   /** The occurrence a button was pressed for (from its key). */
   readonly at?: number
+  /** The open notification selected by voice, revalidated under the answer lock. */
+  readonly noteId?: string
   /** The notification or card pressed (a snooze of the same one is not pushed further). */
   readonly pressId?: string
   /** Pressed on the notification: the service resolves that notification itself after the handler. */
   readonly viaNotification?: boolean
   readonly ms?: number
   readonly actor?: Actor
+  readonly turn?: TurnContext | undefined
 }
 
 export const remindersModule = defineModule({
@@ -140,21 +154,39 @@ export const remindersModule = defineModule({
         return (typeof m === "number" ? m : 10) * 60_000
       }
       /** The cards of due reminders this part is showing (a transient card ends with the part, so this is all of them). */
-      const cards = new Map<string, PresentHandle>()
+      const cards = new Map<string, { readonly at: number; readonly noteId: string; readonly handle: PresentHandle }>()
+
+      const mayReveal = (owner: string | undefined, subject: TurnContext | string | undefined) =>
+        owner === undefined || ctx.host.service(Privacy)?.mayReveal(owner, subject) === true
+
+      /** The last synchronous step of every tool, action and press: decide what may be returned now. */
+      const finish = (result: unknown, subject: TurnContext | string | undefined): unknown => {
+        if (isPresentResult(result)) {
+          const owner = (result.forModel as { readonly owner?: string } | undefined)?.owner
+          return mayReveal(owner, subject) ? result : { spoken: say(texts, lang(), "unreadableHere") }
+        }
+        if (result === undefined || result === null || typeof result !== "object") return result
+        const { privateSpoken, ...reply } = result as Reply & { readonly say?: string }
+        if (mayReveal(reply.owner, subject)) return reply
+        return {
+          ...("say" in reply ? { say: privateSpoken ?? say(texts, lang(), "unreadableHere") } : { spoken: privateSpoken ?? say(texts, lang(), "unreadableHere") }),
+          ...(reply.keepOpen === true ? { keepOpen: true } : {})
+        }
+      }
 
       // ---- one at a time -------------------------------------------------------------------------------------------
 
       const lock = Semaphore.makeUnsafe(1)
 
-      const listPresentation = (rows: ReadonlyArray<Row<Reminder>>, owner: string | undefined): Presentation => {
+      const listPresentation = (rows: ReadonlyArray<Row<Reminder>>, owner: string | undefined, cutRead: boolean): Presentation => {
         const l = lang()
         const z = zone()
         return {
           kind: "list",
           title: say(texts, l, "listTitle"),
           style: "bullets",
-          items: rows.slice(0, 12).map((r) => ({ id: r.id, text: cut(`${shortMoment(speaksAt(r.value) ?? r.value.ring?.at ?? 0, l, z)} · ${r.value.text}`, 80) })),
-          spoken: say(texts, l, "spokenList", { count: rows.length }),
+          items: rows.slice(0, 12).map((r) => ({ id: r.id, text: cut(`${shortMoment(speaksAt(r.value) ?? (r.value.ring?.from ?? r.value.ring?.at) ?? 0, l, z)} · ${r.value.text}`, 80) })),
+          spoken: `${say(texts, l, "spokenList", { count: rows.length })}${cutRead ? ` ${say(texts, l, "cutRead", { count: SCAN_ROWS })}` : ""}`,
           ...(owner !== undefined ? { sensitivity: { personal: owner } } : {})
         }
       }
@@ -163,6 +195,24 @@ export const remindersModule = defineModule({
       /** Every change of a reminder goes one at a time: a tool, a job and a press never read and write over each other. */
       const exclusive = <A, E, R>(effect: Effect.Effect<A, E, R>) => lock.withPermits(1)(effect)
 
+      /** Live jobs plus the slots an unanswered ring will need when it is answered. Called under the row lock. */
+      const occupied = () => Effect.gen(function*() {
+        const scan = yield* scanRows<Reminder, StoreFailure>((p) => board.list({ where: { state: "open" }, orderBy: { field: "nextAt", direction: "asc" }, ...p }))
+        let after: JobRow | undefined
+        let jobs = 0
+        const keys = new Set<string>()
+        for (let page = 0; page < 20; page++) {
+          const got = yield* ctx.scheduler.list({ limit: 10, ...(after === undefined ? {} : { after }) })
+          jobs += got.length
+          for (const job of got) if (job.key !== undefined) keys.add(job.key)
+          if (got.length < 10) break
+          after = got.at(-1)
+          yield* Effect.yieldNow
+        }
+        return scan.cut && scan.rows.every((r) => r.value.nextAt === undefined) ? 200 :
+          jobs + scan.rows.filter((r) => r.value.ring !== undefined && planOf(r.value) === undefined && !keys.has(jobKey(r.id))).length
+      })
+
       // ---- writing a row and planning its one job ------------------------------------------------------------------
 
       /**
@@ -170,20 +220,30 @@ export const remindersModule = defineModule({
        * transaction (no job when nothing is planned: the old one is cancelled after the commit, and one left over finds
        * nothing to do). A problem to report becomes a job that fails at once: a Health issue (left out at the job limit).
        */
-      const write = (row: Row<Reminder>, f: (v: Reminder) => Reminder, opts: { readonly actor?: Actor | undefined; readonly report?: string } = {}) =>
+      const write = (row: Row<Reminder>, f: (v: Reminder) => Reminder, opts: {
+        readonly actor?: Actor | undefined
+        readonly report?: string
+        /** Recording already-owed cleanup is independent of permission to change the reminder. */
+        readonly housekeeping?: boolean
+      } = {}) =>
         Effect.gen(function*() {
+          const turn = yield* CurrentTurn
+          const subject = opts.actor?.kind === "ui" ? opts.actor.deviceId : turn
+          const userWrite = opts.housekeeping !== true && (opts.actor?.kind === "ui" || turn !== undefined)
           const value0 = f(row.value)
           const nextAt = planOf(value0)
           const value: Reminder = nextAt === undefined ? without(value0, "nextAt") : { ...value0, nextAt }
           const job = nextAt === undefined
             ? undefined
             : yield* ctx.scheduler.prepare({ handler: "due", key: jobKey(row.id), payload: { id: row.id }, at: nextAt, late: "run", origin: originOf(value) })
-          const report = opts.report === undefined
+          const report = opts.report === undefined || (yield* occupied()) >= 200
             ? undefined
             : yield* ctx.scheduler.prepare({ handler: "problem", key: `problem:${row.id}`, payload: { reason: cut(opts.report, 200) }, inMs: 0, origin: {} }).pipe(
               Effect.orElseSucceed(() => undefined)
             )
           const written = yield* ctx.store.transaction((tx) => {
+            // Transaction admission is after job preparation and the store's own wait. A refusal writes nothing.
+            if (userWrite && !mayReveal(row.value.owner, subject)) return undefined
             const w = tx.collection(reminders).update(row.id, () => value, { expectRev: row.rev, ...(opts.actor !== undefined ? { actor: opts.actor } : {}) })
             job?.writeIn(tx)
             if (report !== undefined) {
@@ -196,6 +256,7 @@ export const remindersModule = defineModule({
             }
             return w
           })
+          if (written === undefined) return yield* new ToolError({ message: say(texts, lang(), "unreadableHere") })
           if (job === undefined) yield* Effect.ignore(ctx.scheduler.cancel({ key: jobKey(row.id) }))
           return written
         })
@@ -203,7 +264,7 @@ export const remindersModule = defineModule({
       // ---- delivering ----------------------------------------------------------------------------------------------
 
       /** The card of a delivered reminder on the device it was set on, with the same two answers (its key replaces an older one). */
-      const showCard = (id: string, rem: Reminder, at: number) =>
+      const showCard = (id: string, rem: Reminder, owed: Owed, noteId: string) =>
         Effect.gen(function*() {
           if (rem.deviceId === undefined) return
           const l = lang()
@@ -213,7 +274,7 @@ export const remindersModule = defineModule({
             title: say(texts, l, "notificationTitle"),
             text: rem.text,
             facts: [
-              { label: say(texts, l, "cardDue"), value: shortMoment(at, l, zone()) },
+              { label: say(texts, l, "cardDue"), value: shortMoment(owedDueAt(rem, owed), l, zone()) },
               ...(rem.rrule !== undefined ? [{ label: say(texts, l, "cardRepeats"), value: cut(ruleText(rem, l), 60) }] : []),
               { label: say(texts, l, "cardFor"), value: say(texts, l, owner === undefined ? "forHousehold" : "forYou") }
             ],
@@ -224,9 +285,9 @@ export const remindersModule = defineModule({
           }
           // The key carries the occurrence, so a newer card does not replace an older one by itself: the older goes first.
           const older = cards.get(id)
-          if (older !== undefined) yield* Effect.ignore(older.dismiss)
-          const handle = yield* ctx.present.show({ device: rem.deviceId }, present, { lifetime: "transient", expiresInMs: CARD_MS, key: cardKey(id, at) })
-          cards.set(id, handle)
+          if (older !== undefined) yield* Effect.ignore(older.handle.dismiss)
+          const handle = yield* ctx.present.show({ device: rem.deviceId }, present, { lifetime: "transient", expiresInMs: CARD_MS, key: cardKey(id, owed.at) })
+          cards.set(id, { at: owed.at, noteId, handle })
         }).pipe(Effect.ignore)
 
       /**
@@ -238,10 +299,11 @@ export const remindersModule = defineModule({
         Effect.gen(function*() {
           const l = lang()
           const priority = ctx.settingsFor(undefined)?.priority === "normal" ? "normal" : "ring"
-          const late = now - owed.from > LATE_NOTE_MS ? ` (${say(texts, l, "late", { when: momentText(owed.at, l, zone(), now) })})` : ""
-          yield* ctx.notify.send({
+          const late = now - owed.from > LATE_NOTE_MS ? ` (${say(texts, l, "late", { when: momentText(owedDueAt(rem, owed), l, zone(), now) })})` : ""
+          const text = cut(`${rem.text}${late}`, 200)
+          const sent = yield* ctx.notify.send({
             title: say(texts, l, "notificationTitle"),
-            text: cut(`${rem.text}${late}`, 200),
+            text,
             priority,
             key: noteKey(id, owed.at),
             expiresInMs: priority === "ring" ? RING_EXPIRES_MS : NORMAL_EXPIRES_MS,
@@ -250,7 +312,7 @@ export const remindersModule = defineModule({
             target: rem.deviceId !== undefined ? "origin" : "everywhere",
             ...(rem.owner !== undefined ? { owner: rem.owner } : {})
           })
-          yield* showCard(id, rem, owed.at)
+          yield* showCard(id, rem, owed, sent.notification.id)
         })
 
       const when = (ms: number) => new Date(ms).toISOString().slice(0, 16).replace("T", " ")
@@ -263,15 +325,18 @@ export const remindersModule = defineModule({
         readonly send: boolean
         /** Try the cleanup owed now, whatever its time (a tool or a button tries it once, in line). */
         readonly forceStop?: boolean
+        /** The host owns this active press; its notification is checked by the later row job. */
+        readonly deferNote?: number
       }
 
       /** Takes down the notifications and the card still owed; what fails is tried again later, a bounded number of times. */
-      const takeDown = (row: Row<Reminder>, now: number, actor: Actor | undefined) =>
+      const takeDown = (row: Row<Reminder>, now: number, actor: Actor | undefined, deferNote?: number) =>
         Effect.gen(function*() {
           const s = row.value.stop!
           const left: Array<number> = []
           let why = ""
           for (const at of s.notes) {
+            if (at === deferNote) { left.push(at); continue }
             const failed = yield* ctx.notify.resolve({ key: noteKey(row.id, at) }).pipe(Effect.as(undefined), Effect.catchTag("NotifyError", (e) => Effect.succeed(e.reason)))
             if (failed !== undefined) {
               left.push(at)
@@ -279,24 +344,27 @@ export const remindersModule = defineModule({
             }
           }
           let card = false
-          const shown = s.card ? cards.get(row.id) : undefined
+          const currentCard = cards.get(row.id)
+          const shown = s.card && (s.cardAt === undefined || s.cardAt === currentCard?.at) ? currentCard : undefined
           if (shown !== undefined) {
-            const failed = yield* shown.dismiss.pipe(Effect.as(undefined), Effect.catchTag("PresentError", (e) => Effect.succeed(e.reason)))
+            const failed = yield* shown.handle.dismiss.pipe(Effect.as(undefined), Effect.catchTag("PresentError", (e) => Effect.succeed(e.reason)))
             if (failed === undefined) cards.delete(row.id)
             else {
               card = true
               why = failed
             }
           }
-          if (left.length === 0 && !card) return yield* write(row, (v) => without(v, "stop"), { actor })
+          if (left.length === 0 && !card) return yield* write(row, (v) => without(v, "stop"), { actor, housekeeping: true })
+          // An active host claim is not a failed cleanup try. Keep its verification durable without resolving it inline.
+          if (why === "") return yield* write(row, (v) => ({ ...v, stop: { ...s, notes: left, card: false, tryAt: now + STOP_RETRY_MS } }), { actor, housekeeping: true })
           const attempts = s.attempts + 1
           if (attempts >= MAX_STOP_TRIES) {
             return yield* write(row, (v) => ({ ...without(v, "stop"), stopFailed: true }), {
-              actor,
+              actor, housekeeping: true,
               report: `A reminder's ring or card could not be taken down after ${attempts} tries (${why}); it ends by itself when it expires. Reminder ${row.id}.`
             })
           }
-          return yield* write(row, (v) => ({ ...v, stop: { notes: left, card, attempts, tryAt: now + STOP_RETRY_MS * 2 ** (attempts - 1) } }), { actor })
+          return yield* write(row, (v) => ({ ...v, stop: { notes: left, card, ...(s.cardAt !== undefined ? { cardAt: s.cardAt } : {}), attempts, tryAt: now + STOP_RETRY_MS * 2 ** (attempts - 1) } }), { actor, housekeeping: true })
         })
 
       /** An occurrence that is due moves from the series to `owed`, and the series advances, in one write. */
@@ -325,7 +393,7 @@ export const remindersModule = defineModule({
           // The late rule, on every try, from the occurrence's own time (or the snooze's end): a repeat at most six hours late.
           if (isRepeat(r) && now - o.from > REPEAT_DELIVER_WITHIN_MS) {
             // An attempt may have sent it already (a write that failed afterwards): what may be open is taken down like any cleanup.
-            return yield* write(row, (v) => withStop({ ...without(v, "owed"), dropped: { at: o.at, why: "late" as const, when: now } }, o.attempts > 0 ? addStop(v.stop, [o.at], true, now) : v.stop), { actor })
+            return yield* write(row, (v) => withStop({ ...(v.ring?.at === o.at ? without(v, "owed", "ring") : without(v, "owed")), dropped: { at: o.at, why: "late" as const, when: now } }, o.attempts > 0 ? addStop(v.stop, [o.at], true, now) : v.stop), { actor })
           }
           const tries = o.attempts + 1
           const tried = yield* write(row, (v) => ({ ...v, owed: { ...o, attempts: tries, tryAt: now + RETRY_MS * 2 ** (tries - 1) } }), { actor })
@@ -337,11 +405,11 @@ export const remindersModule = defineModule({
               const prev = v.ring
               const stop0 = prev !== undefined && prev.at !== o.at ? addStop(v.stop, [prev.at], false, now) : v.stop
               const stop = stop0 === undefined ? undefined : stop0.notes.length === 0 ? undefined : { ...stop0, card: false }
-              return withStop({ ...without(v, "owed", "ring"), ring: { at: o.at, deliveredAt: now } }, stop)
+              return withStop({ ...without(v, "owed", "ring"), ring: { at: o.at, deliveredAt: now, ...(owedDueAt(r, o) !== o.at ? { from: owedDueAt(r, o) } : {}) } }, stop)
             }, { actor })
           }
           if (tries < MAX_TRIES) return tried
-          return yield* write(tried, (v) => ({ ...without(v, "owed"), dropped: { at: o.at, why: "failed" as const, when: now } }), {
+          return yield* write(tried, (v) => ({ ...(v.ring?.at === o.at ? without(v, "owed", "ring") : without(v, "owed")), dropped: { at: o.at, why: "failed" as const, when: now } }), {
             actor,
             report: `A reminder due ${when(o.at)} UTC could not be delivered after ${tries} tries (${failed.reason}). It was set on device ${r.deviceId ?? "(none)"}. Reminder ${row.id}.`
           })
@@ -364,12 +432,12 @@ export const remindersModule = defineModule({
             const r: Reminder = row.value
             if (r.stop !== undefined && (force || r.stop.tryAt <= now)) {
               force = false
-              row = yield* takeDown(row, now, opts.actor)
+              row = yield* takeDown(row, now, opts.actor, opts.deferNote)
               continue
             }
             if (r.state !== "open") break
-            if (r.ring !== undefined && r.ring.snoozeUntil === undefined && r.ring.deliveredAt + UNANSWERED_MS <= now) {
-              // Its notification and card have expired long since; the take-down is asked for anyway, as for every ending.
+            if (r.ring !== undefined && r.owed?.at !== r.ring.at && r.ring.snoozeUntil === undefined && r.ring.deliveredAt + UNANSWERED_MS <= now) {
+              // A text resend still needs its ring's display time. Otherwise the unanswered ring has expired long since.
               const at = r.ring.at
               row = yield* write(row, (v) => withStop({ ...without(v, "ring"), dropped: { at, why: "unanswered" as const, when: now } }, addStop(v.stop, [at], true, now)), { actor: opts.actor })
               continue
@@ -404,6 +472,10 @@ export const remindersModule = defineModule({
           if (opts.send && row.rev === startRev && planOf(row.value) !== undefined) row = yield* write(row, (v) => v, { actor: opts.actor })
           return row
         })
+
+      /** After a committed change, inline cleanup is owed work: its failure cannot undo the saved answer. */
+      const afterCommit = (committed: Row<Reminder>, opts: Opts) =>
+        reconcileLocked(committed.id, opts).pipe(Effect.orElseSucceed(() => committed))
 
       const actorOf = Effect.gen(function*() {
         const job = yield* CurrentJob
@@ -485,7 +557,6 @@ export const remindersModule = defineModule({
        */
       const readVisible = (turn: TurnContext | undefined) =>
         Effect.gen(function*() {
-          const privacy = ctx.host.service(Privacy)
           const person = turn?.person?.id
           const scan = yield* scanRows<Reminder, unknown>((p) => board.list({ where: { state: "open" }, orderBy: { field: "nextAt", direction: "asc" }, ...p }))
           const rows: Array<Row<Reminder>> = []
@@ -494,7 +565,7 @@ export const remindersModule = defineModule({
             const owner = row.value.owner
             if (owner === undefined) rows.push(row)
             else if (owner === person) {
-              if (privacy?.mayReveal(owner, turn) === true) rows.push(row)
+              if (mayReveal(owner, turn)) rows.push(row)
               else hidden.push(row)
             }
           }
@@ -502,64 +573,70 @@ export const remindersModule = defineModule({
         })
 
       /** Finished reminders whose cleanup is still owed (they have a `nextAt`), that the asking device may be told of. */
-      const readStopping = (turn: TurnContext | undefined) =>
+      const readStopping = () =>
         Effect.gen(function*() {
-          const privacy = ctx.host.service(Privacy)
-          const person = turn?.person?.id
           const found: Array<Row<Reminder>> = []
           for (const state of ["done", "cancelled", "lapsed"] as const) {
             const page = yield* board.list({ where: { state }, orderBy: { field: "nextAt", direction: "desc" }, limit: PAGE })
             for (const row of page) {
               if (row.value.nextAt === undefined) break
-              const owner = row.value.owner
-              if (owner === undefined || (owner === person && privacy?.mayReveal(owner, turn) === true)) found.push(row)
+              found.push(row)
             }
           }
           return found
         })
 
-      /** Which reminder is meant by its words: exactly one match, else a sentence that asks or says there is none. */
+      /** Match only what may be revealed after the final lookup, before any mutation or reply. */
       const pick = (which: string, turn: TurnContext | undefined, l: Language) =>
         Effect.gen(function*() {
+          if (holdsSecret(which)) return { spoken: say(texts, l, "code") }
           const seen = yield* readVisible(turn)
-          const stopping = yield* readStopping(turn)
-          const found = matching([...seen.rows, ...stopping], which)
+          const stopping = yield* readStopping()
+          const person = turn?.person?.id
+          const reveal = person !== undefined && mayReveal(person, turn)
+          const allowed = (r: Row<Reminder>) => r.value.owner === undefined || (r.value.owner === person && reveal)
+          const candidates = [...seen.rows, ...seen.hidden, ...stopping.filter((r) => r.value.owner === undefined || r.value.owner === person)]
+          const found = matching(candidates.filter(allowed), which)
+          const cutRead = seen.cut
           if (found.rows.length === 0) {
-            if (seen.cut) return { spoken: say(texts, l, "cutNone", { count: SCAN_ROWS }) }
-            return { spoken: `${say(texts, l, "noMatch", { which: cut(which, 60) })}${seen.hidden.length > 0 ? ` ${say(texts, l, "unreadableHere")}` : ""}` }
+            if (cutRead) return { spoken: say(texts, l, "cutNone", { count: SCAN_ROWS }) }
+            if (matching(candidates.filter((r) => !allowed(r)), which).rows.length > 0) return { spoken: say(texts, l, "unreadableHere") }
+            return { spoken: `${say(texts, l, "noMatch", { which: cut(which, 60) })}${candidates.some((r) => r.value.owner === turn?.person?.id && !allowed(r)) ? ` ${say(texts, l, "unreadableHere")}` : ""}` }
           }
-          // A cut read cannot say a partial match is the only one: one beyond the bound could match too.
-          if (found.rows.length === 1 && (!seen.cut || found.exact)) return { row: found.rows[0]! }
+          if (found.rows.length === 1 && (!cutRead || found.exact)) return { row: found.rows[0]! }
           if (found.rows.length === 1) return { spoken: say(texts, l, "cutAsk", { count: SCAN_ROWS }) }
-          return { spoken: say(texts, l, "ask", { list: speakList(found.rows.slice(0, 4).map((r) => cut(r.value.text, 50)), l, { max: 4 }) ?? "" }) }
+          const owner = found.rows.some((r) => r.value.owner !== undefined) ? turn?.person?.id : undefined
+          return { spoken: say(texts, l, "ask", { list: speakList(found.rows.slice(0, 4).map((r) => cut(r.value.text, 50)), l, { max: 4 }) ?? "" }), ...(owner !== undefined ? { owner } : {}) }
         })
 
       /** The reminder that rang on this device: the one reminder with an open ring of this module there that may be told here. */
-      const ringing = (turn: TurnContext | undefined, l: Language) =>
+      const ringing = (turn: TurnContext | undefined, l: Language, kind: Kind = "done") =>
         Effect.gen(function*() {
-          const privacy = ctx.host.service(Privacy)
           const open = yield* ctx.notify.list()
-          const ids = new Map<string, number>()
+          const ids = new Map<string, { readonly at: number; readonly noteId: string; readonly owner: string | undefined }>()
           for (const n of open) {
             const m = n.key === undefined ? null : NOTE_KEY.exec(n.key)
             if (m === null) continue
             if (n.deviceId !== undefined && n.deviceId !== turn?.deviceId) continue
-            if (n.owner !== undefined && privacy?.mayReveal(n.owner, turn) !== true) continue
-            ids.set(m[1]!, Math.max(ids.get(m[1]!) ?? 0, Number(m[2])))
+            if (!mayReveal(n.owner, turn)) continue
+            const at = Number(m[2])
+            if (at >= (ids.get(m[1]!)?.at ?? 0)) ids.set(m[1]!, { at, noteId: n.id, owner: n.owner })
           }
-          if (ids.size === 0) return { spoken: say(texts, l, "nothingRang") }
-          if (ids.size > 1) return { spoken: say(texts, l, "askRang") }
-          return { id: [...ids.keys()][0]! }
+          if (ids.size === 0) return { spoken: say(texts, l, kind === "snooze" ? "nothingToSnooze" : "nothingRang") }
+          if (ids.size > 1) return { spoken: say(texts, l, kind === "snooze" ? "askSnooze" : "askRang") }
+          const [id, selected] = [...ids.entries()][0]!
+          return { id, ...selected }
         })
 
-      /** Whether the notification of an occurrence is open now. A read that fails counts as open (it is taken down and sent again). */
+      /** Whether the notification of an occurrence is open now. A failed read refuses the edit. */
       const isOpen = (id: string, at: number) =>
         ctx.notify.list().pipe(
-          Effect.map((open) => open.some((n) => n.key === noteKey(id, at))),
-          Effect.orElseSucceed(() => true)
+          Effect.map((open) => open.some((n) => n.key === noteKey(id, at)))
         )
 
-      const stopping = (row: Row<Reminder> | undefined, l: Language) =>
+      const stopping = (row: Row<Reminder> | undefined, l: Language, deferNote?: number) =>
+        // A successful handler leaves only verification of the host's closure; that is not a failed take-down.
+        deferNote !== undefined && row?.value.stop?.card === false && row.value.stop.attempts === 0 && row.value.stop.notes.length === 1 && row.value.stop.notes[0] === deferNote ? "" :
         row?.value.stop !== undefined ? ` ${say(texts, l, "stopping")}` : row?.value.stopFailed === true ? ` ${say(texts, l, "stopFailed")}` : ""
 
       // ---- answering: done, snooze ---------------------------------------------------------------------------------
@@ -574,49 +651,92 @@ export const remindersModule = defineModule({
           const l = lang()
           const z = zone()
           const actor = by.actor
-          let row = yield* reconcileLocked(id, { actor, send: false })
-          if (row === undefined) return say(texts, l, "gone")
+          const pressed = by.viaNotification === true ? by.at : undefined
+          const deferred = pressed === undefined ? {} : { deferNote: pressed }
+          const reply = (spoken: string, keepOpen = false): Reply => ({ spoken, ...(keepOpen ? { keepOpen } : {}) })
+          const entry = yield* board.get(id)
+          if (entry === undefined) return reply(say(texts, l, "gone"))
+          const subject = by.turn ?? (actor?.kind === "ui" ? actor.deviceId : undefined)
+          const allowed = () => mayReveal(entry.value.owner, subject)
+          if (!allowed()) return reply(say(texts, l, "unreadableHere"), true)
+          // Only occurrence-scoped answer cleanup is a repeated answer; a time edit leaves unscoped cleanup.
+          // Capture this before reconciliation can finish the cleanup and erase its evidence.
+          const cleanupPending = by.at === undefined && entry.value.ring === undefined && entry.value.owed === undefined && entry.value.stop !== undefined
+          const cleanupOnly = cleanupPending && entry.value.stop?.cardAt !== undefined
+          let row = yield* reconcileLocked(id, { actor, send: false, ...deferred, ...(cleanupPending ? { forceStop: true } : {}) })
+          if (row === undefined) return reply(say(texts, l, "gone"))
           const now = yield* Clock.currentTimeMillis
           const r: Reminder = row.value
+          const cleanupAt = pressed === undefined ? now : now + STOP_RETRY_MS
+          const cleanupOpts = { actor, send: false, forceStop: true, ...deferred }
+          const status = () => stopping(row, l, pressed)
+          // Only successful confirmations may become a generic Done when permission changes during the write.
+          const confirmed = (sentence: () => string, safe = `${say(texts, l, "done")}${status()}`): Reply => ({
+            spoken: sentence(), privateSpoken: safe, ...(r.owner !== undefined ? { owner: r.owner } : {})
+          })
           if (r.state !== "open") {
-            // Finished already (twice, or cancelled meanwhile): nothing is written again; cleanup still owed is finished.
-            if (r.stop !== undefined) row = yield* reconcileLocked(id, { actor, send: false, forceStop: true })
-            return `${say(texts, l, kind === "done" ? "doneAgain" : "snoozeEnded")}${stopping(row, l)}`
+            if (!cleanupOnly && r.stop !== undefined) row = yield* reconcileLocked(id, cleanupOpts)
+            return reply(`${say(texts, l, kind === "done" ? "doneAgain" : "snoozeEnded")}${status()}`)
           }
-          const pressed = by.viaNotification === true && by.at !== undefined ? by.at : undefined
-          const current = r.ring?.at ?? r.owed?.at
+          if (cleanupOnly) return reply(`${say(texts, l, "doneAgain")}${status()}`)
+          if (by.pressId !== undefined && r.handled === by.pressId) return reply(say(texts, l, "snoozedAlready"))
+
+          // Admit an occurrence-bound answer once: its card and its selected notification must still be current and open.
+          if (by.at !== undefined) {
+            const card = cards.get(id)
+            if (by.pressId !== undefined && by.viaNotification !== true && (card?.handle.id !== by.pressId || card.at !== by.at)) return reply(say(texts, l, "answeredAlready"))
+            const noteId = by.noteId ?? (by.viaNotification === true ? by.pressId : card?.noteId)
+            const open = yield* ctx.notify.list()
+            if (!open.some((n) => n.id === noteId && n.key === noteKey(id, by.at!)) || (r.ring?.at === by.at && r.ring.snoozeUntil !== undefined)) return reply(say(texts, l, "answeredAlready"))
+          }
+          // A send can succeed before its ring write fails. A named answer belongs to that newer open notification.
+          const openAttempt = by.at === undefined && r.owed !== undefined && r.owed.attempts > 0 && r.owed.at > (r.ring?.at ?? -1) && (yield* isOpen(id, r.owed.at))
+          // The notification lookup can wait too: check immediately before accepting the mutation.
+          if (!allowed()) return reply(say(texts, l, "unreadableHere"), true)
+          const current = by.at !== undefined
+            ? (by.at === r.ring?.at || (by.at === r.owed?.at && r.owed.attempts > 0) ? by.at : undefined)
+            : openAttempt ? r.owed!.at : r.ring?.at ?? r.owed?.at
+          // A successfully delivered newer attempt supersedes the old ring even if recording the new ring failed.
+          const older = current === r.owed?.at && r.ring !== undefined && r.ring.at !== current ? r.ring.at : undefined
+          const notes = current === undefined ? [] : [current, ...(older === undefined ? [] : [older])]
           if (kind === "done") {
             if (current !== undefined && (by.at === undefined || by.at === current)) {
-              const notes = [r.ring?.at, r.owed !== undefined && r.owed.attempts > 0 ? r.owed.at : undefined].filter((x): x is number => x !== undefined && x !== pressed)
-              const goesOn = r.dueAt !== undefined
-              row = yield* write(row, (v) => withStop(goesOn ? without(v, "ring", "owed", "handled") : { ...without(v, "ring", "owed", "handled"), state: "done" as const, endedAt: now }, addStop(v.stop, notes, true, now)), { actor })
-              row = yield* reconcileLocked(id, { actor, send: false, forceStop: true })
-              const next = row?.value.dueAt
-              return `${next !== undefined ? say(texts, l, "doneRepeat", { when: momentText(next, l, z, now) }) : say(texts, l, "done")}${stopping(row, l)}`
+              const clear = (v: Reminder) => {
+                let next = v
+                if (v.ring?.at === current || older !== undefined) next = without(next, "ring", "handled")
+                if (v.owed?.at === current) next = without(next, "owed")
+                return next
+              }
+              const goesOn = r.dueAt !== undefined || (r.owed !== undefined && r.owed.at !== current)
+              row = yield* write(row, (v) => withStop(goesOn ? clear(v) : { ...clear(v), state: "done" as const, endedAt: now }, addStop(v.stop, notes, true, cleanupAt, current)), { actor })
+              row = yield* afterCommit(row, cleanupOpts)
+              const next = row?.value.owed === undefined ? row?.value.dueAt : undefined
+              return confirmed(() => `${next !== undefined ? say(texts, l, "doneRepeat", { when: momentText(next, l, z, now) }) : say(texts, l, "done")}${status()}`)
             }
-            if (by.at !== undefined) return say(texts, l, "answeredAlready")
+            if (by.at !== undefined) return reply(say(texts, l, "answeredAlready"))
             if (!isRepeat(r) || r.dueAt === undefined) {
               row = yield* write(row, (v) => ({ ...without(v, "dueAt"), state: "done" as const, endedAt: now }), { actor })
-              row = yield* reconcileLocked(id, { actor, send: false })
-              return `${say(texts, l, "done")}${stopping(row, l)}`
+              row = yield* afterCommit(row, { actor, send: false })
+              return confirmed(() => `${say(texts, l, "done")}${status()}`)
             }
             // A repeat that is not ringing: done for its next time, which is skipped; the series goes on after it.
             const skipped = r.dueAt
             const next = nextOf(r, skipped)
             row = yield* write(row, (v) => (next !== undefined ? { ...v, dueAt: next } : { ...without(v, "dueAt"), state: "done" as const, endedAt: now }), { actor })
             const said = momentText(skipped, l, z, now)
-            return next !== undefined ? say(texts, l, "doneSkipped", { skipped: said, when: momentText(next, l, z, now) }) : say(texts, l, "doneSkippedLast", { skipped: said })
+            return confirmed(() => next !== undefined ? say(texts, l, "doneSkipped", { skipped: said, when: momentText(next, l, z, now) }) : say(texts, l, "doneSkippedLast", { skipped: said }))
           }
-          const ring = r.ring
-          if (by.at !== undefined && by.at !== ring?.at) return say(texts, l, "answeredAlready")
-          if (ring === undefined) return say(texts, l, "notRinging")
-          // The same press again: it has been put off already, and is not put off further.
-          if (by.pressId !== undefined && r.handled === by.pressId && ring.snoozeUntil !== undefined) return say(texts, l, "snoozedAlready")
+          const ring = current === r.ring?.at ? r.ring : current !== undefined && current === r.owed?.at && r.owed.attempts > 0 ? { at: current, deliveredAt: now, ...(owedDueAt(r, r.owed) !== current ? { from: owedDueAt(r, r.owed) } : {}) } : undefined
+          if (by.at !== undefined && by.at !== ring?.at) return reply(say(texts, l, "answeredAlready"))
+          if (ring === undefined) return reply(say(texts, l, "notRinging"))
+          if (r.owed !== undefined && r.owed.at > ring.at) return { ...reply(say(texts, l, "snoozeNewer"), true), ...(r.owner !== undefined ? { owner: r.owner } : {}) }
           const ms = by.ms ?? snoozeMs()
           const until = now + ms
-          row = yield* write(row, (v) => withStop({ ...v, ring: { ...ring, snoozeUntil: until }, ...(by.pressId !== undefined ? { handled: by.pressId } : {}) }, addStop(v.stop, ring.at === pressed ? [] : [ring.at], true, now)), { actor })
-          row = yield* reconcileLocked(id, { actor, send: false, forceStop: true })
-          return `${say(texts, l, "snoozed", { duration: speakDuration(ms, l, { natural: true }) ?? `${Math.round(ms / 60_000)}` })}${stopping(row, l)}`
+          if (r.dueAt !== undefined && until >= r.dueAt) return { ...reply(say(texts, l, "snoozeOvertaken"), true), ...(r.owner !== undefined ? { owner: r.owner } : {}) }
+          row = yield* write(row, (v) => withStop({ ...(v.owed?.at === ring.at ? without(v, "owed") : v), ring: { ...ring, snoozeUntil: until }, ...(by.pressId !== undefined ? { handled: by.pressId } : {}) }, addStop(v.stop, notes, true, cleanupAt, ring.at)), { actor })
+          row = yield* afterCommit(row, cleanupOpts)
+          const spoken = `${say(texts, l, "snoozed", { duration: speakDuration(ms, l, { natural: true }) ?? `${Math.round(ms / 60_000)}` })}${status()}`
+          return confirmed(() => spoken, `${say(texts, l, "snoozedPrivate")}${status()}`)
         })
 
       const answer = (kind: Kind, id: string, by: By) => exclusive(answerLocked(kind, id, by))
@@ -625,7 +745,7 @@ export const remindersModule = defineModule({
       const press = (kind: Kind, key: string | undefined, by: Omit<By, "at" | "actor">, deviceId: string) => {
         // Both keys carry the occurrence: a press belongs to the occurrence it was made for, never to "the next one".
         const m = key === undefined ? null : NOTE_KEY.exec(key) ?? CARD_KEY.exec(key)
-        if (m === null) return Effect.succeed(say(texts, lang(), "gone"))
+        if (m === null) return Effect.succeed({ spoken: say(texts, lang(), "gone") })
         return answer(kind, m[1]!, { ...by, at: Number(m[2]), actor: { kind: "ui", deviceId } })
       }
 
@@ -633,15 +753,18 @@ export const remindersModule = defineModule({
       yield* ctx.notify.handle("reminders", {
         run: (p) =>
           press(p.actionId === "snooze" ? "snooze" : "done", p.key, { pressId: p.notificationId, viaNotification: true }, p.deviceId).pipe(
-            Effect.map((text) => ({ say: text })),
-            Effect.catch(() => Effect.succeed({ say: say(texts, lang(), "cantNow"), keepOpen: true }))
+            Effect.map((result) => {
+              const reply = finish(result, p.deviceId) as Reply
+              return { say: reply.spoken, ...(reply.keepOpen ? { keepOpen: true } : {}) }
+            }),
+            Effect.catch((e) => Effect.succeed({ say: e instanceof ToolError ? e.message : say(texts, lang(), "cantNow"), keepOpen: true }))
           )
       }).pipe(Effect.orDie)
       yield* ctx.present.handle("reminders", {
         run: (p) =>
           press(p.action === "snooze" ? "snooze" : "done", p.key, { pressId: p.presentationId }, p.deviceId).pipe(
-            Effect.map((text) => ({ say: text })),
-            Effect.catch(() => Effect.succeed({ say: say(texts, lang(), "cantNow") }))
+            Effect.map((result) => ({ say: (finish(result, p.deviceId) as Reply).spoken })),
+            Effect.catch((e) => Effect.succeed({ say: e instanceof ToolError ? e.message : say(texts, lang(), "cantNow") }))
           )
       }).pipe(Effect.orDie)
 
@@ -673,7 +796,7 @@ export const remindersModule = defineModule({
               return { _tag: "section", sentences: [], priority: "normal", withheld } as const
             }
             const owner = today.some((r) => r.value.owner !== undefined) ? seen.person : undefined
-            const items = today.map((r) => {
+            const items = today.slice(0, 3).map((r) => {
               const at = localOf(speaksAt(r.value)!, z)
               return say(texts, l, "briefAt", { text: cut(r.value.text, 60), time: speakTime(at, l) ?? `${at.hour}:${String(at.minute).padStart(2, "0")}` })
             })
@@ -683,10 +806,11 @@ export const remindersModule = defineModule({
               seen.cut
                 ? say(texts, l, count === 1 ? "briefAtLeastOne" : "briefAtLeast", { count: counted, list })
                 : say(texts, l, count === 1 ? "briefOne" : "briefMany", { count: counted, list })
-            let sentence = sentenceWith(items[0]!)
-            for (const max of [3, 2]) {
-              const list = items.length === 1 ? items[0]! : speakList(items, l, { max })
-              if (list === undefined) continue
+            let sentence = ""
+            for (const shown of (count <= 3 ? [count, 2, 1] : [2, 1])) {
+              const preview = speakList(items.slice(0, shown), l) ?? items[0]!
+              const rest = count - shown
+              const list = rest === 0 ? preview : say(texts, l, "remainder", { list: items.slice(0, shown).join(", "), count: rest <= 20 ? speakNumber(rest, l, { words: true }) ?? String(rest) : String(rest) })
               sentence = sentenceWith(list)
               if (sentence.length <= 300) break
             }
@@ -695,14 +819,13 @@ export const remindersModule = defineModule({
       }
 
       return {
-        value: { board, exclusive, lang, zone, write, reconcileLocked, readVisible, pick, ringing, isOpen, answerLocked, answer, stopping, listPresentation, bySpeaking, originOf },
+        value: { finish, board, occupied, exclusive, lang, zone, write, reconcileLocked, afterCommit, readVisible, pick, ringing, isOpen, answerLocked, answer, stopping, listPresentation, bySpeaking, originOf },
         contributions: [BriefingSections.of(section)]
       }
     }),
   start: (ctx) => {
     const sh = ctx.shared
     const failed = (l: Language, key: "unsaved" | "unread" = "unsaved") => new ToolError({ message: say(texts, l, key) })
-    const personalQuiet = (owner: string | undefined, turn: TurnContext | undefined) => owner !== undefined && ctx.host.service(Privacy)?.mayReveal(owner, turn) !== true
     // A confirmation that was reduced because its owner may not be told here names nothing personal and carries no owner:
     // it is household content, so the gateway lets it through where the personal one would be withheld.
     const ownerOf = (result: unknown) => {
@@ -733,22 +856,22 @@ export const remindersModule = defineModule({
         }
         const id = randomUUID()
         const written = yield* sh.exclusive(Effect.gen(function*() {
+          if ((yield* sh.occupied()) >= 200) return yield* new ToolError({ message: say(texts, l, "tooMany") })
           const job = yield* ctx.scheduler.prepare({ handler: "due", key: jobKey(id), payload: { id }, at: said.at, late: "run", origin: sh.originOf(rem) })
           return yield* ctx.store.transaction((tx) => {
             const row = tx.collection(reminders).insert(rem, { id })
             job.writeIn(tx)
             return row
           })
-        })).pipe(Effect.mapError((e) => new ToolError({ message: say(texts, l, "reason" in e && e.reason === "limit" || ("message" in e && /live jobs|limit/i.test(String(e.message))) ? "tooMany" : "unsaved") })))
+        })).pipe(Effect.mapError((e) => e instanceof ToolError ? e : new ToolError({ message: say(texts, l, "reason" in e && e.reason === "limit" || ("message" in e && /live jobs|limit/i.test(String(e.message))) ? "tooMany" : "unsaved") })))
         const v = written.value
-        // Asked now, after the last wait and write, and not before: what may be told here is decided at this moment.
-        const quiet = personalQuiet(owner, turn)
+        // Carry both confirmations to the common reply boundary, which asks what may be told after the last wait.
         const at = momentText(v.dueAt ?? said.at, l, z, now)
         const rule = said.kind === "repeat" ? (said.rule ?? say(texts, l, "repeating")) : ""
         const spoken = said.kind === "once"
-          ? say(texts, l, quiet ? "setOncePrivate" : owner === undefined ? "setOnceHousehold" : "setOnce", { when: at, text: v.text })
-          : say(texts, l, quiet ? "setRepeatPrivate" : owner === undefined ? "setRepeatHousehold" : "setRepeat", { when: at, text: v.text, rule })
-        return { spoken, ...(owner !== undefined && !quiet ? { owner } : {}) }
+          ? say(texts, l, owner === undefined ? "setOnceHousehold" : "setOnce", { when: at, text: v.text })
+          : say(texts, l, owner === undefined ? "setRepeatHousehold" : "setRepeat", { when: at, text: v.text, rule })
+        return { spoken, privateSpoken: say(texts, l, said.kind === "once" ? "setOncePrivate" : "setRepeatPrivate"), ...(owner !== undefined ? { owner } : {}) }
       })
 
     const setTool = makeTool({
@@ -767,6 +890,7 @@ export const remindersModule = defineModule({
         Effect.gen(function*() {
           const l = sh.lang()
           // A secret is refused without repeating the words, and nothing is stored.
+          if (text.trim() === "") return { spoken: say(texts, l, "what") }
           if (holdsSecret(text)) return { spoken: say(texts, l, "code") }
           const now = yield* Clock.currentTimeMillis
           const said = parseWhen(when, l, sh.zone(), now)
@@ -802,7 +926,7 @@ export const remindersModule = defineModule({
               const t = speaksAt(rem)
               return {
                 text: rem.text,
-                when: t === undefined ? say(texts, l, "wasDue", { when: momentText(rem.ring?.at ?? 0, l, z, now) }) : momentText(t, l, z, now),
+                when: t === undefined ? say(texts, l, "wasDue", { when: momentText((rem.ring?.from ?? rem.ring?.at) ?? 0, l, z, now) }) : momentText(t, l, z, now),
                 ...(rem.rrule !== undefined ? { repeats: ruleText(rem, l) } : {}),
                 ...(rem.owner !== undefined ? { personal: true } : {})
               }
@@ -821,7 +945,7 @@ export const remindersModule = defineModule({
             // Presenter when the turn is committed), built from the rows just read under the same privacy answer; it ends
             // by its lifetime or is replaced by the next presentation on that device, and is not kept up to date.
             if (deviceId === undefined) return forModel
-            return { forModel, present: sh.listPresentation(rows.slice(0, 12), owner), show: { lifetime: "transient" as const, expiresInMs: LIST_MS } }
+            return { forModel, present: sh.listPresentation(rows, owner, seen.cut), show: { lifetime: "transient" as const, expiresInMs: LIST_MS } }
           }))
         })
     })
@@ -841,6 +965,7 @@ export const remindersModule = defineModule({
           const turn = yield* CurrentTurn
           const l = sh.lang()
           if (text === undefined && when === undefined) return { spoken: say(texts, l, "changeWhat") }
+          if (text !== undefined && text.trim() === "") return { spoken: say(texts, l, "what") }
           if (text !== undefined && holdsSecret(text)) return { spoken: say(texts, l, "code") }
           const z = sh.zone()
           const now = yield* Clock.currentTimeMillis
@@ -848,50 +973,56 @@ export const remindersModule = defineModule({
           if (said?.kind === "ask") return { spoken: say(texts, l, said.key) }
           return yield* sh.exclusive(Effect.gen(function*() {
             const picked = yield* sh.pick(which, turn, l)
-            if ("spoken" in picked) return { spoken: picked.spoken }
+            if ("spoken" in picked) return picked
             let row: Row<Reminder> | undefined = picked.row
             const id = row.id
             const owner = row.value.owner
             if (row.value.state !== "open") {
               row = yield* sh.reconcileLocked(id, { send: false, forceStop: true })
-              return { spoken: `${say(texts, l, "snoozeEnded")}${sh.stopping(row, l)}`, ...(owner !== undefined && !personalQuiet(owner, turn) ? { owner } : {}) }
+              return { spoken: `${say(texts, l, "snoozeEnded")}${sh.stopping(row, l)}`, ...(owner !== undefined ? { owner } : {}) }
             }
             const r = row.value
-            const ring = r.ring
+            const attempted = r.owed !== undefined && r.owed.attempts > 0 ? [r.owed.at] : []
+            // The send may have succeeded before recording its ring failed. An open attempt is the same resend case.
+            const openAttempt = said === undefined && r.owed !== undefined && r.owed.attempts > 0 && (yield* sh.isOpen(id, r.owed.at))
+            const ring: Reminder["ring"] = openAttempt && r.owed !== undefined
+              ? { at: r.owed.at, deliveredAt: now, ...(owedDueAt(r, r.owed) !== r.owed.at ? { from: owedDueAt(r, r.owed) } : {}) }
+              : r.ring
             let resend = false
             if (said !== undefined) {
               // A new time ends a ring (its notification and card go) and an owed delivery, and replaces the series.
               const notes = [ring?.at, r.owed !== undefined && r.owed.attempts > 0 ? r.owed.at : undefined].filter((x): x is number => x !== undefined)
-              row = yield* sh.write(row, (v) => withStop({
-                ...without(v, "owed", "ring", "handled", "rrule", "dtstart", "timeZone", "dropped"),
-                text: text ?? v.text,
-                dueAt: said.at,
-                ...(said.kind === "repeat" ? { rrule: said.rrule, dtstart: said.dtstart, timeZone: said.timeZone } : {})
-              }, notes.length > 0 || ring !== undefined ? addStop(v.stop, notes, true, now) : v.stop))
-            } else if (ring !== undefined && ring.snoozeUntil === undefined && (yield* sh.isOpen(id, ring.at))) {
+              row = yield* sh.write(row, (v) => {
+                // The new occurrence owes the old cleanup, but has not inherited its answer.
+                const stop = v.stop === undefined ? undefined : without(v.stop, "cardAt")
+                return withStop({
+                  ...without(v, "owed", "ring", "handled", "rrule", "dtstart", "timeZone", "dropped"),
+                  text: text ?? v.text,
+                  dueAt: said.at,
+                  ...(said.kind === "repeat" ? { rrule: said.rrule, dtstart: said.dtstart, timeZone: said.timeZone } : {})
+                }, notes.length > 0 || ring !== undefined ? addStop(stop, notes, true, now) : stop)
+              })
+            } else if (ring !== undefined && ring.snoozeUntil === undefined && (openAttempt || (yield* sh.isOpen(id, ring.at)))) {
               // New words while it rings: its notification and card go, and the same occurrence is sent again with them.
-              resend = true
-              row = yield* sh.write(row, (v) => withStop({ ...without(v, "ring"), text: text!, owed: { at: ring.at, from: now, attempts: 0, tryAt: now } }, addStop(v.stop, [ring.at], true, now)))
+              resend = r.owed === undefined || r.owed.at === ring.at
+              row = yield* sh.write(row, (v) => withStop({ ...(resend ? { ...v, ring } : without(v, "ring")), text: text!, ...(resend ? { owed: { at: ring.at, from: now, attempts: 0, tryAt: now } } : {}) }, addStop(v.stop, [ring.at, ...attempted, ...(r.ring === undefined ? [] : [r.ring.at])], true, now)))
             } else if (ring !== undefined && ring.snoozeUntil === undefined) {
               // Its notification is gone already (stopped on the host), its card may be on a screen with the old words: it goes.
-              row = yield* sh.write(row, (v) => withStop({ ...v, text: text! }, addStop(v.stop, [], true, now)))
+              row = yield* sh.write(row, (v) => withStop({ ...v, text: text! }, addStop(v.stop, attempted, true, now)))
             } else {
-              row = yield* sh.write(row, (v) => ({ ...v, text: text! }))
+              row = yield* sh.write(row, (v) => withStop({ ...v, text: text! }, attempted.length > 0 ? addStop(v.stop, attempted, true, now) : v.stop))
             }
-            row = yield* sh.reconcileLocked(id, { send: false, forceStop: true })
-            // The confirmation is built from the row as it was written, and what it may tell is asked now, after the last wait.
-            const quiet = personalQuiet(owner, turn)
+            row = yield* sh.afterCommit(row, { send: false, forceStop: true })
+            // Build from the saved row; the common reply boundary chooses what may be told after the last wait.
             const v = row?.value ?? r
             const t = speaksAt(v)
-            const whenSaid = t !== undefined ? momentText(t, l, z, now) : say(texts, l, "wasDue", { when: momentText(v.ring?.at ?? 0, l, z, now) })
-            const spoken = resend
-              ? say(texts, l, quiet ? "changedRingingPrivate" : "changedRinging", { text: v.text })
-              : quiet
-              ? say(texts, l, "changedPrivate")
-              : v.rrule !== undefined
+            const whenSaid = t !== undefined ? momentText(t, l, z, now) : say(texts, l, "wasDue", { when: momentText((v.ring?.from ?? v.ring?.at) ?? 0, l, z, now) })
+            const spoken = said === undefined && v.owed !== undefined
+              ? say(texts, l, "changedRinging", { text: v.text })
+              : v.rrule !== undefined && v.dueAt !== undefined
               ? say(texts, l, "changedRepeat", { text: v.text, rule: ruleText(v, l), when: whenSaid })
               : say(texts, l, "changed", { text: v.text, when: whenSaid })
-            return { spoken: `${spoken}${sh.stopping(row, l)}`, ...(owner !== undefined && !quiet ? { owner } : {}) }
+            return { spoken: `${spoken}${sh.stopping(row, l)}`, privateSpoken: `${say(texts, l, said === undefined && v.owed !== undefined ? "changedRingingPrivate" : "changedPrivate")}${sh.stopping(row, l)}`, ...(owner !== undefined ? { owner } : {}) }
           }))
         }).pipe(Effect.mapError((e) => (e instanceof ToolError ? e : failed(sh.lang()))))
     })
@@ -908,7 +1039,7 @@ export const remindersModule = defineModule({
           const l = sh.lang()
           return yield* sh.exclusive(Effect.gen(function*() {
             const picked = yield* sh.pick(which, turn, l)
-            if ("spoken" in picked) return { spoken: picked.spoken }
+            if ("spoken" in picked) return picked
             let row: Row<Reminder> | undefined = picked.row
             const id = row.id
             const owner = row.value.owner
@@ -917,10 +1048,11 @@ export const remindersModule = defineModule({
             const done = (row: Row<Reminder> | undefined, state: Reminder["state"]) => ({
               spoken: `${
                 state === "cancelled"
-                  ? personalQuiet(owner, turn) ? say(texts, l, "cancelledPrivate") : say(texts, l, "cancelled", { text })
+                  ? say(texts, l, "cancelled", { text })
                   : say(texts, l, "snoozeEnded")
               }${sh.stopping(row, l)}`,
-              ...(owner !== undefined && !personalQuiet(owner, turn) ? { owner } : {})
+              privateSpoken: `${say(texts, l, state === "cancelled" ? "cancelledPrivate" : "snoozeEnded")}${sh.stopping(row, l)}`,
+              ...(owner !== undefined ? { owner } : {})
             })
             if (row.value.state !== "open") {
               // Finished already, its cleanup still owed: this finishes the cleanup.
@@ -932,7 +1064,7 @@ export const remindersModule = defineModule({
             const notes = [r.ring?.at, r.owed !== undefined && r.owed.attempts > 0 ? r.owed.at : undefined].filter((x): x is number => x !== undefined)
             // Marked, not removed: the daily clean-up removes it later, off this turn's path.
             row = yield* sh.write(row, (v) => withStop({ ...without(v, "dueAt", "owed", "ring", "handled"), state: "cancelled" as const, endedAt: now }, addStop(v.stop, notes, true, now)))
-            row = yield* sh.reconcileLocked(id, { send: false, forceStop: true })
+            row = yield* sh.afterCommit(row, { send: false, forceStop: true })
             return done(row, "cancelled")
           }))
         }).pipe(Effect.mapError((e) => (e instanceof ToolError ? e : failed(sh.lang()))))
@@ -944,6 +1076,7 @@ export const remindersModule = defineModule({
         "Mark a reminder done. With `which` (words that find it) it is that reminder; without, it is the one that is ringing or waiting on this device. Done on a repeating reminder that is not ringing skips its next time; the series goes on.",
       parameters: Schema.Struct({ which: Schema.optionalKey(Line(TEXT_CHARS).annotate({ description: "Words that find the reminder; leave out for the one that just rang here" })) }),
       risk: "change",
+      sensitivity: ownerOf,
       execute: ({ which }) =>
         Effect.gen(function*() {
           const turn = yield* CurrentTurn
@@ -951,12 +1084,12 @@ export const remindersModule = defineModule({
           if (which === undefined) {
             const found = yield* sh.ringing(turn, l)
             if ("spoken" in found) return { spoken: found.spoken }
-            return { spoken: yield* sh.answer("done", found.id, {}) }
+            return yield* sh.answer("done", found.id, { at: found.at, noteId: found.noteId, turn })
           }
           return yield* sh.exclusive(Effect.gen(function*() {
             const picked = yield* sh.pick(which, turn, l)
-            if ("spoken" in picked) return { spoken: picked.spoken }
-            return { spoken: yield* sh.answerLocked("done", picked.row.id, {}) }
+            if ("spoken" in picked) return picked
+            return yield* sh.answerLocked("done", picked.row.id, { turn })
           }))
         }).pipe(Effect.mapError((e) => (e instanceof ToolError ? e : failed(sh.lang()))))
     })
@@ -977,11 +1110,12 @@ export const remindersModule = defineModule({
       run: ({ delay, text }) =>
         Effect.gen(function*() {
           const l = sh.lang()
+          if (text.trim() === "") return { say: say(texts, l, "what") }
           if (!isLine(text, TEXT_CHARS)) return { say: say(texts, l, "unsaved") }
           if (holdsSecret(text)) return { say: say(texts, l, "code") }
           const now = yield* Clock.currentTimeMillis
           const made = yield* create(text, { kind: "once", at: now + delay }, undefined, now)
-          return { say: made.spoken }
+          return { ...made, say: made.spoken }
         }).pipe(Effect.mapError((e) => new ActionError({ message: e instanceof ToolError ? e.message : say(texts, sh.lang(), "unsaved") })))
     })
 
@@ -1003,8 +1137,9 @@ export const remindersModule = defineModule({
           const l = sh.lang()
           const found = yield* sh.ringing(turn, l)
           if ("spoken" in found) return { say: found.spoken }
-          return { say: yield* sh.answer("done", found.id, {}) }
-        }).pipe(Effect.mapError(() => new ActionError({ message: say(texts, sh.lang(), "cantNow") })))
+          const reply = yield* sh.answer("done", found.id, { at: found.at, noteId: found.noteId, turn })
+          return { ...reply, say: reply.spoken }
+        }).pipe(Effect.mapError((e) => new ActionError({ message: e instanceof ToolError ? e.message : say(texts, sh.lang(), "cantNow") })))
     })
 
     const ringingSnooze = defineAction({
@@ -1020,15 +1155,28 @@ export const remindersModule = defineModule({
         Effect.gen(function*() {
           const turn = yield* CurrentTurn
           const l = sh.lang()
-          const found = yield* sh.ringing(turn, l)
+          const found = yield* sh.ringing(turn, l, "snooze")
           if ("spoken" in found) return { say: found.spoken }
-          return { say: yield* sh.answer("snooze", found.id, { ...(ms !== undefined ? { ms } : {}) }) }
-        }).pipe(Effect.mapError(() => new ActionError({ message: say(texts, sh.lang(), "cantNow") })))
+          const reply = yield* sh.answer("snooze", found.id, { at: found.at, noteId: found.noteId, turn, ...(ms !== undefined ? { ms } : {}) })
+          return { ...reply, say: reply.spoken }
+        }).pipe(Effect.mapError((e) => new ActionError({ message: e instanceof ToolError ? e.message : say(texts, sh.lang(), "cantNow") })))
+    })
+
+    const finalAction = <P extends ActionParams>(action: ActionDefinition<P>): ActionDefinition<P> => ({
+      ...action,
+      run: (input) => action.run(input).pipe(
+        Effect.catch((e) => e.message === say(texts, sh.lang(), "unreadableHere") ? Effect.succeed({ say: e.message }) : Effect.fail(e)),
+        Effect.flatMap((result) => Effect.map(CurrentTurn, (turn) => sh.finish(result, turn) as ActionOutcome | void)))
     })
 
     return Effect.succeed({
-      tools: [setTool, listTool, changeTool, cancelTool, doneTool],
-      actions: [remindIn, ringingDone, ringingSnooze],
+      tools: [setTool, listTool, changeTool, cancelTool, doneTool].map((tool) => ({
+        ...tool,
+        execute: (input) => tool.execute(input).pipe(
+          Effect.catch((e) => e.message === say(texts, sh.lang(), "unreadableHere") ? Effect.succeed({ spoken: e.message }) : Effect.fail(e)),
+          Effect.flatMap((result) => Effect.map(CurrentTurn, (turn) => sh.finish(result, turn))))
+      })),
+      actions: [finalAction(remindIn), finalAction(ringingDone), finalAction(ringingSnooze)],
       instructions: "Reminders: a task at a moment (a time, or a repeat) is a reminder; a bare duration is a timer; a task without a moment is a list item. Never guess a time that was not said: ask."
     })
   }

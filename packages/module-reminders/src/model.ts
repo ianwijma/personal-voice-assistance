@@ -32,6 +32,8 @@ export type Owed = typeof Owed.Type
 export const Ring = Schema.Struct({
   at: Epoch,
   deliveredAt: Epoch,
+  /** Effective deadline displayed after a snooze; `at` remains the stable occurrence key. */
+  from: Schema.optionalKey(Epoch),
   /** Put off until then: its notification and card were taken down, and it is sent again at that moment. */
   snoozeUntil: Schema.optionalKey(Epoch)
 })
@@ -41,6 +43,8 @@ export type Ring = typeof Ring.Type
 export const Stop = Schema.Struct({
   notes: Schema.Array(Epoch).check(Schema.isMaxLength(STOP_NOTES)),
   card: Schema.Boolean,
+  /** Cleanup from an answer to this occurrence; only its card is taken down. Kept until its notifications are gone too. */
+  cardAt: Schema.optionalKey(Epoch),
   attempts: Count,
   tryAt: Epoch
 })
@@ -117,10 +121,13 @@ export const planOf = (r: Reminder): number | undefined => {
   return min
 }
 
+/** A resend retains its delivered ring's effective due time while `owed.from` starts the new lateness window. */
+export const owedDueAt = (r: Reminder, o: Owed): number => r.ring?.at === o.at ? r.ring.from ?? r.ring.at : o.from
+
 /** The moment a reminder next speaks (its owed occurrence, its snooze, its next occurrence); absent when it only waits for an answer. */
 export const speaksAt = (r: Reminder): number | undefined => {
   let min: number | undefined
-  for (const t of [r.owed?.at, r.ring?.snoozeUntil, r.dueAt]) if (t !== undefined && (min === undefined || t < min)) min = t
+  for (const t of [r.owed === undefined ? undefined : owedDueAt(r, r.owed), r.ring?.snoozeUntil, r.dueAt]) if (t !== undefined && (min === undefined || t < min)) min = t
   return min
 }
 
@@ -205,7 +212,7 @@ export const endOfToday = (now: number, zone: string): number =>
 /** The household's zone: `HOME_TIME_ZONE`, and when it is empty (the default), this machine's. */
 export const homeZone = (home: Readonly<Record<string, unknown>>): string => {
   const zone = home.HOME_TIME_ZONE
-  return typeof zone === "string" && zone.trim() !== "" ? zone : Intl.DateTimeFormat().resolvedOptions().timeZone
+  return typeof zone === "string" && zone.trim() !== "" ? zone.trim() : Intl.DateTimeFormat().resolvedOptions().timeZone
 }
 
 // ---- words ---------------------------------------------------------------------------------------------------------
@@ -227,8 +234,8 @@ export const holdsSecret = (text: string): boolean => {
   WORD.lastIndex = 0
   for (let m = WORD.exec(text); m !== null; m = WORD.exec(text)) {
     const rest = text.slice(m.index + m[0].length).replace(/\s+/gu, "")
-    const digits = rest.replace(/\D/gu, "").length
-    if (digits >= 3 && digits * 2 >= rest.length) return true
+    const digits = [...rest].filter((c) => /\p{Nd}/u.test(c)).length
+    if (digits >= 1 && digits * 2 >= [...rest].length) return true
   }
   return false
 }
@@ -243,6 +250,8 @@ export interface Matches<A> {
 
 /** The reminders whose words contain every word asked for; one whose text is exactly the words wins over longer ones. */
 export const matching = <A extends { readonly text: string }>(rows: ReadonlyArray<Row<A>>, which: string): Matches<A> => {
+  const literal = rows.filter((r) => r.value.text.toLowerCase() === which.toLowerCase())
+  if (literal.length > 0) return { rows: literal, exact: literal.length === 1 }
   const wanted = words(which)
   if (wanted.length === 0) return { rows: [], exact: false }
   const exact = rows.filter((r) => words(r.value.text).join(" ") === wanted.join(" "))

@@ -145,7 +145,7 @@ describe("setting a reminder", () => {
       const kit = yield* startTestModule(remindersModule, lobby)
       const set = yield* kit.tool("reminders_set", { text: "dentist", when: "in an hour", scope: "me" }, { device: "lobby-screen" })
       // No owner on the reduced confirmation: it names nothing personal, so it is household content and is not withheld.
-      assert.deepStrictEqual(set.value, { spoken: "Reminder set for today at eleven o'clock in the morning, only for you. This device does not ring with your personal reminders." })
+      assert.deepStrictEqual(set.value, { spoken: "Reminder set, only for you. This device does not ring with your personal reminders." })
       assert.notInclude(set.content, "dentist")
       assert.strictEqual((yield* theRow(kit)).value.text, "dentist")
     }))
@@ -160,7 +160,7 @@ describe("setting a reminder", () => {
       const E = 8_640_000_000_000_000
       const big: Reminder = {
         text, whose: "personal", owner: "p".repeat(40), state: "done", dueAt: E, owed: { at: E, from: E, attempts: 20, tryAt: E },
-        ring: { at: E, deliveredAt: E, snoozeUntil: E }, stop: { notes: [E, E, E, E], card: true, attempts: 20, tryAt: E }, nextAt: E,
+        ring: { at: E, from: E, deliveredAt: E, snoozeUntil: E }, stop: { notes: [E, E, E, E], card: true, cardAt: E, attempts: 20, tryAt: E }, nextAt: E,
         deviceId: "\"".repeat(64), assistantId: "\"".repeat(40), setBy: "\"".repeat(40), rrule: "\"".repeat(100), dtstart: "\"".repeat(70),
         timeZone: "\"".repeat(64), handled: "\"".repeat(64), dropped: { at: E, why: "superseded", when: E }, endedAt: E
       }
@@ -273,7 +273,7 @@ describe("which reminder is meant", () => {
     Effect.gen(function*() {
       const kit = yield* startTestModule(remindersModule)
       yield* seed(kit)
-      assert.deepStrictEqual((yield* kit.tool("reminders_cancel", { which: "call" }, { device: SAM })).value, { spoken: "Which reminder: call mum and call the dentist?" })
+      assert.deepStrictEqual((yield* kit.tool("reminders_cancel", { which: "call" }, { device: SAM })).value, { spoken: "Which reminder: call mum and call the dentist?", owner: "p-sam" })
       assert.strictEqual((yield* allRows(kit)).filter((r) => r.value.state === "open").length, 3)
       assert.deepStrictEqual((yield* kit.tool("reminders_cancel", { which: "holiday" }, { device: SAM })).value, { spoken: "I don't have a reminder called holiday." })
       assert.deepStrictEqual((yield* kit.tool("reminders_cancel", { which: "dentist" }, { device: SAM })).value, { spoken: "Cancelled: call the dentist.", owner: "p-sam" })
@@ -313,7 +313,7 @@ describe("which reminder is meant", () => {
       const first = yield* ring(kit, "call dad", "in ten minutes", "household")
       const row = yield* theRow(kit)
       const changed = yield* kit.tool("reminders_change", { which: "dad", text: "call sister" }, { device: SAM })
-      assert.strictEqual(spoken(changed), "Changed it: call sister. It rings again now with the new words.")
+      assert.strictEqual(spoken(changed), "Changed it: call sister. The new words are waiting for delivery.")
       yield* kit.advance(1_000)
       yield* kit.present.settle
       const all = yield* kit.notify.all
@@ -462,7 +462,7 @@ describe("listing and privacy", () => {
       assert.strictEqual(mixed.withheld, "2 personal reminders are not read out here.")
       assert.strictEqual(mixed.covers, "the household's reminders; yours are not read out here")
       const cancel = yield* kit.tool("reminders_cancel", { which: "secret" }, { device: "lobby-screen" })
-      assert.strictEqual(spoken(cancel), "I don't have a reminder called secret. Personal reminders are not read out or changed here.")
+      assert.strictEqual(spoken(cancel), "Personal reminders are not read out or changed here.")
       assert.strictEqual((yield* allRows(kit)).filter((r) => r.value.state === "open").length, 3)
     }))
 
@@ -649,10 +649,10 @@ describe("the briefing's section", () => {
           const s: string = r.sentences[0]
           assert.isAtMost(s.length, 300, s)
           const time = speakTime({ hour: 11, minute: 25 }, lang)!
-          // Three whole items in English are 300 characters and more: one item fewer, and the rest counted ("… and two more.").
+          // Three whole items exceed the English budget: try two complete items and count the remainder.
           // Three fit in Dutch; four fit in neither.
           if (lang === "nl" && letters.length === 3) assert.isTrue(s.endsWith(` om ${time}.`), s)
-          else assert.match(s, new RegExp(lang === "en" ? ` at ${time} and two more\\.$` : ` om ${time} en nog twee\\.$`))
+          else assert.match(s, new RegExp(lang === "en" ? ` at ${time} and ${letters.length === 3 ? "one" : "two"} more\\.$` : ` om ${time} en nog twee\\.$`))
           // Every item named is whole: its 60 letters and its time.
           for (const run of s.match(/([a-d])\1{9,}/g) ?? []) assert.strictEqual(run.length, 60, s)
         }
@@ -744,6 +744,7 @@ describe("Dutch", () => {
       yield* kit.advance(11 * MIN)
       const second = (yield* openNotes(kit))[0]!
       assert.deepStrictEqual(yield* kit.notify.press(second.id, "done", { device: SAM }), { ok: true, say: "Klaar." })
+      assert.strictEqual(spoken(yield* kit.tool("reminders_done", { which: "mama" }, { device: SAM })), "Die was al klaar.")
       assert.strictEqual(spoken(yield* kit.tool("reminders_done", { which: "mama" }, { device: SAM })), "Ik heb geen herinnering met mama.")
       assert.strictEqual(spoken(yield* kit.tool("reminders_cancel", { which: "vuilnis" }, { device: SAM })), "Geannuleerd: vuilnis.")
       assert.deepStrictEqual((yield* kit.tool("reminders_list", {}, { device: SAM })).value, { spoken: "Je hebt geen herinneringen." })
@@ -758,7 +759,7 @@ describe("Dutch", () => {
       yield* kit.present.settle
       const [card] = kit.present.shown(SAM)
       assert.strictEqual(card?.content.kind === "card" ? card.content.title : "", "Herinnering")
-      assert.strictEqual(spoken(yield* kit.tool("reminders_change", { which: "mama", text: "bel papa" }, { device: SAM })), "Veranderd: bel papa. Hij gaat nu opnieuw af met de nieuwe woorden.")
+      assert.strictEqual(spoken(yield* kit.tool("reminders_change", { which: "mama", text: "bel papa" }, { device: SAM })), "Veranderd: bel papa. De nieuwe woorden wachten op bezorging.")
       yield* kit.advance(1_000)
       faults.resolveFails = 1
       assert.strictEqual(spoken(yield* kit.tool("reminders_cancel", { which: "papa" }, { device: SAM })), "Geannuleerd: bel papa. De melding wordt nog weggehaald; ik blijf het proberen.")
