@@ -225,6 +225,12 @@ describe("the mock, through its handlers, as the server", { timeout: 30_000 }, (
     // A level is moved to the nearest step within the bounds.
     expect((await post({ deviceId: "d-mock-volume01", to: 0.05 })).body).toMatchObject({ level: 0.2 })
     expect((await post({ deviceId: "d-mock-volume01" })).status).toBe(400)
+    // b9: an absolute setting that is the level already changes nothing (as the server: atLimit).
+    expect((await post({ deviceId: "d-mock-volume01", to: 0.2 })).body).toEqual({ level: 0.2, atLimit: true })
+    // b9 + b8: past the cap the oldest level is dropped and its pages are set back to the default, as the server does.
+    for (let i = 0; i < 256; i++) await post({ deviceId: `d-cap-${String(i).padStart(4, "0")}`, direction: "quieter" })
+    expect((await one.waitFor("output.volume", (m) => m.volume === 1)).volume).toBe(1)
+    expect((await post({ deviceId: "d-mock-volume01", direction: "louder" })).body).toEqual({ level: 1, atLimit: true })
     for (const p of [one, other, again]) p.ws.close()
   })
 

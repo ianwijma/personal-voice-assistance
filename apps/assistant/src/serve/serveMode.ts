@@ -649,15 +649,17 @@ export const startServe = (options: ServeOptions): Effect.Effect<ServeHandle, Ht
      * effective settings; the others always pass), the tools it has not switched off, and their instructions. The
      * whole snapshot when nothing is left out.
      */
-    const modulesFor = (snapshot: ModuleSnapshot, assistant: Assistant) => {
-      const own = snapshot.assistantParts.get(assistant.id) ?? snapshot.parts
-      const parts = own.flatMap((part) => {
+    /** The parts an assistant's turns get: the modules it has on (capabilities), without the tools it switched off. */
+    const partsFor = (snapshot: ModuleSnapshot, assistant: Assistant) =>
+      (snapshot.assistantParts.get(assistant.id) ?? snapshot.parts).flatMap((part) => {
         if (!isCapability(part.moduleId)) return [part]
         const choice = assistant.modules[part.moduleId]
         if (choice === undefined || !choice.on) return []
         if (choice.offTools.length === 0) return [part]
         return [{ ...part, module: withoutOffTools(part.module, choice.offTools) }]
       })
+    const modulesFor = (snapshot: ModuleSnapshot, assistant: Assistant) => {
+      const parts = partsFor(snapshot, assistant)
       /** The modules it has on that run (capabilities; for the turn's configuration snapshot). */
       const modules = parts.reduce((n, p) => (isCapability(p.moduleId) && p.unavailable !== true ? n + 1 : n), 0)
       const same = parts.length === snapshot.parts.length && parts.every((p, i) => p === snapshot.parts[i])
@@ -670,12 +672,13 @@ export const startServe = (options: ServeOptions): Effect.Effect<ServeHandle, Ht
       }
     }
 
-    // P7: phrase commands (docs/PHRASES.md): each assistant's set from the registry its turns get, cached per snapshot;
-    // the Health page names what a set leaves out (made again whenever the modules change, and at every check).
-    const servePhrases = makeServePhrases({
+    // P7: phrase commands (docs/PHRASES.md): each switched-on assistant's set, prepared ahead of use whenever the modules,
+    // an assistant's choices or the language change (a final only reads a ready set); the Health page names what a set
+    // leaves out (after each preparation, and at every check).
+    const servePhrases = yield* makeServePhrases({
       host,
       assistants: assistantsNow,
-      registryOf: (snapshot, assistant) => modulesFor(snapshot, assistant).registry,
+      partsOf: partsFor,
       language: () => phraseLanguageOf(sections.value("HOME_LANGUAGE")),
       notify,
       ringingAllowed: (deviceId) => ringingWithoutWake(deviceSettingsOf(deviceId).place),
@@ -683,7 +686,9 @@ export const startServe = (options: ServeOptions): Effect.Effect<ServeHandle, Ht
       volume: replyVolumes.service,
       log: (line) => runFork(Effect.logInfo(line))
     })
-    host.subscribe(() => servePhrases.refreshIssues())
+    // A settings save may change an assistant's choices or the household's language: prepare again (cheap when nothing changed).
+    const stopPhraseWatch = store.onCommitted(() => servePhrases.changed())
+    yield* Effect.addFinalizer(() => Effect.sync(stopPhraseWatch))
 
     /** The household's ambient facts in every turn's context (`HOME_AMBIENT_FACTS`, read at each turn). */
     const ambientFacts = household.ambient({
@@ -1454,6 +1459,11 @@ export const startServe = (options: ServeOptions): Effect.Effect<ServeHandle, Ht
             // Admin's Diagnostics › Latency grows live (admin connections get no `turn.*`; ADMIN_ONLY).
             hub?.broadcast({ type: "trace", key, ...(device !== undefined ? { deviceId: device.id } : {}), trace })
           },
+          // P7 (E7): a taken utterance's execution trace, in admin's latency list (no turn, no history, no turn.ended event).
+          onPhraseTrace: (trace) => {
+            sessions.addTrace(trace)
+            hub?.broadcast({ type: "trace", key, ...(device !== undefined ? { deviceId: device.id } : {}), trace })
+          },
           minuteMs,
           conversationEnded: (conversationId) =>
             run(household.store.endConversation(conversationId).pipe(Effect.asVoid, Effect.catch((e) => Effect.logWarning(`Conversation data not deleted: ${e.message}`)))),
@@ -1514,7 +1524,7 @@ export const startServe = (options: ServeOptions): Effect.Effect<ServeHandle, Ht
       // The household's cheap checks (backup age, directories, the log's size); its quick check is `pnpm start doctor`'s.
       checks: {
         // P7: what each assistant's phrase set leaves out (duplicates, modules past the bound).
-        phrases: Effect.sync(() => servePhrases.issues()),
+        phrases: Effect.sync(() => servePhrases.sets.issues()),
         ...(household.sqlite !== undefined ? { "household-checks": householdBackupIssues(household.sqlite) } : {})
       }
     })

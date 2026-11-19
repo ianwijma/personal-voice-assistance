@@ -157,7 +157,7 @@ import { encodeWav, MOCK_PROVIDERS } from "./voices.ts"
 import { createModelPickersMock } from "./modelPickers.ts"
 import { createModuleRoutesMock, DEMO_DEFINITION_ACTIONS, demoHomeAction, demoHomeModule, TokenRefusal } from "./demoHome.ts"
 import { createScheduledJobsMock, MockSchedulerError } from "./scheduledJobs.ts"
-import { boundaryKey, checkDietList, checkMembersValue, cleanDeviceName, type Condition, decideDelivery, deviceOutputsFrom, type FieldError, REPLY_VOLUME, replyVolumeLevel, speakerAllowedFrom, stepReplyVolume } from "@pva/protocol"
+import { boundaryKey, checkDietList, checkMembersValue, cleanDeviceName, type Condition, decideDelivery, deviceOutputsFrom, type FieldError, changeReplyVolume, NO_REPLY_VOLUMES, type ReplyVolumes, speakerAllowedFrom } from "@pva/protocol"
 
 const PORT = Number(process.env.MOCK_PORT ?? 8787)
 const HOST = process.env.MOCK_HOST ?? "127.0.0.1"
@@ -1450,8 +1450,10 @@ const MOCK_NOTIFY_TEXTS = {
   nl: { cantNow: "Dat kan ik nu niet doen.", done: "Klaar.", region: "Meldingen", startAudio: "Zet het geluid aan om het te horen." }
 } as const
 const mockNotifyTexts = () => (String(valueOf("HOME_LANGUAGE") ?? "").toLowerCase().startsWith("nl") ? MOCK_NOTIFY_TEXTS.nl : MOCK_NOTIFY_TEXTS.en)
+/** The reply volumes, in the server's one state machine (`changeReplyVolume`, `@pva/protocol`): the same steps, cap and drops. */
+let mockVolumes: ReplyVolumes = NO_REPLY_VOLUMES
 const resetState = () => {
-  mockVolumes.clear()
+  mockVolumes = NO_REPLY_VOLUMES
   mockNotifications.clear()
   mockHeld.clear()
   for (const t of scriptTimers) clearTimeout(t)
@@ -1543,22 +1545,18 @@ const notificationsAfterWelcome = (c: Conn) => {
 
 // ---- P7: the reply volume, as the real server keeps it (docs/PHRASES.md "Louder and quieter")
 
-/** Per device, only while not the default (the server keeps it in memory, as here). */
-const mockVolumes = new Map<string, number>()
 /** After a voice page's welcome: its device's level when it is not the default (the page went back to the default). */
 const volumeAfterWelcome = (c: Conn) => {
   if (c.frontend !== "voice" || c.deviceId === undefined) return
   const level = mockVolumes.get(c.deviceId)
   if (level !== undefined) sendTo(c, { type: "output.volume", volume: level })
 }
-/** One "louder" / "quieter" or a level for a device, with the server's own step (`stepReplyVolume`), sent to its voice pages when it changed. */
+/** One "louder" / "quieter" or a level for a device, as the server changes it: every send of the transition goes out in this step. */
 const changeMockVolume = (deviceId: string, change: "louder" | "quieter" | { readonly to: number }) => {
-  const before = mockVolumes.get(deviceId) ?? REPLY_VOLUME.default
-  const next = typeof change === "string" ? stepReplyVolume(before, change) : { level: replyVolumeLevel(change.to), atLimit: false }
-  if (next.level === REPLY_VOLUME.default) mockVolumes.delete(deviceId)
-  else mockVolumes.set(deviceId, next.level)
-  if (next.level !== before) for (const c of notifyConns(deviceId)) sendTo(c, { type: "output.volume", volume: next.level })
-  return next
+  const t = changeReplyVolume(mockVolumes, deviceId, change)
+  mockVolumes = t.volumes
+  for (const send of t.sends) for (const c of notifyConns(send.deviceId)) sendTo(c, { type: "output.volume", volume: send.volume })
+  return t.change
 }
 const resolveMockNotification = (id: string, outcome: string) => {
   const n = mockNotifications.get(id)

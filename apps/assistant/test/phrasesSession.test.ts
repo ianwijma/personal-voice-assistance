@@ -20,7 +20,7 @@ import {
   type SttEvent,
   type TurnSetup
 } from "@pva/core"
-import { BUILT_IN_WEB_VOICE_SETTINGS, type InterruptMode, REPLY_VOLUME, type ServerMessage, stepReplyVolume } from "@pva/protocol"
+import { BUILT_IN_WEB_VOICE_SETTINGS, type InterruptMode, REPLY_VOLUME, type ServerMessage, stepReplyVolume, type TraceInfo } from "@pva/protocol"
 import { Effect, Exit, Schema, Scope, Stream } from "effect"
 import { mkdtempSync } from "node:fs"
 import { tmpdir } from "node:os"
@@ -83,6 +83,10 @@ const session = async (o: {
   readonly reply?: string
   /** The assignment's follow-up (default: the assistant's own). */
   readonly followUpSeconds?: number
+  /** The page's report that a reply stopped comes this long after `reply.stop` (default: at once, synchronously). */
+  readonly stopReportMs?: number
+  /** Extra actions in the module's set. */
+  readonly actions?: ReadonlyArray<ReturnType<typeof registerActions>[number]>
 }) => {
   ran.length = 0
   const stt = controlledStt()
@@ -96,6 +100,7 @@ const session = async (o: {
   const registry = makeToolRegistry([{ name: "test", tools: [tool] }])
   const model = toolLlm(o.reply ?? "One long sentence of the reply. A second long sentence follows it. And a third one to finish.")
   const outcomes: Array<PhraseOutcome> = []
+  const phraseTraces: Array<TraceInfo> = []
   const stopped: Array<string> = []
   const pressed: Array<string> = []
   let volume: number = REPLY_VOLUME.default
@@ -122,9 +127,10 @@ const session = async (o: {
     onChange: () => undefined,
     heard: { dir: mkdtempSync(join(tmpdir(), "pva-heard-")), enabled: () => false, maxFiles: () => 0, model: () => "", lostOnTheWay: () => 0 },
     log: () => undefined,
+    onPhraseTrace: (t) => void phraseTraces.push(t),
     phrases: {
       language: () => "en",
-      commandsFor: (a) => (a === undefined ? hostCommandSet("en") : buildCommandSet("en", egg)),
+      commandsFor: (a) => (a === undefined ? hostCommandSet("en") : buildCommandSet("en", [...egg, ...(o.actions ?? [])])),
       ringing: o.ringing ?? (() => undefined),
       ports: {
         notify: () => ({
@@ -154,7 +160,11 @@ const session = async (o: {
     sendMessage: (m: ServerMessage) => {
       messages.push(m)
       if (m.type === "reply.start") starting = m.turnId
-      if (m.type === "reply.stop") voice.web.report({ type: "playback.stopped", turnId: m.turnId, playedSamples: 0 }, link as never)
+      if (m.type === "reply.stop") {
+        const report = () => voice.web.report({ type: "playback.stopped", turnId: m.turnId, playedSamples: 0 }, link as never)
+        if (o.stopReportMs === undefined) report()
+        else setTimeout(report, o.stopReportMs)
+      }
       if (m.type === "reply.end") setTimeout(() => voice.web.report({ type: "playback.finished", turnId: m.turnId, playedSamples: 10_000_000 }, link as never), 600)
     },
     sendBinary: () => {
@@ -175,6 +185,7 @@ const session = async (o: {
     stt,
     messages,
     outcomes,
+    phraseTraces,
     sideEffects,
     stopped,
     pressed,
@@ -241,7 +252,6 @@ describe("one decision per utterance, on the real voice session", () => {
       try {
         expect(await run(s.voice.conversation.sendText("tell me something", true))).toBe("accepted")
         await until(() => s.voice.gate.audible(performance.now()))
-        const historyBefore = (await s.history()).length
         s.stt.emit({ _tag: "SpeechStarted" }, { _tag: "Interim", text: "hey jeff quieter" }, { _tag: "EndOfTurn", text: "hey jeff quieter" })
         if (mode === "manual") {
           // Manual: the microphone counts for nothing while the reply plays (the echo gate drops every event).
@@ -259,7 +269,8 @@ describe("one decision per utterance, on the real voice session", () => {
         await sleep(300)
         // The typed turn is its exchange; nothing of "quieter" is in the history.
         const history = await s.history()
-        expect(history.length).toBe(historyBefore === 0 ? history.length : historyBefore)
+        // Exactly the typed exchange (b5: this compared the history's length with itself before).
+        expect(history.filter((m) => m.role === "user").map((m) => (m as { content: string }).content)).toEqual(["tell me something"])
         expect(JSON.stringify(history)).not.toContain("quieter")
         expect(s.userTurns()).toBe(1)
       } finally {
@@ -294,7 +305,8 @@ describe("the ringing window, on the real voice session", () => {
 
   it("a device that answers nobody: 'stop' and a button's label without the wake phrase are taken while something rings, not otherwise", async () => {
     let ringing: ReadonlyArray<RingingCard> = card
-    const s = await session({ withoutPhrase: "nobody", ringing: () => ringing })
+    // No follow-up window (the spoken "Snoozed." would open one, and "stop" in it is the host's control).
+    const s = await session({ withoutPhrase: "nobody", followUpSeconds: 0, ringing: () => ringing })
     try {
       s.stt.emit({ _tag: "SpeechStarted" }, { _tag: "EndOfTurn", text: "Stop." })
       await until(() => s.outcomes.length === 1)
@@ -341,6 +353,138 @@ describe("the ringing window, on the real voice session", () => {
       s.stt.emit({ _tag: "SpeechStarted" }, { _tag: "EndOfTurn", text: "stop" })
       await sleep(300)
       expect(s.outcomes).toEqual([])
+    } finally {
+      await s.close()
+    }
+  })
+})
+
+describe("review round 1 on the real voice session (the page's stop report comes later, as a browser's does)", () => {
+  const reply = "One long sentence of the reply. A second long sentence follows it. And a third one to finish."
+
+  it("b1 (E5): Stop or a new conversation between an utterance's first events and its final: no command runs for it", async () => {
+    const s = await session({})
+    try {
+      s.stt.emit({ _tag: "SpeechStarted" }, { _tag: "Interim", text: "boil an" })
+      await until(() => s.voice.conversation.dispatcher.delivering() !== undefined)
+      s.voice.conversation.stop()
+      s.stt.emit({ _tag: "EndOfTurn", text: "boil an egg" })
+      await sleep(300)
+      expect(s.outcomes).toEqual([])
+      expect(ran).toEqual([])
+      // The same after a new conversation, and on the resumed path.
+      s.stt.emit({ _tag: "SpeechStarted" }, { _tag: "EagerEndOfTurn", text: "boil an egg" }, { _tag: "TurnResumed" })
+      await until(() => s.voice.conversation.dispatcher.delivering() !== undefined)
+      await run(s.voice.conversation.newConversation())
+      s.stt.emit({ _tag: "EndOfTurn", text: "boil an egg" })
+      await sleep(300)
+      expect(s.outcomes).toEqual([])
+      expect(ran).toEqual([])
+      expect(s.userTurns()).toBe(0)
+      // The next utterance is not cancelled.
+      s.stt.emit({ _tag: "SpeechStarted" }, { _tag: "EndOfTurn", text: "boil an egg" })
+      await until(() => s.outcomes.length === 1)
+      expect(ran).toEqual(["boil"])
+    } finally {
+      await s.close()
+    }
+  })
+
+  it("b4 (E8): never mind over a reply whose stop report comes late: no follow-up window opens; an unaddressed sentence is not answered", async () => {
+    const s = await session({ withoutPhrase: "nobody", followUpSeconds: 5, stopReportMs: 200, reply })
+    try {
+      await run(s.voice.conversation.sendText("tell me something", true))
+      await until(() => s.voice.gate.audible(performance.now()))
+      s.stt.emit({ _tag: "SpeechStarted" }, { _tag: "Interim", text: "hey jeff never mind" }, { _tag: "EndOfTurn", text: "hey jeff never mind" })
+      await until(() => s.outcomes.length === 1)
+      expect(s.outcomes[0]!.did).toBe("cancelled")
+      await sleep(700)
+      expect(s.voice.route.window(performance.now())).toBeUndefined()
+      s.stt.emit({ _tag: "SpeechStarted" }, { _tag: "EndOfTurn", text: "what time is it" })
+      await sleep(400)
+      expect(s.userTurns()).toBe(1)
+      // A later reply opens its own window as before.
+      await run(s.voice.conversation.sendText("and now", true))
+      await until(() => s.messages.filter((m) => m.type === "turn.end").length >= 2, 8_000)
+      await until(() => s.voice.route.window(performance.now())?.by === "follow-up", 4_000)
+    } finally {
+      await s.close()
+    }
+  })
+
+  it("b4 (E8): SessionControl's cancelPending during a reply with a late stop report closes the window for good", async () => {
+    const s = await session({ withoutPhrase: "nobody", followUpSeconds: 5, stopReportMs: 200, reply })
+    try {
+      await run(s.voice.conversation.sendText("tell me something", true))
+      await until(() => s.voice.gate.audible(performance.now()))
+      expect(await run(s.voice.control.cancelPending)).toBe(true)
+      expect(s.voice.route.window(performance.now())).toBeUndefined()
+      await sleep(700)
+      expect(s.voice.route.window(performance.now())).toBeUndefined()
+    } finally {
+      await s.close()
+    }
+  })
+
+  for (const mode of ["instant", "confirm"] as const) {
+    it(`b5 (E4), ${mode}: quieter over a reply whose stop report comes late says the interrupted reply again`, async () => {
+      const s = await session({ interrupt: mode, withoutPhrase: "nobody", stopReportMs: 200, reply })
+      try {
+        await run(s.voice.conversation.sendText("tell me something", true))
+        await until(() => s.voice.gate.audible(performance.now()))
+        s.stt.emit({ _tag: "SpeechStarted" }, { _tag: "Interim", text: "hey jeff quieter" }, { _tag: "EndOfTurn", text: "hey jeff quieter" })
+        await until(() => s.outcomes.length === 1, 8_000)
+        expect(s.outcomes[0]).toMatchObject({ did: "volume" })
+        expect(s.outcomes[0]!.said).toContain("One long sentence of the reply.")
+        expect(s.outcomes[0]!.said).not.toContain("Quieter.")
+      } finally {
+        await s.close()
+      }
+    })
+  }
+
+  it("b5 (E4): a fast command over a reply with a late stop report: its answer, then the interrupted reply", async () => {
+    const s = await session({ withoutPhrase: "nobody", stopReportMs: 200, reply })
+    try {
+      await run(s.voice.conversation.sendText("tell me something", true))
+      await until(() => s.voice.gate.audible(performance.now()))
+      s.stt.emit({ _tag: "SpeechStarted" }, { _tag: "Interim", text: "hey jeff boil" }, { _tag: "EndOfTurn", text: "hey jeff boil an egg" })
+      await until(() => s.outcomes.length === 1, 8_000)
+      expect(s.outcomes[0]!.said).toMatch(/^Egg on\. One long sentence of the reply\./)
+      // Two canned replies, the second after the first ended.
+      const canned = s.messages.filter((m) => m.type === "turn.start" && m.userText === "")
+      expect(canned.length).toBe(2)
+    } finally {
+      await s.close()
+    }
+  })
+
+  it("b6 (E4): stop with a ring and a reply: the ring is stopped, and the reply this utterance interrupted is said again", async () => {
+    const s = await session({ withoutPhrase: "nobody", stopReportMs: 200, reply, ringing: () => [{ id: "n-1", actions: [] }] })
+    try {
+      await run(s.voice.conversation.sendText("tell me something", true))
+      await until(() => s.voice.gate.audible(performance.now()))
+      s.stt.emit({ _tag: "SpeechStarted" }, { _tag: "Interim", text: "hey jeff stop" }, { _tag: "EndOfTurn", text: "hey jeff stop" })
+      await until(() => s.outcomes.length === 1, 8_000)
+      expect(s.outcomes[0]).toMatchObject({ did: "stopped-ring" })
+      expect(s.stopped).toEqual(["phrase-device"])
+      expect(s.outcomes[0]!.said).toContain("One long sentence of the reply.")
+    } finally {
+      await s.close()
+    }
+  })
+
+  it("b7 (E7): every taken utterance publishes an execution trace (no turn, no history)", async () => {
+    const s = await session({})
+    try {
+      s.stt.emit({ _tag: "SpeechStarted" }, { _tag: "EndOfTurn", text: "boil an egg" })
+      await until(() => s.phraseTraces.length === 1, 6_000)
+      s.stt.emit({ _tag: "SpeechStarted" }, { _tag: "EndOfTurn", text: "louder" })
+      await until(() => s.phraseTraces.length === 2, 6_000)
+      const [command, control] = s.phraseTraces
+      expect(command).toMatchObject({ mode: "voice", outcome: "completed", phrase: { by: "command", name: "egg.boil", did: "ran", risk: "change" }, tools: [{ name: "egg_boil" }] })
+      expect(control).toMatchObject({ outcome: "completed", phrase: { by: "control", name: "louder", did: "volume" } })
+      expect(await s.history()).toEqual([])
     } finally {
       await s.close()
     }

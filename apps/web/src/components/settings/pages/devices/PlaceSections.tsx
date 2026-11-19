@@ -132,7 +132,7 @@ export function PlaceSection({ ctx }: { readonly ctx: SectionContext }) {
       <DField label="Quiet room" help="Nothing that nobody here asked for is spoken here: announcements and reminders from elsewhere stay silent.">
         <Toggle label="Quiet room" checked={place.quietRoom} onChange={(v) => set({ quietRoom: v })} testId="place-quiet" />
       </DField>
-      <DField label="Stop a ring without the wake phrase" help="While something rings here, “stop” and the ringing card’s buttons can be said without the wake phrase. Off: they need it, like everything else.">
+      <DField label="Stop a ring without the wake phrase" help="While something rings here, “stop” and the ringing card’s buttons can be said without the wake phrase. Off: a card’s buttons cannot be said at all (press them on the card); “stop” still works after the wake phrase, as the assistant’s own control.">
         <Toggle label="Stop a ring without the wake phrase" checked={ringingWithoutWake(place)} onChange={(v) => set({ ringingWithoutWake: v })} testId="place-ringing-without-wake" />
       </DField>
     </section>
