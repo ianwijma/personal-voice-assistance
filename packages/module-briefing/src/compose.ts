@@ -260,3 +260,37 @@ export const join = (briefing: Briefing, language: Language): string => {
   if (empty !== undefined) parts.push(empty)
   return parts.join(" ")
 }
+
+/** The one honest closing sentence of an answer that did not fit: how many sections it leaves out. */
+export const moreLine = (omitted: number, language: Language): string =>
+  omitted === 1 ? say(texts, language, "phraseMoreOne") : say(texts, language, "phraseMore", { count: speakNumber(omitted, language, { words: true }) ?? String(omitted) })
+
+/**
+ * The template join inside `max` characters (what a phrase command may say): whole sections in the briefing's order, as
+ * many as fit with room kept for what the briefing always says (a greeting, what failed, the cap, what was held back)
+ * and for one closing sentence counting the sections left out. Never a cut sentence, never a silent omission. What fits
+ * whole is exactly `join`. `briefing` is the part that was spoken; `omitted` counts the sections with something to say
+ * that were not.
+ */
+export const joinWithin = (full: Briefing, language: Language, max: number): { readonly text: string; readonly briefing: Briefing; readonly omitted: number } => {
+  const whole = join(full, language)
+  if (whole.length <= max || full.none !== undefined || full.sections.length === 0) return { text: whole, briefing: full, omitted: 0 }
+  const n = notes(full, language)
+  const render = (k: number) => {
+    const kept = full.sections.slice(0, k)
+    const omitted = full.sections.slice(k).filter((s) => s.sentences.length > 0).length
+    const parts: Array<string> = []
+    if (n.prefsUnread !== undefined) parts.push(n.prefsUnread)
+    if (full.kind === "morning") parts.push(say(texts, language, "morning"))
+    if (full.kind === "evening") parts.push(say(texts, language, "evening"))
+    for (const s of kept) parts.push(...s.sentences)
+    for (const line of [n.failed, n.notAsked, n.withheld]) if (line !== undefined) parts.push(line)
+    if (omitted > 0) parts.push(moreLine(omitted, language))
+    return { text: parts.join(" "), briefing: { ...full, sections: kept }, omitted }
+  }
+  for (let k = full.sections.length - 1; k > 0; k--) {
+    const r = render(k)
+    if (r.text.length <= max) return r
+  }
+  return render(0)
+}

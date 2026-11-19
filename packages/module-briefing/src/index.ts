@@ -1,7 +1,8 @@
-import { ActionError, CurrentTurn, defineAction, defineCollection, defineModule, makeTool, ModuleStartError, Param, type Sensitivity, Setting, ToolError, UNKNOWN_OWNER } from "@pva/core"
+import { ActionError, CurrentTurn, defineAction, defineCollection, defineModule, makeTool, ModuleStartError, Param, PHRASE_ANSWER_CHARS, type PresentHandle, type Presentation, type Sensitivity, Setting, ToolError, UNKNOWN_OWNER } from "@pva/core"
 import { type BriefingSection, BriefingSections, homeLanguage, type Language, say, StoredText } from "@pva/module-contracts"
-import { Effect, Schema } from "effect"
-import { allOf, compose, emptyLine, join, type Kind, matchesId, mentioned, notes } from "./compose.ts"
+import { Deferred, Effect, Exit, Schema, Semaphore } from "effect"
+import { allOf, compose, emptyLine, join, joinWithin, type Kind, matchesId, mentioned, notes } from "./compose.ts"
+import { briefingList } from "./present.ts"
 import { knownNames, nameOf, resolveAll, SECTION_ID, settingIds } from "./names.ts"
 import { texts } from "./texts.ts"
 
@@ -77,6 +78,27 @@ const personal = (owner: string): Sensitivity => ({ kind: "personal", owner })
 /** Spoken briefings remembered for their sensitivity: the action's result is its `say`, so its owner is found by it. */
 const REMEMBERED = 64
 const AMBIGUOUS = Symbol("ambiguous")
+/** Devices whose briefing list this run may still withdraw: bounded, newest last (a restart forgets them, and so does the Presenter's transient list). */
+const SHOWN_DEVICES = 64
+/** Finished phrase invocations remembered (unfinished ones are never evicted). */
+const INVOCATIONS = 256
+/** How long a briefing list stays on the screen. */
+const LIST_MS = 60_000
+
+interface Invocation {
+  readonly outcome: Deferred.Deferred<{ readonly say: string; readonly owner?: string }, ActionError>
+  finished: boolean
+}
+
+/**
+ * What every settings instance of the module shares: the one lock, the device → list handle record (so a briefing by
+ * any assistant replaces or withdraws the list another one showed), and the record of phrase invocations.
+ */
+interface Shared {
+  readonly lock: Semaphore.Semaphore
+  readonly lists: Map<string, PresentHandle>
+  readonly invocations: Map<string, Invocation>
+}
 
 export const briefingModule = defineModule({
   apiVersion: 2,
@@ -86,8 +108,10 @@ export const briefingModule = defineModule({
   enabledByDefault: false,
   settings,
   storage: { collections: [preferences] },
+  shared: () => Semaphore.make(1).pipe(Effect.map((lock): { readonly value: Shared } => ({ value: { lock, lists: new Map(), invocations: new Map() } }))),
   start: (ctx) =>
     Effect.gen(function*() {
+      const shared = ctx.shared as Shared
       const store = ctx.store.collection(preferences)
       // The owner's lists are read strictly: an entry that is neither a section id nor a name this module knows is
       // refused (the module stops with the reason), never ignored, so a skip the owner meant is never lost.
@@ -255,6 +279,65 @@ export const briefingModule = defineModule({
         return typeof known === "string" ? personal(known) : personal(UNKNOWN_OWNER)
       }
 
+      // The handle of the list each device was last shown (in `shared`, one record for every assistant), to replace or
+      // take it down. Under the one lock, so two briefings never interleave their show and their withdrawal.
+      const dismissBefore = (device: string) =>
+        Effect.gen(function*() {
+          const before = shared.lists.get(device)
+          if (before === undefined) return
+          // Kept for another try when the dismissal fails; forgotten once it is down (or already ended).
+          yield* before.dismiss.pipe(Effect.tap(() => Effect.sync(() => void shared.lists.delete(device))))
+        }).pipe(Effect.ignore)
+      const showList = (device: string | undefined, list: Presentation | undefined) =>
+        shared.lock.withPermits(1)(
+          Effect.gen(function*() {
+            if (device === undefined) return
+            if (list === undefined) return yield* dismissBefore(device)
+            const shown = yield* ctx.present.show({ device }, list, { lifetime: "transient", expiresInMs: LIST_MS }).pipe(Effect.option)
+            // A replacement that could not be shown takes the outdated list down: what is on the screen follows the answer.
+            if (shown._tag === "None") return yield* dismissBefore(device)
+            shared.lists.delete(device)
+            shared.lists.set(device, shown.value)
+            while (shared.lists.size > SHOWN_DEVICES) shared.lists.delete(shared.lists.keys().next().value!)
+          }).pipe(Effect.ignore)
+        )
+
+      /**
+       * A phrase heard once acts once: a call in a phrase turn is keyed by its full identity (assistant, conversation,
+       * turn, device, operation and resolved input); a repeat, also one at the same time, gets the first outcome and
+       * shows nothing again. A call in any other kind of turn runs every time.
+       */
+      const once = <E>(
+        turn: { readonly source: string; readonly assistantId?: string; readonly conversationId: string; readonly turnId: number; readonly deviceId?: string } | undefined,
+        input: unknown,
+        run: Effect.Effect<{ readonly say: string; readonly owner?: string }, ActionError>
+      ) => {
+        if (turn === undefined || turn.source !== "phrase") return run
+        const key = JSON.stringify([turn.assistantId, turn.conversationId, turn.turnId, turn.deviceId, "brief", input])
+        return Effect.suspend(() => {
+          const known = shared.invocations.get(key)
+          if (known !== undefined) return Deferred.await(known.outcome)
+          const entry: Invocation = { outcome: Deferred.makeUnsafe(), finished: false }
+          shared.invocations.set(key, entry)
+          return run.pipe(
+            Effect.onExit((exit) =>
+              Effect.sync(() => {
+                if (Exit.hasInterrupts(exit)) shared.invocations.delete(key)
+                else {
+                  entry.finished = true
+                  // Oldest finished first; an entry still running is never evicted.
+                  for (const [k, v] of shared.invocations) {
+                    if (shared.invocations.size <= INVOCATIONS) break
+                    if (v.finished) shared.invocations.delete(k)
+                  }
+                }
+                Deferred.doneUnsafe(entry.outcome, exit)
+              })
+            )
+          )
+        })
+      }
+
       const brieflyAction = defineAction({
         id: "brief",
         label: "Brief me",
@@ -271,6 +354,12 @@ export const briefingModule = defineModule({
           "geef me de korte briefing",
           "goedenavond"
         ],
+        // Said after the wake phrase these run this action with no model. The greetings are plain words, in both
+        // languages (a phrase cannot fix a parameter, so they run with the kind left out).
+        phrases: {
+          en: ["good morning", "good evening", "brief me", "give me my briefing"],
+          nl: ["goedemorgen", "goedenavond", "geef me mijn briefing"]
+        },
         params: {
           length: Param.choice({ label: "Length", options: [{ value: "short", label: "short", aliases: ["kort"] }, { value: "normal", label: "normal" }, { value: "long", label: "long", aliases: ["uitgebreid"] }], optional: true }),
           kind: Param.choice({ label: "Kind", options: [{ value: "morning", label: "morning", aliases: ["goedemorgen"] }, { value: "evening", label: "evening", aliases: ["goedenavond"] }, { value: "on-request", label: "any time" }], optional: true })
@@ -283,15 +372,32 @@ export const briefingModule = defineModule({
         offerAsTool: false,
         sensitivity: actionSensitivity,
         run: ({ length, kind }) =>
-          brief({ kind: kindOf(kind), length, only: undefined }).pipe(
-            Effect.map((got) => {
-              if (got._tag === "unknown") return { say: unknownLine(got.language, got.sections) }
-              const text = join(got.briefing, got.language)
-              remember(text, got.briefing.owner)
-              return { say: text, ...(got.briefing.owner !== undefined ? { owner: got.briefing.owner } : {}) }
-            }),
-            Effect.catchCause((cause) => (cause.reasons.some((r) => r._tag === "Interrupt") ? Effect.failCause(cause) : Effect.fail(new ActionError({ message: say(texts, homeLanguage(ctx.host.view()), "nothing") }))))
-          )
+          Effect.gen(function*() {
+            const turn = yield* CurrentTurn
+            return yield* once(
+              turn,
+              { length, kind },
+              brief({ kind: kindOf(kind), length, only: undefined }).pipe(
+                Effect.flatMap((got) =>
+                  Effect.gen(function*() {
+                    if (got._tag === "unknown") {
+                      yield* showList(turn?.deviceId, undefined)
+                      return { say: unknownLine(got.language, got.sections) }
+                    }
+                    // A phrase's answer is cut by the host at its limit: built inside it, whole sections, and the list
+                    // shows what was spoken and counts the rest. Anywhere else the answer is the whole join.
+                    const fitted = turn?.source === "phrase" ? joinWithin(got.briefing, got.language, PHRASE_ANSWER_CHARS) : { text: join(got.briefing, got.language), briefing: got.briefing, omitted: 0 }
+                    remember(fitted.text, got.briefing.owner)
+                    // What is shown follows what was said: a list of its sections, or, when there are none, nothing (and an
+                    // earlier list on this device is taken down). A device that cannot show it changes nothing above.
+                    yield* showList(turn?.deviceId, briefingList(fitted.briefing, got.language, fitted.omitted))
+                    return { say: fitted.text, ...(got.briefing.owner !== undefined ? { owner: got.briefing.owner } : {}) }
+                  })
+                ),
+                Effect.catchCause((cause) => (cause.reasons.some((r) => r._tag === "Interrupt") ? Effect.failCause(cause) : Effect.fail(new ActionError({ message: say(texts, homeLanguage(ctx.host.view()), "nothing") }))))
+              )
+            )
+          })
       })
 
       return {
