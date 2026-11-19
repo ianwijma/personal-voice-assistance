@@ -88,6 +88,7 @@ case a reminder that was already stopped can ring once more; it can never ring z
   eight. The next one is tomorrow at eight."); the series goes on after it. If cleanup from the answered ring is still owed, named Done retries that cleanup first. Cancel ends a repeat for good.
 - **Snooze** takes the notification and card down and rings the same time again after the setting's minutes (or a said
   duration). A snooze ending at or after the next regular occurrence is declined: choose a shorter snooze.
+  An older ring cannot be snoozed while a newer occurrence is waiting for delivery; snooze the newer one when it arrives.
   After redelivery its notification, due card and lists use the snooze deadline as the due time; the original
   occurrence time remains its stable identity. The same button pressed again (the service may run a handler twice) does not push it further, even after redelivery; only the fresh delivery's own button can snooze it again.
 - An unnamed voice answer or a button answers one occurrence and the open notification selected for it. Admission is
@@ -114,8 +115,9 @@ case a reminder that was already stopped can ring once more; it can never ring z
 ### When taking it down fails
 
 Finishing, cancelling, answering, snoozing or changing a reminder takes its notification down and dismisses its card.
-Once a button's answer is saved, the host resolves that pressed notification even if the inline cleanup read fails;
-the row's job continues the remaining cleanup.
+Once an answer, change or cancellation is saved, a failed inline cleanup read does not turn its confirmation into a
+save failure: it confirms the saved result and reports any cleanup still owed. The row's job continues the remaining
+cleanup. For a notification button, the host also resolves that pressed notification.
 The tool or button tries that once, at once. If it fails, the reminder keeps **clean-up owed**, its job comes back a few
 seconds later (5 s, then doubling) and tries again, at most five times; then it is given up with a Health issue (the
 notification and card still end by themselves when they expire). The answer is true in each case: "Cancelled: call mum."
@@ -169,7 +171,7 @@ Typed actions (the intent agent runs them from their examples and phrases, witho
 |---|---|---|
 | `reminders.remind_in` `{ delay, text }` | "remind me in {delay} to {text}"; "herinner me over {delay} om {text}" | Sets a reminder a said duration from now (1 minute to a year), for the asking person (the household's when nobody is known), words as the one text slot at the end (at most eight words). The same confirmation and refusals as `reminders_set`. |
 | `reminders.ringing_done` | "reminder done", "mark the reminder as done", "that reminder is done"; "herinnering klaar", "markeer de herinnering als klaar", "die herinnering is klaar" | The reminder that rang on this device is done. None waiting, or more than one: it says so (and "reminders_done" with words is how to say which). |
-| `reminders.ringing_snooze` `{ for? }` | "snooze the reminder", "snooze the reminder for {for}"; "stel de herinnering uit", "stel de herinnering {for} uit" | Puts the reminder that rang here off for a said duration (1 minute to a day), else the setting's. |
+| `reminders.ringing_snooze` `{ for? }` | "snooze the reminder", "snooze the reminder for {for}"; "stel de herinnering uit", "stel de herinnering {for} uit" | Puts the reminder that rang here off for a said duration (1 minute to a day), else the setting's. With several waiting, use the Snooze button on the intended notification; with none, it says none is waiting. |
 
 While a reminder rings, the labels of its buttons ("Done", "Snooze"; "Klaar", "Uitstellen") are also accepted without the
 wake phrase (the host's ringing window). A reminder's own words are free text, so no answering phrase uses them as a lookup slot (the duration creation phrase does take new reminder text);
@@ -261,7 +263,9 @@ snoozes at once leave one snooze and one job.
   existing reminder checks permission at transaction admission, after notification lookup, job preparation and the
   store's wait. Already-owed cleanup continues independently. A list is built from the rows just read and checked again
   before it is returned. Done and Snooze buttons use the pressing device. A refused answer keeps its refusal and
-  notification; permission lost after a successful Done reduces its confirmation to "Done." without the schedule.
+  notification; permission lost after a successful Done reduces its confirmation to "Done." without the schedule, and
+  after a successful Snooze to "Snoozed." without its duration. A plain reply does not authorize a card: its personal
+  sensitivity is checked separately when it would show.
 - Reading and matching look at the household's reminders and the **asking person's own** only; another person's are not
   read, not counted, not matched. Without a known person only the household's are read, and the answer says so. The
   person's own that the asking device may not be told are counted anonymously ("2 personal reminders are not read out
