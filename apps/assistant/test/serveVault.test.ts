@@ -101,6 +101,7 @@ describe("serve: key vault and admin access", () => {
     expect(flags).toEqual({
       home: false,
       members: false,
+      risk: true,
       "language-model": true,
       "llm-behaviour": false,
       "llm-openai-accounts": true,

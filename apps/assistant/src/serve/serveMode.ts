@@ -8,7 +8,8 @@ import {
   makePresentEngine,
   type NotDelivered,
   notifyLanguageOf,
-  defaultRiskPolicy,
+  decodeRiskPolicy,
+  riskLanguageOf,
   makeToolRegistry,
   type ModuleDemand,
   type Principal,
@@ -489,9 +490,20 @@ export const startServe = (options: ServeOptions): Effect.Effect<ServeHandle, Ht
       programMissing: (tool) => checker.markMissing(tool),
       // Serve mode: a call with no turn and no job is refused (a missing context never means "allowed").
       localPrincipal: false,
-      // The risk policy (P1's default): read and change run; message, money and security are refused, and a tool that
-      // can only be one of those is not offered at all.
-      gatewayHooks: { riskPolicy: defaultRiskPolicy },
+      // P8: the household's risk policy (Shared settings › Risk policy), read at every decision and every tool list
+      // (`sections.value` is a cached map read until a save commits): a save applies to the next call. Its refusals in
+      // the household's language; a tool's `personal` result asked of the privacy rule for the call's device; a
+      // refusal outside a turn logged (a turn's decisions are in its trace line).
+      gatewayHooks: {
+        policy: () => decodeRiskPolicy((key) => sections.value(key)),
+        language: () => riskLanguageOf(sections.value("HOME_LANGUAGE")),
+        mayReveal: (owner, deviceId) => deviceFacts.privacy.mayReveal(owner, deviceId),
+        onDecision: (record) => {
+          if (record.turnId === undefined && record.outcome !== "allow") {
+            logInfo(`Risk policy: ${record.name} refused (${record.outcome}, ${record.by}) for a ${record.principal} call`)
+          }
+        }
+      },
       // The execution gateway's first checks, on every call (and the turn's action catalogue): the assistant has the
       // module on, and the tool is not one it switched off. Agents and decision providers are not per assistant.
       access: {

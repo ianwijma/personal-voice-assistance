@@ -1,6 +1,10 @@
 import { Setting, type SettingsCheck, type SettingsProblem, type SettingsSpec } from "@pva/core"
 import {
   type Condition,
+  DEFAULT_RISK_POLICY,
+  FIXED_REASON,
+  RISK_POLICY_KEYS,
+  riskPageTexts,
   CONVERSATION_IDLE_MINUTES_LIMITS,
   DEFAULT_CONVERSATION_IDLE_MINUTES,
   DEFAULT_MAX_VOICE_SESSIONS,
@@ -66,6 +70,12 @@ export interface SectionDefinition {
    * ids a hand-edited file left missing or twice). Must return the same object while nothing changed.
    */
   readonly load?: (stored: Readonly<Record<string, unknown>>) => Readonly<Record<string, unknown>>
+  /**
+   * P8: fields whose value is fixed (key → the value and why): shown locked with the reason, never written (a saved
+   * value of a hand-edited file is ignored: every reader sees the fixed value), and a save that sets one to anything
+   * else is refused with the reason.
+   */
+  readonly fixed?: Readonly<Record<string, { readonly value: string; readonly reason: string }>>
 }
 
 const reload = "reload" as const
@@ -266,6 +276,62 @@ export const homeSection: SectionDefinition = {
   }
 }
 
+const riskWords = riskPageTexts("en")
+const outcomeOptions = [
+  { value: "allow", label: riskWords.outcomes.allow, description: "The assistant does it." },
+  { value: "confirm", label: riskWords.outcomes.confirm, description: "Refused, saying it needs your confirmation: the assistant cannot ask for it yet." },
+  { value: "deny", label: riskWords.outcomes.deny, description: "Refused, saying this household does not allow it." }
+] as const
+const refuseOnly = [{ value: "deny", label: riskWords.outcomes.deny }] as const
+
+/**
+ * P8: the household's risk policy (docs/MODULES.md §4, docs/MODULES-PLAN.md §4 P8 "First version"): what the
+ * assistant does with each kind of thing a tool or action would do, for every assistant on every device (one level:
+ * no assistant or device narrows it). Read at every call and every tool list (`decodeRiskPolicy` over these keys);
+ * a save applies to the next call. `money` and `security` are fixed at Refuse. Admin only.
+ */
+export const riskSection: SectionDefinition = {
+  id: "risk",
+  title: "Risk policy",
+  group: "modules",
+  page: {
+    id: "risk",
+    title: "Risk policy",
+    description: "What the assistant may do on its own, for every assistant on every device. A refused call is not run; the assistant says why."
+  },
+  order: 7,
+  protected: true,
+  spec: {
+    [RISK_POLICY_KEYS.read]: Setting.choice({
+      label: riskWords.classes.read,
+      description: "Lookups that change nothing: the weather, what is on a list, the time.",
+      env: RISK_POLICY_KEYS.read,
+      default: DEFAULT_RISK_POLICY.read,
+      options: outcomeOptions
+    }),
+    [RISK_POLICY_KEYS.change]: Setting.choice({
+      label: riskWords.classes.change,
+      description: "Lights, timers, lists, reminders, speaking or ringing on the house's own devices.",
+      env: RISK_POLICY_KEYS.change,
+      default: DEFAULT_RISK_POLICY.change,
+      options: outcomeOptions
+    }),
+    [RISK_POLICY_KEYS.message]: Setting.choice({
+      label: riskWords.classes.message,
+      description: "Mail, chat or a call to people outside the house, or anything in your name on an outside channel. No module sends one yet.",
+      env: RISK_POLICY_KEYS.message,
+      default: DEFAULT_RISK_POLICY.message,
+      options: outcomeOptions
+    }),
+    [RISK_POLICY_KEYS.money]: Setting.choice({ label: riskWords.classes.money, description: "Purchases and payments.", default: "deny", options: refuseOnly }),
+    [RISK_POLICY_KEYS.security]: Setting.choice({ label: riskWords.classes.security, description: "Unlocking, disarming, opening a garage door or a gate.", default: "deny", options: refuseOnly })
+  },
+  fixed: {
+    [RISK_POLICY_KEYS.money]: { value: "deny", reason: FIXED_REASON },
+    [RISK_POLICY_KEYS.security]: { value: "deny", reason: FIXED_REASON }
+  }
+}
+
 /**
  * The shared `routing` section (WP-14). Off by default: sentences leave this machine only once the owner switches it
  * on and adds a key, and only from devices set to "TypeSafe decides". Applied live (each decision reads it).
@@ -372,6 +438,7 @@ export const sectionDefinitions = (dirs: ModelDirs = defaultModelDirs): Readonly
   return [
     homeSection,
     membersSection,
+    riskSection,
     openAiAccountsSection,
     // ---- Language model
     {

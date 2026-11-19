@@ -1,5 +1,5 @@
 import { claudeSubscriptionAgent } from "@pva/agent-claude-code"
-import { defaultRiskPolicy, makeModuleHost, type ModuleDefinition, type ModuleDemand, type ModuleHost, type ModulePersistence, type ModuleSnapshot, readOnlyPersistence, type TurnSetup, withContextProvider } from "@pva/core"
+import { decodeRiskPolicy, makeModuleHost, RISK_POLICY_KEYS, riskLanguageOf, type ModuleDefinition, type ModuleDemand, type ModuleHost, type ModulePersistence, type ModuleSnapshot, readOnlyPersistence, type TurnSetup, withContextProvider } from "@pva/core"
 import { homeAssistantModule } from "@pva/module-home-assistant"
 import { catalog as assistantControlsModules } from "@pva/module-assistant-controls"
 import { catalog as briefingModules } from "@pva/module-briefing"
@@ -154,6 +154,17 @@ export const startCliModules = (
     // The household data read-only (serve is its one writer): version 2 modules read it here and every write is refused.
     const services = yield* Effect.context<never>()
     const household = yield* openCliHousehold({ dataDir, catalog, log: (line) => void Effect.runForkWith(services)(Effect.logWarning(line)) })
+    // P8: the household's risk policy and language as saved (serve mode is their one writer): read once here, through
+    // the same decoder as serve mode, from the settings the CLI modes read (the environment, then the saved values).
+    const saved = yield* Effect.all({
+      read: Config.String(RISK_POLICY_KEYS.read).pipe(Config.withDefault("")),
+      change: Config.String(RISK_POLICY_KEYS.change).pipe(Config.withDefault("")),
+      message: Config.String(RISK_POLICY_KEYS.message).pipe(Config.withDefault("")),
+      language: Config.String("HOME_LANGUAGE").pipe(Config.withDefault(""))
+    }).pipe(Effect.orElseSucceed(() => ({ read: "", change: "", message: "", language: "" })))
+    const riskPolicy = decodeRiskPolicy((key) =>
+      key === RISK_POLICY_KEYS.read ? saved.read : key === RISK_POLICY_KEYS.change ? saved.change : key === RISK_POLICY_KEYS.message ? saved.message : undefined
+    )
     const host = yield* makeModuleHost({
       catalog,
       persistence,
@@ -163,8 +174,9 @@ export const startCliModules = (
       requirements: checker.check,
       // The CLI modes have no assistants: a call runs for the person at the terminal.
       localPrincipal: true,
-      // The same risk policy as serve mode: message, money and security are refused here too.
-      gatewayHooks: { riskPolicy: defaultRiskPolicy },
+      // The household's risk policy, decided as serve mode decides it (money and security are refused here too). No
+      // `mayReveal`: the CLI modes have no devices, and the person at the terminal is who asked.
+      gatewayHooks: { policy: () => riskPolicy, language: () => riskLanguageOf(saved.language) },
       programMissing: (tool) => checker.markMissing(tool)
     })
     yield* host.startEnabled

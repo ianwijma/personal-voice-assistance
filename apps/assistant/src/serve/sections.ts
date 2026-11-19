@@ -170,6 +170,9 @@ export const makeSections = (
       const checked = runSettingsChecks(d.checks ?? [], checkView)
       errors.push(...checked.errors)
       warnings.push(...checked.warnings)
+      // P8: a fixed field is shown locked with its reason (its value is the fixed one: `loaded` dropped any saved value).
+      const fixed = d.fixed
+      const fields = fixed === undefined ? form.fields : form.fields.map((f) => (Object.hasOwn(fixed, f.key) ? { ...f, locked: { reason: fixed[f.key]!.reason } } : f))
       return {
         id: d.id,
         title: d.title,
@@ -181,6 +184,7 @@ export const makeSections = (
         ...(d.protected === true ? { protected: true } : {}),
         form: {
           ...form,
+          fields,
           errors: [...form.errors, ...checked.errors],
           ...(checked.warnings.length > 0 ? { warnings: checked.warnings } : {})
         },
@@ -195,6 +199,15 @@ export const makeSections = (
   const loaded = (definitions: ReadonlyArray<SectionDefinition>, stored: Readonly<Record<string, unknown>>) => {
     let out = stored
     for (const d of definitions) if (d.load !== undefined) out = d.load(out)
+    // P8: a fixed field's saved value (a hand-edited file) is never read: every reader sees the fixed value.
+    for (const d of definitions) {
+      if (d.fixed === undefined) continue
+      for (const key of Object.keys(d.fixed)) {
+        if (!Object.hasOwn(out, key)) continue
+        const { [key]: _ignored, ...rest } = out
+        out = rest
+      }
+    }
     return out
   }
   const saved = (definitions: ReadonlyArray<SectionDefinition> = sectionDefinitions(modelDirs())) => ({
@@ -250,6 +263,15 @@ export const makeSections = (
         const built = build((key) => before.values.get(key) as SettingValue | undefined)
         if ("refused" in built) return failed(path, { ok: false, error: { code: "invalid_settings", message: built.refused } })
         const patch: SettingsPatch = built
+        // P8: a fixed field takes only its fixed value (or `null`); it is never written either way.
+        const fixedErrors: Array<FieldError> = []
+        for (const [key, fixed] of Object.entries(d.fixed ?? {})) {
+          const v = patch.values[key]
+          if (v !== undefined && v !== null && v !== fixed.value) fixedErrors.push({ key, message: fixed.reason })
+        }
+        if (fixedErrors.length > 0) {
+          return failed(path, { ok: false, error: { code: "invalid_settings", message: fixedErrors[0]!.message, fieldErrors: fixedErrors } })
+        }
         const missingModel = [...checkModel(patch, modelDirs().stt), ...checkLocalVoice(patch, modelDirs().tts)]
         if (missingModel.length > 0) {
           return failed(path, { ok: false, error: { code: "invalid_settings", message: missingModel[0]!.message, fieldErrors: missingModel } })
@@ -260,6 +282,12 @@ export const makeSections = (
         }
         // P5: a section may complete its values before they are written (Members gives a new person an id).
         if (d.normalize !== undefined) patched = { ...patched, stored: d.normalize(patched.stored, stored) }
+        // P8: a fixed field is never written (its key is in the section's keys, so a hand-edited value goes too).
+        if (d.fixed !== undefined) {
+          const out: Record<string, SettingValue> = {}
+          for (const [key, value] of Object.entries(patched.stored)) if (!Object.hasOwn(d.fixed, key)) out[key] = value
+          patched = { ...patched, stored: out }
+        }
         // The values after this save, for every section (keys are global), and the keys it writes.
         const keys = [...Object.keys(d.spec), ...(d.storedKeys ?? [])]
         const replace = <V>(base: Readonly<Record<string, V>>, next: Readonly<Record<string, V>>) => {
