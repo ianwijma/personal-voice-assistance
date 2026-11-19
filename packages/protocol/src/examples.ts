@@ -802,6 +802,8 @@ export const serverExamples: { readonly [T in ServerMessageType]: Extract<Server
     }
   },
   "notification.resolved": { type: "notification.resolved", id: "n-4f2a", outcome: "stop" },
+  // P7 (additive within 11): the reply output's gain on one device.
+  "output.volume": { type: "output.volume", volume: 0.6 },
   // P10 (additive within 11): a checklist on the stage, a tick taken in, and its end.
   "present.show": { type: "present.show", presentation: examplePresentation },
   "present.update": {

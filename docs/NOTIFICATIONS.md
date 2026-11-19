@@ -251,13 +251,14 @@ speaker and no display gets the cue and no card.
 
 ## What P7 and P10 build on
 
-- P7 (`ringing` window, the spoken "stop"): `engine.ringingOn(deviceId)` (what rings there, with its actions),
+- P7 (`ringing` window, the spoken "stop"; built: [PHRASES.md](PHRASES.md)): `engine.ringingOn(deviceId)` (what rings there, with its actions),
   `engine.onRingingChanged(listener)` (open and close the window: called whenever what rings on a device differs from
   what it last told: at the end of every step of a pass that can change what a page holds, also a step that failed
   part-way (the clean-up at a page's bound and the held-but-unseen tail included), and when a closed page's cards are
   dropped), `engine.stopRinging(deviceId)` (what rings there is recorded in one step and each ring stopped
   through the same admission as a press, in work the service owns: a caller that is interrupted leaves none of it
-  undone; it answers how many it stopped), `engine.stopSpeech(deviceId)`, `engine.press(…)` for a ringing phrase of an
+  undone; it answers how many it stopped, and fails, busy or failed, when one it found could not be stopped: a zero is
+  "nothing rang any more", never a failure), `engine.stopSpeech(deviceId)`, `engine.press(…)` for a ringing phrase of an
   action, and `engine.busyAnswer()` (the refusal of a press over an admission bound, in the household's language).
 - P10: the card's data is `NotificationCard` on the wire; the presentation stage draws `NotificationCards.tsx` first.
 
