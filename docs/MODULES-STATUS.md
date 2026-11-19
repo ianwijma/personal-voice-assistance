@@ -1,7 +1,7 @@
 # Modules: where the work stands
 
 Status of the work planned in [MODULES-PLAN.md](MODULES-PLAN.md), kept here so it does not depend on any one working
-session. Updated 2026-11-19, 18:39. Nothing below is merged into `main`; the owner merges.
+session. Updated 2026-11-19, 18:49. Nothing below is merged into `main`; the owner merges.
 
 **State: the work is done and waits for the owner.** Every preparation part, every module that was not deferred and
 every follow-up has an open pull request, has had at least one complete Sol review, and has its findings fixed. On
@@ -12,7 +12,8 @@ last fix round. The reviewer's allowance also ran out that afternoon: the last t
 parts, and the lists follow-up's second) stopped early; what they had already reproduced was fixed or is written down
 under "Known gaps kept on purpose".
 
-**The whole, on one branch: `t3/modules-13-all`, pull request #130 (`08b3c65c`, plus merges of this page).** Every branch below merged
+**The whole, on one branch: `t3/modules-13-all`, pull request #130 (code as of `08b3c65c`; later commits on it are merges that change no code: this page, and branch heads that
+moved by a test-only fix).** Every branch below merged
 together, merges only, plus one commit of its own (a 20 second test limit for the `node` project on CI). On it:
 `pnpm check` passes; `pnpm test`: 10,094 passed and one failed, a measurement (the music module's latency test
 "resolving a room at the largest cache": 10.2 ms on the main thread against its 10 ms bound in the full run; alone it
@@ -65,16 +66,16 @@ its own pull request on the scaffold.
 | memory and notes | #97 | `t3/module-memory` | `b3b827c8` |
 | web search | #98 | `t3/module-web-search` | `cacdd17c` |
 | news and feeds | #99 | `t3/module-news` | `eceee3b5` |
-| local info (weather, bin day) | #100 | `t3/module-local-info` | `72507efb` |
+| local info (weather, bin day) | #100 | `t3/module-local-info` | `c85569af` |
 | core tools | #101 | `t3/module-core-tools` | `58d41ab4` |
 | lists | #102 | `t3/module-lists` | `5aea824e` |
 | smart home (Home Assistant) | #103 | `t3/module-smart-home` | `ff54d2fe` |
 | kitchen | #104 | `t3/module-kitchen` | `77e84d50` |
-| calendar (ICS only) | #105 | `t3/module-calendar` | `159b08b8` |
+| calendar (ICS only) | #105 | `t3/module-calendar` | `d958d507` |
 
 CI is green on all eleven at these heads. They carry the whole scaffold (`5bfeca0d`); their heads moved with that merge (see each pull request).
 
-**Integration branch**: `t3/modules-12-wave-a`, pull request #116 (`6ffa37db`): the presentation branch (P10, final)
+**Integration branch**: `t3/modules-12-wave-a`, pull request #116 (`130dec1d`): the presentation branch (P10, final)
 with the eleven module branches merged in, merges only. It is the base of the follow-up pull requests. Everything in
 it is also in the branch with everything.
 
@@ -144,7 +145,8 @@ Found by the last checks and written down instead of fixed:
 - **Tests that depend on the CI machine's load.** The CI machine has two cores, and now and then a test that waits
   in real time or starts several test households fails there and passes on a rerun. Fixed where it was cheap: the
   presentation mock's tests (P10), the calendar privacy tests' limit, the bin-day test that looked at the Health page
-  right after a job (in the local-info follow-up), and a 20 second limit on CI in the branch with everything. Still
+  right after a job (on the local-info module branch and its follow-up), and a 20 second limit on CI in the branch
+  with everything. Still
   seen once each: `ModuleHostP3Round5` "forty modules" (core, 5 s limit), the SQLite scheduler contract's
   daylight-saving test (30 s limit), the calendar privacy test "finding 22" (the kit gave up waiting for the module
   to stop), the bin-day reminder test "a copy too old to trust"; and in local full runs under load the SQLite
@@ -160,8 +162,9 @@ Found by the last checks and written down instead of fixed:
   were not measured.
 - **A main-thread write right behind the store's checkpoint worker** waits about 24 ms on a desktop disk (a few
   hundred on an SD card), on a timer, without blocking the event loop (`docs/STORING-DATA.md` on the scaffold).
-- **Music at its largest**: resolving a room name against the largest cache, cold, sits at the 10 ms bound (10.2 ms
-  once in a full local run; under it when the test runs alone).
+- **Music at its largest**: resolving a room name against the largest cache, cold, sits at the 10 ms bound: 10.23 ms
+  once in a full local run with everything running beside it; under the bound 10 times out of 10 alone, and in the
+  latency run the way CI does it (37 files, 420 tests, all pass on the branch with everything).
 - **Smart home at its largest**: with 2,000 lights in a single room the first-wave module's own status read stops
   the main thread 8 to 15 ms and "lights off" 13 to 17 ms, over the 10 ms bound at that extreme (measured while
   reviewing its follow-up, whose own work is under 1 ms).
