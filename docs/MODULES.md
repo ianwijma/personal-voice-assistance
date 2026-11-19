@@ -155,7 +155,7 @@ const read = makeTool({
   description: "Read the notes pinned on the household's pinboard, newest first.",
   parameters: Schema.Struct({}),
   speculative: true, // a plain read: safe to run before the turn is committed; its risk is `read`
-  // The result names whose personal note it holds; P8 will check it against the asking device.
+  // The result names whose personal note it holds; the gateway checks it against the asking device (P8).
   sensitivity: (result) => {
     const owner = (result as { readonly owner?: string }).owner
     return owner === undefined ? { kind: "household" } : { kind: "personal", owner }
@@ -336,26 +336,54 @@ house's own devices), `message` (sent to people outside the house, or in the own
 "change"`. A plain read is `speculative: true` (it may run before the turn is committed) and is `read`. A class that
 depends on the input is `risk: { classes: ["change", "security"], of: (input) => … }`: a pure function of the validated
 input, at most 2 ms, that answers one of its declared classes (otherwise the call is refused with a generic sentence).
+A press handler (`ctx.present.handle`, `ctx.notify.handle`) may declare `risk` the same way, of the press; without it
+a press is `change`.
 
-What the gateway does, in order, on every path (a model's tool call, the Claude Code bridge, the intent agent, a
-routine step through `host.actions.run`, a job): checks the principal (§3), that the assistant has the module on and
-the tool is not switched off, runs the risk function, then the **risk policy** on the class. The policy is the core's
-`defaultRiskPolicy`, the same in serve mode, the CLI modes and the test kit: **`read` and `change` run; `message` is
-refused as needing a confirmation the assistant cannot ask for yet; `money` and `security` are denied everywhere**
-(devices are not authenticated), each refusal with its own sentence. An action declared `confirm: true` is refused on
-every path (confirmation is off).
+**The policy is the household's** (P8, first version): the owner sets it on the admin page, Shared settings › Risk
+policy, per class: **Run it** (`allow`), **Refuse: needs confirmation** (`confirm`) or **Refuse** (`deny`). One level
+only: it applies to every assistant on every device (no assistant or device narrows it yet). `money` and `security`
+are fixed at Refuse (devices are not authenticated): the page shows them and does not let them change, a settings file
+that says otherwise is read as Refuse, and the decision refuses them whatever it is given. Nothing saved means the
+default, which is the behaviour before the policy was a setting: **`read` and `change` run, `message` is refused as
+needing a confirmation the assistant cannot ask for yet, `money` and `security` are refused.** Confirmation itself is
+still off, so `confirm` refuses too, with its own sentence.
+
+What the gateway does, in order, on every path that runs a tool, an action or a press handler (a model's tool call, the
+Claude Code bridge, a generated action tool, the intent agent, a routine step or tool through `host.actions.run`, a job,
+a press on a presentation or a notification, core's confirmed path, the CLI modes): checks the principal (§3), that the
+assistant has the module on and the tool is not switched off, runs the risk function on the validated input, then
+decides with **one function**, `decideRisk(policy, declared classes, class of this input)` (`@pva/protocol`), on the
+policy **as saved at that moment**: a save applies to the next call, without a restart. An action declared `confirm:
+true` is refused on every path before that (confirmation is off). A module route and a field action (a Test button)
+run with no principal: a call they make is refused before any decision.
 
 - A tool or action **every** declared class of which is refused is **not offered**: it is left out of the model's tool
-  list and of the turn's action catalogue. One that can also be `change` (a cover: a blind or a garage door) is offered,
-  and each call is refused when its input makes it `security`.
-- A refusal comes back to the model as a tool result "Not run: …" (a typed action: its error), and the module's code
-  never runs.
+  list and of the turn's action catalogue, decided with the same function each time a list is read. One that can also
+  be `change` (a cover: a blind or a garage door) is offered, and each call is refused when its input makes it
+  `security`. A list made before a change and a call after it may disagree; the call's check wins and the model gets
+  the refusal.
+- A refusal comes back to the model as a tool result ("Not run: …", in Dutch "Niet uitgevoerd: …", by the Home
+  language), a typed action says it in a sentence for speech ("I can't do that: …"), a press is answered with that
+  sentence on the page, `host.actions.run` answers `{ ok: false, code: "refused", message }`; `confirm` and `deny` have
+  different sentences, and the module's code never runs.
+- Every decision is recorded: a turn's on its trace (`Trace.calls`, the latency line's `risk:` part), every one through
+  the gateway's `onDecision` (serve mode logs refusals outside a turn; the test kit keeps them in `riskDecisions()`). A
+  call refused before the decision (no principal, the module off, invalid input) has no outcome recorded.
 - So: build nothing whose first version needs `message`, `money` or `security`; and say in the description of a tool
   that can be `money` or `security` that it is (`checkModule`'s `risk-said`), so the model is not surprised.
 
-`sensitivity` (`household`, `personal` with an owner, or a function of the result) says whose a result is; the gateway
-carries it and P8 will check it against the asking device, so today **your code checks privacy itself** (§7).
-`latency` (`instant`, `quick`, `slow`, `background`) is metadata.
+`sensitivity` (`household`, `personal` with an owner, or a function of the result) says whose a result is. **The
+gateway enforces it for a tool's result on its way back to the model**: a `personal` result is passed through
+`Privacy.mayReveal` for the asking device at that moment; where it may not be revealed, the model gets a fixed sentence
+("Withheld: …") and nothing of the result, and nothing of it is presented. `personal` without a known owner is someone
+else's. A job, a route and `host.actions.run` hand results to module code, not to a model, and a job has no asking
+device: there the module checks privacy itself, on the device that will speak or show it (§7), as it always did. Keep
+checking in your own code where you build a result from several people's data (the gateway sees one sensitivity per
+result). `latency` (`instant`, `quick`, `slow`, `background`) is metadata.
+
+In tests, the kit behaves like serve mode: `startTestModule(m, { household: { risk: { change: "deny" } } })` starts
+with a saved policy, `kit.setRiskPolicy(…)` saves another (it applies to the next call and list), and
+`kit.riskDecisions()` lists every decision.
 
 ## 5. Storing data
 
@@ -1573,6 +1601,7 @@ values), `startAt`, `started`. It returns handles:
 | `service(Key)`, `contributions(Key, as?)` | what is published now, as a turn's assistant sees it |
 | `stop`, `start`, `restart`, `configure(values, secrets?)` | switched off for every assistant, on again; one real restart of the module with its demand kept (the same host and store: not a restart of the server); a settings change as the owner saves it |
 | `info()`, `issues()`, `checkHealth`, `toolNames(as?)` | the admin page's view of it, its Health issues (health run now), the tools the turn's model is sent: as serve mode offers them, without the tools and action tools the assistant switched off and those the risk policy refuses |
+| `riskPolicy()`, `setRiskPolicy(p)`, `riskDecisions()` | P8: the household's risk policy now (start with `household.risk`), a save of another (through serve mode's decoder: `money` and `security` stay refused; it applies to the next call and list), every decision so far on every path (§4) |
 | `expectNoSecrets(...values)` | fails when the value of a secret given to the kit is in any string of the `values` you pass (tool results, action outcomes, spoken lines, **the rows your test read**), decoded: every key and string, and a string that is JSON parsed and walked too, so an escaped secret is found; it also looks at every event and the admin page. It reads no collection itself: pass it the rows your module wrote |
 | `notify` | P9: the real notification service: `all`, `messages` (what each page was sent), `decisions` (where it would go, and why not), `press(id, action, { device })`, `announced`, `replying(device, on)`, `connect` / `disconnect`, `dnd()`, `settle`, `engine` ([NOTIFICATIONS.md](NOTIFICATIONS.md) "Testing") |
 | `moduleStore()`, `store`, `events`, `people`, `schedulerUses` | the module's store, the household store, every event on the bus, the household's core services, what the kit saw of the scheduler |

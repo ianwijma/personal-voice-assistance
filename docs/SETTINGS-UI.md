@@ -105,6 +105,23 @@ draw them (docs/UI-AND-MODULES.md §1.11, §3.7). Built:
 Sections do not declare buttons yet (a section's handler would be the server's: `settings.action` is still not in the
 protocol); a button outside a module form is shown disabled.
 
+## Status: the risk policy (modules P8, first version, 2026-11-19)
+
+The household's risk policy (docs/MODULES.md §4) is a household section like Home and Members, on its own page:
+**Shared settings › Risk policy**. (This "P8" is the modules plan's, docs/MODULES-PLAN.md §4; not this document's
+search phase.)
+
+| Piece | Where | Notes |
+|---|---|---|
+| Section | `apps/assistant/src/serve/sectionDefinitions.ts` (`riskSection`, id `risk`, group `modules`, page `risk`, order 7, **protected**: admin only) | `RISK_READ`, `RISK_CHANGE`, `RISK_MESSAGE`: a choice of **Run it** / **Refuse: needs confirmation** / **Refuse** (`allow` / `confirm` / `deny`), defaults `allow`, `allow`, `confirm`, applied live (no reload). `RISK_MONEY`, `RISK_SECURITY`: a choice with only Refuse, no environment variable |
+| Fixed fields | `sections.ts` (`SectionDefinition.fixed`: key → value and reason) | Shown locked with the reason ("Fixed at Refuse: devices are not authenticated yet …", `FIXED_REASON`), never written; a saved value of a hand-edited file is dropped when the values are read (every reader sees Refuse) and taken out of the file at the section's next save; a save that sets one to anything but Refuse is refused with the reason and writes nothing |
+| Validation | `applySettingsPatch` (the choice's options) and the fixed check; one save, one lock, as every section | An unknown outcome or an opened money/security refuses the whole save (`invalid_settings`), nothing written. A typo in a hand-edited file is that field's error on the page, and the policy reads that class's default meanwhile |
+| Reading | `serveMode.ts`: `gatewayHooks.policy = () => decodeRiskPolicy((key) => sections.value(key))` | `sections.value` is a cached map read until a save commits, so a save applies to the next call and the next tool list; the CLI modes read the saved values once at their start (`modules.ts`) |
+| Page | `apps/web/src/lib/settingsTree.ts` (`SHARED_PAGES` "Risk policy"), `ui/adminRegistry.ts` (`risk-extra`), `settings/pages/RiskPolicyPage.tsx` | The generic form (the fixed rows drawn by `FieldRow` as locked values with a padlock and the reason; locked fields are never in a patch), and under it **What the assistant says when it refuses**: for each class the saved outcome and the sentence the person hears, in the household's language (Home › Language: Dutch or English), made with `decodeRiskPolicy`, `decideRisk` and `riskSpoken` from `@pva/protocol`. The form's own labels are English, like every admin page |
+| Mock | `apps/web/mock/server.ts` (section `risk`) | The same fields; a save is checked with `riskPolicyValueProblem` (the server's rules) before the generic checks, and money/security are never written |
+
+Not built: a policy per assistant or per device (the plan's later P8), Connections and OAuth.
+
 ## Status: phase 2b (P4 and P7, 2026-11-14)
 
 **Built: P4 and P7** (protocol 4). Still not built: P6 (tools, Claude login: the jobs model is ready for it), P8, P9.

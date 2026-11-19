@@ -177,7 +177,7 @@ export const pinboardModule = defineModule({
         description: "Read the notes pinned on the household's pinboard, newest first.",
         parameters: Schema.Struct({}),
         speculative: true, // a plain read: safe to run before the turn is committed; its risk is `read`
-        // The result names whose personal note it holds; P8 will check it against the asking device.
+        // The result names whose personal note it holds; the gateway checks it against the asking device (P8).
         sensitivity: (result) => {
           const owner = (result as { readonly owner?: string }).owner
           return owner === undefined ? { kind: "household" } : { kind: "personal", owner }

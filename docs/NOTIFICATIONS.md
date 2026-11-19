@@ -192,7 +192,9 @@ speaker and no display gets the cue and no card.
   the claim's wall time on the row is only for a claim found with no run alive.
 - The handler runs as a call in flight of the module's part, with the press's notification principal
   (`CurrentPrincipal` `notification`: the notification and the device it was pressed on), admitted by the execution
-  gateway first, within 5 s. It answers `{ say?, keepOpen? }`: `say` is shown on the card (cut to 300 at the page
+  gateway first (and decided by the household's risk policy on the handler's declared `risk`, inferred `change`: a
+  refusal answers with the policy's sentence and `code: "refused"`, docs/MODULES.md §4; `stop` is the host's and needs
+  no handler), within 5 s. It answers `{ say?, keepOpen? }`: `say` is shown on the card (cut to 300 at the page
   boundary; default "Done."); unless `keepOpen`, the notification is then resolved with the action as its outcome. A
   handler that fails or times out changes nothing ("That didn't work.").
 - **After a store failure the handler may run again**: the outcome is written with a few retries; if it still cannot be

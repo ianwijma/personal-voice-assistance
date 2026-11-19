@@ -144,7 +144,9 @@ allows, oldest first, at most 8, and the newest transient the decision allows.
 - **The handler** the module registered with `ctx.present.handle(name, …)` **in `shared`** (a registration of the part:
   published and withdrawn with the module) runs as a call in flight of the part, with the press's principal
   (`CurrentPrincipal` `presentation`: the presentation and the device and connection it was pressed on), admitted by the
-  execution gateway first (serve mode checks that the connection is the device's), within 5 s. While it is not
+  execution gateway first (serve mode checks that the connection is the device's; then the household's risk policy on
+  the handler's declared `risk`, inferred `change`: a refusal answers with the policy's sentence and `code: "refused"`,
+  docs/MODULES.md §4), within 5 s. While it is not
   published (the module is stopped, failed or restarting), the press answers "I can't do that right now." and changes
   nothing. It answers `{ say? }` (default "Done."); the press itself changes nothing on the page: the handler shows the
   change (`update`, or the same key again), which reconciliation sends.

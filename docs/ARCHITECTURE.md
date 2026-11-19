@@ -342,12 +342,12 @@ CurrentPrincipal: Context.Reference<Principal | undefined>       // the admitted
   assistant has the module on; the tool is not in its `offTools` (`ModuleHostOptions.access`; skipped for the local
   principal and a notification); only then the module's **risk function** (`risk: { classes, of }`, else the declared
   or inferred class: `read` for speculative tools, else `change`), run on the validated input (a generated action
-  tool's input is resolved to the action's values once; those are classified, admitted and run); then the **risk
-  policy** on that class (`ModuleHostOptions.gatewayHooks.riskPolicy`: `defaultRiskPolicy` in serve mode, the CLI modes
-  and the module test kit; `read` and `change` run, `message` is refused as needing confirmation, `money` and
-  `security` are denied, each with its own sentence); then the later hook (`gatewayHooks.risk`, empty). A tool or
-  action whose every declared class the policy refuses is left out of every registry's `specs` and `actions` and of the
-  host's action catalogue (`ExecutionGateway.offers`); a call that names it is still refused. A tool without
+  tool's input is resolved to the action's values once; those are classified, admitted and run); then the household's
+  **risk policy** (P8, "Risk policy" below: `gatewayHooks.policy`, read at that moment, decided by `decideRisk`, the
+  refusal in the household's language, the decision recorded); then the later hook (`gatewayHooks.risk`, empty). A tool
+  or action whose every declared class the policy refuses is left out of every registry's `specs` and `actions`
+  (decided when they are read) and of the host's action catalogue (`ExecutionGateway.offers`); a call that names it is
+  still refused. After a tool runs, its result passes the `sensitivity` check before it goes back to the model. A tool without
   parameters is sent to a model as `{ "type": "object", "properties": {} }` (`toolSpec`). The host refuses, when a
   module starts, a tool name outside `[A-Za-z0-9_-]{1,64}`, a duplicate, and an action whose generated tool name is
   over 64 characters, naming it. A risk function that throws, answers a class it did not
@@ -376,6 +376,42 @@ CurrentPrincipal: Context.Reference<Principal | undefined>       // the admitted
   is 0.9 ms at the median before P1 (`main` at `548f5d2`) and 0.8 ms with it, 0.8 and 0.7 ms on the session path, and
   the tool turn's `current_time` takes 0.2 ms in both; every realistic scenario is within 1 ms. The bench's tools are a
   hand-made registry (through `defaultGateway` with P1), not the module host, and it has no Claude Code bridge.
+- **Risk policy (P8, first version; docs/MODULES.md §4).** A household setting (Shared settings › Risk policy: flat
+  keys `RISK_READ`, `RISK_CHANGE`, `RISK_MESSAGE`; `RISK_MONEY` and `RISK_SECURITY` shown fixed), one level: no
+  narrowing by assistant or device. The pure functions live in `@pva/protocol` (`risk.ts`), so the server, the CLI
+  modes, the test kit and the web mock share them; `@pva/core` re-exports them (`RiskPolicy.ts`):
+
+  ```ts
+  type RiskOutcome = "allow" | "confirm" | "deny"
+  interface RiskPolicy { read: RiskOutcome; change: RiskOutcome; message: RiskOutcome; money: "deny"; security: "deny" }
+  const DEFAULT_RISK_POLICY: RiskPolicy                    // { allow, allow, confirm, deny, deny }: P1's behaviour
+  type RiskDecision =
+    | { outcome: "allow"; by: ToolRisk } | { outcome: "confirm"; by: "read" | "change" | "message" }
+    | { outcome: "deny"; by: ToolRisk | "unjudged" | "unknown" }
+  decideRisk(policy, declared: ReadonlyArray<ToolRisk>, risk: ToolRisk | undefined): RiskDecision  // THE decision
+  riskOffered(policy, declared): boolean                   // some declared class is allowed (the tool list)
+  riskPolicyKey(policy): string                            // changes exactly when riskOffered can change
+  decodeRiskPolicy(value: (key) => unknown): RiskPolicy    // flat keys; a bad value is its default; money/security deny
+  riskPolicyOf(partial): RiskPolicy                        // the same decoder over an object (the kit)
+  riskPolicyValueProblem(key, value): string | undefined   // the save check (server section, mock)
+  riskReason / riskSpoken(language, decision), riskRefusalPrefix(language), riskWithheld(language), riskLanguageOf(HOME_LANGUAGE)
+  ```
+
+  The gateway's options (`GatewayOptions`, given to the host as `ModuleHostOptions.gatewayHooks`): `policy: () =>
+  RiskPolicy` (read at every decision and every list read; absent: nothing decided, every class allowed), `language: ()
+  => "en" | "nl"`, `mayReveal(owner, deviceId)` (the `sensitivity` check; absent in the CLI modes), `onDecision(record:
+  GatewayDecisionRecord)` (every decision on every path: kind, module, name, principal, turn id, outcome, class,
+  `withheld`). `ExecutionGateway` gains `offerKey()` (the registry decides its list again only when it changes) and
+  `handler(moduleId, name, meta, input)`: the admission of a registered press handler (a presentation's, a
+  notification's), with the handler's declared `risk` (`PresentPressHandler.risk`, `NotifyActionHandler.risk`, inferred
+  `change`). `GatewayRefused` carries `spoken`, `outcome` and `by` for a refusal of the policy (`spokenRefusal(error)`);
+  the intent agent says `spoken`; a refused press is answered `{ ok: false, say: spoken, code: "refused" }`. A turn's
+  decisions are on its `Trace.calls` (`TraceCall`: name, outcome, by, withheld; the latency line's `risk:` part):
+  `Conversation` provides `CurrentTurnTrace` around its tool calls and action runs, and the Claude Code bridge gives
+  each SDK call the turn's trace. A registry wrapper keeps reading the list through (`registryWith`). Measured
+  (`RiskLatency.test.ts`): 61 ns per decision, 0.5 µs added to a gateway call, 5.5 µs to read a 64-tool list after a
+  change and 0.4 µs otherwise; a turn's end of turn → playback start 10.725 ms without a saved policy and 10.710 ms with
+  one.
 - **Availability.** `requires`, `platforms` and `apiVersion` are judged before anything starts, from the app's probes
   (`apps/assistant/src/requirements.ts`). Two kinds of requirement: a **program on the server** (`{ tool, version?,
   why }`) and the **network** (`{ network }`, not probed yet: `unchecked`). One program registry (argv and a version
@@ -1153,7 +1189,8 @@ apps/
 - Serve mode is tested with a scripted client (`apps/assistant/test/support/scriptedClient.ts`: a Node `ws` client that speaks the protocol and simulates the browser's player) against the real server with injected providers, plus one live test with the local models. Gotcha: `TestClock.adjust` waits only one scheduler hop before advancing, so let freshly forked fibers run first (see `advance` in `Conversation.test.ts`). The Conversation table above — speculation, promotion, discard, barge-in, tool loop — each has a test.
 - Adapters have unit tests for their protocol mapping against recorded/mock messages (a local mock WebSocket server), and an opt-in live test that runs only when the provider's API key is set.
 - Modules are tested with the module test kit (`@pva/core/testing`, P11; docs/MODULES.md §17): `startTestModule` runs one
-  definition in the real module host with serve mode's gateway checks and risk policy, the real scheduler engine on the
+  definition in the real module host with serve mode's gateway checks and risk policy (the household's `risk`,
+  changed with `setRiskPolicy`, every decision in `riskDecisions()`), the real scheduler engine on the
   in-memory store, the core's `Privacy` rule over a test household fixed for the test, and stand-ins for the modules it
   uses (`provide`, with stubs of their services: `stubService` records calls and answers what the test programs), and
   runs its tools, actions and jobs as a given turn; it does not imitate the HTTP router. `makeOfflineNet` gives
