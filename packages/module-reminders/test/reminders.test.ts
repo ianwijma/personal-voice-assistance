@@ -364,6 +364,82 @@ describe("answering: done and snooze", () => {
     }))
 })
 
+describe("phrase commands", () => {
+  const ringOne = (kit: Kit, when = "in ten minutes") =>
+    Effect.gen(function*() {
+      yield* kit.tool("reminders_set", { text: "call mum", when }, { device: SAM })
+      yield* kit.advance(11 * MIN)
+      yield* kit.present.settle
+    })
+
+  it.effect("done and snooze are said without the model, with the duration as the only slot", () =>
+    Effect.gen(function*() {
+      const kit = yield* startTestModule(remindersModule)
+      yield* ringOne(kit)
+      const snoozed = yield* kit.phrases.say("Snooze the reminder for twenty minutes", { device: SAM })
+      assert.isTrue(snoozed.taken && snoozed.by === "command")
+      assert.deepStrictEqual(kit.phrases.spoken.map((s) => s.text), ["I'll remind you again in 20 minutes."])
+      assert.strictEqual((yield* rows(kit))[0]?.value.snoozeAt, (yield* kit.now) + 20 * MIN)
+      yield* kit.advance(21 * MIN)
+      const plain = yield* kit.phrases.say("snooze the reminder", { device: SAM })
+      assert.isTrue(plain.taken)
+      assert.strictEqual(kit.phrases.spoken.at(-1)?.text, "I'll remind you again in 10 minutes.")
+      yield* kit.advance(11 * MIN)
+      const done = yield* kit.phrases.say("reminder done", { device: SAM })
+      assert.isTrue(done.taken)
+      assert.strictEqual(kit.phrases.spoken.at(-1)?.text, "Done.")
+      assert.strictEqual((yield* rows(kit))[0]?.value.state, "done")
+      // A bare "done" is not a phrase of this module: it goes on to the assistant.
+      assert.deepStrictEqual(yield* kit.phrases.say("done", { device: SAM }), { taken: false })
+    }))
+
+  it.effect("'remind me in … to …' is said without the model: a duration and the words, nothing guessed", () =>
+    Effect.gen(function*() {
+      const kit = yield* startTestModule(remindersModule)
+      const said = yield* kit.phrases.say("Remind me in ten minutes to take the pizza out", { device: SAM })
+      assert.isTrue(said.taken && said.by === "command")
+      assert.strictEqual(kit.phrases.spoken.at(-1)?.text, "Reminder set for today at ten past ten in the morning: take the pizza out.")
+      const [row] = yield* rows(kit)
+      assert.strictEqual(row?.value.text, "take the pizza out")
+      assert.strictEqual(row?.value.owner, "p-sam")
+      assert.strictEqual(row?.value.deviceId, SAM)
+      // The same on a public screen: nobody known, so it is the household's, and it is not guessed to be personal.
+      yield* kit.phrases.say("remind me in an hour to water the plants", { device: HALL })
+      assert.strictEqual((yield* rows(kit)).find((r) => r.value.text === "water the plants")?.value.whose, "household")
+      // A clock time is no phrase of this module: it goes to the model.
+      assert.deepStrictEqual(yield* kit.phrases.say("remind me at five to call mum", { device: SAM }), { taken: false })
+      // A password beside digits is refused in words, and nothing is stored.
+      yield* kit.phrases.say("remind me in an hour to enter password 123456", { device: SAM })
+      assert.strictEqual(kit.phrases.spoken.at(-1)?.text, "I don't keep codes or passwords in reminders.")
+      assert.strictEqual((yield* rows(kit)).length, 2)
+      // The same action through its generated tool.
+      const viaAction = yield* kit.action("remind_in", { delay: "five minutes", text: "stretch" }, { device: ROBIN })
+      assert.deepStrictEqual(viaAction, { ok: true, say: "Reminder set for today at five past ten in the morning: stretch." })
+    }))
+
+  it.effect("while it rings, the label of a button is said without the wake phrase; nothing ringing, nothing taken", () =>
+    Effect.gen(function*() {
+      const kit = yield* startTestModule(remindersModule)
+      assert.deepStrictEqual(yield* kit.phrases.say("Done", { device: SAM, wake: false }), { taken: false })
+      yield* ringOne(kit)
+      const said = yield* kit.phrases.say("Done", { device: SAM, wake: false })
+      assert.isTrue(said.taken && said.by === "ringing")
+      assert.strictEqual((yield* rows(kit))[0]?.value.state, "done")
+    }))
+
+  it.effect("in Dutch, and with nothing waiting it says so", () =>
+    Effect.gen(function*() {
+      const kit = yield* startTestModule(remindersModule, { household: { home: { HOME_LANGUAGE: "nl-NL" } } })
+      assert.isTrue((yield* kit.phrases.say("herinnering klaar", { device: SAM })).taken)
+      assert.strictEqual(kit.phrases.spoken.at(-1)?.text, "Op dit apparaat wacht geen herinnering op een antwoord. Zeg welke je bedoelt.")
+      assert.isTrue((yield* kit.phrases.say("herinner me over tien minuten om te bellen", { device: SAM })).taken)
+      assert.strictEqual(kit.phrases.spoken.at(-1)?.text, "Herinnering gezet voor vandaag om tien over tien 's ochtends: te bellen.")
+      yield* kit.advance(11 * MIN)
+      assert.isTrue((yield* kit.phrases.say("stel de herinnering vijf minuten uit", { device: SAM })).taken)
+      assert.strictEqual(kit.phrases.spoken.at(-1)?.text, "Ik herinner je er over 5 minuten weer aan.")
+    }))
+})
+
 describe("which reminder is meant", () => {
   const seed = (kit: Kit) =>
     Effect.gen(function*() {

@@ -5,7 +5,7 @@ import {
 import {
   describeRRule, type Language, nextOccurrence, parseDateTime, parseDtstart, parseRecurrence, speakDuration, speakList, speakNumber, speakTime
 } from "@pva/language"
-import { BriefingSectionError, BriefingSections, homeLanguage, say } from "@pva/module-contracts"
+import { BriefingSectionError, BriefingSections, homeLanguage, isLine, say } from "@pva/module-contracts"
 import { Clock, Effect, Exit, Schema, Semaphore } from "effect"
 import { randomUUID } from "node:crypto"
 import {
@@ -435,6 +435,42 @@ export const remindersModule = defineModule({
     const failed = (l: Language, key: "unsaved" | "unread" = "unsaved") => new ToolError({ message: say(texts, l, key) })
     const personalQuiet = (owner: string | undefined, turn: TurnContext | undefined) => owner !== undefined && ctx.host.service(Privacy)?.mayReveal(owner, turn) !== true
 
+    /** Writes the reminder and its first job in one transaction, and says what was set (nothing personal where it may not be told). */
+    const create = (text: string, said: Exclude<When, { kind: "ask" }>, scope: "me" | "household" | undefined, now: number) =>
+      Effect.gen(function*() {
+        const turn = yield* CurrentTurn
+        const l = sh.lang()
+        const person = turn?.person?.id
+        const personal = scope === "me" ? true : scope === "household" ? false : person !== undefined
+        // Personal content needs an owner: nobody known is asking, so ask whose, write nothing, repeat nothing.
+        if (personal && person === undefined) return { spoken: say(texts, l, "whose") }
+        const z = sh.zone()
+        const owner = personal ? person : undefined
+        const rem: Reminder = {
+          text, whose: owner === undefined ? "household" : "personal", state: "open", dueAt: said.at,
+          ...(owner !== undefined ? { owner } : {}),
+          ...(turn?.deviceId !== undefined ? { deviceId: turn.deviceId } : {}),
+          ...(turn?.assistantId !== undefined ? { assistantId: turn.assistantId } : {}),
+          ...(person !== undefined ? { setBy: person } : {}),
+          ...(said.kind === "repeat" ? { rrule: said.rrule, dtstart: said.dtstart, timeZone: said.timeZone } : {})
+        }
+        const id = randomUUID()
+        const quiet = personalQuiet(owner, turn)
+        yield* sh.exclusive(Effect.gen(function*() {
+          const job = yield* sh.prepareDue(id, rem, said.at)
+          yield* ctx.store.transaction((tx) => {
+            tx.collection(reminders).insert(rem, { id })
+            job.writeIn(tx)
+          })
+        })).pipe(Effect.mapError((e) => new ToolError({ message: say(texts, l, "reason" in e && e.reason === "limit" || ("message" in e && /live jobs|limit/i.test(String(e.message))) ? "tooMany" : "unsaved") })))
+        const at = momentText(said.at, l, z, now)
+        const rule = said.kind === "repeat" ? (said.rule ?? say(texts, l, "repeating")) : ""
+        const spoken = said.kind === "once"
+          ? say(texts, l, quiet ? "setOncePrivate" : owner === undefined ? "setOnceHousehold" : "setOnce", { when: at, text })
+          : say(texts, l, quiet ? "setRepeatPrivate" : owner === undefined ? "setRepeatHousehold" : "setRepeat", { when: at, text, rule })
+        return { spoken, ...(owner !== undefined ? { owner } : {}) }
+      })
+
     const setTool = makeTool({
       name: "reminders_set",
       description:
@@ -452,41 +488,12 @@ export const remindersModule = defineModule({
       },
       execute: ({ text, when, scope }) =>
         Effect.gen(function*() {
-          const turn = yield* CurrentTurn
           const l = sh.lang()
-          const person = turn?.person?.id
-          const personal = scope === "me" ? true : scope === "household" ? false : person !== undefined
-          // Personal content needs an owner: nobody known is asking, so ask whose, write nothing, repeat nothing.
-          if (personal && person === undefined) return { spoken: say(texts, l, "whose") }
           if (looksLikeCode(text)) return { spoken: say(texts, l, "code") }
           const now = yield* Clock.currentTimeMillis
-          const z = sh.zone()
-          const said = parseWhen(when, l, z, now)
+          const said = parseWhen(when, l, sh.zone(), now)
           if (said.kind === "ask") return { spoken: say(texts, l, said.key) }
-          const owner = personal ? person : undefined
-          const rem: Reminder = {
-            text, whose: owner === undefined ? "household" : "personal", state: "open", dueAt: said.at,
-            ...(owner !== undefined ? { owner } : {}),
-            ...(turn?.deviceId !== undefined ? { deviceId: turn.deviceId } : {}),
-            ...(turn?.assistantId !== undefined ? { assistantId: turn.assistantId } : {}),
-            ...(person !== undefined ? { setBy: person } : {}),
-            ...(said.kind === "repeat" ? { rrule: said.rrule, dtstart: said.dtstart, timeZone: said.timeZone } : {})
-          }
-          const id = randomUUID()
-          const quiet = personalQuiet(owner, turn)
-          yield* sh.exclusive(Effect.gen(function*() {
-            const job = yield* sh.prepareDue(id, rem, said.at)
-            yield* ctx.store.transaction((tx) => {
-              tx.collection(reminders).insert(rem, { id })
-              job.writeIn(tx)
-            })
-          })).pipe(Effect.mapError((e) => new ToolError({ message: say(texts, l, "reason" in e && e.reason === "limit" || ("message" in e && /live jobs|limit/i.test(String(e.message))) ? "tooMany" : "unsaved") })))
-          const at = momentText(said.at, l, z, now)
-          const rule = said.kind === "repeat" ? (said.rule ?? say(texts, l, "repeating")) : ""
-          const spoken = said.kind === "once"
-            ? say(texts, l, quiet ? "setOncePrivate" : owner === undefined ? "setOnceHousehold" : "setOnce", { when: at, text })
-            : say(texts, l, quiet ? "setRepeatPrivate" : owner === undefined ? "setRepeatHousehold" : "setRepeat", { when: at, text, rule })
-          return { spoken, ...(owner !== undefined ? { owner } : {}) }
+          return yield* create(text, said, scope, now)
         })
     })
 
@@ -660,12 +667,40 @@ export const remindersModule = defineModule({
         }).pipe(Effect.mapError((e) => (e instanceof ToolError ? e : failed(sh.lang()))))
     })
 
+    const remindIn = defineAction({
+      id: "remind_in",
+      label: "Remind me in a while",
+      description: "Set a reminder a said time from now (\"remind me in ten minutes to call mum\"), for the person asking, or the household when nobody is known. A clock time or a repeat is reminders_set.",
+      examples: ["remind me in ten minutes to take the pizza out", "remind me in an hour to call mum", "herinner me over tien minuten om te bellen"],
+      params: {
+        delay: Param.duration({ label: "In how long", minMs: 60_000, maxMs: MAX_AHEAD_MS }),
+        text: Param.text({ label: "What to remind of", after: ["to", "om"], maxWords: 8 })
+      },
+      // The moment is a duration (never a clock time, which would have to be guessed), the words are the one text slot at
+      // the end; a clock time or a repeat goes to the model.
+      phrases: { en: ["remind me in {delay} to {text}"], nl: ["herinner me over {delay} om {text}"] },
+      risk: "change",
+      run: ({ delay, text }) =>
+        Effect.gen(function*() {
+          const l = sh.lang()
+          if (!isLine(text, TEXT_CHARS)) return { say: say(texts, l, "unsaved") }
+          if (looksLikeCode(text)) return { say: say(texts, l, "code") }
+          const now = yield* Clock.currentTimeMillis
+          const made = yield* create(text, { kind: "once", at: now + delay }, undefined, now)
+          return { say: made.spoken }
+        }).pipe(Effect.mapError((e) => new ActionError({ message: e instanceof ToolError ? e.message : say(texts, sh.lang(), "unsaved") })))
+    })
+
     const ringingDone = defineAction({
       id: "ringing_done",
       label: "Reminder done",
       description: "The reminder that is ringing or waiting on this device is done. Not for finding a reminder by its words: that is reminders_done.",
       examples: ["done", "that's done", "I've done it", "klaar", "dat is gedaan"],
       params: {},
+      // No slot: a reminder's words are free text, so these name the reminder only as "the reminder". "done" alone is a
+      // button's label while it rings (the ringing window takes it without the wake phrase) and is not a phrase here,
+      // where another module's "done" could meet it.
+      phrases: { en: ["reminder done", "mark the reminder as done", "that reminder is done"], nl: ["herinnering klaar", "markeer de herinnering als klaar", "die herinnering is klaar"] },
       risk: "change",
       offerAsTool: false,
       run: () =>
@@ -684,6 +719,8 @@ export const remindersModule = defineModule({
       description: "Put off the reminder that is ringing or waiting on this device, for some minutes (the setting's default when none is said).",
       examples: ["snooze", "snooze it for ten minutes", "remind me again in half an hour", "uitstellen", "herinner me over tien minuten nog eens"],
       params: { for: Param.duration({ label: "For how long", optional: true, minMs: 60_000, maxMs: DAY }) },
+      // The duration is the only slot, and optional: without it the setting's default is used.
+      phrases: { en: ["snooze the reminder", "snooze the reminder for {for}"], nl: ["stel de herinnering uit", "stel de herinnering {for} uit"] },
       risk: "change",
       run: ({ for: ms }) =>
         Effect.gen(function*() {
@@ -697,7 +734,7 @@ export const remindersModule = defineModule({
 
     return Effect.succeed({
       tools: [setTool, listTool, changeTool, cancelTool, doneTool],
-      actions: [ringingDone, ringingSnooze],
+      actions: [remindIn, ringingDone, ringingSnooze],
       instructions: "Reminders: a task at a moment (a time, or a repeat) is a reminder; a bare duration is a timer; a task without a moment is a list item. Never guess a time that was not said: ask."
     })
   }
