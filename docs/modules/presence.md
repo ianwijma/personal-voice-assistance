@@ -83,16 +83,12 @@ presentation can have several owners (see below).
   device with no screen, or a page that cannot draw lists, is told nothing different: the answer is spoken as before.
 - **The list is the answer.** Its person and its overflow line come from the same selection as the sentences (the same
   people, the same "and N more"), with every note the answer has.
-- **What is on screen follows the data.** The module keeps the handle of every list it was given, on each device (in
-  memory, at most 32 devices), whether or not a page shows it at that moment (a page that gains a screen later must not
-  show what is out of date). The next answer from that device takes it down first (and shows a new one only if it has
-  something to show, so an empty answer withdraws it), and any change of a Home Assistant person, a snapshot, a break
-  of the connection or the end of its stream takes every list down. A list is not rewritten out of a turn: it is taken
-  down, and shown again by asking again.
-- **After a restart** of the module its lists are gone with it (the Presenter withdraws a stopped part's transient
-  presentations) and the memory of them with it.
-- **A phrase turn that repeats** (same assistant, conversation, turn and device) is shown once; a call the model makes
-  runs every time.
+- **The list is a snapshot of its answer.** The action may run speculatively (before its turn is committed), so it never
+  shows anything from inside its run: it returns the list with its result, and the host shows it when the turn is
+  promoted and drops it when the turn is discarded (docs/PRESENTING.md). The module keeps no handle and withdraws
+  nothing: a change in Home Assistant, an empty answer or a restart does not take a list down. It ends after its
+  lifetime (30 seconds), or when the next answer from that device (or any other transient presentation there) replaces
+  it. A device that gains a screen later may show what was returned until then, at most for that lifetime.
 - **A phrase's answer fits what a phrase may say** (300 characters): in a phrase turn the module names fewer people, whole
   sentences only, so that "and N more", the count of people not said here and the lost-connection warning are never cut
   off. Outside a phrase turn the answer is as it was (up to four people).

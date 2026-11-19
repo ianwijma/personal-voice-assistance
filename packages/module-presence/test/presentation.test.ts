@@ -5,7 +5,7 @@ import { assert, describe, it, vi } from "@effect/vitest"
 import { provide, startTestModule, stubService } from "@pva/core/testing"
 import { type HaChange, type HaConnection, type HaEntity, HomeAssistant, type HomeAssistantService } from "@pva/module-contracts"
 import { type Cause, Effect, Queue, Stream } from "effect"
-import { PRESENT_OWNER, presentations } from "@pva/core"
+import { CurrentTurnCommit, PRESENT_OWNER, presentations } from "@pva/core"
 import { cutText, presenceModule } from "../src/index.ts"
 
 vi.setConfig({ testTimeout: 30_000 })
@@ -186,31 +186,6 @@ describe("who is home: the list", () => {
       assert.deepStrictEqual(listOf(solo, PHONE)[0]?.items.map((i) => i.text), ["Robin: out"])
     }))
 
-  it.effect("a list the page could not show is still withdrawn by a change, an empty answer or a stop (the page gains a screen later)", () =>
-    Effect.gen(function*() {
-      const household = {
-        people: [{ id: "p-sam", name: "Sam" }, { id: "p-robin", name: "Robin" }, { id: "p-alex", name: "Alex" }],
-        devices: [{ id: "robins-tablet", name: "Tablet", room: "Hall", privacy: "private", defaultPerson: "p-robin", capabilities: { v: 1, speaker: { media: ["speech"] } } }]
-      }
-      const ha = yield* makeHa(world())
-      const kit = yield* startTestModule(presenceModule, { settings: { people: [links[1]!] }, provide: [ha.provided], household } as never)
-      yield* kit.phrases.say("who is home", { device: "robins-tablet", turnId: 5 } as never)
-      yield* kit.present.settle
-      assert.strictEqual(kit.present.engine.live().length, 1, "stored although nothing shows it")
-      assert.deepStrictEqual(kit.present.shown("robins-tablet"), [])
-      ha.move("person.robin", "home", START)
-      yield* kit.advance(10)
-      yield* kit.present.settle
-      assert.deepStrictEqual(kit.present.engine.live(), [], "the change withdrew it")
-      // An empty answer withdraws one too.
-      yield* kit.phrases.say("who is home", { device: "robins-tablet", turnId: 6 } as never)
-      yield* kit.present.settle
-      assert.strictEqual(kit.present.engine.live().length, 1)
-      yield* kit.action("who_is_home", { person: "p-sam" }, { device: "robins-tablet", turnId: 7 })
-      yield* kit.present.settle
-      assert.deepStrictEqual(kit.present.engine.live(), [])
-    }))
-
   it.effect("a phrase answer fits a phrase's reply, whole items with the warning and the count kept, in both languages; a model call does not shrink", () =>
     Effect.gen(function*() {
       const en = yield* startSix()
@@ -279,64 +254,62 @@ describe("who is home: the list", () => {
       assert.strictEqual(kit.present.engine.live()[0]?.owner, "p-robin")
     }))
 
-  it.effect("a change of the data takes it down; the next answer replaces it; an empty answer withdraws it", () =>
+  it.effect("a list is a snapshot of its answer: a change in Home Assistant leaves it, an empty answer leaves it, the next answer replaces it, and it ends by its lifetime", () =>
     Effect.gen(function*() {
-      const household = {
-        people: [{ id: "p-sam", name: "Sam" }, { id: "p-robin", name: "Robin" }, { id: "p-alex", name: "Alex" }],
-        devices: [
-          { id: KITCHEN, name: "Kitchen display", room: "Kitchen", privacy: "shared", defaultPerson: "p-sam" },
-          { id: "robin-tablet", name: "Robin's tablet", room: "Bedroom", privacy: "shared", defaultPerson: "p-robin" }
-        ]
-      }
-      const { kit, ha } = yield* start({ household })
-      let turn = 20
-      const ask = (device: string, params: Record<string, unknown> = {}) => kit.action("who_is_home", params, { device, turnId: ++turn })
-      yield* ask(KITCHEN)
-      yield* ask("robin-tablet")
+      const { kit, ha } = yield* start({ household: { devices: [{ id: KITCHEN, name: "Kitchen display", room: "Kitchen", privacy: "shared", defaultPerson: "p-sam" }] } })
+      const ask = (turnId: number, params: Record<string, unknown> = {}) => kit.action("who_is_home", params, { device: KITCHEN, turnId })
+      yield* ask(1)
       yield* kit.present.settle
-      const first = kit.present.shown(KITCHEN)[0]!.id
-      assert.strictEqual(kit.present.shown("robin-tablet").length, 1)
-      // Someone arrives: what was shown is no longer true, so it all comes down.
-      ha.move("person.robin", "home", START)
+      const first = kit.present.shown(KITCHEN)
+      assert.strictEqual(first.length, 1)
+      // Sam leaves: the list still says what the answer said (a snapshot; nothing withdraws it).
+      ha.move("person.sam", "not_home", START)
       yield* kit.advance(10)
       yield* kit.present.settle
+      assert.deepStrictEqual(kit.present.shown(KITCHEN).map((p) => p.id), first.map((p) => p.id))
+      // An empty answer leaves it too (a read cannot withdraw anything).
+      yield* ask(2, { person: "p-robin" })
+      yield* kit.present.settle
+      assert.deepStrictEqual(kit.present.shown(KITCHEN).map((p) => p.id), first.map((p) => p.id))
+      // The next answer replaces it on that device: one list, the new one.
+      yield* ask(3)
+      yield* kit.present.settle
+      const next = kit.present.shown(KITCHEN)
+      assert.strictEqual(next.length, 1)
+      assert.notStrictEqual(next[0]!.id, first[0]!.id)
+      assert.strictEqual(listOf(kit, KITCHEN)[0]?.items[0]?.text, "Sam: out since 10:00")
+      // And it ends by its lifetime.
+      yield* kit.advance(31_000)
+      yield* kit.present.settle
       assert.deepStrictEqual(kit.present.shown(KITCHEN), [])
-      assert.deepStrictEqual(kit.present.shown("robin-tablet"), [])
-      // Asked again: a new show, and asked once more the one shown is replaced, never two.
-      yield* ask(KITCHEN)
-      yield* ask("robin-tablet")
-      yield* kit.present.settle
-      assert.notStrictEqual(kit.present.shown(KITCHEN)[0]!.id, first)
-      yield* ask(KITCHEN)
-      yield* kit.present.settle
-      assert.strictEqual(kit.present.shown(KITCHEN).length, 1)
-      // An empty answer on the kitchen display (Robin is not Sam's to tell) withdraws its list, and only its list.
-      assert.isTrue((yield* ask(KITCHEN, { person: "p-robin" })).ok)
-      yield* kit.present.settle
-      assert.deepStrictEqual(kit.present.shown(KITCHEN), [])
-      assert.strictEqual(kit.present.shown("robin-tablet").length, 1)
     }))
 
-  it.effect("a repeated phrase turn is shown once; a model's second call on the same turn is shown again", () =>
+  it.effect("a speculative turn that is discarded shows nothing and withdraws nothing; a promoted one shows once", () =>
     Effect.gen(function*() {
-      const { kit } = yield* start({ household: { devices: [{ id: KITCHEN, name: "Kitchen", room: "Kitchen", privacy: "shared", defaultPerson: "p-sam" }] } })
+      const { kit } = yield* start({ household: { devices: [{ id: KITCHEN, name: "Kitchen display", room: "Kitchen", privacy: "shared", defaultPerson: "p-sam" }] } })
+      const held: Array<() => void> = []
+      const speculative = { committed: () => false, whenCommitted: (f: () => void) => void held.push(f) }
+      const askSpeculatively = (turnId: number) => kit.action("who_is_home", {}, { device: KITCHEN, turnId }).pipe(Effect.provideService(CurrentTurnCommit, speculative))
       const shows = () => kit.present.messages.filter((m) => m.deviceId === KITCHEN && m.message.type === "present.show").length
-      const phrase = (turnId: number) => kit.action("who_is_home", {}, { device: KITCHEN, turnId, source: "phrase" })
-      yield* phrase(31)
+      yield* kit.action("who_is_home", {}, { device: KITCHEN, turnId: 1 })
       yield* kit.present.settle
+      const before = kit.present.shown(KITCHEN).map((p) => p.id)
+      assert.strictEqual(before.length, 1)
       assert.strictEqual(shows(), 1)
-      assert.isTrue((yield* phrase(31)).ok)
+      // Discarded: the held work is never run. Nothing new is shown and the earlier list is still there.
+      assert.isTrue((yield* askSpeculatively(2)).ok)
       yield* kit.present.settle
+      held.length = 0
       assert.strictEqual(shows(), 1)
-      yield* phrase(32)
+      assert.deepStrictEqual(kit.present.shown(KITCHEN).map((p) => p.id), before)
+      // Promoted: the held work runs once and the list is shown once, replacing the earlier one.
+      yield* askSpeculatively(3)
+      assert.isAtLeast(held.length, 1)
+      for (const f of held) f()
       yield* kit.present.settle
       assert.strictEqual(shows(), 2)
-      // The model calls it twice in one turn on purpose: each call runs.
-      yield* kit.action("who_is_home", {}, { device: KITCHEN, turnId: 33, source: "voice" })
-      yield* kit.present.settle
-      yield* kit.action("who_is_home", {}, { device: KITCHEN, turnId: 33, source: "voice" })
-      yield* kit.present.settle
-      assert.strictEqual(shows(), 4)
+      assert.strictEqual(kit.present.shown(KITCHEN).length, 1)
+      assert.notDeepEqual(kit.present.shown(KITCHEN).map((p) => p.id), before)
     }))
 
   it.effect("a restart of the module takes the list down, and the module shows again afterwards", () =>

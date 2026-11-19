@@ -8,7 +8,6 @@ import {
   type PeopleService,
   Param,
   PHRASE_ANSWER_CHARS,
-  type PresentHandle,
   type Presentation,
   People,
   type Person,
@@ -159,9 +158,6 @@ interface Tracked {
   readonly awaySince?: number
 }
 
-/** The most devices whose "who is home" list is remembered (one handle each), and the most turns remembered as shown. */
-const MAX_HANDLES = 32
-const MAX_SEEN = 64
 /** The most items of a list presentation, the longest name shown in one, and its longest spoken fallback. */
 const LIST_ITEMS = 12
 const NAME_CHARS = 30
@@ -183,12 +179,6 @@ const oneLine = (s: string): string => s.replace(/[\ud800-\udbff](?![\udc00-\udf
 
 /** What the shared part offers the instances. */
 interface Shared {
-  /** The "who is home" lists on screen, by device: kept so that the next answer or a change of the data withdraws them. */
-  readonly shown: Map<string, PresentHandle>
-  /** The turns whose answer was already shown (a replay of one shows nothing twice). */
-  readonly seen: Set<string>
-  /** Takes every list down (the data changed or its stream broke). */
-  readonly withdrawAll: Effect.Effect<void>
   /** When the person went away, if the module saw it happen and the person is still away: else `undefined`. */
   readonly awaySince: (entityId: string, liveState: string) => number | undefined
 }
@@ -254,16 +244,6 @@ export const makePresenceModule = () => {
 
         // What the module knows, in memory: every person entity's last state, and the departures waiting out the delay.
         const tracked = new Map<string, Tracked>()
-        // The lists on screen (in memory; a restart of the module takes its transient presentations down with it).
-        const shown = new Map<string, PresentHandle>()
-        const seen = new Set<string>()
-        const quietly = (e: Effect.Effect<unknown, unknown>): Effect.Effect<void> => e.pipe(Effect.ignore, Effect.catchDefect(() => Effect.void))
-        /** The data a list shows changed or can no longer be trusted: every list comes down (none is rewritten out of a turn). */
-        const withdrawAll = Effect.suspend(() => {
-          const handles = [...shown.values()]
-          shown.clear()
-          return Effect.forEach(handles, (h) => quietly(h.dismiss), { discard: true })
-        })
         const pending = new Map<string, { readonly token: object; readonly fiber: Fiber.Fiber<void> }>()
 
         /** Calls a waiting departure off, at once; true when there was one. */
@@ -347,7 +327,6 @@ export const makePresenceModule = () => {
                 // A snapshot is a state, not news: it calls off every waiting departure and announces nothing. A person
                 // whose state and last change are exactly as the module knew them keeps when they went away.
                 cancelAll()
-                yield* withdrawAll
                 const before = new Map(tracked)
                 tracked.clear()
                 for (const e of change.entities) {
@@ -360,28 +339,24 @@ export const makePresenceModule = () => {
               }
               case "connection":
                 if (change.connection !== "connected") cancelAll()
-                yield* withdrawAll
                 return
               case "removed":
                 cancel(change.entityId)
-                yield* withdrawAll
                 tracked.delete(change.entityId)
                 return
               case "changed":
                 // A change with no previous entity is one new to Home Assistant's cache: what it is now is not news.
                 if (change.entity.domain === "person") {
-                  yield* withdrawAll
-                  yield* onChanged(change.entity, change.previous)
+                    yield* onChanged(change.entity, change.previous)
                 }
                 return
             }
           })
 
         /** The stream ended (the provider stopped or was replaced): nothing pending survives, and the next snapshot is the baseline. */
-        const reset = Effect.suspend(() => {
+        const reset = Effect.sync(() => {
           cancelAll()
           tracked.clear()
-          return withdrawAll
         })
 
         // Home Assistant's changes, for as long as this part lives. The provider is looked up again each time the
@@ -398,9 +373,6 @@ export const makePresenceModule = () => {
         )
 
         const shared: Shared = {
-          shown,
-          seen,
-          withdrawAll,
           awaySince: (entityId, liveState) => {
             const known = tracked.get(entityId)
             return isAway(liveState) && isAway(known?.state) ? known.awaySince : undefined
@@ -524,41 +496,6 @@ export const makePresenceModule = () => {
           return { kind: "list", title: say(texts, lang, "listTitle"), style: "bullets", items, spoken, sensitivity: { personal: g.rows[0]!.owner } }
         }
 
-        /**
-         * Shows the answer on the asking device, as a transient list, and keeps its handle (whether or not a page shows it
-         * now: a page that gains a screen later must not show what is out of date): the next answer from that device takes
-         * it down first (and shows nothing when it has nothing to show), and a change of the data takes every list down. A
-         * device that cannot show it changes nothing about the answer. A phrase turn that repeats (same assistant,
-         * conversation, turn and device) is shown once; a call the model makes runs every time.
-         */
-        const showAnswer = (lang: Lang, g: Gathered, named: number): Effect.Effect<void> =>
-          Effect.gen(function*() {
-            const turn = yield* CurrentTurn
-            const device = turn?.deviceId
-            if (turn === undefined || device === undefined) return
-            if (turn.source === "phrase") {
-              const identity = JSON.stringify([turn.assistantId, turn.conversationId, turn.turnId, device])
-              if (ctx.shared.seen.has(identity)) return
-              ctx.shared.seen.add(identity)
-              if (ctx.shared.seen.size > MAX_SEEN) ctx.shared.seen.delete(ctx.shared.seen.values().next().value!)
-            }
-            const before = ctx.shared.shown.get(device)
-            ctx.shared.shown.delete(device)
-            if (before !== undefined) yield* before.dismiss.pipe(Effect.ignore, Effect.catchDefect(() => Effect.void))
-            if (g.kind !== "rows") return
-            const presentation = listOf(lang, g, named)
-            if (presentation === undefined) return
-            const handle = yield* ctx.present.show("origin", presentation).pipe(Effect.option, Effect.catchDefect(() => Effect.succeed(Option.none<PresentHandle>())))
-            if (Option.isNone(handle)) return
-            ctx.shared.shown.set(device, handle.value)
-            if (ctx.shared.shown.size > MAX_HANDLES) {
-              const oldest = ctx.shared.shown.keys().next().value!
-              const old = ctx.shared.shown.get(oldest)!
-              ctx.shared.shown.delete(oldest)
-              yield* old.dismiss.pipe(Effect.ignore, Effect.catchDefect(() => Effect.void))
-            }
-          })
-
         const where = makeTool({
           name: "presence_where",
           description: "Say whether a household member is home (or out) according to Home Assistant, or who is home when no name is given. Where people are is personal: it is only told on a device that may reveal it.",
@@ -646,8 +583,9 @@ export const makePresenceModule = () => {
               // In a phrase turn the answer must fit what a phrase may say; anywhere else it is as it always was.
               const turn = yield* CurrentTurn
               const named = namedCount(lang, g, turn?.source === "phrase" ? PHRASE_ANSWER_CHARS : undefined)
-              yield* showAnswer(lang, g, named)
-              return { say: sentences(lang, g, named) }
+              // The list goes with the result: it is shown when the turn is promoted and dropped when it is discarded.
+              const present = g.kind === "rows" ? listOf(lang, g, named) : undefined
+              return { say: sentences(lang, g, named), ...(present !== undefined ? { present } : {}) }
             })
         })
 
