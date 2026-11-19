@@ -8,6 +8,13 @@ branches: `t3/modules-11-scaffold` at `5bfeca0d` (P1 to P6 and the scaffold, wit
 `t3/modules-10-present` at `3280b6ef`, `t3/module-calendar` at `7050c33e` and `t3/module-smart-home` at `e8f64ba8`.
 None of it is on `main`.
 
+Note, 2026-11-19 evening: the branches named above have moved since (their final heads are in
+[MODULES-STATUS.md](MODULES-STATUS.md)); nothing that changed there alters the order or the designs below. Two things
+to read first when this plan is taken up: the owner's instruction on reviews (one Sol round per pull request, more only
+where something is badly broken) replaces the review rounds of MODULES-PLAN §6 for this plan too; and the owner wants
+to try out the modules first and may rework how modules and tool calls are done, so check this plan against the code
+again before starting it.
+
 Everything in MODULES-PLAN §2 (decisions), §3 (rules for every PR, what host code must survive) and §6 (review)
 applies here unchanged. Where this document and a research document disagree, this document wins. Where the research
 and the code disagree, the code wins, and the section says so.

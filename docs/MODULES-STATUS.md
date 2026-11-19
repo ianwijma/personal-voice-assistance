@@ -1,15 +1,30 @@
 # Modules: where the work stands
 
 Status of the work planned in [MODULES-PLAN.md](MODULES-PLAN.md), kept here so it does not depend on any one working
-session. Updated 2026-11-19, 17:40. Nothing below is merged into `main`; the owner merges.
+session. Updated 2026-11-19, 18:39. Nothing below is merged into `main`; the owner merges.
 
-**How it is being finished (owner's instruction, 2026-11-19 afternoon).** Wrap up so that testing can start: one
-review round per pull request, a second or third only where something is badly broken. Every pull request below has
-had at least one complete review. From here a pull request closes when its running fix round is pushed and CI is
-green; the further checks that were planned for reminders, timers, routines and the follow-ups are dropped (three
-that had just started were stopped). Only the checks already running on the presentation layer (P10) and on the
-rebuilt pinned checklist (lists follow-up) are allowed to finish, and only what would break use is fixed from them.
-Everything is then merged together on one branch for testing (see "One branch with everything").
+**State: the work is done and waits for the owner.** Every preparation part, every module that was not deferred and
+every follow-up has an open pull request, has had at least one complete Sol review, and has its findings fixed. On
+the owner's instruction (2026-11-19 afternoon: wrap up so that testing can start; one review round per pull request, a
+second or third only where something is badly broken; "acceptable for now", then iterate) the further checks that
+were planned for reminders, timers, routines and the follow-ups were dropped, and no head got another review after its
+last fix round. The reviewer's allowance also ran out that afternoon: the last three checks (P10's third round, in two
+parts, and the lists follow-up's second) stopped early; what they had already reproduced was fixed or is written down
+under "Known gaps kept on purpose".
+
+**The whole, on one branch: `t3/modules-13-all`, pull request #130 (`08b3c65c`, plus merges of this page).** Every branch below merged
+together, merges only, plus one commit of its own (a 20 second test limit for the `node` project on CI). On it:
+`pnpm check` passes; `pnpm test`: 10,094 passed and one failed, a measurement (the music module's latency test
+"resolving a room at the largest cache": 10.2 ms on the main thread against its 10 ms bound in the full run; alone it
+passed three times out of three; the run before the last two merges had 10,085 passed, none failed); the browser
+tests pass (218 cases). This is
+the branch to try out. Putting the parts together found three faults, fixed on their own branches: the risk layer
+withheld every refusal and failure sentence of a module with per-answer privacy (#115, corrected: a module's own
+failure sentence goes back as it is, a crash stays withheld); reminders tagged an already reduced confirmation with
+its owner (#114); a browser test did not know the new Risk policy page (#115).
+
+**Two ways to merge.** Either #130 alone (it contains every commit of #87 to #129; the others can then be
+closed), or the stack one by one in the order of the tables below.
 
 ## The stack
 
@@ -28,8 +43,8 @@ findings fixed; it does not mean merged.
 | P11 scaffold, contracts, test kit, guide | #94 | `t3/modules-11-scaffold` | `5bfeca0d` | closed; CI green |
 | P9 notifications, speech, ringing | #106 | `t3/modules-09-notify` | `a7fccff9` | closed after three review rounds; carries the scaffold's last store fix |
 | P7 phrase commands, essential controls | #107 | `t3/modules-07-phrases` | `3ce75007` | closed after two review rounds (24, then 8 findings, all fixed); CI was green at `86ab9161`; the head adds a merge of P9 and one test fix (a wall-clock limit that failed on a loaded CI machine) |
-| P10 presentation | #108 | `t3/modules-10-present` | `ae20348a` | three rounds so far: 30 findings, then 15, all addressed; the second round also added the rule that nothing a speculative turn asks for reaches a screen before the turn is promoted. A third-round check is running |
-| P8 risk policy in admin | #115 | `t3/modules-08-risk` | `d5601c95` | first review found 7 problems and 2 notes, all addressed; the fixed P10 is merged in; a press and a phrase command are decided by the policy; deciding review running. It takes in P10's second round when that lands |
+| P10 presentation | #108 | `t3/modules-10-present` | `f83e6cae` | closed: two complete reviews (30, then 15 findings, all addressed) and a third check that stopped early (three reproduced faults fixed: a stale card's button could run its replacement's action; an update did not rebuild the maintenance jobs; a failed read forgot a held image). Since round 2: nothing a speculative turn asks for reaches a screen before the turn is promoted |
+| P8 risk policy in admin | #115 | `t3/modules-08-risk` | `ca5dc31f` | closed: two reviews (7 findings and 2 notes, then 4), all fixed; a press and a phrase command are decided by the policy; then corrected after the parts were put together (a module's own failure sentence is no longer withheld) |
 
 **Fixes to P1 to P6 code found later live on the scaffold branch**, not on their own branches: the worker-thread
 helper `offThread`; POST and typed loopback in `@pva/net`; the gateway no longer timing its own risk lookup (an
@@ -59,18 +74,9 @@ its own pull request on the scaffold.
 
 CI is green on all eleven at these heads. They carry the whole scaffold (`5bfeca0d`); their heads moved with that merge (see each pull request).
 
-**Integration branch**: `t3/modules-12-wave-a`, pull request #116 (`d19e7944`): the presentation branch (P10, after its
-second fix round) with the eleven module branches merged in, merges only. `pnpm check` passes; in the full local run
-one test fails under load and passes alone (the calendar module's latency test cannot read its store when the whole
-suite runs beside it; CI runs latency tests one at a time and has passed it). It is the base for the follow-up pull
-requests. P8 is merged into it when it closes, and it is then retargeted to the top of the stack.
-
-**One branch with everything**: being put together as the pieces close (`t3/modules-13-all`, not pushed yet): the
-integration branch above plus every wave B module, routines, P8 and every follow-up, merges only. So far it holds
-assistant controls, notifications, images, broadcast, music, reminders and the briefing, core tools, kitchen and
-presence follow-ups: no merge conflicts, `pnpm check` passes. When the last fix rounds are in it gets the full test
-run and the browser tests once, and a pull request of its own, so that the whole can be tried out and merged in one
-step if the owner prefers that to merging the stack one by one.
+**Integration branch**: `t3/modules-12-wave-a`, pull request #116 (`6ffa37db`): the presentation branch (P10, final)
+with the eleven module branches merged in, merges only. It is the base of the follow-up pull requests. Everything in
+it is also in the branch with everything.
 
 ## Wave B: the modules that need P7 to P10
 
@@ -83,56 +89,94 @@ Each sits on the newest part it needs for now and moves on top of P8 at the end.
 | images and photos | #111 | `t3/module-images` | `4965a03d` | closed: two reviews (15, then 3 findings), all fixed, CI green |
 | broadcast | #112 | `t3/module-broadcast` | `5e84f110` | closed: reviewed (8 findings and a note), fixed, adapted to P10's fix round |
 | music | #113 | `t3/module-music` | `081edbdb` | closed: two reviews (16, then 4 findings), all fixed, CI green |
-| reminders | #114 | `t3/module-reminders` | `806bd328` | closed: two reviews (22, then 9 findings), both fix rounds done (84 tests), the fixed P10 merged in; no third check (owner's instruction) |
-| timers and alarms | #117 | `t3/module-timers` | `cc2788e3` | two reviews (14, then 13 findings); rebuilt around one state and one job per timer and alarm; second fix round running (changing an alarm is cut: cancel and set again; one ring per timer or alarm at a time) |
-| routines and automations | #129 | `t3/module-routines` | `49bc910c` | first review found 8 problems; fix round running. The contract changed where the host offers nothing to build on: a routine is checked step by step and stops, with a true sentence, where a step is refused; a called action's answer is not read out; it gets its own way to be cancelled |
+| reminders | #114 | `t3/module-reminders` | `d2a603b1` | closed: two reviews (22, then 9 findings), both fix rounds done; one fix after the parts were put together (a reduced confirmation carries no owner) |
+| timers and alarms | #117 | `t3/module-timers` | `37e0f5ce` | closed: two reviews (14, then 13 findings), both fix rounds done (103 tests). Changing an alarm was cut (cancel and set again); one ring per timer or alarm at a time; Stop pressed in the same instant as a snooze can lose (stated on the page) |
+| routines and automations | #129 | `t3/module-routines` | `f9b5a440` | closed: one review (8 findings and a note), fixed (62 tests). A routine is checked step by step and stops, with a true sentence, where a step is refused; a called action's answer is not read out; "cancel the routine" stops one; at most 15 routines |
 
-## What is left, in order
+## The follow-ups: phrase commands and what is shown on a screen
 
-1. P10 (#108): review, fix, merge P7 into it, make P7 its base.
-2. P8, first version (the risk policy as a household setting in admin): finish the build, review, fix.
-3. A browser-test run with new cases and fresh screenshots at the top of the stack (the last one on the whole stack was at P6; the existing 218 cases pass on P9).
-4. Wave B, one pull request per module (table above): finish the review and fix rounds, build timers and routines,
-   move every one on top of P8, CI green.
-5. The phrase commands and presentations wave A left out: one small pull request per module on
-   `t3/modules-12-wave-a` (#116), branches `t3/follow-<module>`, each reviewed and fixed. Started 2026-11-19 on the
-   fixed P10: lists, kitchen, smart home, calendar, memory and local info are being built; presence, briefing, news,
-   web search and core tools start as those report.
-   State: all eleven have a pull request and a complete review; every one had findings, and every one is fixed or
-   in its last fix round. Closed: briefing #118 (CI green), core tools #126 (`748f6205`), kitchen #120 (`c0bd38f5`,
-   cut down to the phrase and a plain list), presence #121 (`cdc7da9a`). Taking in P10's rule about speculative
-   turns now (the list or card is returned with the answer and is a snapshot of it), then closed: memory #119,
-   calendar #123, web search #124 (its list comes back now that the rule exists), smart home #125 (cut down to the
-   room-less phrases and a snapshot list), news #127. Lists #122: the pinned checklist rebuilt as one saved state per
-   device, its check running. Local info #128: fix round running.
-6. Deferred, with a plan of their own ([MODULES-DEFERRED-PLAN.md](MODULES-DEFERRED-PLAN.md): sixteen pull requests in order, with eighteen decisions for the owner and a recommendation for each): google, t3-code, mcp-client, calls and intercom, CalDAV; connections and
-   OAuth (the rest of P8); streaming and WebSocket to an owner-typed address.
+One small pull request per first-wave module on `t3/modules-12-wave-a`, each reviewed once and fixed. Where a list or
+card comes from a tool that may run before its turn is committed, it is returned with the answer and is a snapshot of
+it (shown when the turn is promoted, never updated or withdrawn later).
+
+| Module | Pull request | Head | What it adds, and what was cut |
+|---|---|---|---|
+| briefing | #118 | `72d67c78` | phrase command; 6 findings and a note fixed |
+| memory and notes | #119 | `f9bcc8d3` | the Remembered card with Undo; recall and notes lists as snapshots; 5 findings fixed |
+| kitchen | #120 | `c0bd38f5` | "we're out of …" phrase and a plain list of what the answer named; the kept, ticked checklist was cut (8 findings) |
+| presence | #121 | `cdc7da9a` | "who is home" phrase; a list only for one person or the reduced answer; 5 findings fixed |
+| lists | #122 | `ff94007b` | phrases; one pinned checklist per device, kept as one saved state; 7 findings fixed, then 3 from a second check that stopped early |
+| calendar | #123 | `934740f4` | agenda list and next-appointment card; 7 findings fixed |
+| web search | #124 | `cf200315` | the sources of a search as a list; 4 findings fixed |
+| smart home | #125 | `91847978` | four room-less phrases and "what is on here"; phrases with a room name and lists that follow device state were cut (11 findings) |
+| core tools | #126 | `748f6205` | knowledge card and status list; two reviews (the first stopped early), all fixed |
+| news | #127 | `02ee167a` | news phrase and a headline list; 6 findings fixed |
+| local info | #128 | `fb5b8d3d` | weather card; the bin-day reminder the evening before; 8 findings fixed |
+
+## What is left
+
+Nothing of this piece of work, except what only the owner can do:
+
+1. Try it out on `t3/modules-13-all` (#130) and merge, in one of the two ways above.
+2. Deferred, with a plan of their own ([MODULES-DEFERRED-PLAN.md](MODULES-DEFERRED-PLAN.md): sixteen pull requests in
+   order, with eighteen decisions for the owner and a recommendation for each): google, t3-code, mcp-client, calls and
+   intercom, CalDAV; connections and OAuth (the rest of P8); streaming and WebSocket to an owner-typed address.
+3. One follow-up below the modules for the gaps listed further down, if the way modules and tool calls work stays as
+   it is. The owner has said that this may be reworked after testing, so none of it was started.
+
+## Known gaps kept on purpose
+
+Found by the last checks and written down instead of fixed:
+
+- **P10:** a presentation returned by a tool that ran speculatively is checked against the bounds when the tool
+  answers, not again at promotion: if the module's eight places fill up in between, the model was told "Showing on …"
+  and nothing is shown. While the image cache is not sure of its directory, a request is still fetched before it is
+  refused.
+- **Timers and alarms, reminders:** delivery is at least once (a ring that was already stopped can sound again after a
+  crash between sending and recording); Stop pressed in the same instant as "five more minutes" or a snooze can lose.
+- **Routines:** not all-or-nothing; the host's "stop" ends a routine only while it is speaking its own line.
+- **No review after the last fix round** of: reminders, timers and alarms, routines, the lists follow-up, the web
+  search follow-up (its list was rebuilt after its review), P8's correction, P10's third round. Each has its tests,
+  `pnpm check` and the full run on the whole.
 
 ## Open points
 
-- Two tests of the presentation layer's development mock (`apps/web/test/mockServer.test.ts`) depend on real time
-  and on each other and failed once on CI under load (on #121); they are being made independent of load on P10.
+- **Tests that depend on the CI machine's load.** The CI machine has two cores, and now and then a test that waits
+  in real time or starts several test households fails there and passes on a rerun. Fixed where it was cheap: the
+  presentation mock's tests (P10), the calendar privacy tests' limit, the bin-day test that looked at the Health page
+  right after a job (in the local-info follow-up), and a 20 second limit on CI in the branch with everything. Still
+  seen once each: `ModuleHostP3Round5` "forty modules" (core, 5 s limit), the SQLite scheduler contract's
+  daylight-saving test (30 s limit), the calendar privacy test "finding 22" (the kit gave up waiting for the module
+  to stop), the bin-day reminder test "a copy too old to trust"; and in local full runs under load the SQLite
+  `logStart` test ("database is locked") and the calendar latency test.
 
 - **Not run against a real Home Assistant**: the smart-home module's templates (they use `regex_replace`, `unique`
   and `abs`) are only tested against the fake server.
-- **Playwright** was run last at the top of P6 (218 of 218). P9 and P7 changed the voice page and have not had a
-  browser run or screenshots; their accounts list the cases to add.
+- **Browser tests**: the existing 218 cases pass on the branch with everything. No new cases or screenshots were
+  added for what P7, P9, P10, P8 and the modules put on the pages; the accounts of those parts list the cases.
+- **Not run against real services**: Music Assistant, calendar feeds, the weather and bin-day sources and the search
+  service are tested against fake servers only.
 - **The ringing window** (P7) cannot tell a television or another device from a person saying "stop"; false stops
   were not measured.
 - **A main-thread write right behind the store's checkpoint worker** waits about 24 ms on a desktop disk (a few
   hundred on an SD card), on a timer, without blocking the event loop (`docs/STORING-DATA.md` on the scaffold).
+- **Music at its largest**: resolving a room name against the largest cache, cold, sits at the 10 ms bound (10.2 ms
+  once in a full local run; under it when the test runs alone).
 - **Smart home at its largest**: with 2,000 lights in a single room the first-wave module's own status read stops
   the main thread 8 to 15 ms and "lights off" 13 to 17 ms, over the 10 ms bound at that extreme (measured while
   reviewing its follow-up, whose own work is under 1 ms).
-- **Two tests that depend on the machine's load**: the calendar module's latency test (above) and the bin-day test
-  that looks at the Health page right after a job (being fixed in the local-info follow-up).
 - **The order of P7 to P10 and the two waves** was the lead's decision, reported to the owner and not confirmed.
 
 ## Found by the wave B reviews, for one follow-up below the modules
 
 - **Speculative tools.** A tool that may run before its turn is committed must not change a screen from inside its
-  run (three follow-ups did). Being fixed in P10's second round: a presentation returned with a tool's result is
-  shown at promotion, and a direct show from inside an unpromoted turn does nothing.
+  run (three follow-ups did). Fixed in P10's second round: a presentation returned with a tool's result is shown at
+  promotion, and a direct show from inside an unpromoted turn is refused. What it costs: such a list or card is a
+  snapshot (no handle, no update, no withdrawal).
+- **Privacy labels and the risk layer (P8).** The gateway acts on a tool's own sensitivity answer: a result that the
+  module already reduced must be labelled household, or it is withheld where its owner may not be revealed; a failure
+  sentence of a tool with per-answer privacy is not withheld, so it must not carry personal content. Only reminders
+  was checked for the first by a test; the other modules pass their tests on the whole, which is not proof.
 - **A tool cannot attach a presentation without changing its result's shape** (five follow-up authors); **a
   presentation has one owner** (a list about several people cannot be shown safely: presence); **a phrase cannot
   carry a fixed value or take a parameter whose values the module supplies** (briefing, smart home); **a press
