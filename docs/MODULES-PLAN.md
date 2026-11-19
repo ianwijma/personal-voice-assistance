@@ -197,10 +197,14 @@ modules built early, and P7 to P10 are built as small first versions:
 4. **Wave B: the modules that need them**: timers-and-alarms, reminders, notifications, assistant-controls, music,
    routines-and-automations, broadcast, images-and-photos; and the phrase commands and presentations wave A left
    out, as one small PR per module.
-5. **Later, not in this piece of work**: connections and OAuth (the rest of P8) with the google and t3-code
-   modules; mcp-client, because `@pva/net` fetches with GET and HEAD only and an MCP client needs POST with
-   streamed answers to an address the owner typed; CalDAV in the calendar module, for the same reason; and
-   calls-and-intercom with the `call` guard. They get their own plan.
+5. **Later, not in this piece of work**: accounts and OAuth (the rest of P8) with the google and t3-code
+   modules; mcp-client, because an MCP client needs streamed answers (`@pva/net` can since send one JSON POST to an
+   address the owner typed, but cannot stream or hold a socket); CalDAV in the calendar module, which needs request
+   kinds the helper does not make; and calls-and-intercom with the `call` guard. Their plan is
+   [MODULES-DEFERRED-PLAN.md](MODULES-DEFERRED-PLAN.md), whose §13 also lists where this document is stale in the
+   light of the code (among them: `ctx.connections` is renamed to accounts there, because a connection already
+   means a browser tab in the code; the two outside client libraries of Appendix A are not to be used, because they
+   make their own network requests).
 
 ### P1. Module API v2, tool context, the execution gateway
 

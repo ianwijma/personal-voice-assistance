@@ -60,7 +60,7 @@ merged into each.
 4. Wave B, one pull request per module on top of P8: timers and alarms, reminders, notifications, assistant controls,
    music, routines and automations, broadcast, images and photos; and the phrase commands and presentations wave A
    left out, one small pull request per module.
-5. Deferred, with a plan of their own ([MODULES-DEFERRED-PLAN.md](MODULES-DEFERRED-PLAN.md), being written): google, t3-code, mcp-client, calls and intercom, CalDAV; connections and
+5. Deferred, with a plan of their own ([MODULES-DEFERRED-PLAN.md](MODULES-DEFERRED-PLAN.md): sixteen pull requests in order, with eighteen decisions for the owner and a recommendation for each): google, t3-code, mcp-client, calls and intercom, CalDAV; connections and
    OAuth (the rest of P8); streaming and WebSocket to an owner-typed address.
 
 ## Open points
