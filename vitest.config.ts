@@ -15,6 +15,8 @@ export default defineConfig({
         test: {
           name: "node",
           environment: "node",
+          // The CI machine has two cores: tests that start several households pass the default 5 s there now and then.
+          ...(process.env.CI ? { testTimeout: 20_000 } : {}),
           include,
           exclude: [...exclude, ...latency],
           globalSetup: ["./vitest.global-setup.ts"]
