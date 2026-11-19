@@ -89,6 +89,12 @@ is done. I couldn't confirm step 2."). If none is confirmed but some are unconfi
 be confirmed; it does not claim nothing was done. Every such sentence fits an announcement (300 characters) whole with
 20 steps and the longest name in the four representative done/unconfirmed partitions covered by the tests.
 
+**What counts as done.** Completion, refusal, cancellation and module-stop reports use the same record of completed
+steps. A `call` enters it only after the gateway answers that the action succeeded; a `say` also waits for confirmed
+playback. Refusal, withdrawal, failure, and cancellation before that answer leave the step out. `stop_if_failed` is
+local control and does not add a completed action. An unconfirmed step may still have had an effect; it is never
+counted as confirmed done.
+
 **One at a time.** A second start of the same routine while it runs is refused, it does not join: "Good night is
 already running." (on any device). A start of another routine on a device that is already running one is refused too:
 "Good night is still running here." Different routines run at once on different devices.
@@ -125,7 +131,8 @@ model (`routines_run`) runs every time; while the routine runs it is refused as 
   routine". (A test holds this limit as stated; see "What was left out".)
 
 **A run that is interrupted does not resume in the middle.** A provider action interrupting itself is an unconfirmed
-step, following the ordinary failure and `stop_if_failed` rules above; it is not a module stop. When the module stops
+step, following the ordinary failure and `stop_if_failed` rules above; it is not a module stop. A line action withdrawn
+while the routines module is stopping follows module-stop cleanup even if the gateway returns `failed`. When the module stops
 while a routine runs (a disable, a restart, a settings save, which restarts the module, the server shutting down), the
 run's fiber is interrupted with the shared part: it requests a stop for its line and waits for the handle's terminal
 outcome (subject to the speech handoff limit above), and only then the device is told, while the part is still closing:

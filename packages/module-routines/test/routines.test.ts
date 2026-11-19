@@ -1231,7 +1231,7 @@ describe("routines: review round 4 ownership regressions", () => {
           yield* kit.advance(10_000)
           yield* kit.action("r_dim", {}, turn)
           yield* kit.advance(10_000)
-          assert.isAtMost(seen.length, 1, `interrupted at yield ${ticks}`)
+          assert.strictEqual(seen.length, 1, `interrupted at yield ${ticks}`)
         }))
       }
     }))
@@ -1455,4 +1455,89 @@ describe("routines: review round 4 ownership regressions", () => {
         yield* kit.advance(3_000)
       }
     }))
+})
+
+
+describe("routines: review round 5 completion regressions", () => {
+  for (const count of [1, 2]) {
+    it.effect(`R5.1: restarting across line admission counts zero completed steps (${count} say steps)`, () =>
+      Effect.gen(function*() {
+        let admittedWithoutPlayback = false
+        for (let ticks = 0; ticks < 45; ticks++) {
+          yield* Effect.scoped(Effect.gen(function*() {
+            const kit = yield* start([], [routine("Bedtime", Array.from({ length: count }, () => ({ say: "Night." })))])
+            const asking = yield* Effect.forkChild(kit.tool("routines_run", { name: "Bedtime" }).pipe(Effect.provideService(Scheduler.MaxOpsBeforeYield, 8)))
+            for (let i = 0; i < ticks; i++) yield* Effect.yieldNow
+            yield* kit.restart
+            const answer = yield* Fiber.await(asking)
+            yield* kit.advance(0)
+            yield* kit.advance(30_000)
+            const reports = texts_(kit).filter((text) => text !== "Night.")
+            if (lineDecisions(kit).some((d) => d.outcome === "allow") && !texts_(kit).includes("Night.")) admittedWithoutPlayback = true
+            assert.isTrue(reports.every((text) => text === `Bedtime was cut short when the routines module stopped; it had finished 0 of its ${count} steps.`), `restart at yield ${ticks}: ${JSON.stringify(reports)}`)
+            if (answer._tag === "Success" && (answer.value.value as { spoken?: string })?.spoken === "Starting Bedtime.") {
+              assert.deepStrictEqual(reports, [`Bedtime was cut short when the routines module stopped; it had finished 0 of its ${count} steps.`], `accepted start at yield ${ticks}`)
+            }
+            assert.isAtMost(reports.length, 1)
+          }))
+        }
+        assert.isTrue(admittedWithoutPlayback, "exercise an admitted line withdrawn before playback")
+      }))
+  }
+
+  for (const how of ["cancel", "restart"] as const) {
+    it.effect(`R5.2: ${how} across a gateway values refusal never counts the refused step as done`, () =>
+      Effect.gen(function*() {
+        let cutShort = false
+        let refused = false
+        for (let ticks = 65; ticks < 125; ticks++) {
+          yield* Effect.scoped(Effect.gen(function*() {
+            const seen: Array<Seen> = []
+            const kit = yield* start(seen, [routine("Bedtime", [{ call: "lamp.dim", params: { level: 150 } }])])
+            const asking = yield* Effect.forkChild(kit.tool("routines_run", { name: "Bedtime" }).pipe(Effect.provideService(Scheduler.MaxOpsBeforeYield, 2)))
+            for (let i = 0; i < ticks; i++) yield* Effect.yieldNow
+            let cancelled = false
+            if (how === "cancel") {
+              const answer = (yield* kit.tool("routines_stop", {})).value
+              assert.isTrue(answer === "I stopped Bedtime; it had finished 0 of its 1 steps." || answer === "I stopped Bedtime during step 1; that step may still complete." || answer === "No routine is running here.", `cancel at yield ${ticks}: ${answer}`)
+              cancelled = answer !== "No routine is running here."
+              cutShort ||= cancelled
+            } else yield* kit.restart
+            yield* Fiber.await(asking)
+            yield* kit.advance(0)
+            yield* kit.advance(30_000)
+            const reports = texts_(kit)
+            const refusal = "Bedtime stopped at step 1: its values don't fit that action. Nothing before it was done."
+            const interrupted = "Bedtime was cut short when the routines module stopped; it had finished 0 of its 1 steps."
+            const duringCall = "Bedtime was cut short when the routines module stopped, during step 1, which may or may not have been done."
+            refused ||= reports.includes(refusal)
+            cutShort ||= reports.includes(interrupted) || reports.includes(duringCall)
+            assert.isTrue(reports.every((text) => text === refusal || (how === "restart" && (text === interrupted || text === duringCall))), `${how} at yield ${ticks}: ${JSON.stringify(reports)}`)
+            assert.isAtMost(reports.length, 1)
+            if (cancelled) assert.deepStrictEqual(reports, [])
+            assert.deepStrictEqual(seen, [])
+          }))
+        }
+        assert.isTrue(cutShort, "exercise interruption before the refusal closes")
+        assert.isTrue(refused, "exercise refusal winning and preserving its report")
+      }))
+  }
+
+  for (const how of ["cancel", "restart"] as const) {
+    it.effect(`R5: ${how} counts only successful gateway steps after a failed call and local control`, () =>
+      Effect.gen(function*() {
+        const seen: Array<Seen> = []
+        const kit = yield* start(seen, [routine("Bedtime", [{ call: "flaky.fail" }, { call: "lamp.quiet" }, { stop_if_failed: true }, { say: "Night." }])])
+        yield* kit.notify.replying("kitchen-display", true)
+        yield* kit.tool("routines_run", { name: "Bedtime" })
+        yield* kit.advance(100)
+        if (how === "cancel") assert.strictEqual((yield* kit.tool("routines_stop", {})).value, "I stopped Bedtime; it had finished 1 of its 4 steps.")
+        else yield* kit.restart
+        yield* kit.notify.replying("kitchen-display", false)
+        yield* kit.advance(10_000)
+        assert.deepStrictEqual(seen.map((s) => s.action), ["flaky.fail", "lamp.quiet"])
+        // The accepted host handoff limit can allow the queued line to play once; it never counts as done.
+        assert.deepStrictEqual(texts_(kit).filter((text) => text !== "Night."), how === "cancel" ? [] : ["Bedtime was cut short when the routines module stopped; it had finished 1 of its 4 steps."])
+      }))
+  }
 })

@@ -35,8 +35,8 @@ interface RunState {
   readonly deviceId: string
   /** The step being run (1-based, the owner's numbering); 0 before the first. */
   step: number
-  /** Steps finished, whatever their outcome. */
-  finished: number
+  /** Steps confirmed done: a successful gateway answer, and for a line, completed playback. */
+  readonly done: Array<number>
   /** A `call` step's action is under way: interrupted or cancelled now, it may or may not complete. */
   inCall: boolean
   /** The line of the current `say` step, from its enqueue until it has ended. */
@@ -192,7 +192,7 @@ export const makeRunner = (deps: { readonly host: ModuleHostApi; readonly speech
       const asStep = <A>(effect: Effect.Effect<A>) => Effect.provideService(effect, CurrentTurn, stepTurn)
       let lastFailed = false
       let spoke = false
-      const done: Array<number> = []
+      const done = state.done
       const unconfirmed: Array<number> = []
       /** The run stops at step `at`, which the gateway refused or whose values did not fit: one sentence, how far it got. */
       const stopAt = (at: number, why: "whyRefused" | "whyValues" | "failed") =>
@@ -202,7 +202,6 @@ export const makeRunner = (deps: { readonly host: ModuleHostApi; readonly speech
         state.step = i + 1
         if (step.kind === "stop_if_failed") {
           if (lastFailed) return yield* stopAt(i, "failed")
-          state.finished = i + 1
           continue
         }
         const catalogue = yield* asStep(host.actions.list)
@@ -239,10 +238,9 @@ export const makeRunner = (deps: { readonly host: ModuleHostApi; readonly speech
         if (!result.ok) {
           if (step.kind === "say") yield* stopLine(state)
           if (state.cancelled) return
-          // The host withdraws our instance before closing the shared scope. Its missing line action means this
-          // run is being stopped too: use the same cleanup now, before a failed step can announce completion.
-          if (step.kind === "say" && result.code === "not_running") return yield* Effect.interrupt
-          state.finished = i + 1
+          // The host can withdraw our line before its handler runs, returning either not_running or failed.
+          // A stopping module uses interruption cleanup, without counting the withdrawn step as done.
+          if (step.kind === "say" && (result.code === "not_running" || host.view().modules.some((m) => m.id === deps.moduleId && m.state === "stopping"))) return yield* Effect.interrupt
           // Refused now (the policy, the assistant's switches or the device changed), or values that do not fit: stop here.
           if (result.code === "refused" || result.code === "needs_confirmation") return yield* stopAt(i + 1, "whyRefused")
           if (result.code === "invalid_params") return yield* stopAt(i + 1, "whyValues")
@@ -252,7 +250,6 @@ export const makeRunner = (deps: { readonly host: ModuleHostApi; readonly speech
         }
         if (step.kind === "call") {
           // A called action's answer is never read out: it does not say whose content it is (docs/modules/routines.md).
-          state.finished = i + 1
           lastFailed = false
           done.push(i + 1)
           continue
@@ -260,7 +257,6 @@ export const makeRunner = (deps: { readonly host: ModuleHostApi; readonly speech
         const outcome = line === undefined ? "not-spoken" as const : yield* waitLine(deviceId, line)
         state.lineOpen = false
         state.line = undefined
-        state.finished = i + 1
         // Stopped on the device (the spoken "stop", the page's Stop, a reply taking the speaker) or cancelled: it ends here.
         if (outcome === "stopped" || state.cancelled) return
         lastFailed = outcome !== "spoken"
@@ -283,7 +279,7 @@ export const makeRunner = (deps: { readonly host: ModuleHostApi; readonly speech
           const name = nameIn(state.routine.name, state.language)
           const text = state.inCall
             ? say(texts, state.language, "cutShortCall", { name, step: state.step })
-            : say(texts, state.language, "cutShort", { name, done: state.finished, total: state.routine.steps.length })
+            : say(texts, state.language, "cutShort", { name, done: state.done.length, total: state.routine.steps.length })
           yield* tell(state.deviceId, text)
         }).pipe(Effect.catchDefect(() => Effect.void))
       )
@@ -343,7 +339,7 @@ export const makeRunner = (deps: { readonly host: ModuleHostApi; readonly speech
         const inCall = state.inCall
         answer = inCall
           ? { kind: "cancelled", inCall, text: say(texts, language, "cancelledCall", { name, step: state.step }) }
-          : { kind: "cancelled", inCall, text: say(texts, language, "cancelled", { name, done: state.finished, total: state.routine.steps.length }) }
+          : { kind: "cancelled", inCall, text: say(texts, language, "cancelled", { name, done: state.done.length, total: state.routine.steps.length }) }
       }
       // Marking cancelled and handing off cleanup share a mask. A caller leaving cannot abandon a claimed line.
       yield* owned(Effect.as(state === undefined ? Effect.void : stopLine(state), answer), settled)
@@ -357,7 +353,7 @@ export const makeRunner = (deps: { readonly host: ModuleHostApi; readonly speech
       if (running.has(routine.key)) return refusal({ kind: "already", other: name }, language, name)
       const here = [...running.values()].find((r) => r.deviceId === turn.deviceId)
       if (here !== undefined) return refusal({ kind: "busyHere", other: nameIn(here.routine.name, language) }, language, name)
-      const state: RunState = { runId: ++runs, routine, language, deviceId: turn.deviceId, step: 0, finished: 0, inCall: false, line: undefined, lineClaimed: undefined, lineOpen: false, ending: false, cancelled: false }
+      const state: RunState = { runId: ++runs, routine, language, deviceId: turn.deviceId, step: 0, done: [], inCall: false, line: undefined, lineClaimed: undefined, lineOpen: false, ending: false, cancelled: false }
       running.set(routine.key, state)
       byId.set(state.runId, state)
       const release = Effect.sync(() => {
@@ -367,7 +363,7 @@ export const makeRunner = (deps: { readonly host: ModuleHostApi; readonly speech
       let handedOff = false
       return yield* Effect.gen(function*() {
         const problem = yield* restore(precheck(routine))
-        if (state.cancelled) return { kind: "cancelled" as const, text: say(texts, language, "cancelled", { name, done: state.finished, total: routine.steps.length }) }
+        if (state.cancelled) return { kind: "cancelled" as const, text: say(texts, language, "cancelled", { name, done: state.done.length, total: routine.steps.length }) }
         if (problem !== undefined) return refusal(problem, language, name)
         const stepTurn: TurnContext = { ...turn, source: "routine" }
         const run = runSteps(state, stepTurn).pipe(
