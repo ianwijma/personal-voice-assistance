@@ -46,6 +46,10 @@ export interface Faults {
   storeReads: boolean
   /** The next N transactions fail (after any other check). */
   failTransactions: number
+  onRead?: ((q: any) => void) | undefined
+  listFails?: number
+  listGate?: Deferred.Deferred<void>
+  listEntered?: Deferred.Deferred<void>
   sendFails: number
   /** After a successful send: what to do (e.g. make the next transaction fail: a crash between the send and the write). */
   afterSend?: (() => void) | undefined
@@ -84,7 +88,7 @@ export const faulty = (faults: Faults): ModuleDefinition<any> => {
       return {
         ...h,
         get: (...a: Array<any>) => (faults.storeReads ? bad("injected") : h.get(...a)),
-        list: (...a: Array<any>) => (faults.storeReads ? bad("injected") : h.list(...a)),
+        list: (...a: Array<any>) => (faults.storeReads ? bad("injected") : Effect.tap(h.list(...a), () => Effect.sync(() => faults.onRead?.(a[0])))),
         update: (...a: Array<any>) => (faults.storeWrites ? bad("injected") : h.update(...a))
       }
     }
@@ -118,6 +122,14 @@ export const faulty = (faults: Faults): ModuleDefinition<any> => {
         faults.handlers[`notify:${name}`] = h
         return ctx.notify.handle(name, h)
       },
+      list: () => Effect.suspend(() => {
+        if ((faults.listFails ?? 0) > 0) {
+          faults.listFails!--
+          return Effect.fail(new NotifyError({ reason: "busy", message: "injected" }))
+        }
+        return Effect.flatMap(ctx.notify.list(), (ns: any) => faults.listGate === undefined ? Effect.succeed(ns) :
+          Effect.andThen(Deferred.succeed(faults.listEntered!, undefined), Effect.as(Deferred.await(faults.listGate), ns)))
+      }),
       resolve: (...a: Array<any>) => (faults.resolveFails > 0 ? (faults.resolveFails--, Effect.fail(new NotifyError({ reason: "busy", message: "injected" }))) : ctx.notify.resolve(...a)),
       send: (r: any) => {
         if (faults.gate !== undefined) return Effect.andThen(Effect.andThen(faults.entered === undefined ? Effect.void : Deferred.succeed(faults.entered, undefined), Deferred.await(faults.gate)), ctx.notify.send(r))

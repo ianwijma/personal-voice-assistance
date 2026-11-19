@@ -227,8 +227,8 @@ export const holdsSecret = (text: string): boolean => {
   WORD.lastIndex = 0
   for (let m = WORD.exec(text); m !== null; m = WORD.exec(text)) {
     const rest = text.slice(m.index + m[0].length).replace(/\s+/gu, "")
-    const digits = rest.replace(/\D/gu, "").length
-    if (digits >= 3 && digits * 2 >= rest.length) return true
+    const digits = [...rest].filter((c) => /\p{Nd}/u.test(c)).length
+    if (digits >= 1 && digits * 2 >= [...rest].length) return true
   }
   return false
 }
@@ -243,6 +243,8 @@ export interface Matches<A> {
 
 /** The reminders whose words contain every word asked for; one whose text is exactly the words wins over longer ones. */
 export const matching = <A extends { readonly text: string }>(rows: ReadonlyArray<Row<A>>, which: string): Matches<A> => {
+  const literal = rows.filter((r) => r.value.text.toLowerCase() === which.toLowerCase())
+  if (literal.length > 0) return { rows: literal, exact: literal.length === 1 }
   const wanted = words(which)
   if (wanted.length === 0) return { rows: [], exact: false }
   const exact = rows.filter((r) => words(r.value.text).join(" ") === wanted.join(" "))

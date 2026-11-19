@@ -524,6 +524,7 @@ describe("jobs", () => {
         yield* kit.runJob(job!.id)
         assert.strictEqual(faults.runs.due, entered + 1, name)
         assert.deepStrictEqual(yield* kit.notify.all, [], name)
+        if (name === "moved") assert.strictEqual((yield* jobOf(kit, row.id))[0]?.dueAt, row.value.dueAt! + H)
       }
     }))
 
