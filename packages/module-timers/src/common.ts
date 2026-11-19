@@ -145,6 +145,7 @@ export const scan = <A>(list: ListPage<A>, page: number, max: number): Effect.Ef
       rows.push(...got)
       if (got.length < want) return { rows, cut: false }
       after = got.at(-1)
+      yield* Effect.yieldNow
     }
     const beyond = yield* list({ limit: 1, ...(after !== undefined ? { after } : {}) })
     return { rows, cut: beyond.length > 0 }

@@ -73,7 +73,9 @@ When a place comes free in time, it rings and says how late: "The 2 minutes time
 while I couldn't ring.". A timer due while the server or the module was down rings on restart if it is still inside
 its delivery window, and says how late.
 
-If its delivery window passes without a recorded ring, it is recorded as missed and the Health page says so. A module
+Before giving up at the delivery deadline, the module checks for an open notification under this ring's key. It records
+that notification with its existing expiry if found; if the lookup fails, delivery stays owed. Otherwise the timer is
+recorded as missed and the Health page says so. A module
 has no other way to raise a Health issue, so a job of its own (`trouble`) fails on purpose. That job is written in the same
 transaction that gives the ring up: if it cannot be written, the ring is not given up, and stays owed.
 
@@ -82,13 +84,12 @@ transaction that gives the ring up: if it cannot be written, the ring is not giv
 The order is: write the owed ring, send it under its key, write that it was sent. If the server fails between the send
 and that last write, the next reconcile finds the ring still owed:
 
-- within the delivery window, if its notification is still open, the module only records it;
+- if its notification is still open, the module only records it, even beyond the delivery window;
 - if nobody stopped it, it rings once;
 - if someone pressed **Stop in that moment, the ring can sound a second time.** A ring is never lost this way.
 
-If a delivery is first refused, a later send succeeds but its outcome write fails, and recovery happens beyond the
-delivery window, the timer can be reported missed while its card still rings and voice cancel cannot find it; the
-host's Stop still ends that card, or it expires after the ring setting's minutes.
+An open ring recovered after a lost outcome write remains available to voice cancellation. This also covers a refused
+first send followed by a successful retry whose outcome write failed across the delivery deadline.
 
 What would close this is below the module: see "Missing below".
 
@@ -299,9 +300,10 @@ SQLite on a file is not measured here either; the store's own latency tests give
 notification `send` a 0.37 ms median.
 
 The cancel-all check in `packages/module-timers/test/bulkCancelLatency.test.ts` samples a real 1 ms heartbeat while
-cancelling 100 expired timers (two batches of 50, expired a minute apart), four rounds on the in-memory store. It
+cancelling 190 expired timers (batches of 50, 50, 50 and 40, expired a minute apart), four rounds on the in-memory store. It
 asserts the longest gap stays below `bound(10)` ms, including the one atomic batch write and the keyed job
-cancellations. Preparation and cleanup yield in batches so audio can keep running between them.
+cancellations. The heartbeat must also advance during the pending-row scan. Page reads, preparation and cleanup
+yield in batches so audio can keep running between them.
 
 ## Contract readings
 
