@@ -572,7 +572,19 @@ export const makeVoiceSession = (options: VoiceSessionOptions): Effect.Effect<Vo
     /** P7: waiting for a reply's end, by turn (the settlement, while the page's stop report has not come). */
     const replyEndWaits = new Map<number, Deferred.Deferred<void>>()
     /** P7: canned replies a settlement waits for: the next canned turn of `assistant` after the send, and its end. */
-    const cannedWatches: Array<{ readonly assistant: string; turnId: number | undefined; readonly done: Deferred.Deferred<"done" | "cut"> }> = []
+    const cannedWatches: Array<{ readonly assistant: string; turnId: number | undefined; readonly done: Deferred.Deferred<"done" | "cut">; readonly quiet?: () => boolean }> = []
+    /**
+     * P7 (review round 2, b1): cancellations of every conversation and per assistant (Stop, "never mind", a new
+     * conversation). A pending settlement compares them with what they were at its utterance's final: a reply cancelled
+     * since is not said again, and its remaining lines open no follow-up window.
+     */
+    const cancellations = { all: 0, by: new Map<string, number>() }
+    /** Settlements running now that will say an interrupted reply again (and whether it is still theirs to say). */
+    const pendingResumes = new Set<{ readonly cancelled: () => boolean }>()
+    const cancelledFor = (assistant: string | undefined) => {
+      if (assistant === undefined) cancellations.all++
+      else cancellations.by.set(assistant, (cancellations.by.get(assistant) ?? 0) + 1)
+    }
     const keepReply = (assistant: string, turnId: number, texts: ReadonlyArray<string | undefined>, interrupted: boolean) => {
       const text = keptReplyText(texts)
       if (text === "") return
@@ -648,7 +660,14 @@ export const makeVoiceSession = (options: VoiceSessionOptions): Effect.Effect<Vo
           // (A `Say` starts a text turn with no words; single-model conversations do not mark it `canned`.)
           if (event.text === "" && event.source === "text" && !event.speculative) {
             const watch = cannedWatches.find((w) => w.assistant === assistant && w.turnId === undefined)
-            if (watch !== undefined) watch.turnId = event.turnId
+            if (watch !== undefined) {
+              watch.turnId = event.turnId
+              // A line of a settlement whose reply was cancelled meanwhile: no follow-up window when it ends (b1).
+              if (watch.quiet?.() === true) {
+                noFollowUp.add(event.turnId)
+                while (noFollowUp.size > 16) noFollowUp.delete(noFollowUp.values().next().value!)
+              }
+            }
           }
           touch()
           // Committed turns reach the tracker through the publisher's onCommitted, right after turn.start.
@@ -950,7 +969,7 @@ export const makeVoiceSession = (options: VoiceSessionOptions): Effect.Effect<Vo
       Effect.suspend(() => {
         const t = now()
         if (event._tag !== "EndOfTurn") heard.event(event)
-        if (options.phrases !== undefined) watchUtterance(event, t)
+        watchUtterance(event, t)
         let echoes: ReadonlyArray<SttEvent> = []
         let echoDropped = false
         const gates = (e: SttEvent): ReadonlyArray<RouteResult> => {
@@ -962,9 +981,9 @@ export const makeVoiceSession = (options: VoiceSessionOptions): Effect.Effect<Vo
         let results: ReadonlyArray<RouteResult>
         let taken: { readonly taken: Taken; readonly utterance: NonNullable<typeof heardUtterance> } | undefined
         const phrases = options.phrases
-        if (event._tag === "EndOfTurn" && phrases !== undefined) {
-          const utterance = heardUtterance ?? { audible: gate.audible(t), cancelled: false, active: false, replyTurn: undefined }
-          heardUtterance = undefined
+        const utterance = event._tag === "EndOfTurn" ? heardUtterance ?? { audible: gate.audible(t), cancelled: false, active: false, replyTurn: undefined } : undefined
+        if (event._tag === "EndOfTurn") heardUtterance = undefined
+        if (event._tag === "EndOfTurn" && phrases !== undefined && utterance !== undefined) {
           const decision = decideUtterance({
             final: event,
             // E5: Stop or a new conversation between its first events and its final: nothing takes it.
@@ -978,6 +997,13 @@ export const makeVoiceSession = (options: VoiceSessionOptions): Effect.Effect<Vo
           results = decision.results
           if (decision.taken !== undefined) taken = { taken: decision.taken, utterance }
         } else results = gates(event)
+        // Review round 2, b2: an utterance stopped (the page's Stop, a new conversation) before its final reaches the
+        // dispatcher with no words, with or without phrases: the conversation may not have opened it yet when the stop
+        // came (speech and stops travel on separate queues), and a final with words would then start a turn. A final
+        // with no words is what a taken utterance sends: never a turn, nothing in the history.
+        if (utterance?.cancelled === true) {
+          results = results.map((r) => ({ ...r, events: r.events.map((e): SttEvent => (e._tag === "EndOfTurn" && e.text !== "" ? { _tag: "EndOfTurn", text: "" } : e)) }))
+        }
         let dropped = false
         results.forEach((r, i) => {
           const e = echoes[i]!
@@ -1037,11 +1063,11 @@ export const makeVoiceSession = (options: VoiceSessionOptions): Effect.Effect<Vo
      * Speak `text` as a canned reply of `assistant` (the answering one when absent) and wait until it ended (bounded):
      * `cut` when it did not play to its end (something cut it short, or it could not be sent).
      */
-    const sayLine = (assistant: string | undefined, text: string): Effect.Effect<"done" | "cut"> =>
+    const sayLine = (assistant: string | undefined, text: string, quiet?: () => boolean): Effect.Effect<"done" | "cut"> =>
       Effect.suspend(() => {
         const a = assistant ?? answering()
         if (a === undefined || text.trim().length === 0) return Effect.succeed("done" as const)
-        const watch = { assistant: a, turnId: undefined as number | undefined, done: Deferred.makeUnsafe<"done" | "cut">() }
+        const watch = { assistant: a, turnId: undefined as number | undefined, done: Deferred.makeUnsafe<"done" | "cut">(), ...(quiet !== undefined ? { quiet } : {}) }
         cannedWatches.push(watch)
         const forget = Effect.sync(() => {
           const i = cannedWatches.indexOf(watch)
@@ -1128,13 +1154,22 @@ export const makeVoiceSession = (options: VoiceSessionOptions): Effect.Effect<Vo
           }
         }
         const notify = phrases.ports.notify
+        // b1: the cancellations as they are at the final; the interrupted reply's assistant, when the session knows it.
+        const replyAssistant = utterance.replyTurn === undefined ? undefined : assistantOfTurn(utterance.replyTurn)
+        const atFinal = { all: cancellations.all, by: new Map(cancellations.by) }
+        const changedFor = (a: string) => (cancellations.by.get(a) ?? 0) !== (atFinal.by.get(a) ?? 0)
+        const replyCancelled = () =>
+          cancellations.all !== atFinal.all || (replyAssistant !== undefined ? changedFor(replyAssistant) : [...cancellations.by.keys()].some(changedFor))
+        // A reply another pending settlement will say again is the device's reply still to come: "stop" selects it.
+        const mine = { cancelled: replyCancelled }
+        const otherResumes = () => [...pendingResumes].some((p) => p !== mine && !p.cancelled())
         const ports: PhrasePorts = {
           ...phrases.ports,
           deviceId: options.deviceId,
           language: phrases.language,
           slot: phraseSlot,
           session: {
-            replyActive: () => utterance.active || replyActiveNow(),
+            replyActive: () => utterance.active || replyActiveNow() || otherResumes(),
             announcementActive: () => lease.holder() === ANNOUNCE_HOLDER,
             stopReply: Effect.sync(() => {
               const was = replyActiveNow() || utterance.active
@@ -1148,13 +1183,18 @@ export const makeVoiceSession = (options: VoiceSessionOptions): Effect.Effect<Vo
             cancelPending: cancelPendingFor(utterance.replyTurn),
             lastReply: () => lastReply,
             interruptedReply: interruptedReplyOf(utterance.replyTurn),
+            replyCancelled,
             answering,
-            say: sayLine
+            say: (assistant, text) => sayLine(assistant, text, replyCancelled)
           },
           turn: phraseTurn,
           trace: publishPhraseTrace
         }
-        return Effect.asVoid(Effect.forkIn(runTaken(taken, ports).pipe(Effect.tap((outcome) => Effect.sync(() => report(outcome)))), sessionScope))
+        if (utterance.replyTurn !== undefined) pendingResumes.add(mine)
+        return Effect.asVoid(Effect.forkIn(
+          runTaken(taken, ports).pipe(Effect.tap((outcome) => Effect.sync(() => report(outcome))), Effect.ensuring(Effect.sync(() => void pendingResumes.delete(mine)))),
+          sessionScope
+        ))
       })
 
     // ---- Which recogniser the device hears with (docs/ASSISTANTS.md §3.5)
@@ -1317,6 +1357,7 @@ export const makeVoiceSession = (options: VoiceSessionOptions): Effect.Effect<Vo
       Effect.suspend(() => {
         const a = assistant ?? answering()
         const made = conversationOf(a)
+        cancelledFor(a)
         if (made !== undefined) {
           // Its conversation stops the open utterance; the dispatcher must not hand the rest to another one.
           dispatcher.cancelUtterance(a!)
@@ -1380,6 +1421,7 @@ export const makeVoiceSession = (options: VoiceSessionOptions): Effect.Effect<Vo
         }),
       stop: (assistant) => {
         const outcome = dispatcher.stop(assistant)
+        cancelledFor(assistant)
         utteranceCancelled(assistant)
         return outcome
       },
