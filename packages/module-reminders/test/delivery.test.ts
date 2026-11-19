@@ -273,19 +273,22 @@ describe("delivery is at least once, never zero times", () => {
       const faults = nofaults()
       const kit = yield* startTestModule(faulty(faults))
       yield* kit.tool("reminders_set", { text: "bins", when: "in a minute", scope: "household" }, { device: SAM })
+      const due = (yield* theRow(kit)).value.dueAt!
       faults.sendFails = 2
       yield* kit.advance(MIN + 1_000)
       assert.deepStrictEqual(yield* kit.notify.all, [])
       yield* kit.advance(30_000 + 60_000)
       assert.strictEqual((yield* kit.notify.all).length, 1)
-      assert.strictEqual((yield* theRow(kit)).value.ring?.at, (yield* theRow(kit)).value.ring?.at)
+      // The ring is the occurrence that was due, however late the third try was.
+      assert.strictEqual((yield* theRow(kit)).value.ring?.at, due)
       yield* kit.advance(H)
       assert.strictEqual((yield* kit.notify.all).length, 1)
     }))
 
   it.effect("a one-off found eight days late at 03:58 is delivered, and the 04:00 clean-up does not end it: a week is counted from delivery", () =>
     Effect.gen(function*() {
-      const kit = yield* startTestModule(remindersModule, { startAt: at("2026-11-18T02:58:00Z") })
+      const faults = nofaults()
+      const kit = yield* startTestModule(faulty(faults), { startAt: at("2026-11-18T02:58:00Z") })
       yield* kit.tool("reminders_set", { text: "early", when: "in a minute", scope: "household" }, { device: SAM })
       yield* kit.stop
       yield* kit.advance(8 * DAY)
@@ -293,8 +296,10 @@ describe("delivery is at least once, never zero times", () => {
       yield* kit.advance(1_000)
       const [n] = yield* kit.notify.all
       assert.include(n?.text ?? "", "late: due")
+      const tidied = faults.runs.tidy ?? 0
       yield* kit.advance(2 * MIN + 1_000)
-      assert.strictEqual((yield* kit.jobs).filter((j) => j.handler === "tidy" && j.state === "done" || j.handler === "tidy").length > 0, true)
+      // The 04:00 (Amsterdam) clean-up ran in this step, and the week is counted from the delivery.
+      assert.strictEqual(faults.runs.tidy, tidied + 1)
       const row = yield* theRow(kit)
       assert.strictEqual(row.value.state, "open")
       assert.strictEqual((yield* openNotes(kit)).length, 1)
@@ -534,7 +539,7 @@ describe("jobs", () => {
       assert.deepStrictEqual(yield* allRows(kit), before)
       // A card's done twice: done once, then "already done".
       const [card] = kit.present.shown(SAM)
-      const press = { presentationId: card!.id, key: `due:${row.id}`, deviceId: SAM, action: "done" }
+      const press = { presentationId: card!.id, key: `due:${row.id}:${row.value.ring!.at}`, deviceId: SAM, action: "done" }
       assert.deepStrictEqual(yield* (faults.handlers["present:reminders"].run(press) as Effect.Effect<unknown>), { say: "Done." })
       assert.deepStrictEqual(yield* (faults.handlers["present:reminders"].run(press) as Effect.Effect<unknown>), { say: "That one was already done." })
       assert.strictEqual((yield* theRow(kit)).value.state, "done")

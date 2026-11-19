@@ -1,15 +1,15 @@
 import {
-  ActionError, type Actor, CurrentJob, CurrentTurn, defineAction, defineModule, makeTool, type ModuleDefinition, Param, type PresentHandle,
+  ActionError, type Actor, CurrentJob, CurrentTurn, defineAction, isPresentResult, defineModule, makeTool, type ModuleDefinition, Param, type PresentHandle,
   type Presentation, Privacy, type Row, type ScheduleOrigin, Setting, StoreError, ToolError, type TurnContext
 } from "@pva/core"
 import {
   describeRRule, type Language, parseDateTime, parseDtstart, parseRecurrence, speakDuration, speakList, speakNumber, speakTime
 } from "@pva/language"
 import { BriefingSectionError, BriefingSections, homeLanguage, isLine, say } from "@pva/module-contracts"
-import { Cause, Clock, Effect, Exit, Schema, Semaphore } from "effect"
+import { Clock, Effect, Schema, Semaphore } from "effect"
 import { randomUUID } from "node:crypto"
 import {
-  cut, endOfToday, holdsSecret, homeZone, isRepeat, Line, localOf, matching, momentText, nextOf, type Owed, PAGE, planOf, Reminder, reminders,
+  blocked, cut, endOfToday, holdsSecret, homeZone, isRepeat, Line, localOf, matching, momentText, nextOf, type Owed, PAGE, planOf, Reminder, reminders,
   SCAN_ROWS, scanRows, shortMoment, speaksAt, type Stop, STOP_NOTES, TEXT_CHARS, WHEN_CHARS, without
 } from "./model.ts"
 import { texts } from "./texts.ts"
@@ -26,7 +26,8 @@ const MAX_AHEAD_MS = 366 * DAY
 const RING_EXPIRES_MS = 30 * 60_000
 const NORMAL_EXPIRES_MS = DAY
 const CARD_MS = 5 * 60_000
-const LIST_MS = 2 * 60_000
+/** A list returned with an answer ends by itself after this (it is not kept up to date). */
+const LIST_MS = 30_000
 /** A delivery is tried at most this often; the second try 30 s after the first, then twice as long each time. */
 export const MAX_TRIES = 5
 export const RETRY_MS = 30_000
@@ -94,7 +95,8 @@ const originOf = (rem: Reminder): ScheduleOrigin => ({
 export const jobKey = (id: string) => `reminder:${id}`
 export const noteKey = (id: string, at: number) => `rem:${id}:${at}`
 const NOTE_KEY = /^rem:([A-Za-z0-9_-]{1,40}):(\d{1,16})$/
-const cardKey = (id: string) => `due:${id}`
+const cardKey = (id: string, at: number) => `due:${id}:${at}`
+const CARD_KEY = /^due:([A-Za-z0-9_-]{1,40}):(\d{1,16})$/
 
 /** Cleanup owed, with more to take down: tried at once (`tryAt` now), notes merged, at most `STOP_NOTES` (an older one has expired by then). */
 const addStop = (stop: Stop | undefined, notes: ReadonlyArray<number>, card: boolean, now: number): Stop | undefined => {
@@ -105,7 +107,7 @@ const addStop = (stop: Stop | undefined, notes: ReadonlyArray<number>, card: boo
   if (kept.length === 0 && !withCard) return stop
   return { notes: kept, card: withCard, attempts: stop?.attempts ?? 0, tryAt: now }
 }
-const withStop = (value: Reminder, stop: Stop | undefined): Reminder => (stop === undefined ? without(value, "stop") : { ...value, stop })
+const withStop = (value: Reminder, stop: Stop | undefined): Reminder => (stop === undefined ? without(value, "stop") : { ...without(value, "stopFailed"), stop })
 
 type Kind = "done" | "snooze"
 
@@ -118,15 +120,6 @@ interface By {
   readonly viaNotification?: boolean
   readonly ms?: number
   readonly actor?: Actor
-}
-
-interface ShownList {
-  readonly handle: PresentHandle
-  readonly ids: ReadonlyArray<string>
-  readonly person: string | undefined
-  readonly owner: string | undefined
-  readonly deviceId: string
-  readonly until: number
 }
 
 export const remindersModule = defineModule({
@@ -148,10 +141,6 @@ export const remindersModule = defineModule({
       }
       /** The cards of due reminders this part is showing (a transient card ends with the part, so this is all of them). */
       const cards = new Map<string, PresentHandle>()
-      /** The list this part showed on each device, so a change to a reminder on it replaces or dismisses it. */
-      const lists = new Map<string, ShownList>()
-      /** Reminders written in the present locked step: the lists showing them are brought up to date at its end. */
-      const touched = new Set<string>()
 
       // ---- one at a time -------------------------------------------------------------------------------------------
 
@@ -171,40 +160,8 @@ export const remindersModule = defineModule({
       }
       const bySpeaking = (a: Row<Reminder>, b: Row<Reminder>) => (speaksAt(a.value) ?? -1) - (speaksAt(b.value) ?? -1)
 
-      /** A list on a screen showing a reminder that changed: shown again from the rows as they are now, or dismissed when none is left. */
-      const refreshList = (shown: ShownList) =>
-        Effect.gen(function*() {
-          const now = yield* Clock.currentTimeMillis
-          if (now >= shown.until) return void lists.delete(shown.deviceId)
-          const privacy = ctx.host.service(Privacy)
-          const rows: Array<Row<Reminder>> = []
-          for (const id of shown.ids) {
-            const row = yield* board.get(id)
-            if (row === undefined || row.value.state !== "open") continue
-            const owner = row.value.owner
-            // Asked again now, for that device: a person's own only where it may be shown there at this moment.
-            if (owner === undefined || (owner === shown.person && privacy?.mayReveal(owner, shown.deviceId) === true)) rows.push(row)
-          }
-          rows.sort(bySpeaking)
-          if (rows.length === 0) {
-            const gone = yield* Effect.exit(shown.handle.dismiss)
-            if (Exit.isSuccess(gone)) lists.delete(shown.deviceId)
-            return
-          }
-          const updated = yield* shown.handle.update(listPresentation(rows, shown.owner))
-          if (updated === undefined) lists.delete(shown.deviceId)
-          else lists.set(shown.deviceId, { ...shown, ids: rows.map((r) => r.id) })
-        }).pipe(Effect.ignore)
-
-      const flushLists = Effect.gen(function*() {
-        if (touched.size === 0) return
-        const changed = new Set(touched)
-        touched.clear()
-        for (const shown of [...lists.values()]) if (shown.ids.some((id) => changed.has(id))) yield* refreshList(shown)
-      })
-
       /** Every change of a reminder goes one at a time: a tool, a job and a press never read and write over each other. */
-      const exclusive = <A, E, R>(effect: Effect.Effect<A, E, R>) => lock.withPermits(1)(Effect.ensuring(effect, flushLists))
+      const exclusive = <A, E, R>(effect: Effect.Effect<A, E, R>) => lock.withPermits(1)(effect)
 
       // ---- writing a row and planning its one job ------------------------------------------------------------------
 
@@ -240,7 +197,6 @@ export const remindersModule = defineModule({
             return w
           })
           if (job === undefined) yield* Effect.ignore(ctx.scheduler.cancel({ key: jobKey(row.id) }))
-          touched.add(row.id)
           return written
         })
 
@@ -266,7 +222,10 @@ export const remindersModule = defineModule({
             handler: "reminders",
             ...(owner !== undefined ? { sensitivity: { personal: owner } } : {})
           }
-          const handle = yield* ctx.present.show({ device: rem.deviceId }, present, { lifetime: "transient", expiresInMs: CARD_MS, key: cardKey(id) })
+          // The key carries the occurrence, so a newer card does not replace an older one by itself: the older goes first.
+          const older = cards.get(id)
+          if (older !== undefined) yield* Effect.ignore(older.dismiss)
+          const handle = yield* ctx.present.show({ device: rem.deviceId }, present, { lifetime: "transient", expiresInMs: CARD_MS, key: cardKey(id, at) })
           cards.set(id, handle)
         }).pipe(Effect.ignore)
 
@@ -332,7 +291,7 @@ export const remindersModule = defineModule({
           if (left.length === 0 && !card) return yield* write(row, (v) => without(v, "stop"), { actor })
           const attempts = s.attempts + 1
           if (attempts >= MAX_STOP_TRIES) {
-            return yield* write(row, (v) => without(v, "stop"), {
+            return yield* write(row, (v) => ({ ...without(v, "stop"), stopFailed: true }), {
               actor,
               report: `A reminder's ring or card could not be taken down after ${attempts} tries (${why}); it ends by itself when it expires. Reminder ${row.id}.`
             })
@@ -365,7 +324,8 @@ export const remindersModule = defineModule({
           const o = r.owed!
           // The late rule, on every try, from the occurrence's own time (or the snooze's end): a repeat at most six hours late.
           if (isRepeat(r) && now - o.from > REPEAT_DELIVER_WITHIN_MS) {
-            return yield* write(row, (v) => ({ ...without(v, "owed"), dropped: { at: o.at, why: "late" as const, when: now } }), { actor })
+            // An attempt may have sent it already (a write that failed afterwards): what may be open is taken down like any cleanup.
+            return yield* write(row, (v) => withStop({ ...without(v, "owed"), dropped: { at: o.at, why: "late" as const, when: now } }, o.attempts > 0 ? addStop(v.stop, [o.at], true, now) : v.stop), { actor })
           }
           const tries = o.attempts + 1
           const tried = yield* write(row, (v) => ({ ...v, owed: { ...o, attempts: tries, tryAt: now + RETRY_MS * 2 ** (tries - 1) } }), { actor })
@@ -398,6 +358,7 @@ export const remindersModule = defineModule({
           let row = yield* board.get(id)
           if (row === undefined) return undefined
           let force = opts.forceStop === true
+          const startRev = row.rev
           for (let step = 0; step < 16; step++) {
             const now = yield* Clock.currentTimeMillis
             const r: Reminder = row.value
@@ -426,7 +387,7 @@ export const remindersModule = defineModule({
                 continue
               }
               // An owed delivery waits for the take-down of a notification with its own key (a change of words while it rang).
-              if (r.owed !== undefined && r.owed.tryAt <= now && r.stop?.notes.includes(r.owed.at) !== true) {
+              if (r.owed !== undefined && r.owed.tryAt <= now && !blocked(r)) {
                 const before = r.owed.attempts
                 row = yield* attempt(row, now, opts.actor)
                 if (row.value.owed !== undefined && row.value.owed.attempts !== before && row.value.owed.tryAt > now) break
@@ -439,6 +400,8 @@ export const remindersModule = defineModule({
             }
             break
           }
+          // The row's one job: a run that wrote nothing would end as done, so with anything still owed it is planned again.
+          if (opts.send && row.rev === startRev && planOf(row.value) !== undefined) row = yield* write(row, (v) => v, { actor: opts.actor })
           return row
         })
 
@@ -596,7 +559,8 @@ export const remindersModule = defineModule({
           Effect.orElseSucceed(() => true)
         )
 
-      const stopping = (row: Row<Reminder> | undefined, l: Language) => (row?.value.stop !== undefined ? ` ${say(texts, l, "stopping")}` : "")
+      const stopping = (row: Row<Reminder> | undefined, l: Language) =>
+        row?.value.stop !== undefined ? ` ${say(texts, l, "stopping")}` : row?.value.stopFailed === true ? ` ${say(texts, l, "stopFailed")}` : ""
 
       // ---- answering: done, snooze ---------------------------------------------------------------------------------
 
@@ -644,8 +608,8 @@ export const remindersModule = defineModule({
             return next !== undefined ? say(texts, l, "doneSkipped", { skipped: said, when: momentText(next, l, z, now) }) : say(texts, l, "doneSkippedLast", { skipped: said })
           }
           const ring = r.ring
+          if (by.at !== undefined && by.at !== ring?.at) return say(texts, l, "answeredAlready")
           if (ring === undefined) return say(texts, l, "notRinging")
-          if (by.at !== undefined && by.at !== ring.at) return say(texts, l, "answeredAlready")
           // The same press again: it has been put off already, and is not put off further.
           if (by.pressId !== undefined && r.handled === by.pressId && ring.snoozeUntil !== undefined) return say(texts, l, "snoozedAlready")
           const ms = by.ms ?? snoozeMs()
@@ -659,10 +623,10 @@ export const remindersModule = defineModule({
 
       /** A button's press: the occurrence from its key, the pressing device as the writer. */
       const press = (kind: Kind, key: string | undefined, by: Omit<By, "at" | "actor">, deviceId: string) => {
-        const m = key === undefined ? null : NOTE_KEY.exec(key)
-        const id = m?.[1] ?? (key?.startsWith("due:") === true ? key.slice(4) : undefined)
-        if (id === undefined) return Effect.succeed(say(texts, lang(), "gone"))
-        return answer(kind, id, { ...by, ...(m !== null ? { at: Number(m[2]) } : {}), actor: { kind: "ui", deviceId } })
+        // Both keys carry the occurrence: a press belongs to the occurrence it was made for, never to "the next one".
+        const m = key === undefined ? null : NOTE_KEY.exec(key) ?? CARD_KEY.exec(key)
+        if (m === null) return Effect.succeed(say(texts, lang(), "gone"))
+        return answer(kind, m[1]!, { ...by, at: Number(m[2]), actor: { kind: "ui", deviceId } })
       }
 
       // A button on a due reminder's notification, and on its card: the same two answers, registered in `shared`.
@@ -731,7 +695,7 @@ export const remindersModule = defineModule({
       }
 
       return {
-        value: { board, exclusive, lang, zone, write, reconcileLocked, readVisible, pick, ringing, isOpen, answerLocked, answer, stopping, lists, listPresentation, bySpeaking, originOf },
+        value: { board, exclusive, lang, zone, write, reconcileLocked, readVisible, pick, ringing, isOpen, answerLocked, answer, stopping, listPresentation, bySpeaking, originOf },
         contributions: [BriefingSections.of(section)]
       }
     }),
@@ -740,7 +704,9 @@ export const remindersModule = defineModule({
     const failed = (l: Language, key: "unsaved" | "unread" = "unsaved") => new ToolError({ message: say(texts, l, key) })
     const personalQuiet = (owner: string | undefined, turn: TurnContext | undefined) => owner !== undefined && ctx.host.service(Privacy)?.mayReveal(owner, turn) !== true
     const ownerOf = (result: unknown) => {
-      const owner = (result as { readonly owner?: string }).owner
+      // A list comes with its presentation: the owner is in what the model gets.
+      const said = isPresentResult(result) ? result.forModel : result
+      const owner = (said as { readonly owner?: string } | null)?.owner
       return owner === undefined ? { kind: "household" as const } : { kind: "personal" as const, owner }
     }
 
@@ -764,7 +730,6 @@ export const remindersModule = defineModule({
           ...(said.kind === "repeat" ? { rrule: said.rrule, dtstart: said.dtstart, timeZone: said.timeZone } : {})
         }
         const id = randomUUID()
-        const quiet = personalQuiet(owner, turn)
         const written = yield* sh.exclusive(Effect.gen(function*() {
           const job = yield* ctx.scheduler.prepare({ handler: "due", key: jobKey(id), payload: { id }, at: said.at, late: "run", origin: sh.originOf(rem) })
           return yield* ctx.store.transaction((tx) => {
@@ -774,6 +739,8 @@ export const remindersModule = defineModule({
           })
         })).pipe(Effect.mapError((e) => new ToolError({ message: say(texts, l, "reason" in e && e.reason === "limit" || ("message" in e && /live jobs|limit/i.test(String(e.message))) ? "tooMany" : "unsaved") })))
         const v = written.value
+        // Asked now, after the last wait and write, and not before: what may be told here is decided at this moment.
+        const quiet = personalQuiet(owner, turn)
         const at = momentText(v.dueAt ?? said.at, l, z, now)
         const rule = said.kind === "repeat" ? (said.rule ?? say(texts, l, "repeating")) : ""
         const spoken = said.kind === "once"
@@ -823,12 +790,6 @@ export const remindersModule = defineModule({
             const deviceId = turn?.deviceId
             const rows = [...seen.rows].sort(sh.bySpeaking)
             if (rows.length === 0) {
-              // Nothing to show here: a list this part showed on this device goes.
-              const shown = deviceId === undefined ? undefined : sh.lists.get(deviceId)
-              if (shown !== undefined) {
-                sh.lists.delete(shown.deviceId)
-                yield* Effect.ignore(shown.handle.dismiss)
-              }
               if (seen.cut) return { spoken: say(texts, l, "cutNone", { count: SCAN_ROWS }) }
               if (seen.hidden.length > 0) return { spoken: say(texts, l, "withheld", { count: seen.hidden.length }) }
               return { spoken: say(texts, l, seen.person === undefined ? "nothingHousehold" : "nothing") }
@@ -845,28 +806,20 @@ export const remindersModule = defineModule({
               }
             }
             const owner = rows.some((r) => r.value.owner !== undefined) ? seen.person : undefined
-            let screen: string | undefined
-            if (deviceId !== undefined) {
-              const shownRows = rows.slice(0, 12)
-              const shown = yield* Effect.exit(ctx.present.show({ device: deviceId }, sh.listPresentation(shownRows, owner), { lifetime: "transient", expiresInMs: LIST_MS }))
-              if (Exit.isSuccess(shown)) {
-                sh.lists.set(deviceId, { handle: shown.value, ids: shownRows.map((r) => r.id), person: seen.person, owner, deviceId, until: now + LIST_MS })
-                screen = shown.value.outcome.note
-              } else {
-                const e = Cause.squash(shown.cause)
-                screen = `Not shown: ${e instanceof Error ? e.message : "the screen refused it"}`
-              }
-            }
-            return {
+            const forModel = {
               covers: say(texts, l, seen.person === undefined ? "coversHousehold" : seen.hidden.length > 0 ? "coversHouseholdHere" : "coversYours"),
               count: rows.length,
               reminders: rows.slice(0, 5).map(item),
               more: Math.max(0, rows.length - 5),
               ...(seen.hidden.length > 0 ? { withheld: say(texts, l, "withheld", { count: seen.hidden.length }) } : {}),
               ...(seen.cut ? { cut: say(texts, l, "cutRead", { count: SCAN_ROWS }) } : {}),
-              ...(screen !== undefined ? { screen } : {}),
               ...(owner !== undefined ? { owner } : {})
             }
+            // A read, speculative: it touches no screen. The list is a snapshot returned with the answer (shown by the
+            // Presenter when the turn is committed), built from the rows just read under the same privacy answer; it ends
+            // by its lifetime or is replaced by the next presentation on that device, and is not kept up to date.
+            if (deviceId === undefined) return forModel
+            return { forModel, present: sh.listPresentation(rows.slice(0, 12), owner), show: { lifetime: "transient" as const, expiresInMs: LIST_MS } }
           }))
         })
     })
@@ -897,7 +850,6 @@ export const remindersModule = defineModule({
             let row: Row<Reminder> | undefined = picked.row
             const id = row.id
             const owner = row.value.owner
-            const quiet = personalQuiet(owner, turn)
             if (row.value.state !== "open") {
               row = yield* sh.reconcileLocked(id, { send: false, forceStop: true })
               return { spoken: `${say(texts, l, "snoozeEnded")}${sh.stopping(row, l)}`, ...(owner !== undefined ? { owner } : {}) }
@@ -918,11 +870,15 @@ export const remindersModule = defineModule({
               // New words while it rings: its notification and card go, and the same occurrence is sent again with them.
               resend = true
               row = yield* sh.write(row, (v) => withStop({ ...without(v, "ring"), text: text!, owed: { at: ring.at, from: now, attempts: 0, tryAt: now } }, addStop(v.stop, [ring.at], true, now)))
+            } else if (ring !== undefined && ring.snoozeUntil === undefined) {
+              // Its notification is gone already (stopped on the host), its card may be on a screen with the old words: it goes.
+              row = yield* sh.write(row, (v) => withStop({ ...v, text: text! }, addStop(v.stop, [], true, now)))
             } else {
               row = yield* sh.write(row, (v) => ({ ...v, text: text! }))
             }
             row = yield* sh.reconcileLocked(id, { send: false, forceStop: true })
-            // The confirmation is built from the row as it was written.
+            // The confirmation is built from the row as it was written, and what it may tell is asked now, after the last wait.
+            const quiet = personalQuiet(owner, turn)
             const v = row?.value ?? r
             const t = speaksAt(v)
             const whenSaid = t !== undefined ? momentText(t, l, z, now) : say(texts, l, "wasDue", { when: momentText(v.ring?.at ?? 0, l, z, now) })

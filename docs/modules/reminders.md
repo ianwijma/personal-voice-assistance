@@ -49,7 +49,9 @@ series moves on to its next time **in the same write** (so a failed delivery nev
 tried; on success it becomes the ring (an older ring of the same reminder is taken down); a snooze that has come
 rings the same time again; a reminder with no series, no delivery under way and no ring is finished. Run twice, late,
 or after the reminder changed, it does only what the row says is owed at that moment. A delivery that fails needs no
-extra job: the reminder's one job is moved to the next try.
+extra job: the reminder's one job is moved to the next try. A delivery that must wait for the take-down of the
+notification with its own key (new words while it rang) is planned for that take-down's next try, never for a moment at
+which it cannot run; and a job's run that ends with anything still owed leaves the one job planned for a future moment.
 
 ### The late rules
 
@@ -101,14 +103,22 @@ case a reminder that was already stopped can ring once more; it can never ring z
 Finishing, cancelling, answering, snoozing or changing a reminder takes its notification down and dismisses its card.
 The tool or button tries that once, at once. If it fails, the reminder keeps **clean-up owed**, its job comes back a few
 seconds later (5 s, then doubling) and tries again, at most five times; then it is given up with a Health issue (the
-notification and card still end by themselves when they expire). The answer is true either way: "Cancelled: call mum."
-only when the ring is gone; otherwise "Cancelled: call mum. Its ring is still being taken down; I'll keep trying." Saying
-cancel or done again on such a reminder finishes the clean-up instead of answering that nothing matches.
+notification and card still end by themselves when they expire). The answer is true in each case: "Cancelled: call mum."
+only when the ring is gone; while tries are left "Cancelled: call mum. Its ring is still being taken down; I'll keep trying."; and
+when the tries are used up the row records that outcome (`stopFailed`) and every sentence after it says "Stopping its ring
+failed, and I've stopped trying; it ends by itself when it expires.", with no promise of further tries. Saying cancel or
+done again on a reminder with tries left finishes the clean-up instead of answering that nothing matches. A late
+delivery that is dropped after at least one try (it may have been sent: a write that failed afterwards) keeps its
+notification as clean-up owed, like any other.
 
 ### What it says about priority and expiry
 
 Every reminder is `ring` unless the setting says otherwise; its notification expires after 30 minutes (a `normal` card
-after a day). The card on the screen is transient (5 minutes; a newer transient presentation on that screen ends it).
+after a day). The card on the screen is transient (5 minutes; a newer transient presentation on that screen ends it). Its key and its
+buttons carry the occurrence (`due:<id>:<time>`): a press on a card for an occurrence that is not the reminder's current
+ring answers "That one was already answered." and changes nothing; "skip the next occurrence" is only for the tool.
+Changing the words of a reminder whose notification was stopped on the host but whose card is still on a screen withdraws
+that card (it does not ring again).
 
 ## Tools
 
@@ -118,7 +128,7 @@ than one asks, none says so).
 | Tool | Risk | What it does | Example |
 |---|---|---|---|
 | `reminders_set` `{ text, when, scope? }` | change | Sets a reminder: one moment or a repeat; answers with the moment in words. A personal one with nobody known asks whose and writes nothing; a text that holds a secret is refused (below). | "remind me to call mum at five" |
-| `reminders_list` `{}` | read, speculative | The open reminders, soonest first by the moment each next speaks (a snoozed one by its snooze; one waiting for an answer first, as "was due …"): the household's and the asking person's own; at most five with "and N more"; says what the answer covers and when the read was cut. On a device that can show it, also a `list` (twelve at most), and `screen` says what the screen did. | "what are my reminders?" |
+| `reminders_list` `{}` | read, speculative | The open reminders, soonest first by the moment each next speaks (a snoozed one by its snooze; one waiting for an answer first, as "was due …"): the household's and the asking person's own; at most five with "and N more"; says what the answer covers and when the read was cut. On a device that can show it, the answer comes with a `list` (twelve at most), a 30-second snapshot shown when the turn is promoted. | "what are my reminders?" |
 | `reminders_change` `{ which, text?, when? }` | change | New words, a new time (one moment or a repeat), or both, for the one reminder `which` finds (see "Changing a reminder while it rings"). | "move the dentist to Friday at ten" |
 | `reminders_cancel` `{ which }` | change | Cancels one reminder (a repeating one for good); its ring and card go. It is marked and removed by the daily clean-up, not on the turn. | "cancel the bins reminder" |
 | `reminders_done` `{ which? }` | change | Marks a reminder done: the one `which` finds, or the one ringing on this device (see "Answering"). | "I've called mum" |
@@ -129,9 +139,9 @@ only one: the answer asks for the exact words and changes nothing. Exact words s
 **Secrets.** A reminder must not hold a secret. Refused on set, change and `remind_in`, without repeating the words and
 without storing anything: a credential word (password, passcode, PIN, code, door code, …; wachtwoord, pincode, deurcode,
 …) followed by "is", ":" or "=" and a value, whatever the value looks like ("my password is violet-badger", "PIN: 1234");
-a credential word followed by mostly digits ("door code 12 34"); a credential word anywhere with four digits in a row.
-"Change my password" is an ordinary reminder. A false refusal of an innocent text ("the barcode is on the box") is the
-price of that rule.
+or a credential word followed by text that is mostly digits ("door code 12 34"). A credential word beside a year or a
+number that is not the value is an ordinary reminder: "change my password", "change my password for the 2027 account" and
+"learn to code in Python 2027" are stored.
 
 Typed actions (the intent agent runs them from their examples and phrases, without the model; the generated tools of
 `remind_in` and `ringing_snooze` are also offered to the model, that of `ringing_done` is not, since `reminders_done` is):
@@ -146,10 +156,13 @@ While a reminder rings, the labels of its buttons ("Done", "Snooze"; "Klaar", "U
 wake phrase (the host's ringing window). A reminder's own words are free text, so no phrase has the text as a slot;
 "done" on its own is not a phrase of this module, because another module's "done" could meet it.
 
-**The list on a screen follows the reminders.** The module keeps the list it showed on each device; when a reminder on it
-changes (cancelled, done, changed, delivered), the list is shown again from the rows as they are now, with privacy asked
-again for that device, or dismissed when nothing on it is left. An empty or withheld-only answer on that device
-dismisses it. It is transient (2 minutes; a newer transient presentation there ends it).
+**The list is a snapshot returned with the answer.** `reminders_list` is a read that may run speculatively, so its run
+touches no screen. On a device that can show it, the tool returns the list with its result (`{ forModel, present }`: the
+model gets what it always got, and the list, twelve items at most, is a transient presentation of 30 seconds), built at
+the moment of answering under the same privacy decision as the answer. It is **not updated** when a reminder changes
+afterwards: it ends by its lifetime or is replaced by the next presentation on that device. The presentation layer shows a
+presentation returned by a speculative tool only when its turn is promoted. The due card, shown by the reminder's own job,
+keeps its handle and its clean-up.
 
 The briefing section `reminders` (a `BriefingSection` contribution) says what is coming **today** for the asking person:
 the household's reminders and, only where `Privacy.mayReveal` allows it on the asking device now, their own. Personal
@@ -183,6 +196,7 @@ One collection, `reminders` (scope household; rows carry their owner), `storage.
 | `owed` | a delivery under way: `{ at, from, attempts, tryAt }` (`from`: what the late rule counts from) |
 | `ring` | a delivered time not yet answered: `{ at, deliveredAt, snoozeUntil? }` |
 | `stop` | clean-up owed: `{ notes, card, attempts, tryAt }` (the times whose notifications are to go, the card) |
+| `stopFailed` | the clean-up's tries were used up: a ring or card may still be open and ends by itself when it expires |
 | `nextAt` | the next moment anything happens for it; its one job is planned for it |
 | `deviceId`, `assistantId`, `setBy` | where it is delivered, the assistant that heard it, whose turn set it |
 | `rrule`, `dtstart`, `timeZone` | a repeat's rule, its start line and the household's zone |
@@ -204,7 +218,7 @@ The clean-up looks at every open reminder, a page of 12 at a time with a yield b
 unanswered for a week; then it removes finished rows older than the setting, oldest first, a page per transaction with
 a yield between, skipping (and reading past) rows whose clean-up is still owed, until it reaches the cutoff. A job's
 write carries the job as its actor; a button's write names the device it was pressed on (`{ kind: "ui", deviceId }`).
-Notifications use the key `rem:<id>:<time>` (one open per reminder and time), cards `due:<id>`.
+Notifications use the key `rem:<id>:<time>` (one open per reminder and time), cards `due:<id>:<time>`.
 
 **Concurrency.** A tool, a job and a press change reminders one at a time (one semaphore in the module's shared part),
 and every write also passes `expectRev` from the row it read. Two presses of done at once finish a reminder once; two
@@ -219,7 +233,8 @@ snoozes at once leave one snooze and one job.
   asking device **at the moment of answering**, after the last read; nothing is cached or decided when a reminder is
   stored. The delivery passes the owner to the notification service and the card carries `sensitivity: personal`, so
   each device is decided again when it would ring or show: a shared device whose default person changed since the
-  reminder was set gets neither. A list on a screen asks again for that device every time it is shown again.
+  reminder was set gets neither. A confirmation asks after the last wait and write, immediately before its sentence is
+  built; a list is built from the rows just read under the same answer.
 - Reading and matching look at the household's reminders and the **asking person's own** only; another person's are not
   read, not counted, not matched. Without a known person only the household's are read, and the answer says so. The
   person's own that the asking device may not be told are counted anonymously ("2 personal reminders are not read out

@@ -418,6 +418,8 @@ describe("which reminder is meant", () => {
     }))
 })
 
+const listItems = (result: any): Array<string> => (result?.present?.kind === "list" ? result.present.items.map((i: any) => i.text.split(" · ")[1]) : [])
+
 describe("listing and privacy", () => {
   const prepare = (kit: Kit) =>
     Effect.gen(function*() {
@@ -463,77 +465,81 @@ describe("listing and privacy", () => {
       assert.strictEqual((yield* allRows(kit)).filter((r) => r.value.state === "open").length, 3)
     }))
 
-  it.effect("the list is a presentation on the device that can show it, personal only where it may be shown", () =>
+  it.effect("the list comes back with the answer as a snapshot presentation, personal only where it may be shown, and the run touches no screen", () =>
     Effect.gen(function*() {
-      const kit = yield* startTestModule(remindersModule)
+      const faults = nofaults()
+      const kit = yield* startTestModule(faulty(faults))
       yield* prepare(kit)
-      const shown = forModel(yield* kit.tool("reminders_list", {}, { device: SAM }))
-      assert.isString(shown.screen)
-      yield* kit.present.settle
-      const [list] = kit.present.shown(SAM)
-      assert.strictEqual(list?.content.kind, "list")
-      assert.deepStrictEqual(list?.content.kind === "list" ? list.content.items.map((i) => i.text.split(" · ")[1]) : [], ["Sam's dentist", "bins out"])
-      assert.deepStrictEqual(kit.present.shown(ROBIN), [])
+      const answer = yield* kit.tool("reminders_list", {}, { device: SAM })
+      assert.include(answer.content, "[Screen:")
+      const result = faults.results.reminders_list
+      // `forModel` is what the answer was; the list is a transient presentation of 30 seconds, and nothing was shown by the run.
+      assert.deepStrictEqual(Object.keys(result).sort(), ["forModel", "present", "show"])
+      assert.deepStrictEqual(result.show, { lifetime: "transient", expiresInMs: 30_000 })
+      assert.deepStrictEqual(result.forModel.reminders.map((r: any) => r.text), ["Sam's dentist", "bins out"])
+      assert.deepStrictEqual(forModel(answer), result.forModel)
+      assert.strictEqual(result.present.kind, "list")
+      assert.deepStrictEqual(listItems(result), ["Sam's dentist", "bins out"])
+      assert.deepStrictEqual(result.present.sensitivity, { personal: "p-sam" })
+      assert.strictEqual(faults.shows, 0)
+      // The phone of Robin gets Robin's list.
+      yield* kit.tool("reminders_list", {}, { device: ROBIN })
+      assert.deepStrictEqual(listItems(faults.results.reminders_list), ["Robin's vet", "bins out"])
       const empty = yield* startTestModule(remindersModule)
       const none = yield* empty.tool("reminders_list", {}, { device: SAM })
       assert.deepStrictEqual(none.value, { spoken: "You have no reminders." })
       assert.deepStrictEqual(empty.present.shown(SAM), [])
     }))
 
-  it.effect("a list on the screen follows the reminders: replaced after a change, dismissed when none is left or the answer is empty", () =>
+  it.effect("the list is a snapshot: nothing refreshes or dismisses it when a reminder changes, and the module never touches a screen for it", () =>
     Effect.gen(function*() {
-      const kit = yield* startTestModule(remindersModule)
+      const faults = nofaults()
+      const kit = yield* startTestModule(faulty(faults))
       yield* kit.tool("reminders_set", { text: "dentist", when: "tomorrow at nine am", scope: "household" }, { device: SAM })
       yield* kit.tool("reminders_set", { text: "bins", when: "tomorrow at ten am", scope: "household" }, { device: SAM })
       yield* kit.tool("reminders_list", {}, { device: SAM })
+      assert.deepStrictEqual(listItems(faults.results.reminders_list), ["dentist", "bins"])
       yield* kit.present.settle
-      const items = () => kit.present.shown(SAM).flatMap((p) => (p.content.kind === "list" ? p.content.items.map((i) => i.text.split(" · ")[1]) : []))
-      assert.deepStrictEqual(items(), ["dentist", "bins"])
+      const before = kit.present.messages.length
       yield* kit.tool("reminders_cancel", { which: "dentist" }, { device: SAM })
-      yield* kit.present.settle
-      assert.deepStrictEqual(items(), ["bins"])
       yield* kit.tool("reminders_done", { which: "bins" }, { device: SAM })
       yield* kit.present.settle
-      assert.deepStrictEqual(kit.present.shown(SAM), [])
-      // Shown again, then an empty answer on the same page takes it down.
-      yield* kit.tool("reminders_set", { text: "cake", when: "tomorrow at eleven am", scope: "household" }, { device: SAM })
-      yield* kit.tool("reminders_list", {}, { device: SAM })
-      yield* kit.present.settle
-      assert.deepStrictEqual(items(), ["cake"])
-      yield* kit.moduleStore().collection(reminders).update((yield* rowByText(kit, "cake"))!.id, (v) => ({ ...v, state: "cancelled" as const, endedAt: 1 }))
+      // Every list message the pages were sent came from the returned presentation, none from a refresh or a dismissal.
+      assert.deepStrictEqual(kit.present.messages.slice(before).map((m) => m.message.type), [])
+      assert.strictEqual(faults.shows, 0)
+      // An empty answer shows and dismisses nothing either.
       assert.deepStrictEqual((yield* kit.tool("reminders_list", {}, { device: SAM })).value, { spoken: "You have no reminders." })
       yield* kit.present.settle
-      assert.deepStrictEqual(kit.present.shown(SAM), [])
+      assert.deepStrictEqual(kit.present.messages.slice(before).map((m) => m.message.type), [])
+      assert.strictEqual(faults.shows, 0)
     }))
 
-  it.effect("a shown personal list that may no longer be shown there loses that person's reminders at its next change", () =>
+  it.effect("the list is built under the privacy answer of the moment it is returned: a person's own are left out where they may not be shown", () =>
     Effect.gen(function*() {
       const faults = nofaults()
       const kit = yield* startTestModule(faulty(faults))
       yield* kit.tool("reminders_set", { text: "Sam's dentist", when: "tomorrow at nine am" }, { device: SAM })
       yield* kit.tool("reminders_set", { text: "bins", when: "tomorrow at ten am", scope: "household" }, { device: SAM })
-      yield* kit.tool("reminders_set", { text: "cake", when: "tomorrow at eleven am", scope: "household" }, { device: SAM })
       yield* kit.tool("reminders_list", {}, { device: SAM })
-      yield* kit.present.settle
-      const items = () => kit.present.shown(SAM).flatMap((p) => (p.content.kind === "list" ? p.content.items.map((i) => i.text.split(" · ")[1]) : []))
-      assert.deepStrictEqual(items(), ["Sam's dentist", "bins", "cake"])
+      assert.deepStrictEqual(listItems(faults.results.reminders_list), ["Sam's dentist", "bins"])
       // The kitchen display's default person changed: Sam's reminders may not be shown there any more.
       faults.reveal = (owner) => (owner === "p-sam" ? false : undefined)
-      yield* kit.tool("reminders_cancel", { which: "cake" }, { device: SAM })
-      yield* kit.present.settle
-      assert.notInclude(items(), "Sam's dentist")
+      const answer = yield* kit.tool("reminders_list", {}, { device: SAM })
+      assert.deepStrictEqual(listItems(faults.results.reminders_list), ["bins"])
+      assert.notInclude(answer.content, "dentist")
+      assert.notInclude(JSON.stringify(faults.results.reminders_list.present), "dentist")
     }))
 
   it.effect("a list item at the text's limit in characters outside the basic plane is shown whole or cut at a character, never split", () =>
     Effect.gen(function*() {
-      const kit = yield* startTestModule(remindersModule)
+      const faults = nofaults()
+      const kit = yield* startTestModule(faulty(faults))
       const pills = "💊".repeat(80)
       assert.include(spoken(yield* kit.tool("reminders_set", { text: pills, when: "tomorrow at nine am", scope: "household" }, { device: SAM })), "Reminder for the household")
-      const v = forModel(yield* kit.tool("reminders_list", {}, { device: SAM }))
-      assert.notInclude(v.screen, "Not shown")
-      yield* kit.present.settle
-      const [list] = kit.present.shown(SAM)
-      const text = list?.content.kind === "list" ? list.content.items[0]!.text : ""
+      const answer = yield* kit.tool("reminders_list", {}, { device: SAM })
+      assert.notInclude(answer.content, "Not shown")
+      const list = faults.results.reminders_list.present
+      const text: string = list.kind === "list" ? list.items[0]!.text : ""
       assert.isAtMost(text.length, 80)
       assert.isFalse(/[\ud800-\udbff](?![\udc00-\udfff])/.test(text))
       assert.isTrue(text.endsWith("💊…"))
@@ -541,7 +547,8 @@ describe("listing and privacy", () => {
 
   it.effect("soonest first by the moment each next speaks: a snoozed one is ordered by its snooze", () =>
     Effect.gen(function*() {
-      const kit = yield* startTestModule(remindersModule)
+      const faults = nofaults()
+      const kit = yield* startTestModule(faulty(faults))
       // "first" rings at 10:01 and is snoozed at 10:11 for an hour (11:11); then one for 10:30 and one for noon.
       yield* ring(kit, "first", "in a minute", "household")
       assert.strictEqual(((yield* kit.action("ringing_snooze", { for: "an hour" }, { device: SAM })) as any).say, "I'll remind you again in 1 hour.")
@@ -549,9 +556,7 @@ describe("listing and privacy", () => {
       yield* kit.tool("reminders_set", { text: "third", when: "today at noon", scope: "household" }, { device: SAM })
       const v = forModel(yield* kit.tool("reminders_list", {}, { device: SAM }))
       assert.deepStrictEqual(v.reminders.map((r: any) => r.text), ["second", "first", "third"])
-      yield* kit.present.settle
-      const [list] = kit.present.shown(SAM)
-      assert.deepStrictEqual(list?.content.kind === "list" ? list.content.items.map((i) => i.text.split(" · ")[1]) : [], ["second", "first", "third"])
+      assert.deepStrictEqual(listItems(faults.results.reminders_list), ["second", "first", "third"])
       // The briefing's order is the same.
       assert.deepStrictEqual((yield* gather(kit, HALL)).sentences, ["You have three reminders today: second at half past ten, first at eleven eleven and third at noon."])
     }))

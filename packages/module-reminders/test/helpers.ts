@@ -60,8 +60,12 @@ export interface Faults {
   readonly handlers: Record<string, any>
   /** How often each scheduler handler was entered. */
   readonly runs: Record<string, number>
+  /** What each tool last returned, as the module gave it (before the gateway splits `{ forModel, present }`). */
+  readonly results: Record<string, any>
+  /** How often the module itself called `present.show` (a tool's returned presentation is not counted). */
+  shows: number
 }
-export const nofaults = (): Faults => ({ storeWrites: false, storeReads: false, failTransactions: 0, sendFails: 0, resolveFails: 0, dismissFails: 0, handlers: {}, runs: {} })
+export const nofaults = (): Faults => ({ storeWrites: false, storeReads: false, failTransactions: 0, sendFails: 0, resolveFails: 0, dismissFails: 0, handlers: {}, runs: {}, results: {}, shows: 0 })
 
 export const faulty = (faults: Faults): ModuleDefinition<any> => {
   const bad = (what: string) => Effect.fail(new StoreError({ reason: "busy", message: what }))
@@ -130,13 +134,20 @@ export const faulty = (faults: Faults): ModuleDefinition<any> => {
         faults.handlers[`present:${name}`] = h
         return ctx.present.handle(name, h)
       },
-      show: (...a: Array<any>) => Effect.map(ctx.present.show(...a), wrapHandle)
+      show: (...a: Array<any>) => {
+        faults.shows++
+        return Effect.map(ctx.present.show(...a), wrapHandle)
+      }
     }
   })
   return {
     ...remindersModule,
     shared: (ctx: any) => remindersModule.shared!(wrap(ctx)),
-    start: (ctx: any) => remindersModule.start!(wrap(ctx))
+    start: (ctx: any) =>
+      Effect.map(remindersModule.start!(wrap(ctx)) as Effect.Effect<any>, (out: any) => ({
+        ...out,
+        tools: out.tools.map((t: any) => ({ ...t, execute: (input: unknown) => Effect.tap(t.execute(input), (r: unknown) => Effect.sync(() => void (faults.results[t.name] = r))) }))
+      }))
   } as ModuleDefinition<any>
 }
 
@@ -157,6 +168,19 @@ export const ring = (kit: Kit, text = "call mum", when = "in ten minutes", scope
     yield* kit.advance(11 * MIN)
     yield* kit.present.settle
     return (yield* kit.notify.all).filter((n) => n.state === "open").at(-1)!
+  })
+
+/** The assertion of the one-job rule: a reminder with anything owed has its one job, planned for its next moment. */
+export const assertJob = (kit: Kit, id: string, opts: { readonly future?: boolean } = {}) =>
+  Effect.gen(function*() {
+    const row = (yield* allRows(kit)).find((r) => r.id === id)!
+    const v = row.value
+    const owed = v.state === "open" ? v.dueAt !== undefined || v.owed !== undefined || v.ring?.snoozeUntil !== undefined || v.stop !== undefined : v.stop !== undefined
+    const jobs = yield* jobOf(kit, id)
+    if (!owed) return
+    assert.strictEqual(jobs.length, 1, "one live job while anything is owed")
+    assert.strictEqual(jobs[0]?.dueAt, v.nextAt, "the job is planned for the row's next moment")
+    if (opts.future === true) assert.isAbove(jobs[0]!.dueAt, yield* kit.now, "…which is a future moment")
   })
 
 /** The result the model got from a tool (its first line is the JSON). */

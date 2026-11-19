@@ -71,6 +71,8 @@ export const Reminder = Schema.Struct({
   owed: Schema.optionalKey(Owed),
   ring: Schema.optionalKey(Ring),
   stop: Schema.optionalKey(Stop),
+  /** Cleanup was given up after its tries: a ring or card may still be open and ends by itself when it expires. */
+  stopFailed: Schema.optionalKey(Schema.Boolean),
   /** The next moment anything happens for this row (`planOf`); indexed with `state`. Absent: nothing is planned. */
   nextAt: Schema.optionalKey(Epoch),
   /** The device it was set on, where it is delivered; the assistant that heard it. */
@@ -98,10 +100,17 @@ export const reminders = defineCollection({
   indexes: [["state", "nextAt"], ["state", "endedAt"]]
 })
 
+/** An owed delivery cannot be tried while a take-down of the notification with its own key is still owed (a change of words while it rang). */
+export const blocked = (r: Reminder): boolean => r.owed !== undefined && r.stop?.notes.includes(r.owed.at) === true
+
+/** When the owed delivery can next be tried: its own time, and never before the take-down it waits for is tried again. */
+export const owedTryAt = (r: Reminder): number | undefined =>
+  r.owed === undefined ? undefined : blocked(r) ? Math.max(r.owed.tryAt, r.stop!.tryAt) : r.owed.tryAt
+
 /** The next moment anything happens for a row: its series, its owed delivery's next try, its snooze, its cleanup. */
 export const planOf = (r: Reminder): number | undefined => {
   const times = r.state === "open"
-    ? [r.dueAt, r.owed?.tryAt, r.ring?.snoozeUntil, r.stop?.tryAt]
+    ? [r.dueAt, owedTryAt(r), r.ring?.snoozeUntil, r.stop?.tryAt]
     : [r.stop?.tryAt]
   let min: number | undefined
   for (const t of times) if (t !== undefined && (min === undefined || t < min)) min = t
@@ -209,20 +218,19 @@ const WORD = new RegExp(CREDENTIAL, "giu")
 
 /**
  * A stored reminder must not hold a secret. Refused: a credential word followed by "is", ":" or "=" and a value, whatever
- * the value looks like; a credential word followed by text that is mostly digits ("door code 12 34"); and a credential
- * word anywhere with a run of four digits. "Change my password" is an ordinary reminder.
+ * the value looks like; and a credential word followed by text that is mostly digits ("door code 12 34").
+ * "Change my password" and "change my password for the 2027 account" are ordinary reminders: a number is a value only
+ * when it is stated or makes up the text after the word.
  */
 export const holdsSecret = (text: string): boolean => {
   if (STATED.test(text)) return true
   WORD.lastIndex = 0
-  let any = false
   for (let m = WORD.exec(text); m !== null; m = WORD.exec(text)) {
-    any = true
     const rest = text.slice(m.index + m[0].length).replace(/\s+/gu, "")
     const digits = rest.replace(/\D/gu, "").length
     if (digits >= 3 && digits * 2 >= rest.length) return true
   }
-  return any && /\d{4,}/u.test(text)
+  return false
 }
 
 const words = (text: string): ReadonlyArray<string> => text.toLowerCase().split(/[^\p{L}\p{N}]+/u).filter((w) => w !== "")
