@@ -29,7 +29,7 @@ const office = { id: "office-speaker", name: "Office speaker", room: "Office", c
 type Kit = Effect.Success<ReturnType<typeof on>>
 const cardOn = (kit: Kit, device: string) => kit.present.shown(device).map((p) => p.content)
 
-const TOMORROW = { kind: "weather", place: "Utrecht", now: { temperature: "8 – 13°", condition: "Light rain", icon: "rain" }, days: [{ label: "Tomorrow", high: "13°", low: "8°", icon: "rain" }] }
+const TOMORROW = { kind: "weather", place: "Utrecht", now: { temperature: "8 – 13°", condition: "Light rain", icon: "rain" }, days: [{ label: "Tomorrow", high: "13°", low: "8°", icon: "rain" }] } as const
 
 describe("the forecast card: what it says", () => {
   it.effect("tomorrow's forecast: the place, the day's range, the condition and the day's high and low, and nothing the kind has no field for", () =>
@@ -60,7 +60,7 @@ describe("the forecast card: what it says", () => {
       const nl = yield* on(world(), { household: dutch })
       yield* nl.tool("weather_forecast", { day: "morgen" })
       yield* nl.present.settle
-      assert.deepStrictEqual(cardOn(nl, "kitchen-display"), [{ kind: "weather", place: "Utrecht", now: { temperature: "8 – 13°", condition: "Lichte regen", icon: "rain" }, days: [{ label: "Morgen", high: "13°", low: "8°", icon: "rain" }] }])
+      assert.deepStrictEqual(cardOn(nl, "kitchen-display"), [{ kind: "weather", place: "Utrecht", now: { temperature: "8 – 13°", condition: "Lichte regen", icon: "rain" }, days: [{ label: "Morgen", high: "13°", low: "8°", icon: "rain" }] } as const])
       const us = yield* on(world(), { household: { assistants: [{ id: "jeff", modules: { weather: { own: { units: "fahrenheit" } } } }] } })
       yield* us.tool("weather_forecast", { day: "tomorrow" })
       yield* us.present.settle
@@ -87,7 +87,7 @@ describe("the forecast card: what it says", () => {
       yield* kit.present.settle
       const [card] = cardOn(kit, "kitchen-display")
       assert.strictEqual(card?.kind === "weather" ? card.place : undefined, "A".repeat(39))
-      assert.isUndefined(presentationProblem({ ...card!, spoken: "x" } as never))
+      assert.isUndefined(presentationProblem({ ...card!, spoken: "x" }, Date.now()))
       // The same cut at an exact boundary keeps the whole emoji.
       const exact = `${"A".repeat(38)}😀`
       const kept = forecastCard({ lang: "en", placeName: exact, date: { year: 2026, month: 11, day: 19 }, daysFromToday: 1, code: 61, condition: "light rain", min: 8, max: 13, fahrenheit: false, spoken: "Tomorrow.", spokenShort: "Tomorrow." })
