@@ -92,6 +92,17 @@ export const texts = defineTexts({
     modeOff: "off",
     almostZero: "almost zero",
     roomless: "Without a room",
+    roomUnknownThat: "I don't know that room in Home Assistant. Which room do you mean?",
+    whichOneThat: "That room is more than one thing in Home Assistant. Which one do you mean?",
+    kindOnOff: "lights or switches",
+    onTitle: "On in {area}",
+    onSome: "On in {area}: {names}.",
+    onCount: "In {area}, {count} are on.",
+    onNone: "Nothing is on in {area}.",
+    onNoneRead: "Nothing I could read is on in {area}.",
+    onUnreadOne: "One device could not be read.",
+    onUnreadMany: "{count} devices could not be read.",
+    andMore: "and {count} more",
     refused: "I'm not allowed to do that through Home Assistant."
   },
   nl: {
@@ -178,6 +189,17 @@ export const texts = defineTexts({
     modeOff: "uit",
     almostZero: "bijna nul",
     roomless: "Zonder kamer",
+    roomUnknownThat: "Ik ken die kamer niet in Home Assistant. Welke kamer bedoel je?",
+    whichOneThat: "Die kamer is meer dan één ding in Home Assistant. Welke bedoel je?",
+    kindOnOff: "lampen of schakelaars",
+    onTitle: "Aan in {area}",
+    onSome: "Aan in {area}: {names}.",
+    onCount: "In {area} staan er {count} aan.",
+    onNone: "In {area} staat niets aan.",
+    onNoneRead: "In {area} staat niets aan dat ik kon lezen.",
+    onUnreadOne: "Eén apparaat kon ik niet lezen.",
+    onUnreadMany: "{count} apparaten kon ik niet lezen.",
+    andMore: "en nog {count}",
     refused: "Dat mag ik niet via Home Assistant doen."
   }
 })

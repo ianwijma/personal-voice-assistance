@@ -171,6 +171,54 @@ Questions it asks instead of guessing: "Which room? I don't know which room this
 without a room); "I don't know a room called Attic in Home Assistant. Which room do you mean?"; "There are no lights in
 Hall that I may use."; the "more than one thing" question above. Failures, each one sentence, in English and Dutch.
 
+## Phrase commands
+
+A few commands run **without the language model**, said after the wake phrase (or in a follow-up window), in English and
+Dutch (docs/PHRASES.md). They are phrases of the actions above, so the assistant's switches, the same refusals and
+sentences, the same risk class (`change`) and the same allow-list apply; nothing of the security kind becomes reachable
+(no phrase for a lock, an alarm, a gate or a garage door). Words are matched exactly: no filler ("lights on please" goes to
+the assistant), no near misses. They are said **without a room**: the room of the device that heard it (the action's own
+"here"); a device with no room that is an area gets the action's question.
+
+| Action | English | Dutch |
+|---|---|---|
+| `lights_on` | "lights on", "turn on the lights", "turn the lights on" | "licht aan", "lampen aan", "doe het licht aan", "zet het licht aan" |
+| `lights_off` | "lights off", "turn off the lights", "turn the lights off" | "licht uit", "lampen uit", "doe het licht uit", "zet het licht uit" |
+| `covers_open` | "open the blinds" | "doe de rolluiken open", "doe de zonwering open" |
+| `covers_close` | "close the blinds" | "doe de rolluiken dicht", "doe de zonwering dicht" |
+
+- **A phrase heard once acts once.** An invocation that came in as a phrase command is kept in a bounded record in the
+  module's shared part, by assistant, conversation, turn, device, action and resolved input; the same invocation again
+  (also while the first still runs) gets the first outcome and sends nothing. A new utterance is a new turn and acts. Every
+  other kind of turn (the model's tool calls, text, voice) runs every time, a repeated call in one turn included.
+- **A refusal said as a phrase never repeats words it did not recognise**: a room the module does not know is "that room"
+  ("I don't know that room in Home Assistant. Which room do you mean?"), two rooms of one name "That room is more than one
+  thing in Home Assistant. Which one do you mean?".
+
+## What is on here
+
+"**What is on here**" ("wat staat er hier aan") says which lights and switches (the kinds the assistant uses; fans and
+on/off helpers included) are on in the room of the device that asked, and returns, with the answer, a transient plain
+`list` for its screen (`whats_on`, a read; it takes no parameter and is not a tool). The house is read again at once, as
+for the status questions.
+
+- **The list is the answer's snapshot.** It names exactly the devices the sentence names, in its order (the house's), with
+  the same shortened names (40 characters), the same "and 12 more" and the same notes. It is not updated when the house
+  changes; it ends by its lifetime (30 seconds) or when the next presentation on that device replaces it. Nothing in the
+  module follows the house or keeps a handle, and the status questions (`lights_status`, `climate_status`, `locks_status`, `home_state`, which may run before their turn is committed) never touch a screen. The action is not speculative, and its list travels with its result: it is shown when the turn is promoted and dropped when the turn is discarded. With nothing named (nothing
+  on, or only a count would fit) no list is shown.
+- **Only what is known.** "On in Living room: Ceiling." A device that is unavailable or unknown is counted, never called
+  off ("2 devices could not be read."); nothing on is "Nothing is on in Living room." only when every device was read, else
+  "Nothing I could read is on …"; a house read only in part adds "Your house has more than I can read, so there may be
+  more."
+- **Text from Home Assistant** is shown as text, one line each, cut by one function at a code point boundary inside the
+  UTF-16 length the presentation protocol checks (controls, separators and bidirectional characters become spaces, a lone
+  surrogate goes). Everything is counted; only the few devices the answer can name are cleaned and formatted. The sentence
+  names at most four (fewer when it would pass 300 characters), the title is "On in <room>".
+- **Privacy.** The names are household content, the same sentence that is said aloud on that device; the Presenter decides
+  per device (shared, private and public screens alike). A device without a screen, or one that cannot draw a list, changes
+  nothing about the answer.
+
 ## The `HomeAssistant` service
 
 The module publishes the transport of `packages/module-contracts/src/homeAssistant.ts` from its `shared` part, under
@@ -297,9 +345,16 @@ to read is taken as Home Assistant's success (its error answers are short).
 choosing scenes from a list**: a new settings field would change the form the app's serve test pins; scenes are chosen
 through "Other names".
 
-**Left out for wave B** (phrase commands, presentations, notifications and a module's own speech do not exist yet):
-the short cue instead of words for a command in the device's own room; a `facts` card for climate and a `list` of what
-is on in a room; doorbell, leak and smoke notifications.
+**Left out, still** (the four phrases without a room and "what is on here" are above): the short cue instead of words for
+a command in the device's own room; a `facts` card for climate; doorbell, leak and smoke notifications; phrases for the
+other commands (brightness, switches, heating, scenes, a blind's position, the status questions); a list that follows the
+house (the host gives a module no way to follow a presentation without a handle that can go stale).
+
+**Phrases with a room's name** ("lights on in the kitchen"): cut. A phrase slot must be bound to a parameter of the existing
+action, and the targets are parameters whose values the module supplies while it runs, which the host does not let a
+phrase read; a separate action with a text slot would be a second way in that the owner's switches and the name rules do
+not cover. **Missing below the module:** a phrase slot that reads a parameter whose values the module supplies, or a binding
+from a phrase to an existing action's parameter (resolved off the matching path, with the action's own admission).
 
 **Left for later by the plan:** locking, unlocking, arming and disarming; watches; cameras; energy; delayed commands;
 media player control (music's, over the `HomeAssistant` service); the MCP long tail.
