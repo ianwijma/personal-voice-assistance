@@ -558,7 +558,7 @@ The longest stop of the event loop (a 1 ms timer) while the work ran, with a tur
 
 | Work | Longest stop |
 |---|---|
-| a backup (own connection, one step on SQLite's worker thread) | 2.7 ms |
+| a backup (own connection, one step on SQLite's worker thread; the copy is made a single file on a thread of its own too) | 2.7 ms (real disk: 4.0–5.3 ms; 15–54 ms, and 251–296 ms on a disk others were writing to, while the copy's journal change still synced on the main thread) |
 | a removal and the truncating checkpoint after it (worker thread), after a reader let the log grow | 1.6 ms |
 | ending a conversation of 3,000 rows of about 1 KB (steps of 10) | 1.8 ms |
 | ending a conversation at the legal maximum: values of 16,000 characters, eight indexed fields of 500 characters (sixteen indexes), secure deletion (steps of 10; 100 rows a step took 48 ms) | 3.4 ms (real disk: 3.6–7.7 ms) |
