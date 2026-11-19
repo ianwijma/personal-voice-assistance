@@ -1,4 +1,4 @@
-import { ActionError, CurrentTurn, type ModuleStore, type ParamOption, resolveOption, type Row, type StoreFailure, type StoreTx, type WriteOptions } from "@pva/core"
+import { ActionError, type Collection, CurrentTurn, type ModuleStore, type ParamOption, resolveOption, type Row, type StoreFailure, type StoreTx, type TxCollection, type WriteOptions } from "@pva/core"
 import { convertAmount, type UnitId } from "@pva/language"
 import { type Language, LISTS_LIMITS, say } from "@pva/module-contracts"
 import { Deferred, Effect, Exit, Semaphore } from "effect"
@@ -98,19 +98,67 @@ const refusable = <X>(store: ModuleStore, f: (tx: StoreTx) => X): Effect.Effect<
 
 export const isRefusal = (x: unknown): x is Refusal => x instanceof Refusal
 
+/** A transaction's handle that notes the lists written through it (`touched`); everything else as it is. */
+const watched = (tx: StoreTx, touched: Set<string>): StoreTx => ({
+  publish: tx.publish,
+  afterCommit: tx.afterCommit,
+  onRollback: tx.onRollback,
+  collection: <A>(c: Collection<A>): TxCollection<A> => {
+    const inner = tx.collection(c)
+    if (c.name === lists.name) {
+      return {
+        ...inner,
+        insert: (v, o) => {
+          const row = inner.insert(v, o)
+          touched.add(row.id)
+          return row
+        },
+        update: (id, f, o) => (touched.add(id), inner.update(id, f, o)),
+        remove: (id, o) => (touched.add(id), inner.remove(id, o))
+      }
+    }
+    if (c.name === items.name) {
+      const listOf = (v: A) => (v as unknown as Item).list
+      return {
+        ...inner,
+        insert: (v, o) => (touched.add(listOf(v)), inner.insert(v, o)),
+        update: (id, f, o) =>
+          inner.update(id, (v) => {
+            const next = f(v)
+            touched.add(listOf(v))
+            touched.add(listOf(next))
+            return next
+          }, o),
+        remove: (id, o) => {
+          const row = inner.get(id, o)
+          if (row !== undefined) touched.add(listOf(row.value))
+          return inner.remove(id, o)
+        }
+      }
+    }
+    return inner
+  }
+})
+
 /**
  * The lists module's work on the store: shared by its tools, actions, service and job. One per module (`shared`),
  * with a cache of the list rows (at most `MAX_LISTS`, one read) for the synchronous list choices of the typed actions.
  */
 export const makeEngine = (rawStore: ModuleStore) => {
-  /** Called after every committed transaction of the module (what shows a list follows its data); set by `shared`. */
-  let onChange: () => void = () => {}
-  /** The module's store: every transaction of the lists and items (tools, actions, service, clean-up, undo) tells `onChange`. */
+  /** Called after every committed transaction of the module with the lists it touched (what shows a list follows its data); set by `shared`. */
+  let onChange: (touched: ReadonlySet<string>) => void = () => {}
+  /**
+   * The module's store: every transaction of the lists and items (tools, actions, service, clean-up, undo) tells
+   * `onChange` which lists it wrote: a list row's id, and the list of every item it inserted, changed or removed.
+   */
   const store: ModuleStore = {
     moduleId: rawStore.moduleId,
     readOnly: rawStore.readOnly,
     collection: (c) => rawStore.collection(c),
-    transaction: (f) => Effect.tap(rawStore.transaction(f), () => Effect.sync(() => onChange()))
+    transaction: (f) => {
+      const touched = new Set<string>()
+      return Effect.tap(rawStore.transaction((tx) => f(watched(tx, touched))), () => Effect.sync(() => onChange(touched)))
+    }
   }
   const listStore = store.collection(lists)
   const itemStore = store.collection(items)
@@ -709,7 +757,7 @@ export const makeEngine = (rawStore: ModuleStore) => {
     store,
     /** The store without the change signal (the module's own bookkeeping that must not wake what follows the lists). */
     rawStore,
-    setOnChange: (f: () => void) => {
+    setOnChange: (f: (touched: ReadonlySet<string>) => void) => {
       onChange = f
     },
     once,

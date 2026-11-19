@@ -1,7 +1,7 @@
 import { ActionError, CurrentJob, CurrentTurn, defineAction, defineModule, makeTool, Param, type Row, Setting, type StoreFailure, ToolError } from "@pva/core"
 import { homeLanguage, isLine, type Language, Lists, LISTS_LIMITS, say, StoredText } from "@pva/module-contracts"
 import { speakList } from "@pva/language"
-import { Clock, Effect, Queue, Schema } from "effect"
+import { Clock, Effect, Schema } from "effect"
 import { type Item, items, listPhrase, lists, MAX_CLEAR, MAX_LIVE_LISTS, MAX_OPEN, MAX_PER_REQUEST, NAME_CHARS, normalise, type Quantity, SHOPPING, TODO, pins, undo, undoIdOf } from "./data.ts"
 import { type Checklists, HANDLER, makeChecklists } from "./checklist.ts"
 import { type Engine, isRefusal, listChoice, makeEngine, speak } from "./engine.ts"
@@ -116,26 +116,21 @@ export const listsModule = defineModule({
       }).pipe(Effect.orDie)
       // A system job at a quarter past four, the household's time zone.
       yield* ctx.scheduler.schedule({ handler: "tidy", key: "tidy", cron: "15 4 * * *" }).pipe(Effect.orDie)
-      // The checklists: a list's open items on a screen. Every committed change of the module's lists wakes one fiber
-      // that makes each pinned checklist equal to its list (off the call's path, one at a time with the module's work).
-      const checklists = makeChecklists(ctx, engine)
-      const wake = yield* Queue.sliding<void>(1)
-      engine.setOnChange(() => void Queue.offerUnsafe(wake, undefined))
+      // The checklists: a list's open items on a screen, one per device. Every committed change of the module's lists
+      // asks for the pins of those lists to be reconciled by one worker (off the call's path, each pin under the
+      // module's permit); a pin that fails is tried again on its own, and a new change never waits for it.
+      const checklists = yield* makeChecklists(ctx, engine)
+      engine.setOnChange(checklists.changed)
       yield* ctx.present.handle(HANDLER, {
         // A tick: the same change as `lists_complete`, by the item's id. A busy store is said, not failed.
         run: (press) => checklists.press(press).pipe(Effect.catch((e: StoreFailure) => Effect.succeed({ say: storeSentence(homeLanguage(ctx.host.view()), e, false) })))
       }).pipe(Effect.orDie)
-      yield* Effect.forkScoped(Effect.forever(Effect.gen(function*() {
-        yield* Queue.take(wake)
-        const done = yield* Effect.exit(checklists.refresh)
-        // One that could not be brought up to date (the host was busy) is tried again in half a minute.
-        if (done._tag === "Failure" || done.value === false) {
-          yield* Effect.sleep("30 seconds")
-          Queue.offerUnsafe(wake, undefined)
-        }
-      })))
-      // What changed while the module was stopped (or before a restart forgot what it had shown) is brought up to date now.
-      Queue.offerUnsafe(wake, undefined)
+      // A store that cannot be written (a CLI mode) shows nothing and keeps no pins: no worker then.
+      if (!ctx.store.readOnly) {
+        yield* Effect.forkScoped(checklists.worker)
+        // What changed while the module was stopped is brought up to date now, and each pin's handle is taken again.
+        checklists.reconcileAll()
+      }
       const shared: Shared = Object.assign(engine, { checklists })
       return { value: shared, services: [Lists.of(makeListsService(engine))] }
     }),
@@ -380,7 +375,7 @@ export const listsModule = defineModule({
         id: "show",
         label: "Show a list on the screen",
         description:
-          "Put a household list (the shopping list unless another is named) on this device's screen as a checklist of what is still open, with ticks. It stays there and follows the list (an item added, ticked off or removed anywhere) until it is closed with lists_hide, and is taken down when the list is deleted. Not for reading the list out (lists_read).",
+          "Put a household list (the shopping list unless another is named) on this device's screen as a checklist of what is still open, with ticks. A screen shows one checklist: another list there is replaced. It stays there and follows the list (an item added, ticked off or removed anywhere) until it is closed with lists_hide, and is taken down when the list is deleted. Not for reading the list out (lists_read).",
         examples: ["show the shopping list", "put the to-do list on the screen", "show me the list on the screen", "toon de boodschappenlijst", "zet de takenlijst op het scherm"],
         params: { list: listParam },
         risk: "change",
@@ -405,7 +400,8 @@ export const listsModule = defineModule({
                 // The answer is the one spoken: a device that cannot show it changes nothing about it.
                 return { say: speak(l, r.why === "no-display" || r.why === "cannot-show-kind" ? "noScreen" : "notShown", { spoken: r.spoken }) }
               case "shown":
-                return { say: speak(l, "showing", { list: phrase }) }
+                // A device shows one checklist: another list there was replaced, and the answer says which.
+                return { say: r.replaced === undefined ? speak(l, "showing", { list: phrase }) : speak(l, "showingInstead", { list: phrase, before: engine.phraseOf(r.replaced, l) }) }
             }
           })
       })
@@ -413,7 +409,7 @@ export const listsModule = defineModule({
       const hide = defineAction({
         id: "hide",
         label: "Close a list on the screen",
-        description: "Take a checklist that lists_show put on this device's screen down again (one list, or every one on this screen when none is named). The list itself is not changed.",
+        description: "Take the checklist that lists_show put on this device's screen down again (when a list is named, only if it is that list's). The list itself is not changed.",
         examples: ["close the shopping list", "hide the list", "take the lists off the screen", "sluit de boodschappenlijst", "haal de lijst van het scherm"],
         params: { list: listParam },
         risk: "change",
@@ -430,8 +426,9 @@ export const listsModule = defineModule({
                 return yield* Effect.fail(actionError(speak(l, "noDevice")))
               case "none":
                 return { say: target === undefined ? speak(l, "nothingOnScreen") : speak(l, "notOnScreen", { list: phrase }) }
-              case "failed":
-                return yield* Effect.fail(actionError(speak(l, "hideFailed")))
+              case "later":
+                // The close is recorded and tried again until it is done.
+                return { say: speak(l, "hideLater", { list: engine.phraseOf(r.list, l) }) }
               case "closed":
                 return { say: target === undefined ? speak(l, "hiddenAll") : speak(l, "hidden", { list: phrase }) }
             }

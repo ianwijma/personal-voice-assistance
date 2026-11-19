@@ -367,20 +367,39 @@ describe("the checklist", () => {
       assert.deepStrictEqual(textsOf(checklistOf(kit, "kitchen-display")), ["milk", "bread"])
     }))
 
-  it.effect("no more than eight are kept, and a ninth says so", () =>
+  it.effect("a device shows one checklist: another list there replaces it, and the answer says so", () =>
     Effect.gen(function*() {
       const kit = yield* startTestModule(listsModule, { household: HOUSEHOLD })
-      for (let i = 0; i < 7; i++) yield* kit.tool("lists_create", { name: `list number ${String.fromCharCode(97 + i)}` })
-      const named = ["list number a", "list number b", "list number c", "list number d", "list number e", "list number f", "list number g"]
+      yield* kit.tool("lists_create", { name: "camping", items: "tent" })
       yield* kit.action("show", {}, { device: "kitchen-display" })
-      for (const name of named) yield* kit.action("show", { list: name }, { device: "kitchen-display" })
+      const r = yield* kit.action("show", { list: "camping" }, { device: "kitchen-display" })
+      assert.deepStrictEqual(r, { ok: true, say: "Showing the camping list on this screen, instead of the shopping list." })
       yield* kit.present.settle
-      assert.strictEqual(kit.present.shown("kitchen-display").length, 8)
-      yield* kit.action("show", { list: "to do" }, { device: "hall-screen" }).pipe(Effect.ignore)
-      const refused = yield* kit.action("show", { list: "to do" }, { device: "hall-screen" })
+      assert.strictEqual(kit.present.shown("kitchen-display").length, 1)
+      assert.deepStrictEqual(textsOf(checklistOf(kit, "kitchen-display")), ["tent"])
+      const rows = yield* kit.moduleStore().collection(pins).list({})
+      assert.deepStrictEqual(rows.map((row) => row.id), ["pin.kitchen-display"])
+      assert.notStrictEqual(rows[0]!.value.list, SHOPPING)
+      // The same list again says nothing about a replacement; the replaced list is not on this screen any more.
+      assert.deepStrictEqual(yield* kit.action("show", { list: "camping" }, { device: "kitchen-display" }), { ok: true, say: "Showing the camping list on this screen." })
+      assert.deepStrictEqual(yield* kit.action("hide", { list: "groceries" }, { device: "kitchen-display" }), { ok: true, say: "The shopping list isn't on this screen." })
+      // In Dutch too.
+      const nl = yield* startTestModule(listsModule, { household: DUTCH })
+      yield* nl.action("show", {}, { device: "kitchen-display" })
+      assert.deepStrictEqual(yield* nl.action("show", { list: "to do" }, { device: "kitchen-display" }), { ok: true, say: "De takenlijst staat nu op dit scherm, in plaats van de boodschappenlijst." })
+    }))
+
+  it.effect("no more than eight screens hold one at once (the host's bound for a module), and a ninth says so", () =>
+    Effect.gen(function*() {
+      const screens: ReadonlyArray<TestDevice> = Array.from({ length: 9 }, (_, i) => ({ id: `screen-${i + 1}`, name: `Screen ${i + 1}`, room: `Room ${i + 1}`, privacy: "shared" }))
+      const kit = yield* startTestModule(listsModule, { household: { devices: screens } })
+      for (const screen of screens.slice(0, 8)) assert.isTrue((yield* kit.action("show", {}, { device: screen.id })).ok)
+      yield* kit.present.settle
+      const refused = yield* kit.action("show", {}, { device: "screen-9" })
       assert.isFalse(refused.ok)
       assert.strictEqual(refused.message, "Too many lists are on screens already; close one first.")
-      assert.deepStrictEqual(kit.present.shown("hall-screen"), [])
+      assert.deepStrictEqual(kit.present.shown("screen-9"), [])
+      assert.strictEqual((yield* kit.moduleStore().collection(pins).list({})).length, 8)
     }))
 })
 
@@ -467,7 +486,7 @@ describe("the pin and what it stores", () => {
       yield* kit.action("show", {}, { device: "robins-phone" })
       const rows = yield* kit.moduleStore().collection(pins).list({})
       assert.strictEqual(rows.length, 1)
-      assert.deepStrictEqual(Object.keys(rows[0]!.value).sort(), ["device", "key", "list", "until"])
+      assert.deepStrictEqual(Object.keys(rows[0]!.value).sort(), ["device", "key", "list", "shown", "until"])
       assert.strictEqual(rows[0]!.value.device, "robins-phone")
       // The row's value (the store's own change record, `updatedBy`, is the store's).
       assert.notInclude(JSON.stringify(rows.map((r) => r.value)), "milk")

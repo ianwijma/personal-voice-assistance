@@ -170,19 +170,30 @@ export const undoIdOf = (conversationId: string) => `u-${createHash("sha256").up
 // ---------------------------------------------------------------------------------------------------------------------
 // Checklists on screens
 
-/** Where a list is pinned as a checklist: a row per list and device (at most `MAX_PINS` at once). */
-export const MAX_PINS = 8
+/** A device id as the household gives it (core's `isDeviceId`: 8 to 64 letters, digits, `_` and `-`), looser here: 1 to 64 of a row id's characters. */
+const DEVICE_ID = StoredText(64).check(Schema.isPattern(/^[A-Za-z0-9_.:-]{1,64}$/))
 
 /**
- * One checklist pinned on one device's screen. It holds no person and no content (the content is read again from the
- * lists every time it is shown): the list, the household's own device id, the key of the presentation and the time the
- * host ends it by itself. The row is removed when the checklist is closed, when its list is deleted or once it ended.
+ * One checklist pinned on one device's screen: a device shows at most one, so there is at most one row per household
+ * device, found by its id (`pinIdOf(device)`). It holds no person and no content (the content is read again from the
+ * lists every time it is shown): the list, the household's own device id, the presentation's key, the fixed end
+ * (`until`: 24 hours after it was shown or its content last changed), a hash of the content last shown, and the work
+ * still owed with its attempts and next try. Every write of a pin is one transaction that records what is owed then.
+ *
+ * - `owed` absent: the screen holds what the row says (or it is offline and gets it back when it reconnects).
+ * - `show`: the content (`shown`) is to be shown again under the key, with what remains until `until`.
+ * - `dismiss`: it is to be taken down (closed, its list deleted, its device removed), then the row removed.
+ * - `remove`: it was taken down; only the row is left to remove.
  */
 export const Pin = Schema.Struct({
+  device: DEVICE_ID,
   list: ROW_ID,
-  device: StoredText(64).check(Schema.isPattern(/^[A-Za-z0-9_.:-]{1,64}$/)),
   key: StoredText(64).check(Schema.isPattern(/^[A-Za-z0-9_.:@/-]{1,64}$/)),
-  until: EPOCH_MS
+  until: EPOCH_MS,
+  shown: Schema.optionalKey(StoredText(32).check(Schema.isPattern(/^[0-9a-f]{32}$/))),
+  owed: Schema.optionalKey(Schema.Literals(["show", "dismiss", "remove"])),
+  attempts: Schema.optionalKey(Schema.Int.check(Schema.isBetween({ minimum: 1, maximum: 1_000_000 }))),
+  next: Schema.optionalKey(EPOCH_MS)
 })
 export type Pin = typeof Pin.Type
 
@@ -190,14 +201,17 @@ export const pins = defineCollection({
   name: "pins",
   scope: "household",
   schema: Pin,
-  // The worst legal pin is 393 characters of JSON (checkModule computes it).
-  maxChars: 400
+  // The worst legal pin is 528 characters of JSON (checkModule computes it). The pins of a list are found by `list`.
+  maxChars: 540,
+  indexes: ["list"]
 })
 
-const pinHash = (list: string, device: string) => createHash("sha256").update(`${list}\n${device}`).digest("hex")
-/** A pin's row id and its presentation key: hashes of the list and the device, so neither says what it names. */
-export const pinIdOf = (list: string, device: string) => `pin-${pinHash(list, device).slice(0, 32)}`
-export const pinKeyOf = (list: string, device: string) => `lists.${pinHash(list, device).slice(32, 56)}`
+/** A pin's row id: the device's id after a fixed prefix (one to one, at most 68 characters: inside the store's 200). */
+export const pinIdOf = (device: string) => `pin.${device}`
+/** A device's checklist key: a hash of the device id, so the key says nothing about which device it is. */
+export const pinKeyOf = (device: string) => `lists.${createHash("sha256").update(device).digest("hex").slice(0, 24)}`
+/** What a checklist holds, as the hash a pin keeps. */
+export const signatureOf = (content: string) => createHash("sha256").update(content).digest("hex").slice(0, 32)
 
 // ---------------------------------------------------------------------------------------------------------------------
 // Matching

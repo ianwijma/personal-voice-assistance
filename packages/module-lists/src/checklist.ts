@@ -1,8 +1,8 @@
-import { CurrentTurn, type HostView, type ModulePresent, type PresentError, type PresentHandle, type Presentation, type PresentPress, type Row, type StoreFailure } from "@pva/core"
+import { CurrentTurn, type ModuleHostApi, type ModulePresent, type PresentError, type PresentHandle, type Presentation, PRESENT_MIN_EXPIRY_MS, type PresentPress, type Row, type StoreFailure } from "@pva/core"
 import { homeLanguage, type Language, say } from "@pva/module-contracts"
 import { speakList } from "@pva/language"
-import { Clock, Effect } from "effect"
-import { type Item, type ListRow, MAX_PINS, type Pin, pinIdOf, pinKeyOf, pins, SHOPPING, TODO } from "./data.ts"
+import { Clock, Effect, Exit, Queue } from "effect"
+import { type Item, type ListRow, type Pin, pinIdOf, pinKeyOf, pins, SHOPPING, signatureOf, TODO } from "./data.ts"
 import { type Engine, isRefusal, speak } from "./engine.ts"
 import { sayItem } from "./parse.ts"
 import { texts } from "./texts.ts"
@@ -19,10 +19,16 @@ const ITEM_CHARS = 80
 const SPOKEN_CHARS = 300
 /** The spoken fallback names items while its sentence stays inside this (leaving room for the rest of the sentence). */
 const SPOKEN_ITEMS_CHARS = 200
-/** A shown checklist stays until it is closed or this long after it last changed (the host's longest lifetime). */
+/** A shown checklist stays until it is closed or this long after it was shown or its content last changed (the host's longest lifetime). */
 export const PIN_MS = 24 * 3_600_000
-/** A checklist closed after a restart (no handle any more) is replaced by an empty one that the host ends after this (its shortest lifetime). */
+/** A checklist closed without a handle of this run is replaced by an empty one that the host ends after this (its shortest lifetime). */
 export const CLOSE_MS = 3_000
+/** How long a pin waits after its n-th failed try: 5 s, 20 s, 80 s, 320 s, then every 10 minutes. */
+export const retryIn = (attempts: number): number => Math.min(5_000 * 4 ** Math.max(0, attempts - 1), 600_000)
+/** How often the pinned devices are compared with the household's devices (the host sends no signal when one is removed). */
+export const MEMBERS_MS = 60_000
+/** Pins per read when the pins of a list (or, at a start, all of them) are looked up; the pages go on until the end. */
+const PIN_PAGE = 16
 
 const LONE_SURROGATE = /[\ud800-\udbff](?![\udc00-\udfff])|(?<![\ud800-\udbff])[\udc00-\udfff]/g
 const NOT_ONE_LINE = /[\u0000-\u001f\u007f-\u009f\u2028\u2029\u200e\u200f\u202a-\u202e\u2066-\u2069]/g
@@ -43,14 +49,14 @@ export const cutAt = (text: string, max: number): string => {
 /** What a checklist shows of a list now. */
 export interface Built {
   readonly presentation: Presentation
-  /** What a screen would hold, for comparing with what is shown (a change of any of it is an update). */
+  /** What a screen holds of it (the title and the items), for comparing with what is shown (a change of either is an update). */
   readonly signature: string
   readonly open: number
 }
 
 /** The result of putting a checklist on a screen. */
 export type Shown =
-  | { readonly kind: "shown"; readonly spoken: string }
+  | { readonly kind: "shown"; readonly spoken: string; readonly replaced: string | undefined }
   | { readonly kind: "not-shown"; readonly spoken: string; readonly why: string | undefined }
   | { readonly kind: "gone" }
   | { readonly kind: "limit" }
@@ -72,211 +78,405 @@ const spokenWords = (named: ReadonlyArray<string>, total: number, lang: Language
   return rest <= 0 ? speakOf(shown, lang, Math.max(2, shown.length)) : say(texts, lang, "more", { items: shown.join(", "), count: rest })
 }
 
-export const makeChecklists = (ctx: {
-  readonly present: ModulePresent
-  readonly host: { readonly view: () => HostView }
-  readonly settingsFor: (assistantId: string | undefined) => { readonly readItems: number } | undefined
-}, engine: Engine) => {
-  const lang = () => homeLanguage(ctx.host.view())
-  const pinStore = engine.rawStore.collection(pins)
-  /** The newest handle of each pin made in this run (a restart forgets them; the host keeps what is pinned). */
-  const handles = new Map<string, PresentHandle>()
-  /** What each pin was last shown as, so a change that leaves the screen as it is sends nothing. */
-  const signatures = new Map<string, string>()
-
-  const readItemsFor = (assistantId: string | undefined) => ctx.settingsFor(assistantId)?.readItems ?? 5
-
-  /** The list as a checklist now, or `undefined` when it is gone or deleted. Under the module's permit. */
-  const build = (list: string, l: Language, readItems: number): Effect.Effect<Built | undefined, StoreFailure> =>
-    Effect.gen(function*() {
-      const row = yield* engine.listStore.get(list)
-      const isDefault = list === SHOPPING || list === TODO
-      if ((row === undefined && !isDefault) || row?.value.deletedAt !== undefined) return undefined
-      const open = row?.value.open ?? 0
-      const scanned = yield* engine.scan(list, "open", SHOWN_ITEMS)
-      const rows: ReadonlyArray<Row<Item>> = scanned.rows
-      // What a screen does not show is counted, never hidden: "(+3 more)" in the title, and the spoken text says it too.
-      const more = Math.max(rows.length < open ? open - rows.length : 0, scanned.cut ? 1 : 0)
-      const name = titleOf(list, row?.value, l)
-      const tail = more > 0 ? say(texts, l, "titleMore", { count: more }) : ""
-      const title = `${cutAt(name, TITLE_CHARS - tail.length)}${tail}`
-      const items = rows.map((r) => ({ id: r.id, text: cutAt(sayItem(r.value.text, r.value.quantity, l), ITEM_CHARS), done: false }))
-      const phrase = engine.phraseOf(list, l)
-      const named = rows.map((r) => cutAt(sayItem(r.value.text, r.value.quantity, l), 60))
-      const total = Math.max(open, rows.length)
-      const words = spokenWords(named, total, l, readItems)
-      const spoken = cutAt(open === 0 && rows.length === 0 ? speak(l, "empty", { list: phrase }) : total === 1 ? speak(l, "readOne", { list: phrase, items: words }) : speak(l, "readOpen", { list: phrase, count: total, items: words }), SPOKEN_CHARS)
-      const presentation: Presentation = { kind: "list", title, style: "checklist", items, spoken, handler: HANDLER }
-      return { presentation, signature: JSON.stringify([title, items, spoken]), open }
-    })
-
-  /** Every pin (at most `MAX_PINS`, with a few spare for rows left by a failed removal). */
-  const pinRows = pinStore.list({ limit: MAX_PINS * 2 + 1 })
-
-  const upsertPin = (pin: Pin) =>
-    engine.rawStore.transaction((tx) => {
-      const c = tx.collection(pins)
-      const id = pinIdOf(pin.list, pin.device)
-      if (c.get(id) === undefined) c.insert(pin, { id })
-      else c.update(id, () => pin)
-    })
-  const removePin = (id: string) =>
-    Effect.tap(engine.rawStore.transaction((tx) => void (tx.collection(pins).get(id) !== undefined && tx.collection(pins).remove(id))), () => Effect.sync(() => {
-      handles.delete(id)
-      signatures.delete(id)
-    }))
-
-  type Tried<A> = { readonly ok: A } | { readonly err: PresentError }
-  const tried = <A>(effect: Effect.Effect<A, PresentError>): Effect.Effect<Tried<A>> =>
-    effect.pipe(Effect.map((ok): Tried<A> => ({ ok })), Effect.catch((err: PresentError) => Effect.succeed<Tried<A>>({ err })))
-
-  /**
-   * Show a list as a checklist on a device (again: the same key replaces it in place, on the same page). A device that
-   * does not show it keeps nothing: no pin is made. The host bounds what is shown at once (eight of this module), so
-   * there are never more pins than that. Under the module's permit.
-   */
-  const showLocked = (list: string, device: string, l: Language, readItems: number, now: number): Effect.Effect<Shown, StoreFailure> =>
-    Effect.gen(function*() {
-      const built = yield* build(list, l, readItems)
-      if (built === undefined) return { kind: "gone" } as const
-      const id = pinIdOf(list, device)
-      const result = yield* tried(ctx.present.show({ device }, built.presentation, { lifetime: "pinned", key: pinKeyOf(list, device), expiresInMs: PIN_MS }))
-      if ("err" in result) return result.err.reason === "limit" ? ({ kind: "limit" } as const) : ({ kind: "failed" } as const)
-      const handle = result.ok
-      const here = handle.outcome.devices.find((d) => d.deviceId === device)
-      if (here?.shown !== true) {
-        // The device cannot show it (no screen, a page that cannot draw a list, offline): nothing is kept for it.
-        yield* Effect.ignore(handle.dismiss)
-        yield* Effect.ignore(removePin(id))
-        return { kind: "not-shown", spoken: built.presentation.spoken, why: here?.why } as const
-      }
-      const kept = yield* Effect.exit(upsertPin({ list, device, key: pinKeyOf(list, device), until: now + PIN_MS }))
-      if (kept._tag === "Failure") {
-        yield* Effect.ignore(handle.dismiss)
-        return { kind: "failed" } as const
-      }
-      handles.set(id, handle)
-      signatures.set(id, built.signature)
-      return { kind: "shown", spoken: built.presentation.spoken } as const
-    })
-
-  /**
-   * Take a pinned checklist down and forget it. With the handle of this run it is dismissed; after a restart (no handle)
-   * it is replaced by an empty one the host ends after `CLOSE_MS`, by the same key. A host that is busy leaves the pin
-   * to be closed by the next change or request (`false`).
-   */
-  const endLocked = (pin: Row<Pin>, l: Language): Effect.Effect<boolean, StoreFailure> =>
-    Effect.gen(function*() {
-      const handle = handles.get(pin.id)
-      if (handle !== undefined) {
-        const r = yield* tried(handle.dismiss)
-        if ("err" in r && (r.err.reason === "busy" || r.err.reason === "failed")) return false
-      } else {
-        const listRow = yield* engine.listStore.get(pin.value.list)
-        const closing: Presentation = {
-          kind: "list",
-          title: cutAt(titleOf(pin.value.list, listRow?.value, l), TITLE_CHARS),
-          style: "checklist",
-          items: [],
-          spoken: speak(l, "finalSpoken", { list: engine.phraseOf(pin.value.list, l) }),
-          handler: HANDLER
-        }
-        const r = yield* tried(ctx.present.show({ device: pin.value.device }, closing, { lifetime: "pinned", key: pin.value.key, expiresInMs: CLOSE_MS }))
-        if ("err" in r && (r.err.reason === "busy" || r.err.reason === "failed")) return false
-      }
-      yield* removePin(pin.id)
-      return true
-    })
-
-  /** Make every pinned checklist equal to its list now: changed ones shown again, deleted ones closed, ended ones forgotten. Under the permit. */
-  const refreshLocked = Effect.gen(function*() {
-    const now = yield* Clock.currentTimeMillis
-    const l = lang()
-    const readItems = readItemsFor(undefined)
-    let allDone = true
-    for (const pin of yield* pinRows) {
-      // The host ends a shown checklist on its own; its row is forgotten with it.
-      if (pin.value.until <= now + CLOSE_MS) {
-        yield* removePin(pin.id)
-        continue
-      }
-      const step = Effect.gen(function*() {
-        const built = yield* build(pin.value.list, l, readItems)
-        if (built === undefined) {
-          if (!(yield* endLocked(pin, l))) allDone = false
-          return
-        }
-        if (signatures.get(pin.id) === built.signature) return
-        const shown = yield* showLocked(pin.value.list, pin.value.device, l, readItems, now)
-        if (shown.kind === "failed" || shown.kind === "limit") allDone = false
-        if (shown.kind === "gone") yield* endLocked(pin, l)
-      })
-      // One checklist that cannot be refreshed leaves the others as they are, and is tried again later.
-      const exit = yield* Effect.exit(step)
-      if (exit._tag === "Failure") allDone = false
-    }
-    return allDone
-  })
-
-  /** The checklists on a device, or of one list. */
-  const onDevice = (device: string, list: string | undefined) =>
-    Effect.map(pinRows, (rows) => rows.filter((r) => r.value.device === device && (list === undefined || r.value.list === list)))
-
-  const device = Effect.map(CurrentTurn, (turn) => turn?.deviceId)
-
-  /** What a tick on a checklist does: the same change as `lists_complete` makes, by the item's id, once. */
-  const press = (p: PresentPress): Effect.Effect<{ readonly say: string }, StoreFailure> =>
-    Effect.gen(function*() {
-      const l = lang()
-      const rows = yield* pinRows
-      const pin = rows.find((r) => r.value.key === p.key && r.value.device === p.deviceId)
-      if (pin === undefined || p.item === undefined) return { say: speak(l, "pinGone") }
-      if (p.done !== true) return { say: speak(l, "tickOnly") }
-      const row = yield* engine.itemStore.get(p.item)
-      if (row === undefined || row.value.list !== pin.value.list || row.value.status === "removed") {
-        yield* refreshLocked
-        return { say: speak(l, "itemGone") }
-      }
-      const phrase = engine.phraseOf(pin.value.list, l)
-      // Already ticked off (a second press, or another device's): nothing changes, and it says so.
-      if (row.value.status === "done") return { say: speak(l, "alreadyTicked", { items: row.value.text }) }
-      const now = yield* Clock.currentTimeMillis
-      // The same path as the tool: the item as read, at its rev; a change since is a conflict, and nothing is done twice.
-      const done = yield* engine.setStatus(pin.value.list, [row], "done", "complete", undefined, now)
-      yield* refreshLocked
-      if (isRefusal(done)) return { say: speak(l, "itemGone") }
-      return { say: speak(l, "completed", { items: row.value.text, list: phrase }) }
-    })
-
-  return {
-    readItemsFor,
-    build,
-    /** Put a list on the asking device as a checklist. */
-    show: (list: string, readItems: number) =>
-      engine.serial(Effect.gen(function*() {
-        const d = yield* device
-        if (d === undefined) return { kind: "no-device" } as const
-        const now = yield* Clock.currentTimeMillis
-        return yield* showLocked(list, d, lang(), readItems, now)
-      })),
-    /** Close the checklists on the asking device (of one list, or all). `undefined`: none was shown there. */
-    hide: (list: string | undefined) =>
-      engine.serial(Effect.gen(function*() {
-        const d = yield* device
-        if (d === undefined) return { kind: "no-device" } as const
-        const l = lang()
-        const found = yield* onDevice(d, list)
-        if (found.length === 0) return { kind: "none" } as const
-        let all = true
-        for (const pin of found) if (!(yield* endLocked(pin, l))) all = false
-        return { kind: all ? "closed" : "failed", count: found.length } as const
-      })),
-    /** Every pinned checklist follows its list; `false` when one could not be brought up to date (try again later). */
-    refresh: engine.serial(refreshLocked),
-    /** The press handler's body, under the module's permit (the same one-at-a-time rule as the tools). */
-    press: (p: PresentPress) => engine.serial(press(p)),
-    pinRows
-  }
+/** What reconciling a pin did: when to look at it again (its end, its next try; none: it is gone), and whether it was taken down. */
+export interface Reconciled {
+  readonly next: number | undefined
+  readonly down: boolean
 }
 
-export type Checklists = ReturnType<typeof makeChecklists>
+/** What putting a checklist under a device's key did. */
+type Put =
+  | { readonly kind: "error"; readonly reason: PresentError["reason"] }
+  | { readonly kind: "shown" | "offline"; readonly handle: PresentHandle }
+  | { readonly kind: "cannot"; readonly handle: PresentHandle; readonly why: string | undefined }
+
+/**
+ * The checklists on screens (docs/modules/lists.md "Checklists"). The saved pin is the one state: one row per device,
+ * found by its id, saying which list, its key, its end, what was last shown and what is owed. `reconcile(device)` is the
+ * one function that does what a pin owes; a worker of `shared` runs it for every pin a change concerns, at a pin's end,
+ * at its next try and at a start. A new signal never waits for another pin's retry.
+ */
+export const makeChecklists = (ctx: {
+  readonly present: ModulePresent
+  readonly host: Pick<ModuleHostApi, "view">
+  readonly settingsFor: (assistantId: string | undefined) => { readonly readItems: number } | undefined
+}, engine: Engine) =>
+  Effect.gen(function*() {
+    const lang = () => homeLanguage(ctx.host.view())
+    const pinStore = engine.rawStore.collection(pins)
+    /** This run's handle of each device's checklist (a restart forgets them; the host keeps what is pinned). */
+    const handles = new Map<string, PresentHandle>()
+    /** Devices whose checklist this run took down while its row is still there (the row is removed next). */
+    const dismissed = new Set<string>()
+
+    const readItemsFor = (assistantId: string | undefined) => ctx.settingsFor(assistantId)?.readItems ?? 5
+
+    /** The list as a checklist now, or `undefined` when it is gone or deleted. Under the module's permit. */
+    const build = (list: string, l: Language, readItems: number): Effect.Effect<Built | undefined, StoreFailure> =>
+      Effect.gen(function*() {
+        const row = yield* engine.listStore.get(list)
+        const isDefault = list === SHOPPING || list === TODO
+        if ((row === undefined && !isDefault) || row?.value.deletedAt !== undefined) return undefined
+        const open = row?.value.open ?? 0
+        const scanned = yield* engine.scan(list, "open", SHOWN_ITEMS)
+        const rows: ReadonlyArray<Row<Item>> = scanned.rows
+        // What a screen does not show is counted, never hidden: "(+3 more)" in the title, and the spoken text says it too.
+        const more = Math.max(rows.length < open ? open - rows.length : 0, scanned.cut ? 1 : 0)
+        const name = titleOf(list, row?.value, l)
+        const tail = more > 0 ? say(texts, l, "titleMore", { count: more }) : ""
+        const title = `${cutAt(name, TITLE_CHARS - tail.length)}${tail}`
+        const items = rows.map((r) => ({ id: r.id, text: cutAt(sayItem(r.value.text, r.value.quantity, l), ITEM_CHARS), done: false }))
+        const phrase = engine.phraseOf(list, l)
+        const named = rows.map((r) => cutAt(sayItem(r.value.text, r.value.quantity, l), 60))
+        const total = Math.max(open, rows.length)
+        const words = spokenWords(named, total, l, readItems)
+        const spoken = cutAt(open === 0 && rows.length === 0 ? speak(l, "empty", { list: phrase }) : total === 1 ? speak(l, "readOne", { list: phrase, items: words }) : speak(l, "readOpen", { list: phrase, count: total, items: words }), SPOKEN_CHARS)
+        const presentation: Presentation = { kind: "list", title, style: "checklist", items, spoken, handler: HANDLER }
+        return { presentation, signature: JSON.stringify([title, items]), open }
+      })
+
+
+    /** What a pin keeps of what was shown: a hash of the household's language, the title and the items. */
+    const hashOf = (built: Built, l: Language) => signatureOf(JSON.stringify([l, built.signature]))
+
+    /**
+     * A device that is no longer one of the household's known devices (`host.view().devices`, read at each use). Not
+     * knowing the devices (none listed: the CLI modes, or before serve mode's session hub is up) is not "removed".
+     */
+    const removedDevice = (device: string) => {
+      const all = ctx.host.view().devices
+      return all.length > 0 && !all.some((d) => d.id === device)
+    }
+
+    type Tried<A> = { readonly ok: A } | { readonly err: PresentError }
+    const tried = <A>(effect: Effect.Effect<A, PresentError>): Effect.Effect<Tried<A>> =>
+      effect.pipe(Effect.map((ok): Tried<A> => ({ ok })), Effect.catch((err: PresentError) => Effect.succeed<Tried<A>>({ err })))
+    /** A refusal that may pass when tried again (the store was busy or said no); the others will not. */
+    const transient = (r: Tried<unknown>) => "err" in r && (r.err.reason === "busy" || r.err.reason === "failed")
+
+    /** Show the checklist under the device's key for `ms`; what the host decided for that device. */
+    const put = (device: string, key: string, built: Built, ms: number): Effect.Effect<Put> =>
+      Effect.map(tried(ctx.present.show({ device }, built.presentation, { lifetime: "pinned", key, expiresInMs: Math.min(ms, PIN_MS) })), (r): Put => {
+        if ("err" in r) return { kind: "error", reason: r.err.reason }
+        const here = r.ok.outcome.devices.find((d) => d.deviceId === device)
+        if (here?.shown === true) return { kind: "shown", handle: r.ok }
+        // Offline: accepted and kept by the host, which gives it to the page when it reconnects.
+        if (here?.why === "offline") return { kind: "offline", handle: r.ok }
+        return { kind: "cannot", handle: r.ok, why: here?.why }
+      })
+
+    /** A pin's row, written as `value` (made when there is none), in one transaction. Without the change signal. */
+    const write = (value: Pin) =>
+      engine.rawStore.transaction((tx) => {
+        const c = tx.collection(pins)
+        const id = pinIdOf(value.device)
+        if (c.get(id) === undefined) c.insert(value, { id })
+        else c.update(id, () => value)
+      })
+
+    /** The row with work owed (its attempts counted, its next try set), in one write; when to try it next. */
+    const owe = (row: Row<Pin>, owed: NonNullable<Pin["owed"]>, now: number, changes: Partial<Pin> = {}) =>
+      Effect.gen(function*() {
+        const attempts = (row.value.owed === owed ? row.value.attempts ?? 0 : 0) + 1
+        const next = now + retryIn(attempts)
+        const { device, list, key, until, shown } = { ...row.value, ...changes }
+        yield* write({ device, list, key, until, ...(shown !== undefined ? { shown } : {}), owed, attempts, next })
+        return next
+      })
+
+    /** Remove a pin's row (it was taken down, or ended); a removal that fails leaves the row saying "remove me". */
+    const removeRow = (row: Row<Pin>, now: number, down: boolean) =>
+      Effect.gen(function*() {
+        const removed = yield* Effect.exit(engine.rawStore.transaction((tx) => void tx.collection(pins).remove(row.id, { expectRev: row.rev })))
+        if (Exit.isSuccess(removed)) {
+          dismissed.delete(row.value.device)
+          handles.delete(row.value.device)
+          return { next: undefined, down } satisfies Reconciled
+        }
+        return { next: yield* owe(row, "remove", now), down } satisfies Reconciled
+      })
+
+    /**
+     * Take a device's checklist down. With this run's handle it is dismissed; without one (a restart forgot it) it is
+     * replaced under its key by an empty one that the host ends after `CLOSE_MS`. `false`: try again later.
+     */
+    const takeDown = (pin: Pin, l: Language): Effect.Effect<boolean, StoreFailure> =>
+      Effect.gen(function*() {
+        const handle = handles.get(pin.device)
+        if (handle !== undefined) return !transient(yield* tried(handle.dismiss))
+        const listRow = yield* engine.listStore.get(pin.list)
+        const closing: Presentation = {
+          kind: "list",
+          title: cutAt(titleOf(pin.list, listRow?.value, l), TITLE_CHARS),
+          style: "checklist",
+          items: [],
+          spoken: speak(l, "finalSpoken", { list: engine.phraseOf(pin.list, l) }),
+          handler: HANDLER
+        }
+        // A device that is not the household's any more is refused (`invalid`): nothing more can be done for it here.
+        return !transient(yield* tried(ctx.present.show({ device: pin.device }, closing, { lifetime: "pinned", key: pin.key, expiresInMs: CLOSE_MS })))
+      })
+
+    /**
+     * THE reconciliation of one device's pin, from the row and the list as they are now. Under the module's permit.
+     *
+     * - no row: nothing; taken down already (this run, or the row says so): remove the row;
+     * - closed, its list deleted or gone, its device no longer the household's: take it down (unless it has ended), then
+     *   remove the row;
+     * - at or past its end: remove the row (the host ended it);
+     * - its content changed: show it under the key with a new end (24 hours from now); work owed, a retry and a restart
+     *   (no handle in this run) show it again with what remains of its end, or leave it to end when that is under the
+     *   host's minimum; unchanged with a handle: nothing.
+     *
+     * A device that cannot show a checklist any more is taken down and forgotten; an offline one keeps its pin (the host
+     * gives the presentation back when the page reconnects). A failed step leaves the work owed with a later try.
+     */
+    const reconcileLocked = (device: string): Effect.Effect<Reconciled, StoreFailure> =>
+      Effect.gen(function*() {
+        const now = yield* Clock.currentTimeMillis
+        const row = yield* pinStore.get(pinIdOf(device))
+        if (row === undefined) {
+          handles.delete(device)
+          dismissed.delete(device)
+          return { next: undefined, down: true }
+        }
+        const pin = row.value
+        if (pin.owed === "remove" || dismissed.has(device)) return yield* removeRow(row, now, true)
+        const l = lang()
+        const built = pin.owed === "dismiss" || removedDevice(device) ? undefined : yield* build(pin.list, l, readItemsFor(undefined))
+        if (built === undefined) {
+          if (now < pin.until && !(yield* takeDown(pin, l))) return { next: yield* owe(row, "dismiss", now), down: false }
+          dismissed.add(device)
+          handles.delete(device)
+          return yield* removeRow(row, now, true)
+        }
+        if (now >= pin.until) return yield* removeRow(row, now, true)
+        const shown = hashOf(built, l)
+        const changed = pin.shown !== shown
+        if (!changed && pin.owed === undefined && handles.has(device)) return { next: pin.until, down: false }
+        const until = changed ? now + PIN_MS : pin.until
+        if (until - now < PRESENT_MIN_EXPIRY_MS) return { next: pin.until, down: false }
+        const r = yield* put(device, pin.key, built, until - now)
+        if (r.kind === "error") return { next: yield* owe(row, "show", now, { shown, until }), down: false }
+        if (r.kind === "cannot") {
+          yield* Effect.ignore(r.handle.dismiss)
+          dismissed.add(device)
+          handles.delete(device)
+          return yield* removeRow(row, now, true)
+        }
+        handles.set(device, r.handle)
+        if (changed || pin.owed !== undefined) yield* write({ device, list: pin.list, key: pin.key, until, shown })
+        return { next: until, down: false }
+      })
+
+    // -- the worker: what is asked, and when each pin is due ------------------------------------------------------------
+
+    /** Devices to reconcile now. */
+    const asked = new Set<string>()
+    /** Lists whose pins are to be reconciled now (looked up by the `list` index). */
+    const askedLists = new Set<string>()
+    /** Every pin is to be reconciled (a start). */
+    let askedAll = false
+    /** When a failed lookup of pins is tried again (a new signal tries it at once). */
+    let lookupAt: number | undefined
+    /** Each known pin's next moment: its end, or its next try. Its keys are the devices with a pin. */
+    const due = new Map<string, number>()
+    /** Failed reconciliations of a device in a row (when even the row could not be written). */
+    const failures = new Map<string, number>()
+    const wake = yield* Queue.sliding<void>(1)
+    const poke = () => void Queue.offerUnsafe(wake, undefined)
+
+    /** The devices of the pins of one list (`list` given) or of all, a page at a time until the end. */
+    const devicesOf = (list: string | undefined) =>
+      Effect.gen(function*() {
+        const found: Array<string> = []
+        let after: Row<Pin> | undefined
+        for (;;) {
+          const rows = yield* pinStore.list({
+            ...(list !== undefined ? { where: { list } } : {}),
+            orderBy: { field: "createdAt", direction: "asc" },
+            limit: PIN_PAGE,
+            ...(after !== undefined ? { after } : {})
+          })
+          for (const r of rows) found.push(r.value.device)
+          if (rows.length === 0) return found
+          after = rows[rows.length - 1]
+        }
+      })
+
+    /** What one reconciliation said about when its pin is due again. */
+    const settled = (device: string, exit: Exit.Exit<Reconciled, StoreFailure>, now: number) => {
+      if (Exit.isSuccess(exit)) {
+        failures.delete(device)
+        if (exit.value.next === undefined) due.delete(device)
+        else due.set(device, exit.value.next)
+        return
+      }
+      const n = (failures.get(device) ?? 0) + 1
+      failures.set(device, n)
+      due.set(device, now + retryIn(n))
+    }
+
+    const lookups = (now: number) => (askedAll || askedLists.size > 0) && (lookupAt === undefined || lookupAt <= now)
+
+    /** One pass: what is due and asked, each pin on its own (one that fails is tried again later, the others go on). */
+    const pass = Effect.gen(function*() {
+      const now = yield* Clock.currentTimeMillis
+      for (const [d, t] of due) if (t <= now || removedDevice(d)) asked.add(d)
+      if (lookups(now)) {
+        lookupAt = undefined
+        if (askedAll) {
+          const all = yield* Effect.exit(devicesOf(undefined))
+          if (Exit.isSuccess(all)) {
+            askedAll = false
+            for (const d of all.value) asked.add(d)
+          } else lookupAt = now + retryIn(1)
+        }
+        for (const list of [...askedLists]) {
+          const found = yield* Effect.exit(devicesOf(list))
+          if (Exit.isSuccess(found)) {
+            askedLists.delete(list)
+            for (const d of found.value) asked.add(d)
+          } else lookupAt = now + retryIn(1)
+        }
+      }
+      for (const d of [...asked]) {
+        asked.delete(d)
+        settled(d, yield* Effect.exit(engine.serial(reconcileLocked(d))), now)
+        yield* Effect.yieldNow
+      }
+    })
+
+    /** Waits for a signal, or for the next pin due (its end, its try, the look at the household's devices), whichever is first. */
+    const idle = Effect.gen(function*() {
+      const now = yield* Clock.currentTimeMillis
+      if (asked.size > 0 || lookups(now)) return
+      let first = lookupAt
+      for (const t of due.values()) if (first === undefined || t < first) first = t
+      if (due.size > 0) first = Math.min(first ?? Number.POSITIVE_INFINITY, now + MEMBERS_MS)
+      if (first === undefined) yield* Queue.take(wake)
+      else if (first > now) yield* Effect.timeoutOption(Queue.take(wake), first - now)
+    })
+
+    const worker: Effect.Effect<never> = Effect.forever(Effect.andThen(idle, pass))
+
+    const turnDevice = Effect.map(CurrentTurn, (turn) => turn?.deviceId)
+
+    /** Ask for a device's pin to be reconciled (by the worker, at once). */
+    const ask = (device: string) => {
+      asked.add(device)
+      poke()
+    }
+
+    /** What a tick on a checklist does: the same change as `lists_complete` makes, by the item's id, once. */
+    const press = (p: PresentPress): Effect.Effect<{ readonly say: string }, StoreFailure> =>
+      Effect.gen(function*() {
+        const l = lang()
+        const row = yield* pinStore.get(pinIdOf(p.deviceId))
+        const pin = row?.value
+        if (pin === undefined || pin.key !== p.key || pin.owed === "dismiss" || pin.owed === "remove" || p.item === undefined) return { say: speak(l, "pinGone") }
+        if (p.done !== true) return { say: speak(l, "tickOnly") }
+        const item = yield* engine.itemStore.get(p.item)
+        if (item === undefined || item.value.list !== pin.list || item.value.status === "removed") {
+          // The screen is behind its list: it is brought up to date by the worker.
+          ask(p.deviceId)
+          return { say: speak(l, "itemGone") }
+        }
+        // Already ticked off (a second press, or another device's): nothing changes, and it says so.
+        if (item.value.status === "done") return { say: speak(l, "alreadyTicked", { items: item.value.text }) }
+        const now = yield* Clock.currentTimeMillis
+        // The same path as the tool: the item as read, at its rev; a change since is a conflict, and nothing is done twice.
+        // Its commit asks for every pin of the list to be reconciled; the answer is what was committed.
+        const done = yield* engine.setStatus(pin.list, [item], "done", "complete", undefined, now)
+        if (isRefusal(done)) return { say: speak(l, "itemGone") }
+        return { say: speak(l, "completed", { items: item.value.text, list: engine.phraseOf(pin.list, l) }) }
+      })
+
+    return {
+      readItemsFor,
+      build,
+      /**
+       * Put a list on the asking device as its checklist: under the device's one key, so another list there is replaced
+       * in place (`replaced` names it). One show and one write; a device that cannot show checklists keeps no pin.
+       */
+      show: (list: string, readItems: number) =>
+        engine.serial(Effect.gen(function*() {
+          const device = yield* turnDevice
+          if (device === undefined) return { kind: "no-device" } as const
+          const now = yield* Clock.currentTimeMillis
+          const l = lang()
+          const before = yield* pinStore.get(pinIdOf(device))
+          const built = yield* build(list, l, readItems)
+          if (built === undefined) return { kind: "gone" } as const
+          const key = pinKeyOf(device)
+          const r = yield* put(device, key, built, PIN_MS)
+          if (r.kind === "error") return r.reason === "limit" ? ({ kind: "limit" } as const) : ({ kind: "failed" } as const)
+          const spoken = built.presentation.spoken
+          if (r.kind === "cannot") {
+            // Nothing is kept for a device that cannot show a checklist (an earlier one under its key is gone with it).
+            yield* Effect.ignore(r.handle.dismiss)
+            handles.delete(device)
+            if (before !== undefined) {
+              dismissed.add(device)
+              ask(device)
+            }
+            return { kind: "not-shown", spoken, why: r.why } as const
+          }
+          const kept = yield* Effect.exit(write({ device, list, key, until: now + PIN_MS, shown: hashOf(built, l) }))
+          if (Exit.isFailure(kept)) {
+            // Not kept, so not shown: an earlier checklist of the device is put back by its own row.
+            yield* Effect.ignore(r.handle.dismiss)
+            handles.delete(device)
+            if (before !== undefined) ask(device)
+            return { kind: "failed" } as const
+          }
+          handles.set(device, r.handle)
+          dismissed.delete(device)
+          failures.delete(device)
+          due.set(device, now + PIN_MS)
+          poke()
+          const b = before?.value
+          const replaced = b !== undefined && b.list !== list && b.owed !== "dismiss" && b.owed !== "remove" && now < b.until ? b.list : undefined
+          if (r.kind === "offline") return { kind: "not-shown", spoken, why: "offline" } as const
+          return { kind: "shown", spoken, replaced } as const
+        })),
+      /**
+       * Close the asking device's checklist (`list` given: only when it is that list's). One write records the close as
+       * owed; then it is done at once, or tried again later (`later`).
+       */
+      hide: (list: string | undefined) =>
+        engine.serial(Effect.gen(function*() {
+          const device = yield* turnDevice
+          if (device === undefined) return { kind: "no-device" } as const
+          const now = yield* Clock.currentTimeMillis
+          const row = yield* pinStore.get(pinIdOf(device))
+          const pin = row?.value
+          if (row === undefined || pin === undefined || pin.owed === "remove" || dismissed.has(device) || now >= pin.until) return { kind: "none" } as const
+          if (list !== undefined && pin.list !== list) return { kind: "none" } as const
+          yield* write({ device, list: pin.list, key: pin.key, until: pin.until, ...(pin.shown !== undefined ? { shown: pin.shown } : {}), owed: "dismiss" })
+          const done = yield* Effect.exit(reconcileLocked(device))
+          settled(device, done, now)
+          poke()
+          return { kind: Exit.isSuccess(done) && done.value.down ? "closed" : "later", list: pin.list } as const
+        })),
+      /** The lists a committed transaction wrote: their pins are reconciled at once. */
+      changed: (touched: ReadonlySet<string>) => {
+        if (touched.size === 0) return
+        for (const list of touched) askedLists.add(list)
+        lookupAt = undefined
+        poke()
+      },
+      /** Reconcile every pin (at a start: what changed while the module was stopped, and this run's handles). */
+      reconcileAll: () => {
+        askedAll = true
+        lookupAt = undefined
+        poke()
+      },
+      /** The worker, forked in `shared`'s scope. */
+      worker,
+      /** The press handler's body, under the module's permit (the same one-at-a-time rule as the tools). */
+      press: (p: PresentPress) => engine.serial(press(p))
+    }
+  })
+
+export type Checklists = Effect.Success<ReturnType<typeof makeChecklists>>

@@ -81,7 +81,9 @@ export const texts = defineTexts({
     alreadyTicked: "Already ticked off: {items}.",
     tickOnly: "Here I can only tick things off.",
     pinGone: "That list isn't shown here any more.",
-    finalSpoken: "{list} isn't shown any more."
+    finalSpoken: "{list} isn't shown any more.",
+    showingInstead: "Showing {list} on this screen, instead of {before}.",
+    hideLater: "I'll take {list} off this screen as soon as I can."
   },
   nl: {
     shoppingList: "de boodschappenlijst",
@@ -158,7 +160,9 @@ export const texts = defineTexts({
     alreadyTicked: "Al afgevinkt: {items}.",
     tickOnly: "Hier kan ik alleen dingen afvinken.",
     pinGone: "Die lijst staat hier niet meer.",
-    finalSpoken: "{list} wordt niet meer getoond."
+    finalSpoken: "{list} wordt niet meer getoond.",
+    showingInstead: "{list} staat nu op dit scherm, in plaats van {before}.",
+    hideLater: "Ik haal {list} van dit scherm zodra dat kan."
   }
 })
 
