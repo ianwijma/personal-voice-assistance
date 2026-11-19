@@ -213,6 +213,34 @@ describe("ringing", () => {
     }))
 })
 
+describe("where it rings and shows", () => {
+  it.effect("changed from another device, it still rings on its own; while it rings, its button's label said without the wake phrase presses it", () =>
+    Effect.gen(function*() {
+      const kit = yield* startTestModule(timersModule, { household })
+      yield* kit.action("start", { duration: "2 minutes", name: "eggs" }, { device: "kitchen-tablet" })
+      assert.strictEqual(said(yield* kit.action("adjust", { amount: "1 minute", change: "remove" }, { device: "robins-phone", conversationId: "c-robin" })), "Eggs timer: 1 minute left.")
+      const jobs = (yield* kit.jobs).filter((j) => j.handler === "ring" && j.state === "scheduled")
+      assert.deepStrictEqual(jobs.map((j) => j.origin.deviceId), ["kitchen-tablet"])
+      yield* kit.advance(MIN)
+      assert.deepStrictEqual(kit.notify.engine.ringingOn("robins-phone"), [])
+      assert.strictEqual(kit.notify.engine.ringingOn("kitchen-tablet").length, 1)
+      // The ringing window: "five more minutes", said on that device with no wake phrase, is the card's button.
+      const taken = yield* kit.phrases.say("Five more minutes", { device: "kitchen-tablet", wake: false })
+      assert.isTrue(taken.taken && taken.by === "ringing")
+      assert.strictEqual(said(yield* kit.action("list", {})), "Eggs timer: 5 minutes left.")
+    }))
+
+  it.effect("a ninth running timer runs and rings without a countdown (the Presenter keeps 8 per module)", () =>
+    Effect.gen(function*() {
+      const kit = yield* startTestModule(timersModule)
+      for (let i = 1; i <= 9; i++) yield* kit.action("start", { duration: `${i} minutes`, name: `t${i}` })
+      yield* kit.present.settle
+      assert.strictEqual(kit.present.shown("kitchen-display").length, 8)
+      yield* kit.advance(9 * MIN)
+      assert.isTrue((yield* kit.notify.all).some((n) => n.title === "T9 timer is done"))
+    }))
+})
+
 describe("phrase commands", () => {
   it.effect("set, ask and cancel without the model, with a name as text", () =>
     Effect.gen(function*() {

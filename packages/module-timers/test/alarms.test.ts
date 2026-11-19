@@ -311,6 +311,29 @@ describe("data and settings", () => {
       assert.isTrue(kit.events.some((e) => e.type === "alarms.alarms.changed" && e.actor?.kind === "job" && e.actor.jobId === job!.id))
     }))
 
+  it.effect("the clean-up keeps an ended alarm whose snooze is still to ring", () =>
+    Effect.gen(function*() {
+      const kit = yield* startTestModule(alarmsModule)
+      const old: Alarm = { deviceId: "kitchen-display", phase: "ended", next: 1, endedAt: 1 }
+      yield* kit.moduleStore().collection(alarms).insert({ ...old, again: "job_pending" })
+      yield* kit.moduleStore().collection(alarms).insert(old)
+      const job = (yield* kit.jobs).find((j) => j.handler === "cleanup" && j.state === "scheduled")
+      yield* kit.runJob(job!.id)
+      assert.deepStrictEqual((yield* rows(kit)).map((r) => r.value.again), ["job_pending"])
+    }))
+
+  it.effect("changed from another device, it still rings on its own device", () =>
+    Effect.gen(function*() {
+      const kit = yield* startTestModule(alarmsModule)
+      yield* kit.action("set", { when: "every day at 7" }, { device: "robins-phone" })
+      assert.strictEqual(said(yield* kit.action("change", { which: "7:00", to: "7:30", scope: "all" }, { device: "kitchen-display" })), "The alarm now rings every day; the next one is tomorrow at half past seven in the morning.")
+      assert.strictEqual(said(yield* kit.action("cancel", { which: "7:30", scope: "next" }, { device: "hall-screen", conversationId: "c-hall" })), "The alarm for tomorrow at half past seven in the morning is skipped; the next one is Friday at half past seven in the morning.")
+      assert.deepStrictEqual((yield* liveJobs(kit)).map((j) => j.origin.deviceId), ["robins-phone"])
+      yield* kit.advance(at(20, 7, 30) - (yield* kit.now))
+      assert.strictEqual(kit.notify.engine.ringingOn("robins-phone").length, 1)
+      assert.deepStrictEqual(kit.notify.engine.ringingOn("kitchen-display"), [])
+    }))
+
   it.effect("invalid settings: the module does not run with them", () =>
     Effect.gen(function*() {
       for (const bad of [{ snoozeMinutes: 0 }, { snoozeMinutes: 31 }, { ringMinutes: 0 }, { ringMinutes: 2.5 }]) {
