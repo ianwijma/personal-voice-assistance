@@ -1,7 +1,7 @@
 # Modules: where the work stands
 
 Status of the work planned in [MODULES-PLAN.md](MODULES-PLAN.md), kept here so it does not depend on any one working
-session. Updated 2026-11-19 (afternoon). Nothing below is merged into `main`; the owner merges.
+session. Updated 2026-11-19, 15:20. Nothing below is merged into `main`; the owner merges.
 
 ## The stack
 
@@ -20,8 +20,8 @@ findings fixed; it does not mean merged.
 | P11 scaffold, contracts, test kit, guide | #94 | `t3/modules-11-scaffold` | `5bfeca0d` | closed; CI green |
 | P9 notifications, speech, ringing | #106 | `t3/modules-09-notify` | `a7fccff9` | closed after three review rounds; carries the scaffold's last store fix |
 | P7 phrase commands, essential controls | #107 | `t3/modules-07-phrases` | `3ce75007` | closed after two review rounds (24, then 8 findings, all fixed); CI was green at `86ab9161`; the head adds a merge of P9 and one test fix (a wall-clock limit that failed on a loaded CI machine) |
-| P10 presentation | #108 | `t3/modules-10-present` | `d6f7034d` | P7 merged in (base is now #107); first review found 30 problems, all addressed in one fix round (CI green at this head); the deciding review of the core found 8 more, second fix round running; the deciding review of the server and page is still running |
-| P8 risk policy in admin | #115 | `t3/modules-08-risk` | `46fd00da` | first review found 7 problems and 2 notes; fix round running, which also merges the moved base (no CI until then: the branch conflicts with its base) |
+| P10 presentation | #108 | `t3/modules-10-present` | `d6f7034d` | first review found 30 problems, fixed (CI green at this head); the two deciding reviews found 8 and 7 more; a second, small fix round is running, with one added rule: nothing a speculative turn asks for reaches a screen before the turn is promoted |
+| P8 risk policy in admin | #115 | `t3/modules-08-risk` | `2b0ce0c5` | first review found 7 problems and 2 notes; the fix round is running; it has merged the base (the head holds the risk policy with the phrase commands and the presentation layer, pushed early so the routines module could start) |
 
 **Fixes to P1 to P6 code found later live on the scaffold branch**, not on their own branches: the worker-thread
 helper `offThread`; POST and typed loopback in `@pva/net`; the gateway no longer timing its own risk lookup (an
@@ -64,13 +64,13 @@ Each sits on the newest part it needs for now and moves on top of P8 at the end.
 | Module | Pull request | Branch | Head | State |
 |---|---|---|---|---|
 | assistant controls | #109 | `t3/module-assistant-controls` | `634952dc` | closed (review found three test gaps and a doc note, fixed); CI green |
-| notifications | #110 | `t3/module-notifications` | `105fec77` | two reviews (10, then 4 findings), all fixed; the second review left out the hook's token handling, which the lead checked by hand, because the review provider refused that part; one last correction running (see "repeated calls" below) |
-| images and photos | #111 | `t3/module-images` | `a64bbce8` | two reviews (15, then 3 findings); the last 3 are being fixed, then closed |
+| notifications | #110 | `t3/module-notifications` | `062d8ce1` | closed: two reviews (10, then 4 findings), all fixed, CI green; the second review left out the hook's token handling, which the lead checked by hand, because the review provider refused that part |
+| images and photos | #111 | `t3/module-images` | `4965a03d` | closed pending CI: two reviews (15, then 3 findings), all fixed |
 | broadcast | #112 | `t3/module-broadcast` | `5e84f110` | closed: reviewed (8 findings and a note), fixed, adapted to P10's fix round |
-| music | #113 | `t3/module-music` | `5146d789` | two reviews (16, then 4 findings); the last 4 are being fixed, then closed |
+| music | #113 | `t3/module-music` | `081edbdb` | closed pending CI: two reviews (16, then 4 findings), all fixed |
 | reminders | #114 | `t3/module-reminders` | `f27f18af` | reviewed (22 findings); fix round running (one state and one job per reminder); a deciding review follows |
-| timers and alarms | #117 | `t3/module-timers` | `3e942aa2` | reviewed (14 findings); fix round running (one state and one job per timer and alarm); a deciding review follows |
-| routines and automations | none yet | `t3/module-routines` | | starts when P8 is reviewed and holds P10 and P7 |
+| timers and alarms | #117 | `t3/module-timers` | `cc2788e3` | reviewed (14 findings), rebuilt around one state and one job per timer and alarm; deciding review running |
+| routines and automations | none yet | `t3/module-routines` | | being built on `t3/modules-08-risk` |
 
 ## What is left, in order
 
@@ -83,8 +83,10 @@ Each sits on the newest part it needs for now and moves on top of P8 at the end.
    `t3/modules-12-wave-a` (#116), branches `t3/follow-<module>`, each reviewed and fixed. Started 2026-11-19 on the
    fixed P10: lists, kitchen, smart home, calendar, memory and local info are being built; presence, briefing, news,
    web search and core tools start as those report.
-   State: briefing #118, memory #119, kitchen #120, presence #121, lists #122 and calendar #123 are built and in
-   review; smart home, local info, news, web search and core tools are being built.
+   State: ten of the eleven have a pull request (briefing #118, memory #119, kitchen #120, presence #121, lists
+   #122, calendar #123, web search #124, smart home #125, core tools #126, news #127); local info is being built.
+   Reviewed so far, each with a fix round running: briefing (6 findings), memory (5), presence (5), web search (4),
+   kitchen (8; cut down to the phrase and a plain list). The others are in review.
 6. Deferred, with a plan of their own ([MODULES-DEFERRED-PLAN.md](MODULES-DEFERRED-PLAN.md): sixteen pull requests in order, with eighteen decisions for the owner and a recommendation for each): google, t3-code, mcp-client, calls and intercom, CalDAV; connections and
    OAuth (the rest of P8); streaming and WebSocket to an owner-typed address.
 
@@ -102,6 +104,14 @@ Each sits on the newest part it needs for now and moves on top of P8 at the end.
 
 ## Found by the wave B reviews, for one follow-up below the modules
 
+- **Speculative tools.** A tool that may run before its turn is committed must not change a screen from inside its
+  run (three follow-ups did). Being fixed in P10's second round: a presentation returned with a tool's result is
+  shown at promotion, and a direct show from inside an unpromoted turn does nothing.
+- **A tool cannot attach a presentation without changing its result's shape** (five follow-up authors); **a
+  presentation has one owner** (a list about several people cannot be shown safely: presence); **a phrase cannot
+  carry a fixed value or take a parameter whose values the module supplies** (briefing, smart home); **a press
+  carries no id**, and there is no handle for a presentation returned with a result (kitchen's kept, ticked
+  checklist was cut for this).
 - **Repeated calls.** The gateway hands a tool or an action no per-call id (the model's tool-call id stops at the
   registry), so a module cannot tell a replay from a second deliberate call in one turn. Decided for now: a phrase
   command heard once acts once; the assistant's own calls always run ("skip two songs" as two calls skips twice).
