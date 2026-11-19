@@ -39,8 +39,8 @@ it.each([false, true])("r3 b1: modal chat hides and inerts ordinary presentation
   expect(screen.getByTestId("chat-panel").getAttribute("aria-modal")).toBe(wide ? null : "true")
   expect(screen.getByTestId("page-behind").hasAttribute("inert")).toBe(!wide)
   // jsdom does not enforce inert clicks: assert the actual shell boundary as well as accessible visibility.
-  expect(cards.hasAttribute("inert")).toBe(!wide)
-  expect(screen.queryByRole("button", { name: "Choose tea" }) !== null).toBe(wide)
+  expect(cards.hasAttribute("inert")).toBe(true)
+  expect(screen.queryByRole("button", { name: "Choose tea" })).toBeNull()
   const stop = screen.getByRole("button", { name: "Stop" })
   expect(stop.closest("[inert]")).toBeNull()
   await act(async () => fireEvent.click(stop))

@@ -1,5 +1,7 @@
 "use client"
 import { type ReactNode, useEffect, useId, useRef, useState } from "react"
+import { NotificationCards } from "../NotificationCards.tsx"
+import { usePageMenu } from "./PageMenus.tsx"
 import { Icon } from "../ui/Icon.tsx"
 import { cx } from "../ui/controls.tsx"
 
@@ -43,6 +45,7 @@ export function PopMenu({
   readonly children: ReactNode
 }) {
   const [open, setOpen] = useState(false)
+  const menuId = usePageMenu(open, setOpen)
   const wrap = useRef<HTMLDivElement>(null)
   const trigger = useRef<HTMLButtonElement>(null)
   const menu = useRef<HTMLDivElement>(null)
@@ -90,7 +93,7 @@ export function PopMenu({
     else if (e.key === "ArrowUp") go(i - 1)
     else if (e.key === "Home") go(0)
     else if (e.key === "End") go(all.length - 1)
-    else if (e.key === "Tab") close(true)
+    else if (e.key === "Tab" && !wrap.current?.querySelector("[data-testid=notification-cards]")) close(true)
   }
 
   return (
@@ -120,41 +123,42 @@ export function PopMenu({
         <div
           ref={menu}
           id={id}
-          role="menu"
-          aria-label={menuLabel}
-          data-testid={`${testId}-menu`}
           onKeyDown={onMenuKey}
+          data-testid={`${testId}-menu`}
           className={cx(
-            "absolute left-0 top-[calc(100%+6px)] z-50 w-[296px] max-w-[calc(100vw-24px)] rounded-lg border border-line bg-surface p-1 shadow-panel animate-[pva-rise_160ms_var(--ease-out)]",
+            "absolute left-0 top-[calc(100%+6px)] z-50 flex max-h-[calc(100dvh-128px)] w-[296px] max-w-[calc(100vw-24px)] flex-col overflow-hidden rounded-lg border border-line bg-surface p-1 shadow-panel animate-[pva-rise_160ms_var(--ease-out)]",
             menuClass
           )}
         >
-          {items.map((item) => (
-            <div key={item.value}>
-              {item.separator === true && <div role="separator" className="mx-1.5 my-1 h-px bg-line/60" />}
-              <button
-                type="button"
-                role="menuitemradio"
-                aria-checked={item.checked}
-                tabIndex={-1}
-                data-testid={item.testId}
-                data-value={item.value}
-                onClick={() => {
-                  setOpen(false)
-                  trigger.current?.focus()
-                  onPick(item.value)
-                }}
-                className="flex min-h-[52px] w-full items-start gap-2.5 rounded-md px-2.5 py-2 text-left transition-colors duration-[120ms] hover:bg-surface-2 focus-visible:bg-surface-2 focus-visible:outline-offset-[-2px]"
-              >
-                <span className="inline-flex h-5 w-4 shrink-0 items-center justify-center text-you">{item.checked && <Icon name="check" size={16} />}</span>
-                <span className="min-w-0">
-                  <span className="block text-[14px] text-ink">{item.title}</span>
-                  <span className="block text-[13px] text-ink-muted">{item.detail}</span>
-                </span>
-              </button>
-            </div>
-          ))}
-          <p className="px-2.5 pb-2 pt-1.5 pl-9 text-[12px] text-ink-faint">{note}</p>
+          <NotificationCards inPanel menu={menuId} />
+          <div role="menu" aria-label={menuLabel} className="min-h-0 overflow-y-auto">
+            {items.map((item) => (
+              <div key={item.value}>
+                {item.separator === true && <div role="separator" className="mx-1.5 my-1 h-px bg-line/60" />}
+                <button
+                  type="button"
+                  role="menuitemradio"
+                  aria-checked={item.checked}
+                  tabIndex={-1}
+                  data-testid={item.testId}
+                  data-value={item.value}
+                  onClick={() => {
+                    setOpen(false)
+                    trigger.current?.focus()
+                    onPick(item.value)
+                  }}
+                  className="flex min-h-[52px] w-full items-start gap-2.5 rounded-md px-2.5 py-2 text-left transition-colors duration-[120ms] hover:bg-surface-2 focus-visible:bg-surface-2 focus-visible:outline-offset-[-2px]"
+                >
+                  <span className="inline-flex h-5 w-4 shrink-0 items-center justify-center text-you">{item.checked && <Icon name="check" size={16} />}</span>
+                  <span className="min-w-0">
+                    <span className="block text-[14px] text-ink">{item.title}</span>
+                    <span className="block text-[13px] text-ink-muted">{item.detail}</span>
+                  </span>
+                </button>
+              </div>
+            ))}
+            <p className="px-2.5 pb-2 pt-1.5 pl-9 text-[12px] text-ink-faint">{note}</p>
+          </div>
         </div>
       )}
     </div>

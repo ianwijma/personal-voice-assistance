@@ -15,6 +15,7 @@ import { TopBar } from "../TopBar.tsx"
 import { useMediaQuery, WIDE_QUERY } from "../useMediaQuery.ts"
 import { useShortcuts } from "../useShortcuts.ts"
 import { useSessionFocus } from "./useSessionFocus.ts"
+import { PageMenus } from "./PageMenus.tsx"
 import { VoiceSheet } from "./VoiceSheet.tsx"
 
 /**
@@ -38,39 +39,43 @@ export function VoiceApp() {
 
 /**
  * While a modal panel is open (the settings sheet, Help, or the chat as a sheet below 1024 px) everything behind it is
- * `inert`; Settings and Help also hide the stage. Narrow chat holds the notification ring controls inside its focus
- * scope. Toasts and the screen-reader announcers stay outside,
- * above every panel.
+ * `inert`. Every page menu or dialog hides and inerts the presentation stage on every width; notification controls
+ * move into the open surface so Stop stays visible and within its keyboard scope. Toasts and the screen-reader
+ * announcers stay outside, above every panel.
  */
 function Shell() {
   useShortcuts()
   useSessionFocus()
   const ui = useClientState((s) => ({ chat: s.ui.chatOpen, sheet: s.ui.sheetOpen, help: s.ui.shortcutsOpen }), shallowEqual)
+  const [menus, setMenus] = useState<ReadonlyArray<string>>([])
   const wide = useMediaQuery(WIDE_QUERY)
   const modal = ui.sheet || ui.help
   const behind = modal || (ui.chat && !wide)
+  const stageCovered = modal || ui.chat || menus.length > 0
   return (
-    <div className="fixed inset-0 flex flex-col overflow-hidden pt-[env(safe-area-inset-top)] pb-[env(safe-area-inset-bottom)]">
-      <h1 className="sr-only">Voice assistant</h1>
-      <div className="contents" inert={behind} data-testid="page-behind">
-        <TopBar />
-        <main className="relative min-h-0 flex-1" data-chat-open={ui.chat || undefined}>
-          <Stage />
-          <ControlDock />
-        </main>
+    <PageMenus.Provider value={{ surface: ui.help ? "help" : ui.sheet ? "settings" : ui.chat ? "chat" : "page", ids: menus, set: setMenus }}>
+      <div className="fixed inset-0 flex flex-col overflow-hidden pt-[env(safe-area-inset-top)] pb-[env(safe-area-inset-bottom)]">
+        <h1 className="sr-only">Voice assistant</h1>
+        <div className="contents" inert={behind} data-testid="page-behind">
+          <TopBar />
+          <main className="relative min-h-0 flex-1" data-chat-open={ui.chat || undefined}>
+            <Stage />
+            <ControlDock />
+          </main>
+        </div>
+        <div className="contents" inert={modal}>
+          <ChatPanel />
+        </div>
+        <div className={stageCovered ? "hidden" : "contents"} hidden={stageCovered} inert={stageCovered}>
+          {/* P10: the presentation stage beside the character: P9's notification cards first, then the presentations. */}
+          <PresentationStage obscured={stageCovered} />
+        </div>
+        <VoiceSheet />
+        <ShortcutsDialog />
+        <Toasts />
+        <StateAnnouncer />
+        <LiveAnnouncer />
       </div>
-      <div className="contents" inert={modal}>
-        <ChatPanel />
-      </div>
-      <div className={modal ? "hidden" : "contents"} hidden={modal} inert={modal}>
-        {/* P10: the presentation stage beside the character: P9's notification cards first, then the presentations. */}
-        <PresentationStage obscured={ui.chat && !wide} />
-      </div>
-      <VoiceSheet />
-      <ShortcutsDialog />
-      <Toasts />
-      <StateAnnouncer />
-      <LiveAnnouncer />
-    </div>
+    </PageMenus.Provider>
   )
 }

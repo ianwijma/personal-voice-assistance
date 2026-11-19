@@ -23,6 +23,7 @@ import { useMediaQuery, WIDE_QUERY } from "./useMediaQuery.ts"
 export function ChatPanel() {
   const client = useClient()
   const open = useClientState((s) => s.ui.chatOpen)
+  const covered = useClientState((s) => s.ui.sheetOpen || s.ui.shortcutsOpen)
   // P5 round 3: a session the server ended takes the draft with it (the composer starts afresh); round 4: the message
   // list's scroll state too (it starts at the bottom of the new session).
   const sessionSeq = useClientState((s) => s.sessionSeq)
@@ -74,7 +75,7 @@ export function ChatPanel() {
             </button>
           </div>
         </div>
-        {modal ? <NotificationCards inChat /> : null}
+        {!covered ? <NotificationCards inPanel /> : null}
         <ConversationNote />
         <MessageList key={`list-${sessionSeq}`} />
         <Composer key={`composer-${sessionSeq}`} />

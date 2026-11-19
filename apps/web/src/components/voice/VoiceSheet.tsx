@@ -4,6 +4,7 @@ import { VoiceAudio } from "@/lib/audio/VoiceAudio.ts"
 import { displayPhrase, visualState } from "@/lib/state.ts"
 import { shallowEqual } from "@/lib/store.ts"
 import { defaultAssistantId, reachText } from "@/lib/voiceSetup.ts"
+import { NotificationCards } from "../NotificationCards.tsx"
 import { useClient, useClientState, usePrefs } from "../context.tsx"
 import { inputClass } from "../fields/types.ts"
 import { Icon, Spinner } from "../ui/Icon.tsx"
@@ -48,6 +49,7 @@ export function VoiceSheet() {
         <div className="pt-[env(safe-area-inset-top)] max-sm:pt-0">
           <PanelHeader title="Settings" titleId="sheet-title" onClose={close} />
         </div>
+        <NotificationCards inPanel />
         <div className="min-h-0 flex-1 overflow-y-auto overscroll-contain px-5 pb-[max(20px,env(safe-area-inset-bottom))] pt-5 scrollbar-quiet">
           <SheetBody />
         </div>

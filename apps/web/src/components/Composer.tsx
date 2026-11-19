@@ -57,13 +57,14 @@ export function Composer() {
   }
 
   return (
-    <div className="shrink-0 border-t border-line px-3 pb-[max(12px,env(safe-area-inset-bottom))] pt-2.5">
+    // The notification region reserves Stop's room first. Only the textarea shrinks/scrolls; its draft stays intact.
+    <div className="flex min-h-[78px] shrink flex-col border-t border-line px-3 pb-[max(12px,env(safe-area-inset-bottom))] pt-2.5">
       {(blocked ?? error) !== undefined && (
         <p role={error !== undefined ? "alert" : undefined} className={cx("px-2 pb-2 text-[13px]", error !== undefined && blocked === undefined ? "text-danger" : "text-ink-muted")}>
           {blocked ?? error}
         </p>
       )}
-      <div className="flex items-end gap-2 rounded-md border border-line bg-surface-2/70 py-1 pl-3 pr-1 focus-within:border-you focus-within:outline-2 focus-within:outline-offset-2 focus-within:outline-you">
+      <div className="flex min-h-0 flex-1 items-end gap-2 rounded-md border border-line bg-surface-2/70 py-1 pl-3 pr-1 focus-within:border-you focus-within:outline-2 focus-within:outline-offset-2 focus-within:outline-you">
         <label htmlFor="chat-input" className="sr-only">{v.several ? `Message to ${v.name}` : "Message"}</label>
         <textarea
           id="chat-input"
@@ -75,7 +76,7 @@ export function Composer() {
           placeholder={v.several ? `Type a message to ${v.name}` : "Type a message"}
           onChange={(e) => setText(e.target.value)}
           onKeyDown={onKeyDown}
-          className="max-h-[148px] min-h-[38px] flex-1 resize-none bg-transparent py-2 text-base leading-[22px] sm:text-[15px] text-ink outline-none placeholder:text-ink-faint focus-visible:outline-none disabled:cursor-not-allowed"
+          className="max-h-full min-h-[38px] flex-1 resize-none bg-transparent py-2 text-base leading-[22px] sm:text-[15px] text-ink outline-none placeholder:text-ink-faint focus-visible:outline-none disabled:cursor-not-allowed"
         />
         <button
           type="button"

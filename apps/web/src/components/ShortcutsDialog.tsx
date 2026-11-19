@@ -1,5 +1,6 @@
 "use client"
 import { useRef } from "react"
+import { NotificationCards } from "./NotificationCards.tsx"
 import { useClient, useClientState, usePrefs } from "./context.tsx"
 import { SHORTCUTS } from "./shortcuts.ts"
 import { PanelHeader, useDialog } from "./ui/Panel.tsx"
@@ -29,6 +30,7 @@ export function ShortcutsDialog() {
         className="flex max-h-[calc(100dvh-32px)] w-full max-w-[420px] flex-col overflow-hidden rounded-lg border border-line bg-surface shadow-panel animate-[pva-rise_200ms_var(--ease-out)]"
       >
         <PanelHeader title="Help" titleId="shortcuts-title" onClose={close} />
+        <NotificationCards inPanel />
         <div className="min-h-0 flex-1 overflow-y-auto scrollbar-quiet">
           <ShortcutList />
           <div className="border-t border-line px-5 py-4">

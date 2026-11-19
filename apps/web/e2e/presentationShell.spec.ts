@@ -57,8 +57,7 @@ for (const wide of [false, true]) {
     const stop = page.getByRole("button", { name: "Stop", exact: true })
     await expect(stop).toHaveCount(1)
     await expect(stop).toBeVisible()
-    if (wide) await expect(page.getByTestId("presentations")).toBeVisible()
-    else await expect(page.getByTestId("presentations")).toBeHidden()
+    await expect(page.getByTestId("presentations")).toBeHidden()
     for (let i = 0; i < 20 && !(await stop.evaluate((el) => el === document.activeElement)); i++) await page.keyboard.press("Tab")
     await expect(stop).toBeFocused()
     await page.screenshot({ path: info.outputPath(`stop-focused-${wide ? "desktop" : "phone"}.png`) })
@@ -143,3 +142,169 @@ for (const settleInChat of [false, true]) {
     expect(await page.evaluate("window.notificationPending.requests.length")).toBe(1)
   })
 }
+
+const shopping = () => ({ type: "present.show", presentation: {
+  ...serverExamples["present.show"].presentation,
+  id: "p-menu-shopping", revision: "shopping:1", lifetime: "pinned", interactive: true,
+  content: { kind: "list", title: "Shopping", style: "checklist", items: [{ id: "milk", text: "Milk", done: false }] },
+  buttons: []
+} })
+
+/** A complete button inside every clipping ancestor, with an unobstructed pointer target. */
+const tappable = (el: Element) => {
+  const r = el.getBoundingClientRect()
+  if (r.height < 44 || r.top < 0 || r.bottom > window.visualViewport!.height) return false
+  for (let p = el.parentElement; p !== null && p !== document.body; p = p.parentElement) {
+    if (/(auto|scroll|hidden|clip)/.test(getComputedStyle(p).overflowY)) {
+      const box = p.getBoundingClientRect()
+      if (r.top < box.top || r.bottom > box.bottom) return false
+    }
+  }
+  return el.contains(document.elementFromPoint(r.x + r.width / 2, r.y + r.height / 2))
+}
+
+test("r6 b1: an arriving checklist cannot take the open More menu's tap", async ({ page, baseURL }, info) => {
+  await page.setViewportSize({ width: 375, height: 667 })
+  await page.emulateMedia({ reducedMotion: "reduce" })
+  await page.goto(appUrl(baseURL))
+  const item = page.getByTestId("dock-new-conversation")
+  await page.getByTestId("dock-more").click()
+  await expect(item).toBeVisible()
+  const point = await item.evaluate((el) => { const r = el.getBoundingClientRect(); return { x: r.x + r.width / 2, y: r.y + r.height / 2 } })
+  await mock.send([shopping()])
+  await expect(page.getByTestId("presentation")).toHaveCount(1)
+  await page.screenshot({ path: info.outputPath("more-over-checklist.png") })
+  await page.mouse.click(point.x, point.y)
+  await expect.poll(async () => (await mock.log()).messages.filter((m) => m.type === "conversation.new").length).toBe(1)
+  expect((await mock.log()).messages.filter((m) => m.type === "present.action")).toHaveLength(0)
+})
+
+for (const keyboard of [false, true]) {
+  test(`r6 b2: Stop precedes Send without losing a six-line draft at 300px (keyboard=${keyboard})`, async ({ page, baseURL }, info) => {
+    await mock.device({ assistants: [{ assistant: "jeff", phrases: [] }, { assistant: "t3", phrases: ["hey t3"] }], withoutPhrase: { mode: "assistant", assistant: "jeff" } })
+    await page.setViewportSize({ width: 375, height: 667 })
+    await page.emulateMedia({ reducedMotion: "reduce" })
+    await page.goto(appUrl(baseURL))
+    await expect(page.getByTestId("start")).toBeVisible()
+    await ui(page, { chatOpen: true })
+    await expect(page.getByTestId("conversation-note")).toBeVisible()
+    const draft = "One\nTwo\nThree\nFour\nFive\nSix"
+    await page.locator("#chat-input").fill(draft)
+    await page.evaluate(() => {
+      Object.defineProperty(window.visualViewport, "height", { configurable: true, value: 300 })
+      window.visualViewport!.dispatchEvent(new Event("resize"))
+    })
+    await mock.send([serverExamples["notification.ring"]])
+    const stop = page.getByRole("button", { name: "Stop", exact: true })
+    await expect(stop).toHaveCount(1)
+    await expect.poll(() => stop.evaluate(tappable)).toBe(true)
+    await page.screenshot({ path: info.outputPath(`stop-before-send-${keyboard}.png`) })
+    if (keyboard) {
+      for (let i = 0; i < 20 && !(await stop.evaluate((el) => el === document.activeElement)); i++) await page.keyboard.press("Tab")
+      await expect(stop).toBeFocused()
+      await page.keyboard.press("Enter")
+    } else await stop.click()
+    await expect.poll(async () => (await mock.log()).messages.filter((m) => m.type === "notification.action" && m.actionId === "stop").length).toBe(1)
+    await expect(page.locator("#chat-input")).toHaveValue(draft)
+    expect((await mock.log()).messages.filter((m) => m.type === "text.send")).toHaveLength(0)
+    await page.getByTestId("send").click()
+    await expect.poll(async () => (await mock.log()).messages.filter((m) => m.type === "text.send" && m.text === draft).length).toBe(1)
+  })
+}
+
+for (const width of [375, 1280]) for (const surface of ["more", "assistant", "conversation", "settings", "help", "chat"] as const) {
+  if (surface === "more" && width === 1280) continue
+  test(`r6: ${surface} keeps arriving presentations inert and a ring's Stop usable (width=${width})`, async ({ page, baseURL }, info) => {
+    await mock.device({ assistants: [{ assistant: "jeff", phrases: [] }, { assistant: "t3", phrases: ["hey t3"] }], withoutPhrase: { mode: "assistant", assistant: "jeff" } })
+    await page.setViewportSize({ width, height: 700 })
+    await page.emulateMedia({ reducedMotion: "reduce" })
+    await page.goto(appUrl(baseURL))
+    await expect(page.getByTestId("start")).toBeVisible()
+    if (surface === "more") await page.getByTestId("dock-more").click()
+    if (surface === "assistant") await page.getByTestId("assistant-menu-button").click()
+    if (surface === "settings") await ui(page, { sheetOpen: true })
+    if (surface === "help") await ui(page, { shortcutsOpen: true })
+    if (surface === "chat" || surface === "conversation") await ui(page, { chatOpen: true })
+    if (surface === "conversation") await page.getByTestId("conversation-switcher").click()
+    await mock.send([shopping()])
+    const stage = page.getByTestId("present-stage")
+    await expect(stage).toBeHidden()
+    expect(await stage.evaluate((el) => el.closest("[inert]") !== null)).toBe(true)
+    await mock.send([serverExamples["notification.ring"]])
+    const stop = page.getByRole("button", { name: "Stop", exact: true })
+    await expect(stop).toHaveCount(1)
+    await expect.poll(() => stop.evaluate(tappable)).toBe(true)
+    expect(await stop.evaluate((el) => el.closest("[inert]") !== null)).toBe(false)
+    await page.screenshot({ path: info.outputPath(`${surface}-${width}-ring.png`) })
+    for (let i = 0; i < 25 && !(await stop.evaluate((el) => el === document.activeElement)); i++) await page.keyboard.press("Tab")
+    await expect(stop).toBeFocused()
+    await page.keyboard.press("Enter")
+    await expect.poll(async () => (await mock.log()).messages.filter((m) => m.type === "notification.action" && m.actionId === "stop").length).toBe(1)
+    expect((await mock.log()).messages.filter((m) => m.type === "present.action")).toHaveLength(0)
+  })
+}
+
+for (const target of ["settings", "help", "chat"] as const) {
+  test(`r6: ${target} takes notification controls from an already open More menu`, async ({ page, baseURL }) => {
+    await page.setViewportSize({ width: 375, height: 667 })
+    await page.emulateMedia({ reducedMotion: "reduce" })
+    await page.goto(appUrl(baseURL))
+    await expect(page.getByTestId("start")).toBeVisible()
+    await page.getByTestId("dock-more").click()
+    await page.keyboard.press(target === "settings" ? "s" : target === "help" ? "?" : "c")
+    await expect(page.getByTestId("dock-menu")).toHaveCount(0)
+    await mock.send([serverExamples["notification.ring"]])
+    const stop = page.getByRole("button", { name: "Stop", exact: true })
+    await expect(stop).toHaveCount(1)
+    await expect.poll(() => stop.evaluate(tappable)).toBe(true)
+    expect(await stop.evaluate((el) => el.closest("[inert]") !== null)).toBe(false)
+    for (let i = 0; i < 25 && !(await stop.evaluate((el) => el === document.activeElement)); i++) await page.keyboard.press("Tab")
+    await expect(stop).toBeFocused()
+    await page.keyboard.press("Enter")
+    await expect.poll(async () => (await mock.log()).messages.filter((m) => m.type === "notification.action" && m.actionId === "stop").length).toBe(1)
+  })
+}
+
+test("r6: the conversation menu keeps Stop above a phone keyboard without clearing the draft", async ({ page, baseURL }) => {
+  await mock.device({ assistants: [{ assistant: "jeff", phrases: [] }, { assistant: "t3", phrases: ["hey t3"] }], withoutPhrase: { mode: "assistant", assistant: "jeff" } })
+  await page.setViewportSize({ width: 375, height: 667 })
+  await page.emulateMedia({ reducedMotion: "reduce" })
+  await page.goto(appUrl(baseURL))
+  await expect(page.getByTestId("start")).toBeVisible()
+  await ui(page, { chatOpen: true })
+  const draft = "One\nTwo\nThree\nFour\nFive\nSix"
+  await page.locator("#chat-input").fill(draft)
+  await page.evaluate(() => {
+    Object.defineProperty(window.visualViewport, "height", { configurable: true, value: 300 })
+    window.visualViewport!.dispatchEvent(new Event("resize"))
+  })
+  await page.getByTestId("conversation-switcher").click()
+  await mock.send([serverExamples["notification.ring"]])
+  const stop = page.getByRole("button", { name: "Stop", exact: true })
+  await expect(stop).toHaveCount(1)
+  await expect.poll(() => stop.evaluate(tappable)).toBe(true)
+  for (let i = 0; i < 25 && !(await stop.evaluate((el) => el === document.activeElement)); i++) await page.keyboard.press("Tab")
+  await expect(stop).toBeFocused()
+  await expect.poll(() => stop.evaluate(tappable)).toBe(true)
+  await page.keyboard.press("Enter")
+  await expect.poll(async () => (await mock.log()).messages.filter((m) => m.type === "notification.action" && m.actionId === "stop").length).toBe(1)
+  await expect(page.locator("#chat-input")).toHaveValue(draft)
+  expect((await mock.log()).messages.filter((m) => m.type === "text.send")).toHaveLength(0)
+})
+
+test("r6: resizing past the phone More menu returns Stop to the visible stage", async ({ page, baseURL }) => {
+  await page.setViewportSize({ width: 375, height: 667 })
+  await page.emulateMedia({ reducedMotion: "reduce" })
+  await page.goto(appUrl(baseURL))
+  await expect(page.getByTestId("start")).toBeVisible()
+  await page.getByTestId("dock-more").click()
+  await mock.send([serverExamples["notification.ring"]])
+  await expect(page.getByTestId("dock-menu").getByRole("button", { name: "Stop", exact: true })).toBeVisible()
+  await page.setViewportSize({ width: 1280, height: 700 })
+  await expect(page.getByTestId("dock-menu")).toHaveCount(0)
+  const stop = page.getByRole("button", { name: "Stop", exact: true })
+  await expect(stop).toHaveCount(1)
+  await expect.poll(() => stop.evaluate(tappable)).toBe(true)
+  await stop.click()
+  await expect.poll(async () => (await mock.log()).messages.filter((m) => m.type === "notification.action" && m.actionId === "stop").length).toBe(1)
+})

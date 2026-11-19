@@ -10,13 +10,13 @@ import { cx } from "./ui/controls.tsx"
 /**
  * P10: the presentation stage (docs/PRESENTING.md "The voice page"; docs/CHARACTERS.md §2.7). One layout on every
  * character: a column centred under the character's box, just above the controls, that grows upward as far as it may
- * without covering the box (at least 160 px on a short screen) and scrolls within itself beyond that; it slides with the
- * stage while the desktop chat is open. The character's box, its canvas and the focus it is given are exactly as before:
+ * without covering the box (at least 160 px on a short screen) and scrolls within itself beyond that. The character's
+ * box, its canvas and the focus it is given are exactly as before:
  * the stage only adds bottom padding to the page's scroll area (`--pva-present-h`) so captions can scroll clear of it.
  *
  * It holds the notification cards first (P9, unchanged: `NotificationCards`), then the presentations, a transient one
- * first, then the pinned ones. Narrow chat renders notification cards inside its dialog instead. Every word the host
- * shows comes from the server in the household's language
+ * first, then the pinned ones. Open page menus and dialogs hide ordinary presentations and render notification cards
+ * inside their own surface instead. Every word the host shows comes from the server in the household's language
  * (`texts`); every text of a presentation passed the server's page boundary and is put on the page as text, never as
  * markup. An image is only ever `/media/<token>`, the server's copy.
  */
@@ -51,7 +51,7 @@ export function PresentationStage({ obscured = false }: { readonly obscured?: bo
     <div
       data-testid="present-stage"
       className={cx(
-        "pointer-events-none fixed inset-x-0 bottom-[calc(96px+env(safe-area-inset-bottom))] z-[60] flex justify-center px-4 transition-transform duration-[320ms] ease-out",
+        "pointer-events-none fixed inset-x-0 bottom-[calc(96px+env(safe-area-inset-bottom))] z-[5] flex justify-center px-4 transition-transform duration-[320ms] ease-out",
         chatOpen && "lg:max-[1439px]:-translate-x-[200px]"
       )}
     >
@@ -59,7 +59,7 @@ export function PresentationStage({ obscured = false }: { readonly obscured?: bo
         ref={inner}
         className="pointer-events-auto flex max-h-[max(160px,min(42dvh,calc(100dvh-540px)))] w-full max-w-[420px] flex-col gap-2 overflow-y-auto overscroll-contain scrollbar-quiet pt-1"
       >
-        {/* Narrow chat owns these controls so its modal focus trap includes Stop. */}
+        {/* An open menu or dialog owns these controls, including its keyboard scope. */}
         {!obscured ? <NotificationCards /> : null}
         {ordered.length > 0
           ? (

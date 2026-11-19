@@ -2,6 +2,9 @@
 import { useEffect, useRef, useState } from "react"
 import { nameOf, newConversationTip, newConversationToast, viewedId } from "@/lib/voiceSetup.ts"
 import { useClient, useClientState } from "./context.tsx"
+import { useMediaQuery } from "./useMediaQuery.ts"
+import { NotificationCards } from "./NotificationCards.tsx"
+import { usePageMenu } from "./voice/PageMenus.tsx"
 import { Icon, Spinner } from "./ui/Icon.tsx"
 import { cx } from "./ui/controls.tsx"
 
@@ -56,6 +59,8 @@ export function DockOverflow({ className }: { readonly className: string }) {
   const v = useNewConversation(true)
   const menuText = useClientState((s) => ((s.setup?.assistants.length ?? 0) > 1 ? `New conversation with ${nameOf(s, viewedId(s))}` : "New conversation"))
   const [open, setOpen] = useState(false)
+  const phone = !useMediaQuery("(min-width: 640px)")
+  const menuId = usePageMenu(open && phone, setOpen)
   const wrap = useRef<HTMLDivElement>(null)
   const trigger = useRef<HTMLButtonElement>(null)
   const item = useRef<HTMLButtonElement>(null)
@@ -98,32 +103,33 @@ export function DockOverflow({ className }: { readonly className: string }) {
       >
         <Icon name="more" />
       </button>
-      {open && (
+      {open && phone && (
         <div
-          role="menu"
-          aria-label="More"
           data-testid="dock-menu"
           onKeyDown={(e) => {
-            if (e.key === "Tab") setOpen(false)
+            if (e.key === "Tab" && !wrap.current?.querySelector("[data-testid=notification-cards]")) setOpen(false)
           }}
-          className="absolute bottom-full right-0 mb-3 w-max min-w-48 overflow-hidden rounded-lg border border-line bg-surface p-1 shadow-panel animate-[pva-rise_160ms_var(--ease-out)]"
+          className="absolute bottom-full right-0 mb-3 flex max-h-[calc(100dvh-128px)] w-max min-w-48 max-w-[calc(100vw-32px)] flex-col overflow-hidden rounded-lg border border-line bg-surface p-1 shadow-panel animate-[pva-rise_160ms_var(--ease-out)]"
         >
-          <button
-            ref={item}
-            type="button"
-            role="menuitem"
-            data-testid="dock-new-conversation"
-            disabled={v.disabled}
-            onClick={() => {
-              setOpen(false)
-              trigger.current?.focus()
-              void v.start()
-            }}
-            className="flex min-h-11 w-full items-center gap-2.5 rounded-md px-3 text-left text-[15px] text-ink transition-colors duration-[120ms] hover:bg-surface-2 disabled:opacity-40"
-          >
-            <Icon name="newChat" size={18} className="text-ink-muted" />
-            {menuText}
-          </button>
+          <NotificationCards inPanel menu={menuId} />
+          <div role="menu" aria-label="More" className="min-h-0 overflow-y-auto">
+            <button
+              ref={item}
+              type="button"
+              role="menuitem"
+              data-testid="dock-new-conversation"
+              disabled={v.disabled}
+              onClick={() => {
+                setOpen(false)
+                trigger.current?.focus()
+                void v.start()
+              }}
+              className="flex min-h-11 w-full items-center gap-2.5 rounded-md px-3 text-left text-[15px] text-ink transition-colors duration-[120ms] hover:bg-surface-2 disabled:opacity-40"
+            >
+              <Icon name="newChat" size={18} className="text-ink-muted" />
+              {menuText}
+            </button>
+          </div>
         </div>
       )}
     </div>
