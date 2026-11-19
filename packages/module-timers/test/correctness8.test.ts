@@ -87,7 +87,8 @@ for (const utterance of ["set a mysterious alarm at noon", "set a tomorrow alarm
   const kit = yield* startTestModule(alarmsModule)
   yield* spoken(kit, utterance, "alarms.set", false)
   const rows = yield* alarmRows(kit)
-  assert.isTrue(rows.length === 0 || rows.length === 1 && rows[0]!.value.next?.date === "2026-11-19")
+  if (utterance === "set a mysterious alarm at noon") assert.strictEqual(rows.length, 0)
+  else assert.isTrue(rows.length === 0 || rows.length === 1 && rows[0]!.value.next?.date === "2026-11-19")
 }))
 it.effect("control: genuinely unqualified subtraction still changes the sole timer", () => Effect.gen(function*() {
   const kit = yield* startTestModule(timersModule)
