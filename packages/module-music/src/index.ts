@@ -5,8 +5,8 @@ import { Answer, type Control, type Kind, makeControl, QUERY_CHARS, type Queue, 
 import { ROOM_CHARS, roomKey } from "./resolve.ts"
 import { texts } from "./texts.ts"
 
-export { CALL_TIMEOUT_MS, OWN_LEVEL_MS, QUERY_CHARS, queryProblem, TITLE_CHARS } from "./control.ts"
-export { MAX_PLAYERS, oneLine, resolvePlayer, ROOM_CHARS, STEP_NAMES } from "./resolve.ts"
+export { CALL_TIMEOUT_MS, INVOCATIONS_KEPT, QUERY_CHARS, queryProblem, TITLE_CHARS } from "./control.ts"
+export { NAMED, oneLine, resolvePlayer, ROOM_CHARS, STEP_NAMES } from "./resolve.ts"
 export { texts }
 
 /**
@@ -50,8 +50,7 @@ const settings = {
     label: "Use Home Assistant areas",
     description: "For a room not listed above, use the media player in the Home Assistant area of the same name (with several, the one Music Assistant serves, or ask which).",
     default: true
-  }),
-  volumeStep: Setting.number({ label: "Volume step", description: "How much \"louder\" and \"quieter\" change a player's volume.", default: 10, integer: true, min: 5, max: 25, unit: "percent" })
+  })
 }
 
 const KINDS = [
@@ -124,7 +123,7 @@ export const musicModule = defineModule({
     ),
   shared: (ctx) =>
     Effect.gen(function*() {
-      const control = yield* makeControl(ctx.host, { players: ctx.settings.players ?? [], useAreas: ctx.settings.useAreas ?? true, volumeStep: ctx.settings.volumeStep ?? 10 })
+      const control = yield* makeControl(ctx.host, { players: ctx.settings.players ?? [], useAreas: ctx.settings.useAreas ?? true })
       return { value: control, services: [Playback.of(control.playback)] }
     }),
   start: (ctx) =>
@@ -137,23 +136,26 @@ export const musicModule = defineModule({
         id: "play",
         label: "Play music",
         description: "Play an artist, an album, a song, a playlist or a radio station by its name, through Music Assistant, in the room said or the asking device's room. "
-          + "Choose the kind from the request (a performer is an artist). Music Assistant plays its closest match to the name; the answer says what was asked for, not what was found. "
+          + "Choose the kind from the request (a performer is an artist). For a song or an album, give its artist separately when it is known (\"Kind of Blue\" by \"Miles Davis\"): "
+          + "it is sent as \"Miles Davis - Kind of Blue\", the form Music Assistant's name search takes. A title that is only a number (\"1989\") needs its artist. "
+          + "Music Assistant plays its closest match to the name, which may not be exactly what was asked; \"now\" replaces the queue. Names only: never an address or a file. "
           + NOTE,
-        examples: ["play Nina Simone", "play the album Kind of Blue in the kitchen", "play Radio 2", "speel de afspeellijst Zondagochtend", "zet Radio 538 aan in de woonkamer"],
+        examples: ["play Nina Simone", "play the album Kind of Blue by Miles Davis in the kitchen", "play Radio 2", "speel de afspeellijst Zondagochtend", "zet Radio 538 aan in de woonkamer"],
         params: {
           query: Param.text({ label: "What to play", question: "What should be played, by name?", after: ["play", "speel"], maxWords: 8 }),
           kind: Param.choice({ label: "Kind", question: "Is it an artist, an album, a song, a playlist or a radio station?", options: KINDS }),
+          artist: Param.text({ label: "Artist", question: "Which artist is the song or album by, if the request says?", after: ["by", "van"], maxWords: 6, optional: true }),
           where: whereParam,
           queue: Param.choice({ label: "When", question: "Should it play now, next, or be added to the queue?", options: QUEUE, optional: true, default: "now" })
         },
         risk: "change",
-        run: ({ query, kind, where, queue }) => Effect.flatMap(turnRoom, (room) => answered(control.play({ query, kind, queue }, where, room, lang())))
+        run: ({ query, kind, artist, where, queue }) => Effect.flatMap(turnRoom, (room) => answered(control.play({ query, kind, artist, queue }, where, room, lang())))
       })
 
       const volume = defineAction({
         id: "volume",
         label: "Set the music volume",
-        description: "Set a music player's volume to a level from 0 to 100, or turn it up or down a step, in the room said or the asking device's room. Not the assistant's own speaking volume. "
+        description: "Set a music player's volume to a level from 0 to 100, or turn it up or down one of the player's own steps, in the room said or the asking device's room. Not the assistant's own speaking volume. "
           + NOTE,
         examples: ["set the music to 30 percent", "turn the music up", "music quieter in the kitchen", "zet de muziek op 40 procent", "muziek zachter"],
         params: {

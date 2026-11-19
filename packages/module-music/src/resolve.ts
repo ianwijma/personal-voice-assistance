@@ -1,25 +1,32 @@
 import { macrotask, nameKey } from "@pva/core"
-import type { HaEntity, HomeAssistantService } from "@pva/module-contracts"
+import type { HaArea, HaEntity, HomeAssistantService } from "@pva/module-contracts"
 import { Effect } from "effect"
 
 /**
- * Which media player a room (or a player's own name) means, decided at each call from the Home Assistant provider's
- * cache as it is then: nothing of it is kept. The steps, the first that matches decides:
+ * Which media player a room (or a player's own name or entity id) means, decided at each call from the Home Assistant
+ * provider's cache as it is then. The steps, the first that matches decides:
  *
- * 1. a line of the module's `players` setting whose room is the name (compared as Members compares names: `nameKey`);
- * 2. with `useAreas` on, a Home Assistant area whose name or an alias is the name, and the media players in it: one is
+ * 1. a line of the module's `players` setting whose room is the name (compared as Members compares names: `nameKey`,
+ *    and without a leading article);
+ * 2. an exposed media player whose entity id is exactly the text, looked up directly;
+ * 3. with `useAreas` on, a Home Assistant area whose name or an alias is the name, and the media players in it: one is
  *    the room's player; of several, the one Music Assistant serves (an entity with the `mass_player_type` attribute) when
  *    exactly one is; otherwise the person is asked which (never the first);
- * 3. a media player whose name, an alias or entity id is the name (so "the kitchen speaker" answers "which one?").
+ * 4. every exposed media player whose name or an alias is the name: one is it; several, a question.
+ *
+ * A question names at most `NAMED` players and says how many there are.
  *
  * **Bounds.** Comparing a name costs about 5 µs (`nameKey` of a 170-character name on the development machine), and a
- * provider may hold 500 areas of 20 aliases and thousands of entities. So the areas and the players are compared in
- * steps of at most `STEP_NAMES` names with a yield to the event loop between them (`macrotask`), and only the first
- * `MAX_PLAYERS` media players (the provider keeps entities in id order) are compared by name. latency.test.ts holds the
- * longest stop of the main thread at the largest cache under 10 ms.
+ * provider may hold 500 areas and 5,000 entities, each with 20 aliases. Every area and every media player is compared
+ * (none is left out), in steps of at most `STEP_NAMES` (100) names with a yield to the event loop between them
+ * (`macrotask`). The compared form of an area's or entity's names is remembered per object (a `WeakMap` on the
+ * provider's own objects, so a poll that brings a new object is compared afresh). latency.test.ts holds the longest
+ * stop of the main thread at the largest cache under 10 ms.
  */
-export const STEP_NAMES = 200
-export const MAX_PLAYERS = 200
+export const STEP_NAMES = 100
+
+/** The most players a "which one?" question names. */
+export const NAMED = 3
 
 /** The longest room or player name the module takes (the server's `MAX_ROOM_CHARS`, the `Playback` contract's bound). */
 export const ROOM_CHARS = 60
@@ -36,8 +43,8 @@ export type Resolved =
   | { readonly kind: "player"; readonly entity: HaEntity }
   /** The settings name a player for that room that Home Assistant does not expose. */
   | { readonly kind: "missing"; readonly where: string }
-  /** Several players, none chosen: their names, for the question. */
-  | { readonly kind: "ambiguous"; readonly where: string; readonly names: ReadonlyArray<string> }
+  /** Several players, none chosen: how many, and the names of at most `NAMED` of them, for the question. */
+  | { readonly kind: "ambiguous"; readonly where: string; readonly count: number; readonly names: ReadonlyArray<string> }
   /** A room or area that is known but has no player. */
   | { readonly kind: "empty"; readonly where: string }
   /** Nothing of that name. */
@@ -65,13 +72,40 @@ export const playerName = (entity: HaEntity): string => {
 
 const isMusicAssistant = (e: HaEntity): boolean => Object.hasOwn(e.attributes, "mass_player_type")
 
-/** Of the candidates: one, the one Music Assistant serves, or a question. */
+/** The compared names of an area or entity, made once per object. */
+const keysOf = new WeakMap<HaArea | HaEntity, ReadonlyArray<string>>()
+const keys = (o: HaArea | HaEntity): { readonly keys: ReadonlyArray<string>; readonly made: number } => {
+  const known = keysOf.get(o)
+  if (known !== undefined) return { keys: known, made: 0 }
+  const made = [o.name, ...o.aliases].map(roomKey)
+  keysOf.set(o, made)
+  return { keys: made, made: made.length }
+}
+
+/** Every item of `items` whose names include `key`, compared in steps with a yield between them. */
+const matching = <T extends HaArea | HaEntity>(items: ReadonlyArray<T>, key: string): Effect.Effect<ReadonlyArray<T>> =>
+  Effect.gen(function*() {
+    const found: Array<T> = []
+    let counted = 0
+    for (const item of items) {
+      const k = keys(item)
+      if (k.keys.includes(key)) found.push(item)
+      counted += k.made + 1
+      if (counted >= STEP_NAMES) {
+        counted = 0
+        yield* macrotask
+      }
+    }
+    return found
+  })
+
+/** Of the candidates: one, the one Music Assistant serves, or a question naming at most `NAMED` with the count. */
 const choose = (where: string, candidates: ReadonlyArray<HaEntity>): Resolved => {
   if (candidates.length === 1) return { kind: "player", entity: candidates[0]! }
   const served = candidates.filter(isMusicAssistant)
   if (served.length === 1) return { kind: "player", entity: served[0]! }
   const pool = served.length > 1 ? served : candidates
-  return { kind: "ambiguous", where, names: pool.map(playerName) }
+  return { kind: "ambiguous", where, count: pool.length, names: pool.slice(0, NAMED).map(playerName) }
 }
 
 /**
@@ -85,7 +119,8 @@ export const resolvePlayer = (
   text: string
 ): Effect.Effect<Resolved> =>
   Effect.gen(function*() {
-    const where = text.trim().replace(LEADING_ARTICLE, "")
+    const raw = text.trim()
+    const where = raw.replace(LEADING_ARTICLE, "")
     const key = roomKey(text)
     if (key === "") return { kind: "unknown", where }
     // 1. The owner's table: at most 32 lines.
@@ -96,50 +131,26 @@ export const resolvePlayer = (
       return ha.connection() === "unknown" ? { kind: "not-yet" } : { kind: "missing", where: row.room }
     }
     if (ha.connection() === "unknown") return { kind: "not-yet" }
+    // 2. An exact entity id, looked up directly.
+    if (raw.startsWith("media_player.")) {
+      const entity = ha.entity(raw)
+      if (entity !== undefined && entity.domain === "media_player") return { kind: "player", entity }
+    }
     const players = ha.entities().filter((e) => e.domain === "media_player")
-    // 2. Areas, in steps.
+    // 3. Areas, every one, in steps.
     if (useAreas) {
-      const areaIds = new Set<string>()
-      let areaName: string | undefined
-      let counted = 0
-      for (const area of ha.areas()) {
-        const names = [area.name, ...area.aliases]
-        if (names.some((n) => roomKey(n) === key)) {
-          areaIds.add(area.id)
-          areaName ??= oneLine(area.name, ROOM_CHARS)
-        }
-        counted += names.length
-        if (counted >= STEP_NAMES) {
-          counted = 0
-          yield* macrotask
-        }
-      }
-      if (areaIds.size > 0) {
+      const areas = yield* matching(ha.areas(), key)
+      if (areas.length > 0) {
+        const areaIds = new Set(areas.map((a) => a.id))
+        const areaName = oneLine(areas[0]!.name, ROOM_CHARS)
         const inArea = players.filter((p) => p.areaId !== undefined && areaIds.has(p.areaId))
-        if (inArea.length > 0) return choose(areaName ?? where, inArea)
-        // An area of that name without a player: a player may still carry the name (step 3); otherwise it is empty.
-        const byName = yield* playersNamed(players, key, text.trim())
-        return byName.length > 0 ? choose(where, byName) : { kind: "empty", where: areaName ?? where }
+        if (inArea.length > 0) return choose(areaName, inArea)
+        // An area of that name without a player: a player may still carry the name (step 4); otherwise it is empty.
+        const byName = yield* matching(players, key)
+        return byName.length > 0 ? choose(where, byName) : { kind: "empty", where: areaName }
       }
     }
-    // 3. A player's own name.
-    const byName = yield* playersNamed(players, key, text.trim())
+    // 4. Every player's own names, in steps.
+    const byName = yield* matching(players, key)
     return byName.length > 0 ? choose(where, byName) : { kind: "unknown", where }
-  })
-
-/** The first `MAX_PLAYERS` media players whose name, an alias or id is `key`, compared in steps. */
-const playersNamed = (players: ReadonlyArray<HaEntity>, key: string, raw: string): Effect.Effect<ReadonlyArray<HaEntity>> =>
-  Effect.gen(function*() {
-    const found: Array<HaEntity> = []
-    let counted = 0
-    for (const p of players.slice(0, MAX_PLAYERS)) {
-      const names = [p.name, ...p.aliases]
-      if (p.entityId === raw || names.some((n) => roomKey(n) === key)) found.push(p)
-      counted += names.length
-      if (counted >= STEP_NAMES) {
-        counted = 0
-        yield* macrotask
-      }
-    }
-    return found
   })
