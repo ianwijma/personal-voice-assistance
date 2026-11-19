@@ -259,9 +259,11 @@ transient the decision allows.
   later; an image left loading by a restart is fetched again when a page is to show it. None stays loading. A fetch
   is shared by address only while it is in flight: a key shown again with the same address during the fetch gets its
   outcome. A completion claims a showing only while it still wants that address; replacing or updating it to a
-  different address discards the older address's completion. Completed outcomes awaiting a store retry belong to
-  that showing; a fresh showing resolves its own address off the turn path, so it cannot inherit an older showing's
-  refusal or reuse an expired file. A content update of the same show keeps its resolved image.
+  different address discards the older address's completion, even if the handle returns to that address before its
+  write finishes. Each write and cleanup checks ownership of that specific completed outcome. Completed outcomes
+  awaiting a store retry belong to that showing; a fresh showing resolves its own address off the turn path, so it
+  cannot inherit an older showing's refusal or reuse an expired file. A content update of the same show keeps its
+  resolved image.
 - **The cache** fetches through `safeFetch` (public addresses only, redirects checked again; never the owner-configured
   helper, for anything a model or a page supplies) with its own image policy, checks the type the response says and the
   bytes it is against each other, and its size, keeps it as `data/media/<sha256>.<ext>` (directory `0700`, files `0600`,
@@ -306,7 +308,9 @@ transient the decision allows.
   scroll area, so captions scroll clear of it.
 - P9's **notification cards are drawn first in the stage**, with their wire messages and behaviour unchanged; then the
   presentations, a transient one first, then the pinned ones oldest first. While narrow-screen chat is modal, ordinary
-  presentations are hidden and inert; notification ring controls remain usable. Desktop chat leaves presentations visible.
+  presentations are hidden and inert; notification cards move inside the chat dialog so keyboard focus can reach ring
+  Stop. Desktop chat leaves presentations visible and notification cards in the stage. Settings and Help hide the
+  entire stage until they close, without clearing the held presentations.
 - One renderer per kind. Every text of a presentation passed the server's page boundary (`ModuleHost.pageText`) and is
   put on the page as text, never as markup; long text, button labels and weather values wrap. **Every word the host
   shows** (the region's name, "Loading the image…", "The image is not available.", the timer's "Done", "Image:", "High",
@@ -351,8 +355,10 @@ transient the decision allows.
 which device, and why not), `press(id, action, { device, item?, done? })` (as that device's page; the clock is driven
 while the handler runs), and `engine` (`live`, `held`, `maintainNow`, `planNow`, `plannedAt`, `loaded`).
 `kit.notify.connect` / `disconnect` reconcile it too; a page that disconnects shows nothing, as the real page.
-Reconnect starts four fresh press slots; old requests release their original connection’s slots, and all connections
-share the sixteen-slot global bound (notification Stop remains exempt). A kit
+Each reconnect gets a fresh connection ID for delivery and press-principal lookup, so hello restores live pins even
+when close reconciliation has not run yet. Reconnect starts four fresh press slots; old requests release their
+original connection’s slots, and all connections share the sixteen-slot global bound (notification Stop remains
+exempt). A kit
 device without `capabilities` declares this build's voice page on a tablet (`KIT_PAGE_CAPABILITIES`: a display with
 touch, every kind, a speaker, a microphone), so it is decided as serve mode decides for this build's page; give
 `capabilities` to model a speaker or an older page. `StartTestModuleOptions.media` gives the kit a fake image cache
@@ -370,12 +376,12 @@ boundary.
 
 | What | Number |
 |---|---|
-| end of turn → first audio (`TurnTrace`, the real `Conversation`, a tool round through the host's registry and gateway, zero-delay synthesis and output, the model's tokens 5 ms after each request; median of 80 turns × 4 counterbalanced runs; 31 other presentations live, 8 pinned on the turn's device) | without a presentation 10.879 ms (p95 11.525); with the worst legal presentation in the tool's result 11.047 ms (p95 12.132) |
-| `show` as a tool calls it (200 calls, a transient replacing the last) | median 0.530 ms, p95 0.723 ms, worst 0.977 ms; longest main-thread stop across the whole workload 1.66 ms |
-| a page saying hello with 9 presentations | longest main-thread stop 0.96 ms |
-| reconciling every device with real fan-out (64 devices in one room, 8 pinned and 1 transient room-wide, 64 fresh pages: 576 frames, 2.03 MiB encoded) | longest main-thread stop 1.46 ms |
+| end of turn → first audio (`TurnTrace`, the real `Conversation`, a tool round through the host's registry and gateway, zero-delay synthesis and output, the model's tokens 5 ms after each request; median of 80 turns × 4 counterbalanced runs; 31 other presentations live, 8 pinned on the turn's device) | without a presentation 10.838 ms (p95 11.369); with the worst legal presentation in the tool's result 11.097 ms (p95 11.817) |
+| `show` as a tool calls it (200 calls, a transient replacing the last) | median 0.494 ms, p95 0.563 ms, worst 0.966 ms; longest main-thread stop across the whole workload 1.43 ms |
+| a page saying hello with 9 presentations | longest main-thread stop 0.81 ms |
+| reconciling every device with real fan-out (64 devices in one room, 8 pinned and 1 transient room-wide, 64 fresh pages: 576 frames, 2.03 MiB encoded) | longest main-thread stop 2.02 ms |
 
-So a tool's presentation at the stated maximum moved the turn's first audio by a median 0.168 ms, not zero: the turn
+So a tool's presentation at the stated maximum moved the turn's first audio by a median 0.259 ms, not zero: the turn
 itself pays the validation, the decision and the note (way 1), and the writer and the reconciliation of the turn's device
 run on the same thread while the model thinks. The test asserts the difference stays under 2 ms and the longest stops
 under 10 ms.

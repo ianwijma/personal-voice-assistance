@@ -15,9 +15,10 @@ import { cx } from "./ui/controls.tsx"
  * the stage only adds bottom padding to the page's scroll area (`--pva-present-h`) so captions can scroll clear of it.
  *
  * It holds the notification cards first (P9, unchanged: `NotificationCards`), then the presentations, a transient one
- * first, then the pinned ones. Every word the host shows comes from the server in the household's language
+ * first, then the pinned ones. Narrow chat renders notification cards inside its dialog instead. Every word the host
+ * shows comes from the server in the household's language
  * (`texts`); every text of a presentation passed the server's page boundary and is put on the page as text, never as
- * markup. An image is only ever `/media/<hash>`, the server's copy.
+ * markup. An image is only ever `/media/<token>`, the server's copy.
  */
 export function PresentationStage({ obscured = false }: { readonly obscured?: boolean }) {
   const shownCards = useClientState((s) => s.notifications.some((c) => c.show))
@@ -58,7 +59,8 @@ export function PresentationStage({ obscured = false }: { readonly obscured?: bo
         ref={inner}
         className="pointer-events-auto flex max-h-[max(160px,min(42dvh,calc(100dvh-540px)))] w-full max-w-[420px] flex-col gap-2 overflow-y-auto overscroll-contain scrollbar-quiet pt-1"
       >
-        <NotificationCards />
+        {/* Narrow chat owns these controls so its modal focus trap includes Stop. */}
+        {!obscured ? <NotificationCards /> : null}
         {ordered.length > 0
           ? (
             <section

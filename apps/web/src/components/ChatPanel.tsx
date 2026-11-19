@@ -6,6 +6,7 @@ import { answeringId, conversationNote, exchangesOf, nameOf, needsRead, viewedId
 import { Composer } from "./Composer.tsx"
 import { useClient, useClientState } from "./context.tsx"
 import { MessageList } from "./MessageList.tsx"
+import { NotificationCards } from "./NotificationCards.tsx"
 import { NewConversationButton } from "./NewConversation.tsx"
 import { Icon } from "./ui/Icon.tsx"
 import { useDialog } from "./ui/Panel.tsx"
@@ -73,6 +74,7 @@ export function ChatPanel() {
             </button>
           </div>
         </div>
+        {modal ? <NotificationCards /> : null}
         <ConversationNote />
         <MessageList key={`list-${sessionSeq}`} />
         <Composer key={`composer-${sessionSeq}`} />

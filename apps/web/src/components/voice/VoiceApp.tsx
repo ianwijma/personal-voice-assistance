@@ -38,7 +38,8 @@ export function VoiceApp() {
 
 /**
  * While a modal panel is open (the settings sheet, Help, or the chat as a sheet below 1024 px) everything behind it is
- * `inert`; notification ring controls remain available over chat. Toasts and the screen-reader announcers stay outside,
+ * `inert`; Settings and Help also hide the stage. Narrow chat holds the notification ring controls inside its focus
+ * scope. Toasts and the screen-reader announcers stay outside,
  * above every panel.
  */
 function Shell() {
@@ -61,7 +62,7 @@ function Shell() {
       <div className="contents" inert={modal}>
         <ChatPanel />
       </div>
-      <div className="contents" inert={modal}>
+      <div className={modal ? "hidden" : "contents"} hidden={modal} inert={modal}>
         {/* P10: the presentation stage beside the character: P9's notification cards first, then the presentations. */}
         <PresentationStage obscured={ui.chat && !wide} />
       </div>

@@ -50,3 +50,37 @@ it.each([false, true])("r3 b1: modal chat hides and inerts ordinary presentation
   await act(async () => fireEvent.click(screen.getByRole("button", { name: "Choose tea" })))
   expect(request).toHaveBeenCalledWith(expect.objectContaining({ type: "present.action", action: "choose" }))
 })
+
+it.each(["sheetOpen", "shortcutsOpen"] as const)("r4 b1: %s hides the stage over four held pins and restores them on close", (modal) => {
+  mocks.wide = false
+  const store = createStore(initialState, reducer)
+  mocks.client = { store, connect: () => () => undefined } as unknown as AssistantClient
+  render(<VoiceApp />)
+  act(() => {
+    for (let i = 0; i < 4; i++) store.dispatch({ type: "present.show", presentation: {
+      id: `p-${i}`, revision: "r1", lifetime: "pinned", shownAt: i, serverNow: 1000, v: 1,
+      content: { kind: "card", title: `Shopping ${i}`, facts: [] }, buttons: [], interactive: false,
+      texts: serverExamples["present.show"].presentation.texts
+    } })
+    store.dispatch({ type: "local/ui", patch: { [modal]: true } })
+  })
+  expect(screen.queryByRole("region", { name: "On screen" })).toBeNull()
+  const stage = screen.getByTestId("present-stage")
+  expect(stage.closest("[hidden]")).not.toBeNull()
+  expect(store.get().presentations).toHaveLength(4)
+  act(() => store.dispatch({ type: "local/ui", patch: { [modal]: false } }))
+  expect(stage.closest("[hidden]")).toBeNull()
+  expect(screen.getAllByRole("heading", { name: /Shopping/ })).toHaveLength(4)
+})
+
+it("r4 b2: narrow chat includes exactly one ringing Stop in its modal focus scope", () => {
+  mocks.wide = false
+  const store = createStore(initialState, reducer)
+  mocks.client = { store, connect: () => () => undefined } as unknown as AssistantClient
+  render(<VoiceApp />)
+  act(() => store.dispatch({ type: "local/ui", patch: { chatOpen: true } }))
+  act(() => store.dispatch(serverExamples["notification.ring"]))
+  const stop = screen.getByRole("button", { name: /^Stop$/ })
+  expect(screen.getByTestId("chat-panel").contains(stop)).toBe(true)
+  expect(screen.getAllByTestId("notification-cards")).toHaveLength(1)
+})

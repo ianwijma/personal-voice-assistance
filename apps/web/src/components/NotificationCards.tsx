@@ -8,8 +8,9 @@ import { cx } from "./ui/controls.tsx"
  * P9: the notification cards of this device (docs/NOTIFICATIONS.md "The voice page"): a plain card per notification the
  * server says to show, with its title, its text and its buttons (`stop` first). Every word on it comes from the server,
  * in the household's language (the card's `texts` and labels). Since P10 it is drawn first in the presentation stage
- * (`PresentationStage.tsx`), the one region beside the character's box that scrolls within the viewport (every Stop
- * reachable, long text wrapped), so every character keeps drawing exactly as before (docs/CHARACTERS.md). A press goes to the server (`notification.action`):
+ * (`PresentationStage.tsx`), or inside narrow chat so its modal focus scope includes Stop. Both regions scroll within
+ * the viewport (every Stop reachable, long text wrapped), so every character keeps drawing exactly as before
+ * (docs/CHARACTERS.md). A press goes to the server (`notification.action`):
  * Stop is always usable, a module action disables only its own button while it is pending, and an answer that comes
  * after the card is gone is ignored.
  */
