@@ -107,12 +107,9 @@ export const copyDatabase = async (source: string, path: string): Promise<string
     } finally {
       from.close()
     }
-    const copy = new DatabaseSync(part)
-    try {
-      copy.exec("PRAGMA journal_mode = DELETE")
-    } finally {
-      copy.close()
-    }
+    // One file without a log: on a thread of its own, since the change writes and syncs a journal and syncs the
+    // directory (an 87 ms and a 62 ms sync on the development machine's busy disk), which on the main thread stopped it.
+    await toRollbackJournal(part)
     await narrow(part)
     await fsyncFile(part)
     await rename(part, path)
@@ -146,6 +143,22 @@ export const copyFilePrivately = async (from: string, path: string): Promise<str
   return problem
 }
 
+/** Set a database file's journal mode to DELETE on a short-lived worker thread (the copy of a backup). */
+const toRollbackJournal = (file: string): Promise<void> =>
+  new Promise<void>((resolve, reject) => {
+    const w = new Worker(JOURNAL_TO_DELETE, { eval: true, workerData: { file } })
+    let settled = false
+    const done = (error?: Error) => {
+      if (settled) return
+      settled = true
+      if (error === undefined) resolve()
+      else reject(error)
+    }
+    w.once("message", (m: { ok: boolean; error?: string }) => done(m.ok ? undefined : new Error(m.error ?? "the journal mode could not be set")))
+    w.once("error", (e) => done(e))
+    w.once("exit", (code) => done(code === 0 ? new Error("the journal mode worker ended without an answer") : new Error(`the journal mode worker ended with code ${code}`)))
+  })
+
 // ---- Checkpoints: a worker thread with a connection of its own
 
 /** The size the write-ahead log's file is cut back to when a log starts again (`PRAGMA journal_size_limit`). */
@@ -166,6 +179,23 @@ export const WORKER_WARNING_FILTER = `
     if (type === "ExperimentalWarning" && sqlite.test(text)) return
     original(warning, ...rest)
   }
+}
+`
+
+const JOURNAL_TO_DELETE = `
+const { parentPort, workerData } = require("node:worker_threads")
+${WORKER_WARNING_FILTER}
+const { DatabaseSync } = require("node:sqlite")
+try {
+  const db = new DatabaseSync(workerData.file)
+  try {
+    db.exec("PRAGMA journal_mode = DELETE")
+  } finally {
+    db.close()
+  }
+  parentPort.postMessage({ ok: true })
+} catch (e) {
+  parentPort.postMessage({ ok: false, error: String(e) })
 }
 `
 
