@@ -14,6 +14,8 @@ const TOKEN = "hook-t0ken-for-tests-1234"
 /** Every turn of a test is its own: the kit gives the same turn id to every call unless told otherwise. */
 let turns = 100
 const as = (device: string) => ({ device, turnId: ++turns })
+/** A phrase command's turn (the only kind whose identity is a replay): its own turn id each time. */
+const ph = (device: string) => ({ device, source: "phrase" as const, turnId: ++turns })
 const NL = { household: { home: { HOME_LANGUAGE: "nl-NL" } } }
 
 /** A test's own wrapper: the module with its `ctx.notify` changed, and the routes its shared part returned recorded. */
@@ -578,11 +580,11 @@ describe("review 1.4: a repeat of the same invocation returns the first outcome"
       assert.strictEqual(kit.notify.dnd().until, until)
       // Inside the bound the repeat still joins the first. Past it (256 others finished since), the oldest is forgotten and acts again.
       // (Other finished invocations that change nothing: a dismissal with nothing open.)
-      for (let i = 0; i < 254; i++) yield* kit.tool("notifications_dismiss", {}, as("kitchen-display"))
+      for (let i = 0; i < 254; i++) yield* kit.tool("notifications_dismiss", {}, ph("kitchen-display"))
       yield* kit.action("dnd_for", { duration: "ten minutes" }, turn)
       assert.strictEqual(kit.notify.dnd().until, until)
-      yield* kit.tool("notifications_dismiss", {}, as("kitchen-display"))
-      yield* kit.tool("notifications_dismiss", {}, as("kitchen-display"))
+      yield* kit.tool("notifications_dismiss", {}, ph("kitchen-display"))
+      yield* kit.tool("notifications_dismiss", {}, ph("kitchen-display"))
       yield* kit.action("dnd_for", { duration: "ten minutes" }, turn)
       assert.strictEqual(kit.notify.dnd().until, (yield* kit.now) + 600_000)
     }))
@@ -703,12 +705,12 @@ describe("review 2", () => {
       const seen = { routes: [] as ReadonlyArray<ModuleRoute> }
       const kit = yield* startTestModule(wrapped(g.change, seen), { secrets: { hookToken: TOKEN } })
       yield* hit(seen.routes[0]!, { body: { title: "Washer done", key: "w" } })
-      const turn = kit.turn({ device: "kitchen-display", turnId: 5001 })
+      const turn = kit.turn({ device: "kitchen-display", source: "phrase", turnId: 5001 })
       g.state.held = true
       const original = yield* kit.tool("notifications_dismiss", {}, turn).pipe(Effect.forkChild)
       yield* until(g.state, 1)
       g.state.held = false
-      for (let i = 0; i < 256; i++) yield* kit.tool("notifications_dnd_off", {}, as("kitchen-display"))
+      for (let i = 0; i < 256; i++) yield* kit.tool("notifications_dnd_off", {}, ph("kitchen-display"))
       const repeat = yield* kit.tool("notifications_dismiss", {}, turn).pipe(Effect.forkChild)
       for (let i = 0; i < 50; i++) yield* Effect.yieldNow
       yield* hit(seen.routes[0]!, { body: { title: "Door open", key: "d" } })
@@ -725,17 +727,17 @@ describe("review 2", () => {
       const kit = yield* startTestModule(wrapped(g.change))
       g.state.held = true
       const fibers = []
-      for (let i = 0; i < 64; i++) fibers.push(yield* kit.tool("notifications_dismiss", {}, as("kitchen-display")).pipe(Effect.forkChild))
+      for (let i = 0; i < 64; i++) fibers.push(yield* kit.tool("notifications_dismiss", {}, ph("kitchen-display")).pipe(Effect.forkChild))
       yield* until(g.state, 64)
       assert.strictEqual(g.state.started, 64)
-      const refused = yield* kit.tool("notifications_dnd_on", {}, as("kitchen-display"))
+      const refused = yield* kit.tool("notifications_dnd_on", {}, ph("kitchen-display"))
       assert.isFalse(refused.ok)
       assert.include(refused.content, "I'm busy with other things right now; try again in a moment.")
       assert.isFalse(kit.notify.dnd().on)
       g.state.held = false
       yield* Deferred.succeed(g.state.release, undefined)
       for (const f of fibers) yield* Fiber.join(f)
-      assert.isTrue((yield* kit.tool("notifications_dnd_on", {}, as("kitchen-display"))).ok)
+      assert.isTrue((yield* kit.tool("notifications_dnd_on", {}, ph("kitchen-display"))).ok)
     }))
 
   it.effect("the busy sentence is Dutch in a Dutch household", () =>
@@ -744,9 +746,9 @@ describe("review 2", () => {
       const kit = yield* startTestModule(wrapped(g.change), NL)
       g.state.held = true
       const fibers = []
-      for (let i = 0; i < 64; i++) fibers.push(yield* kit.tool("notifications_dismiss", {}, as("kitchen-display")).pipe(Effect.forkChild))
+      for (let i = 0; i < 64; i++) fibers.push(yield* kit.tool("notifications_dismiss", {}, ph("kitchen-display")).pipe(Effect.forkChild))
       yield* until(g.state, 64)
-      assert.include((yield* kit.tool("notifications_dnd_off", {}, as("kitchen-display"))).content, "Ik ben even bezig met andere dingen; probeer het zo nog eens.")
+      assert.include((yield* kit.tool("notifications_dnd_off", {}, ph("kitchen-display"))).content, "Ik ben even bezig met andere dingen; probeer het zo nog eens.")
       g.state.held = false
       yield* Deferred.succeed(g.state.release, undefined)
       for (const f of fibers) yield* Fiber.join(f)
@@ -812,4 +814,47 @@ describe("review 2", () => {
       }))
   }
   const dutchOrEnglish = (language: "en" | "nl") => (language === "nl" ? "een deur" : "a door")
+})
+
+describe("after review round 2: only a phrase command is replayed", () => {
+  it.effect("two `notifications_dismiss {}` calls of the assistant in one turn dismiss both cards (one at a time)", () =>
+    Effect.gen(function*() {
+      const seen = { routes: [] as ReadonlyArray<ModuleRoute> }
+      const kit = yield* startTestModule(wrapped((n) => n, seen), { secrets: { hookToken: TOKEN } })
+      yield* hit(seen.routes[0]!, { body: { title: "Washer done", key: "w" } })
+      const turn = kit.turn({ device: "kitchen-display", turnId: 7001 })
+      assert.deepStrictEqual((yield* kit.tool("notifications_dismiss", {}, turn)).value, { spoken: "Dismissed." })
+      yield* hit(seen.routes[0]!, { body: { title: "Door open", key: "d" } })
+      assert.deepStrictEqual((yield* kit.tool("notifications_dismiss", {}, turn)).value, { spoken: "Dismissed." })
+      assert.deepStrictEqual((yield* kit.notify.all).filter((n) => n.state === "open"), [])
+    }))
+
+  it.effect("two `notifications_dismiss {}` calls in one turn: each acts on what is open then (a second says nothing is left)", () =>
+    Effect.gen(function*() {
+      const seen = { routes: [] as ReadonlyArray<ModuleRoute> }
+      const kit = yield* startTestModule(wrapped((n) => n, seen), { secrets: { hookToken: TOKEN } })
+      yield* hit(seen.routes[0]!, { body: { title: "Washer done", key: "w" } })
+      const turn = kit.turn({ device: "kitchen-display", turnId: 7002 })
+      assert.deepStrictEqual((yield* kit.tool("notifications_dismiss", {}, turn)).value, { spoken: "Dismissed." })
+      assert.include(JSON.stringify((yield* kit.tool("notifications_dismiss", {}, turn)).value), "nothing open")
+    }))
+
+  it.effect("two send_test calls in one turn: the second is truthfully 'already open', not a second 'sent'", () =>
+    Effect.gen(function*() {
+      const kit = yield* startTestModule(notificationsModule)
+      const turn = kit.turn({ device: "kitchen-display", turnId: 7003 })
+      assert.deepStrictEqual((yield* kit.tool("notifications_send_test", {}, turn)).value, { spoken: "I sent a test notification to this device." })
+      assert.deepStrictEqual((yield* kit.tool("notifications_send_test", {}, turn)).value, { spoken: "A test notification is already open on this device." })
+    }))
+
+  it.effect("a routine's run of an action is not replayed either", () =>
+    Effect.gen(function*() {
+      const kit = yield* startTestModule(notificationsModule)
+      const turn = kit.turn({ device: "kitchen-display", source: "routine", turnId: 7004 })
+      yield* kit.action("dnd_for", { duration: "ten minutes" }, turn)
+      const first = kit.notify.dnd().until
+      yield* kit.advance(60_000)
+      yield* kit.action("dnd_for", { duration: "ten minutes" }, turn)
+      assert.strictEqual(kit.notify.dnd().until, first! + 60_000)
+    }))
 })

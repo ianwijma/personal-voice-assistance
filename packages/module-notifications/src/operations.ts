@@ -82,12 +82,14 @@ export const makeOperations = (ctx: { readonly notify: ModuleNotify; readonly ho
   /**
    * Runs `run` once for an invocation's identity (assistant, conversation, turn, device, the operation and its resolved
    * request): a repeat, even a concurrent one, gets the first outcome and changes nothing. At `PENDING_MAX` invocations in
-   * flight a new one is refused ("busy") and nothing is done. Without a turn there is no identity.
+   * flight a new one is refused ("busy") and nothing is done. Only an invocation whose turn is a phrase command has an identity; every other call runs.
    */
   const once = (operation: string, asked: string, run: Effect.Effect<Outcome>, onAbort: Outcome): Effect.Effect<Outcome> =>
     Effect.gen(function*() {
       const turn = yield* CurrentTurn
-      if (turn === undefined) return yield* run
+      // Only a phrase command heard once is known to be one invocation. The gateway gives a tool no per-call id, so the
+      // assistant's own calls (a model may call a tool twice in a turn on purpose) and routines always run.
+      if (turn === undefined || turn.source !== "phrase") return yield* run
       const key = [operation, turn.assistantId, turn.conversationId, turn.turnId, turn.deviceId, asked].join("\u0000")
       const admitted = Effect.sync(() => {
         const done = finished.get(key)

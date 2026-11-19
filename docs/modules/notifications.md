@@ -37,6 +37,8 @@ are kept until they settle and are bounded at 64 (a 65th mutation is refused as 
 evicted (256, oldest first) (do not disturb is not extended; a
 dismissal stays bound to the notification chosen the first time). A new utterance has a new turn id and acts again.
 
+**What is deduplicated, and what is not.** Only a phrase command (`CurrentTurn.source` is `phrase`) has an identity that proves a replay: one heard once acts once. The assistant's own tool calls, and routines, are never held back and never answered from the record, because the gateway gives a tool or action no per-call id and a model may call a tool twice in one turn on purpose ("dismiss both" is two calls that each act); each such call runs and says what is true then.
+
 | Tool | Risk | Does | Example |
 |---|---|---|---|
 | `notifications_open` | read | the open ones for this device (at most 5 titles and "and N more", how many personal ones are kept back, and that the read was cut when it was); titles are marked as untrusted outside text | "which notifications are open?" |
@@ -103,6 +105,8 @@ the CLI modes: every call then answers that it is unavailable) and `Privacy`. It
 buttons beyond the host's Stop, so no action handler is registered.
 
 ## What was left out
+
+- **A stable per-call identity** (the model's tool-call id) handed to tool and action handlers: with it the assistant's own calls could be deduplicated safely too. Missing from the gateway; until then only phrase commands are.
 
 - **Phone channels, escalation, hooks from outside the home network, anything above `normal` from a hook** (the brief).
 - **Listing every module's notifications for a device.** The service gives a module only its own (see above). The
