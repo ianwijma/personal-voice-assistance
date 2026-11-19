@@ -20,7 +20,7 @@ import { AudioInput, AudioOutput, Llm, Stt, Tts, type TtsAudio } from "./Service
 import { ToolRegistry } from "./ToolRegistry.ts"
 import { defaultGateway } from "./Gateway.ts"
 import { confirmedRunnerOf } from "./GatewayPrivate.ts"
-import { type ConnectionRef, CurrentTurn, makeTurnContext, type TurnContext } from "./TurnContext.ts"
+import { type ConnectionRef, CurrentTurn, CurrentTurnCommit, makeTurnContext, type TurnCommit, type TurnContext } from "./TurnContext.ts"
 import { CurrentTurnTrace, type Trace, TurnTrace, type TurnOutcome } from "./TurnTrace.ts"
 import { ACTION_TIMEOUT_MS, ActionError, type ActionOutcome, actionToolName, type RegisteredAction } from "./Actions.ts"
 import { confirmationQuestion, describeProposal } from "./Decision.ts"
@@ -438,6 +438,8 @@ interface ActiveTurn {
   speaking: boolean
   done: boolean
   readonly promoted: Deferred.Deferred<void>
+  /** Work held until the turn is committed (`TurnCommit.whenCommitted`, R8): run at promotion, dropped when discarded. */
+  readonly onCommit: Array<() => void>
   readonly trace: Trace
   readonly plan: TurnPlan
   /** An agent asked for a reply while the turn was still pending: arm it at promotion. */
@@ -456,6 +458,8 @@ interface ReplyContext {
   readonly spoken: boolean
   readonly speculative: boolean
   readonly promoted: Effect.Effect<void>
+  /** Whether the turn is committed, for the calls it makes (`CurrentTurnCommit`, R8). */
+  readonly commit: TurnCommit
   readonly history: ReadonlyArray<Message>
   /** Messages evicted before `history[0]` when the snapshot was taken. */
   readonly historyStart: number
@@ -547,6 +551,9 @@ const turnContextOf = (
   source: "voice" | "text" = trace.mode
 ): TurnContext | undefined =>
   setup?.turnContext === undefined ? undefined : makeTurnContext({ turnId: trace.id, conversationId, source }, setup.turnContext)
+
+/** The commit state of a turn that starts committed (a typed turn without speech). */
+const COMMITTED: TurnCommit = { committed: () => true, whenCommitted: (f) => f() }
 
 const withCurrentTurn = <A, E, R>(effect: Effect.Effect<A, E, R>, turn: TurnContext | undefined): Effect.Effect<A, E, R> =>
   turn === undefined ? effect : Effect.provideService(effect, CurrentTurn, turn)
@@ -1048,7 +1055,9 @@ const makeConversationCore = Effect.fnUntraced(function*(options: AgentConversat
     }))
 
   const reply = (ctx: ReplyContext): Stream.Stream<string, AgentError> =>
-    Stream.suspend(() => (ctx.plan.answer !== undefined ? answerReply(ctx, ctx.plan.answer) : agentReply(ctx)))
+    Stream.suspend(() => (ctx.plan.answer !== undefined ? answerReply(ctx, ctx.plan.answer) : agentReply(ctx))).pipe(
+      Stream.provideService(CurrentTurnCommit, ctx.commit)
+    )
 
   const agentReply = (ctx: ReplyContext): Stream.Stream<string, AgentError> =>
     Stream.suspend(() => {
@@ -1404,6 +1413,7 @@ const makeConversationCore = Effect.fnUntraced(function*(options: AgentConversat
         spoken: false,
         speculative: false,
         promoted: Effect.void,
+        commit: COMMITTED,
         history: history.slice(),
         historyStart: evicted,
         conversationId,
@@ -1425,6 +1435,13 @@ const makeConversationCore = Effect.fnUntraced(function*(options: AgentConversat
       let current: ActiveTurn | undefined
 
       const live = () => (current !== undefined && !current.done ? current : undefined)
+      const runCommitted = (f: () => void) => {
+        try {
+          f()
+        } catch {
+          // Held work must not change the turn.
+        }
+      }
 
       const contextOf = (turn: ActiveTurn, log: TurnLog, history: ReadonlyArray<Message>, historyStart: number, conversationId: string): ReplyContext => ({
         plan: turn.plan,
@@ -1435,6 +1452,13 @@ const makeConversationCore = Effect.fnUntraced(function*(options: AgentConversat
         spoken: turn.spoken,
         speculative: turn.trace.speculative,
         promoted: Deferred.await(turn.promoted),
+        commit: {
+          committed: () => !turn.pending,
+          whenCommitted: (f) => {
+            if (!turn.pending) runCommitted(f)
+            else if (!turn.done) turn.onCommit.push(f)
+          }
+        },
         history,
         historyStart,
         conversationId,
@@ -1581,7 +1605,7 @@ const makeConversationCore = Effect.fnUntraced(function*(options: AgentConversat
             tt.mark(trace, "endOfTurn")
             yield* Deferred.succeed(promoted, undefined)
           }
-          const turn: ActiveTurn = { text, source, spoken, pending: speculative, speaking: false, done: false, promoted, trace, plan }
+          const turn: ActiveTurn = { text, source, spoken, pending: speculative, speaking: false, done: false, promoted, onCommit: [], trace, plan }
           const log = newLog(plan, text)
           current = turn
           emit(turnStarted(trace, source, text, speculative, spoken, plan))
@@ -1594,6 +1618,8 @@ const makeConversationCore = Effect.fnUntraced(function*(options: AgentConversat
             Effect.onExit((exit) =>
               Effect.suspend(() => {
                 turn.done = true
+                // Discarded (or ended) before it was committed: what it held for its commit is dropped (R8).
+                if (turn.pending) turn.onCommit.length = 0
                 if (current === turn) current = undefined
                 return finishTurn(log, trace, spoken, exit, turn.pending, turn.stopped === true)
               })
@@ -1691,6 +1717,7 @@ const makeConversationCore = Effect.fnUntraced(function*(options: AgentConversat
                 emit({ _tag: "TurnPromoted", turnId: turn.trace.id })
                 yield* commitPlan(turn.plan, turn.trace)
                 if (turn.expectReply !== undefined && !overruled(turn.plan)) armFor(turn.plan.setup?.agents, turn.expectReply)
+                for (const f of turn.onCommit.splice(0)) runCommitted(f)
                 return yield* Deferred.succeed(turn.promoted, undefined)
               }
               if (turn !== undefined) {
