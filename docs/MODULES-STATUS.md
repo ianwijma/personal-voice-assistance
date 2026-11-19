@@ -150,7 +150,9 @@ Found by the last checks and written down instead of fixed:
   seen once each: `ModuleHostP3Round5` "forty modules" (core, 5 s limit), the SQLite scheduler contract's
   daylight-saving test (30 s limit), the calendar privacy test "finding 22" (the kit gave up waiting for the module
   to stop), the bin-day reminder test "a copy too old to trust"; and in local full runs under load the SQLite
-  `logStart` test ("database is locked") and the calendar latency test.
+  `logStart` test ("database is locked"), the calendar latency test and one timers test ("the repeating series moves
+  on although its ring is refused": the alarm's row was not there yet when the test looked; it passes alone 5 times
+  out of 5). Four full local runs of the whole: none failed twice, two were clean, two had one such test each.
 
 - **Not run against a real Home Assistant**: the smart-home module's templates (they use `regex_replace`, `unique`
   and `abs`) are only tested against the fake server.
