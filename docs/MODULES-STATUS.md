@@ -19,8 +19,8 @@ findings fixed; it does not mean merged.
 | P6 scheduler | #92 | `t3/modules-06-scheduler` | `c842653` | closed |
 | P11 scaffold, contracts, test kit, guide | #94 | `t3/modules-11-scaffold` | `5bfeca0d` | closed; CI green |
 | P9 notifications, speech, ringing | #106 | `t3/modules-09-notify` | `d177f3ec` | closed after three review rounds; CI green |
-| P7 phrase commands, essential controls | #107 | `t3/modules-07-phrases` | `77e36eca` | two review rounds done (24, then 8 findings); last fix round running |
-| P10 presentation | #108 | `t3/modules-10-present` | `3280b6ef` | built on top of P9; first review running; P7 is merged in when it closes, then the pull request's base becomes P7 |
+| P7 phrase commands, essential controls | #107 | `t3/modules-07-phrases` | `86ab9161` | closed after two review rounds (24, then 8 findings, all fixed) |
+| P10 presentation | #108 | `t3/modules-10-present` | `3280b6ef` | built on top of P9; first review running; P7 is being merged in, then the pull request's base becomes P7 |
 | P8 risk policy in admin | being built | `t3/modules-08-risk` | (being built) | build started on top of P10 |
 
 **Fixes to P1 to P6 code found later live on the scaffold branch**, not on their own branches: the worker-thread
@@ -54,11 +54,12 @@ merged into each.
 
 ## What is left, in order
 
-1. P7 (#107): finish the last fix round.
-2. P10 (#108): review, fix, merge P7 into it, make P7 its base.
-3. P8, first version (the risk policy as a household setting in admin): finish the build, review, fix.
-4. Wave B, one pull request per module on top of P8: timers and alarms, reminders, notifications, assistant controls,
-   music, routines and automations, broadcast, images and photos; and the phrase commands and presentations wave A
+1. P10 (#108): review, fix, merge P7 into it, make P7 its base.
+2. P8, first version (the risk policy as a household setting in admin): finish the build, review, fix.
+3. A browser-test run with new cases and fresh screenshots at the top of the stack (the last one on the whole stack was at P6; the existing 218 cases pass on P9).
+4. Wave B, one pull request per module (they end up on top of P8): assistant controls is #109 (built, in review);
+   notifications, music, images and photos, broadcast and reminders are being built; timers and alarms and routines
+   and automations start when their base is ready; and the phrase commands and presentations wave A
    left out, one small pull request per module.
 5. Deferred, with a plan of their own ([MODULES-DEFERRED-PLAN.md](MODULES-DEFERRED-PLAN.md): sixteen pull requests in order, with eighteen decisions for the owner and a recommendation for each): google, t3-code, mcp-client, calls and intercom, CalDAV; connections and
    OAuth (the rest of P8); streaming and WebSocket to an owner-typed address.
