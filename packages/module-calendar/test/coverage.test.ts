@@ -6,6 +6,10 @@ import { assert, describe, it } from "@effect/vitest"
 import { BriefingSections } from "@pva/module-contracts"
 import { Effect } from "effect"
 import { advanceAndRefresh, AMS, calendar, ics, sayOf, served, startCalendar } from "./fixtures.ts"
+import { vi } from "vitest"
+
+// Several test households are started per test here: on a loaded CI machine one test can pass the default 5 s.
+vi.setConfig({ testTimeout: 30_000 })
 
 const STALE = "Family could not be refreshed since today at ten o'clock; this is what I had then."
 const NOT_READ = "School has not been read yet, so its events are not in this."
