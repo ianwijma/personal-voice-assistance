@@ -82,3 +82,10 @@ export const sent = (ha: { readonly calls: ReadonlyArray<HaServiceCall> }) => ha
 export const KITCHEN = { device: "kitchen-display" } // shared, Sam's, room Kitchen
 export const PHONE = { device: "robins-phone" } // private, room Bedroom
 export const HALL = { device: "hall-screen" } // public, room Hall
+
+let turns = 0
+/** A turn of its own on `device` (a new turn id and conversation): each invocation in a test is a new one unless it says otherwise. */
+export const at = (device: string) => {
+  turns++
+  return { device, turnId: turns, conversationId: `conversation-${turns}` }
+}
