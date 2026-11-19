@@ -2,7 +2,7 @@ import { CurrentTurn, type ModuleHostApi, type ModulePresent, type PresentError,
 import { homeLanguage, type Language, say } from "@pva/module-contracts"
 import { speakList } from "@pva/language"
 import { Clock, Effect, Exit, Queue } from "effect"
-import { type Item, type ListRow, type Pin, pinIdOf, pinKeyOf, pins, SHOPPING, signatureOf, TODO } from "./data.ts"
+import { type Item, type ListRow, type Pin, lists, pinIdOf, pinKeyOf, pins, SHOPPING, signatureOf, TODO } from "./data.ts"
 import { type Engine, isRefusal, speak } from "./engine.ts"
 import { sayItem } from "./parse.ts"
 import { texts } from "./texts.ts"
@@ -17,8 +17,6 @@ export const SHOWN_ITEMS = 12
 const TITLE_CHARS = 60
 const ITEM_CHARS = 80
 const SPOKEN_CHARS = 300
-/** The spoken fallback names items while its sentence stays inside this (leaving room for the rest of the sentence). */
-const SPOKEN_ITEMS_CHARS = 200
 /** A shown checklist stays until it is closed or this long after it was shown or its content last changed (the host's longest lifetime). */
 export const PIN_MS = 24 * 3_600_000
 /** A checklist closed without a handle of this run is replaced by an empty one that the host ends after this (its shortest lifetime). */
@@ -69,15 +67,21 @@ const titleOf = (list: string, row: ListRow | undefined, l: Language) =>
 
 const speakOf = (things: ReadonlyArray<string>, lang: Language, max: number) => speakList(things.slice(0, 100), lang, { max: Math.max(2, max) }) ?? things.slice(0, max).join(", ")
 
-/** The items a spoken fallback names (whole items within a character budget) and "and N more" for the rest of the list. */
-const spokenWords = (named: ReadonlyArray<string>, total: number, lang: Language, max: number): string => {
-  let take = Math.min(named.length, max)
-  const fits = (n: number) => named.slice(0, n).reduce((sum, t) => sum + t.length + 2, 0) <= SPOKEN_ITEMS_CHARS
-  while (take > 1 && !fits(take)) take--
-  const shown = named.slice(0, take)
-  const rest = total - shown.length
-  return rest <= 0 ? speakOf(shown, lang, Math.max(2, shown.length)) : say(texts, lang, "more", { items: shown.join(", "), count: rest })
+/** A spoken fallback budgets the complete sentence, naming only whole items and counting everything omitted. */
+const spokenList = (named: ReadonlyArray<string>, total: number, lang: Language, max: number, list: string): string => {
+  if (total === 0) return speak(lang, "empty", { list })
+  for (let take = Math.min(named.length, max); take > 0; take--) {
+    const shown = named.slice(0, take)
+    const rest = total - shown.length
+    const words = rest <= 0 ? speakOf(shown, lang, Math.max(2, shown.length)) : say(texts, lang, "more", { items: shown.join(", "), count: rest })
+    const sentence = oneLine(total === 1 ? speak(lang, "readOne", { list, items: words }) : speak(lang, "readOpen", { list, count: total, items: words }))
+    if (sentence.length <= SPOKEN_CHARS) return sentence
+  }
+  return speak(lang, "readUnspoken", { list, count: total })
 }
+
+/** A deletion cancels the intent of an older pin, even when undo restored the list's data. */
+const cancelled = (row: Row<Pin>, through: number | undefined) => through !== undefined && row.rev <= through
 
 /** What reconciling a pin did: when to look at it again (its end, its next try; none: it is gone), and whether it was taken down. */
 export interface Reconciled {
@@ -129,10 +133,9 @@ export const makeChecklists = (ctx: {
         const title = `${cutAt(name, TITLE_CHARS - tail.length)}${tail}`
         const items = rows.map((r) => ({ id: r.id, text: cutAt(sayItem(r.value.text, r.value.quantity, l), ITEM_CHARS), done: false }))
         const phrase = engine.phraseOf(list, l)
-        const named = rows.map((r) => cutAt(sayItem(r.value.text, r.value.quantity, l), 60))
+        const named = rows.map((r) => oneLine(sayItem(r.value.text, r.value.quantity, l)))
         const total = Math.max(open, rows.length)
-        const words = spokenWords(named, total, l, readItems)
-        const spoken = cutAt(open === 0 && rows.length === 0 ? speak(l, "empty", { list: phrase }) : total === 1 ? speak(l, "readOne", { list: phrase, items: words }) : speak(l, "readOpen", { list: phrase, count: total, items: words }), SPOKEN_CHARS)
+        const spoken = spokenList(named, total, l, readItems, phrase)
         const presentation: Presentation = { kind: "list", title, style: "checklist", items, spoken, handler: HANDLER }
         return { presentation, signature: JSON.stringify([title, items]), open, cancelledThrough: row?.value.pinsCancelledThrough }
       })
@@ -218,7 +221,10 @@ export const makeChecklists = (ctx: {
           if ("ok" in result && result.ok) return true
           // A replacement may have been accepted before its handle reached us. The old handle cannot close that show.
         }
+        // At the fixed end the host has expired the card. Never create another one to close it.
+        if ((yield* Clock.currentTimeMillis) >= pin.until) return true
         const listRow = yield* engine.listStore.get(pin.list)
+        if ((yield* Clock.currentTimeMillis) >= pin.until) return true
         const closing: Presentation = {
           kind: "list",
           title: cutAt(titleOf(pin.list, listRow?.value, l), TITLE_CHARS),
@@ -258,7 +264,7 @@ export const makeChecklists = (ctx: {
         if (pin.owed === "remove" || dismissed.has(device)) return yield* removeRow(row, now, true)
         const l = lang()
         const content = pin.owed === "dismiss" || removedDevice(device) ? undefined : yield* build(pin.list, l, readItemsFor(undefined))
-        const built = content?.cancelledThrough !== undefined && row.rev <= content.cancelledThrough ? undefined : content
+        const built = cancelled(row, content?.cancelledThrough) ? undefined : content
         now = yield* Clock.currentTimeMillis
         if (built === undefined || now >= pin.until) {
           if ((handles.has(device) || now < pin.until) && !(yield* takeDown(pin, l))) return { next: yield* owe(row, "dismiss", now), down: false }
@@ -414,7 +420,12 @@ export const makeChecklists = (ctx: {
         const l = lang()
         const row = yield* pinStore.get(pinIdOf(p.deviceId))
         const pin = row?.value
-        if (pin === undefined || pin.key !== p.key || pin.owed === "dismiss" || pin.owed === "remove" || p.item === undefined) return { say: speak(l, "pinGone") }
+        if (row === undefined || pin === undefined || pin.key !== p.key || pin.owed === "dismiss" || pin.owed === "remove" || p.item === undefined) return { say: speak(l, "pinGone") }
+        const list = yield* engine.listStore.get(pin.list)
+        if (cancelled(row, list?.value.pinsCancelledThrough)) {
+          ask(p.deviceId)
+          return { say: speak(l, list?.value.deletedAt !== undefined ? "itemGone" : "pinGone") }
+        }
         if (p.done !== true) return { say: speak(l, "tickOnly") }
         const item = yield* engine.itemStore.get(p.item)
         if (item === undefined || item.value.list !== pin.list || item.value.status === "removed") {
@@ -469,7 +480,11 @@ export const makeChecklists = (ctx: {
               const c = tx.collection(pins)
               const id = pinIdOf(device)
               if (before === undefined) c.remove(id)
-              else c.update(id, () => before.value)
+              else {
+                const list = tx.collection(lists).get(before.value.list)
+                // Compare the old revision before restoring: the write's newer revision must not revive cancelled intent.
+                c.update(id, () => cancelled(before, list?.value.pinsCancelledThrough) ? { ...before.value, owed: "dismiss" } : before.value)
+              }
               tx.afterCommit(() => {
                 if (previousHandle !== undefined) handles.set(device, previousHandle)
                 if (wasDismissed) dismissed.add(device)
