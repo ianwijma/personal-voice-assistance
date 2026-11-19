@@ -131,9 +131,9 @@ export const makeChecklists = (ctx: {
         const name = titleOf(list, row?.value, l)
         const tail = more > 0 ? say(texts, l, "titleMore", { count: more }) : ""
         const title = `${cutAt(name, TITLE_CHARS - tail.length)}${tail}`
-        const items = rows.map((r) => ({ id: r.id, text: cutAt(sayItem(r.value.text, r.value.quantity, l), ITEM_CHARS), done: false }))
+        const named = rows.map((r) => oneLine(sayItem(r.value.text, r.value.quantity, l)) || say(texts, l, "unnamedItem"))
+        const items = rows.map((r, i) => ({ id: r.id, text: cutAt(named[i]!, ITEM_CHARS), done: false }))
         const phrase = engine.phraseOf(list, l)
-        const named = rows.map((r) => oneLine(sayItem(r.value.text, r.value.quantity, l)))
         const total = Math.max(open, rows.length)
         const spoken = spokenList(named, total, l, readItems, phrase)
         const presentation: Presentation = { kind: "list", title, style: "checklist", items, spoken, handler: HANDLER }
@@ -237,6 +237,13 @@ export const makeChecklists = (ctx: {
         return !transient(yield* tried(ctx.present.show({ device: pin.device }, closing, { lifetime: "pinned", key: pin.key, expiresInMs: CLOSE_MS })))
       })
 
+    /** An accepted show can still be stored by the host when this page cannot draw it. Keep its handle until closed. */
+    const oweUnsupportedDismissal = (pin: Pin, handle: PresentHandle) =>
+      Effect.gen(function*() {
+        yield* write({ device: pin.device, list: pin.list, key: pin.key, until: pin.until, ...(pin.shown !== undefined ? { shown: pin.shown } : {}), owed: "dismiss" })
+        handles.set(pin.device, { handle, shown: pin.shown ?? "", until: pin.until })
+      })
+
     /**
      * THE reconciliation of one device's pin, from the row and the list as they are now. Under the module's permit.
      *
@@ -294,10 +301,8 @@ export const makeChecklists = (ctx: {
         if (r.kind === "ended") return { next: until, down: false }
         if (r.kind === "error") return { next: yield* owe(current, "show", now), down: false }
         if (r.kind === "cannot") {
-          yield* Effect.ignore(r.handle.dismiss)
-          dismissed.add(device)
-          handles.delete(device)
-          return yield* removeRow(current, now, true)
+          yield* oweUnsupportedDismissal(current.value, r.handle)
+          return yield* reconcileLocked(device)
         }
         handles.set(device, { handle: r.handle, shown, until })
         // Owed work done: cleared without touching the end.
@@ -448,7 +453,8 @@ export const makeChecklists = (ctx: {
       build,
       /**
        * Put a list on the asking device as its checklist: under the device's one key, so another list there is replaced
-       * in place (`replaced` names it). One show and one write; a device that cannot show checklists keeps no pin.
+       * in place (`replaced` names it). The intent is saved before showing; an unsupported device keeps only dismissal
+       * work until its accepted presentation is closed.
        */
       show: (list: string, readItems: number) =>
         engine.serial(Effect.gen(function*() {
@@ -499,10 +505,8 @@ export const makeChecklists = (ctx: {
           }
           const spoken = built.presentation.spoken
           if (r.kind === "cannot") {
-            // Nothing is kept for a device that cannot show a checklist (an earlier one under its key is gone with it).
-            yield* Effect.ignore(r.handle.dismiss)
-            handles.delete(device)
-            dismissed.add(device)
+            // The host accepted it: dismissal stays owed until its retained handle closes it.
+            yield* oweUnsupportedDismissal(recorded, r.handle)
             ask(device)
             return { kind: "not-shown", spoken, why: r.why } as const
           }

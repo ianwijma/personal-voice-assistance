@@ -402,9 +402,12 @@ export const listsModule = defineModule({
               case "not-shown":
                 // The answer is the one spoken: a device that cannot show it changes nothing about it.
                 return { say: speak(l, r.why === "no-display" || r.why === "cannot-show-kind" ? "noScreen" : "notShown", { spoken: r.spoken }) }
-              case "shown":
-                // A device shows one checklist: another list there was replaced, and the answer says which.
-                return { say: r.replaced === undefined ? speak(l, "showing", { list: phrase }) : speak(l, "showingInstead", { list: phrase, before: engine.phraseOf(r.replaced, l) }) }
+              case "shown": {
+                // Name the replaced list only while its display name is available (undo can remove its row).
+                const before = r.replaced !== undefined && (r.replaced === SHOPPING || r.replaced === TODO || engine.cached().some((row) => row.id === r.replaced))
+                  ? engine.phraseOf(r.replaced, l) : undefined
+                return { say: before === undefined ? speak(l, "showing", { list: phrase }) : speak(l, "showingInstead", { list: phrase, before }) }
+              }
             }
           })
       })

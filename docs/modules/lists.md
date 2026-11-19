@@ -143,7 +143,9 @@ assistant, whose tools take them as before.
 "Show the shopping list" puts the list's **open items on the screen of the device that asked**, as a `list`
 presentation in the `checklist` style, one tickable line per item (the item's text with its amount, one line of at most
 80 characters; at most 12 items, the oldest first as read out; the title is the list's name, with "(+3 more)" when
-more are open than are shown, so what is not shown is counted and never hidden):
+more are open than are shown, so what is not shown is counted and never hidden). An item whose text becomes empty
+when control and direction characters are removed is shown and read in the fallback as "unnamed item" / "naamloos item";
+it keeps its item ID, tick and place in the count:
 
 - **When it is shown.** `lists_show` (or "show the shopping list", "toon de boodschappenlijst", "zet de takenlijst op
   het scherm", and the model's tool). It is **pinned**: it stays until closed or until the host ends it, 24 hours (its
@@ -151,17 +153,19 @@ more are open than are shown, so what is not shown is counted and never hidden):
   answer says "Showing the shopping list on this screen."
 - **One checklist per device.** A device shows at most one: showing another list there replaces it in place (the same
   key, the same page), and the answer says so: "Showing the camping list on this screen, instead of the shopping list."
-  ("De takenlijst staat nu op dit scherm, in plaats van de boodschappenlijst."). Showing the same list again just shows
-  it again. So the module never has more checklists than the household has screens; the host's bound for one module
-  (8 live presentations), or a screen already full of other modules' cards, can refuse a show. The answer is
+  ("De takenlijst staat nu op dit scherm, in plaats van de boodschappenlijst."). If the previous list's name is no
+  longer available (for example after undoing its creation), the confirmation names only the new list. Showing the
+  same list again just shows it again. So the module never has more checklists than the household has screens; the
+  host's bound for one module (8 live presentations), or a screen already full of other modules' cards, can refuse a show. The answer is
   "There isn't room to show this list right now; close something on a screen first."
   ("Er is nu geen ruimte om deze lijst te tonen; sluit eerst iets op een scherm.").
 - **A device that cannot show it** (no screen, a page that cannot draw a list) changes nothing about the answer: it
   says "This device can't show it." and then the read-out sentence of the list ("The shopping list has 3 things: …",
-  which is also the presentation's spoken fallback), and nothing is kept for that device (an earlier checklist there
-  is taken down). The spoken sentence is at most 300 characters: it uses whole item names, within `readItems`, and
-  counts the items left out; the separate 80-character visual limit does not shorten speech. If no whole item fits,
-  the sentence says how many were not read out. The model's tool says the same.
+  which is also the presentation's spoken fallback). Its accepted presentation (including any earlier checklist
+  replaced under its key) is dismissed; the handle and dismissal work stay in the pin until that succeeds, then the pin
+  is removed. A failed dismissal is retried by reconciliation and can also be closed with `lists_hide`. The spoken
+  sentence is at most 300 characters: it uses whole item names, within `readItems`, and counts the items left out;
+  the separate 80-character visual limit does not shorten speech. If no whole item fits, the sentence says how many were not read out. The model's tool says the same.
 - **Privacy.** A list is household data, read out on shared, private and public devices alike, so its presentation is
   the household's (`sensitivity` is not personal) and is shown on every device that has a screen; the rule is the one
   that lets the same list be read out there. Nothing about a person is put on it.

@@ -1,7 +1,7 @@
 // The single-fault sequences from the correctness review, at the store and Presenter boundaries.
 import { assert, describe, it } from "@effect/vitest"
 import { type ModulePresent, PresentError, StoreError, type StoreTx } from "@pva/core"
-import { startTestModule } from "@pva/core/testing"
+import { KIT_PAGE_CAPABILITIES, startTestModule } from "@pva/core/testing"
 import { Clock, Deferred, Effect, Fiber } from "effect"
 import { TestClock } from "effect/testing"
 import { vi } from "vitest"
@@ -488,5 +488,133 @@ describe("correctness review round 2", () => {
       assert.isUndefined(screen(kit))
       assert.deepStrictEqual(yield* rows(kit), [])
     }))
+  }
+})
+
+
+describe("correctness review round 3", () => {
+  for (const path of ["initial", "refresh"] as const) {
+    for (const close of ["retry", "hide", "no fault"] as const) {
+      it.effect(`1: ${path} unsupported checklist retains dismissal work until ${close}`, () => Effect.gen(function*() {
+        const kinds: Record<string, number> = { ...KIT_PAGE_CAPABILITIES.present!.kinds }
+        const capabilities = { ...structuredClone(KIT_PAGE_CAPABILITIES), present: { ...KIT_PAGE_CAPABILITIES.present!, kinds } }
+        const support = capabilities.present.kinds.list!
+        let fail = false
+        let faults = 0
+        const kit = yield* startTestModule(wrap((ctx) => ({ ...ctx, present: { ...ctx.present,
+          show: (...a: ReadonlyArray<unknown>) => ctx.present.show(...a).pipe(Effect.map((handle: { dismiss: Effect.Effect<boolean, PresentError> }) => ({ ...handle,
+            dismiss: Effect.suspend(() => {
+              if (!fail) return handle.dismiss
+              fail = false
+              faults++
+              return Effect.fail(new PresentError({ reason: "busy", message: "one failed dismissal" }))
+            })
+          })))
+        } })), { household: { devices: [{ id: "kitchen-display", name: "Kitchen", capabilities }] } })
+        yield* kit.action("add", { items: "milk" })
+        if (path === "refresh") {
+          yield* kit.action("show", {})
+          yield* kit.present.settle
+        }
+        delete capabilities.present.kinds.list
+        fail = close !== "no fault"
+        const answer = path === "initial" ? yield* kit.action("show", {}) : yield* kit.action("add", { items: "bread" })
+        assert.isTrue(answer.ok)
+        yield* kit.present.settle
+        if (close !== "no fault") assert.strictEqual((yield* rows(kit))[0]!.value.owed, "dismiss")
+        if (close === "hide") {
+          const hidden = yield* kit.action("hide", {})
+          assert.deepStrictEqual(hidden, { ok: true, say: "Closed what I showed on this screen." })
+        }
+        yield* kit.advance(65_000)
+        assert.strictEqual(faults, close === "no fault" ? 0 : 1)
+        assert.deepStrictEqual(yield* rows(kit), [])
+        assert.strictEqual(kit.present.engine.live().length, 0)
+        capabilities.present.kinds.list = support
+        yield* kit.notify.disconnect("kitchen-display")
+        yield* kit.notify.connect("kitchen-display")
+        yield* kit.present.settle
+        assert.isUndefined(screen(kit))
+      }))
+    }
+  }
+
+  for (const language of ["en", "nl"] as const) {
+    for (const mark of ["\u200e", "\u200f", "\u200eeggs"] as const) {
+      it.effect(`2: ${language} checklist and fallback keep an item sanitized from ${JSON.stringify(mark)}`, () => Effect.gen(function*() {
+        const kinds: Record<string, number> = { ...KIT_PAGE_CAPABILITIES.present!.kinds }
+        const capabilities = { ...structuredClone(KIT_PAGE_CAPABILITIES), present: { ...KIT_PAGE_CAPABILITIES.present!, kinds } }
+        const kit = yield* startTestModule(listsModule, { household: {
+          home: { HOME_LANGUAGE: language === "en" ? "en-GB" : "nl-NL" },
+          devices: [{ id: "kitchen-display", name: "Kitchen", capabilities }]
+        } })
+        yield* kit.action("add", { items: "milk" })
+        yield* kit.action("show", {})
+        yield* kit.present.settle
+        assert.isTrue((yield* kit.action("add", { items: mark })).ok)
+        yield* kit.action("add", { items: "bread" })
+        const item = (yield* kit.moduleStore().collection(items).list({})).find((r) => r.value.text === mark)!
+        const label = mark.length > 1 ? "eggs" : language === "en" ? "unnamed item" : "naamloos item"
+        yield* kit.advance(65_000)
+        assert.deepStrictEqual(screen(kit), ["milk", label, "bread"])
+        assert.isTrue((yield* kit.action("show", {})).ok)
+        yield* kit.present.settle
+        const card = kit.present.shown()[0]!
+        assert.include((card.content as { items: ReadonlyArray<{ id: string }> }).items.map((i) => i.id), item.id)
+        delete capabilities.present.kinds.list
+        const fallback = yield* kit.action("show", {})
+        assert.isTrue(fallback.ok)
+        if (fallback.ok) {
+          assert.include(fallback.say!, label)
+          assert.include(fallback.say!, language === "en" ? "3 things" : "3 dingen")
+          assert.notInclude(fallback.say!, mark[0]!)
+        }
+        // Restore a screen and tick the placeholder by its original item ID.
+        capabilities.present.kinds.list = KIT_PAGE_CAPABILITIES.present!.kinds.list!
+        yield* kit.action("show", {})
+        yield* kit.present.settle
+        yield* kit.present.press(kit.present.shown()[0]!.id, "tick", { item: item.id, done: true })
+        yield* kit.present.settle
+        assert.strictEqual((yield* kit.moduleStore().collection(items).get(item.id))!.value.status, "done")
+        assert.deepStrictEqual(screen(kit), ["milk", "bread"])
+        assert.strictEqual((yield* kit.moduleStore().collection(lists).get("shopping"))!.value.open, 2)
+      }))
+    }
+
+    for (const undo of [true, false]) {
+      it.effect(`3: ${language} replacement ${undo ? "omits a missing" : "keeps an existing"} list name`, () => Effect.gen(function*() {
+        const entered = yield* Deferred.make<void>()
+        const release = yield* Deferred.make<void>()
+        let pause = false
+        const kit = yield* startTestModule(wrap((ctx) => ({ ...ctx, store: { ...ctx.store,
+          collection: (c: { name: string }) => {
+            const h = ctx.store.collection(c)
+            return c.name !== "pins" ? h : { ...h, list: (q: { where?: { list?: string } }) => h.list(q).pipe(Effect.tap(() => Effect.gen(function*() {
+              if (!pause || q.where?.list === undefined) return
+              pause = false
+              yield* Deferred.succeed(entered, undefined)
+              yield* Deferred.await(release)
+            }))) }
+          }
+        } })), { household: { home: { HOME_LANGUAGE: language === "en" ? "en-GB" : "nl-NL" } } })
+        yield* kit.tool("lists_create", { name: "camping", items: "tent" })
+        yield* kit.action("show", { list: "camping" })
+        yield* kit.present.settle
+        const id = (yield* rows(kit))[0]!.value.list
+        if (undo) {
+          pause = true
+          yield* kit.action("undo", {})
+          yield* Deferred.await(entered)
+        }
+        const shown = yield* kit.action("show", {})
+        yield* Deferred.succeed(release, undefined)
+        yield* kit.present.settle
+        const ordinary = language === "en" ? "Showing the shopping list on this screen." : "De boodschappenlijst staat op dit scherm."
+        const replaced = language === "en" ? "Showing the shopping list on this screen, instead of the camping list." : "De boodschappenlijst staat nu op dit scherm, in plaats van de lijst camping."
+        assert.deepStrictEqual(shown, { ok: true, say: undo ? ordinary : replaced })
+        if (shown.ok) assert.notInclude(shown.say!, id)
+        assert.deepStrictEqual(screen(kit), [])
+      }))
+    }
   }
 })
