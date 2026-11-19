@@ -1481,7 +1481,8 @@ export const makeVoiceSession = (options: VoiceSessionOptions): Effect.Effect<Vo
           for (;;) {
             while (!isQuiet()) yield* Effect.sleep(QUIET_POLL_MS)
             // The reply's synthesis: the line cut into clauses, synthesised as it plays.
-            const voice = tts.synthesize(Stream.make(text).pipe(chunkClauses())).pipe(Stream.map((chunk) => chunk.audio))
+            // An empty line is a chime alone (`say("", { cue: true })`): nothing is synthesised.
+            const voice = text.trim() === "" ? Stream.empty : tts.synthesize(Stream.make(text).pipe(chunkClauses())).pipe(Stream.map((chunk) => chunk.audio))
             const audio = o.cue ? Stream.concat(Stream.make(announcementChime(tts.sampleRate)), voice) : voice
             const how = yield* lease.playIfFree(ANNOUNCE_HOLDER, audio, tts.sampleRate, () => (isQuiet() ? o.gate() : "wait"))
             if (how === "played") return "spoken" as const

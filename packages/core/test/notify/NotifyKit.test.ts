@@ -336,4 +336,28 @@ describe("the kit's own promises", () => {
       bell.parts.answer = () => Effect.as(Effect.sleep(1_000), { say: "Slow but done." })
       assert.deepStrictEqual(yield* kit.notify.press(idOf(second), "snooze", { device: "kitchen-display" }), { ok: true, say: "Slow but done." })
     }))
+
+  it.effect("speech for a broadcast: a chime alone (an empty text with a cue) and a room except one device", () =>
+    Effect.gen(function*() {
+      const bell = makeBell()
+      const kit = yield* startTestModule(bell.definition, {
+        household: {
+          devices: [
+            { id: "kitchen-display", name: "Kitchen display", room: "Kitchen" },
+            { id: "kitchen-tablet", name: "Kitchen tablet", room: "Kitchen" },
+            { id: "hall-screen", name: "Hall screen", room: "Hall" }
+          ]
+        }
+      })
+      const handle = yield* bell.parts.speech!.say({ room: "Kitchen", except: "kitchen-display" }, "", { cue: true })
+      assert.deepStrictEqual(handle.deliveries, [{ deviceId: "kitchen-tablet", queued: true }])
+      yield* kit.advance(3_000)
+      assert.deepStrictEqual(kit.notify.announced.map((a) => [a.deviceId, a.text, a.cue, a.outcome]), [["kitchen-tablet", "", true, "spoken"]])
+      // Empty without a cue is nothing to say: refused.
+      const exit = yield* Effect.exit(bell.parts.speech!.say({ room: "Kitchen" }, " "))
+      assert.strictEqual(exit._tag === "Failure" ? (exit.cause.reasons[0] as { readonly error?: { readonly reason?: string } }).error?.reason : "succeeded", "invalid")
+      // `except` belongs beside a room only.
+      const odd = yield* Effect.exit(bell.parts.speech!.say({ device: "hall-screen", except: "x" } as never, "Hello"))
+      assert.strictEqual(odd._tag, "Failure")
+    }))
 })
