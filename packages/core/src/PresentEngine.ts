@@ -1375,6 +1375,10 @@ export const makePresentEngine = (options: PresentEngineOptions): Effect.Effect<
             if (typeof resolveTarget(s.entry.target, undefined) === "string") return "gone"
             const current = index.get(s.entry.id)
             if (current !== undefined && current.showId !== s.entry.showId && current.shownAt > s.entry.shownAt) return "gone"
+            // A room move while this write waited can create overlap with a newer show (R1). Recheck it in the
+            // committing attempt, before this older accepted transient can end that show on every room screen.
+            if (s.entry.lifetime === "transient" && overlapping(s.entry.target, s.entry.id).some((e) =>
+              e.expiresAt > at && (e.shownAt > s.entry.shownAt || (e.shownAt === s.entry.shownAt && e.id > s.entry.id)))) return "gone"
             return writeShow(p, s.entry, () => s.content, s.spoken, s.buttons, at)
           }, (w) => {
             if (w === "gone" || w === "ended") {

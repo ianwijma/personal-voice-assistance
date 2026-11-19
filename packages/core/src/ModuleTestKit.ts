@@ -1113,13 +1113,13 @@ export const startTestModule = (definition: ModuleDefinition<any>, options: Star
         ),
       /** Run one of the module's actions with its values in tool input form, as `host.actions.run` does (routines). */
       action: (actionId: string, params: Readonly<Record<string, unknown>> = {}, as?: TurnContext | TestTurnInput): Effect.Effect<ActionRunResult> =>
-        checked(`after the action ${actionId}`, host.actions.run({ moduleId: id, actionId, params }).pipe(Effect.provideService(CurrentTurn, asTurn(as)))),
+        checked(`after the action ${actionId}`, Effect.suspend(() => host.actions.run({ moduleId: id, actionId, params }).pipe(Effect.provideService(CurrentTurn, asTurn(as))))),
       /** Run `effect` as a turn: what a tool's code would see (`CurrentTurn`), for calling services directly. */
-      asTurn: <A, E, R>(effect: Effect.Effect<A, E, R>, as?: TurnContext | TestTurnInput) => checked("after asTurn", Effect.provideService(effect, CurrentTurn, asTurn(as))),
+      asTurn: <A, E, R>(effect: Effect.Effect<A, E, R>, as?: TurnContext | TestTurnInput) => checked("after asTurn", Effect.suspend(() => Effect.provideService(effect, CurrentTurn, asTurn(as)))),
       /** A service published now (the module's own, a stand-in's, or the core's). */
       service: <T>(key: ServiceKey<T>): T | undefined => host.service(key),
       /** The contributions under `key` that a turn's assistant sees (default the first device's turn). */
-      contributions: <T>(key: ContributionKey<T>, as?: TurnContext | TestTurnInput) => checked("after reading contributions", host.contributions(key).pipe(Effect.provideService(CurrentTurn, asTurn(as)))),
+      contributions: <T>(key: ContributionKey<T>, as?: TurnContext | TestTurnInput) => checked("after reading contributions", Effect.suspend(() => host.contributions(key).pipe(Effect.provideService(CurrentTurn, asTurn(as))))),
       /**
        * The module's live and finished jobs: the scheduler's whole job list, every module's, read to its end and
        * filtered to this module, so other modules' jobs never hide one of its own. Past `MAX_JOB_LIST_PAGES` pages it
@@ -1266,7 +1266,7 @@ export const startTestModule = (definition: ModuleDefinition<any>, options: Star
          * Press an action of a notification on a device (default the first), as that device's page's button does (its
          * connection must hold the card); the test clock is driven while the module's handler runs.
          */
-        press: (notificationId: string, actionId: string, as: { readonly device?: string } = {}): Effect.Effect<PressAnswer> => {
+        press: (notificationId: string, actionId: string, as: { readonly device?: string } = {}): Effect.Effect<PressAnswer> => Effect.suspend(() => {
           const deviceId = as.device ?? deviceList[0]?.id ?? "kitchen-display"
           const connection = connectionOf(deviceId)
           const work = checked(
@@ -1277,7 +1277,7 @@ export const startTestModule = (definition: ModuleDefinition<any>, options: Star
             )
           )
           return actionId === STOP_ACTION ? work : admitPress(deviceId, work, notify.busyAnswer)
-        },
+        }),
         /**
          * A reply starts on the device (`true`) or has ended: announcements there wait for it, and one being spoken is
          * cut (`stopped`, why "a reply"), as serve mode's output lease does.
