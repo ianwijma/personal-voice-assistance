@@ -48,6 +48,30 @@ describe("routines: the settings refuse what could not run", () => {
     assert.strictEqual(save([routine("A", SAY, ["film"]), routine("B", SAY, [], ["film"])]), "ok")
   })
 
+  it.effect("R11: a settings save refuses case-only duplicate phrases before text-list normalization", () =>
+    Effect.gen(function*() {
+      const kit = yield* startTestModule(routinesModule)
+      for (const language of ["phrasesEn", "phrasesNl"] as const) {
+        const row = { ...routine("Lights", SAY), [language]: ["evening lights", "EVENING LIGHTS"] }
+        assert.notStrictEqual(save([row]), "ok")
+        assert.isFalse((yield* kit.configure({ routines: [row] })).ok)
+        assert.deepStrictEqual((yield* kit.tool("routines_list", {})).value, { spoken: "There are no routines yet." })
+      }
+    }))
+
+  it("R1: invalid parameter names and excess submitted parameters are refused before decoding", () => {
+    for (const params of [
+      { "room-name": "kitchen" },
+      { "": "kitchen" },
+      { ["p".repeat(41)]: "kitchen" },
+      { ...Object.fromEntries(Array.from({ length: 8 }, (_, i) => [`p${i}`, i])), "bad-key": "kitchen" }
+    ]) {
+      const text = JSON.stringify([{ call: "helper.select", params }])
+      assert.isString(parseSteps(text))
+      assert.notStrictEqual(save([routine("Lights", text)]), "ok")
+    }
+  })
+
   it("a phrase the host would refuse: a slot, too many words", () => {
     assert.match(save([routine("A", SAY, ["play {song}"])]), /^Routine "A", English phrase "play \{song\}": the slot \{song\} names no parameter of the action$/)
     assert.match(save([routine("A", SAY, ["one two three four five six seven eight nine"])]), /at most 8 words/)
@@ -118,8 +142,12 @@ describe("routines: at the bounds the module still starts", () => {
     }))
 
   it("names that make the same action id still get their own", () => {
-    const ids = routinesOf({ routines: [routine("Ünïcode", SAY), routine("日本", SAY), routine("中文", SAY), routine("Routine", SAY)], goodMorning: false }).map((r) => r.actionId)
-    assert.deepStrictEqual(ids, ["r_unicode", "r_routine", "r_routine_2", "r_routine_3"])
+    const rows = [routine("Ünïcode", SAY), routine("日本", SAY), routine("中文", SAY), routine("Routine", SAY), routine("N".repeat(39) + "a", SAY), routine("N".repeat(39) + "b", SAY)]
+    const ids = routinesOf({ routines: rows, goodMorning: false }).map((r) => r.actionId)
+    assert.strictEqual(ids[0], "r_unicode")
+    assert.strictEqual(ids[3], "r_routine")
+    assert.deepStrictEqual(routinesOf({ routines: [...rows].reverse(), goodMorning: false }).map((r) => r.actionId).reverse(), ids)
+    for (const [i, row] of rows.entries()) assert.strictEqual(routinesOf({ routines: [row], goodMorning: false })[0]!.actionId, ids[i])
     assert.strictEqual(new Set(ids).size, ids.length)
     for (const id of ids) assert.match(id, /^[a-z][a-z0-9_]{0,39}$/)
   })
@@ -136,6 +164,20 @@ describe("routines: what it says fits where it is said", () => {
       }
     }
   })
+
+  it.effect("R12: the actual clarification tool output budgets complete names at all 15 longest names", () =>
+    Effect.gen(function*() {
+      const rows = Array.from({ length: 15 }, (_, i) => routine(`Bedtime ${String(i + 1).padStart(2, "0")}${"x".repeat(30)}`, SAY))
+      for (const language of ["en-GB", "nl-NL"]) {
+        const kit = yield* startTestModule(routinesModule, { settings: { routines: rows }, household: { home: { HOME_LANGUAGE: language } } })
+        const result = (yield* kit.tool("routines_run", { name: "bedtime" })).value as { spoken: string }
+        assert.isAtMost(result.spoken.length, 300)
+        for (const row of rows.slice(0, 3)) assert.include(result.spoken, row.name)
+        assert.notInclude(result.spoken, rows[3]!.name)
+        assert.include(result.spoken, "12")
+        assert.include(result.spoken, language === "en-GB" ? "more specific" : "specifieker")
+      }
+    }))
 
   it("what a run says when it stops fits an announcement whole at the worst: 20 steps, the longest name, every split of done and unconfirmed", () => {
     const name = "N".repeat(40)

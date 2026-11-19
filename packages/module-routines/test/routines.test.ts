@@ -117,7 +117,7 @@ const helpers = (seen: Array<Seen>) => {
             examples: ["slow"],
             params: {},
             risk: "change",
-            run: () => Effect.andThen(record("flaky.slow", {}), Effect.as(Effect.sleep(3_000), { say: "Slow is done." }))
+            run: () => Effect.andThen(record("flaky.slow", {}), Effect.andThen(Effect.sleep(3_000), Effect.as(record("flaky.slow.done", {}), { say: "Slow is done." })))
           })
         ]
       })
@@ -560,7 +560,7 @@ describe("routines: stopping one", () => {
       const stopped = yield* kit.tool("routines_stop", {})
       assert.strictEqual(stopped.value, "I stopped Slowly during step 2; that step may still complete.")
       yield* kit.advance(10_000)
-      assert.deepStrictEqual(seen.map((s) => s.action), ["flaky.slow"])
+      assert.deepStrictEqual(seen.map((s) => s.action), ["flaky.slow", "flaky.slow.done"])
       assert.deepStrictEqual(texts_(kit), ["Here we go."])
       // It has ended: it can start again from the beginning.
       assert.isTrue((yield* kit.phrases.say("go slowly")).taken)
@@ -579,7 +579,7 @@ describe("routines: stopping one", () => {
       yield* kit.notify.replying("kitchen-display", false)
       yield* kit.advance(10_000)
       assert.deepStrictEqual(seen, [])
-      assert.isFalse(kit.notify.announced.some((a) => a.text === "Queued line." && a.outcome === "spoken"))
+      assert.isFalse(kit.notify.announced.some((a) => a.text === "Queued line."))
     }))
 
   it.effect("in Dutch, and with nothing running here it says so", () =>
@@ -615,7 +615,7 @@ describe("routines: stopping one", () => {
       const stop = yield* kit.phrases.say("stop")
       assert.isTrue(stop.taken && stop.by === "control")
       yield* kit.advance(10_000)
-      assert.deepStrictEqual(seen.map((s) => s.action), ["flaky.slow", "lamp.quiet"])
+      assert.deepStrictEqual(seen.map((s) => s.action), ["flaky.slow", "flaky.slow.done", "lamp.quiet"])
     }))
 })
 
@@ -632,7 +632,7 @@ describe("routines: a restart in the middle does not resume", () => {
       assert.deepStrictEqual(seen.map((s) => s.action), ["flaky.slow"])
       assert.deepStrictEqual(texts_(kit), [
         "Here we go.",
-        "Slowly was cut short when the routines module restarted, during step 2, which may or may not have been done."
+        "Slowly was cut short when the routines module stopped, during step 2, which may or may not have been done."
       ])
       assert.isTrue((yield* kit.phrases.say("go slowly")).taken)
       assert.deepStrictEqual(kit.phrases.spoken.map((s) => s.text), [])
@@ -649,7 +649,7 @@ describe("routines: a restart in the middle does not resume", () => {
       assert.deepStrictEqual(seen, [])
       assert.deepStrictEqual(kit.notify.announced.map((a) => [a.text, a.outcome]), [
         ["Daar gaan we.", "stopped"],
-        ["Langzaam is afgebroken doordat de routinemodule opnieuw startte; 0 van de 2 stappen waren klaar.", "spoken"]
+        ["Langzaam is afgebroken doordat de routinemodule stopte; 0 van de 2 stappen waren klaar.", "spoken"]
       ])
     }))
 
@@ -664,8 +664,8 @@ describe("routines: a restart in the middle does not resume", () => {
       yield* kit.notify.replying("kitchen-display", false)
       yield* kit.advance(10_000)
       assert.deepStrictEqual(seen, [])
-      assert.deepStrictEqual(kit.notify.announced.filter((a) => a.outcome === "spoken").map((a) => a.text), [
-        "Check was cut short when the routines module restarted; it had finished 0 of its 2 steps."
+      assert.deepStrictEqual(kit.notify.announced.map((a) => a.text), [
+        "Check was cut short when the routines module stopped; it had finished 0 of its 2 steps."
       ])
     }))
 })
@@ -784,5 +784,198 @@ describe("routines: the Good morning template", () => {
       yield* mine.advance(10_000)
       assert.deepStrictEqual(texts_(mine), ["Up you get."])
       assert.deepStrictEqual(((yield* mine.tool("routines_list", {})).value as { count: number }).count, 1)
+    }))
+})
+
+
+describe("routines: review round 1 regressions", () => {
+  it.effect("R2: a provider restart removing a parameter stops at that step with a values refusal", () =>
+    Effect.gen(function*() {
+      const selected: Array<string> = []
+      const seen: Array<Seen> = []
+      let changed = false
+      let restart: Effect.Effect<void> = Effect.void
+      const helper = defineModule({
+        apiVersion: 2, id: "helper", name: "Helper", description: "Select a room.", enabledByDefault: false,
+        start: (ctx) => Effect.sync(() => {
+          restart = ctx.host.requestRestart("parameter removed")
+          return { actions: [defineAction({
+            id: "select", label: "Select", description: "Select a room.", examples: ["select"], risk: "change",
+            params: changed ? {} : { room: Param.text({ label: "Room", after: ["room"], optional: true }) },
+            run: (p) => Effect.sync(() => { selected.push("room" in p ? String(p.room) : "every room"); return {} })
+          })] }
+        })
+      })
+      const kit = yield* startTestModule(routinesModule, {
+        settings: { routines: [routine("Lights", [{ say: "Starting." }, { call: "helper.select", params: { room: "kitchen" } }, { call: "lamp.quiet" }], ["set lights"])] },
+        others: [helper, ...helpers(seen)]
+      })
+      yield* kit.phrases.say("set lights")
+      yield* kit.advance(100)
+      changed = true
+      yield* restart
+      yield* kit.advance(10_000)
+      assert.deepStrictEqual(selected, [])
+      assert.deepStrictEqual(seen, [])
+      assert.deepStrictEqual(texts_(kit), ["Starting.", "Lights stopped at step 2: its values don't fit that action. Step 1 is done."])
+    }))
+
+  it.effect("R3: withdrawing routines from the starting assistant lets the in-flight call finish and refuses the next step", () =>
+    Effect.gen(function*() {
+      const jeff = { id: "jeff", modules: { routines: {} as false | object } }
+      const seen: Array<Seen> = []
+      const kit = yield* start(seen, [routine("Check", [{ call: "flaky.slow" }, { call: "lamp.quiet" }], ["check it"])], {
+        household: { assistants: [jeff, { id: "other", modules: { routines: {} } }] }
+      })
+      yield* kit.phrases.say("check it")
+      yield* kit.advance(100)
+      jeff.modules.routines = false
+      yield* kit.start
+      assert.notInclude(kit.toolNames({ device: "kitchen-display", assistant: "jeff" }), "routines_run")
+      yield* kit.advance(10_000)
+      assert.deepStrictEqual(seen.map((s) => s.action), ["flaky.slow", "flaky.slow.done"])
+      assert.deepStrictEqual(texts_(kit), ["Check stopped at step 2: I'm not allowed to do that. Step 1 is done."])
+    }))
+
+  it.effect("R4: a routine's off switch follows its normalized name across reordering, and a renamed routine starts enabled", () =>
+    Effect.gen(function*() {
+      const a = routine("日本", [{ say: "Japanese." }])
+      const b = routine("中文", [{ say: "Chinese." }])
+      const id = routinesOf({ routines: [a, b], goodMorning: false })[0]!.actionId
+      const kit = yield* start([], [a, b], { household: { assistants: [{ id: "jeff", modules: { routines: { offTools: [`routines_${id}`] } } }] } })
+      assert.deepStrictEqual((yield* kit.tool("routines_run", { name: a.name })).value, { spoken: "I can't run 日本 here." })
+      assert.isTrue((yield* kit.configure({ routines: [b, a] })).ok)
+      assert.deepStrictEqual((yield* kit.tool("routines_run", { name: a.name })).value, { spoken: "I can't run 日本 here." })
+      assert.deepStrictEqual((yield* kit.tool("routines_run", { name: b.name })).value, { spoken: "Starting 中文." })
+      yield* kit.advance(10_000)
+      assert.deepStrictEqual(texts_(kit), ["Chinese."])
+      assert.isTrue((yield* kit.configure({ routines: [{ ...a, name: "日本語" }] })).ok)
+      assert.deepStrictEqual((yield* kit.tool("routines_run", { name: "日本語" })).value, { spoken: "Starting 日本語." })
+    }))
+
+  it.effect("R5: a replayed phrase cancellation returns its first outcome and leaves a different run alone; model calls cancel anew", () =>
+    Effect.gen(function*() {
+      const seen: Array<Seen> = []
+      const kit = yield* start(seen, [
+        routine("First", [{ call: "flaky.slow" }, { call: "lamp.quiet" }]),
+        routine("Second", [{ say: "Second line." }, { call: "lamp.quiet" }])
+      ])
+      const turn = { ...kit.turn({ device: "kitchen-display" }), source: "phrase" as const, turnId: 21 }
+      yield* kit.tool("routines_run", { name: "First" })
+      yield* kit.advance(100)
+      const cancelled = yield* kit.action("stop", {}, turn)
+      yield* kit.advance(4_000)
+      yield* kit.notify.replying("kitchen-display", true)
+      yield* kit.tool("routines_run", { name: "Second" })
+      yield* kit.advance(100)
+      assert.deepStrictEqual(yield* kit.action("stop", {}, turn), cancelled)
+      yield* kit.notify.replying("kitchen-display", false)
+      yield* kit.advance(10_000)
+      assert.deepStrictEqual(seen.map((s) => s.action), ["flaky.slow", "flaky.slow.done", "lamp.quiet"])
+      assert.deepStrictEqual(texts_(kit), ["Second line."])
+      const modelTurn = { ...turn, source: "voice" as const }
+      assert.deepStrictEqual(yield* kit.action("stop", {}, modelTurn), { ok: true, say: "No routine is running here." })
+      yield* kit.tool("routines_run", { name: "First" })
+      yield* kit.advance(100)
+      assert.deepStrictEqual(yield* kit.action("stop", {}, modelTurn), { ok: true, say: "I stopped First during step 1; that step may still complete." })
+      yield* kit.advance(4_000)
+    }))
+
+  it.effect("R6: unconfirmed earlier changes are never described as nothing done", () =>
+    Effect.gen(function*() {
+      for (const [language, expected] of [
+        ["en-GB", "Check stopped: I couldn't confirm step 2, so I left out the rest. I couldn't confirm step 1."],
+        ["nl-NL", "Check is gestopt: stap 2 kon ik niet bevestigen, dus de rest heb ik overgeslagen. Niet bevestigd: stap 1."]
+      ] as const) {
+        const seen: Array<Seen> = []
+        const kit = yield* start(seen, [routine("Check", [{ call: "flaky.fail" }, { call: "flaky.fail" }, { stop_if_failed: true }])], { household: { home: { HOME_LANGUAGE: language } } })
+        yield* kit.tool("routines_run", { name: "Check" })
+        yield* kit.advance(10_000)
+        assert.deepStrictEqual(seen.map((s) => s.action), ["flaky.fail", "flaky.fail"])
+        assert.deepStrictEqual(texts_(kit), [expected])
+      }
+    }))
+
+  it.effect("R7: cancellation over the model's start reply says only the acknowledgement and the in-flight call completes", () =>
+    Effect.gen(function*() {
+      const seen: Array<Seen> = []
+      const kit = yield* start(seen, [routine("Bedtime", [{ call: "flaky.slow" }, { call: "lamp.quiet" }])])
+      const reply = (yield* kit.tool("routines_run", { name: "Bedtime" })).value as { spoken: string }
+      yield* kit.advance(100)
+      yield* kit.phrases.say("cancel the routine", { interrupting: reply.spoken, interruptedBy: "jeff" })
+      yield* kit.advance(10_000)
+      assert.deepStrictEqual(kit.phrases.spoken.map((s) => s.text), ["I stopped Bedtime during step 1; that step may still complete."])
+      assert.deepStrictEqual(texts_(kit), [])
+      assert.deepStrictEqual(seen.map((s) => s.action), ["flaky.slow", "flaky.slow.done"])
+    }))
+
+  it.effect("R8: a provider's self-interruption is an unconfirmed step under the ordinary continuation and stop_if_failed rules", () =>
+    Effect.gen(function*() {
+      const interrupted = defineModule({
+        apiVersion: 2, id: "interrupted", name: "Interrupted", description: "An interrupted provider.", enabledByDefault: false,
+        start: () => Effect.succeed({ actions: [defineAction({
+          id: "call", label: "Call", description: "Interrupt itself.", examples: ["interrupt"], params: {}, risk: "change", run: () => Effect.interrupt
+        })] })
+      })
+      for (const guarded of [false, true]) {
+        const seen: Array<Seen> = []
+        const kit = yield* startTestModule(routinesModule, {
+          settings: { routines: [routine("Check", [{ call: "interrupted.call" }, ...(guarded ? [{ stop_if_failed: true }] : []), { call: "lamp.quiet" }])] },
+          others: [interrupted, ...helpers(seen)]
+        })
+        yield* kit.tool("routines_run", { name: "Check" })
+        yield* kit.advance(10_000)
+        assert.deepStrictEqual(seen.map((s) => s.action), guarded ? [] : ["lamp.quiet"])
+        assert.deepStrictEqual(texts_(kit), [guarded
+          ? "Check stopped: I couldn't confirm step 1, so I left out the rest. Nothing before it was done."
+          : "Check is done, but I couldn't confirm step 1."])
+        assert.strictEqual(kit.info()?.state, "running")
+      }
+    }))
+
+  it.effect("R8: disabling the whole module stops speech and reports a module stop without claiming a restart", () =>
+    Effect.gen(function*() {
+      const seen: Array<Seen> = []
+      const kit = yield* start(seen, [GOOD_NIGHT])
+      yield* kit.phrases.say("good night")
+      yield* kit.advance(500)
+      yield* kit.stop
+      yield* kit.advance(10_000)
+      assert.strictEqual(kit.info()?.state, "disabled")
+      assert.deepStrictEqual(seen, [])
+      assert.deepStrictEqual(kit.notify.announced.map((a) => [a.text, a.outcome]), [
+        ["Sleep well.", "stopped"], ["Good night was cut short when the routines module stopped; it had finished 0 of its 2 steps.", "spoken"]
+      ])
+    }))
+
+  it.effect("R9: duplicate internal line requests retain one speech handle so cancellation prevents every playback start", () =>
+    Effect.gen(function*() {
+      const seen: Array<Seen> = []
+      const kit = yield* start(seen, [GOOD_NIGHT])
+      yield* kit.notify.replying("kitchen-display", true)
+      yield* kit.phrases.say("good night")
+      yield* kit.advance(100)
+      const original = kit.phrases.traces.at(-1)!.turn!
+      const params = { run: 1, step: 1 }
+      assert.isFalse((yield* kit.action("line", params, kit.turn({ source: "voice" }))).ok)
+      assert.isFalse((yield* kit.action("line", params, kit.turn({ source: "routine", device: "robins-phone" }))).ok)
+      assert.deepStrictEqual(yield* kit.action("line", params, { ...original, source: "routine" }), { ok: true })
+      assert.deepStrictEqual(kit.notify.announced, [])
+      yield* kit.phrases.say("cancel the routine")
+      yield* kit.notify.replying("kitchen-display", false)
+      yield* kit.advance(10_000)
+      assert.deepStrictEqual(kit.notify.announced, [])
+      assert.deepStrictEqual(seen, [])
+    }))
+
+  it.effect("R10: the evening one answers the routine's clarification, while an exact saved One still wins", () =>
+    Effect.gen(function*() {
+      const kit = yield* start([], [
+        routine("Evening lights", [{ call: "lamp.quiet" }]), routine("Morning lights", [{ call: "lamp.quiet" }]), routine("One", [{ call: "lamp.quiet" }])
+      ])
+      assert.deepStrictEqual((yield* kit.tool("routines_run", { name: "lights" })).value, { spoken: "Which one: Evening lights or Morning lights?" })
+      assert.deepStrictEqual((yield* kit.tool("routines_run", { name: "the evening one" })).value, { spoken: "Starting Evening lights." })
+      yield* kit.advance(10_000)
+      assert.deepStrictEqual((yield* kit.tool("routines_run", { name: "one" })).value, { spoken: "Starting One." })
     }))
 })

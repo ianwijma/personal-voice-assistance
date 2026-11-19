@@ -87,6 +87,7 @@ export const routinesModule = defineModule({
         examples: [...CANCEL_PHRASES.en, ...CANCEL_PHRASES.nl, "stop the good night routine"],
         params: {},
         phrases: { en: [...CANCEL_PHRASES.en], nl: [...CANCEL_PHRASES.nl] },
+        endsReply: true,
         risk: "change",
         run: () => Effect.map(ctx.shared.cancel(language()), (answer) => ({ say: answer.text }))
       })
@@ -108,7 +109,11 @@ export const routinesModule = defineModule({
             if (found.kind === "none") return { spoken: say(texts, lang, "unknown") }
             if (found.kind === "ambiguous") {
               const names = found.routines.map((r) => nameIn(r.name, lang))
-              return { spoken: say(texts, lang, "which", { list: `${names.slice(0, -1).join(", ")} ${say(texts, lang, "or")} ${names.at(-1)}` }) }
+              const shown = names.slice(0, 3)
+              const list = `${shown.slice(0, -1).join(", ")} ${say(texts, lang, "or")} ${shown.at(-1)}`
+              return { spoken: names.length > shown.length
+                ? say(texts, lang, "whichMore", { list, count: names.length - shown.length })
+                : say(texts, lang, "which", { list }) }
             }
             const answer = yield* begin(found.routine)
             return answer.kind === "refused" ? { spoken: answer.text } : { spoken: say(texts, lang, "started", { name: nameIn(found.routine.name, lang) }) }

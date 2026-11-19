@@ -5,7 +5,7 @@
 // the line being spoken, so an action under way is never cut off in the middle.
 import { type CatalogAction, CurrentJob, CurrentPrincipal, CurrentTurn, CurrentTurnTrace, type ModuleHostApi, type ModuleSpeech, type SpeechHandle, type TurnContext } from "@pva/core"
 import { type Language, say } from "@pva/module-contracts"
-import { Deferred, Effect, Exit, type Scope } from "effect"
+import { Deferred, Effect, Exit, Fiber, type Scope } from "effect"
 import { nameIn, type Routine, type Step } from "./routines.ts"
 import { texts } from "./texts.ts"
 
@@ -41,6 +41,8 @@ interface RunState {
   inCall: boolean
   /** The line of the current `say` step, from its enqueue until it has ended. */
   line: SpeechHandle | undefined
+  /** Claimed before enqueueing, so a duplicate internal request cannot replace the original handle. */
+  lineClaimed: boolean
   /** Cancelled by the person: no further step starts and nothing more is said. */
   cancelled: boolean
 }
@@ -88,9 +90,9 @@ const stepsText = (language: Language, steps: ReadonlyArray<number>) => say(text
 /** How far a run that stopped got: the steps before it that were done, and those it could not confirm. */
 const before = (language: Language, done: ReadonlyArray<number>, unconfirmed: ReadonlyArray<number>) => {
   const doneText = done.length === 0
-    ? say(texts, language, "beforeNone")
+    ? unconfirmed.length === 0 ? say(texts, language, "beforeNone") : ""
     : say(texts, language, done.length === 1 ? "beforeOne" : "beforeMany", { list: listOf(language, done) })
-  return unconfirmed.length === 0 ? doneText : `${doneText} ${say(texts, language, "alsoUnconfirmed", { steps: stepsText(language, unconfirmed) })}`
+  return [doneText, ...(unconfirmed.length === 0 ? [] : [say(texts, language, "alsoUnconfirmed", { steps: stepsText(language, unconfirmed) })])].filter(Boolean).join(" ")
 }
 
 /** The sentence of a run that stopped at step `at`: refused there, its values did not fit, or the step before it failed (`stop_if_failed`). */
@@ -113,6 +115,7 @@ export const makeRunner = (deps: { readonly host: ModuleHostApi; readonly speech
   let runs = 0
   /** Phrase starts by their turn and routine: the first start's answer, for a replay of the same phrase turn. */
   const replays = new Map<string, Deferred.Deferred<StartAnswer>>()
+  const cancelReplays = new Map<string, CancelAnswer>()
 
   const refusal = (refusal: Refusal, language: Language, name: string): StartAnswer => ({
     kind: "refused",
@@ -180,13 +183,24 @@ export const makeRunner = (deps: { readonly host: ModuleHostApi; readonly speech
           state.finished = i + 1
           continue
         }
-        // Every step is a gateway call: a `say` through the module's own line action, a `call` through the action named.
+        const catalogue = yield* asStep(host.actions.list)
+        // Every dispatched step is a gateway call: a `say` through our line action, a `call` through the action named.
         const request = step.kind === "say"
           ? { moduleId: deps.moduleId, actionId: LINE_ACTION, params: { run: state.runId, step: i + 1 } }
           : { moduleId: step.moduleId, actionId: step.actionId, params: step.params }
+        const action = catalogue.find((a) => a.id === `${request.moduleId}.${request.actionId}`)
+        // An unavailable target is still sent to the gateway for its refusal (including a policy's decision). Only
+        // an otherwise offered action needs our additional check that the starting assistant still offers this routine.
+        if (action !== undefined && !catalogue.some((a) => a.id === `${deps.moduleId}.${routine.actionId}`)) return yield* stopAt(i + 1, "whyRefused")
+        if (step.kind === "call" && action !== undefined && !paramsFit(action, step.params)) return yield* stopAt(i + 1, "whyValues")
         state.inCall = step.kind === "call"
         state.line = undefined
-        const result = yield* asStep(host.actions.run(request))
+        state.lineClaimed = false
+        // A provider may interrupt its own call. Observe that child's outcome without interrupting this run; an
+        // interruption of the outer run still reaches its cleanup and interrupts the child with it.
+        const call = yield* Effect.forkChild(asStep(host.actions.run(request)))
+        const exit = yield* Fiber.await(call)
+        const result = Exit.isSuccess(exit) ? exit.value : { ok: false as const, code: "failed" as const }
         state.inCall = false
         // The line action set it while it ran (read through a function: the compiler cannot see that write).
         const line = lineOf(state)
@@ -248,6 +262,9 @@ export const makeRunner = (deps: { readonly host: ModuleHostApi; readonly speech
       const s = state?.routine.steps[step - 1]
       // Only the current step's line of a run on this very device, called by that run.
       if (state === undefined || s?.kind !== "say" || state.step !== step || turn?.source !== "routine" || turn.deviceId !== state.deviceId || state.cancelled) return false
+      // Claim before the enqueue can yield. Duplicates retain the original handle until this step settles.
+      if (state.lineClaimed) return true
+      state.lineClaimed = true
       // Enqueued and kept in one uninterruptible step: whatever interrupts the run afterwards finds the handle to stop.
       return yield* Effect.uninterruptible(
         speech.say({ device: state.deviceId }, textOf(s, state.language)).pipe(
@@ -263,8 +280,18 @@ export const makeRunner = (deps: { readonly host: ModuleHostApi; readonly speech
   const cancel = (language: Language): Effect.Effect<CancelAnswer> =>
     Effect.gen(function*() {
       const turn = yield* CurrentTurn
+      const replayKey = turn?.source === "phrase" ? JSON.stringify([turn.assistantId, turn.conversationId, turn.turnId, turn.deviceId, "stop"]) : undefined
+      const known = replayKey === undefined ? undefined : cancelReplays.get(replayKey)
+      if (known !== undefined) return known
+      const remember = (answer: CancelAnswer) => {
+        if (replayKey !== undefined) {
+          cancelReplays.set(replayKey, answer)
+          if (cancelReplays.size > MAX_REPLAYS) cancelReplays.delete(cancelReplays.keys().next().value!)
+        }
+        return answer
+      }
       const state = [...running.values()].find((r) => r.deviceId === turn?.deviceId && !r.cancelled)
-      if (state === undefined) return { kind: "none" as const, text: say(texts, language, "nothingRunning") }
+      if (state === undefined) return remember({ kind: "none", text: say(texts, language, "nothingRunning") })
       state.cancelled = true
       const name = nameIn(state.routine.name, language)
       const inCall = state.inCall
@@ -272,6 +299,7 @@ export const makeRunner = (deps: { readonly host: ModuleHostApi; readonly speech
       const answer: CancelAnswer = inCall
         ? { kind: "cancelled", inCall, text: say(texts, language, "cancelledCall", { name, step: state.step }) }
         : { kind: "cancelled", inCall, text: say(texts, language, "cancelled", { name, done: state.finished, total: state.routine.steps.length }) }
+      remember(answer)
       // No further step starts. The line being spoken (or waiting) stops now; an action under way is left to finish.
       if (state.line !== undefined) yield* state.line.stop
       return answer
@@ -285,7 +313,7 @@ export const makeRunner = (deps: { readonly host: ModuleHostApi; readonly speech
       if (running.has(routine.key)) return refusal({ kind: "already", other: name }, language, name)
       const here = [...running.values()].find((r) => r.deviceId === turn.deviceId)
       if (here !== undefined) return refusal({ kind: "busyHere", other: nameIn(here.routine.name, language) }, language, name)
-      const state: RunState = { runId: ++runs, routine, language, deviceId: turn.deviceId, step: 0, finished: 0, inCall: false, line: undefined, cancelled: false }
+      const state: RunState = { runId: ++runs, routine, language, deviceId: turn.deviceId, step: 0, finished: 0, inCall: false, line: undefined, lineClaimed: false, cancelled: false }
       running.set(routine.key, state)
       byId.set(state.runId, state)
       const release = Effect.sync(() => {
