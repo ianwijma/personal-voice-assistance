@@ -88,6 +88,39 @@ Dutch.
 |---|---|---|
 | `web-search.usage` | "how many searches have I used", "how much web search budget is left", "hoeveel zoekopdrachten heb ik gebruikt" | "Today 3 of 100 searches are used. This month 41 searches, and the paid ones cost about 0.2 of the 5 dollars allowed." Numbers are worded by `@pva/language` (`speakNumber`: "0,2" in Dutch); a spend under half a cent is "less than 0.01" |
 
+## Sources on screen
+
+A search that found something returns, with its answer, a **list of its sources** for the screen of the device that asked
+(`{ forModel, present }`): a transient `list` (bullets, no ticks, no buttons) titled "Sources" ("Bronnen"), one line per
+source, **title, a dash and the site's name** ("Dutch GP report — nos.nl"), at most the number of results the tool
+returned (1 to 5). `forModel` is exactly the answer the tool gave before; the host adds a line "[Screen: Showing on …]"
+(or "Not showing it: …") after it. The list is made from the results already returned (no second request) and holds
+nothing else: never a snippet, a date or an address. A title that is an address in any form (a `scheme:` such as
+`https://` or `mailto:`, `www.`, a bracketed IPv6 host, a mail address, a host followed by a path, query, fragment or
+port) is replaced by the site's name alone, so no path, query, fragment or mail address reaches a screen. Every line is
+plain text of one line, at most 80 characters, cut at a code point boundary (an emoji at the cut is never split); the
+site's name is never cut, the title gives way to it.
+
+- **Speculation.** `web_search` is speculative when no paid provider is set up, so the search may run before the turn is
+  committed. It never touches a screen itself: the host shows a presentation returned by a speculative tool only when the
+  turn is promoted and drops it when the turn is discarded (tested through the real conversation: a discarded turn shows
+  nothing and withdraws nothing; a promoted one shows the list once).
+- **Where.** On the asking device only. A device without a screen, or whose page draws no lists, shows nothing, and the
+  model has the same answer.
+- **Privacy.** Decided at the moment of showing for the device that would show it (`Privacy.mayReveal`): when the turn
+  knows who is asking, the list belongs to that person, so a public screen, or a shared one that is not that person's,
+  shows nothing of it (the spoken answer is still given); with nobody identified it is the household's, like the answer.
+- **A snapshot.** The list ends by its lifetime (30 seconds) or is replaced by the next transient on that device (the
+  next list, or any other module's transient). The module keeps no handle and never withdraws it: a search that finds
+  nothing, fails or is refused leaves an earlier list to its lifetime, and another module's card is never touched. A
+  restart removes a transient list with the module.
+- **Spoken fallback** (for where nothing can be shown): "The sources are: nos.nl, bbc.com." ("De bronnen zijn: nos.nl,
+  bbc.com."): whole site names in order while the sentence stays within 300 characters, then "and 2 more" ("en nog 2");
+  a name is never cut.
+
+Example: "who won the Dutch Grand Prix?" on the kitchen display: the answer is spoken, and a "Sources" list with the sites of
+the results stays beside the character for half a minute.
+
 ## Settings
 
 | Field | Default | Notes |
@@ -114,7 +147,9 @@ button is the network check).
 Counters only. No query text, no result and no page is stored anywhere; no person or device is named in a row (every write
 names the module as its actor, so the store's "last written by" is not whoever searched). A row holds a month, a day, the
 provider's name and numbers, and its id is the month and the provider (`2026-11:brave`), so nothing a search could be
-recovered from (tested with a provider whose answer repeats a personal query). A query does leave the house: the
+recovered from (tested with a provider whose answer repeats a personal query). The one exception is not the module's data:
+the list of sources on screen (above) is a transient presentation the Presenter keeps in its own collection, with its
+owner, while it is live (at most 30 seconds, removed shortly after). A query does leave the house: the
 provider sees it, with the server's address.
 
 | Collection | Scope | `maxChars` | Indexes | Rows a list reads | Holds |
@@ -137,8 +172,9 @@ one bounded read of at most 12 of the oldest rows through the `month` index, tho
 
 Left out for wave B (needs something that does not exist yet):
 
-- **Sources on screen** and **`search_sources`**: the `list` presentation of the sources and the QR hand-off (P10), and
-  sending the sources to a phone (P9 notifications). The `url` in each result is there for the model, which never reads it out.
+- **`search_sources`** as a tool of its own, the QR hand-off (P10) and sending the sources to a phone (P9 notifications).
+  The sources are on screen already (above); the `url` in each result is there for the model, which never reads it out,
+  and no address is shown on a screen.
 - **Spoken filler** ("let me look that up") from the module: `ctx.speech` does not exist. The tool's `latency` is `slow`
   and its instructions line asks the model for a short lead-in.
 
