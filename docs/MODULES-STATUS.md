@@ -1,7 +1,7 @@
 # Modules: where the work stands
 
 Status of the work planned in [MODULES-PLAN.md](MODULES-PLAN.md), kept here so it does not depend on any one working
-session. Updated 2026-11-19, 19:11. Nothing below is merged into `main`; the owner merges.
+session. Updated 2026-11-19, 19:28. Nothing below is merged into `main`; the owner merges.
 
 **State: the work is done and waits for the owner.** Every preparation part, every module that was not deferred and
 every follow-up has an open pull request, has had at least one complete Sol review, and has its findings fixed. On
@@ -23,6 +23,11 @@ the branch to try out. Putting the parts together found three faults, fixed on t
 withheld every refusal and failure sentence of a module with per-answer privacy (#115, corrected: a module's own
 failure sentence goes back as it is, a crash stays withheld); reminders tagged an already reduced confirmation with
 its owner (#114); a browser test did not know the new Risk policy page (#115).
+
+**CI is green on all 44 open pull requests of this work (#87 to #130) at the heads named on this page** (seen
+2026-11-19, 19:28). On the final head of the branch with everything, locally: `pnpm check` passes, `pnpm test` 10,095
+passed and none failed, the latency tests the way CI runs them pass (37 files, 420 tests), the browser tests pass
+(218 cases).
 
 **Two ways to merge.** Either #130 alone (it contains every commit of #87 to #129; the others can then be
 closed), or the stack one by one in the order of the tables below.
@@ -148,7 +153,8 @@ Found by the last checks and written down instead of fixed:
   right after a job (on the local-info module branch and its follow-up), and a 20 second limit on CI in the branch
   with everything. Still
   seen once each: `ModuleHostP3Round5` "forty modules" (core, 5 s limit), the SQLite scheduler contract's
-  daylight-saving test (30 s limit), the calendar privacy test "finding 22" (the kit gave up waiting for the module
+  daylight-saving test (30 s limit), a test of code already on `main` (the vault's "unlock time … stays under a
+  second" measured 1.4 s), the calendar privacy test "finding 22" (the kit gave up waiting for the module
   to stop), the bin-day reminder test "a copy too old to trust"; and in local full runs under load the SQLite
   `logStart` test ("database is locked"), the calendar latency test and one timers test ("the repeating series moves
   on although its ring is refused": the alarm's row was not there yet when the test looked; it passes alone 5 times
