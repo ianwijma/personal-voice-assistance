@@ -3,7 +3,7 @@ import { homeLanguage, isLine, type Language, Lists, LISTS_LIMITS, say, StoredTe
 import { speakList } from "@pva/language"
 import { Clock, Effect, Schema } from "effect"
 import { type Item, items, listPhrase, lists, MAX_CLEAR, MAX_LIVE_LISTS, MAX_OPEN, MAX_PER_REQUEST, NAME_CHARS, normalise, type Quantity, SHOPPING, TODO, pins, undo, undoIdOf } from "./data.ts"
-import { type Checklists, HANDLER, makeChecklists } from "./checklist.ts"
+import { type Checklists, HANDLER, makeChecklists, oneLine } from "./checklist.ts"
 import { type Engine, isRefusal, listChoice, makeEngine, speak } from "./engine.ts"
 import { type SaidItem, sayItem, type SplitMode, splitItems, takeListSuffix } from "./parse.ts"
 import { makeListsService } from "./service.ts"
@@ -61,7 +61,7 @@ export const settings = {
 // ---------------------------------------------------------------------------------------------------------------------
 // Shared helpers
 
-const lineText = (max: number, what: string) => StoredText(max).check(Schema.makeFilter((t: string) => (isLine(t, max) && t.trim() !== "") || `${what}: one line of 1 to ${max} characters`))
+const lineText = (max: number, what: string) => StoredText(max).check(Schema.makeFilter((t: string) => (isLine(t, max) && oneLine(t) !== "") || `${what}: one line of 1 to ${max} characters`))
 
 /** The conversation's undo row, or none outside a turn (a job, a routine step run by a job). */
 const undoKey = Effect.map(CurrentTurn, (turn) => (turn === undefined ? undefined : undoIdOf(turn.conversationId)))
@@ -89,9 +89,9 @@ export const listsModule = defineModule({
   description: "Shopping and to-do lists: add, read, tick off and remove items.",
   enabledByDefault: false,
   settings,
-  // Version 2: an item's `match` holds its status too (indexed with `since`), so a name finds the open item first.
-  // The pins (where a list is shown as a checklist) are a new collection: the existing ones are as they were.
-  storage: { version: 2, collections: [lists, items, undo, pins] },
+  // Version 2 added status to an item's `match`, and pins. Version 3 adds an optional deletion cutoff to lists:
+  // existing values stay as they are; undo preserves that cutoff so it cannot resurrect cancelled pins.
+  storage: { version: 3, collections: [lists, items, undo, pins] },
   shared: (ctx) =>
     Effect.gen(function*() {
       const engine = makeEngine(ctx.store)
@@ -157,7 +157,7 @@ export const listsModule = defineModule({
         const split = splitItems(text, l, mode)
         switch (split.kind) {
           case "ok":
-            return split.items
+            return split.items.some((item) => oneLine(item.text) === "") ? speak(l, "nothingSaid") : split.items
           case "empty":
             return speak(l, "nothingSaid")
           case "too-many":
@@ -193,10 +193,11 @@ export const listsModule = defineModule({
         latency: "instant",
         // A phrase command runs once per invocation: a repeat of the same one gets its first outcome (`engine.once`).
         run: ({ items: text, list: value }) =>
-          engine.once("add", JSON.stringify([text, value ?? null]), serial(Effect.gen(function*() {
+          engine.once("add", JSON.stringify([text, value ?? null]), (complete) => serial(Effect.gen(function*() {
             const l = lang()
             yield* engine.loadLists.pipe(Effect.mapError((e) => actionError(storeSentence(l, e, true))))
-            const picked = chosen(value)
+            const turn = yield* CurrentTurn
+            const picked = chosen(turn?.source === "phrase" ? SHOPPING : value)
             // The typed path hands over the rest of the sentence: "milk to the shopping list", "melk op mijn lijstje".
             const named = picked.list === undefined ? takeListSuffix(text.replace(/\s+/g, " ").trim(), LIST_MARKERS, (w) => engine.resolveList(w, l)) : { text, list: picked.list, mine: picked.mine }
             // A list said the way a list is named, that the household does not have: refused, nothing written elsewhere.
@@ -206,17 +207,19 @@ export const listsModule = defineModule({
             if (typeof things === "string") return yield* Effect.fail(actionError(things))
             const now = yield* Clock.currentTimeMillis
             const key = yield* undoKey
-            const result = yield* engine.add(target, things, merge, key, now, l).pipe(Effect.mapError((e) => actionError(storeSentence(l, e, false))))
-            const plain = engine.phraseOf(target, l)
-            if (isRefusal(result)) {
-              return yield* Effect.fail(actionError(result.reason === "full" ? speak(l, "full", { list: plain, count: MAX_OPEN }) : speak(l, "unknownList", { name: plain, items: listOf(engine.listNames(l), l, 8) })))
-            }
-            // "My shopping list": there are no personal lists, so it went on the household's, and the answer says so.
-            const shared = named.mine === true
-            const phrase = shared ? say(texts, l, "householdsList", { name: l === "en" ? plain.replace(/^the /, "") : plain }) : plain
-            if (result.added.length === 0) return { say: speak(l, shared ? "alreadyShared" : "already", { list: phrase, items: listOf(result.already, l) }) }
-            if (result.already.length === 0) return { say: speak(l, shared ? "addedShared" : "added", { list: phrase, items: listOf(result.added, l) }) }
-            return { say: speak(l, shared ? "addedAndAlreadyShared" : "addedAndAlready", { list: phrase, items: listOf(result.added, l), already: listOf(result.already, l) }) }
+            return yield* complete(Effect.gen(function*() {
+              const result = yield* engine.add(target, things, merge, key, now, l).pipe(Effect.mapError((e) => actionError(storeSentence(l, e, false))))
+              const plain = engine.phraseOf(target, l)
+              if (isRefusal(result)) {
+                return yield* Effect.fail(actionError(result.reason === "full" ? speak(l, "full", { list: plain, count: MAX_OPEN }) : speak(l, "unknownList", { name: plain, items: listOf(engine.listNames(l), l, 8) })))
+              }
+              // "My shopping list": there are no personal lists, so it went on the household's, and the answer says so.
+              const shared = named.mine === true
+              const phrase = shared ? say(texts, l, "householdsList", { name: l === "en" ? plain.replace(/^the /, "") : plain }) : plain
+              if (result.added.length === 0) return { say: speak(l, shared ? "alreadyShared" : "already", { list: phrase, items: listOf(result.already, l) }) }
+              if (result.already.length === 0) return { say: speak(l, shared ? "addedShared" : "added", { list: phrase, items: listOf(result.added, l) }) }
+              return { say: speak(l, shared ? "addedAndAlreadyShared" : "addedAndAlready", { list: phrase, items: listOf(result.added, l), already: listOf(result.already, l) }) }
+            }))
           })), speak(lang(), "unsaved"))
       })
 
@@ -391,17 +394,20 @@ export const listsModule = defineModule({
               case "no-device":
                 return yield* Effect.fail(actionError(speak(l, "noDevice")))
               case "gone":
-                return yield* Effect.fail(actionError(speak(l, "unknownList", { name: phrase, items: listOf(engine.listNames(l), l, 8) })))
+                return yield* Effect.fail(actionError(speak(l, "listGone")))
               case "limit":
-                return yield* Effect.fail(actionError(speak(l, "tooManyPins")))
+                return yield* Effect.fail(actionError(speak(l, "screenCapacity")))
               case "failed":
                 return yield* Effect.fail(actionError(speak(l, "showFailed", { list: phrase })))
               case "not-shown":
                 // The answer is the one spoken: a device that cannot show it changes nothing about it.
                 return { say: speak(l, r.why === "no-display" || r.why === "cannot-show-kind" ? "noScreen" : "notShown", { spoken: r.spoken }) }
-              case "shown":
-                // A device shows one checklist: another list there was replaced, and the answer says which.
-                return { say: r.replaced === undefined ? speak(l, "showing", { list: phrase }) : speak(l, "showingInstead", { list: phrase, before: engine.phraseOf(r.replaced, l) }) }
+              case "shown": {
+                // Name the replaced list only while its display name is available (undo can remove its row).
+                const before = r.replaced !== undefined && (r.replaced === SHOPPING || r.replaced === TODO || engine.cached().some((row) => row.id === r.replaced))
+                  ? engine.phraseOf(r.replaced, l) : undefined
+                return { say: before === undefined ? speak(l, "showing", { list: phrase }) : speak(l, "showingInstead", { list: phrase, before }) }
+              }
             }
           })
       })
@@ -421,6 +427,7 @@ export const listsModule = defineModule({
             const target = chosen(list).list
             const phrase = target === undefined ? "" : engine.phraseOf(target, l)
             const r = yield* checklists.hide(target).pipe(Effect.mapError((e) => actionError(storeSentence(l, e, false))))
+            if ("list" in r && r.list !== SHOPPING && r.list !== TODO && !engine.cached().some((row) => row.id === r.list && row.value.deletedAt === undefined)) return { say: speak(l, "listGone") }
             switch (r.kind) {
               case "no-device":
                 return yield* Effect.fail(actionError(speak(l, "noDevice")))

@@ -2,13 +2,14 @@ import type { Row, StoreFailure } from "@pva/core"
 import { type AddItemRequest, type AddItemResult, isLine, LIST_KEY_PATTERN, type ListItem, LISTS_LIMITS, ListsError, type ListsService } from "@pva/module-contracts"
 import { Clock, Effect } from "effect"
 import { type Item, ITEM_PAGE, itemOf, items, matchOf, MAX_OPEN, placeOf, type Quantity, SHOPPING, withStatus } from "./data.ts"
+import { oneLine } from "./checklist.ts"
 import { type Engine, isRefusal } from "./engine.ts"
 
 /** Why a request is outside the contract's bounds (`detail`, English, for the log), or `undefined`. */
 const problemOf = (request: AddItemRequest): string | undefined => {
   if (typeof request !== "object" || request === null) return "the request is not an object"
   const { text, note, quantity, dedupeKey } = request
-  if (!isLine(text, LISTS_LIMITS.textChars) || text.trim() === "") return `text must be 1 to ${LISTS_LIMITS.textChars} characters of one line, not only spaces`
+  if (!isLine(text, LISTS_LIMITS.textChars) || oneLine(text) === "") return `text must be 1 to ${LISTS_LIMITS.textChars} characters of one line, not only spaces`
   if (note !== undefined && !isLine(note, LISTS_LIMITS.noteChars)) return `note must be at most ${LISTS_LIMITS.noteChars} characters of one line`
   if (quantity !== undefined) {
     if (typeof quantity !== "object" || quantity === null) return "quantity must be an object"

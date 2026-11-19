@@ -114,7 +114,8 @@ Dutch: "zet melk op de boodschappenlijst" → "Melk op de boodschappenlijst geze
 Two actions can be said without the language model, after the wake phrase or in a follow-up window
 ([docs/PHRASES.md](../PHRASES.md)). Both are for **the household's shopping list only**: the words name it, so the
 action's `list` is left out and it takes its own default. A phrase runs the existing action: the same parameters, the
-same refusals and sentences, the same risk class.
+same refusals and sentences, the same risk class. On a matched add phrase, the whole `items` slot is item text for
+shopping: "tuna in oil" stays that item even if the household also has a list named "oil".
 
 | Action | English | Dutch |
 |---|---|---|
@@ -132,7 +133,9 @@ assistant, whose tools take them as before.
   by the invocation's identity (assistant, conversation, turn, device, the operation and what it was asked) in one
   bounded record in `shared` (256 finished ones; one still running is never forgotten): the same invocation twice
   (a replay) returns the first outcome and adds nothing more; the next phrase is a new invocation and acts as the
-  action does (an item said again is merged, with merging off a second item). Spoken and typed calls are not kept.
+  action does (an item said again is merged, with merging off a second item). The bounded write and completion of
+  that record are protected together: interruption at commit cannot make a replay add the item again. Interruption
+  before reaching that write leaves the invocation free to retry. Spoken and typed calls are not kept.
 - **A phrase that cannot be said by a device** (the slot would be longer than 8 words) is not taken; nothing is written.
 
 ## Checklists
@@ -140,7 +143,9 @@ assistant, whose tools take them as before.
 "Show the shopping list" puts the list's **open items on the screen of the device that asked**, as a `list`
 presentation in the `checklist` style, one tickable line per item (the item's text with its amount, one line of at most
 80 characters; at most 12 items, the oldest first as read out; the title is the list's name, with "(+3 more)" when
-more are open than are shown, so what is not shown is counted and never hidden):
+more are open than are shown, so what is not shown is counted and never hidden). An item name that becomes empty
+under those text rules is refused when added or renamed, including through `Lists.addItem`; an amount does not
+stand in for a name:
 
 - **When it is shown.** `lists_show` (or "show the shopping list", "toon de boodschappenlijst", "zet de takenlijst op
   het scherm", and the model's tool). It is **pinned**: it stays until closed or until the host ends it, 24 hours (its
@@ -148,13 +153,21 @@ more are open than are shown, so what is not shown is counted and never hidden):
   answer says "Showing the shopping list on this screen."
 - **One checklist per device.** A device shows at most one: showing another list there replaces it in place (the same
   key, the same page), and the answer says so: "Showing the camping list on this screen, instead of the shopping list."
-  ("De takenlijst staat nu op dit scherm, in plaats van de boodschappenlijst."). Showing the same list again just shows
-  it again. So the module never has more checklists than the household has screens; the host's bound for one module
-  (8 live presentations) refuses a ninth screen with "Too many lists are on screens already; close one first."
+  ("De takenlijst staat nu op dit scherm, in plaats van de boodschappenlijst."). If the previous list's name is no
+  longer available (for example after undoing its creation), the confirmation names only the new list. Showing the
+  same list again just shows it again. So the module never has more checklists than the household has screens; the
+  host's bound for one module (8 live presentations), or a screen already full of other modules' cards, can refuse a show. The answer is
+  "There isn't room to show this list right now; close something on a screen first."
+  ("Er is nu geen ruimte om deze lijst te tonen; sluit eerst iets op een scherm.").
 - **A device that cannot show it** (no screen, a page that cannot draw a list) changes nothing about the answer: it
   says "This device can't show it." and then the read-out sentence of the list ("The shopping list has 3 things: …",
-  which is also the presentation's spoken fallback), and nothing is kept for that device (an earlier checklist there
-  is taken down). The model's tool says the same.
+  which is also the presentation's spoken fallback). Its accepted presentation (including any earlier checklist
+  replaced under its key) is dismissed; the handle and dismissal work stay in the pin until that succeeds, then the pin
+  is removed. The worker saves dismissal work before closing the accepted handle; if that write fails it retains the
+  handle and retries the write before dismissal, while the answer still gives the readout. A failed dismissal is retried
+  by reconciliation and can also be closed with `lists_hide`. The spoken
+  sentence is at most 300 characters: it uses whole item names, within `readItems`, and counts the items left out;
+  the separate 80-character visual limit does not shorten speech. If no whole item fits, the sentence says how many were not read out. The model's tool says the same.
 - **Privacy.** A list is household data, read out on shared, private and public devices alike, so its presentation is
   the household's (`sensitivity` is not personal) and is shown on every device that has a screen; the rule is the one
   that lets the same list be read out there. Nothing about a person is put on it.
@@ -165,17 +178,28 @@ more are open than are shown, so what is not shown is counted and never hidden):
   the list as they are and does what is owed; a worker of the `shared` part runs it, under the module's one permit,
   off the path of the call that asked. The row is written before the screen is touched (a first show, or a changed
   content with its new end, is recorded as owed first and cleared after the show), so an interruption or a restart
-  leaves work that reconciliation finishes, and a checklist is never on a screen without a row.
+  leaves work that reconciliation finishes, and a checklist is never on a screen without a row. A show or hide asks
+  the worker from its intent transaction's `afterCommit`, even if the caller is interrupted. Once the Presenter
+  answers a show or a close, the request returns its sentence without waiting for bookkeeping: the worker clears a
+  successful show's owed work, rolls back a refused show's intent, or removes a dismissed pin. Until rollback commits,
+  requests use the previous pin and handle; a refused first show has no previous pin. Every worker dismissal is recorded
+  as owed before the screen is touched. Committing a replacement also invalidates the old handle and any old dismissal
+  marker.
 - **When the list changes.** Every committed change of the module's lists (a voice add or tick, a tool,
-  `lists_update`, undo, the `Lists` service, the daily clean-up, deleting the list) names the lists it wrote; their
+  `lists_update`, undo, the `Lists` service, the daily clean-up, deleting the list) names the lists it wrote from the
+  committing transaction's `afterCommit`, even if its caller has gone away; their
   pins are found through the `list` index, a page of 16 at a time until the end, and reconciled at once. A change that
   leaves what the screen holds as it is (title and items) sends nothing; a real change is shown again under the key
   with a new end, 24 hours from then. Deleting a list takes its checklists down; undoing the delete does not put them
-  back.
+  back. The deletion records a store revision cutoff on the list, kept by undo: pins that existed then stay
+  cancelled, including when a refused replacement restores their row; a press on a cancelled pin changes no item.
+  A later explicit show establishes a new pin without scanning pins on the deletion's turn.
 - **When something fails.** A step that fails (the host busy, the store busy) leaves its work owed in the row with a
-  later try for that pin alone (5 s, 20 s, 80 s, 320 s, then every 10 minutes); it never holds up another pin or a
-  later change, and a new change of the pin's list tries it again at once. A checklist that was taken down while its
-  row could not be removed leaves the row saying so, and the next try removes it: rows never pile up.
+  later try for that pin alone (5 s, 20 s, 80 s, 320 s, then every 10 minutes). A new change of the pin's list asks
+  for another try at once. After a failed read, the next change to any checklist can reach its screen up to five
+  seconds late. A checklist that was taken down while its row could not be removed leaves the row saying so, and
+  the next try removes it: rows never pile up. A refused show followed by a module restart before its rollback commits
+  can still show the recorded intent; it then follows the ordinary close and expiry rules.
 - **When a device is offline.** A change while the device's page is disconnected is still a success: the host keeps
   the pinned presentation, updated, and gives it back when the page reconnects (docs/PRESENTING.md); the pin stays.
   Showing a list on a device that is offline at that moment keeps the pin too, and answers "I can't show it here right
@@ -188,22 +212,32 @@ more are open than are shown, so what is not shown is counted and never hidden):
   down; with a list named, only when that is the list shown ("The shopping list isn't on this screen." otherwise);
   without one, whatever list it is ("Closed what I showed on this screen."). The list itself is not changed. The close is
   first recorded in the row, then done; if the host is busy it is tried again until done, and the answer says "I'll
-  take the shopping list off this screen as soon as I can." A close is a close until the checklist's actual end, also
-  in its last seconds.
+  take the shopping list off this screen as soon as I can." A handle that no longer closes the current card also leaves
+  the fallback close to the worker and answers with that sentence. A close is a close until the checklist's actual end, also
+  in its last seconds. If the list is gone (for example its creation was undone), the answer says "That list is gone."
+  / "Die lijst bestaat niet meer."; a closing card uses a generic localized title and the same sentence when the list's row
+  is absent, while a deleted list retained for undo keeps its name and says "The camping list isn't shown any more."
+  / "De lijst camping wordt niet meer getoond." A list's internal
+  id is never used as its display name or spoken name.
 - **A restart** keeps the pins and the screens (the host keeps pinned presentations). When the module starts it
   reconciles every pin (a page of 16 at a time): what changed while it was stopped is shown, and an unchanged checklist
   is shown again with **what remains of its end**, so this run has its handle; a restart never moves the end. With less
   than the host's minimum (3 seconds) left, it is left to end. Without a handle (one that could not be taken again),
   a checklist is closed by showing it empty under the same key, which the host ends three seconds later.
 - **When it ends.** At its end the host takes it down by itself, and the worker removes the pin then (it is due at
-  `until`). Before that moment it is never treated as ended.
+  `until`). Remaining lifetime is computed immediately before every call to the Presenter, including refreshes and
+  restarts. At the fixed end the worker dismisses a still-live handle before removing its row; it never shows an
+  empty replacement then, and an owed show whose end has passed is dropped. Before that moment the pin is never
+  treated as ended.
 - **A tick** on an item is the press handler `lists` (registered in `shared`). It completes that item by its id through
   the same engine call as `lists_complete` (so under the one-at-a-time rule) and answers what it committed: "Ticked off
-  eggs on the shopping list." Bringing the screens up to date is owed work of the pins (the commit names the list); a
+  eggs on the shopping list." The item and its list's count are attributed to the UI device (`actor: { kind: "ui", deviceId }`). Bringing the screens up to date is owed work of the pins (the commit names the list); a
   failure there never changes the answer. When the status write itself fails, the answer is "The lists are busy just
   now; try again in a moment." and nothing changed. It is idempotent by the item: an item that is already ticked off (by
   another device, or a second press) is not ticked again and the answer says "Already ticked off: eggs."; an item that
-  is gone says so (and the screen is brought up to date). A press records no undo entry (a press has no conversation).
+  is gone says so (and the screen is brought up to date). Each line carries a signature of its item's id, name and amount;
+  if the name or amount changed before the tap, nothing is ticked, the answer asks for another tap, and the worker refreshes
+  the checklist. Editing another item does not invalidate the tap. A press records no undo entry (a press has no conversation).
   A tick can only tick off: the checklist shows open items, and an untick answers "Here I can only tick things off." A
   device that does not hold the checklist, and a module that is stopped, are refused by the host ("I can't do that
   right now.") before any of this runs.
@@ -222,8 +256,8 @@ No secrets, no addresses.
 
 ## What it stores
 
-Four household-scoped collections (`storage.version` 2: version 1 kept the hash alone in an item's `match`; the
-upgrade adds the status to it; the fourth, `pins`, is new and the other three are as they were). **Nothing in the first
+Four household-scoped collections (`storage.version` 3: version 2 added the status to an item's `match` and the
+`pins` collection; version 3 adds optional `pinsCancelledThrough` to lists, preserving all existing values). **Nothing in the first
 three is about one person**: no person id, no device id, no conversation id (the undo row's id is a hash of the
 conversation id). A pin holds a device's id (the household's own screen, also in its row id) and no person and no item. Lists are shared household data
 by design, read out on shared, private and public devices alike; the store's own change record (`updatedBy`) is the
@@ -231,7 +265,7 @@ store's, not read by the module.
 
 | Collection | `maxChars` (worst legal value) | Indexes | A list reads | Kept |
 |---|---|---|---|---|
-| `lists`: one row per list (name, kind, open and ticked-off counts, `deletedAt`); the two default lists' rows made at the start | 200 (167) | none | all lists in one read (at most 50) | until deleted, then a day for undo |
+| `lists`: one row per list (name, kind, open and ticked-off counts, `deletedAt`, the optional deletion cutoff `pinsCancelledThrough`); the two default lists' rows made at the start | 240 (207) | none | all lists in one read (at most 50) | until deleted, then a day for undo |
 | `items`: one row per item (list, text, quantity, note, status `open`/`done`/`removed`, `place` = list and status, `since`, `match` = a hash of the list and normalised text with the status, `dedupeKey`) | 1,500 (1,466) | `[place, since]`, `[match, since]`, `dedupeKey` | 16 rows: every list read pages with `after` | open: until ticked off or removed; ticked off: by the settings; removed: a day for undo |
 | `pins`: the checklist of one device: at most one row per household device, id `pin.<device id>` (list, device id, the presentation's key (a hash of the device id), its end, a hash of what was last shown, the work owed with its attempts and next try) | 540 (528) | `list` | a device's pin by id; a list's pins (and at a start all) 16 at a time until the end | until the checklist is closed, its list is deleted, its device is removed or it ended |
 | `undo`: the last change of each conversation (the items it changed with the rev it left them at and their status before, the amounts and notes a merge changed, an item's text before a change) | 16,000 (14,758) | `at` | 1 row (undo reads its row by id) | a day |

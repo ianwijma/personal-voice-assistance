@@ -1,10 +1,12 @@
 // What the lists module keeps and how: indexed values at their largest, reads past one store page, the daily
 // clean-up job across a restart, invalid settings, and that lists are household data on every kind of device.
 import { assert, describe, it } from "@effect/vitest"
-import { startTestModule } from "@pva/core/testing"
+import { defineCollection } from "@pva/core"
+import { makeMemoryHouseholdStore, startTestModule } from "@pva/core/testing"
+import { pins, pinIdOf } from "../src/data.ts"
 import { Lists, LISTS_LIMITS } from "@pva/module-contracts"
-import { Effect } from "effect"
-import { type Item, items, type ListRow, lists, listsModule, MAX_OPEN, undo, undoIdOf } from "../src/index.ts"
+import { Effect, Schema } from "effect"
+import { type Item, items, ListRow, lists, listsModule, MAX_OPEN, undo, undoIdOf } from "../src/index.ts"
 
 const said = (r: { readonly ok: boolean; readonly say?: string; readonly message?: string }) => (r.ok ? r.say : r.message)
 const HOUR = 3_600_000
@@ -28,13 +30,40 @@ describe("storage", () => {
         dedupeKey: `k:${"/".repeat(LISTS_LIMITS.keyChars - 2)}`
       }
       yield* store.collection(items).insert(largest)
-      const listRow: ListRow = { name: "\"".repeat(40), kind: "generic", open: MAX_OPEN, done: 1_000_000_000, deletedAt: 8_640_000_000_000_000 }
+      const listRow: ListRow = { name: "\"".repeat(40), kind: "generic", open: MAX_OPEN, done: 1_000_000_000, deletedAt: 8_640_000_000_000_000, pinsCancelledThrough: Number.MAX_SAFE_INTEGER }
       yield* store.collection(lists).insert(listRow, { id: list })
       yield* store.collection(undo).insert({ at: 8_640_000_000_000_000, op: "add", list, steps: [] }, { id: undoIdOf("c") })
       assert.strictEqual((yield* store.collection(items).list({})).length, 1)
       // Beside the two default lists, made at the start.
       assert.strictEqual((yield* store.collection(lists).list({})).length, 3)
       assert.strictEqual((yield* store.collection(undo).list({})).length, 1)
+      const device = "d".repeat(64)
+      yield* store.collection(pins).insert({ list, device, key: "k".repeat(64), shown: "f".repeat(32), until: 8_640_000_000_000_000, owed: "dismiss", attempts: 1_000_000, next: 8_640_000_000_000_000 }, { id: pinIdOf(device) })
+      const found = yield* store.collection(pins).list({ where: { list }, orderBy: { field: "createdAt" }, limit: 16 })
+      assert.deepStrictEqual(found.map((r) => [r.id, r.value.list]), [[pinIdOf(device), list]])
+    }))
+
+  it.effect("version 2 lists, items, undo and pins upgrade without changing their values", () =>
+    Effect.gen(function*() {
+      const store = makeMemoryHouseholdStore()
+      const { pinsCancelledThrough: _cutoff, ...oldFields } = ListRow.fields
+      const oldLists = defineCollection({ name: "lists", scope: "household", schema: Schema.Struct(oldFields), maxChars: 200 })
+      yield* store.prepare([{ id: "lists", storage: { version: 2, collections: [oldLists, items, undo, pins] } }])
+      const previous = store.forModule("lists")
+      const listValue = { name: "camping", kind: "generic" as const, open: 1, done: 0 }
+      const itemValue: Item = { list: "camping", text: "tent", status: "open", place: "camping:open", since: 1, match: "f".repeat(32) + ":open" }
+      const undoValue = { at: 1, op: "add" as const, list: "camping", steps: [] }
+      const pinValue = { list: "camping", device: "kitchen-display", key: "lists.test", until: 86_400_000, owed: "show" as const }
+      yield* previous.collection(oldLists).insert(listValue, { id: "camping" })
+      yield* previous.collection(items).insert(itemValue, { id: "tent" })
+      yield* previous.collection(undo).insert(undoValue, { id: "u-test" })
+      yield* previous.collection(pins).insert(pinValue, { id: pinIdOf("kitchen-display") })
+      yield* store.prepare([{ id: "lists", storage: listsModule.storage }])
+      const current = store.forModule("lists")
+      assert.deepStrictEqual((yield* current.collection(lists).get("camping"))?.value, listValue)
+      assert.deepStrictEqual((yield* current.collection(items).get("tent"))?.value, itemValue)
+      assert.deepStrictEqual((yield* current.collection(undo).get("u-test"))?.value, undoValue)
+      assert.deepStrictEqual((yield* current.collection(pins).get(pinIdOf("kitchen-display")))?.value, pinValue)
     }))
 
   it.effect("finds an item by a close name past one store page of a long list", () =>
