@@ -378,7 +378,7 @@ describe("review: delivered at least once, with the receipt failing", () => {
       yield* advanceTo(kit, atLocal(18, 19, 1))
       const job = (yield* kit.jobs).find((j) => j.key === REMIND_JOB && j.state === "scheduled")!
       const row = yield* kit.moduleStore().collection(reminded).get(REMINDED_ID)
-      const actor = { kind: "job", jobId: (yield* kit.jobs).filter((j) => j.key === REMIND_JOB).map((j) => j.id).find((id) => JSON.stringify(row?.updatedBy).includes(id)) ?? "none" }
+      const actor = { kind: "job" as const, jobId: (yield* kit.jobs).filter((j) => j.key === REMIND_JOB).map((j) => j.id).find((id) => JSON.stringify(row?.updatedBy).includes(id)) ?? "none" }
       assert.deepStrictEqual(row?.updatedBy, actor)
       assert.strictEqual(job.handler, "remind")
       const events = kit.events.filter((e) => e.type === "bin-day.reminded.changed")
