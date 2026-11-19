@@ -160,7 +160,7 @@ import { encodeWav, MOCK_PROVIDERS } from "./voices.ts"
 import { createModelPickersMock } from "./modelPickers.ts"
 import { createModuleRoutesMock, DEMO_DEFINITION_ACTIONS, demoHomeAction, demoHomeModule, TokenRefusal } from "./demoHome.ts"
 import { createScheduledJobsMock, MockSchedulerError } from "./scheduledJobs.ts"
-import { DEFAULT_RISK_POLICY, FIXED_REASON, FIXED_RISK_CLASSES, RISK_POLICY_KEYS, riskPageTexts, riskPolicyValueProblem } from "@pva/protocol"
+import { decideRisk, decodeRiskPolicy, DEFAULT_RISK_POLICY, FIXED_REASON, FIXED_RISK_CLASSES, RISK_POLICY_KEYS, riskLanguageOf, riskPageTexts, riskPolicyPatchProblems, riskSpoken } from "@pva/protocol"
 import { boundaryKey, changeReplyVolume, checkDietList, checkMembersValue, cleanDeviceName, type Condition, decideDelivery, decidePresentation, type DeviceCapabilities, deviceOutputsFrom, devicePresentFrom, type FieldError, MAX_PINNED_PER_DEVICE, NO_REPLY_VOLUMES, PRESENT_KIND_VERSIONS, type Presentation, presentationProblem, type PresentKindName, presentLifetime, presentWireContent, type ReplyVolumes, selectPresentations, type ShowOptions, showOptionsProblem, speakerAllowedFrom } from "@pva/protocol"
 
 const PORT = Number(process.env.MOCK_PORT ?? 8787)
@@ -795,6 +795,14 @@ const initialSections = (): Array<SettingsSection> => [
 ]
 
 /** Every section's value of `key` (keys are global), and whether a secret is set. */
+/**
+ * P8, as the real gateway decides a press (a notification's action, a presentation's tick or button): the saved policy
+ * through the shared decoder, `decideRisk` with the handler's class (the mock's handlers declare none: `change`), and on
+ * a refusal the policy's spoken sentence in the household's language. `undefined`: allowed.
+ */
+const mockPressRefusal = (): string | undefined =>
+  riskSpoken(riskLanguageOf(valueOf("HOME_LANGUAGE")), decideRisk(decodeRiskPolicy((key) => valueOf(key)), ["change"], "change"))
+
 const valueOf = (key: string, list: ReadonlyArray<SettingsSection> = sections): unknown => {
   for (const x of list) if (Object.hasOwn(x.form.values, key)) return x.form.values[key]
   return undefined
@@ -2592,10 +2600,7 @@ const onClientMessage = (c: Conn, m: ClientMessage) => {
       // one of the three outcomes, money and security only Refuse (or back to the default), and those two are never
       // written.
       if (section.id === "risk") {
-        const problems = Object.entries(m.patch.values).flatMap(([k, v]) => {
-          const problem = riskPolicyValueProblem(k, v)
-          return problem === undefined ? [] : [{ key: k, message: problem }]
-        })
+        const problems = riskPolicyPatchProblems(m.patch.values)
         if (problems.length > 0) return result(c, m.requestId, false, { code: "invalid_settings", message: problems[0]!.message, fieldErrors: problems })
       }
       const fixedKey = (k: string) => section.id === "risk" && FIXED_RISK_CLASSES.some((cls) => RISK_POLICY_KEYS[cls] === k)
@@ -2929,6 +2934,9 @@ const onClientMessage = (c: Conn, m: ClientMessage) => {
       }
       if (m.actionId !== "stop" && !n.card.actions.some((a) => a.id === m.actionId)) return sendTo(c, { ...cant, error: { code: "bad_message", message: cant.say } })
       if (m.actionId !== "stop" && n.handlerDown) return sendTo(c, cant)
+      // P8, as the real gateway: a module's action is decided by the saved policy (its class: change); `stop` is the host's.
+      const refusedN = m.actionId === "stop" ? undefined : mockPressRefusal()
+      if (refusedN !== undefined) return sendTo(c, { type: "result", requestId: m.requestId, ok: false, error: { code: "bad_message", message: refusedN }, say: refusedN })
       resolveMockNotification(m.id, m.actionId)
       return sendTo(c, { type: "result", requestId: m.requestId, ok: true, say: texts.done })
     }
@@ -2951,12 +2959,16 @@ const onClientMessage = (c: Conn, m: ClientMessage) => {
         const list = p.presentation
         if (list.kind !== "list" || list.style !== "checklist" || m.done === undefined || !list.items.some((i) => i.id === m.item)) return cant("bad_message")
         if (p.handlerDown) return cant("not_running")
+        const refusedTick = mockPressRefusal()
+        if (refusedTick !== undefined) return sendTo(c, { type: "result", requestId: m.requestId, ok: false, error: { code: "bad_message", message: refusedTick }, say: refusedTick })
         p.presentation = { ...list, items: list.items.map((i) => (i.id === m.item ? { ...i, done: m.done! } : i)) }
         reconcilePresentEverywhere()
         return sendTo(c, { type: "result", requestId: m.requestId, ok: true, say: texts.done })
       }
       if (!(p.presentation.buttons ?? []).some((b) => b.id === m.action)) return cant("bad_message")
       if (p.handlerDown) return cant("not_running")
+      const refusedButton = mockPressRefusal()
+      if (refusedButton !== undefined) return sendTo(c, { type: "result", requestId: m.requestId, ok: false, error: { code: "bad_message", message: refusedButton }, say: refusedButton })
       return sendTo(c, { type: "result", requestId: m.requestId, ok: true, say: texts.done })
     }
     case "device.caps": {

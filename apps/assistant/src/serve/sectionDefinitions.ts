@@ -5,6 +5,7 @@ import {
   FIXED_REASON,
   RISK_POLICY_KEYS,
   riskPageTexts,
+  riskPolicyPatchProblems,
   CONVERSATION_IDLE_MINUTES_LIMITS,
   DEFAULT_CONVERSATION_IDLE_MINUTES,
   DEFAULT_MAX_VOICE_SESSIONS,
@@ -76,6 +77,12 @@ export interface SectionDefinition {
    * else is refused with the reason.
    */
   readonly fixed?: Readonly<Record<string, { readonly value: string; readonly reason: string }>>
+  /**
+   * P8 (review round 1, H5): the section's own check of a patch's values, run first (before the fixed-field and generic
+   * form checks): any problem refuses the save with the first problem's message and all of them as field errors, and
+   * nothing is written. The web mock runs the same function.
+   */
+  readonly checkPatch?: (values: Readonly<Record<string, unknown>>) => ReadonlyArray<{ readonly key: string; readonly message: string }>
 }
 
 const reload = "reload" as const
@@ -329,7 +336,8 @@ export const riskSection: SectionDefinition = {
   fixed: {
     [RISK_POLICY_KEYS.money]: { value: "deny", reason: FIXED_REASON },
     [RISK_POLICY_KEYS.security]: { value: "deny", reason: FIXED_REASON }
-  }
+  },
+  checkPatch: riskPolicyPatchProblems
 }
 
 /**
