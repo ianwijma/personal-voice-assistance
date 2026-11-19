@@ -575,6 +575,13 @@ describe("bin-day: the copy, the jobs and the briefing section", () => {
       assert.deepStrictEqual(yield* copyIn(kit), good)
       state.up = true
       yield* runJob(kit, daily.id)
+      // A run asked for by id is not due by the clock, so `settle` cannot tell that it has begun; and the Health issue goes
+      // a moment after the row. Wait, bounded, for the outcome this test is about: the error gone and the issue with it.
+      for (let i = 0; i < 600; i++) {
+        const now = (yield* kit.jobs).find((j) => j.id === daily.id)!
+        if (now.lastError === undefined && !kit.issues().some((issue) => issue.module === "bin-day")) break
+        yield* Effect.promise(() => new Promise((resolve) => setTimeout(resolve, 20)))
+      }
       const ok = (yield* kit.jobs).find((j) => j.id === daily.id)!
       assert.isUndefined(ok.lastError)
       assert.isFalse(kit.issues().some((i) => i.module === "bin-day"))
