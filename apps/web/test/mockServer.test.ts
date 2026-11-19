@@ -78,7 +78,7 @@ class Peer {
   send(m: ClientMessage) {
     this.ws.send(encodeClientMessage(m))
   }
-  async waitFor<T extends ServerMessage["type"]>(type: T, test: (m: ServerMessageOf<T>) => boolean = () => true, from = 0, ms = 5000): Promise<ServerMessageOf<T>> {
+  async waitFor<T extends ServerMessage["type"]>(type: T, test: (m: ServerMessageOf<T>) => boolean = () => true, from = 0, ms = 10_000): Promise<ServerMessageOf<T>> {
     const end = Date.now() + ms
     for (;;) {
       const found = this.messages.slice(from).find((m): m is ServerMessageOf<T> => m.type === type && test(m as ServerMessageOf<T>))
@@ -105,6 +105,13 @@ const admin = async () => {
   expect((await peer.request({ type: "admin.login", password: "admin password" })).ok).toBe(true)
   await peer.waitFor("admin.snapshot")
   return peer
+}
+
+/** Every presentation of the mock ends: a presentation test starts from none, whatever an earlier one left. */
+const clearPresentations = async () => {
+  const http = url.replace(/^ws/, "http").replace(/\/ws$/, "")
+  const r = await fetch(`${http}/mock/present/clear`, { method: "POST", body: "{}" })
+  expect(r.status).toBe(200)
 }
 
 const revOf = (peer: Peer, id: string) => {
@@ -209,6 +216,7 @@ describe("the mock, through its handlers, as the server", { timeout: 30_000 }, (
   })
 
   it("P10 presentations as the server: shown where the shared decision allows (a page that declares the kinds), again after a hello; a transient replaces a transient; a tick from the holder updates every page; refused elsewhere and while the handler is down", async () => {
+    await clearPresentations()
     const http = url.replace(/^ws/, "http").replace(/\/ws$/, "")
     const screen = { v: 1, display: { class: "standard", widthPx: 800, heightPx: 600, dpr: 1, touch: "coarse", colour: true }, present: { kinds: { card: 1, list: 1, timer: 1, image: 1, weather: 1 } } }
     const one = await Peer.open({ device: { id: "d-mock-present1", kind: "web-voice", name: "One", capabilities: screen } as never })
@@ -248,6 +256,7 @@ describe("the mock, through its handlers, as the server", { timeout: 30_000 }, (
   })
 
   it("P10 review round 1: the mock checks before it commits (b10), ends presentations at their end (b12), derives lifetimes with the shared helper (b13), reconciles after a saved settings change (b14), sends each tab only its own kinds (G11) and serves images by a page's own address (b11)", async () => {
+    await clearPresentations()
     const http = url.replace(/^ws/, "http").replace(/\/ws$/, "")
     const screen = { v: 1, display: { class: "standard", widthPx: 800, heightPx: 600, dpr: 1, touch: "coarse", colour: true }, present: { kinds: { card: 1, list: 1, timer: 1, image: 1, weather: 1 } } }
     const page = await Peer.open({ device: { id: "d-mock-round1a", kind: "web-voice", name: "Page", capabilities: screen } as never })
@@ -258,26 +267,37 @@ describe("the mock, through its handlers, as the server", { timeout: 30_000 }, (
     expect((await post("/mock/present", { options: { lifetime: "pinned" }, presentation: card("T".repeat(61)) })).status).toBe(400)
     expect((await post("/mock/present", { presentation: { ...card("x"), buttons: [1, 2, 3, 4] } })).status).toBe(400)
     expect((await post("/mock/present", { presentation: card("x"), options: { expiresInMs: 25 * 3_600_000, lifetime: "pinned" } })).status).toBe(400)
-    const valid = await post("/mock/present", { options: { lifetime: "pinned", expiresInMs: 3_000 }, presentation: card("Valid") })
-    expect(valid.status).toBe(200)
-    await page.waitFor("present.show", (m) => m.presentation.id === valid.body.id)
     // b13: a timer is pinned by default and lasts until ten minutes after it ends.
     const endsAt = Date.now() + 60_000
     const timer = await post("/mock/present", { presentation: { kind: "timer", label: "Tea", endsAt, spoken: "Tea." } })
+    expect(timer.status).toBe(200)
     expect(timer.body.lifetime).toBe("pinned")
     expect(timer.body.expiresAt).toBe(endsAt + 10 * 60_000)
-    // b12: eight pins with a three-second life end and free their places.
-    const ids: Array<string> = [valid.body.id!, timer.body.id!]
-    for (let i = 0; i < 6; i++) ids.push((await post("/mock/present", { options: { lifetime: "pinned", expiresInMs: 3_000 }, presentation: card(`P${i}`) })).body.id!)
+    await page.waitFor("present.show", (m) => m.presentation.id === timer.body.id)
+    // b12: seven pins that stay (the timer and six more), then one that ends by itself: the eighth, the bound; one more
+    // is refused. Only one request lies between the short one and that check, and it lives five seconds, so the check
+    // does not race its end even on a slow machine.
+    const pins: Array<string> = []
+    for (let i = 0; i < 6; i++) {
+      const r = await post("/mock/present", { options: { lifetime: "pinned" }, presentation: card(`P${i}`) })
+      expect(r.status).toBe(200)
+      pins.push(r.body.id!)
+    }
+    const valid = await post("/mock/present", { options: { lifetime: "pinned", expiresInMs: 5_000 }, presentation: card("Valid") })
+    expect(valid.status).toBe(200)
     expect((await post("/mock/present", { options: { lifetime: "pinned" }, presentation: card("Full") })).body.error).toBe("limit")
-    // No dismissal: their end alone frees their places.
-    await page.waitFor("present.dismiss", (m) => m.id === valid.body.id, 0, 6_000)
+    await page.waitFor("present.show", (m) => m.presentation.id === valid.body.id)
+    // No dismissal: its end alone frees its place (waited for as the event it is, not for a fixed time).
+    await page.waitFor("present.dismiss", (m) => m.id === valid.body.id, 0, 20_000)
     const fits = await post("/mock/present", { options: { lifetime: "pinned" }, presentation: card("Fits") })
     expect(fits.status).toBe(200)
+    // The six pins are dismissed (room under the module bound for the image below).
+    for (const id of pins) expect((await post("/mock/present/dismiss", { id })).body).toEqual({ dismissed: true })
     // G11: the older tab of the same device got nothing.
     expect(oldTab.messages.some((m) => m.type.startsWith("present."))).toBe(false)
     // b11: an image through the page's own address, with the server's headers; nothing for another address.
     const image = await post("/mock/present", { presentation: { kind: "image", url: "https://example.org/a.png", alt: "A", credit: "C", spoken: "A." } })
+    expect(image.status).toBe(200)
     const shown = await page.waitFor("present.show", (m) => m.presentation.id === image.body.id)
     const img = shown.presentation.content.kind === "image" && shown.presentation.content.image.state === "ready" ? shown.presentation.content.image.token : ""
     const got = await fetch(`${http}/media/${img}`)
@@ -300,6 +320,7 @@ describe("the mock, through its handlers, as the server", { timeout: 30_000 }, (
   })
 
   it("P10 review round 2 (R7): the mock checks the whole request before it changes anything, refuses what it does not model (personal content, a key), and admits with the server's live bounds", async () => {
+    await clearPresentations()
     const http = url.replace(/^ws/, "http").replace(/\/ws$/, "")
     const screen = { v: 1, display: { class: "standard", widthPx: 800, heightPx: 600, dpr: 1, touch: "coarse", colour: true }, present: { kinds: { card: 1, list: 1, timer: 1, image: 1, weather: 1 } } }
     const pages = await Promise.all(["d-mock-round2a", "d-mock-round2b", "d-mock-round2c"].map((id) => Peer.open({ device: { id, kind: "web-voice", name: id, capabilities: screen } as never })))
@@ -355,10 +376,12 @@ describe("the mock, through its handlers, as the server", { timeout: 30_000 }, (
     shown.push(replacing.body.id!)
     // A dismissal gives its place back; an end does too.
     expect((await post("/mock/present/dismiss", { id: onB[0] })).body).toEqual({ dismissed: true })
-    const short = await pin("d-mock-round2c", "Short", { lifetime: "pinned", expiresInMs: 3_000 })
+    // A short one fills the bound again (it lives five seconds: only one request lies between it and the check).
+    const short = await pin("d-mock-round2c", "Short", { lifetime: "pinned", expiresInMs: 5_000 })
     expect(short.status).toBe(200)
     expect((await pin("d-mock-round2c", "Full again")).body.error).toBe("limit")
-    await c.waitFor("present.dismiss", (m) => m.id === short.body.id, 0, 6_000)
+    // Its end, waited for as the event it is: then there is room.
+    await c.waitFor("present.dismiss", (m) => m.id === short.body.id, 0, 20_000)
     expect((await pin("d-mock-round2c", "Fits again")).status).toBe(200)
     for (const id of shown) await post("/mock/present/dismiss", { id })
     void b
