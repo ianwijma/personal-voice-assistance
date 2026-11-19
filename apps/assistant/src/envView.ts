@@ -77,6 +77,8 @@ export interface EnvView {
   readonly locationOf: (key: string) => { readonly file: string; readonly line: number } | undefined
   /** The `.env` files read, in the order they were applied (the first one wins). */
   readonly files: ReadonlyArray<string>
+  /** Every loaded file that declares a key, including declarations shadowed by an earlier file. */
+  readonly declaredIn: (key: string) => ReadonlyArray<string>
   /** Every set variable (non-empty), including redacted ones (their value is gone, their origin is kept). */
   readonly keys: () => ReadonlyArray<string>
   /**
@@ -105,9 +107,11 @@ export const makeEnvView = (options: EnvViewOptions): EnvView => {
   const origins = new Map<string, EnvOrigin>()
   for (const key of Object.keys(record)) origins.set(key, { kind: "process" })
   const files: Array<string> = []
+  const declarations = new Map<string, Array<string>>()
   for (const file of options.files ?? []) {
     files.push(file.path)
     for (const { key, value, line } of parseEnvFile(file.text)) {
+      declarations.set(key, [...(declarations.get(key) ?? []), file.path])
       if (Object.hasOwn(record, key)) continue
       record[key] = value
       origins.set(key, { kind: "file", path: file.path, line })
@@ -137,6 +141,7 @@ export const makeEnvView = (options: EnvViewOptions): EnvView => {
       return o?.kind === "file" ? { file: o.path, line: o.line } : undefined
     },
     files,
+    declaredIn: (key) => declarations.get(key) ?? [],
     keys: () => [...Object.keys(record).filter((k) => (record[k] ?? "") !== ""), ...redacted.keys()],
     redact: (key) => {
       const origin = origins.get(key)

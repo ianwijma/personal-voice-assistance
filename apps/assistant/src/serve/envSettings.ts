@@ -261,6 +261,7 @@ export const makeEnvMover = (options: {
   const envCatalog = makeEnvCatalog(options.catalog)
   const commentOut = options.commentOut ?? commentOutKeys
   let busy = false
+  const policyInput = (key: string) => key === "HOME_LANGUAGE" || Object.values(RISK_POLICY_KEYS).some((k) => k === key)
 
   const fail = (code: "invalid_settings" | "locked" | "busy" | "internal", message: string): HostResult => ({ ok: false, error: { code, message } })
 
@@ -302,41 +303,47 @@ export const makeEnvMover = (options: {
               continue
             }
           }
-          // Keep a risk override effective during its write. Other commits may publish the policy while it waits;
-          // a failed move must never expose the old underlying value, even temporarily.
-          const riskKey = Object.values(RISK_POLICY_KEYS).some((key) => key === p.key)
-          if (!riskKey) options.view.release(p.key)
-          const saved = yield* riskKey ? Effect.uninterruptible(Effect.gen(function*() {
-            const result = yield* save(p, secret)
-            if (result.ok) {
-              options.view.release(p.key)
-              options.sections.announceAll()
-            }
-            return result
-          })) : save(p, secret)
+          // Keep policy inputs effective and locked through saving AND removing every file declaration.
+          // Home language is published with the policy, so it needs the same ordering as the risk keys.
+          const retained = policyInput(p.key)
+          if (!retained) options.view.release(p.key)
+          const saved = yield* retained ? Effect.uninterruptible(save(p, secret)) : save(p, secret)
           if (!saved.ok) {
-            if (!riskKey) options.view.restore(p.key, p.text, p.origin)
+            if (!retained) options.view.restore(p.key, p.text, p.origin)
             problems.push(`${p.key}: ${saved.message}`)
             continue
           }
           moved.push(p)
         }
         if (moved.length > 0) {
-          // Comment the lines out, one rewrite per file. A failure here leaves the value saved and the line in place.
-          const byFile = new Map<string, Array<string>>()
-          for (const p of moved) byFile.set(p.origin.path, [...(byFile.get(p.origin.path) ?? []), p.key])
-          for (const [file, fileKeys] of byFile) {
-            const result = yield* Effect.tryPromise(() => commentOut(file, fileKeys, (options.now ?? (() => new Date()))())).pipe(Effect.result)
-            if (result._tag === "Failure") {
-              const code = (result.failure.cause as NodeJS.ErrnoException | undefined)?.code ?? "error"
-              problems.push(`${fileKeys.join(", ")} saved, but ${file} could not be changed (${code}): comment the lines out by hand`)
-              yield* Effect.logWarning(`Moved ${fileKeys.join(", ")} into the settings, but could not edit ${file} (${code})`)
-            } else {
-              yield* Effect.logInfo(`Moved ${fileKeys.join(", ")} from ${file} into the settings (backup: ${result.success.backup})`)
+          yield* Effect.uninterruptible(Effect.gen(function*() {
+            // Remove shadowed declarations first and the winning one last. If a rewrite fails, leave earlier
+            // declarations of that key in place: even a restart during this step still reads the chosen value.
+            const byFile = new Map<string, Array<string>>()
+            for (const file of [...options.view.files].reverse()) {
+              const fileKeys = moved.filter((p) => policyInput(p.key)
+                ? options.view.declaredIn(p.key).includes(file)
+                : p.origin.path === file).map((p) => p.key)
+              if (fileKeys.length > 0) byFile.set(file, fileKeys)
             }
-          }
-          options.sections.announceAll()
-          options.onMoved()
+            const failedKeys = new Set<string>()
+            for (const [file, plannedKeys] of byFile) {
+              const fileKeys = plannedKeys.filter((key) => !failedKeys.has(key))
+              if (fileKeys.length === 0) continue
+              const result = yield* Effect.tryPromise(() => commentOut(file, fileKeys, (options.now ?? (() => new Date()))())).pipe(Effect.result)
+              if (result._tag === "Failure") {
+                for (const key of fileKeys) failedKeys.add(key)
+                const code = (result.failure.cause as NodeJS.ErrnoException | undefined)?.code ?? "error"
+                problems.push(`${fileKeys.join(", ")} saved, but ${file} could not be changed (${code}): comment the lines out by hand, then retry the move`)
+                yield* Effect.logWarning(`Moved ${fileKeys.join(", ")} into the settings, but could not edit ${file} (${code})`)
+              } else {
+                yield* Effect.logInfo(`Moved ${fileKeys.join(", ")} from ${file} into the settings (backup: ${result.success.backup})`)
+              }
+            }
+            for (const p of moved) if (policyInput(p.key) && !failedKeys.has(p.key)) options.view.release(p.key)
+            options.sections.announceAll()
+            options.onMoved()
+          }))
         }
         if (problems.length > 0) {
           return { ...fail("invalid_settings", problems.join("; ")), moved: moved.map((p) => p.key) }

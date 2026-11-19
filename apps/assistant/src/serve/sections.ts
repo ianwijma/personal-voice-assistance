@@ -320,7 +320,9 @@ export const makeSections = (
           patched = { ...patched, stored: out }
         }
         // The values after this save, for every section (keys are global), and the keys it writes.
-        const sectionKeys = [...Object.keys(d.spec), ...(d.storedKeys ?? [])]
+        // An unrelated Home edit must not replace a concurrently moved language from its earlier snapshot.
+        const sectionKeys = [...Object.keys(d.spec), ...(d.storedKeys ?? [])].filter((key) =>
+          id !== "home" || key !== "HOME_LANGUAGE" || Object.hasOwn(patch.values, key) || Object.hasOwn(patch.secrets, key))
         // A risk edit writes only its patch and fixed-key cleanup: a concurrent environment move writes its own
         // key directly to the store and must not be replaced from this edit's earlier snapshot.
         const keys = id === "risk"
