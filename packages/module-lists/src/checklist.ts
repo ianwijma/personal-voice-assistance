@@ -506,8 +506,8 @@ export const makeChecklists = (ctx: {
           }
           const spoken = built.presentation.spoken
           if (r.kind === "cannot") {
-            // The host accepted it: dismissal stays owed until its retained handle closes it.
-            yield* oweUnsupportedDismissal(recorded, r.handle)
+            // The host answered: retain the close intent now; only the worker waits for bookkeeping.
+            handles.set(device, { handle: r.handle, shown, until, closing: true })
             ask(device)
             return { kind: "not-shown", spoken, why: r.why } as const
           }

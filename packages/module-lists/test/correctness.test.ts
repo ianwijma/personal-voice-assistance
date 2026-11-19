@@ -763,3 +763,44 @@ describe("correctness review round 4", () => {
     }
   }
 })
+
+
+describe("correctness review round 5", () => {
+  for (const language of ["en", "nl"] as const) for (const supported of [true, false]) {
+    it.effect(`1: ${language} ${supported ? "supported" : "unsupported"} show answers while post-acceptance bookkeeping is held`, () => Effect.gen(function*() {
+      const kinds: Record<string, number> = { ...KIT_PAGE_CAPABILITIES.present!.kinds }
+      const capabilities = { ...structuredClone(KIT_PAGE_CAPABILITIES), present: { ...KIT_PAGE_CAPABILITIES.present!, kinds } }
+      if (!supported) delete kinds.list
+      const entered = yield* Deferred.make<void>()
+      const release = yield* Deferred.make<void>()
+      let accepted = false
+      let holds = 0
+      let dismissals = 0
+      const kit = yield* startTestModule(wrap((ctx) => ({ ...ctx,
+        present: { ...ctx.present, show: (...a: ReadonlyArray<unknown>) => ctx.present.show(...a).pipe(Effect.map((handle: { dismiss: Effect.Effect<boolean, PresentError> }) => {
+          accepted = true
+          return { ...handle, dismiss: Effect.suspend(() => { dismissals++; return handle.dismiss }) }
+        })) },
+        store: { ...ctx.store, transaction: (body: (tx: StoreTx) => unknown) => Effect.suspend(() => {
+          if (!accepted || holds > 0) return ctx.store.transaction(body)
+          holds++
+          return Effect.andThen(Deferred.succeed(entered, undefined), Effect.andThen(Deferred.await(release), ctx.store.transaction(body)))
+        }) }
+      })), { household: { home: { HOME_LANGUAGE: language }, devices: [{ id: "kitchen-display", name: "Kitchen", capabilities }] } })
+      yield* kit.action("add", { items: "milk" })
+      const pending = yield* Effect.forkScoped(kit.action("show", {}))
+      yield* Deferred.await(entered)
+      yield* TestClock.adjust(5_001)
+      const answer = yield* Fiber.join(pending)
+      yield* Deferred.succeed(release, undefined)
+      yield* kit.advance(65_000)
+      assert.strictEqual(holds, 1)
+      assert.deepStrictEqual(answer, { ok: true, say: supported
+        ? language === "en" ? "Showing the shopping list on this screen." : "De boodschappenlijst staat op dit scherm."
+        : language === "en" ? "This device can't show it. The shopping list has one thing: milk." : "Dit apparaat kan het niet tonen. Op de boodschappenlijst staat één ding: milk." })
+      assert.strictEqual(dismissals, supported ? 0 : 1)
+      assert.strictEqual((yield* rows(kit)).length, supported ? 1 : 0)
+      assert.strictEqual(kit.present.engine.live().length, supported ? 1 : 0)
+    }))
+  }
+})

@@ -211,7 +211,9 @@ stand in for a name:
   first recorded in the row, then done; if the host is busy it is tried again until done, and the answer says "I'll
   take the shopping list off this screen as soon as I can." A close is a close until the checklist's actual end, also
   in its last seconds. If the list is gone (for example its creation was undone), the answer says "That list is gone."
-  / "Die lijst bestaat niet meer."; a closing card uses a generic localized title and the same sentence. A list's internal
+  / "Die lijst bestaat niet meer."; a closing card uses a generic localized title and the same sentence when the list's row
+  is absent, while a deleted list retained for undo keeps its name and says "The camping list isn't shown any more."
+  / "De lijst camping wordt niet meer getoond." A list's internal
   id is never used as its display name or spoken name.
 - **A restart** keeps the pins and the screens (the host keeps pinned presentations). When the module starts it
   reconciles every pin (a page of 16 at a time): what changed while it was stopped is shown, and an unchanged checklist
