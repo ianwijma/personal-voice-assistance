@@ -210,6 +210,11 @@ export interface HubOptions {
    */
   readonly notify?: Pick<NotifyEngine, "reconcile" | "press" | "stopSpeech" | "busyAnswer">
   /**
+   * P7: a device's reply volume when it is not the default (`DeviceControl`), sent as `output.volume` to each of its
+   * voice connections right after its `welcome`. Absent, or `undefined` for the device: nothing is sent.
+   */
+  readonly replyVolume?: (deviceId: string) => number | undefined
+  /**
    * P10: the Presenter (docs/PRESENTING.md). The device is reconciled at the same moments as for notifications (a hello
    * once its record is written, a close, a changed declaration); a tick or a button is `present.action`, through the
    * bounded admission, answered with `result` (`say`). Absent: none of it.
@@ -978,6 +983,11 @@ export const makeSessionHub = (options: HubOptions): SessionHub => {
       snapshot: first
     })
     if (client.adminToken !== undefined) sendAdminSnapshot(client)
+    // P7: the device's reply volume when it is not the default (the page set its gain back to the default at welcome).
+    if (client.role === "voice" && client.device !== undefined) {
+      const volume = options.replyVolume?.(client.device.id)
+      if (volume !== undefined) send(client, { type: "output.volume", volume })
+    }
     const firstOfDevice = client.device !== undefined && ![...clients].some((c) => c !== client && c.helloed && !c.closed && c.device?.id === client.device!.id)
     client.helloed = true
     if (client.device !== undefined) deviceChanged()
