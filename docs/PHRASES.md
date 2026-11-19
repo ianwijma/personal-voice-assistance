@@ -278,7 +278,8 @@ alias each, and a duration; plus the host's 37 English controls).
 | a 24-word turn that is no command, something ringing, its set invalidated before every final (the final read the host's controls while the set was prepared again: 120 of 120), `TurnTrace`, 100 turns × 4 counterbalanced runs, the real `Conversation`, the model's first token at 5 ms | end of turn → first audio 5.413 ms without the decision, 5.411 ms with it (p95 5.70 / 5.78); the recogniser's final → first audio 5.432 / 5.496 ms (p95 5.73 / 5.92) |
 
 So a turn that is not a command moved by a median 0.06 ms from the recogniser's final (the test asserts under 1 ms),
-and a final never compiles a set.
+and a final never compiles a set. Run as CI runs it (`CI=1`, two cores): the aligned worst case median 0.214 ms, worst
+4.1 ms, longest stop 4.8 ms; a preparation's longest stop 2.7 ms; the turn's final → first audio 5.442 / 5.531 ms.
 
 ## Not now
 
