@@ -3,7 +3,7 @@
 // module's store and shows it again; and its test through the kit (what was shown where, a tick, a page that does not
 // hold it, a device that leaves and comes back, the module stopped).
 import { assert, describe, it } from "@effect/vitest"
-import { defineCollection, defineModule, makeTool, type Presentation } from "@pva/core"
+import { defineAction, defineCollection, defineModule, makeTool, type Presentation } from "@pva/core"
 import { startTestModule } from "@pva/core/testing"
 import { Effect, Schema } from "effect"
 import { defineTexts, homeLanguage, say } from "../../src/index.ts"
@@ -84,7 +84,7 @@ describe("the errands (docs/MODULES.md, docs/PRESENTING.md)", () => {
       const kit = yield* startTestModule(errandsModule)
       const shown = yield* kit.tool("errands_show", {}, { device: "kitchen-display" })
       // The model gets what the tool returned for it, and the note of what the server did.
-      assert.strictEqual(shown.content, "{\"open\":[\"Bread\",\"Stamps\"]}\n[Screen: Shown on \"Kitchen display\".]")
+      assert.strictEqual(shown.content, "{\"open\":[\"Bread\",\"Stamps\"]}\n[Screen: Showing on \"Kitchen display\".]")
       yield* kit.present.settle
       const [list] = kit.present.shown("kitchen-display")
       assert.strictEqual(list?.content.kind, "list")
@@ -122,8 +122,99 @@ describe("the errands (docs/MODULES.md, docs/PRESENTING.md)", () => {
         household: { devices: [{ id: "office-speaker", name: "Office speaker", room: "Office", capabilities: { v: 1, speaker: { media: ["speech"] } } }] }
       })
       const shown = yield* kit.tool("errands_show", {}, { device: "office-speaker" })
-      assert.match(shown.content, /\[Screen: Not shown: "Office speaker" has no display; say it instead\.\]$/)
+      // The note carries what the module would have the model say instead (its `spoken`).
+      assert.match(shown.content, /\[Screen: Not showing it: "Office speaker" has no display\. Say this instead: Your errands: Bread, Stamps\.\]$/)
       yield* kit.present.settle
       assert.deepStrictEqual(kit.present.shown("office-speaker"), [])
+    }))
+
+  it.effect("a8: the kit's page that disconnects shows nothing; a transient that ended meanwhile is not back after it reconnects", () =>
+    Effect.gen(function*() {
+      const kit = yield* startTestModule(flasher)
+      yield* kit.tool("flasher_flash", {}, { device: "kitchen-display" })
+      yield* kit.present.settle
+      assert.strictEqual(kit.present.shown("kitchen-display").length, 1)
+      yield* kit.notify.disconnect("kitchen-display")
+      assert.deepStrictEqual(kit.present.shown("kitchen-display"), [])
+      yield* kit.advance(4_000)
+      yield* kit.notify.connect("kitchen-display")
+      assert.deepStrictEqual(kit.present.shown("kitchen-display"), [])
+    }))
+
+  it.effect("a9: a press handler that sends a notification to \"origin\" sends it to the device it was pressed on", () =>
+    Effect.gen(function*() {
+      const kit = yield* startTestModule(flasher)
+            yield* kit.tool("flasher_pin", {}, { device: "kitchen-display" })
+      yield* kit.present.settle
+      const pinned = kit.present.shown("kitchen-display").find((p) => p.lifetime === "pinned")!
+      assert.deepStrictEqual(yield* kit.present.press(pinned.id, "ring", { device: "kitchen-display" }), { ok: true, say: "Rung." })
+      const [sent] = yield* kit.notify.all
+      assert.strictEqual(sent?.deviceId, "kitchen-display")
+      assert.strictEqual(sent?.target, "origin")
+    }))
+})
+
+/** A small module for the kit's cases: a three-second card, a pinned card whose button rings on the device pressed on. */
+const flasher = defineModule({
+  apiVersion: 2,
+  id: "flasher",
+  name: "Flasher",
+  description: "Shows a card for three seconds.",
+  enabledByDefault: false,
+  shared: (ctx) =>
+    Effect.gen(function*() {
+      yield* ctx.present.handle("ring", { run: () => Effect.as(Effect.orDie(ctx.notify.send({ title: "Pressed", target: "origin" })), { say: "Rung." }) }).pipe(Effect.orDie)
+      return { value: undefined }
+    }),
+  start: () =>
+    Effect.succeed({
+      tools: [
+        makeTool({
+          name: "flasher_flash",
+          description: "Flash a card.",
+          parameters: Schema.Struct({}),
+          speculative: true,
+          execute: () => Effect.succeed({ forModel: "ok", present: { kind: "card" as const, title: "Flash", spoken: "Flash." }, show: { expiresInMs: 3_000 } })
+        }),
+        makeTool({
+          name: "flasher_pin",
+          description: "Pin a card with a button.",
+          parameters: Schema.Struct({}),
+          speculative: true,
+          execute: () => Effect.succeed({ forModel: "ok", present: { kind: "card" as const, title: "Pinned", spoken: "Pinned.", buttons: [{ id: "ring", label: "Ring" }], handler: "ring" }, show: { lifetime: "pinned" as const } })
+        })
+      ]
+    })
+})
+
+describe("a phrase command whose action shows something", () => {
+  it.effect("is shown on the device the phrase was said on, and its execution trace says it presented", () =>
+    Effect.gen(function*() {
+      const shower = defineModule({
+        apiVersion: 2,
+        id: "shower",
+        name: "Shower",
+        description: "Shows the bins.",
+        enabledByDefault: false,
+        start: () =>
+          Effect.succeed({
+            actions: [defineAction({
+              id: "bins",
+              label: "Show the bins",
+              description: "Show which bins go out.",
+              params: {},
+              phrases: { en: ["show the bins"], nl: ["laat de containers zien"] },
+              risk: "read",
+              speculative: true,
+              run: () => Effect.succeed({ say: "Paper tonight.", present: { kind: "card" as const, title: "Bins", text: "Paper", spoken: "Paper tonight." } })
+            })]
+          })
+      })
+      const kit = yield* startTestModule(shower)
+      const said = yield* kit.phrases.say("Show the bins.", { device: "kitchen-display" })
+      assert.isTrue(said.taken)
+      yield* kit.present.settle
+      assert.deepStrictEqual(kit.present.shown("kitchen-display").map((p) => p.content.kind), ["card"])
+      assert.isTrue(kit.phrases.traces.at(-1)?.presented)
     }))
 })

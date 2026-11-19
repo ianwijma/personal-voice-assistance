@@ -1325,8 +1325,8 @@ module's own socket ([NOTIFICATIONS.md](NOTIFICATIONS.md) has the calls, the bou
   as the press (its device is the origin of what it sends; a job it schedules needs `origin: { deviceId }`), answers
   `{ say?, keepOpen? }`, and **is idempotent by notification id**: after a store failure it may run again for the same
   notification.
-- **`ctx.speech.say(target, text, { cue? })`**: one line on a device, a room's devices or everywhere, after whatever is
-  being said there. Inside a turn, never wait for its `done` (it fails `in-turn`); return the spoken answer as the
+- **`ctx.speech.say(target, text, { cue? })`**: one line on a device, a room's devices (`{ room, except? }`: all but one
+  device) or everywhere, after whatever is being said there; an empty text with `cue: true` is the chime alone. Inside a turn, never wait for its `done` (it fails `in-turn`); return the spoken answer as the
   tool's result as before.
 - `ctx.notify.dnd` reads and sets do not disturb for the house. Nothing may send above `ring`.
 
@@ -1429,9 +1429,10 @@ What a module shows on a device's screen goes through the Presenter, never a mod
 ([PRESENTING.md](PRESENTING.md) has the kinds, their bounds, the decision and what is left out):
 
 - **From a tool or an action**, return `{ forModel, present, show? }`: the model gets `forModel` with a note of what the
-  server did ("Shown on "Kitchen display".", or "Not shown: … has no display; say it instead."), and the presentation
-  goes to the device the call came from in one enqueue (nothing else on the turn's path). An action returns
-  `{ say, present }`. A presentation that is not valid or passes a bound is not shown and the note says why.
+  server decided ("Showing on "Kitchen display".", or "Not showing it: … has no display. Say this instead: <your
+  `spoken`>"), and the presentation goes to the device the call came from in one enqueue (nothing else on the turn's
+  path); once accepted it is written, retried if the store refuses, until it is or no longer applies. An action returns
+  `{ say, present }`. A presentation that is not valid or passes a bound is not accepted and the note says why.
 - **From other code** (a job, a press handler), `ctx.present.show(target, presentation, options?)` answers a handle
   with `update` and `dismiss` (they die with `ModuleStopped` once the part has closed); `target` is `"origin"`, a
   `{ device }` or a `{ room }`.
@@ -1443,8 +1444,10 @@ What a module shows on a device's screen goes through the Presenter, never a mod
   A transient one goes when the part that made it stops; a pinned one is stored and stays.
 - **Ticks and buttons reach a press handler registered in `shared`** with `ctx.present.handle(name, { run })`, like
   notification action handlers: claimed first (one press at a time), as the press (its device is the origin), within
-  5 s; while your module is down they answer "I can't do that right now". The handler shows the change; the press
-  itself changes nothing.
+  5 s; while your module is down they answer "I can't do that right now". A press is not a tool call (no risk class or
+  trace of its own; what the handler calls through the gateway is checked there), and what the handler committed before
+  a failure or its time limit stays. The handler shows the change; the press itself changes nothing. A handle acts only
+  on its own show: after the same key is shown again, its `update` answers `undefined` and its `dismiss` `false`.
 
 <!-- region: packages/module-contracts/test/kit/presentExample.test.ts#present-module -->
 ```ts
@@ -1523,7 +1526,7 @@ Its test, through the kit's `present` handles (what each page holds, a press as 
 const kit = yield* startTestModule(errandsModule)
 const shown = yield* kit.tool("errands_show", {}, { device: "kitchen-display" })
 // The model gets what the tool returned for it, and the note of what the server did.
-assert.strictEqual(shown.content, "{\"open\":[\"Bread\",\"Stamps\"]}\n[Screen: Shown on \"Kitchen display\".]")
+assert.strictEqual(shown.content, "{\"open\":[\"Bread\",\"Stamps\"]}\n[Screen: Showing on \"Kitchen display\".]")
 yield* kit.present.settle
 const [list] = kit.present.shown("kitchen-display")
 assert.strictEqual(list?.content.kind, "list")
