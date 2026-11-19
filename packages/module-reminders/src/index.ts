@@ -703,6 +703,8 @@ export const remindersModule = defineModule({
     const sh = ctx.shared
     const failed = (l: Language, key: "unsaved" | "unread" = "unsaved") => new ToolError({ message: say(texts, l, key) })
     const personalQuiet = (owner: string | undefined, turn: TurnContext | undefined) => owner !== undefined && ctx.host.service(Privacy)?.mayReveal(owner, turn) !== true
+    // A confirmation that was reduced because its owner may not be told here names nothing personal and carries no owner:
+    // it is household content, so the gateway lets it through where the personal one would be withheld.
     const ownerOf = (result: unknown) => {
       // A list comes with its presentation: the owner is in what the model gets.
       const said = isPresentResult(result) ? result.forModel : result
@@ -746,7 +748,7 @@ export const remindersModule = defineModule({
         const spoken = said.kind === "once"
           ? say(texts, l, quiet ? "setOncePrivate" : owner === undefined ? "setOnceHousehold" : "setOnce", { when: at, text: v.text })
           : say(texts, l, quiet ? "setRepeatPrivate" : owner === undefined ? "setRepeatHousehold" : "setRepeat", { when: at, text: v.text, rule })
-        return { spoken, ...(owner !== undefined ? { owner } : {}) }
+        return { spoken, ...(owner !== undefined && !quiet ? { owner } : {}) }
       })
 
     const setTool = makeTool({
@@ -852,7 +854,7 @@ export const remindersModule = defineModule({
             const owner = row.value.owner
             if (row.value.state !== "open") {
               row = yield* sh.reconcileLocked(id, { send: false, forceStop: true })
-              return { spoken: `${say(texts, l, "snoozeEnded")}${sh.stopping(row, l)}`, ...(owner !== undefined ? { owner } : {}) }
+              return { spoken: `${say(texts, l, "snoozeEnded")}${sh.stopping(row, l)}`, ...(owner !== undefined && !personalQuiet(owner, turn) ? { owner } : {}) }
             }
             const r = row.value
             const ring = r.ring
@@ -889,7 +891,7 @@ export const remindersModule = defineModule({
               : v.rrule !== undefined
               ? say(texts, l, "changedRepeat", { text: v.text, rule: ruleText(v, l), when: whenSaid })
               : say(texts, l, "changed", { text: v.text, when: whenSaid })
-            return { spoken: `${spoken}${sh.stopping(row, l)}`, ...(owner !== undefined ? { owner } : {}) }
+            return { spoken: `${spoken}${sh.stopping(row, l)}`, ...(owner !== undefined && !quiet ? { owner } : {}) }
           }))
         }).pipe(Effect.mapError((e) => (e instanceof ToolError ? e : failed(sh.lang()))))
     })
@@ -918,7 +920,7 @@ export const remindersModule = defineModule({
                   ? personalQuiet(owner, turn) ? say(texts, l, "cancelledPrivate") : say(texts, l, "cancelled", { text })
                   : say(texts, l, "snoozeEnded")
               }${sh.stopping(row, l)}`,
-              ...(owner !== undefined ? { owner } : {})
+              ...(owner !== undefined && !personalQuiet(owner, turn) ? { owner } : {})
             })
             if (row.value.state !== "open") {
               // Finished already, its cleanup still owed: this finishes the cleanup.

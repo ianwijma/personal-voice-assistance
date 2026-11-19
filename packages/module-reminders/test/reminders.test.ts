@@ -144,7 +144,8 @@ describe("setting a reminder", () => {
     Effect.gen(function*() {
       const kit = yield* startTestModule(remindersModule, lobby)
       const set = yield* kit.tool("reminders_set", { text: "dentist", when: "in an hour", scope: "me" }, { device: "lobby-screen" })
-      assert.deepStrictEqual(set.value, { spoken: "Reminder set for today at eleven o'clock in the morning, only for you. This device does not ring with your personal reminders.", owner: "p-sam" })
+      // No owner on the reduced confirmation: it names nothing personal, so it is household content and is not withheld.
+      assert.deepStrictEqual(set.value, { spoken: "Reminder set for today at eleven o'clock in the morning, only for you. This device does not ring with your personal reminders." })
       assert.notInclude(set.content, "dentist")
       assert.strictEqual((yield* theRow(kit)).value.text, "dentist")
     }))
