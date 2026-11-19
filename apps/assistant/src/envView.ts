@@ -24,7 +24,7 @@ export interface EnvAssignment {
   readonly lines: number
 }
 
-const ASSIGNMENT = /^\s*(?:export\s+)?([\w.-]+)\s*=\s*(.*)$/
+const ASSIGNMENT = /^\s*(?:export\s+)?([\w.-]+)\s*=\s*(.*)$/s
 
 /**
  * The assignments of a `.env` text, in order (a key assigned twice appears twice; the last one wins, as in
@@ -79,6 +79,8 @@ export interface EnvView {
   readonly files: ReadonlyArray<string>
   /** Every loaded file that declares a key, including declarations shadowed by an earlier file. */
   readonly declaredIn: (key: string) => ReadonlyArray<string>
+  /** Parsed declarations at startup, including shadowed values, for move-time validation. */
+  readonly fileValues: (path: string) => Readonly<Record<string, string>>
   /** Every set variable (non-empty), including redacted ones (their value is gone, their origin is kept). */
   readonly keys: () => ReadonlyArray<string>
   /**
@@ -108,9 +110,12 @@ export const makeEnvView = (options: EnvViewOptions): EnvView => {
   for (const key of Object.keys(record)) origins.set(key, { kind: "process" })
   const files: Array<string> = []
   const declarations = new Map<string, Array<string>>()
+  const fileValues = new Map<string, Record<string, string>>()
   for (const file of options.files ?? []) {
     files.push(file.path)
-    for (const { key, value, line } of parseEnvFile(file.text)) {
+    const parsed = parseEnvFile(file.text)
+    fileValues.set(file.path, Object.fromEntries(parsed.map(({ key, value }) => [key, value])))
+    for (const { key, value, line } of parsed) {
       declarations.set(key, [...(declarations.get(key) ?? []), file.path])
       if (Object.hasOwn(record, key)) continue
       record[key] = value
@@ -142,11 +147,13 @@ export const makeEnvView = (options: EnvViewOptions): EnvView => {
     },
     files,
     declaredIn: (key) => declarations.get(key) ?? [],
+    fileValues: (path) => fileValues.get(path) ?? {},
     keys: () => [...Object.keys(record).filter((k) => (record[k] ?? "") !== ""), ...redacted.keys()],
     redact: (key) => {
       const origin = origins.get(key)
       if (!Object.hasOwn(record, key) || origin === undefined) return
       if ((record[key] ?? "") !== "") redacted.set(key, origin)
+      for (const values of fileValues.values()) delete values[key]
       delete record[key]
       origins.delete(key)
       if (options.mirror !== undefined) delete options.mirror[key]

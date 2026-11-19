@@ -714,12 +714,16 @@ each file with `util.parseEnv(readFileSync(path))` (available in this Node **[ru
 4. If a released key is a reload field, set `reloadPending`. The running engines keep the old value until the reload,
    so nothing changes mid-turn.
 
-For configurable risk keys and `HOME_LANGUAGE` (the policy's sentence language), the override and field lock stay
-in place until the value is saved and every loaded file declaring the key has been rewritten. Shadowed declarations
-are removed first, the winning declaration last; a failed rewrite leaves earlier declarations in place, the override
-effective and the field locked. The value is already saved, and retrying the move finishes the remaining rewrites.
-File rewrites, release and the section announcement finish without caller interruption between them. An unrelated
-Home save does not write `HOME_LANGUAGE`.
+For configurable risk keys and `HOME_LANGUAGE` (the policy's sentence language), the move first reads every loaded
+file and compares its parsed values for those keys with the declarations captured at startup (or after this mover's
+own successful rewrites). A changed declaration or unreadable file refuses the move before any settings are saved;
+restart the assistant to reload the `.env` files, then retry. The override and field lock stay in place until the value
+is saved and every declaring file has been rewritten and checked with Node's parser to contain no assignment for
+the moved key. The line scanner includes Unicode line separators inside comments. Shadowed declarations are removed
+first, the winning declaration last; a failed or incomplete rewrite leaves earlier declarations in place, the override
+effective and the field locked. The value is already saved, and retrying the move finishes the remaining rewrites;
+if the files are edited by hand, restart the assistant to reload them first. File rewrites, release and the section
+announcement finish without caller interruption between them. An unrelated Home save does not write `HOME_LANGUAGE`.
 
 The Overrides page (Keys & access › Settings from outside) is derived client-side from every form's `locked` fields,
 plus a server-provided list of known `.env` keys that match no field (`unusedEnvKeys`, so typos like

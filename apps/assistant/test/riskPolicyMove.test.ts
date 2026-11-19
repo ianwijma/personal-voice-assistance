@@ -1,6 +1,6 @@
 import { makeExecutionGateway, makeTool, makeToolRegistry } from "@pva/core"
 import { Effect, Schema } from "effect"
-import { mkdtempSync, readFileSync, writeFileSync } from "node:fs"
+import { existsSync, mkdtempSync, readFileSync, unlinkSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { describe, expect, it } from "vitest"
@@ -224,6 +224,80 @@ describe("moving Home language (review round 2)", () => {
       expect(readFileSync(path, "utf8").includes("HOME_LANGUAGE=")).toBe(!moveFirst)
       const restartedView = makeEnvView({ processEnv: {}, files: [{ path, text: readFileSync(path, "utf8") }] })
       expect(makeSections(await run(openStore(dir)), restartedView.record).riskLanguage()).toBe("nl")
+    })
+  }
+})
+
+
+describe("policy move file validation (review round 3)", () => {
+  const setup = async (key: string, initial: string, shadow: string) => {
+    const dir = mkdtempSync(join(tmpdir(), "pva-policy-files-"))
+    const paths = [join(dir, "launch.env"), join(dir, "repo.env")]
+    writeFileSync(paths[0]!, initial)
+    writeFileSync(paths[1]!, shadow)
+    const load = () => makeEnvView({ processEnv: {}, files: paths.filter(existsSync).map((path) => ({ path, text: readFileSync(path, "utf8") })) })
+    const view = load()
+    const store = await run(openStore(dir))
+    const sections = makeSections(store, view.record)
+    let announcements = 0
+    const options = { view, catalog: [], sections, store, host: {} as never, vaultState: () => "none" as const, onMoved: () => { announcements++ } }
+    const state = (s: typeof sections) => key === "HOME_LANGUAGE" ? s.riskLanguage() : s.riskPolicy().read
+    const restart = async () => state(makeSections(await run(loadSettingsStore(dir, { readOnly: true })), load().record))
+    return { dir, paths, load, view, store, sections, options, state, restart, announcements: () => announcements }
+  }
+
+  for (const key of ["HOME_LANGUAGE", "RISK_READ"]) {
+    const value = key === "HOME_LANGUAGE" ? "nl-NL" : "deny"
+    const other = key === "HOME_LANGUAGE" ? "en-GB" : "allow"
+    for (const change of ["add shadow", "remove shadow", "delete shadow file", "change shadow", "change winner"]) {
+      it(`refuses ${key} before saving when files ${change}, then moves after reload`, async () => {
+        const t = await setup(key, `${key}=${value}\n`, change === "add shadow" ? "# unrelated\n" : `${key}=${other}\n`)
+        const mover = makeEnvMover(t.options)
+        if (change === "delete shadow file") unlinkSync(t.paths[1]!)
+        else if (change === "remove shadow") writeFileSync(t.paths[1]!, "# removed\n")
+        else if (change === "change winner") writeFileSync(t.paths[0]!, `${key}=${other}\n`)
+        else writeFileSync(t.paths[1]!, `${key}=${change === "change shadow" ? value : other}\n`)
+        const filesBefore = t.paths.map((path) => existsSync(path) ? readFileSync(path, "utf8") : undefined)
+        const result = await run(mover.move([key]))
+        expect(result).toMatchObject({ ok: false, error: { code: "invalid_settings", message: expect.stringMatching(/reload/i) } })
+        expect(t.store.settings().assistant[key]).toBeUndefined()
+        expect(t.view.get(key)).toBe(value)
+        expect(t.announcements()).toBe(0)
+        expect(t.paths.map((path) => existsSync(path) ? readFileSync(path, "utf8") : undefined)).toEqual(filesBefore)
+        const reloaded = t.load()
+        const sections = makeSections(t.store, reloaded.record)
+        const before = t.state(sections)
+        expect(await run(makeEnvMover({ ...t.options, view: reloaded, sections }).move([key]))).toEqual({ ok: true, moved: [key] })
+        expect(t.state(sections)).toBe(before)
+        expect(await t.restart()).toBe(before)
+      })
+    }
+
+    for (const separator of ["\u2028", "\u2029"]) {
+      it(`moves ${key} with U+${separator.charCodeAt(0).toString(16)} in its comment and an edit survives restart`, async () => {
+        const t = await setup(key, `${key}=${value} # owner${separator}preference\n`, "# unrelated\n")
+        expect(await run(makeEnvMover(t.options).move([key]))).toEqual({ ok: true, moved: [key] })
+        expect(t.view.get(key)).toBeUndefined()
+        const edited = await run(t.sections.update(key === "HOME_LANGUAGE" ? "home" : "risk", { values: { [key]: other }, secrets: {} }))
+        expect(edited.result.ok).toBe(true)
+        expect(await t.restart()).toBe(t.state(t.sections))
+      })
+    }
+
+    it(`keeps ${key} locked if a rewrite returns success but leaves a declaration, then retries`, async () => {
+      const t = await setup(key, `${key}=${value}\n`, "# unrelated\n")
+      let incomplete = true
+      const mover = makeEnvMover({ ...t.options, commentOut: async (...args) => {
+        if (incomplete) { incomplete = false; return { keys: [key], backup: "incomplete-rewrite" } }
+        return commentOutKeys(...args)
+      } })
+      expect(await run(mover.move([key]))).toMatchObject({ ok: false })
+      expect(t.view.get(key)).toBe(value)
+      expect((await run(t.sections.update(key === "HOME_LANGUAGE" ? "home" : "risk", { values: { [key]: other }, secrets: {} }))).result.ok).toBe(false)
+      expect(await t.restart()).toBe(t.state(t.sections))
+      expect(await run(mover.move([key]))).toEqual({ ok: true, moved: [key] })
+      expect(t.view.get(key)).toBeUndefined()
+      expect(await t.restart()).toBe(t.state(t.sections))
     })
   }
 })

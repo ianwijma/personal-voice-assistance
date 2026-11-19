@@ -3,6 +3,8 @@ import type { HostResult } from "@pva/core"
 import { RISK_POLICY_KEYS } from "@pva/protocol"
 import type { EnvEntry, EnvInfo, EnvKind, SettingsGroup, SettingsPatch, SettingValue } from "@pva/protocol"
 import { Effect } from "effect"
+import { readFile } from "node:fs/promises"
+import { parseEnv } from "node:util"
 import { type CommentOutResult, commentOutKeys, type EnvOrigin, type EnvView } from "../envView.ts"
 import { assistantFieldOf, MIGRATED_ASSISTANT_ID } from "./migrateAssistants.ts"
 import type { Sections } from "./sections.ts"
@@ -260,8 +262,12 @@ export const makeEnvMover = (options: {
 }): EnvMover => {
   const envCatalog = makeEnvCatalog(options.catalog)
   const commentOut = options.commentOut ?? commentOutKeys
-  let busy = false
   const policyInput = (key: string) => key === "HOME_LANGUAGE" || Object.values(RISK_POLICY_KEYS).some((k) => k === key)
+  // Advance only after our own verified rewrites, so a partial move can still be retried. Retain no secrets.
+  const expectedFiles = new Map(options.view.files.map((file) => [file, Object.fromEntries(
+    Object.entries(options.view.fileValues(file)).filter(([key]) => policyInput(key))
+  )]))
+  let busy = false
 
   const fail = (code: "invalid_settings" | "locked" | "busy" | "internal", message: string): HostResult => ({ ok: false, error: { code, message } })
 
@@ -292,6 +298,15 @@ export const makeEnvMover = (options: {
 
       busy = true
       try {
+        const policyKeys = planned.filter((p) => policyInput(p.key)).map((p) => p.key)
+        if (policyKeys.length > 0) {
+          for (const file of options.view.files) {
+            const current = yield* Effect.tryPromise(async () => parseEnv(await readFile(file, "utf8"))).pipe(Effect.result)
+            if (current._tag === "Failure" || policyKeys.some((key) => current.success[key] !== expectedFiles.get(file)?.[key])) {
+              return fail("invalid_settings", `${file} changed or could not be read: restart the assistant to reload .env files before moving these settings`)
+            }
+          }
+        }
         const moved: Array<Planned> = []
         for (const p of planned) {
           const secret = isSecretTarget(p.target, p.key)
@@ -322,7 +337,7 @@ export const makeEnvMover = (options: {
             const byFile = new Map<string, Array<string>>()
             for (const file of [...options.view.files].reverse()) {
               const fileKeys = moved.filter((p) => policyInput(p.key)
-                ? options.view.declaredIn(p.key).includes(file)
+                ? expectedFiles.get(file)?.[p.key] !== undefined
                 : p.origin.path === file).map((p) => p.key)
               if (fileKeys.length > 0) byFile.set(file, fileKeys)
             }
@@ -330,13 +345,21 @@ export const makeEnvMover = (options: {
             for (const [file, plannedKeys] of byFile) {
               const fileKeys = plannedKeys.filter((key) => !failedKeys.has(key))
               if (fileKeys.length === 0) continue
-              const result = yield* Effect.tryPromise(() => commentOut(file, fileKeys, (options.now ?? (() => new Date()))())).pipe(Effect.result)
+              const result = yield* Effect.tryPromise(async () => {
+                const rewritten = await commentOut(file, fileKeys, (options.now ?? (() => new Date()))())
+                // A completed write is not proof that the line scanner removed every Node-readable assignment.
+                const remaining = parseEnv(await readFile(file, "utf8"))
+                if (fileKeys.some((key) => Object.hasOwn(remaining, key))) throw new Error("An environment assignment remains after rewriting")
+                return rewritten
+              }).pipe(Effect.result)
               if (result._tag === "Failure") {
                 for (const key of fileKeys) failedKeys.add(key)
                 const code = (result.failure.cause as NodeJS.ErrnoException | undefined)?.code ?? "error"
-                problems.push(`${fileKeys.join(", ")} saved, but ${file} could not be changed (${code}): comment the lines out by hand, then retry the move`)
+                problems.push(`${fileKeys.join(", ")} saved, but ${file} could not be changed (${code}): retry the move; if the file was edited by hand, restart the assistant to reload .env files first`)
                 yield* Effect.logWarning(`Moved ${fileKeys.join(", ")} into the settings, but could not edit ${file} (${code})`)
               } else {
+                const expected = expectedFiles.get(file)
+                if (expected !== undefined) for (const key of fileKeys) delete expected[key]
                 yield* Effect.logInfo(`Moved ${fileKeys.join(", ")} from ${file} into the settings (backup: ${result.success.backup})`)
               }
             }
