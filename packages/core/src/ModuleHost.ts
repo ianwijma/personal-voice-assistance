@@ -260,7 +260,7 @@ export interface ModuleHost {
   /** Switch it off (saved); see `enable`. */
   readonly disable: (id: string) => Effect.Effect<HostResult>
   /**
-   * Change the shared settings (saved at once). `includeHidden`: also save fields hidden by `visibleWhen` (moving
+   * Change the shared settings (saved at once). `includeHidden`: also save hidden and environment-locked fields (moving
    * values out of `.env`). While the module runs, settings it could not start with are refused at once. Otherwise
    * the module is stopped and started again with them if what it runs changes; a start that fails leaves it down,
    * with its error on the Health page, and is the result.
