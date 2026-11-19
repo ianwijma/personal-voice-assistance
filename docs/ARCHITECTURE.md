@@ -433,12 +433,13 @@ CurrentPrincipal: Context.Reference<Principal | undefined>       // the admitted
   again at dispatch: a result is decided once, when its tool finishes; serve fences and discards a device's session on
   a committed boundary change (its turn is cancelled, `serveRiskWait.test.ts`).
 
-  **Measured** (the shared `bound()`, latency project): `decideRisk` 61 ns per decision; a 64-tool list read 5.4 µs
-  after a change and 0.4 µs otherwise (`packages/core/test/RiskLatency.test.ts`); with serve's production reader over a
-  real settings store (`apps/assistant/test/riskLatency.test.ts`): a policy read 3.5 ns, the first read after a
-  committed save 1.1 µs at the median, a gateway tool call 3.95 µs without a policy and 4.38 µs with serve's reader and
-  the decision (0.43 µs added); a turn's end of turn → playback start (`TurnTrace`, a tool round, 80 turns × 4
-  counterbalanced runs) 10.814 ms with nothing saved and 10.762 ms with a saved policy.
+  **Measured** (the shared `bound()`, latency project; after review round 2's publication at the commit): `decideRisk`
+  58.5 ns per decision; a 64-tool list read 5.5 µs after a change and 0.46 µs otherwise
+  (`packages/core/test/RiskLatency.test.ts`); with serve's production reader over a real settings store
+  (`apps/assistant/test/riskLatency.test.ts`): a policy read 3.4 ns, the first read after a committed save 1.03 µs at
+  the median, a gateway tool call 4.28 µs without a policy and 4.43 µs with serve's reader and the decision (0.15 µs
+  added); a turn's end of turn → playback start (`TurnTrace`, a tool round, 80 turns × 4 counterbalanced runs)
+  10.710 ms with nothing saved and 10.761 ms with a saved policy.
 - **Availability.** `requires`, `platforms` and `apiVersion` are judged before anything starts, from the app's probes
   (`apps/assistant/src/requirements.ts`). Two kinds of requirement: a **program on the server** (`{ tool, version?,
   why }`) and the **network** (`{ network }`, not probed yet: `unchecked`). One program registry (argv and a version
