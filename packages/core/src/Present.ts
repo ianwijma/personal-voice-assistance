@@ -175,7 +175,7 @@ export interface PresentPressHandler {
  * `failed`: the store said no.
  */
 export class PresentError extends Schema.TaggedError<PresentError>()("PresentError", {
-  reason: Schema.Literals(["unavailable", "invalid", "limit", "busy", "failed"]),
+  reason: Schema.Literals(["unavailable", "invalid", "limit", "busy", "failed", "uncommitted"]),
   message: Schema.String
 }) {}
 

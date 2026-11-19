@@ -80,7 +80,8 @@ const boardModule = (
   held: Map<string, ModulePresent>,
   presses: Array<PresentPress>,
   answer: { current: (p: PresentPress) => Effect.Effect<PresentAnswer | void, unknown> },
-  result: { current: unknown }
+  result: { current: unknown },
+  tool: { readonly speculative?: boolean | undefined; readonly run?: ((present: ModulePresent) => Effect.Effect<unknown>) | undefined } = {}
 ) =>
   defineModule({
     apiVersion: 2,
@@ -97,7 +98,13 @@ const boardModule = (
       }),
     start: () =>
       Effect.succeed({
-        tools: [makeTool({ name: `${id.replace(/-/g, "_")}_show`, description: "Show", parameters: Schema.Struct({}), execute: () => Effect.sync(() => result.current) })]
+        tools: [makeTool({
+          name: `${id.replace(/-/g, "_")}_show`,
+          description: "Show",
+          parameters: Schema.Struct({}),
+          ...(tool.speculative === true ? { speculative: true } : {}),
+          execute: () => (tool.run !== undefined ? tool.run(held.get(id)!) : Effect.sync(() => result.current))
+        })]
       })
   })
 
@@ -170,6 +177,10 @@ export const presentWorld = (
     readonly observe?: Parameters<typeof makePresentEngine>[0]["observe"]
     /** What the Presenter is given as its scheduler (a test injects refusals); default the real one. */
     readonly wrapScheduler?: (scheduler: SchedulerEngine) => SchedulerEngine
+    /** The modules' tool is `speculative: true` (it may run before its turn is committed). */
+    readonly speculative?: boolean
+    /** What the modules' tool does (default: return what `toolResult` set), given the module's `ctx.present`. */
+    readonly toolRun?: (present: ModulePresent) => Effect.Effect<unknown>
   } = {}
 ) =>
   Effect.gen(function*() {
@@ -220,7 +231,7 @@ export const presentWorld = (
         onDecision: (r) => void (o.unrecorded !== true && decisions.push(r))
       })
       const host = yield* makeModuleHost({
-        catalog: ids.map((id) => boardModule(id, held, presses, answer, result)),
+        catalog: ids.map((id) => boardModule(id, held, presses, answer, result, { speculative: o.speculative, run: o.toolRun })),
         persistence: readOnlyPersistence({ modules: Object.fromEntries(ids.map((id) => [id, { enabled: true }])), secrets: {} }),
         env: {},
         household: { store, events: makeEventBus() },

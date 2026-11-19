@@ -50,8 +50,17 @@ ctx.present.handle(name, { run: (press) => Effect<{ say? } | void> })   // in sh
   valid, passes a bound, comes from a module that cannot show things, arrives while the stored presentations are still
   being read, or has no device to show it on is not accepted, and the note says why; the turn never fails because of it.
   It is shown on the device the call came from (the turn's, the job's or the press's).
+- **Speculative turns** (R8, review round 2): nothing a speculative turn asks for reaches a screen before the turn is
+  promoted. A tool that may run speculatively returns its presentation with its result and never calls
+  `ctx.present.show` or dismisses in its run. Way 1 from a turn that is not committed yet is checked and its note
+  composed as above, but it is accepted only when the turn is promoted (its times and key's id taken then) and dropped
+  without reaching a screen when the turn is discarded. Way 2 from inside such a turn changes nothing: `show` is refused
+  `uncommitted` ("not shown: the turn is not committed yet"), `update` answers `undefined` and `dismiss` `false`. A call
+  from a committed turn, a job, a press or a route is not affected (`CurrentTurnCommit`, which `Conversation` provides
+  for a turn's calls and the gateway clears for a call made as another principal).
 - **Way 2** is one synchronous transaction and an enqueue, and answers with a typed refusal (`PresentError`): `invalid`,
-  `limit`, `busy` (the store was busy, or the stored presentations are still being read at start), `unavailable`. Its
+  `limit`, `busy` (the store was busy, or the stored presentations are still being read at start), `unavailable`,
+  `uncommitted` (called from inside a turn that is not committed yet). Its
   times (when it was shown, when it ends) and the checks that depend on the clock (a timer's `endsAt`) are taken in the
   attempt of the transaction that commits; a show that waited on a busy store for longer than it would have been shown
   is refused `busy` rather than committed already ended (review round 2). An `update` likewise judges the end and the

@@ -73,7 +73,7 @@ import type { PrivacyService } from "./Privacy.ts"
 import { quotedName } from "./PromptText.ts"
 import type { PartRunner } from "./Scheduler.ts"
 import type { SchedulerEngine } from "./SchedulerEngine.ts"
-import { CurrentJob, CurrentPrincipal, CurrentTurn, type Principal } from "./TurnContext.ts"
+import { CurrentJob, CurrentPrincipal, CurrentTurn, CurrentTurnCommit, type Principal } from "./TurnContext.ts"
 
 /**
  * The Presenter (docs/PRESENTING.md; the contract is `Present.ts`). One per server: serve mode makes it on the household
@@ -1204,8 +1204,15 @@ export const makePresentEngine = (options: PresentEngineOptions): Effect.Effect<
       return open === undefined || open.size === 0 ? undefined : Math.max(...open)
     }
 
+    /**
+     * R8: a way-2 call made from inside a turn that is not committed yet (a speculative tool's run) changes nothing. A
+     * call from a committed turn, a job, a press or a route is not in one (`CurrentTurnCommit` absent or committed).
+     */
+    const uncommitted: Effect.Effect<boolean> = Effect.map(CurrentTurnCommit, (c) => c !== undefined && !c.committed())
+
     const show = (moduleId: string, partId: number) => (target: PresentTarget, presentation: Presentation, o?: ShowOptions): Effect.Effect<PresentHandle, PresentError> =>
       Effect.gen(function*() {
+        if (yield* uncommitted) return yield* new PresentError({ reason: "uncommitted", message: "not shown: the turn is not committed yet (a speculative tool returns its presentation with its result instead)" })
         const now = yield* wallNow
         const problem = requestProblem(moduleId, presentation, o, now)
         if (problem !== undefined) return yield* invalid(problem)
@@ -1252,6 +1259,8 @@ export const makePresentEngine = (options: PresentEngineOptions): Effect.Effect<
     /** G3: the entry and its row are read again in the attempt that commits; a replaced or ended show changes nothing. */
     const update = (moduleId: string, id: string, showId: string, presentation: Presentation): Effect.Effect<ShowOutcome | undefined, PresentError> =>
       Effect.gen(function*() {
+        // Not committed yet (R8): nothing changes; `undefined`, as for a show that is no longer there to change.
+        if (yield* uncommitted) return undefined
         const now = yield* wallNow
         const problem = presentationProblem(presentation, now) ?? handlerProblem(moduleId, presentation)
         if (problem !== undefined) return yield* invalid(problem)
@@ -1293,6 +1302,8 @@ export const makePresentEngine = (options: PresentEngineOptions): Effect.Effect<
     /** G1: no longer eligible at once; the row is marked ended (or removed later by maintenance if that fails). */
     const dismiss = (moduleId: string, id: string, showId: string): Effect.Effect<boolean, PresentError> =>
       Effect.gen(function*() {
+        // Not committed yet (R8): nothing is dismissed.
+        if (yield* uncommitted) return false
         const e = index.get(id)
         if (e === undefined || e.module !== moduleId || e.showId !== showId) return false
         const now = yield* wallNow
@@ -1392,12 +1403,26 @@ export const makePresentEngine = (options: PresentEngineOptions): Effect.Effect<
         const outcome = outcomeOf(e, { asking: origin, spoken: presentation.spoken, module: moduleId, image: presentation.kind === "image" })
         // Accepted: its key's id reserved, its place held in the bounds, one enqueue; written and shown off the turn's path.
         // It supersedes accepted work it replaces (the same key, or a transient it would end): retired now (R1).
-        retireSupersededBy(e)
-        if (e.key !== undefined) pendingKeys.set(keyOf(moduleId, e.key), e.id)
-        const s: PendingShow = { entry: e, content: storedContentOf(presentation), spoken: presentation.spoken, buttons: (presentation.buttons ?? []).map((b) => ({ id: b.id, label: b.label })), failed: false }
-        pending.push(s)
-        work.push(s)
-        void Queue.offerUnsafe(workWake, undefined)
+        const accept = (accepted: Omit<Entry, "rev">) => {
+          retireSupersededBy(accepted)
+          if (accepted.key !== undefined) pendingKeys.set(keyOf(moduleId, accepted.key), accepted.id)
+          const s: PendingShow = { entry: accepted, content: storedContentOf(presentation), spoken: presentation.spoken, buttons: (presentation.buttons ?? []).map((b) => ({ id: b.id, label: b.label })), failed: false }
+          pending.push(s)
+          work.push(s)
+          void Queue.offerUnsafe(workWake, undefined)
+        }
+        // R8: the result of a tool that ran while its turn was speculative is accepted when the turn is promoted (its
+        // entry, times and key's id derived then), and dropped without reaching a screen when the turn is discarded. The
+        // note is the one composed now, for the promoted turn. A call made as another principal is not held.
+        const commit = principal === undefined || principal._tag === "turn" ? yield* CurrentTurnCommit : undefined
+        if (commit === undefined || commit.committed()) accept(e)
+        else {
+          const clock = yield* Clock.Clock
+          commit.whenCommitted(() => {
+            if (partOf(moduleId) !== part) return
+            accept(newEntry(moduleId, part, { device: origin }, presentation, o, timeIn(clock, now)))
+          })
+        }
         return withScreenNote(forModel, outcome.note)
       })
 
