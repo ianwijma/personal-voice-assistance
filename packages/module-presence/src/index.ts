@@ -7,6 +7,8 @@ import {
   type ModuleDefinition,
   type PeopleService,
   Param,
+  PHRASE_ANSWER_CHARS,
+  type Presentation,
   People,
   type Person,
   Privacy,
@@ -155,6 +157,25 @@ interface Tracked {
   /** When the module itself saw this person go from home to away; kept across a change between two away zones. */
   readonly awaySince?: number
 }
+
+/** The most items of a list presentation, the longest name shown in one, and its longest spoken fallback. */
+const LIST_ITEMS = 12
+const NAME_CHARS = 30
+const SPOKEN_CHARS = 300
+
+/** A text cut to at most `max` UTF-16 units at a code point boundary (an emoji is never split), with "…" when cut. */
+export const cutText = (s: string, max: number): string => {
+  if (s.length <= max) return s
+  let out = ""
+  for (const ch of s) {
+    if (out.length + ch.length > max - 1) break
+    out += ch
+  }
+  return `${out}…`
+}
+
+/** Text from outside as one plain line: control, line and bidirectional characters become spaces (it is never markup). */
+const oneLine = (s: string): string => s.replace(/[\ud800-\udbff](?![\udc00-\udfff])|(?<![\ud800-\udbff])[\udc00-\udfff]/g, "\ufffd").replace(/[\p{Cc}\u2028\u2029\u202a-\u202e\u2066-\u2069\u200e\u200f\u061c]/gu, " ").replace(/ {2,}/g, " ").trim()
 
 /** What the shared part offers the instances. */
 interface Shared {
@@ -325,7 +346,9 @@ export const makePresenceModule = () => {
                 return
               case "changed":
                 // A change with no previous entity is one new to Home Assistant's cache: what it is now is not news.
-                if (change.entity.domain === "person") yield* onChanged(change.entity, change.previous)
+                if (change.entity.domain === "person") {
+                    yield* onChanged(change.entity, change.previous)
+                }
                 return
             }
           })
@@ -421,19 +444,56 @@ export const makePresenceModule = () => {
           })
 
         /** The same answer as sentences, for a typed action (no model words it); times by `@pva/language`. */
-        const sentences = (lang: Lang, g: Gathered): string => {
+        const sentences = (lang: Lang, g: Gathered, maxNamed: number = MAX_NAMED): string => {
           if (g.kind === "spoken") return g.text
-          const named = g.rows.slice(0, MAX_NAMED).map((r) => {
+          const named = g.rows.slice(0, maxNamed).map((r) => {
             if (r.at === "unknown") return say(texts, lang, "unknown", { name: r.name })
             const when = r.since === undefined ? undefined : sinceSpoken(r.since, g.now, g.zone, lang)
             if (when === undefined) return say(texts, lang, r.at === "home" ? "home" : "away", { name: r.name })
             return say(texts, lang, r.at === "home" ? "homeSince" : "awaySince", { name: r.name, when })
           })
           const parts = [...named]
-          if (g.rows.length > MAX_NAMED) parts.push(say(texts, lang, "moreHidden", { count: g.rows.length - MAX_NAMED }) + ".")
+          if (g.rows.length > maxNamed) parts.push(say(texts, lang, "moreHidden", { count: g.rows.length - maxNamed }) + ".")
           if (g.withheld > 0) parts.push(say(texts, lang, "withheld", { count: g.withheld }))
           if (g.stale) parts.push(say(texts, lang, "stale"))
           return parts.join(" ")
+        }
+
+        /** What the list says of one person, in a line (the name cut, the time as `HH:MM` or with its date, as the tool gives it). */
+        const rowLine = (lang: Lang, g: Extract<Gathered, { kind: "rows" }>, r: Row): string => {
+          const name = cutText(oneLine(r.name), NAME_CHARS)
+          if (r.at === "unknown") return say(texts, lang, "rowUnknown", { name })
+          if (r.since === undefined) return say(texts, lang, r.at === "home" ? "rowHome" : "rowOut", { name })
+          return say(texts, lang, r.at === "home" ? "rowHomeSince" : "rowOutSince", { name, when: sinceText(r.since, g.now, g.zone) })
+        }
+
+        /** How many people the answer names: four, or fewer when `limit` (a phrase's reply) would otherwise cut it. Whole items only. */
+        const namedCount = (lang: Lang, g: Gathered, limit?: number): number => {
+          if (g.kind !== "rows") return 0
+          let n = Math.min(MAX_NAMED, g.rows.length)
+          if (limit !== undefined) while (n > 0 && sentences(lang, g, n).length > limit) n--
+          return n
+        }
+
+        /**
+         * The same answer as a list: the same people as the sentences name (`named`), the same overflow ("and 2 more"), and
+         * every note the answer has. A presentation has one owner, so a list exists only when it names exactly one person
+         * (personal to that person; the counts and notes tell nothing of anyone). An answer that names several people's
+         * whereabouts is not shown as a list: it is only spoken.
+         */
+        const listOf = (lang: Lang, g: Extract<Gathered, { kind: "rows" }>, named: number): Presentation | undefined => {
+          if (named !== 1) return undefined
+          const items: Array<{ readonly id: string; readonly text: string }> = g.rows.slice(0, named).map((r) => ({ id: r.owner, text: rowLine(lang, g, r) }))
+          if (g.rows.length > named) items.push({ id: ":more", text: say(texts, lang, "moreHidden", { count: g.rows.length - named }) })
+          if (g.withheld > 0) items.push({ id: ":withheld", text: cutText(say(texts, lang, "withheld", { count: g.withheld }), 80) })
+          if (g.stale) items.push({ id: ":stale", text: cutText(say(texts, lang, "stale"), 80) })
+          // The fallback is the answer's own sentences, with fewer names until it fits (never cut in the middle of one).
+          let spoken = ""
+          for (let n = named; n >= 0 && spoken === ""; n--) {
+            const text = oneLine(sentences(lang, g, n))
+            if (text.length <= SPOKEN_CHARS) spoken = text
+          }
+          return { kind: "list", title: say(texts, lang, "listTitle"), style: "bullets", items, spoken, sensitivity: { personal: g.rows[0]!.owner } }
         }
 
         const where = makeTool({
@@ -491,6 +551,11 @@ export const makePresenceModule = () => {
           // The model has presence_where; this action exists to run without it.
           offerAsTool: false,
           description: "Say who is home, or whether one household member is.",
+          // Fixed phrases only: the person is a runtime list, so it cannot be a slot ("is Sam home" goes to the model).
+          phrases: {
+            en: ["who is home", "who is at home", "who's home", "is anyone home"],
+            nl: ["wie is er thuis", "wie is thuis", "is er iemand thuis"]
+          },
           examples: [
             "who is home",
             "who's home",
@@ -514,7 +579,13 @@ export const makePresenceModule = () => {
           run: ({ person }) =>
             Effect.gen(function*() {
               const lang = homeLanguage(view())
-              return { say: sentences(lang, yield* gather(lang, person)) }
+              const g = yield* gather(lang, person)
+              // In a phrase turn the answer must fit what a phrase may say; anywhere else it is as it always was.
+              const turn = yield* CurrentTurn
+              const named = namedCount(lang, g, turn?.source === "phrase" ? PHRASE_ANSWER_CHARS : undefined)
+              // The list goes with the result: it is shown when the turn is promoted and dropped when it is discarded.
+              const present = g.kind === "rows" ? listOf(lang, g, named) : undefined
+              return { say: sentences(lang, g, named), ...(present !== undefined ? { present } : {}) }
             })
         })
 

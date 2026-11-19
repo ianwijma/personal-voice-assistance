@@ -51,9 +51,49 @@ gets no time at all.
 | `people_list` (tool) | none | read, speculative | the household's members and whether each is followed. Never says where anyone is, so it is answered on any device | "who lives here?" |
 | `presence.who_is_home` (typed action) | `person?`: a member (a dynamic choice over Members) | read | the same answer as sentences, with no model, the time worded by `@pva/language` ("Sam has been home since seven o'clock. Robin is out." / "Sam is sinds zeven uur thuis."), at most four people and then "and N more" | "who is home", "is Sam home", "wie is er thuis", "is Sam thuis" |
 
-Every sentence the module speaks itself is in English and Dutch, by the household's language. When Home Assistant's
-module is off, or stops during a call, every tool and the action say so ("The Home Assistant module is off." / "De
-module Home Assistant staat uit."): each call into its service goes through `useService`.
+### Phrase commands and the list
+
+`presence.who_is_home` is also a **phrase command** (docs/PHRASES.md): said after the wake phrase it runs with no model,
+the same action, with the same sentences, refusals and risk class, and nothing else of the module changed. The phrases
+are fixed words, matched exactly (case and punctuation do not count), for the household's language:
+
+| English | Dutch |
+|---|---|
+| "who is home", "who is at home", "who's home", "is anyone home" | "wie is er thuis", "wie is thuis", "is er iemand thuis" |
+
+They ask about everyone. "Is Sam home?" is not a phrase (a name is a runtime list, which cannot be a phrase slot): it
+goes to the assistant, which has `presence_where`; the action itself still takes a `person` from the model or admin.
+"Who is home please" is not matched either.
+
+Whenever the action answers with **one person's** whereabouts (also as the reduced form on a shared device: that person's
+line and the count of the others), it also shows them as a list on the screen of the device that asked: the title "Who is
+home" ("Wie is thuis"), the person's line ("Robin: out", "Sam: home since 07:00"), and the answer's notes as lines of their
+own ("and 2 more", "Where 2 other people are is not said here.", "I lost the connection to Home Assistant, so this is what
+I heard last."). It is a transient list (30 seconds), with no buttons.
+
+**An answer that names the whereabouts of more than one person is only spoken, with no list.** A presentation has one
+owner, so the Presenter can decide privacy again (when a device's place or default person changes, or a page
+reconnects) for one person only; a list of several people would be tagged with one of them. This is left out until a
+presentation can have several owners (see below).
+
+- **Privacy is the answer's.** What the list names is exactly what the answer named for that device (a refused or empty
+  answer shows nothing, so a public device, or a shared device asked about someone who is not its default person, shows
+  no list, not even "nobody"). The list is personal to the person it names, so the Presenter also asks
+  `Privacy.mayReveal` for the device whenever it decides what a screen holds, and takes it down if the rule changes. A
+  device with no screen, or a page that cannot draw lists, is told nothing different: the answer is spoken as before.
+- **The list is the answer.** Its person and its overflow line come from the same selection as the sentences (the same
+  people, the same "and N more"), with every note the answer has.
+- **The list is a snapshot of its answer.** The action may run speculatively (before its turn is committed), so it never
+  shows anything from inside its run: it returns the list with its result, and the host shows it when the turn is
+  promoted and drops it when the turn is discarded (docs/PRESENTING.md). The module keeps no handle and withdraws
+  nothing: a change in Home Assistant, an empty answer or a restart does not take a list down. It ends after its
+  lifetime (30 seconds), or when the next answer from that device (or any other transient presentation there) replaces
+  it. A device that gains a screen later may show what was returned until then, at most for that lifetime.
+- **A phrase's answer fits what a phrase may say** (300 characters): in a phrase turn the module names fewer people, whole
+  sentences only, so that "and N more", the count of people not said here and the lost-connection warning are never cut
+  off. Outside a phrase turn the answer is as it was (up to four people).
+- Names are cut to the Presenter's bounds at a code point (30 characters in a line, 80 per line), and outside text is
+  shown as plain text on one line (control characters become spaces, a lone surrogate becomes U+FFFD).
 
 ### Events
 
@@ -122,12 +162,18 @@ Left out of the first version by the plan's row (`docs/MODULES-PLAN.md` §5.1 ro
 identification, guest mode, the house guide, who may ask about whom (adults and children, `home-only` and `exact`),
 presence history, `presence.room`, `presence.everyone_left` and `presence.first_home`, and the "welcome home" greeting.
 
-Left out for wave B, because they need a phrase command, a presentation, a notification or the module's own speech
-(P7, P9, P10): spoken greetings on arrival, the `list` presentation of who is home, enrolment steps, the Wi-Fi hand-off
-and QR code, notifications such as "everyone left and the door is unlocked", and phrase commands for "who is home".
+Left out for wave B, because they need a notification or the module's own speech (P9): spoken greetings on arrival,
+enrolment steps, the Wi-Fi hand-off and QR code, and notifications such as "everyone left and the door is unlocked".
+(The phrase command for "who is home" and its `list` presentation are described above.)
 
 Left out because something is missing, and reported in the pull request:
 
+- A phrase for one person ("is Sam home?"): a `Param.dynamic` cannot be a slot, and a text slot would need the name
+  resolved in the action with the people's aliases on the matching path. Smallest change: a phrase slot that reads a
+  `Param.dynamic` from a list the host prepares when the set is built.
+- A presentation with several owners, shown only where every owner's lines may be revealed. Today `sensitivity` takes
+  one owner, so a list of several people's whereabouts cannot be shown safely and is left out (the answer is spoken).
+  Smallest change: a per-line owner on a list presentation, decided per line by the Presenter.
 - Zone names are never said (see above); the setting that would let a person share them (`exact`) belongs to the
   "who may ask about whom" part.
 - A linked member is chosen by typing their id (from the Household members line), not from a list: a `records` item
