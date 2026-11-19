@@ -1,6 +1,7 @@
 // P8, review round 1, H5 (finding 7): saving the risk policy is checked by one function (`riskPolicyPatchProblems`),
 // which the real section runs before its generic form checks and the web mock runs too. The same patches (valid,
-// invalid, null, a fixed row, mixed) get the same answers from both; the real section keeps its all-or-nothing write.
+// invalid, null, a fixed row, mixed; review round 2: a secrets part, mixed and alone) get the same answers from both;
+// the real section keeps its all-or-nothing write, and the mock writes nothing for a refused patch either.
 import { encodeClientMessage, PROTOCOL_VERSION, riskPolicyPatchProblems } from "@pva/protocol"
 import { Effect } from "effect"
 import { type ChildProcess, spawn } from "node:child_process"
@@ -26,7 +27,7 @@ const freePort = () =>
     })
   })
 
-const PATCHES: ReadonlyArray<Record<string, unknown>> = [
+const PATCHES: ReadonlyArray<Record<string, unknown> | { readonly values: Record<string, unknown>; readonly secrets: Record<string, string> }> = [
   { RISK_MESSAGE: "allow" },
   { RISK_CHANGE: "sometimes" },
   { RISK_CHANGE: null },
@@ -35,8 +36,14 @@ const PATCHES: ReadonlyArray<Record<string, unknown>> = [
   { RISK_MONEY: "deny" },
   { RISK_CHANGE: "deny", RISK_MONEY: "allow", RISK_READ: "maybe" },
   { RISK_READ: 3 },
-  { RISK_READ: "confirm", RISK_CHANGE: "allow" }
+  { RISK_READ: "confirm", RISK_CHANGE: "allow" },
+  // Review round 2, finding 2: anything in the secrets part (the section has none), mixed with a valid value and alone.
+  { values: { RISK_CHANGE: "deny" }, secrets: { RISK_MONEY: "allow" } },
+  { values: {}, secrets: { RISK_CHANGE: "allow" } },
+  { values: { RISK_MESSAGE: "allow" }, secrets: { RISK_MESSAGE: "allow", RISK_NOTHING: "x" } }
 ]
+const patchOf = (p: (typeof PATCHES)[number]) =>
+  "secrets" in p && "values" in p ? { values: p.values as Record<string, unknown>, secrets: p.secrets as Record<string, string> } : { values: p as Record<string, unknown>, secrets: {} }
 
 type Answer = { readonly ok: boolean; readonly message?: string; readonly fieldErrors?: ReadonlyArray<{ readonly key: string | null; readonly message: string }> }
 
@@ -86,16 +93,21 @@ describe("the real section and the mock check a policy save with the same functi
     ws.send(JSON.stringify({ type: "admin.login", requestId: "login", password: "admin password" }))
     await wait((m) => m.type === "admin.snapshot")
     let n = 0
-    const mockSave = async (values: Record<string, unknown>): Promise<Answer> => {
+    const mockSave = async (patch: { readonly values: Record<string, unknown>; readonly secrets: Record<string, string> }): Promise<Answer> => {
       const requestId = `s${++n}`
-      ws.send(JSON.stringify({ type: "settings.update", requestId, sectionId: "risk", patch: { values, secrets: {} } }))
+      const sentAt = messages.length
+      ws.send(JSON.stringify({ type: "settings.update", requestId, sectionId: "risk", patch }))
+      const from = sentAt
       const r = await wait((m) => m.type === "result" && m.requestId === requestId)
+      await new Promise((done) => setTimeout(done, 50))
+      // A refused patch changes nothing on the mock either: no new revision of the section is announced.
+      if (!r.ok) expect(messages.slice(from).some((m) => m.type === "section.changed" && m.section.id === "risk"), JSON.stringify(patch)).toBe(false)
       return r.ok ? { ok: true } : { ok: false, message: r.error.message, fieldErrors: r.error.fieldErrors }
     }
     // The real section on a real store.
     const dir = mkdtempSync(join(tmpdir(), "pva-risk-parity-"))
     const sections = makeSections(await Effect.runPromise(openStore(dir)), {})
-    const realSave = async (values: Record<string, unknown>): Promise<Answer> => {
+    const realSave = async (patch: { readonly values: Record<string, unknown>; readonly secrets: Record<string, string> }): Promise<Answer> => {
       const before = (() => {
         try {
           return readFileSync(join(dir, "settings.json"), "utf8")
@@ -103,7 +115,7 @@ describe("the real section and the mock check a policy save with the same functi
           return ""
         }
       })()
-      const r = (await Effect.runPromise(sections.update("risk", { values: values as never, secrets: {} }))).result
+      const r = (await Effect.runPromise(sections.update("risk", { values: patch.values as never, secrets: patch.secrets }))).result
       if (!r.ok) {
         // All or nothing: a refused save leaves the file as it was.
         const after = (() => {
@@ -118,12 +130,13 @@ describe("the real section and the mock check a policy save with the same functi
       return r.ok ? { ok: true } : { ok: false, message: r.error.message, ...(r.error.fieldErrors !== undefined ? { fieldErrors: r.error.fieldErrors } : {}) }
     }
     try {
-      for (const values of PATCHES) {
-        const real = await realSave(values)
-        const fake = await mockSave(values)
-        expect(fake, JSON.stringify(values)).toEqual(real)
+      for (const p of PATCHES) {
+        const patch = patchOf(p)
+        const real = await realSave(patch)
+        const fake = await mockSave(patch)
+        expect(fake, JSON.stringify(patch)).toEqual(real)
         // Both answers are the shared function's.
-        const problems = riskPolicyPatchProblems(values)
+        const problems = riskPolicyPatchProblems(patch.values, patch.secrets)
         expect(real.ok).toBe(problems.length === 0)
         if (problems.length > 0) expect(real).toEqual({ ok: false, message: problems[0]!.message, fieldErrors: problems })
       }

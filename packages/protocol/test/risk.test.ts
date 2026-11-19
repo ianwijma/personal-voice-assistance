@@ -17,6 +17,7 @@ import {
   type RiskPolicy,
   riskPolicyKey,
   riskPolicyOf,
+  riskPolicyPatchProblems,
   riskPolicyValueProblem,
   riskReason,
   riskRefusalKey,
@@ -147,6 +148,16 @@ describe("the saved value's decoder and the save check", () => {
       expect(riskPolicyValueProblem(key, "confirm")).toBe(FIXED_REASON)
     }
     expect(riskPolicyValueProblem("HOME_LANGUAGE", "anything")).toBeUndefined()
+  })
+
+  it("the whole patch (review round 2): a secrets part is refused entry by entry, after the values' problems", () => {
+    expect(riskPolicyPatchProblems({ RISK_CHANGE: "deny" }, {})).toEqual([])
+    expect(riskPolicyPatchProblems({ RISK_CHANGE: "deny" }, { RISK_MONEY: "allow" })).toEqual([{ key: "RISK_MONEY", message: "Not a secret" }])
+    expect(riskPolicyPatchProblems({}, { RISK_CHANGE: "allow" })).toEqual([{ key: "RISK_CHANGE", message: "Not a secret" }])
+    expect(riskPolicyPatchProblems({ RISK_READ: "x" }, { RISK_READ: "allow" })).toEqual([
+      { key: "RISK_READ", message: "Choose one of the options." },
+      { key: "RISK_READ", message: "Not a secret" }
+    ])
   })
 })
 

@@ -82,7 +82,10 @@ export interface SectionDefinition {
    * form checks): any problem refuses the save with the first problem's message and all of them as field errors, and
    * nothing is written. The web mock runs the same function.
    */
-  readonly checkPatch?: (values: Readonly<Record<string, unknown>>) => ReadonlyArray<{ readonly key: string; readonly message: string }>
+  readonly checkPatch?: (
+    values: Readonly<Record<string, unknown>>,
+    secrets: Readonly<Record<string, unknown>>
+  ) => ReadonlyArray<{ readonly key: string; readonly message: string }>
 }
 
 const reload = "reload" as const

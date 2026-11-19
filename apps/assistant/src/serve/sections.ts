@@ -284,7 +284,7 @@ export const makeSections = (
         if ("refused" in built) return failed(path, { ok: false, error: { code: "invalid_settings", message: built.refused } })
         const patch: SettingsPatch = built
         // P8 (H5): the section's own check first (the risk policy's: the function the web mock runs too).
-        const own = d.checkPatch?.(patch.values) ?? []
+        const own = d.checkPatch?.(patch.values, patch.secrets) ?? []
         if (own.length > 0) {
           return failed(path, { ok: false, error: { code: "invalid_settings", message: own[0]!.message, fieldErrors: own.map((e) => ({ key: e.key, message: e.message })) } })
         }

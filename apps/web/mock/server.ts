@@ -2615,7 +2615,7 @@ const onClientMessage = (c: Conn, m: ClientMessage) => {
       // one of the three outcomes, money and security only Refuse (or back to the default), and those two are never
       // written.
       if (section.id === "risk") {
-        const problems = riskPolicyPatchProblems(m.patch.values)
+        const problems = riskPolicyPatchProblems(m.patch.values, m.patch.secrets)
         if (problems.length > 0) return result(c, m.requestId, false, { code: "invalid_settings", message: problems[0]!.message, fieldErrors: problems })
       }
       const fixedKey = (k: string) => section.id === "risk" && FIXED_RISK_CLASSES.some((cls) => RISK_POLICY_KEYS[cls] === k)
