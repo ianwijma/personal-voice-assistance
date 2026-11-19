@@ -1,7 +1,8 @@
-import { ActionError, CurrentTurn, defineAction, defineCollection, defineModule, makeTool, ModuleStartError, Param, type Sensitivity, Setting, ToolError, UNKNOWN_OWNER } from "@pva/core"
+import { ActionError, CurrentTurn, defineAction, defineCollection, defineModule, makeTool, ModuleStartError, Param, type PresentHandle, type Presentation, type Sensitivity, Setting, ToolError, UNKNOWN_OWNER } from "@pva/core"
 import { type BriefingSection, BriefingSections, homeLanguage, type Language, say, StoredText } from "@pva/module-contracts"
 import { Effect, Schema } from "effect"
 import { allOf, compose, emptyLine, join, type Kind, matchesId, mentioned, notes } from "./compose.ts"
+import { briefingList } from "./present.ts"
 import { knownNames, nameOf, resolveAll, SECTION_ID, settingIds } from "./names.ts"
 import { texts } from "./texts.ts"
 
@@ -77,6 +78,10 @@ const personal = (owner: string): Sensitivity => ({ kind: "personal", owner })
 /** Spoken briefings remembered for their sensitivity: the action's result is its `say`, so its owner is found by it. */
 const REMEMBERED = 64
 const AMBIGUOUS = Symbol("ambiguous")
+/** Devices whose briefing list this run may still withdraw: bounded, newest last (a restart forgets them, and so does the Presenter's transient list). */
+const SHOWN_DEVICES = 64
+/** How long a briefing list stays on the screen. */
+const LIST_MS = 60_000
 
 export const briefingModule = defineModule({
   apiVersion: 2,
@@ -255,6 +260,25 @@ export const briefingModule = defineModule({
         return typeof known === "string" ? personal(known) : personal(UNKNOWN_OWNER)
       }
 
+      // The handle of the list each device was last shown, to take it down when a later briefing has nothing to list.
+      const shownOn = new Map<string, PresentHandle>()
+      const showList = (device: string | undefined, list: Presentation | undefined) =>
+        Effect.gen(function*() {
+          if (device === undefined) return
+          const before = shownOn.get(device)
+          if (list === undefined) {
+            if (before !== undefined) {
+              shownOn.delete(device)
+              yield* before.dismiss
+            }
+            return
+          }
+          const handle = yield* ctx.present.show({ device }, list, { lifetime: "transient", expiresInMs: LIST_MS })
+          shownOn.delete(device)
+          shownOn.set(device, handle)
+          while (shownOn.size > SHOWN_DEVICES) shownOn.delete(shownOn.keys().next().value!)
+        }).pipe(Effect.ignore)
+
       const brieflyAction = defineAction({
         id: "brief",
         label: "Brief me",
@@ -271,6 +295,12 @@ export const briefingModule = defineModule({
           "geef me de korte briefing",
           "goedenavond"
         ],
+        // Said after the wake phrase these run this action with no model. "good {kind}" reads morning or evening; the
+        // Dutch greetings are plain words (a phrase cannot fix a parameter, so they run with the kind left out).
+        phrases: {
+          en: ["good {kind}", "brief me", "give me my briefing"],
+          nl: ["goedemorgen", "goedenavond", "geef me mijn briefing"]
+        },
         params: {
           length: Param.choice({ label: "Length", options: [{ value: "short", label: "short", aliases: ["kort"] }, { value: "normal", label: "normal" }, { value: "long", label: "long", aliases: ["uitgebreid"] }], optional: true }),
           kind: Param.choice({ label: "Kind", options: [{ value: "morning", label: "morning", aliases: ["goedemorgen"] }, { value: "evening", label: "evening", aliases: ["goedenavond"] }, { value: "on-request", label: "any time" }], optional: true })
@@ -284,12 +314,21 @@ export const briefingModule = defineModule({
         sensitivity: actionSensitivity,
         run: ({ length, kind }) =>
           brief({ kind: kindOf(kind), length, only: undefined }).pipe(
-            Effect.map((got) => {
-              if (got._tag === "unknown") return { say: unknownLine(got.language, got.sections) }
-              const text = join(got.briefing, got.language)
-              remember(text, got.briefing.owner)
-              return { say: text, ...(got.briefing.owner !== undefined ? { owner: got.briefing.owner } : {}) }
-            }),
+            Effect.flatMap((got) =>
+              Effect.gen(function*() {
+                const turn = yield* CurrentTurn
+                if (got._tag === "unknown") {
+                  yield* showList(turn?.deviceId, undefined)
+                  return { say: unknownLine(got.language, got.sections) }
+                }
+                const text = join(got.briefing, got.language)
+                remember(text, got.briefing.owner)
+                // What is shown follows what was said: a list of its sections, or, when there are none, nothing (and an
+                // earlier list on this device is taken down). A device that cannot show it changes nothing above.
+                yield* showList(turn?.deviceId, briefingList(got.briefing, got.language))
+                return { say: text, ...(got.briefing.owner !== undefined ? { owner: got.briefing.owner } : {}) }
+              })
+            ),
             Effect.catchCause((cause) => (cause.reasons.some((r) => r._tag === "Interrupt") ? Effect.failCause(cause) : Effect.fail(new ActionError({ message: say(texts, homeLanguage(ctx.host.view()), "nothing") }))))
           )
       })

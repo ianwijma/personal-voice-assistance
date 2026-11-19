@@ -73,6 +73,42 @@ so and why: "Rain stays out, because you leave out all of weather." for a broade
 household's settings still leave out rain." for the household's. Lists in confirmations are worded by `speakList`
 ("weather, calendar and news" / "weer, agenda en nieuws").
 
+## Phrase commands and the list
+
+**Said after the wake phrase, with no model.** `briefing.brief` has phrases, so these run it as it is (same parameters,
+same sentences, same risk class `read`) on the device that heard them:
+
+| Language | Phrases |
+|---|---|
+| English | "good morning" and "good evening" (`good {kind}`), "brief me", "give me my briefing" |
+| Dutch | "goedemorgen", "goedenavond", "geef me mijn briefing" |
+
+Matching is exact on words: "good night", "good morning please", "brief me about the news" and "goede morgen" are not
+phrases and go on to the assistant. A refusal or an empty answer is the action's own ("There is nothing to tell you
+right now." after the greeting). **A phrase cannot fix a parameter's value**, so the English "good {kind}" reads
+morning or evening from the words, but the Dutch "goedemorgen" and "goedenavond" run the action with the kind left out:
+the same briefing without the "Goedemorgen." in front. (A phrase that could carry a value would fix that.)
+
+**A list on the screen.** Whenever the action answers (by phrase or from the intent agent) it also shows a transient
+`list` on the asking device, 60 seconds, titled "Your briefing" / "Je briefing": one bullet per section that spoke, in
+the briefing's order (lead first), each the section's first sentence when it fits an item whole (80 characters), else
+the section's title (never cut). After the sections, short notes of what the answer also said: preferences that could
+not be read, how many sources failed, how many sections were left out by the cap, and "Some personal items are not
+shown here." With more bullets than fit the twelve items, the first ones are kept and "And seven more." says the rest.
+The text is data: shown as text, never markup. Its `spoken` fallback is "Your briefing covers weather, calendar and
+news." (at most four names, then "and two more"), which the model says where nothing is shown.
+
+- **Privacy** is the spoken briefing's: each section already decided what it may say for the asking device, and the list
+  holds only that. When any personal content is in, the list is personal with the asker as owner, so the Presenter asks
+  `Privacy.mayReveal` for the device that would show it, at the moment of showing: a public screen gets none of it (the
+  household's lines too: one list is one decision), a private phone of the owner gets it. A device without a screen
+  shows nothing and the spoken answer is unchanged.
+- **Updated and withdrawn**: a later briefing on that device replaces the list; one with nothing to list (an empty or
+  unknown answer) takes the earlier list down. The module keeps the handle of the last list of at most 64 devices in
+  memory; a restart forgets them and the Presenter takes a stopped module's transient lists down, so nothing is left to
+  withdraw. It has no buttons, ticks or handlers, and sends no notification.
+- The model's `briefing` tool shows nothing; only the action does.
+
 ## Settings
 
 | Setting | Kind | Default | Meaning |
@@ -115,15 +151,15 @@ works with none of them (it then says it has no briefing sources, in both langua
 
 ## What was left out
 
-Left out, **waits for wave B** (needs P7, P9 or P10 that do not exist yet):
+Left out (what is not here yet):
 
-- The phrase command ("good morning" matched on the device, with no model, as a phrase): today only the typed action
-  and the tool exist.
-- Cards (the presentation of the sections on a screen, the pinned morning cards).
+- Cards on the screen other than the transient list: the pinned morning cards, and the presentation from the model's
+  `briefing` tool.
 - Speaking section by section with steering by voice: "skip", "more about that", "carry on" and a resume point after
   barge-in (the module has no speech of its own; the reply is one text).
 - A scheduled briefing and a presence-triggered one (notifications, the scheduler delivering speech), and the evening
   low-priority items.
+- Dutch greeting phrases that carry the kind (see above), and phrases for length ("the short briefing").
 
 Left out for the plan's row ("Skip and more, scheduled and presence briefings, cards pinned in the morning, 'what did I
 miss'"): "what did I miss" and the last-briefing record, per-assistant section lists, a "household briefing" for several
