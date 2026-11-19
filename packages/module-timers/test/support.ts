@@ -1,7 +1,7 @@
 // A test's own wrapper of what the host gives the two modules (not a test file): failures and gates at the store, the
 // notification service and the Presenter, and a record of the handlers the module registered, so a test can make one
 // step fail, hold one step, or run a registered handler itself with its original identity.
-import { type JobHandler, type ModuleDefinition, type ModuleStore, NotifyError, type NotifyActionHandler, PresentError, type StoreFailure } from "@pva/core"
+import { type JobHandler, type ModuleDefinition, type ModuleStore, NotifyError, type NotifyActionHandler, PresentError, SchedulerError, type StoreFailure } from "@pva/core"
 import { Deferred, Effect } from "effect"
 
 export interface Hooks {
@@ -24,6 +24,10 @@ export interface Hooks {
   /** The next send waits for this to be completed first; `sendEntered` says it is waiting. */
   sendGate?: Deferred.Deferred<void> | undefined
   sendEntered?: boolean
+  /** `notify.send` of a `ring` notification (only those) fails with this while set. */
+  sendFailRing?: NotifyError | undefined
+  /** `scheduler.prepare` for a handler of this name fails with this while set. */
+  prepareFail?: { readonly handler: string; readonly failure: SchedulerError } | undefined
   /** `notify.send` fails with this while set. */
   sendFail?: NotifyError | undefined
   /** `notify.resolve` fails with this while set. */
@@ -51,6 +55,7 @@ export const makeRegistered = (): Registered => ({ jobs: new Map(), presses: new
 export const busyFailure = (): NotifyError => new NotifyError({ reason: "busy", message: "test: busy" })
 export const limitFailure = (): NotifyError => new NotifyError({ reason: "limit", message: "test: limit" })
 export const presentFailure = (): PresentError => new PresentError({ reason: "busy", message: "test: busy" })
+export const schedulerFailure = (): SchedulerError => new SchedulerError({ reason: "busy", message: "test: busy" })
 
 const hookStore = (raw: ModuleStore, hooks: Hooks): ModuleStore => ({
   moduleId: raw.moduleId,
@@ -112,6 +117,8 @@ export const hooked = <M extends ModuleDefinition<any>>(definition: M, hooks: Ho
       store: hookStore(ctx.store, hooks),
       scheduler: {
         ...ctx.scheduler,
+        prepare: (request: any) =>
+          Effect.suspend(() => (hooks.prepareFail !== undefined && hooks.prepareFail.handler === request.handler ? Effect.fail(hooks.prepareFail.failure) : ctx.scheduler.prepare(request))),
         handle: (name: string, handler: JobHandler<any, any>) => {
           const counted = { ...handler, run: (p: any, due: any) => Effect.andThen(Effect.sync(() => void hooks.runs.set(name, (hooks.runs.get(name) ?? 0) + 1)), handler.run(p, due)) }
           registered.jobs.set(name, counted)
@@ -131,6 +138,7 @@ export const hooked = <M extends ModuleDefinition<any>>(definition: M, hooks: Ho
           }).pipe(Effect.andThen(Effect.suspend(() => {
             if (hooks.sendBusyMs !== undefined) busyWait(hooks.sendBusyMs)
             if (hooks.sendFail !== undefined) return Effect.fail(hooks.sendFail)
+            if (hooks.sendFailRing !== undefined && request.priority === "ring") return Effect.fail(hooks.sendFailRing)
             return Effect.tap(ctx.notify.send(request), () =>
               Effect.sync(() => {
                 if (hooks.blockAfterSend !== undefined) {
