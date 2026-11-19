@@ -13,6 +13,7 @@ import {
   PRESENT_KIND_NAMES,
   PRESENT_KIND_VERSIONS,
   type PresentDecision,
+  PresentAction,
   PresentationWire,
   selectPresentations
 } from "../src/index.ts"
@@ -84,5 +85,26 @@ describe("the wire", () => {
     expect(decode(examplePresentation).id).toBe("p-7c1d")
     expect(() => decode({ ...examplePresentation, content: { kind: "card", title: "x".repeat(61), facts: [] } })).toThrow()
     expect(() => decode({ ...examplePresentation, buttons: Array.from({ length: 4 }, (_, i) => ({ id: `b${i}`, label: "B" })) })).toThrow()
+  })
+
+  // Review round 2, finding 8: each bound of the one inbound message, at its maximum (accepted) and one past it
+  // (refused), every other field valid.
+  it("present.action: each bound accepted at its maximum and refused one past it", () => {
+    const decode = Schema.decodeUnknownSync(PresentAction)
+    const base = { type: "present.action", requestId: "r1", id: "p-1", action: "tick", item: "milk", done: true } as const
+    const bounds: ReadonlyArray<readonly [string, (n: number) => Record<string, unknown>, number]> = [
+      ["requestId", (n) => ({ requestId: "r".repeat(n) }), 64],
+      ["id", (n) => ({ id: "p".repeat(n) }), 64],
+      ["action", (n) => ({ action: "a".repeat(n) }), 32],
+      ["item", (n) => ({ item: "i".repeat(n) }), 40]
+    ]
+    expect(decode(base)).toEqual(base)
+    for (const [field, at, max] of bounds) {
+      expect(() => decode({ ...base, ...at(max) }), `${field} at ${max}`).not.toThrow()
+      expect(() => decode({ ...base, ...at(max + 1) }), `${field} at ${max + 1}`).toThrow()
+    }
+    expect(() => decode({ ...base, requestId: "" })).toThrow()
+    expect(() => decode({ ...base, id: "" })).toThrow()
+    expect(() => decode({ ...base, item: "" })).toThrow()
   })
 })
