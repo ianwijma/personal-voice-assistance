@@ -1,10 +1,11 @@
 // What the owner saves: refused with a sentence when a routine could not run as written (names, phrases the host would
-// refuse or two routines share, steps that are not valid), and the bounds: 16 routines, 8 phrases per language each.
+// refuse or two routines share, steps that are not valid), and the bounds: 15 routines, 8 phrases per language each.
 import { assert, describe, it } from "@effect/vitest"
 import { startTestModule } from "@pva/core/testing"
 import { Effect } from "effect"
 import { vi } from "vitest"
-import { fitSpeech, MAX_ROUTINES, parseSteps, routinesModule, routinesOf, settings, texts } from "../src/index.ts"
+import { MAX_ROUTINES, parseSteps, routinesModule, routinesOf, settings, texts } from "../src/index.ts"
+import { stoppedSentence } from "../src/run.ts"
 
 vi.setConfig({ testTimeout: 30_000 })
 
@@ -34,6 +35,9 @@ describe("routines: the settings refuse what could not run", () => {
 
   it("a phrase reserved for the host's own controls is named as the page names it", () => {
     assert.strictEqual(save([routine("Hush", SAY, ["be quiet"])]), "Routine \"Hush\", English phrase \"be quiet\": it is one of the assistant's own \"stop\" phrases, which no module may use")
+    // The module's own command to cancel a routine is not a routine's phrase either.
+    assert.strictEqual(save([routine("Halt", SAY, ["Cancel the routine!"])]), "Routine \"Halt\", English phrase \"Cancel the routine!\": it is the phrase that cancels a running routine")
+    assert.strictEqual(save([routine("Halt", SAY, [], ["annuleer de routine"])]), "Routine \"Halt\", Dutch phrase \"annuleer de routine\": it is the phrase that cancels a running routine")
     assert.strictEqual(save([routine("Stil", SAY, [], ["Stil maar!"])]), "Routine \"Stil\", Dutch phrase \"Stil maar!\": it is one of the assistant's own \"stop\" phrases, which no module may use")
   })
 
@@ -49,9 +53,9 @@ describe("routines: the settings refuse what could not run", () => {
     assert.match(save([routine("A", SAY, ["one two three four five six seven eight nine"])]), /at most 8 words/)
   })
 
-  it("more than 16 routines, more than 8 phrases: refused with the bound", () => {
+  it("more than 15 routines, more than 8 phrases: refused with the bound", () => {
     const many = Array.from({ length: MAX_ROUTINES + 1 }, (_, i) => routine(`Routine ${i + 1}`, SAY))
-    assert.strictEqual(save(many), "At most 16 routines")
+    assert.strictEqual(save(many), "At most 15 routines")
     assert.strictEqual(save(many.slice(0, MAX_ROUTINES)), "ok")
     assert.strictEqual(save([routine("A", SAY, Array.from({ length: 9 }, (_, i) => `phrase number ${i}`))]), "Routine 1, English phrases: At most 8 items")
   })
@@ -94,7 +98,7 @@ describe("routines: the settings refuse what could not run", () => {
 })
 
 describe("routines: at the bounds the module still starts", () => {
-  it.effect("16 routines with 8 phrases in each language; the template is then left out", () =>
+  it.effect("15 routines with 8 phrases in each language, beside the cancel command; the template is then left out", () =>
     Effect.gen(function*() {
       const routines = Array.from({ length: MAX_ROUTINES }, (_, i) =>
         routine(
@@ -108,7 +112,8 @@ describe("routines: at the bounds the module still starts", () => {
       assert.strictEqual(routinesOf({ routines, goodMorning: true }).length, MAX_ROUTINES)
       const kit = yield* startTestModule(routinesModule, { settings: { routines, goodMorning: true } })
       assert.deepStrictEqual(((yield* kit.tool("routines_list", {})).value as { count: number }).count, MAX_ROUTINES)
-      assert.isTrue((yield* kit.phrases.say("do 15 7")).taken)
+      assert.isTrue((yield* kit.phrases.say("do 14 7")).taken)
+      assert.isTrue((yield* kit.phrases.say("cancel the routine")).taken)
       assert.deepStrictEqual(yield* kit.phrases.say("good morning"), { taken: false })
     }))
 
@@ -125,28 +130,26 @@ describe("routines: what it says fits where it is said", () => {
     const name = "N".repeat(40)
     for (const lang of ["en", "nl"] as const) {
       for (const [key, text] of Object.entries(texts[lang])) {
+        if (key === "stoppedAt" || key === "stoppedFailed") continue // composed: the test below fills them at their worst
         const filled = text.replaceAll("{name}", name).replaceAll("{step}", "20").replaceAll("{steps}", "steps 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19 and 20").replaceAll("{list}", `${name}, ${name} or ${name}`)
         assert.isAtMost(filled.length, 300, `${lang}.${key}`)
       }
     }
   })
 
-  it("another module's long answer keeps its whole sentences; one long sentence is cut at a word, never inside an emoji", () => {
-    const sentence = "This is a sentence of exactly fifty characters!!.."
-    assert.strictEqual(fitSpeech("Short."), "Short.")
-    assert.strictEqual(fitSpeech(`${"A sentence. ".repeat(30)}`.trim()).length <= 300, true)
-    assert.match(fitSpeech(`${"A sentence. ".repeat(30)}`.trim()), /\.$/)
-    assert.strictEqual(fitSpeech("line\none\u0007two"), "line one two")
-    const long = `${"word ".repeat(70)}😀😀`
-    const cut = fitSpeech(long)
-    assert.isAtMost(cut.length, 300)
-    assert.isTrue(cut.endsWith("…"))
-    // No lone surrogate: every code point is whole.
-    assert.notMatch(cut, /[\ud800-\udbff](?![\udc00-\udfff])|(?<![\ud800-\udbff])[\udc00-\udfff]/)
-    const emoji = "😀".repeat(200)
-    const emojiCut = fitSpeech(emoji)
-    assert.isAtMost(emojiCut.length, 300)
-    assert.notMatch(emojiCut, /[\ud800-\udbff](?![\udc00-\udfff])|(?<![\ud800-\udbff])[\udc00-\udfff]/)
-    assert.strictEqual(fitSpeech(sentence.repeat(1)), sentence)
+  it("what a run says when it stops fits an announcement whole at the worst: 20 steps, the longest name, every split of done and unconfirmed", () => {
+    const name = "N".repeat(40)
+    const steps = Array.from({ length: 19 }, (_, i) => i + 1)
+    for (const lang of ["en", "nl"] as const) {
+      for (const why of ["whyRefused", "whyValues", "failed"] as const) {
+        for (const split of [0, 1, 2, 3]) {
+          const done = steps.filter((n) => (split === 0 ? true : split === 1 ? false : n % split === 0))
+          const unconfirmed = steps.filter((n) => !done.includes(n))
+          const sentence = stoppedSentence(lang, name, 20, why, done, unconfirmed)
+          assert.isAtMost(sentence.length, 300, `${lang} ${why} ${split}: ${sentence.length}`)
+          assert.notInclude(sentence, "{")
+        }
+      }
+    }
   })
 })
