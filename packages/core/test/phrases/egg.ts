@@ -4,11 +4,12 @@
 import { Effect } from "effect"
 import { ActionError, defineAction, Param } from "../../src/Actions.ts"
 import { defineModule } from "../../src/ModuleDefinition.ts"
-import type { ModuleNotify } from "../../src/Notify.ts"
+import type { ModuleNotify, ModuleSpeech } from "../../src/Notify.ts"
 import { CurrentTurn, type TurnContext } from "../../src/TurnContext.ts"
 
 export interface EggParts {
   notify?: ModuleNotify
+  speech?: ModuleSpeech
   turns: Array<TurnContext | undefined>
   snoozes: Array<string>
   runs: Array<string>
@@ -29,6 +30,7 @@ export const makeEgg = (options: { readonly id?: string; readonly status?: Reado
     shared: (ctx) =>
       Effect.gen(function*() {
         parts.notify = ctx.notify
+        parts.speech = ctx.speech
         yield* ctx.notify.handle("egg", { run: (press) => Effect.sync(() => (parts.snoozes.push(press.notificationId), { say: "Snoozed." })) }).pipe(Effect.orDie)
         return { value: undefined }
       }),

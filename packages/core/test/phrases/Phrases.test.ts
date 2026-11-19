@@ -8,6 +8,7 @@ import {
   defineAction,
   HOST_CONTROL_PHRASES,
   HOST_CONTROLS,
+  type CommandSet,
   hostCommandSet,
   matchCommand,
   matchRinging,
@@ -31,7 +32,7 @@ const lights = actionsOf("lights", [
     id: "on",
     label: "Lights on",
     description: "Lights on in a room.",
-    params: { room: Param.dynamic({ label: "Room", options: () => rooms }) },
+    params: { room: Param.choice({ label: "Room", options: rooms }) },
     phrases: { en: ["{room} lights on", "lights on in the {room}"], nl: ["licht aan in de {room}"] },
     run: () => Effect.succeed({ say: "On." })
   },
@@ -107,7 +108,7 @@ describe("the matcher", () => {
   })
 
   it.each([
-    ["garage lights on", "a dynamic room that is not one"],
+    ["garage lights on", "a room that is not one of the choice"],
     ["dim to a lot", "a number that does not read"],
     ["dim to 140", "a number above its maximum"],
     ["dim to 40 degrees", "a number with another unit"],
@@ -144,12 +145,23 @@ describe("the matcher", () => {
     expect(matchCommand(hostCommandSet("en"), "stop the music")).toBeUndefined()
   })
 
-  it("a host control beats a module phrase of the same length; two modules tied match nothing", () => {
+  it("a host control that is longer than a module phrase reading the same words wins (the reachable case)", () => {
     const tie = actionsOf("a", [{ id: "x", label: "X", description: "X.", params: { thing: Param.text({ label: "Thing", after: [] }) }, phrases: { en: ["{thing} up"] }, run: () => Effect.void }])
     const set = buildCommandSet("en", tie)
-    // "turn it up" is the host's (3 literal words) and "{thing} up" one literal word: the host's is longer anyway.
+    // "turn it up" is the host's (3 literal words); "{thing} up" reads it too, with 1.
     expect(idOf(matchCommand(set, "turn it up"))).toBe("control:louder")
-    const a = actionsOf("a", [{ id: "x", label: "X", description: "X.", params: { room: Param.dynamic({ label: "Room", options: () => rooms }) }, phrases: { en: ["{room} please"] }, run: () => Effect.void }])
+    expect(idOf(matchCommand(set, "the radio up"))).toBe("a.x")
+  })
+
+  it("a host control beats a module phrase of the same length (a set made by hand: a module start refuses such a phrase, so it is a defence)", () => {
+    const [own] = actionsOf("a", [{ id: "x", label: "X", description: "X.", params: {}, phrases: { en: ["louder"] }, run: () => Effect.void }])
+    const host = hostCommandSet("en")
+    const forged: CommandSet = { ...host, phrases: [{ owner: { kind: "action", action: own! }, text: "turn it up", shape: "turn it up", parts: ["turn", "it", "up"], literals: 3, defaults: {} }, ...host.phrases] }
+    expect(idOf(matchCommand(forged, "turn it up"))).toBe("control:louder")
+  })
+
+  it("two modules tied on an utterance match nothing; the same shape twice is a duplicate", () => {
+    const a = actionsOf("a", [{ id: "x", label: "X", description: "X.", params: { room: Param.choice({ label: "Room", options: rooms }) }, phrases: { en: ["{room} please"] }, run: () => Effect.void }])
     const b = actionsOf("b", [{ id: "y", label: "Y", description: "Y.", params: { thing: Param.text({ label: "Thing", after: [] }) }, phrases: { en: ["kitchen {thing}"] }, run: () => Effect.void }])
     const both = buildCommandSet("en", [...a, ...b])
     expect(both.conflicts).toEqual([])
@@ -194,7 +206,7 @@ describe("one assistant's set", () => {
 
 describe("declarations (refused when the module starts)", () => {
   const check = (phrases: ActionPhrases, params: Parameters<typeof defineAction>[0]["params"] = {}) => phraseProblems("mod", [{ id: "act", params, phrases }])
-  const room = { room: Param.dynamic({ label: "Room", options: () => rooms }) }
+  const room = { room: Param.choice({ label: "Room", options: rooms }) }
 
   it("accepts phrases within every bound", () => {
     expect(check({ en: ["a b c d e f g {room}"], nl: Array.from({ length: 8 }, (_, i) => `zin ${i} {room}`) }, room)).toEqual([])
@@ -247,46 +259,145 @@ describe("bounds of an utterance", () => {
     expect(matchCommand(hostCommandSet("en"), `${"stop ".repeat(25)}`)).toBeUndefined()
   })
 
-  it(`at most ${PHRASE_LIMITS.slotReads} slot readings an utterance: a sentence that aligns everywhere stops matching once they are spent`, () => {
-    let reads = 0
-    const counted = () => (reads++, rooms)
-    // Every shape of 3 to 6 tokens over the words "x" and "and" with two slots that are not side by side.
+  it(`at most ${PHRASE_LIMITS.slotReads} slot readings an utterance: a sentence that aligns everywhere is not taken once they are spent`, () => {
+    // Every shape of 3 to 6 tokens over the words "x" and "and" with two number slots that are not side by side.
     const shapes: Array<string> = []
     for (let n = 3; n <= 6; n++) {
       for (let mask = 0; mask < 1 << n; mask++) {
         for (let i = 0; i < n; i++) {
           for (let j = i + 2; j < n; j++) {
-            const tokens = Array.from({ length: n }, (_, k) => (k === i ? "{a}" : k === j ? "{b}" : (mask >> k) & 1 ? "and" : "x"))
-            shapes.push(tokens.join(" "))
+            shapes.push(Array.from({ length: n }, (_, k) => (k === i ? "{a}" : k === j ? "{b}" : (mask >> k) & 1 ? "and" : "x")).join(" "))
           }
         }
       }
     }
     const unique = [...new Set(shapes)].slice(0, 128)
-    const actions = Array.from({ length: 16 }, (_, m) =>
-      actionsOf(`m${m}`, [{
-        id: "x",
-        label: "X",
-        description: "X.",
-        params: { a: Param.dynamic({ label: "A", options: counted }), b: Param.dynamic({ label: "B", options: counted }) },
-        phrases: { en: unique.slice(m * 8, m * 8 + 8) },
-        run: () => Effect.void
-      }])).flat()
+    const numbers = { a: Param.number({ label: "A" }), b: Param.number({ label: "B" }) }
+    const actions = Array.from({ length: 16 }, (_, m) => actionsOf(`m${m}`, [{ id: "x", label: "X", description: "X.", params: numbers, phrases: { en: unique.slice(m * 8, m * 8 + 8) }, run: () => Effect.void }])).flat()
     const set = buildCommandSet("en", actions)
     expect(set.conflicts).toEqual([])
-    // "x and x and …": almost every shape aligns, in several ways; no slot reads (no room is called "x and x").
-    expect(matchCommand(set, "x and x and x and x and x")).toBeUndefined()
-    expect(reads).toBe(PHRASE_LIMITS.slotReads)
+    const stats = { words: 0, phrases: 0, reads: 0, exhausted: false }
+    expect(matchCommand(set, "x and x and x and x and x", stats)).toBeUndefined()
+    expect(stats).toMatchObject({ words: 9, reads: PHRASE_LIMITS.slotReads, exhausted: true })
     // An ordinary sentence costs two readings.
-    const plain = buildCommandSet("en", actionsOf("p", [{ id: "x", label: "X", description: "X.", params: { a: Param.dynamic({ label: "A", options: counted }), b: Param.dynamic({ label: "B", options: counted }) }, phrases: { en: ["{a} and {b}"] }, run: () => Effect.void }]))
-    reads = 0
-    expect(matchCommand(plain, "kitchen and living room")).toMatchObject({ values: { a: "kitchen", b: "living" } })
-    expect(reads).toBe(2)
+    const plain = buildCommandSet("en", actionsOf("p", [{ id: "x", label: "X", description: "X.", params: numbers, phrases: { en: ["{a} and {b}"] }, run: () => Effect.void }]))
+    const two = { words: 0, phrases: 0, reads: 0, exhausted: false }
+    expect(matchCommand(plain, "five and six", two)).toMatchObject({ values: { a: 5, b: 6 } })
+    expect(two).toMatchObject({ reads: 2, exhausted: false })
   })
 
-  it("a dynamic list that throws matches nothing (module code on the turn path is contained)", () => {
-    const set = buildCommandSet("en", actionsOf("t", [{ id: "x", label: "X", description: "X.", params: { room: Param.dynamic({ label: "Room", options: () => { throw new Error("broken cache") } }) }, phrases: { en: ["clean {room}"] }, run: () => Effect.void }]))
-    expect(matchCommand(set, "clean kitchen")).toBeUndefined()
+  it("a3: a search that spent its budget returns no provisional shorter match; the longest wins when it completes", () => {
+    // The reviewer's case: a valid short phrase, then aligned candidates whose slots never read, then the longest phrase.
+    const text = "please turn the kitchen and hall lights on now"
+    const w = text.split(" ")
+    const patterns: Array<string> = []
+    for (let a = 0; a < w.length; a++) for (let b = a + 1; b <= w.length; b++) for (let c = b + 1; c < w.length; c++) for (let d = c + 1; d <= w.length; d++) {
+      const p = [...w.slice(0, a), "{a}", ...w.slice(b, c), "{b}", ...w.slice(d)]
+      if (b - a <= 8 && d - c <= 8 && p.length <= 8 && p.length > 2) patterns.push(p.join(" "))
+    }
+    const uniq = [...new Set(patterns)]
+    const literals = (p: string) => p.split(" ").length - 2
+    const low = uniq.filter((p) => literals(p) === 1).slice(0, 1)
+    const fillers = uniq.filter((p) => literals(p) >= 2 && literals(p) <= 4).slice(0, 70)
+    const longest = uniq.find((p) => literals(p) === 6)!
+    const mk = (id: string, ps: ReadonlyArray<string>, good: boolean) =>
+      actionsOf(id, [{
+        id: "run",
+        label: "Run",
+        description: "Run.",
+        params: { a: good ? Param.text({ label: "A", after: [] }) : Param.choice({ label: "A", options: [{ value: "impossible", label: "impossible" }] }), b: Param.text({ label: "B", after: [] }) },
+        phrases: { en: ps },
+        run: () => Effect.void
+      }])
+    const actions = [...mk("short", low, true), ...Array.from({ length: Math.ceil(fillers.length / 8) }, (_, i) => mk(`fill${i}`, fillers.slice(i * 8, i * 8 + 8), false)).flat(), ...mk("long", [longest], true)]
+    const stats = { words: 0, phrases: 0, reads: 0, exhausted: false }
+    expect(matchCommand(buildCommandSet("en", actions), text, stats)).toBeUndefined()
+    expect(stats.exhausted).toBe(true)
+    // The longest first: proved (the shorter ones are not even read), so it wins.
+    expect(idOf(matchCommand(buildCommandSet("en", [...actions.slice(-1), ...actions.slice(0, -1)]), text))).toBe("long.run")
+  })
+
+  it("E1: a parameter whose options come from a callback cannot be a slot (refused, saying what to do); a choice has at most 32 options", () => {
+    const dynamic = phraseProblems("mod", [{ id: "clean", params: { room: Param.dynamic({ label: "Room", options: () => rooms }) }, phrases: { en: ["clean the {room}"] } }])
+    expect(dynamic.join()).toContain("make the parameter text (Param.text) and resolve the name in the action")
+    const big = Array.from({ length: 33 }, (_, i) => ({ value: `o${i}`, label: `option ${i}` }))
+    expect(phraseProblems("mod", [{ id: "pick", params: { o: Param.choice({ label: "O", options: big }) }, phrases: { en: ["pick {o}"] } }]).join()).toContain("33 options; a phrase reads at most 32")
+    expect(phraseProblems("mod", [{ id: "pick", params: { o: Param.choice({ label: "O", options: big.slice(0, 32) }) }, phrases: { en: ["pick {o}"] } }])).toEqual([])
+  })
+
+  it("E1: a match calls no module code (a choice's names are read from what was prepared)", () => {
+    const options = [{ value: "kitchen", label: "Kitchen", aliases: ["keuken"] }]
+    const set = buildCommandSet("en", actionsOf("t", [{ id: "x", label: "X", description: "X.", params: { room: Param.choice({ label: "Room", options }) }, phrases: { en: ["clean the {room}"] }, run: () => Effect.void }]))
+    // The declaration's list changing afterwards changes nothing: the set holds what it prepared.
+    ;(options as Array<{ value: string; label: string; aliases?: Array<string> }>).push({ value: "hall", label: "Hall" })
+    expect(matchCommand(set, "clean the hall")).toBeUndefined()
+    expect(matchCommand(set, "clean the Keuken")).toMatchObject({ values: { room: "kitchen" } })
+  })
+})
+
+describe("slots are read from the characters said (E2, a2)", () => {
+  const set = buildCommandSet("en", actionsOf("s", [
+    { id: "num", label: "N", description: "N.", params: { n: Param.number({ label: "N", min: -100, max: 100 }) }, phrases: { en: ["set {n}"] }, run: () => Effect.void },
+    { id: "pct", label: "P", description: "P.", params: { p: Param.number({ label: "P", unit: "percent" }) }, phrases: { en: ["dim {p}"] }, run: () => Effect.void },
+    { id: "wait", label: "W", description: "W.", params: { d: Param.duration({ label: "D" }) }, phrases: { en: ["wait {d}"] }, run: () => Effect.void },
+    { id: "note", label: "T", description: "T.", params: { t: Param.text({ label: "T", after: [] }) }, phrases: { en: ["note {t}"] }, run: () => Effect.void }
+  ]))
+  it.each([
+    ["set -5", { n: -5 }],
+    ["set −5", { n: -5 }],
+    ["set .5", { n: 0.5 }],
+    ["set 5.", { n: 5 }],
+    ["dim 40%", { p: 40 }],
+    ["note #123", { t: "#123" }],
+    ["note .NET", { t: ".NET" }],
+    ["note C++", { t: "C++" }],
+    ["note C++.", { t: "C++" }]
+  ])("%j reads %j", (said, values) => {
+    expect(matchCommand(set, said)).toMatchObject({ values })
+  })
+  it.each([
+    ["set –5", "a dash that is no minus"],
+    ["set 5%", "a percent sign on a number without a unit"],
+    ["set 5°", "a degree sign on a number without a unit"],
+    ["wait -5 minutes", "a negative duration"],
+    ["wait minus five minutes", "a negative duration in words"]
+  ])("%j does not match (%s)", (said) => {
+    expect(matchCommand(set, said)).toBeUndefined()
+  })
+})
+
+describe("a4: a parameter the phrase leaves out gets what every path gives it", () => {
+  it("its declared default, false for a yes/no parameter, undefined otherwise", () => {
+    const set = buildCommandSet("en", actionsOf("f", [{
+      id: "fan",
+      label: "Fan",
+      description: "Fan.",
+      params: {
+        speed: Param.choice({ label: "Speed", options: [{ value: "low", label: "low" }, { value: "high", label: "high" }], default: "low", optional: true }),
+        yes: Param.boolean({ label: "Yes", question: "Yes?" }),
+        minutes: Param.number({ label: "Minutes", optional: true })
+      },
+      phrases: { en: ["fan on", "fan on {speed}"] },
+      run: () => Effect.void
+    }]))
+    expect(matchCommand(set, "fan on")).toMatchObject({ values: { speed: "low", yes: false, minutes: undefined } })
+    expect(matchCommand(set, "fan on high")).toMatchObject({ values: { speed: "high", yes: false } })
+  })
+})
+
+describe("a13: canonically equivalent input gives the same words", () => {
+  const set = (lang: "en" | "nl") => buildCommandSet(lang, actionsOf("k", [
+    { id: "dessert", label: "D", description: "D.", params: {}, phrases: { en: ["make crème brûlée"] }, run: () => Effect.void },
+    { id: "timer", label: "T", description: "T.", params: { n: Param.text({ label: "N", after: [] }) }, phrases: { nl: ["zet één timer {n}"] }, run: () => Effect.void }
+  ]))
+  it("English and Dutch, composed and decomposed, in the phrase and the utterance; a slot keeps the original characters", () => {
+    expect(idOf(matchCommand(set("en"), "make crème brûlée".normalize("NFC")))).toBe("k.dessert")
+    expect(idOf(matchCommand(set("en"), "make crème brûlée".normalize("NFD")))).toBe("k.dessert")
+    const nfd = "zet één timer café".normalize("NFD")
+    expect(matchCommand(set("nl"), nfd)).toMatchObject({ values: { n: "café".normalize("NFD") } })
+    expect(idOf(matchCommand(set("nl"), "zet één timer koffie".normalize("NFC")))).toBe("k.timer")
+    // A ringing label too.
+    expect(matchRinging("nl", "Één keer".normalize("NFD"), [{ id: "n", actions: [{ id: "once", label: "één keer".normalize("NFC") }] }])).toMatchObject({ kind: "action", actionId: "once" })
   })
 })
 

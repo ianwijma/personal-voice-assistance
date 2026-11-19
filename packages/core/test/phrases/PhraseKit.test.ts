@@ -11,6 +11,7 @@ import { defineModule } from "../../src/ModuleDefinition.ts"
 import { stubService, succeeds } from "../../src/ModuleStubs.ts"
 import { provide, startTestModule } from "../../src/ModuleTestKit.ts"
 import { PHRASE_ANSWER_CHARS } from "../../src/Phrases.ts"
+import { ECHO_TAIL_MS } from "../../src/EchoGate.ts"
 import { Playback, type PlaybackService } from "../../src/Playback.ts"
 import { makeEgg } from "./egg.ts"
 
@@ -28,7 +29,7 @@ describe("a module's phrase commands", () => {
       const turn = egg.parts.turns[0]!
       assert.deepStrictEqual([turn.source, turn.assistantId, turn.deviceId, turn.person?.id], ["phrase", "jeff", "kitchen-display", "p-sam"])
       assert.deepStrictEqual(kit.phrases.spoken.map((s) => [s.deviceId, s.text]), [["kitchen-display", "Egg timer for 6 minutes."]])
-      // An optional slot left out takes its default.
+      // An optional slot left out, with no declared default: the action gets undefined (it words its own fallback).
       assert.strictEqual(said(yield* kit.phrases.say("boil an egg")), "Egg timer for 6 minutes.")
     }))
 
@@ -116,6 +117,9 @@ describe("the ringing window", () => {
       yield* kit.notify.replying("kitchen-display", true)
       assert.deepStrictEqual(yield* kit.phrases.say("stop", { device: "kitchen-display", wake: false }), { taken: false })
       yield* kit.notify.replying("kitchen-display", false)
+      // Still the reply's echo tail: closed; once it is over, the window takes "stop".
+      assert.deepStrictEqual(yield* kit.phrases.say("stop", { device: "kitchen-display", wake: false }), { taken: false })
+      yield* kit.advance(ECHO_TAIL_MS)
       assert.strictEqual(did(yield* kit.phrases.say("stop", { device: "kitchen-display", wake: false })), "stopped-ring")
       const off = yield* startTestModule(makeEgg().definition, {
         household: { devices: [{ id: "kitchen-display", name: "Kitchen display", room: "Kitchen", ringingWithoutWake: false }] }
@@ -173,10 +177,21 @@ describe("the host's essential controls", () => {
       assert.deepStrictEqual([did(r), said(r)], ["nothing", undefined])
     }))
 
-  it.effect("stop with no Playback provider and nothing else does nothing; a device with no room is not asked about media", () =>
+  it.effect("stop with no Playback provider and nothing else does nothing", () =>
     Effect.gen(function*() {
       const kit = yield* startTestModule(makeEgg().definition)
       assert.strictEqual(did(yield* kit.phrases.say("stop it")), "nothing")
+    }))
+
+  it.effect("a14: a device with no room is not asked about media, even with a Playback provider that would pause", () =>
+    Effect.gen(function*() {
+      const playback = stubService<PlaybackService>("playback", { pause: succeeds(true) })
+      const kit = yield* startTestModule(makeEgg().definition, {
+        provide: [provide("music", { services: [Playback.of(playback.service)] })],
+        household: { devices: [{ id: "roomless-01", name: "Roomless" }] }
+      })
+      assert.strictEqual(did(yield* kit.phrases.say("stop", { device: "roomless-01" })), "nothing")
+      assert.strictEqual(playback.calls.pause, undefined)
     }))
 
   it.effect("never mind: a pending reply is cancelled (silently); without one, nothing", () =>
@@ -232,7 +247,7 @@ describe("conflicts and declarations", () => {
       const a = makeEgg()
       const b = makeEgg({ id: "duck", status: ["egg status", "duck status"] })
       const kit = yield* startTestModule(a.definition, { others: [b.definition] })
-      const conflicts = kit.phrases.commandsFor().conflicts
+      const conflicts = (yield* kit.phrases.commandsFor()).conflicts
       assert.deepStrictEqual(conflicts.filter((c) => c.kind === "duplicate").map((c) => c.kind === "duplicate" && c.shape).sort(), [
         "boil an egg",
         "crack the egg",
@@ -289,7 +304,7 @@ describe("lifecycle", () => {
     Effect.gen(function*() {
       const egg = makeEgg()
       const kit = yield* startTestModule(egg.definition)
-      const taken = kit.phrases.decide("boil an egg")
+      const taken = yield* kit.phrases.decide("boil an egg")
       assert.strictEqual(taken?.by, "phrase")
       yield* kit.stop
       const outcome = yield* kit.phrases.run(taken!)
@@ -297,7 +312,7 @@ describe("lifecycle", () => {
       assert.deepStrictEqual(egg.parts.runs, [])
       // Restarted between the decision and the run: the old action is withdrawn too (a new one is published).
       yield* kit.start
-      const again = kit.phrases.decide("boil an egg")
+      const again = yield* kit.phrases.decide("boil an egg")
       yield* kit.restart
       assert.strictEqual((yield* kit.phrases.run(again!)).did, "not-running")
       assert.deepStrictEqual(egg.parts.runs, [])
