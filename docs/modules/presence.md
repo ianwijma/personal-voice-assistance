@@ -51,6 +51,44 @@ gets no time at all.
 | `people_list` (tool) | none | read, speculative | the household's members and whether each is followed. Never says where anyone is, so it is answered on any device | "who lives here?" |
 | `presence.who_is_home` (typed action) | `person?`: a member (a dynamic choice over Members) | read | the same answer as sentences, with no model, the time worded by `@pva/language` ("Sam has been home since seven o'clock. Robin is out." / "Sam is sinds zeven uur thuis."), at most four people and then "and N more" | "who is home", "is Sam home", "wie is er thuis", "is Sam thuis" |
 
+### Phrase commands and the list
+
+`presence.who_is_home` is also a **phrase command** (docs/PHRASES.md): said after the wake phrase it runs with no model,
+the same action, with the same sentences, refusals and risk class, and nothing else of the module changed. The phrases
+are fixed words, matched exactly (case and punctuation do not count), for the household's language:
+
+| English | Dutch |
+|---|---|
+| "who is home", "who is at home", "who's home", "is anyone home" | "wie is er thuis", "wie is thuis", "is er iemand thuis" |
+
+They ask about everyone. "Is Sam home?" is not a phrase (a name is a runtime list, which cannot be a phrase slot): it
+goes to the assistant, which has `presence_where`; the action itself still takes a `person` from the model or admin.
+"Who is home please" is not matched either.
+
+Whenever the action answers with people (said as a phrase or run another way), it also **shows them as a list** on the
+screen of the device that asked: the title "Who is home" ("Wie is thuis"), one line for each person the answer named
+("Sam: home since 07:00", "Robin: out", "Alex: not known"), and the answer's honest notes as lines of their own ("and 2
+more" past what fits, "Where 2 other people are is not said here.", "I lost the connection to Home Assistant, so this is
+what I heard last."). It is a transient list (30 seconds), with no buttons.
+
+- **Privacy is the answer's.** What the list names is exactly what the answer named for that device (an answer that is
+  refused or empty shows nothing, so a public device, or a shared device asked about someone who is not its default
+  person, shows no list, not even "nobody"). The list is personal to the first person it names, so the Presenter also
+  asks `Privacy.mayReveal` for the device whenever it decides what a screen holds, and takes it down if the rule changes.
+  A device with no screen, or a page that cannot draw lists, is told nothing different: the answer is spoken as before.
+- **What is on screen follows the data.** The module keeps the handle of the list on each device (in memory, for at most
+  32 devices). The next answer from that device takes it down first (and shows a new one only if it has people to
+  show, so an empty answer withdraws it), and any change of a Home Assistant person, a snapshot, a break of the
+  connection or the end of its stream takes every list down. A list is not rewritten out of a turn: it is taken down,
+  and shown again by asking again.
+- **After a restart** of the module its lists are gone with it (the Presenter withdraws a stopped part's transient
+  presentations) and the memory of them with it.
+- The same turn on the same device is shown once: a repeat of an invocation (same assistant, conversation, turn and
+  device) answers again but shows nothing more.
+- Names and the line of text are cut to the Presenter's bounds at a code point (a name at 30 characters, a line at 80,
+  twelve lines, the spoken fallback at 300 characters in whole sentences, naming fewer people until it fits), and
+  outside text is shown as plain text on one line.
+
 Every sentence the module speaks itself is in English and Dutch, by the household's language. When Home Assistant's
 module is off, or stops during a call, every tool and the action say so ("The Home Assistant module is off." / "De
 module Home Assistant staat uit."): each call into its service goes through `useService`.
@@ -122,11 +160,18 @@ Left out of the first version by the plan's row (`docs/MODULES-PLAN.md` §5.1 ro
 identification, guest mode, the house guide, who may ask about whom (adults and children, `home-only` and `exact`),
 presence history, `presence.room`, `presence.everyone_left` and `presence.first_home`, and the "welcome home" greeting.
 
-Left out for wave B, because they need a phrase command, a presentation, a notification or the module's own speech
-(P7, P9, P10): spoken greetings on arrival, the `list` presentation of who is home, enrolment steps, the Wi-Fi hand-off
-and QR code, notifications such as "everyone left and the door is unlocked", and phrase commands for "who is home".
+Left out for wave B, because they need a notification or the module's own speech (P9): spoken greetings on arrival,
+enrolment steps, the Wi-Fi hand-off and QR code, and notifications such as "everyone left and the door is unlocked".
+(The phrase command for "who is home" and its `list` presentation are described above.)
 
 Left out because something is missing, and reported in the pull request:
+
+- A phrase for one person ("is Sam home?"): a `Param.dynamic` cannot be a slot, and a text slot would need the name
+  resolved in the action with the people's aliases on the matching path. Smallest change: a phrase slot that reads a
+  `Param.dynamic` from a list the host prepares when the set is built.
+- One list's privacy is a single owner (`sensitivity` takes one Members id), so a list of several people is personal to
+  the first it names, while the answer was already decided person by person. A presentation with a per-line owner would
+  let the Presenter decide each line.
 
 - Zone names are never said (see above); the setting that would let a person share them (`exact`) belongs to the
   "who may ask about whom" part.

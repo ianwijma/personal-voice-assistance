@@ -20,7 +20,13 @@ export const texts = defineTexts({
     noState: "I haven't heard from Home Assistant yet, so I don't know who is home.",
     noMembers: "There is nobody in the household's list of people yet.",
     membersLine: "The household: {names}.",
-    unreadable: "I couldn't read who is home."
+    unreadable: "I couldn't read who is home.",
+    listTitle: "Who is home",
+    rowHome: "{name}: home",
+    rowHomeSince: "{name}: home since {when}",
+    rowOut: "{name}: out",
+    rowOutSince: "{name}: out since {when}",
+    rowUnknown: "{name}: not known"
   },
   nl: {
     home: "{name} is thuis.",
@@ -40,6 +46,12 @@ export const texts = defineTexts({
     noState: "Ik heb nog niets van Home Assistant gehoord, dus ik weet niet wie er thuis is.",
     noMembers: "Er staat nog niemand in de lijst met huisgenoten.",
     membersLine: "Het huishouden: {names}.",
-    unreadable: "Ik kon niet lezen wie er thuis is."
+    unreadable: "Ik kon niet lezen wie er thuis is.",
+    listTitle: "Wie is thuis",
+    rowHome: "{name}: thuis",
+    rowHomeSince: "{name}: thuis sinds {when}",
+    rowOut: "{name}: weg",
+    rowOutSince: "{name}: weg sinds {when}",
+    rowUnknown: "{name}: onbekend"
   }
 })

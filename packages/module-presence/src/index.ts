@@ -7,6 +7,8 @@ import {
   type ModuleDefinition,
   type PeopleService,
   Param,
+  type PresentHandle,
+  type Presentation,
   People,
   type Person,
   Privacy,
@@ -156,8 +158,36 @@ interface Tracked {
   readonly awaySince?: number
 }
 
+/** The most devices whose "who is home" list is remembered (one handle each), and the most turns remembered as shown. */
+const MAX_HANDLES = 32
+const MAX_SEEN = 64
+/** The most items of a list presentation, the longest name shown in one, and its longest spoken fallback. */
+const LIST_ITEMS = 12
+const NAME_CHARS = 30
+const SPOKEN_CHARS = 300
+
+/** A text cut to at most `max` UTF-16 units at a code point boundary (an emoji is never split), with "…" when cut. */
+export const cutText = (s: string, max: number): string => {
+  if (s.length <= max) return s
+  let out = ""
+  for (const ch of s) {
+    if (out.length + ch.length > max - 1) break
+    out += ch
+  }
+  return `${out}…`
+}
+
+/** Text from outside as one plain line: control, line and bidirectional characters become spaces (it is never markup). */
+const oneLine = (s: string): string => s.replace(/[\ud800-\udbff](?![\udc00-\udfff])|(?<![\ud800-\udbff])[\udc00-\udfff]/g, "\ufffd").replace(/[\p{Cc}\u2028\u2029\u202a-\u202e\u2066-\u2069\u200e\u200f\u061c]/gu, " ").replace(/ {2,}/g, " ").trim()
+
 /** What the shared part offers the instances. */
 interface Shared {
+  /** The "who is home" lists on screen, by device: kept so that the next answer or a change of the data withdraws them. */
+  readonly shown: Map<string, PresentHandle>
+  /** The turns whose answer was already shown (a replay of one shows nothing twice). */
+  readonly seen: Set<string>
+  /** Takes every list down (the data changed or its stream broke). */
+  readonly withdrawAll: Effect.Effect<void>
   /** When the person went away, if the module saw it happen and the person is still away: else `undefined`. */
   readonly awaySince: (entityId: string, liveState: string) => number | undefined
 }
@@ -223,6 +253,16 @@ export const makePresenceModule = () => {
 
         // What the module knows, in memory: every person entity's last state, and the departures waiting out the delay.
         const tracked = new Map<string, Tracked>()
+        // The lists on screen (in memory; a restart of the module takes its transient presentations down with it).
+        const shown = new Map<string, PresentHandle>()
+        const seen = new Set<string>()
+        const quietly = (e: Effect.Effect<unknown, unknown>): Effect.Effect<void> => e.pipe(Effect.ignore, Effect.catchDefect(() => Effect.void))
+        /** The data a list shows changed or can no longer be trusted: every list comes down (none is rewritten out of a turn). */
+        const withdrawAll = Effect.suspend(() => {
+          const handles = [...shown.values()]
+          shown.clear()
+          return Effect.forEach(handles, (h) => quietly(h.dismiss), { discard: true })
+        })
         const pending = new Map<string, { readonly token: object; readonly fiber: Fiber.Fiber<void> }>()
 
         /** Calls a waiting departure off, at once; true when there was one. */
@@ -306,6 +346,7 @@ export const makePresenceModule = () => {
                 // A snapshot is a state, not news: it calls off every waiting departure and announces nothing. A person
                 // whose state and last change are exactly as the module knew them keeps when they went away.
                 cancelAll()
+                yield* withdrawAll
                 const before = new Map(tracked)
                 tracked.clear()
                 for (const e of change.entities) {
@@ -318,22 +359,28 @@ export const makePresenceModule = () => {
               }
               case "connection":
                 if (change.connection !== "connected") cancelAll()
+                yield* withdrawAll
                 return
               case "removed":
                 cancel(change.entityId)
+                yield* withdrawAll
                 tracked.delete(change.entityId)
                 return
               case "changed":
                 // A change with no previous entity is one new to Home Assistant's cache: what it is now is not news.
-                if (change.entity.domain === "person") yield* onChanged(change.entity, change.previous)
+                if (change.entity.domain === "person") {
+                  yield* withdrawAll
+                  yield* onChanged(change.entity, change.previous)
+                }
                 return
             }
           })
 
         /** The stream ended (the provider stopped or was replaced): nothing pending survives, and the next snapshot is the baseline. */
-        const reset = Effect.sync(() => {
+        const reset = Effect.suspend(() => {
           cancelAll()
           tracked.clear()
+          return withdrawAll
         })
 
         // Home Assistant's changes, for as long as this part lives. The provider is looked up again each time the
@@ -350,6 +397,9 @@ export const makePresenceModule = () => {
         )
 
         const shared: Shared = {
+          shown,
+          seen,
+          withdrawAll,
           awaySince: (entityId, liveState) => {
             const known = tracked.get(entityId)
             return isAway(liveState) && isAway(known?.state) ? known.awaySince : undefined
@@ -421,20 +471,87 @@ export const makePresenceModule = () => {
           })
 
         /** The same answer as sentences, for a typed action (no model words it); times by `@pva/language`. */
-        const sentences = (lang: Lang, g: Gathered): string => {
+        const sentences = (lang: Lang, g: Gathered, maxNamed: number = MAX_NAMED): string => {
           if (g.kind === "spoken") return g.text
-          const named = g.rows.slice(0, MAX_NAMED).map((r) => {
+          const named = g.rows.slice(0, maxNamed).map((r) => {
             if (r.at === "unknown") return say(texts, lang, "unknown", { name: r.name })
             const when = r.since === undefined ? undefined : sinceSpoken(r.since, g.now, g.zone, lang)
             if (when === undefined) return say(texts, lang, r.at === "home" ? "home" : "away", { name: r.name })
             return say(texts, lang, r.at === "home" ? "homeSince" : "awaySince", { name: r.name, when })
           })
           const parts = [...named]
-          if (g.rows.length > MAX_NAMED) parts.push(say(texts, lang, "moreHidden", { count: g.rows.length - MAX_NAMED }) + ".")
+          if (g.rows.length > maxNamed) parts.push(say(texts, lang, "moreHidden", { count: g.rows.length - maxNamed }) + ".")
           if (g.withheld > 0) parts.push(say(texts, lang, "withheld", { count: g.withheld }))
           if (g.stale) parts.push(say(texts, lang, "stale"))
           return parts.join(" ")
         }
+
+        /** What the list says of one person, in a line (the name cut, the time as `HH:MM` or with its date, as the tool gives it). */
+        const rowLine = (lang: Lang, g: Extract<Gathered, { kind: "rows" }>, r: Row): string => {
+          const name = cutText(oneLine(r.name), NAME_CHARS)
+          if (r.at === "unknown") return say(texts, lang, "rowUnknown", { name })
+          if (r.since === undefined) return say(texts, lang, r.at === "home" ? "rowHome" : "rowOut", { name })
+          return say(texts, lang, r.at === "home" ? "rowHomeSince" : "rowOutSince", { name, when: sinceText(r.since, g.now, g.zone) })
+        }
+
+        /**
+         * The same answer as a list: one line per person the answer named (never anyone it withheld), then the honest notes
+         * ("and 2 more", how many are not said here, "last heard"). Personal to the first person named, so the Presenter asks
+         * `Privacy.mayReveal` again for the device that would show it whenever it reconciles.
+         */
+        const listOf = (lang: Lang, g: Extract<Gathered, { kind: "rows" }>): Presentation => {
+          const notes = (g.withheld > 0 ? 1 : 0) + (g.stale ? 1 : 0)
+          const room = LIST_ITEMS - notes
+          const shownRows = g.rows.length <= room ? g.rows : g.rows.slice(0, room - 1)
+          const items: Array<{ readonly id: string; readonly text: string }> = shownRows.map((r) => ({ id: r.owner, text: rowLine(lang, g, r) }))
+          if (shownRows.length < g.rows.length) items.push({ id: ":more", text: say(texts, lang, "moreHidden", { count: g.rows.length - shownRows.length }) })
+          if (g.withheld > 0) items.push({ id: ":withheld", text: cutText(say(texts, lang, "withheld", { count: g.withheld }), 80) })
+          if (g.stale) items.push({ id: ":stale", text: cutText(say(texts, lang, "stale"), 80) })
+          // The fallback is the answer's own sentences, with fewer names until it fits (never cut in the middle of one).
+          let spoken = ""
+          for (let n = Math.min(MAX_NAMED, g.rows.length); n >= 0 && spoken === ""; n--) {
+            const text = oneLine(sentences(lang, g, n))
+            if (text.length <= SPOKEN_CHARS) spoken = text
+          }
+          return {
+            kind: "list",
+            title: say(texts, lang, "listTitle"),
+            style: "bullets",
+            items,
+            spoken,
+            sensitivity: { personal: g.rows[0]!.owner }
+          }
+        }
+
+        /**
+         * Shows the answer on the asking device, as a transient list, and keeps its handle: the next answer from that device
+         * takes it down first (and shows nothing when it has nothing to show, also after an empty answer), and a change of
+         * the data takes every list down. A device that cannot show it changes nothing about the answer; the same turn on
+         * the same device is shown once.
+         */
+        const showAnswer = (lang: Lang, g: Gathered): Effect.Effect<void> =>
+          Effect.gen(function*() {
+            const turn = yield* CurrentTurn
+            const device = turn?.deviceId
+            if (turn === undefined || device === undefined) return
+            const identity = JSON.stringify([turn.assistantId, turn.conversationId, turn.turnId, device])
+            if (ctx.shared.seen.has(identity)) return
+            ctx.shared.seen.add(identity)
+            if (ctx.shared.seen.size > MAX_SEEN) ctx.shared.seen.delete(ctx.shared.seen.values().next().value!)
+            const before = ctx.shared.shown.get(device)
+            ctx.shared.shown.delete(device)
+            if (before !== undefined) yield* before.dismiss.pipe(Effect.ignore, Effect.catchDefect(() => Effect.void))
+            if (g.kind !== "rows") return
+            const handle = yield* ctx.present.show("origin", listOf(lang, g)).pipe(Effect.option, Effect.catchDefect(() => Effect.succeed(Option.none<PresentHandle>())))
+            if (Option.isNone(handle) || !handle.value.outcome.devices.some((d) => d.shown)) return
+            ctx.shared.shown.set(device, handle.value)
+            if (ctx.shared.shown.size > MAX_HANDLES) {
+              const oldest = ctx.shared.shown.keys().next().value!
+              const old = ctx.shared.shown.get(oldest)!
+              ctx.shared.shown.delete(oldest)
+              yield* old.dismiss.pipe(Effect.ignore, Effect.catchDefect(() => Effect.void))
+            }
+          })
 
         const where = makeTool({
           name: "presence_where",
@@ -491,6 +608,11 @@ export const makePresenceModule = () => {
           // The model has presence_where; this action exists to run without it.
           offerAsTool: false,
           description: "Say who is home, or whether one household member is.",
+          // Fixed phrases only: the person is a runtime list, so it cannot be a slot ("is Sam home" goes to the model).
+          phrases: {
+            en: ["who is home", "who is at home", "who's home", "is anyone home"],
+            nl: ["wie is er thuis", "wie is thuis", "is er iemand thuis"]
+          },
           examples: [
             "who is home",
             "who's home",
@@ -514,7 +636,9 @@ export const makePresenceModule = () => {
           run: ({ person }) =>
             Effect.gen(function*() {
               const lang = homeLanguage(view())
-              return { say: sentences(lang, yield* gather(lang, person)) }
+              const g = yield* gather(lang, person)
+              yield* showAnswer(lang, g)
+              return { say: sentences(lang, g) }
             })
         })
 
