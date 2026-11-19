@@ -56,7 +56,7 @@ name ("Source: Wikipedia (en)" / "Bron: Wikipedia (nl)"). No image and no second
 - **Returned with the answer, never shown from inside the tool.** The tool answers `{ forModel, present }` and the action
   `{ say, present }`, where `forModel` and `say` are exactly what the result and the sentence always were. The module
   shows, replaces and withdraws nothing itself and keeps no handle: a tool may run before its turn is committed, and the
-  Presenter shows what a speculative tool returned only once the turn is promoted. A device without a display, or no
+  Presenter shows what a speculative tool returned only once the turn is promoted (a discarded turn shows nothing). A device without a display, or no
   Presenter (the CLI modes), changes nothing about the answer.
 - **Same answer, same privacy.** The card says what the answer said and nothing more; it is public Wikipedia text and
   nothing personal, so it is for a shared, a private and a public device alike, decided by the Presenter for that device.
