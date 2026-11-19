@@ -37,31 +37,50 @@ its own pull request on the scaffold.
 
 | Module | Pull request | Branch | Head |
 |---|---|---|---|
-| briefing | #95 | `t3/module-briefing` | `43933f15` |
-| presence and people | #96 | `t3/module-presence` | `edeaaeb6` |
-| memory and notes | #97 | `t3/module-memory` | `20eb68c4` |
-| web search | #98 | `t3/module-web-search` | `c2c202e3` |
-| news and feeds | #99 | `t3/module-news` | `eac90c34` |
-| local info (weather, bin day) | #100 | `t3/module-local-info` | `3304c422` |
-| core tools | #101 | `t3/module-core-tools` | `e72b9780` |
-| lists | #102 | `t3/module-lists` | `19c77559` |
-| smart home (Home Assistant) | #103 | `t3/module-smart-home` | `e8f64ba8` |
-| kitchen | #104 | `t3/module-kitchen` | `8c194006` |
-| calendar (ICS only) | #105 | `t3/module-calendar` | `7050c33e` |
+| briefing | #95 | `t3/module-briefing` | `eeab82d4` |
+| presence and people | #96 | `t3/module-presence` | `db4a3346` |
+| memory and notes | #97 | `t3/module-memory` | `b3b827c8` |
+| web search | #98 | `t3/module-web-search` | `cacdd17c` |
+| news and feeds | #99 | `t3/module-news` | `eceee3b5` |
+| local info (weather, bin day) | #100 | `t3/module-local-info` | `72507efb` |
+| core tools | #101 | `t3/module-core-tools` | `58d41ab4` |
+| lists | #102 | `t3/module-lists` | `5aea824e` |
+| smart home (Home Assistant) | #103 | `t3/module-smart-home` | `ff54d2fe` |
+| kitchen | #104 | `t3/module-kitchen` | `77e84d50` |
+| calendar (ICS only) | #105 | `t3/module-calendar` | `159b08b8` |
 
 CI is green on all eleven at these heads. They carry the whole scaffold (`5bfeca0d`); their heads moved with that merge (see each pull request).
+
+**Integration branch**: `t3/modules-12-wave-a`, pull request #116 (`d673421f`): the phrases branch (P7) with the eleven
+module branches merged in, merges only, no conflict; `pnpm check` and `pnpm test` pass on it (8,976 tests). It is the
+base for the small follow-up pull requests below. P10 and P8 are merged into it when they close, and it is then
+retargeted to the top of the stack.
+
+## Wave B: the modules that need P7 to P10
+
+Each sits on the newest part it needs for now and moves on top of P8 at the end.
+
+| Module | Pull request | Branch | Head | State |
+|---|---|---|---|---|
+| assistant controls | #109 | `t3/module-assistant-controls` | `634952dc` | closed (review found three test gaps and a doc note, fixed); CI green |
+| notifications | #110 | `t3/module-notifications` | `b9474d8e` | reviewed (10 findings); fix round running |
+| images and photos | #111 | `t3/module-images` | `5d49eb1f` | reviewed (15 findings), fixed; one small step left once P10's fix round lands |
+| broadcast | #112 | `t3/module-broadcast` | `8cfcad64` | reviewed (8 findings and a note), fixed; one small step left once P10's fix round lands |
+| music | #113 | `t3/module-music` | `4e262782` | reviewed (16 findings); fix round running |
+| reminders | #114 | `t3/module-reminders` | `f27f18af` | review running |
+| timers and alarms | none yet | `t3/module-timers` | | being built |
+| routines and automations | none yet | `t3/module-routines` | | starts when P8 is reviewed and holds P10 and P7 |
 
 ## What is left, in order
 
 1. P10 (#108): review, fix, merge P7 into it, make P7 its base.
 2. P8, first version (the risk policy as a household setting in admin): finish the build, review, fix.
 3. A browser-test run with new cases and fresh screenshots at the top of the stack (the last one on the whole stack was at P6; the existing 218 cases pass on P9).
-4. Wave B, one pull request per module (they end up on top of P8; until then each sits on the newest part it
-   needs): assistant controls #109 (closed), notifications #110, images and photos #111, broadcast #112, music #113,
-   reminders #114 (each in its review and fix round); timers and alarms is being built; routines and automations
-   starts when P8 has been reviewed; and the phrase commands and presentations wave A
-   left out, one small pull request per module.
-5. Deferred, with a plan of their own ([MODULES-DEFERRED-PLAN.md](MODULES-DEFERRED-PLAN.md): sixteen pull requests in order, with eighteen decisions for the owner and a recommendation for each): google, t3-code, mcp-client, calls and intercom, CalDAV; connections and
+4. Wave B, one pull request per module (table above): finish the review and fix rounds, build timers and routines,
+   move every one on top of P8, CI green.
+5. The phrase commands and presentations wave A left out: one small pull request per module on
+   `t3/modules-12-wave-a` (#116), each reviewed and fixed. They start when P10's contract is settled.
+6. Deferred, with a plan of their own ([MODULES-DEFERRED-PLAN.md](MODULES-DEFERRED-PLAN.md): sixteen pull requests in order, with eighteen decisions for the owner and a recommendation for each): google, t3-code, mcp-client, calls and intercom, CalDAV; connections and
    OAuth (the rest of P8); streaming and WebSocket to an owner-typed address.
 
 ## Open points
