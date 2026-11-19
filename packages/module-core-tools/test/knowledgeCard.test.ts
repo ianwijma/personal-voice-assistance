@@ -5,7 +5,7 @@ import { startTestModule } from "@pva/core/testing"
 import { Effect } from "effect"
 import { bound } from "../../store-sqlite/test/latencyBound.ts"
 import { cardOf, makeKnowledge } from "../src/knowledge.ts"
-import { netWith } from "./support.ts"
+import { counting, netWith } from "./support.ts"
 
 vi.setConfig({ testTimeout: 30_000 })
 
@@ -113,11 +113,14 @@ describe("knowledge: the card", () => {
 
   it.effect("the model's own calls all run: the same summary twice in one turn answers twice and shows its card", () =>
     Effect.gen(function*() {
-      const k = yield* start()
+      const counted = counting(makeKnowledge(netWith(fixtures).deps))
+      const k = yield* startTestModule(counted.module, { household })
       const sameTurn = { device: "kitchen-display", turnId: 7 } as never
       const a = yield* k.tool("lookup", { query: "Eiffel Tower" }, sameTurn)
       const b = yield* k.tool("lookup", { query: "Eiffel Tower" }, sameTurn)
       assert.isTrue(a.ok && b.ok)
+      // Two calls, two executions of the real tool (its network cache is its own business).
+      assert.strictEqual(counted.executions("lookup"), 2)
       assert.strictEqual(a.content, b.content)
       assert.include(a.content, "[Screen")
       assert.include(b.content, "[Screen")

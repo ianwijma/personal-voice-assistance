@@ -33,3 +33,20 @@ export const unchanged = <K extends { readonly tool: (...args: Array<any>) => Ef
       }
     })
 }) as K
+
+/**
+ * The module with every call of its tools' real `execute` counted by name: a test that says "both calls ran" observes
+ * executions here, not identical output (a second answer replayed from the first would look the same).
+ */
+export const counting = <M extends { readonly start: (...args: Array<any>) => any }>(definition: M) => {
+  const counts = new Map<string, number>()
+  const wrapped = {
+    ...definition,
+    start: (...args: Array<unknown>) =>
+      Effect.map(definition.start(...args) as Effect.Effect<{ readonly tools?: ReadonlyArray<any> }>, (parts) => ({
+        ...parts,
+        tools: (parts.tools ?? []).map((t) => ({ ...t, execute: (...a: Array<unknown>) => (counts.set(t.name, (counts.get(t.name) ?? 0) + 1), t.execute(...a)) }))
+      }))
+  } as M
+  return { module: wrapped, executions: (name: string) => counts.get(name) ?? 0 }
+}

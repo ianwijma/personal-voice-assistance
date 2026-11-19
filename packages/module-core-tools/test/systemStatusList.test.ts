@@ -6,6 +6,7 @@ import { startTestModule } from "@pva/core/testing"
 import { Effect } from "effect"
 import { bound } from "../../store-sqlite/test/latencyBound.ts"
 import { cutFor } from "../src/screen.ts"
+import { counting } from "./support.ts"
 import { issuesList, systemStatusModule } from "../src/systemStatus.ts"
 
 vi.setConfig({ testTimeout: 30_000 })
@@ -161,13 +162,24 @@ describe("system-status: the issues list", () => {
   it.effect("the model's own calls all run: the same question twice in one turn answers twice, each with its list", () =>
     Effect.gen(function*() {
       state.trouble = true
-      const s = yield* startTestModule(variable, { household })
+      const counted = counting(variable)
+      const s = yield* startTestModule(counted.module, { household })
       const sameTurn = { device: "kitchen-display", turnId: 9 } as never
       const a = yield* s.tool("system_status", {}, sameTurn)
-      const b = yield* s.tool("system_status", {}, sameTurn)
-      assert.strictEqual(a.content, b.content)
       assert.include(a.content, "[Screen: Showing on")
-      assert.include(b.content, "[Screen: Showing on")
+      // The house recovers between the two calls of the same turn: the second answer describes the new view.
+      state.trouble = false
+      const b = yield* s.tool("system_status", {}, sameTurn)
+      assert.strictEqual(counted.executions("system_status"), 2)
+      assert.include(a.content, "Weather has stopped with an error")
+      assert.include(b.content, "Everything is running")
+      assert.notInclude(b.content, "Weather")
+      // And the other way: trouble again, a third call of the same turn sees it.
+      state.trouble = true
+      const c = yield* s.tool("system_status", {}, sameTurn)
+      assert.strictEqual(counted.executions("system_status"), 3)
+      assert.include(c.content, "Weather has stopped with an error")
+      assert.include(c.content, "[Screen: Showing on")
     }))
 
   it.effect("a stopped module's list is withdrawn with it", () =>
