@@ -56,10 +56,11 @@ export interface Sections {
   /** Where the recogniser's and the voices' models are (environment > saved > `<repo>/models`). */
   readonly modelDirs: () => ModelDirs
   /**
-   * P8 (review round 1, H1): the household's effective risk policy, a field read of an in-memory record. It is published
-   * by `effectiveRiskPolicy` when the sections are made, inside every committed save (in the same uninterruptible step
-   * as the write, before the save is answered) and by `announceAll` (the environment changed); reading it never builds
-   * a section definition, touches the file system or waits.
+   * P8 (review round 1, H1; round 2): the household's effective risk policy, a field read of an in-memory record. It is
+   * published by `effectiveRiskPolicy` when the sections are made, by the store's first commit listener in the very step
+   * that commits a new settings state (before any other listener, the save's caller or another fiber runs), and by
+   * `announceAll` (the environment changed); reading it never builds a section definition, touches the file system or
+   * waits.
    */
   readonly riskPolicy: () => RiskPolicy
 }
@@ -137,6 +138,12 @@ export const makeSections = (
   const publishRisk = () => {
     riskRecord = effectiveRiskPolicy({ stored: store.settings().assistant, env })
   }
+  // P8 (review round 2): published in the step that commits a new settings state, before every other commit listener
+  // and before the save's caller or any other fiber runs again, from the committed values alone (five fields resolved,
+  // no section definitions, no file).
+  store.onCommitted((before, after) => {
+    if (before.assistant !== after.assistant) riskRecord = effectiveRiskPolicy({ stored: after.assistant, env })
+  }, { first: true })
   const listeners = new Set<(section: SettingsSection) => void>()
   const origin = {
     ...(options.envOrigin !== undefined ? { envOrigin: options.envOrigin } : {}),
@@ -341,8 +348,6 @@ export const makeSections = (
             : JSON.stringify(stored[key]) !== JSON.stringify(patched.stored[key])
         })
         values = undefined
-        // P8: the policy every call reads, published with the commit (this step cannot be interrupted).
-        publishRisk()
         // This section, and every other one whose form changed (visibility, warnings), gets a new revision.
         const next = current()
         const changed = next.sections.filter((s, i) =>

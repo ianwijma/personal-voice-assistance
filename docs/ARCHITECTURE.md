@@ -418,8 +418,10 @@ CurrentPrincipal: Context.Reference<Principal | undefined>       // the admitted
   **Serve's reader** (review round 1, H1): `effectiveRiskPolicy({ stored, env })` (`apps/assistant/src/serve/riskPolicy.ts`)
   resolves the `risk` section's own fields exactly as every settings reader does (the environment trimmed and checked
   against the choices, a saved value of the wrong type or outside them read as the field's default) and decodes them.
-  `Sections` publish its result into an in-memory record when they are made, inside every committed save (the same
-  uninterruptible step as the write, before the save is answered) and on `announceAll`; the gateway hook
+  `Sections` publish its result into an in-memory record when they are made, in the settings store's first commit
+  listener (`SettingsStore.onCommitted(…, { first: true })`: the synchronous step that makes a new state the committed
+  one, before every other commit listener, before the save's caller and before any other fiber runs again; computed
+  from the committed values alone) and on `announceAll`; the gateway hook
   (`servePolicyReader`) reads that record as a field: no section definitions are built and no file is touched on a
   call. The settings `ConfigProvider` serves the policy's keys as the reader resolves them, and the CLI start runs the
   same function over what it reads. **What is checked when:** the policy at every decision (each call, each held
