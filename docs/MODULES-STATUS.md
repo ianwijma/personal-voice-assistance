@@ -1,7 +1,7 @@
 # Modules: where the work stands
 
 Status of the work planned in [MODULES-PLAN.md](MODULES-PLAN.md), kept here so it does not depend on any one working
-session. Updated 2026-11-19, 18:49. Nothing below is merged into `main`; the owner merges.
+session. Updated 2026-11-19, 19:11. Nothing below is merged into `main`; the owner merges.
 
 **State: the work is done and waits for the owner.** Every preparation part, every module that was not deferred and
 every follow-up has an open pull request, has had at least one complete Sol review, and has its findings fixed. On
@@ -13,7 +13,7 @@ parts, and the lists follow-up's second) stopped early; what they had already re
 under "Known gaps kept on purpose".
 
 **The whole, on one branch: `t3/modules-13-all`, pull request #130 (code as of `08b3c65c`; later commits on it are merges that change no code: this page, and branch heads that
-moved by a test-only fix).** Every branch below merged
+moved by a test-only fix: the bin-day test and the reminders tests' time limit).** Every branch below merged
 together, merges only, plus one commit of its own (a 20 second test limit for the `node` project on CI). On it:
 `pnpm check` passes; `pnpm test`: 10,094 passed and one failed, a measurement (the music module's latency test
 "resolving a room at the largest cache": 10.2 ms on the main thread against its 10 ms bound in the full run; alone it
@@ -66,7 +66,7 @@ its own pull request on the scaffold.
 | memory and notes | #97 | `t3/module-memory` | `b3b827c8` |
 | web search | #98 | `t3/module-web-search` | `cacdd17c` |
 | news and feeds | #99 | `t3/module-news` | `eceee3b5` |
-| local info (weather, bin day) | #100 | `t3/module-local-info` | `c85569af` |
+| local info (weather, bin day) | #100 | `t3/module-local-info` | `7585cc0e` |
 | core tools | #101 | `t3/module-core-tools` | `58d41ab4` |
 | lists | #102 | `t3/module-lists` | `5aea824e` |
 | smart home (Home Assistant) | #103 | `t3/module-smart-home` | `ff54d2fe` |
@@ -75,8 +75,8 @@ its own pull request on the scaffold.
 
 CI is green on all eleven at these heads. They carry the whole scaffold (`5bfeca0d`); their heads moved with that merge (see each pull request).
 
-**Integration branch**: `t3/modules-12-wave-a`, pull request #116 (`130dec1d`): the presentation branch (P10, final)
-with the eleven module branches merged in, merges only. It is the base of the follow-up pull requests. Everything in
+**Integration branch**: `t3/modules-12-wave-a`, pull request #116 (`963d1eb9`): the presentation branch (P10, final)
+with the eleven module branches merged in: merges, plus the same 20 second CI test limit as the branch with everything. It is the base of the follow-up pull requests. Everything in
 it is also in the branch with everything.
 
 ## Wave B: the modules that need P7 to P10
@@ -90,7 +90,7 @@ Each sits on the newest part it needs for now and moves on top of P8 at the end.
 | images and photos | #111 | `t3/module-images` | `4965a03d` | closed: two reviews (15, then 3 findings), all fixed, CI green |
 | broadcast | #112 | `t3/module-broadcast` | `5e84f110` | closed: reviewed (8 findings and a note), fixed, adapted to P10's fix round |
 | music | #113 | `t3/module-music` | `081edbdb` | closed: two reviews (16, then 4 findings), all fixed, CI green |
-| reminders | #114 | `t3/module-reminders` | `d2a603b1` | closed: two reviews (22, then 9 findings), both fix rounds done; one fix after the parts were put together (a reduced confirmation carries no owner) |
+| reminders | #114 | `t3/module-reminders` | `eb16b2d5` | closed: two reviews (22, then 9 findings), both fix rounds done; one fix after the parts were put together (a reduced confirmation carries no owner) |
 | timers and alarms | #117 | `t3/module-timers` | `37e0f5ce` | closed: two reviews (14, then 13 findings), both fix rounds done (103 tests). Changing an alarm was cut (cancel and set again); one ring per timer or alarm at a time; Stop pressed in the same instant as a snooze can lose (stated on the page) |
 | routines and automations | #129 | `t3/module-routines` | `f9b5a440` | closed: one review (8 findings and a note), fixed (62 tests). A routine is checked step by step and stops, with a true sentence, where a step is refused; a called action's answer is not read out; "cancel the routine" stops one; at most 15 routines |
 
@@ -150,8 +150,14 @@ Found by the last checks and written down instead of fixed:
   seen once each: `ModuleHostP3Round5` "forty modules" (core, 5 s limit), the SQLite scheduler contract's
   daylight-saving test (30 s limit), the calendar privacy test "finding 22" (the kit gave up waiting for the module
   to stop), the bin-day reminder test "a copy too old to trust"; and in local full runs under load the SQLite
-  `logStart` test ("database is locked") and the calendar latency test.
+  `logStart` test ("database is locked"), the calendar latency test and one timers test ("the repeating series moves
+  on although its ring is refused": the alarm's row was not there yet when the test looked; it passes alone 5 times
+  out of 5). Of the three full local runs of the whole after its fixes, one was clean and two had one such test
+  each (a different one each time).
 
+- **Moving a test clock far is slow.** Every simulated hour runs the host's hourly jobs (notifications, presentation),
+  so a module test that advances the clock by two months takes 37 s alone on a 16-core machine (reminders' "the 31st
+  of every month"; it passed 60 s on CI once, its limit is now 180 s). A cheaper far advance belongs in the test kit.
 - **Not run against a real Home Assistant**: the smart-home module's templates (they use `regex_replace`, `unique`
   and `abs`) are only tested against the fake server.
 - **Browser tests**: the existing 218 cases pass on the branch with everything. No new cases or screenshots were
