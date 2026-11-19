@@ -1,66 +1,18 @@
 // The reminders module through the real host and gateway (docs/MODULES.md §17): every tool and action on its ordinary path
 // and on its refusals, privacy on the shared, private and public devices of the default household, paging past one list
-// page, a repeating reminder across an outage and a restart, store and delivery failures, invalid settings, Dutch.
+// page, the briefing's section, invalid settings, Dutch. Delivery, the row's state and its one job: delivery.test.ts.
 import { assert, describe, it, vi } from "@effect/vitest"
-import { BriefingSections, type BriefingRequest } from "@pva/module-contracts"
 import { DEFAULT_TEST_HOUSEHOLD, checkModule, startTestModule } from "@pva/core/testing"
-import { NotifyError, StoreError, type ModuleDefinition } from "@pva/core"
-import { Deferred, Effect, Fiber } from "effect"
-import { catalog, type Reminder, reminders, remindersModule, texts } from "../src/index.ts"
+import { speakTime } from "@pva/language"
+import { Effect } from "effect"
+import { catalog, holdsSecret, type Reminder, reminders, remindersModule, texts } from "../src/index.ts"
+import {
+  type Kit, allRows, DAY, faulty, forModel, gather, H, HALL, jobOf, liveJobs, MIN, nofaults, openNotes, ring, ROBIN, rowByText, SAM, spoken, theRow
+} from "./helpers.ts"
 
 vi.setConfig({ testTimeout: 30_000 })
 
-const SAM = "kitchen-display" // shared, Sam's
-const ROBIN = "robins-phone" // private, Robin's
-const HALL = "hall-screen" // public
-const MIN = 60_000
-const H = 60 * MIN
-const DAY = 24 * H
-
-type Kit = Effect.Success<ReturnType<typeof startTestModule>>
-
-const rows = (kit: { readonly moduleStore: () => { collection: Function } }) =>
-  (kit.moduleStore().collection(reminders) as { list: (q: unknown) => Effect.Effect<ReadonlyArray<{ id: string; rev: number; value: Reminder }>> }).list({ limit: 12 })
-
-/** The module with its store, or its notifications, failing on demand: the kit has no fault-injecting store, so a test wraps the handles. */
-interface Faults {
-  storeWrites: boolean
-  storeReads: boolean
-  sendFails: number
-  /** When set, a delivery waits here (a slow delivery, to call the reminder off while its job runs). */
-  gate?: Deferred.Deferred<void>
-  entered?: Deferred.Deferred<void>
-}
-const faulty = (faults: Faults): ModuleDefinition<any> => {
-  const bad = (what: string) => Effect.fail(new StoreError({ reason: "busy", message: what }))
-  const wrapStore = (store: any) => ({
-    ...store,
-    transaction: (f: any) => (faults.storeWrites ? bad("injected") : store.transaction(f)),
-    collection: (c: any) => {
-      const h = store.collection(c)
-      return {
-        ...h,
-        get: (...a: Array<any>) => (faults.storeReads ? bad("injected") : h.get(...a)),
-        list: (...a: Array<any>) => (faults.storeReads ? bad("injected") : h.list(...a)),
-        update: (...a: Array<any>) => (faults.storeWrites ? bad("injected") : h.update(...a))
-      }
-    }
-  })
-  return {
-    ...remindersModule,
-    shared: (ctx: any) =>
-      remindersModule.shared!({
-        ...ctx,
-        store: wrapStore(ctx.store),
-        notify: {
-          ...ctx.notify,
-          send: (r: any) => (faults.gate !== undefined ? Effect.andThen(Effect.andThen(faults.entered === undefined ? Effect.void : Deferred.succeed(faults.entered, undefined), Deferred.await(faults.gate)), ctx.notify.send(r)) : faults.sendFails > 0 ? (faults.sendFails--, Effect.fail(new NotifyError({ reason: "failed", message: "injected" }))) : ctx.notify.send(r))
-        }
-      }),
-    start: (ctx: any) => remindersModule.start!({ ...ctx, store: wrapStore(ctx.store) })
-  } as ModuleDefinition<any>
-}
-const nofaults = (): Faults => ({ storeWrites: false, storeReads: false, sendFails: 0 })
+const lobby = { household: { devices: [...DEFAULT_TEST_HOUSEHOLD.devices, { id: "lobby-screen", name: "Lobby", room: "Lobby", privacy: "public" as const, defaultPerson: "p-sam" }] } }
 
 describe("conformance", () => {
   it.effect("passes checkModule with its texts in both languages", () =>
@@ -75,30 +27,38 @@ describe("setting a reminder", () => {
       const kit = yield* startTestModule(remindersModule)
       const set = yield* kit.tool("reminders_set", { text: "call mum", when: "in ten minutes" }, { device: SAM })
       assert.deepStrictEqual(set.value, { spoken: "Reminder set for today at ten past ten in the morning: call mum.", owner: "p-sam" })
-      const [row] = yield* rows(kit)
-      assert.strictEqual(row?.value.owner, "p-sam")
-      assert.strictEqual(row?.value.whose, "personal")
-      assert.strictEqual(row?.value.deviceId, SAM)
-      assert.strictEqual(row?.value.dueAt, kit.now === undefined ? 0 : (yield* kit.now) + 10 * MIN)
-      // The job is the turn's: its device and assistant.
-      const job = (yield* kit.jobs).find((j) => j.handler === "due")!
-      assert.strictEqual(job.origin.deviceId, SAM)
-      assert.strictEqual(job.origin.assistantId, "jeff")
-      assert.deepStrictEqual(job.payload, { id: row!.id, at: row!.value.dueAt })
-      // Nothing yet; then it rings where it was set, with its two answers, and a card with the same two.
+      const row = yield* theRow(kit)
+      assert.strictEqual(row.value.owner, "p-sam")
+      assert.strictEqual(row.value.whose, "personal")
+      assert.strictEqual(row.value.deviceId, SAM)
+      assert.strictEqual(row.value.dueAt, (yield* kit.now) + 10 * MIN)
+      assert.strictEqual(row.value.nextAt, row.value.dueAt)
+      // One job, for the row's next moment, with the turn's device and assistant.
+      const [job] = yield* jobOf(kit, row.id)
+      assert.strictEqual(job?.origin.deviceId, SAM)
+      assert.strictEqual(job?.origin.assistantId, "jeff")
+      assert.strictEqual(job?.dueAt, row.value.dueAt)
+      assert.deepStrictEqual(job?.payload, { id: row.id })
       yield* kit.advance(9 * MIN)
       assert.deepStrictEqual(yield* kit.notify.all, [])
       yield* kit.advance(2 * MIN)
-      const [ring] = yield* kit.notify.all
-      assert.strictEqual(ring?.priority, "ring")
-      assert.strictEqual(ring?.deviceId, SAM)
-      assert.strictEqual(ring?.owner, "p-sam")
-      assert.strictEqual(ring?.text, "call mum")
-      assert.deepStrictEqual(ring?.actions.map((a) => a.id), ["done", "snooze"])
+      const [n] = yield* kit.notify.all
+      assert.strictEqual(n?.priority, "ring")
+      assert.strictEqual(n?.deviceId, SAM)
+      assert.strictEqual(n?.owner, "p-sam")
+      assert.strictEqual(n?.text, "call mum")
+      assert.strictEqual(n?.key, `rem:${row.id}:${row.value.dueAt}`)
+      assert.deepStrictEqual(n?.actions.map((a) => a.id), ["done", "snooze"])
       yield* kit.present.settle
       const [card] = kit.present.shown(SAM)
       assert.strictEqual(card?.content.kind, "card")
       assert.deepStrictEqual(kit.present.shown(HALL), [])
+      // Delivered and waiting: the row holds the ring, and no job is left (nothing more is planned for it).
+      const after = yield* theRow(kit)
+      assert.deepStrictEqual(after.value.ring, { at: row.value.dueAt!, deliveredAt: row.value.dueAt! })
+      assert.isUndefined(after.value.dueAt)
+      assert.isUndefined(after.value.nextAt)
+      assert.deepStrictEqual(yield* jobOf(kit, row.id), [])
     }))
 
   it.effect("for the household: no owner, and it rings on the device it was set on", () =>
@@ -106,13 +66,13 @@ describe("setting a reminder", () => {
       const kit = yield* startTestModule(remindersModule)
       const set = yield* kit.tool("reminders_set", { text: "tidy up", when: "in five minutes", scope: "household" }, { device: HALL })
       assert.deepStrictEqual(set.value, { spoken: "Reminder for the household, today at five past ten in the morning: tidy up." })
-      const [row] = yield* rows(kit)
-      assert.strictEqual(row?.value.whose, "household")
-      assert.isUndefined(row?.value.owner)
+      const row = yield* theRow(kit)
+      assert.strictEqual(row.value.whose, "household")
+      assert.isUndefined(row.value.owner)
       yield* kit.advance(6 * MIN)
-      const [ring] = yield* kit.notify.all
-      assert.isUndefined(ring?.owner)
-      assert.strictEqual(ring?.deviceId, HALL)
+      const [n] = yield* kit.notify.all
+      assert.isUndefined(n?.owner)
+      assert.strictEqual(n?.deviceId, HALL)
     }))
 
   it.effect("a personal reminder with nobody known asks whose and writes nothing, and never repeats the words", () =>
@@ -121,253 +81,119 @@ describe("setting a reminder", () => {
       const asked = yield* kit.tool("reminders_set", { text: "private appointment", when: "in an hour", scope: "me" }, { device: HALL })
       assert.deepStrictEqual(asked.value, { spoken: "Whose reminder is it? I can't tell who is asking here." })
       assert.notInclude(asked.content, "private appointment")
-      assert.deepStrictEqual(yield* rows(kit), [])
-      // Without a scope, the same device sets a household reminder (there is nobody to own it).
+      assert.deepStrictEqual(yield* allRows(kit), [])
       const household = yield* kit.tool("reminders_set", { text: "bins", when: "in an hour" }, { device: HALL })
-      assert.include((household.value as { spoken: string }).spoken, "for the household")
+      assert.include(spoken(household), "for the household")
     }))
 
   it.effect("what is not clear is a question, never a guess; nothing is written", () =>
     Effect.gen(function*() {
       const kit = yield* startTestModule(remindersModule)
-      const ask = (when: string) => kit.tool("reminders_set", { text: "x", when }, { device: ROBIN }).pipe(Effect.map((r) => (r.value as { spoken: string }).spoken))
+      const ask = (when: string) => kit.tool("reminders_set", { text: "x", when }, { device: ROBIN }).pipe(Effect.map(spoken))
       assert.strictEqual(yield* ask("tomorrow"), "At what time?")
       assert.strictEqual(yield* ask("yesterday at five"), "That moment has already passed.")
       assert.strictEqual(yield* ask("next Friday at five"), "That could mean more than one moment. Say the day and the time.")
       assert.strictEqual(yield* ask("whenever"), "When should I remind you? I didn't understand when.")
       assert.strictEqual(yield* ask("on 1 March 2028 at five"), "I only set reminders up to a year ahead.")
-      const code = yield* kit.tool("reminders_set", { text: "door code is 12345", when: "in an hour" }, { device: ROBIN })
-      assert.strictEqual((code.value as { spoken: string }).spoken, "I don't keep codes or passwords in reminders.")
-      assert.deepStrictEqual(yield* rows(kit), [])
-      // A reminder about a password without a code in it is an ordinary reminder.
-      const ok = yield* kit.tool("reminders_set", { text: "change my password", when: "in an hour" }, { device: ROBIN })
-      assert.include((ok.value as { spoken: string }).spoken, "change my password")
+      assert.deepStrictEqual(yield* allRows(kit), [])
+      assert.deepStrictEqual((yield* liveJobs(kit)).filter((j) => j.handler === "due"), [])
     }))
 
-  it.effect("the confirmation does not repeat a personal reminder where the privacy rule says no", () =>
-    Effect.gen(function*() {
-      // A public screen with a default person: the write has its owner, and the screen still must not show the words.
-      const kit = yield* startTestModule(remindersModule, {
-        household: { devices: [...DEFAULT_TEST_HOUSEHOLD.devices, { id: "lobby-screen", name: "Lobby", room: "Lobby", privacy: "public", defaultPerson: "p-sam" }] }
-      })
-      const set = yield* kit.tool("reminders_set", { text: "dentist", when: "in an hour", scope: "me" }, { device: "lobby-screen" })
-      assert.deepStrictEqual(set.value, { spoken: "Reminder set for today at eleven o'clock in the morning, only for you.", owner: "p-sam" })
-      assert.notInclude(set.content, "dentist")
-      assert.strictEqual((yield* rows(kit))[0]?.value.text, "dentist")
-    }))
-
-  it.effect("a reminder at the largest the schema allows is stored, with every indexed field at its largest", () =>
+  it.effect("a repeat without a clock time asks at what time, in both languages, and stores nothing", () =>
     Effect.gen(function*() {
       const kit = yield* startTestModule(remindersModule)
-      const text = "é".repeat(160)
-      const set = yield* kit.tool("reminders_set", { text, when: "every weekday at 7 am" }, { device: ROBIN })
-      assert.include((set.value as { spoken: string }).spoken, "Repeating reminder")
-      const store = kit.moduleStore().collection(reminders)
-      const big: Reminder = {
-        text, whose: "personal", owner: "p".repeat(40), state: "done", dueAt: 8_640_000_000_000_000, deviceId: "d".repeat(64), assistantId: "a".repeat(40),
-        setBy: "s".repeat(40), rrule: "R".repeat(100), dtstart: "D".repeat(70), timeZone: "T".repeat(64), notifiedFor: 8_640_000_000_000_000,
-        snoozeAt: 8_640_000_000_000_000, handled: "h".repeat(64), endedAt: 8_640_000_000_000_000
-      }
-      const stored = yield* store.insert(big)
-      assert.strictEqual((yield* store.get(stored.id))?.value.endedAt, 8_640_000_000_000_000)
+      assert.strictEqual(spoken(yield* kit.tool("reminders_set", { text: "call mum", when: "every Monday" }, { device: SAM })), "At what time?")
+      assert.strictEqual(spoken(yield* kit.tool("reminders_change", { which: "x", when: "every Monday" }, { device: SAM })), "At what time?")
+      // With the time said, it is set.
+      assert.include(spoken(yield* kit.tool("reminders_set", { text: "call mum", when: "every Monday at 9 am" }, { device: SAM })), "Repeating reminder")
+      assert.strictEqual((yield* allRows(kit)).length, 1)
+      const nl = yield* startTestModule(remindersModule, { household: { home: { HOME_LANGUAGE: "nl-NL" } } })
+      assert.strictEqual(spoken(yield* nl.tool("reminders_set", { text: "bel mama", when: "elke maandag" }, { device: SAM })), "Hoe laat?")
+      assert.deepStrictEqual(yield* allRows(nl), [])
     }))
 
-  it.effect("too many reminders: the scheduler's limit is said, and nothing is half written", () =>
+  it.effect("a text that holds a password, a PIN or a code is refused on set, change and remind_in, without repeating it, and nothing is stored", () =>
+    Effect.gen(function*() {
+      const kit = yield* startTestModule(remindersModule)
+      const secrets = ["my password is violet-badger", "my PIN is 1234", "door code is 12 34", "door code 12 34", "wifi password: hunter2", "alarm code = 4711", "enter password 123456"]
+      for (const text of secrets) {
+        const set = yield* kit.tool("reminders_set", { text, when: "in an hour" }, { device: SAM })
+        assert.strictEqual(spoken(set), "I don't keep codes or passwords in reminders.", text)
+        assert.notInclude(set.content, text.split(/\s+/).at(-1)!)
+      }
+      assert.deepStrictEqual(yield* allRows(kit), [])
+      // Through the phrase's action too.
+      const viaAction = yield* kit.action("remind_in", { delay: "five minutes", text: "my PIN is 1234" }, { device: SAM })
+      assert.deepStrictEqual(viaAction, { ok: true, say: "I don't keep codes or passwords in reminders." })
+      assert.deepStrictEqual(yield* allRows(kit), [])
+      // A reminder about a password, without one, is an ordinary reminder; a change cannot put a secret into it.
+      const ok = yield* kit.tool("reminders_set", { text: "change my password", when: "in an hour" }, { device: SAM })
+      assert.include(spoken(ok), "change my password")
+      const change = yield* kit.tool("reminders_change", { which: "password", text: "the new password is violet-badger" }, { device: SAM })
+      assert.strictEqual(spoken(change), "I don't keep codes or passwords in reminders.")
+      assert.notInclude(change.content, "violet-badger")
+      const rows = yield* allRows(kit)
+      assert.deepStrictEqual(rows.map((r) => r.value.text), ["change my password"])
+      assert.notInclude(JSON.stringify(rows), "violet")
+      // Dutch forms.
+      for (const text of ["mijn wachtwoord is geheim", "de pincode: 1234", "deurcode 12 34"]) assert.isTrue(holdsSecret(text), text)
+      for (const text of ["change my password", "call the PIN-free bank", "nieuw wachtwoord aanvragen", "pin the poster up"]) assert.isFalse(holdsSecret(text), text)
+    }))
+
+  it.effect("the confirmation does not repeat a personal reminder where the privacy rule says no, and says that device does not ring with it", () =>
+    Effect.gen(function*() {
+      const kit = yield* startTestModule(remindersModule, lobby)
+      const set = yield* kit.tool("reminders_set", { text: "dentist", when: "in an hour", scope: "me" }, { device: "lobby-screen" })
+      assert.deepStrictEqual(set.value, { spoken: "Reminder set for today at eleven o'clock in the morning, only for you. This device does not ring with your personal reminders.", owner: "p-sam" })
+      assert.notInclude(set.content, "dentist")
+      assert.strictEqual((yield* theRow(kit)).value.text, "dentist")
+    }))
+
+  it.effect("a reminder at the largest the schema allows is stored, with every field at its largest", () =>
+    Effect.gen(function*() {
+      const kit = yield* startTestModule(remindersModule)
+      const text = "\"".repeat(160)
+      const set = yield* kit.tool("reminders_set", { text: "é".repeat(160), when: "every weekday at 7 am" }, { device: ROBIN })
+      assert.include(spoken(set), "Repeating reminder")
+      const store = kit.moduleStore().collection(reminders)
+      const E = 8_640_000_000_000_000
+      const big: Reminder = {
+        text, whose: "personal", owner: "p".repeat(40), state: "done", dueAt: E, owed: { at: E, from: E, attempts: 20, tryAt: E },
+        ring: { at: E, deliveredAt: E, snoozeUntil: E }, stop: { notes: [E, E, E, E], card: true, attempts: 20, tryAt: E }, nextAt: E,
+        deviceId: "\"".repeat(64), assistantId: "\"".repeat(40), setBy: "\"".repeat(40), rrule: "\"".repeat(100), dtstart: "\"".repeat(70),
+        timeZone: "\"".repeat(64), handled: "\"".repeat(64), dropped: { at: E, why: "superseded", when: E }, endedAt: E
+      }
+      const stored = yield* store.insert(big)
+      assert.strictEqual((yield* store.get(stored.id))?.value.endedAt, E)
+    }))
+
+  it.effect("too many reminders: the scheduler's limit is said, and nothing of the refused one is written", () =>
     Effect.gen(function*() {
       const kit = yield* startTestModule(remindersModule)
       let last = ""
-      for (let i = 0; i < 205; i++) {
-        const r = yield* kit.tool("reminders_set", { text: `r${i}`, when: "in 50 hours", scope: "household" }, { device: SAM })
-        last = typeof r.value === "string" ? r.value : (r.value as { spoken?: string }).spoken ?? ""
+      let i = 0
+      for (; i < 205; i++) {
+        last = (yield* kit.tool("reminders_set", { text: `r${i}`, when: "in 50 hours", scope: "household" }, { device: SAM })).content
         if (last.startsWith("I'm already")) break
       }
-      assert.strictEqual(last, "I'm already keeping as many reminders as I can.")
-      const jobs = (yield* kit.jobs).filter((j) => j.handler === "due" && j.state === "scheduled")
-      const stored = yield* rows(kit)
-      assert.isAtMost(stored.length, 12)
-      assert.isAtMost(jobs.length, 200)
-    }))
-})
-
-describe("repeating reminders", () => {
-  it.effect("one job for the next occurrence, planned again by its handler, kept across a restart", () =>
-    Effect.gen(function*() {
-      const kit = yield* startTestModule(remindersModule)
-      const set = yield* kit.tool("reminders_set", { text: "bins out", when: "every day at 7 pm" }, { device: SAM })
-      assert.include((set.value as { spoken: string }).spoken, "Repeating reminder, every day at seven o'clock in the evening: bins out.")
-      const [row] = yield* rows(kit)
-      assert.strictEqual(row?.value.rrule, "FREQ=DAILY")
-      assert.strictEqual((yield* kit.jobs).filter((j) => j.handler === "due").length, 1)
-      yield* kit.restart
-      yield* kit.advance(9 * H + MIN)
-      const [first] = yield* kit.notify.all
-      assert.strictEqual(first?.text, "bins out")
-      // The next occurrence is planned (one job), a day later, with the same origin.
-      const live = (yield* kit.jobs).filter((j) => j.handler === "due" && j.state === "scheduled")
-      assert.strictEqual(live.length, 1)
-      assert.strictEqual(live[0]?.dueAt, row!.value.dueAt + DAY)
-      assert.strictEqual(live[0]?.origin.deviceId, SAM)
-            // Answered, it goes on: done on a repeating reminder is done for this time only.
-      const done = yield* kit.notify.press(first!.id, "done", { device: SAM })
-      assert.deepStrictEqual(done, { ok: true, say: "Done. The next one is tomorrow at seven o'clock in the evening." })
-      assert.strictEqual((yield* rows(kit))[0]?.value.state, "open")
-      yield* kit.advance(DAY)
-      assert.strictEqual((yield* kit.notify.all).length, 1)
-    }))
-
-  it.effect("found late after an outage: delivered when it is only a little late, skipped when the moment has passed, the series goes on", () =>
-    Effect.gen(function*() {
-      const kit = yield* startTestModule(remindersModule)
-      yield* kit.tool("reminders_set", { text: "water plants", when: "every day at 9 am", scope: "household" }, { device: SAM })
-      const first = (yield* kit.jobs).find((j) => j.handler === "due")!.dueAt
-      // The module is off through the first morning, and found 7 hours late: the moment has passed.
-      yield* kit.stop
-      yield* kit.advance(first - (yield* kit.now) + 7 * H)
-      yield* kit.start
-      yield* kit.advance(MIN)
-      assert.deepStrictEqual(yield* kit.notify.all, [])
-      const next = (yield* kit.jobs).filter((j) => j.handler === "due" && j.state === "scheduled")
-      assert.strictEqual(next.length, 1)
-      assert.strictEqual(next[0]?.dueAt, first + DAY)
-      // Found two hours late: delivered, and it says so.
-      yield* kit.stop
-      yield* kit.advance(next[0]!.dueAt - (yield* kit.now) + 2 * H)
-      yield* kit.start
-      yield* kit.advance(MIN)
-      const [late] = yield* kit.notify.all
-      assert.include(late?.text ?? "", "late: due")
-      assert.strictEqual((yield* kit.jobs).filter((j) => j.handler === "due" && j.state === "scheduled")[0]?.dueAt, first + 2 * DAY)
-    }))
-
-  it.effect("a delivery that fails is retried and never costs the series", () =>
-    Effect.gen(function*() {
-      const faults = nofaults()
-      const kit = yield* startTestModule(faulty(faults))
-      yield* kit.tool("reminders_set", { text: "pills", when: "every day at 8 pm", scope: "household" }, { device: SAM })
-      const first = (yield* kit.jobs).find((j) => j.handler === "due")!.dueAt
-      faults.sendFails = 1
-      yield* kit.advance(first - (yield* kit.now) + 10_000)
-      // The next occurrence is planned already; the failed one is retried by a job of its own a little later.
-      assert.strictEqual((yield* rows(kit))[0]?.value.dueAt, first + DAY)
-      assert.isDefined((yield* rows(kit))[0]?.value.snoozeAt)
-      assert.deepStrictEqual(yield* kit.notify.all, [])
-      assert.strictEqual((yield* kit.jobs).filter((j) => j.handler === "due" && j.state === "scheduled").length, 1)
-      yield* kit.advance(30_000)
-      assert.strictEqual((yield* kit.notify.all).length, 1)
-      assert.isUndefined((yield* rows(kit))[0]?.value.snoozeAt)
-      assert.strictEqual((yield* kit.jobs).filter((j) => j.handler === "due" && j.state === "scheduled").length, 1)
-    }))
-
-  it.effect("a series with an end delivers its last occurrence and then lapses", () =>
-    Effect.gen(function*() {
-      const kit = yield* startTestModule(remindersModule)
-      const store = kit.moduleStore().collection(reminders)
-      const set = yield* kit.tool("reminders_set", { text: "x", when: "every day at 9 pm", scope: "household" }, { device: SAM })
-      assert.include((set.value as { spoken: string }).spoken, "Repeating")
-      const [row] = yield* rows(kit)
-      // End the series after tonight: UNTIL tonight's occurrence.
-      yield* store.update(row!.id, (v) => ({ ...v, rrule: "FREQ=DAILY;COUNT=1" }))
-      yield* kit.advance(12 * H)
-      assert.strictEqual((yield* kit.notify.all).length, 1)
-      assert.strictEqual((yield* rows(kit))[0]?.value.state, "lapsed")
-    }))
-})
-
-describe("answering: done and snooze", () => {
-  const ring = (kit: Kit, text = "call mum") =>
-    Effect.gen(function*() {
-      yield* kit.tool("reminders_set", { text, when: "in ten minutes" }, { device: SAM })
-      yield* kit.advance(11 * MIN)
-      yield* kit.present.settle
-      return (yield* kit.notify.all)[0]!
-    })
-
-  it.effect("done from the notification: finished once, however many press, and its card goes", () =>
-    Effect.gen(function*() {
-      const kit = yield* startTestModule(remindersModule)
-      const n = yield* ring(kit)
-      const both = yield* Effect.all([kit.notify.press(n.id, "done", { device: SAM }), kit.notify.press(n.id, "done", { device: SAM })], { concurrency: 2 })
-      assert.strictEqual(both.filter((r: any) => r.ok && r.say === "Done.").length, 1)
-      const [row] = yield* rows(kit)
-      assert.strictEqual(row?.value.state, "done")
-      assert.isDefined(row?.value.endedAt)
-      assert.deepStrictEqual(kit.present.shown(SAM), [])
-      assert.deepStrictEqual((yield* kit.notify.all).map((x: any) => x.state), ["resolved"])
-      // No job is left for it.
-      assert.deepStrictEqual((yield* kit.jobs).filter((j: any) => j.state === "scheduled" && j.handler !== "tidy"), [])
-    }))
-
-  it.effect("snooze: rings again later, the same press twice does not push it further, and the setting decides how long", () =>
-    Effect.gen(function*() {
-      const kit = yield* startTestModule(remindersModule, { settings: { snoozeMinutes: 20 } })
-      const n = yield* ring(kit)
-      assert.deepStrictEqual(yield* kit.notify.press(n.id, "snooze", { device: SAM }), { ok: true, say: "I'll remind you again in 20 minutes." })
-      const [row] = yield* rows(kit)
-      assert.strictEqual(row?.value.state, "open")
-      assert.strictEqual(row?.value.snoozeAt, (yield* kit.now) + 20 * MIN)
-      yield* kit.advance(19 * MIN)
-      assert.strictEqual((yield* kit.notify.all).filter((x: any) => x.state === "open").length, 0)
-      yield* kit.advance(2 * MIN)
-      assert.strictEqual((yield* kit.notify.all).filter((x: any) => x.state === "open").length, 1)
-      assert.isUndefined((yield* rows(kit))[0]?.value.snoozeAt)
-    }))
-
-  it.effect("the card's buttons do the same, and its notification goes with it", () =>
-    Effect.gen(function*() {
-      const kit = yield* startTestModule(remindersModule)
-      yield* ring(kit)
-      const [card] = kit.present.shown(SAM)
-      // Pressed from a page that does not hold it: refused, nothing changes.
-      assert.strictEqual((yield* kit.present.press(card!.id, "done", { device: HALL })).ok, false)
-      assert.strictEqual((yield* rows(kit))[0]?.value.state, "open")
-      assert.deepStrictEqual(yield* kit.present.press(card!.id, "done", { device: SAM }), { ok: true, say: "Done." })
-      assert.strictEqual((yield* rows(kit))[0]?.value.state, "done")
-      assert.deepStrictEqual((yield* kit.notify.all).map((x: any) => x.state), ["resolved"])
-      assert.deepStrictEqual(kit.present.shown(SAM), [])
-    }))
-
-  it.effect("the typed actions answer the one that rang here; none rang, or two did, it says so", () =>
-    Effect.gen(function*() {
-      const kit = yield* startTestModule(remindersModule)
-      assert.deepStrictEqual(yield* kit.action("ringing_done", {}, { device: SAM }), { ok: true, say: "No reminder is waiting for an answer on this device. Say which one you mean." })
-      yield* ring(kit, "one")
-      assert.deepStrictEqual(yield* kit.action("ringing_snooze", { for: "ten minutes" }, { device: SAM }), { ok: true, say: "I'll remind you again in 10 minutes." })
-      assert.strictEqual((yield* kit.notify.all).filter((x: any) => x.state === "open").length, 0)
-      yield* kit.advance(11 * MIN)
-      yield* kit.tool("reminders_set", { text: "two", when: "in a minute", scope: "household" }, { device: SAM })
-      yield* kit.advance(2 * MIN)
-      assert.strictEqual((yield* kit.notify.all).filter((x: any) => x.state === "open").length, 2)
-      assert.deepStrictEqual(yield* kit.action("ringing_done", {}, { device: SAM }), { ok: true, say: "More than one reminder is waiting here. Say which one you mean." })
-      // Another device does not hear a household ring that belongs to the kitchen.
-      assert.deepStrictEqual(yield* kit.action("ringing_done", {}, { device: ROBIN }), { ok: true, say: "No reminder is waiting for an answer on this device. Say which one you mean." })
-    }))
-
-  it.effect("two snoozes at once leave one live snooze job", () =>
-    Effect.gen(function*() {
-      const kit = yield* startTestModule(remindersModule)
-      yield* ring(kit)
-      yield* Effect.all([kit.action("ringing_snooze", {}, { device: SAM }), kit.action("ringing_snooze", {}, { device: SAM })], { concurrency: 2 })
-      assert.strictEqual((yield* kit.jobs).filter((j: any) => j.handler === "snooze" && j.state === "scheduled").length, 1)
-    }))
-
-  it.effect("done is refused for one that is finished or gone, in words", () =>
-    Effect.gen(function*() {
-      const kit = yield* startTestModule(remindersModule)
-      const n = yield* ring(kit)
-      yield* kit.notify.press(n.id, "done", { device: SAM })
-      const store = kit.moduleStore().collection(reminders)
-      const [row] = yield* rows(kit)
-      const snooze = yield* kit.notify.press(n.id, "snooze", { device: SAM })
-      assert.strictEqual(snooze.ok, false)
-      yield* store.remove(row!.id)
-      assert.strictEqual((yield* rows(kit)).length, 0)
+      assert.include(last, "I'm already keeping as many reminders as I can.")
+      // The refused one: no row, no job; everything before it is whole (one row and one job each).
+      const rows = yield* allRows(kit)
+      const jobs = yield* liveJobs(kit)
+      assert.strictEqual(rows.length, i)
+      assert.isUndefined(rows.find((r) => r.value.text === `r${i}`))
+      assert.deepStrictEqual(new Set(jobs.filter((j) => j.handler === "due").map((j) => j.key)), new Set(rows.map((r) => `reminder:${r.id}`)))
+      // Asking again changes nothing either.
+      yield* kit.tool("reminders_set", { text: "one more", when: "in 50 hours", scope: "household" }, { device: SAM })
+      assert.strictEqual((yield* allRows(kit)).length, i)
+      assert.strictEqual((yield* liveJobs(kit)).length, jobs.length)
     }))
 })
 
 describe("phrase commands", () => {
-  const ringOne = (kit: Kit, when = "in ten minutes") =>
+  const ringOne = (kit: Kit) =>
     Effect.gen(function*() {
-      yield* kit.tool("reminders_set", { text: "call mum", when }, { device: SAM })
+      yield* kit.tool("reminders_set", { text: "call mum", when: "in ten minutes" }, { device: SAM })
       yield* kit.advance(11 * MIN)
       yield* kit.present.settle
     })
@@ -379,7 +205,7 @@ describe("phrase commands", () => {
       const snoozed = yield* kit.phrases.say("Snooze the reminder for twenty minutes", { device: SAM })
       assert.isTrue(snoozed.taken && snoozed.by === "command")
       assert.deepStrictEqual(kit.phrases.spoken.map((s) => s.text), ["I'll remind you again in 20 minutes."])
-      assert.strictEqual((yield* rows(kit))[0]?.value.snoozeAt, (yield* kit.now) + 20 * MIN)
+      assert.strictEqual((yield* theRow(kit)).value.ring?.snoozeUntil, (yield* kit.now) + 20 * MIN)
       yield* kit.advance(21 * MIN)
       const plain = yield* kit.phrases.say("snooze the reminder", { device: SAM })
       assert.isTrue(plain.taken)
@@ -388,8 +214,7 @@ describe("phrase commands", () => {
       const done = yield* kit.phrases.say("reminder done", { device: SAM })
       assert.isTrue(done.taken)
       assert.strictEqual(kit.phrases.spoken.at(-1)?.text, "Done.")
-      assert.strictEqual((yield* rows(kit))[0]?.value.state, "done")
-      // A bare "done" is not a phrase of this module: it goes on to the assistant.
+      assert.strictEqual((yield* theRow(kit)).value.state, "done")
       assert.deepStrictEqual(yield* kit.phrases.say("done", { device: SAM }), { taken: false })
     }))
 
@@ -399,20 +224,15 @@ describe("phrase commands", () => {
       const said = yield* kit.phrases.say("Remind me in ten minutes to take the pizza out", { device: SAM })
       assert.isTrue(said.taken && said.by === "command")
       assert.strictEqual(kit.phrases.spoken.at(-1)?.text, "Reminder set for today at ten past ten in the morning: take the pizza out.")
-      const [row] = yield* rows(kit)
-      assert.strictEqual(row?.value.text, "take the pizza out")
-      assert.strictEqual(row?.value.owner, "p-sam")
-      assert.strictEqual(row?.value.deviceId, SAM)
-      // The same on a public screen: nobody known, so it is the household's, and it is not guessed to be personal.
+      const row = yield* theRow(kit)
+      assert.strictEqual(row.value.text, "take the pizza out")
+      assert.strictEqual(row.value.owner, "p-sam")
       yield* kit.phrases.say("remind me in an hour to water the plants", { device: HALL })
-      assert.strictEqual((yield* rows(kit)).find((r) => r.value.text === "water the plants")?.value.whose, "household")
-      // A clock time is no phrase of this module: it goes to the model.
+      assert.strictEqual((yield* rowByText(kit, "water the plants"))?.value.whose, "household")
       assert.deepStrictEqual(yield* kit.phrases.say("remind me at five to call mum", { device: SAM }), { taken: false })
-      // A password beside digits is refused in words, and nothing is stored.
       yield* kit.phrases.say("remind me in an hour to enter password 123456", { device: SAM })
       assert.strictEqual(kit.phrases.spoken.at(-1)?.text, "I don't keep codes or passwords in reminders.")
-      assert.strictEqual((yield* rows(kit)).length, 2)
-      // The same action through its generated tool.
+      assert.strictEqual((yield* allRows(kit)).length, 2)
       const viaAction = yield* kit.action("remind_in", { delay: "five minutes", text: "stretch" }, { device: ROBIN })
       assert.deepStrictEqual(viaAction, { ok: true, say: "Reminder set for today at five past ten in the morning: stretch." })
     }))
@@ -424,7 +244,7 @@ describe("phrase commands", () => {
       yield* ringOne(kit)
       const said = yield* kit.phrases.say("Done", { device: SAM, wake: false })
       assert.isTrue(said.taken && said.by === "ringing")
-      assert.strictEqual((yield* rows(kit))[0]?.value.state, "done")
+      assert.strictEqual((yield* theRow(kit)).value.state, "done")
     }))
 
   it.effect("in Dutch, and with nothing waiting it says so", () =>
@@ -452,17 +272,15 @@ describe("which reminder is meant", () => {
     Effect.gen(function*() {
       const kit = yield* startTestModule(remindersModule)
       yield* seed(kit)
-      const ask = yield* kit.tool("reminders_cancel", { which: "call" }, { device: SAM })
-      assert.deepStrictEqual(ask.value, { spoken: "Which reminder: call mum and call the dentist?" })
-      assert.strictEqual((yield* rows(kit)).filter((r) => r.value.state === "open").length, 3)
-      const none = yield* kit.tool("reminders_cancel", { which: "holiday" }, { device: SAM })
-      assert.deepStrictEqual(none.value, { spoken: "I don't have a reminder called holiday." })
-      const one = yield* kit.tool("reminders_cancel", { which: "dentist" }, { device: SAM })
-      assert.deepStrictEqual(one.value, { spoken: "Cancelled: call the dentist.", owner: "p-sam" })
-      const states = (yield* rows(kit)).map((r) => [r.value.text, r.value.state])
-      assert.deepInclude(states, ["call the dentist", "cancelled"])
+      assert.deepStrictEqual((yield* kit.tool("reminders_cancel", { which: "call" }, { device: SAM })).value, { spoken: "Which reminder: call mum and call the dentist?" })
+      assert.strictEqual((yield* allRows(kit)).filter((r) => r.value.state === "open").length, 3)
+      assert.deepStrictEqual((yield* kit.tool("reminders_cancel", { which: "holiday" }, { device: SAM })).value, { spoken: "I don't have a reminder called holiday." })
+      assert.deepStrictEqual((yield* kit.tool("reminders_cancel", { which: "dentist" }, { device: SAM })).value, { spoken: "Cancelled: call the dentist.", owner: "p-sam" })
+      const dentist = (yield* rowByText(kit, "call the dentist"))!
+      assert.strictEqual(dentist.value.state, "cancelled")
       // Marked, not removed; its job is gone, the others stay.
-      assert.strictEqual((yield* kit.jobs).filter((j: any) => j.handler === "due" && j.state === "scheduled").length, 2)
+      assert.deepStrictEqual(yield* jobOf(kit, dentist.id), [])
+      assert.strictEqual((yield* liveJobs(kit)).filter((j) => j.handler === "due").length, 2)
     }))
 
   it.effect("change: new words, a new time, or both; a new time replaces the job in one step; nothing to change asks", () =>
@@ -471,50 +289,98 @@ describe("which reminder is meant", () => {
       yield* seed(kit)
       assert.deepStrictEqual((yield* kit.tool("reminders_change", { which: "plants" }, { device: SAM })).value, { spoken: "What should I change: the words or the time?" })
       const words = yield* kit.tool("reminders_change", { which: "plants", text: "water the garden" }, { device: SAM })
-      assert.include((words.value as { spoken: string }).spoken, "Changed it: water the garden")
+      assert.strictEqual(spoken(words), "Changed it: water the garden, tomorrow at seven o'clock in the morning.")
       const time = yield* kit.tool("reminders_change", { which: "garden", when: "in two hours" }, { device: SAM })
-      assert.include((time.value as { spoken: string }).spoken, "today at noon")
-      const garden = (yield* rows(kit)).find((r) => r.value.text === "water the garden")!
+      assert.strictEqual(spoken(time), "Changed it: water the garden, today at noon.")
+      const garden = (yield* rowByText(kit, "water the garden"))!
       assert.strictEqual(garden.value.dueAt, (yield* kit.now) + 2 * H)
-      const live = (yield* kit.jobs).filter((j: any) => j.handler === "due" && j.state === "scheduled")
-      assert.strictEqual(live.length, 3)
-      assert.deepStrictEqual(live.find((j: any) => j.key === `due:${garden.id}`)?.payload, { id: garden.id, at: garden.value.dueAt })
-      // Made repeating, and back again to one moment.
+      const [job] = yield* jobOf(kit, garden.id)
+      assert.strictEqual(job?.dueAt, garden.value.dueAt)
+      assert.strictEqual((yield* liveJobs(kit)).filter((j) => j.handler === "due").length, 3)
       const rep = yield* kit.tool("reminders_change", { which: "garden", when: "every Monday at 9 am" }, { device: SAM })
-      assert.include((rep.value as { spoken: string }).spoken, "every Monday")
-      assert.strictEqual((yield* rows(kit)).find((r) => r.id === garden.id)?.value.rrule, "FREQ=WEEKLY;BYDAY=MO")
+      assert.include(spoken(rep), "every Monday")
+      assert.strictEqual((yield* rowByText(kit, "water the garden"))?.value.rrule, "FREQ=WEEKLY;BYDAY=MO")
       yield* kit.tool("reminders_change", { which: "garden", when: "tomorrow at nine am" }, { device: SAM })
-      assert.isUndefined((yield* rows(kit)).find((r) => r.id === garden.id)?.value.rrule)
-      // An unclear time changes nothing.
+      assert.isUndefined((yield* rowByText(kit, "water the garden"))?.value.rrule)
       const bad = yield* kit.tool("reminders_change", { which: "garden", when: "whenever" }, { device: SAM })
-      assert.strictEqual((bad.value as { spoken: string }).spoken, "When should I remind you? I didn't understand when.")
+      assert.strictEqual(spoken(bad), "When should I remind you? I didn't understand when.")
     }))
 
-  it.effect("a reminder changed while it rang takes its ring down; one cancelled does the same", () =>
+  it.effect("new words while it rings: the old ring and card go, and it rings again with the new words for the same occurrence", () =>
     Effect.gen(function*() {
       const kit = yield* startTestModule(remindersModule)
-      yield* kit.tool("reminders_set", { text: "bins", when: "in a minute", scope: "household" }, { device: SAM })
-      yield* kit.advance(2 * MIN)
+      const first = yield* ring(kit, "call dad", "in ten minutes", "household")
+      const row = yield* theRow(kit)
+      const changed = yield* kit.tool("reminders_change", { which: "dad", text: "call sister" }, { device: SAM })
+      assert.strictEqual(spoken(changed), "Changed it: call sister. It rings again now with the new words.")
+      yield* kit.advance(1_000)
       yield* kit.present.settle
-      assert.strictEqual((yield* kit.notify.all)[0]?.state, "open")
-      assert.strictEqual(kit.present.shown(SAM).length, 1)
-      yield* kit.tool("reminders_cancel", { which: "bins" }, { device: SAM })
-      yield* kit.present.settle
-      assert.strictEqual((yield* kit.notify.all)[0]?.state, "resolved")
-      assert.deepStrictEqual(kit.present.shown(SAM), [])
+      const all = yield* kit.notify.all
+      assert.strictEqual(all.find((n) => n.id === first.id)?.state, "resolved")
+      const open = all.filter((n) => n.state === "open")
+      assert.strictEqual(open.length, 1)
+      assert.strictEqual(open[0]?.text, "call sister")
+      assert.strictEqual(open[0]?.key, first.key)
+      const [card] = kit.present.shown(SAM)
+      assert.strictEqual(card?.content.kind === "card" ? card.content.text : "", "call sister")
+      assert.strictEqual((yield* theRow(kit)).value.ring?.at, row.value.ring?.at)
     }))
 
-  it.effect("done by its words, and done for the one that is ringing; a repeating one goes on", () =>
+  it.effect("a new time while it rings ends the ring: notification and card go, the new time is planned", () =>
+    Effect.gen(function*() {
+      const kit = yield* startTestModule(remindersModule)
+      yield* ring(kit, "call dad", "in ten minutes", "household")
+      const changed = yield* kit.tool("reminders_change", { which: "dad", when: "in two hours" }, { device: SAM })
+      assert.strictEqual(spoken(changed), "Changed it: call dad, today at twelve eleven in the afternoon.")
+      yield* kit.present.settle
+      assert.deepStrictEqual(yield* openNotes(kit), [])
+      assert.deepStrictEqual(kit.present.shown(SAM), [])
+      const row = yield* theRow(kit)
+      assert.isUndefined(row.value.ring)
+      assert.strictEqual((yield* jobOf(kit, row.id))[0]?.dueAt, row.value.dueAt)
+    }))
+
+  it.effect("new words while it is snoozed: the confirmation says the snooze's time, which is kept", () =>
+    Effect.gen(function*() {
+      const kit = yield* startTestModule(remindersModule)
+      const n = yield* ring(kit, "call dad", "in a minute", "household")
+      assert.strictEqual((yield* kit.notify.press(n.id, "snooze", { device: SAM })).say, "I'll remind you again in 10 minutes.")
+      const until = (yield* theRow(kit)).value.ring?.snoozeUntil
+      const changed = yield* kit.tool("reminders_change", { which: "dad", text: "call sister" }, { device: SAM })
+      // Snoozed at 10:11 for ten minutes: 10:21, not the occurrence's 10:01.
+      assert.strictEqual(spoken(changed), "Changed it: call sister, today at ten twenty one in the morning.")
+      assert.strictEqual((yield* theRow(kit)).value.ring?.snoozeUntil, until)
+      yield* kit.advance(11 * MIN)
+      assert.strictEqual((yield* openNotes(kit))[0]?.text, "call sister")
+    }))
+
+  it.effect("done by its words, and done for the one that is ringing", () =>
     Effect.gen(function*() {
       const kit = yield* startTestModule(remindersModule)
       yield* seed(kit)
       assert.deepStrictEqual((yield* kit.tool("reminders_done", { which: "plants" }, { device: SAM })).value, { spoken: "Done." })
-      assert.strictEqual((yield* rows(kit)).find((r) => r.value.text.includes("plants"))?.value.state, "done")
+      assert.strictEqual((yield* rowByText(kit, "water the plants"))?.value.state, "done")
       assert.deepStrictEqual((yield* kit.tool("reminders_done", {}, { device: SAM })).value, { spoken: "No reminder is waiting for an answer on this device. Say which one you mean." })
+    }))
+
+  it.effect("done on a repeat that is not ringing skips its next occurrence, which does not ring; the one after does", () =>
+    Effect.gen(function*() {
+      const kit = yield* startTestModule(remindersModule)
       yield* kit.tool("reminders_set", { text: "stretch", when: "every day at 8 pm" }, { device: SAM })
+      const tonight = (yield* theRow(kit)).value.dueAt!
       const done = yield* kit.tool("reminders_done", { which: "stretch" }, { device: SAM })
-      assert.include((done.value as { spoken: string }).spoken, "Done. The next one is")
-      assert.strictEqual((yield* rows(kit)).find((r) => r.value.text === "stretch")?.value.state, "open")
+      assert.strictEqual(spoken(done), "Done: I'll skip the one today at eight o'clock in the evening. The next one is tomorrow at eight o'clock in the evening.")
+      const row = yield* theRow(kit)
+      assert.strictEqual(row.value.state, "open")
+      assert.strictEqual(row.value.dueAt, tonight + DAY)
+      assert.strictEqual((yield* jobOf(kit, row.id))[0]?.dueAt, tonight + DAY)
+      yield* kit.advance(tonight - (yield* kit.now) + MIN)
+      assert.deepStrictEqual(yield* kit.notify.all, [])
+      yield* kit.advance(DAY)
+      assert.strictEqual((yield* openNotes(kit)).length, 1)
+      // Done while it rings answers the ring, and the series goes on.
+      assert.strictEqual(spoken(yield* kit.tool("reminders_done", { which: "stretch" }, { device: SAM })), "Done. The next one is tomorrow at eight o'clock in the evening.")
+      assert.deepStrictEqual(yield* openNotes(kit), [])
     }))
 
   it.effect("a read that was cut short is said, never 'none'", () =>
@@ -522,16 +388,33 @@ describe("which reminder is meant", () => {
       const kit = yield* startTestModule(remindersModule)
       const store = kit.moduleStore().collection(reminders)
       const now = yield* kit.now
-      // 250 open household reminders: past the 204 one answer reads.
-      for (let i = 0; i < 250; i++) yield* store.insert({ text: `item ${i}`, whose: "household", state: "open", dueAt: now + DAY + i })
+      for (let i = 0; i < 250; i++) yield* store.insert({ text: `item ${i}`, whose: "household", state: "open", dueAt: now + DAY + i, nextAt: now + DAY + i })
       const missing = yield* kit.tool("reminders_cancel", { which: "item 249" }, { device: SAM })
       assert.deepStrictEqual(missing.value, { spoken: "I found none in the first 204 open reminders; there are more." })
-      const list = yield* kit.tool("reminders_list", {}, { device: SAM })
-      const v = JSON.parse(list.content.split("\n")[0]!)
+      const v = forModel(yield* kit.tool("reminders_list", {}, { device: SAM }))
       assert.strictEqual(v.count, 204)
       assert.strictEqual(v.cut, "I read the first 204 open reminders; there are more.")
       assert.strictEqual(v.reminders.length, 5)
       assert.strictEqual(v.more, 199)
+    }))
+
+  it.effect("a cut read never treats a partial match as the only one: it asks and changes nothing; the exact words still work", () =>
+    Effect.gen(function*() {
+      const kit = yield* startTestModule(remindersModule)
+      const store = kit.moduleStore().collection(reminders)
+      const now = yield* kit.now
+      // "call mum today" is read; "call mum today again" lies beyond the 204 rows one answer reads.
+      yield* store.insert({ text: "call mum today", whose: "household", state: "open", dueAt: now + DAY, nextAt: now + DAY })
+      for (let i = 1; i < 204; i++) yield* store.insert({ text: `other ${i}`, whose: "household", state: "open", dueAt: now + DAY + i, nextAt: now + DAY + i })
+      yield* store.insert({ text: "call mum today again", whose: "household", state: "open", dueAt: now + 2 * DAY, nextAt: now + 2 * DAY })
+      const before = yield* allRows(kit)
+      const ask = "I read only the first 204 open reminders, so I can't be sure that is the only one. Say its exact words."
+      // A partial match that is single in what was read.
+      assert.strictEqual(spoken(yield* kit.tool("reminders_cancel", { which: "mum today" }, { device: SAM })), ask)
+      assert.strictEqual(spoken(yield* kit.tool("reminders_change", { which: "mum today", text: "x" }, { device: SAM })), ask)
+      assert.strictEqual(spoken(yield* kit.tool("reminders_done", { which: "mum today" }, { device: SAM })), ask)
+      assert.deepStrictEqual(yield* allRows(kit), before)
+      assert.strictEqual(spoken(yield* kit.tool("reminders_cancel", { which: "call mum today" }, { device: SAM })), "Cancelled: call mum today.")
     }))
 })
 
@@ -549,73 +432,128 @@ describe("listing and privacy", () => {
     Effect.gen(function*() {
       const kit = yield* startTestModule(remindersModule)
       yield* prepare(kit)
-      const parse = (r: any) => JSON.parse(r.content.split("\n")[0]!)
-      // The shared kitchen display is Sam's: Sam's own and the household's, never Robin's (not even counted).
-      const kitchen = parse(yield* kit.tool("reminders_list", {}, { device: SAM }))
+      const kitchen = forModel(yield* kit.tool("reminders_list", {}, { device: SAM }))
       assert.deepStrictEqual(kitchen.reminders.map((r: any) => r.text), ["Sam's dentist", "bins out"])
       assert.strictEqual(kitchen.covers, "yours and the household's")
       assert.strictEqual(kitchen.owner, "p-sam")
-      // Robin's private phone: Robin's own and the household's.
-      const phone = parse(yield* kit.tool("reminders_list", {}, { device: ROBIN }))
+      const phone = forModel(yield* kit.tool("reminders_list", {}, { device: ROBIN }))
       assert.deepStrictEqual(phone.reminders.map((r: any) => r.text), ["Robin's vet", "bins out"])
-      // The public hall screen has nobody: the household's only, and it says so.
       const hall = yield* kit.tool("reminders_list", {}, { device: HALL })
-      assert.deepStrictEqual(parse(hall).reminders.map((r: any) => r.text), ["bins out"])
-      assert.strictEqual(parse(hall).covers, "the household's reminders only; I can't tell who is asking")
+      assert.deepStrictEqual(forModel(hall).reminders.map((r: any) => r.text), ["bins out"])
+      assert.strictEqual(forModel(hall).covers, "the household's reminders only; I can't tell who is asking")
       assert.notInclude(hall.content, "dentist")
       assert.notInclude(hall.content, "vet")
     }))
 
   it.effect("a public screen with a default person counts that person's reminders and reads none of them", () =>
     Effect.gen(function*() {
-      const kit = yield* startTestModule(remindersModule, {
-        household: { devices: [...DEFAULT_TEST_HOUSEHOLD.devices, { id: "lobby-screen", name: "Lobby", room: "Lobby", privacy: "public", defaultPerson: "p-sam" }] }
-      })
+      const kit = yield* startTestModule(remindersModule, lobby)
       yield* kit.tool("reminders_set", { text: "secret thing", when: "in two hours" }, { device: SAM })
       yield* kit.tool("reminders_set", { text: "second secret", when: "in three hours" }, { device: SAM })
-      const lobby = yield* kit.tool("reminders_list", {}, { device: "lobby-screen" })
-      assert.deepStrictEqual(lobby.value, { spoken: "2 personal reminders are not read out here." })
-      assert.notInclude(lobby.content, "secret")
-      // Where it is household too, the household's are read and the personal ones counted.
+      const l = yield* kit.tool("reminders_list", {}, { device: "lobby-screen" })
+      assert.deepStrictEqual(l.value, { spoken: "2 personal reminders are not read out here." })
+      assert.notInclude(l.content, "secret")
       yield* kit.tool("reminders_set", { text: "bins", when: "in an hour", scope: "household" }, { device: SAM })
-      const mixed = JSON.parse((yield* kit.tool("reminders_list", {}, { device: "lobby-screen" })).content.split("\n")[0]!)
+      const mixed = forModel(yield* kit.tool("reminders_list", {}, { device: "lobby-screen" }))
       assert.deepStrictEqual(mixed.reminders.map((r: any) => r.text), ["bins"])
       assert.strictEqual(mixed.withheld, "2 personal reminders are not read out here.")
       assert.strictEqual(mixed.covers, "the household's reminders; yours are not read out here")
-      // A reminder that cannot be told here cannot be changed or cancelled here either, and says why.
       const cancel = yield* kit.tool("reminders_cancel", { which: "secret" }, { device: "lobby-screen" })
-      assert.strictEqual((cancel.value as { spoken: string }).spoken, "I don't have a reminder called secret. Personal reminders are not read out or changed here.")
-      assert.strictEqual((yield* rows(kit)).filter((r) => r.value.state === "open").length, 3)
+      assert.strictEqual(spoken(cancel), "I don't have a reminder called secret. Personal reminders are not read out or changed here.")
+      assert.strictEqual((yield* allRows(kit)).filter((r) => r.value.state === "open").length, 3)
     }))
 
   it.effect("the list is a presentation on the device that can show it, personal only where it may be shown", () =>
     Effect.gen(function*() {
       const kit = yield* startTestModule(remindersModule)
       yield* prepare(kit)
-      const shown = yield* kit.tool("reminders_list", {}, { device: SAM })
-      assert.include(shown.content, "[Screen: Shown on \"Kitchen display\".]")
+      const shown = forModel(yield* kit.tool("reminders_list", {}, { device: SAM }))
+      assert.isString(shown.screen)
       yield* kit.present.settle
       const [list] = kit.present.shown(SAM)
       assert.strictEqual(list?.content.kind, "list")
       assert.deepStrictEqual(list?.content.kind === "list" ? list.content.items.map((i) => i.text.split(" · ")[1]) : [], ["Sam's dentist", "bins out"])
-      // Robin's phone does not show Sam's list, and its own is its own.
       assert.deepStrictEqual(kit.present.shown(ROBIN), [])
-      // A one-line "nothing" is not a card.
       const empty = yield* startTestModule(remindersModule)
       const none = yield* empty.tool("reminders_list", {}, { device: SAM })
       assert.deepStrictEqual(none.value, { spoken: "You have no reminders." })
       assert.deepStrictEqual(empty.present.shown(SAM), [])
     }))
 
-  it.effect("a ring for a personal reminder is not delivered to a device that may not reveal it", () =>
+  it.effect("a list on the screen follows the reminders: replaced after a change, dismissed when none is left or the answer is empty", () =>
     Effect.gen(function*() {
       const kit = yield* startTestModule(remindersModule)
-      // Set from the public hall as the household's, then check a personal one set on Robin's phone rings only there.
-      yield* kit.tool("reminders_set", { text: "Robin's vet", when: "in a minute" }, { device: ROBIN })
-      yield* kit.advance(2 * MIN)
-      const decisions = kit.notify.decisions
-      assert.isTrue(decisions.some((d: any) => d.deviceId === ROBIN && d.decision.deliver))
-      assert.isFalse(decisions.some((d: any) => d.deviceId === HALL && d.decision.deliver))
+      yield* kit.tool("reminders_set", { text: "dentist", when: "tomorrow at nine am", scope: "household" }, { device: SAM })
+      yield* kit.tool("reminders_set", { text: "bins", when: "tomorrow at ten am", scope: "household" }, { device: SAM })
+      yield* kit.tool("reminders_list", {}, { device: SAM })
+      yield* kit.present.settle
+      const items = () => kit.present.shown(SAM).flatMap((p) => (p.content.kind === "list" ? p.content.items.map((i) => i.text.split(" · ")[1]) : []))
+      assert.deepStrictEqual(items(), ["dentist", "bins"])
+      yield* kit.tool("reminders_cancel", { which: "dentist" }, { device: SAM })
+      yield* kit.present.settle
+      assert.deepStrictEqual(items(), ["bins"])
+      yield* kit.tool("reminders_done", { which: "bins" }, { device: SAM })
+      yield* kit.present.settle
+      assert.deepStrictEqual(kit.present.shown(SAM), [])
+      // Shown again, then an empty answer on the same page takes it down.
+      yield* kit.tool("reminders_set", { text: "cake", when: "tomorrow at eleven am", scope: "household" }, { device: SAM })
+      yield* kit.tool("reminders_list", {}, { device: SAM })
+      yield* kit.present.settle
+      assert.deepStrictEqual(items(), ["cake"])
+      yield* kit.moduleStore().collection(reminders).update((yield* rowByText(kit, "cake"))!.id, (v) => ({ ...v, state: "cancelled" as const, endedAt: 1 }))
+      assert.deepStrictEqual((yield* kit.tool("reminders_list", {}, { device: SAM })).value, { spoken: "You have no reminders." })
+      yield* kit.present.settle
+      assert.deepStrictEqual(kit.present.shown(SAM), [])
+    }))
+
+  it.effect("a shown personal list that may no longer be shown there loses that person's reminders at its next change", () =>
+    Effect.gen(function*() {
+      const faults = nofaults()
+      const kit = yield* startTestModule(faulty(faults))
+      yield* kit.tool("reminders_set", { text: "Sam's dentist", when: "tomorrow at nine am" }, { device: SAM })
+      yield* kit.tool("reminders_set", { text: "bins", when: "tomorrow at ten am", scope: "household" }, { device: SAM })
+      yield* kit.tool("reminders_set", { text: "cake", when: "tomorrow at eleven am", scope: "household" }, { device: SAM })
+      yield* kit.tool("reminders_list", {}, { device: SAM })
+      yield* kit.present.settle
+      const items = () => kit.present.shown(SAM).flatMap((p) => (p.content.kind === "list" ? p.content.items.map((i) => i.text.split(" · ")[1]) : []))
+      assert.deepStrictEqual(items(), ["Sam's dentist", "bins", "cake"])
+      // The kitchen display's default person changed: Sam's reminders may not be shown there any more.
+      faults.reveal = (owner) => (owner === "p-sam" ? false : undefined)
+      yield* kit.tool("reminders_cancel", { which: "cake" }, { device: SAM })
+      yield* kit.present.settle
+      assert.notInclude(items(), "Sam's dentist")
+    }))
+
+  it.effect("a list item at the text's limit in characters outside the basic plane is shown whole or cut at a character, never split", () =>
+    Effect.gen(function*() {
+      const kit = yield* startTestModule(remindersModule)
+      const pills = "💊".repeat(80)
+      assert.include(spoken(yield* kit.tool("reminders_set", { text: pills, when: "tomorrow at nine am", scope: "household" }, { device: SAM })), "Reminder for the household")
+      const v = forModel(yield* kit.tool("reminders_list", {}, { device: SAM }))
+      assert.notInclude(v.screen, "Not shown")
+      yield* kit.present.settle
+      const [list] = kit.present.shown(SAM)
+      const text = list?.content.kind === "list" ? list.content.items[0]!.text : ""
+      assert.isAtMost(text.length, 80)
+      assert.isFalse(/[\ud800-\udbff](?![\udc00-\udfff])/.test(text))
+      assert.isTrue(text.endsWith("💊…"))
+    }))
+
+  it.effect("soonest first by the moment each next speaks: a snoozed one is ordered by its snooze", () =>
+    Effect.gen(function*() {
+      const kit = yield* startTestModule(remindersModule)
+      // "first" rings at 10:01 and is snoozed at 10:11 for an hour (11:11); then one for 10:30 and one for noon.
+      yield* ring(kit, "first", "in a minute", "household")
+      assert.strictEqual(((yield* kit.action("ringing_snooze", { for: "an hour" }, { device: SAM })) as any).say, "I'll remind you again in 1 hour.")
+      yield* kit.tool("reminders_set", { text: "second", when: "today at 10:30", scope: "household" }, { device: SAM })
+      yield* kit.tool("reminders_set", { text: "third", when: "today at noon", scope: "household" }, { device: SAM })
+      const v = forModel(yield* kit.tool("reminders_list", {}, { device: SAM }))
+      assert.deepStrictEqual(v.reminders.map((r: any) => r.text), ["second", "first", "third"])
+      yield* kit.present.settle
+      const [list] = kit.present.shown(SAM)
+      assert.deepStrictEqual(list?.content.kind === "list" ? list.content.items.map((i) => i.text.split(" · ")[1]) : [], ["second", "first", "third"])
+      // The briefing's order is the same.
+      assert.deepStrictEqual((yield* gather(kit, HALL)).sentences, ["You have three reminders today: second at half past ten, first at eleven eleven and third at noon."])
     }))
 
   it.effect("a list past one page of rows is read in full (30 reminders), soonest first", () =>
@@ -623,27 +561,17 @@ describe("listing and privacy", () => {
       const kit = yield* startTestModule(remindersModule)
       const store = kit.moduleStore().collection(reminders)
       const now = yield* kit.now
-      for (let i = 29; i >= 0; i--) yield* store.insert({ text: `item ${i}`, whose: "household", state: "open", dueAt: now + DAY + i * MIN })
-      const v = JSON.parse((yield* kit.tool("reminders_list", {}, { device: SAM })).content.split("\n")[0]!)
+      for (let i = 29; i >= 0; i--) yield* store.insert({ text: `item ${i}`, whose: "household", state: "open", dueAt: now + DAY + i * MIN, nextAt: now + DAY + i * MIN })
+      const v = forModel(yield* kit.tool("reminders_list", {}, { device: SAM }))
       assert.strictEqual(v.count, 30)
       assert.deepStrictEqual(v.reminders.map((r: any) => r.text), ["item 0", "item 1", "item 2", "item 3", "item 4"])
       assert.strictEqual(v.more, 25)
       assert.isUndefined(v.cut)
-      // Cancelling the last of them is found past the first page.
       assert.deepStrictEqual((yield* kit.tool("reminders_cancel", { which: "item 29" }, { device: SAM })).value, { spoken: "Cancelled: item 29." })
     }))
 })
 
 describe("the briefing's section", () => {
-  const gather = (kit: Kit, device: string, extra: Partial<BriefingRequest> = {}) =>
-    Effect.gen(function*() {
-      const turn = kit.turn({ device })
-      const sections = yield* kit.contributions(BriefingSections, { device })
-      const section = sections.find((s: any) => s.id === "reminders")
-      assert.isDefined(section)
-      return (yield* section.gather({ turn, kind: "morning", length: "normal", maxSentences: 2, language: "en", now: yield* kit.now, ...extra })) as any
-    })
-
   it.effect("today's reminders for the asking person, the household's with them; the rest of the day only", () =>
     Effect.gen(function*() {
       const kit = yield* startTestModule(remindersModule)
@@ -656,27 +584,73 @@ describe("the briefing's section", () => {
       assert.deepStrictEqual(r.sentences, ["You have two reminders today: call mum at five o'clock and bins out at seven o'clock."])
       assert.strictEqual(r.owner, "p-sam")
       assert.strictEqual(r.withheld, 0)
-      // A public screen: the household's alone, with an anonymous count and no owner word.
       const hall = yield* gather(kit, HALL)
       assert.deepStrictEqual(hall.sentences, ["You have a reminder today: bins out at seven o'clock."])
       assert.isUndefined(hall.owner)
       assert.notInclude(JSON.stringify(hall), "call mum")
     }))
 
-  it.effect("a person's own on a public screen are counted, not named; a failed read is a failure; Dutch", () =>
+  it.effect("a person's own on a public screen are counted, not named, and only those of today; a failed read is a failure; Dutch", () =>
     Effect.gen(function*() {
       const faults = nofaults()
-      const kit = yield* startTestModule(faulty(faults), {
-        household: { devices: [...DEFAULT_TEST_HOUSEHOLD.devices, { id: "lobby-screen", name: "Lobby", room: "Lobby", privacy: "public", defaultPerson: "p-sam" }], home: { HOME_LANGUAGE: "nl-NL" } }
-      })
+      const kit = yield* startTestModule(faulty(faults), { household: { ...lobby.household, home: { HOME_LANGUAGE: "nl-NL" } } })
+      // Tomorrow only: nothing today, so nothing is counted.
+      yield* kit.tool("reminders_set", { text: "morgen iets", when: "morgen om negen uur 's ochtends" }, { device: SAM })
+      assert.deepStrictEqual(yield* gather(kit, "lobby-screen", { language: "nl" }), { _tag: "empty" })
+      // An unanswered one from before today is not today's either.
+      const store = kit.moduleStore().collection(reminders)
+      const now = yield* kit.now
+      yield* store.insert({ text: "oud", whose: "personal", owner: "p-sam", state: "open", ring: { at: now - 2 * DAY, deliveredAt: now - 2 * DAY } })
+      assert.deepStrictEqual(yield* gather(kit, "lobby-screen", { language: "nl" }), { _tag: "empty" })
       yield* kit.tool("reminders_set", { text: "bel mama", when: "vandaag om vijf uur 's middags" }, { device: SAM })
-      const lobby = yield* gather(kit, "lobby-screen", { language: "nl" })
-      assert.deepStrictEqual(lobby, { _tag: "section", sentences: [], priority: "normal", withheld: 1 })
+      assert.deepStrictEqual(yield* gather(kit, "lobby-screen", { language: "nl" }), { _tag: "section", sentences: [], priority: "normal", withheld: 1 })
       const own = yield* gather(kit, SAM, { language: "nl" })
       assert.strictEqual(own.sentences[0], "Je hebt vandaag een herinnering: bel mama om vijf uur.")
       faults.storeReads = true
       const failure = yield* Effect.flip(gather(kit, SAM, { language: "nl" }))
       assert.strictEqual((failure as { _tag: string })._tag, "BriefingSectionError")
+    }))
+
+  it.effect("a cut read is said in every shape: none found today, and the one-sentence count", () =>
+    Effect.gen(function*() {
+      const kit = yield* startTestModule(remindersModule)
+      const store = kit.moduleStore().collection(reminders)
+      const now = yield* kit.now
+      // 204 old unanswered reminders come first (no next moment), then one due today.
+      for (let i = 0; i < 204; i++) yield* store.insert({ text: `old ${i}`, whose: "household", state: "open", ring: { at: now - DAY, deliveredAt: now - DAY } })
+      yield* store.insert({ text: "today", whose: "household", state: "open", dueAt: now + H, nextAt: now + H })
+      const none = yield* gather(kit, SAM, { maxSentences: 1 })
+      assert.deepStrictEqual(none, { _tag: "section", sentences: ["I couldn't read all the reminders; there may be some today."], priority: "normal", withheld: 0 })
+      // With one of today's inside what is read, the one sentence says "at least".
+      const kit2 = yield* startTestModule(remindersModule)
+      const s2 = kit2.moduleStore().collection(reminders)
+      for (let i = 0; i < 230; i++) yield* s2.insert({ text: `item ${i}`, whose: "household", state: "open", dueAt: now + H + i * 1000, nextAt: now + H + i * 1000 })
+      const some = yield* gather(kit2, SAM, { maxSentences: 1 })
+      assert.strictEqual(some.sentences.length, 1)
+      assert.match(some.sentences[0], /^You have at least two hundred and four reminders today: .*; there may be more\.$/)
+    }))
+
+  it.effect("long items fit whole into one sentence at the limit, with an honest remainder, in English and Dutch", () =>
+    Effect.gen(function*() {
+      for (const [lang, home] of [["en", "en-GB"], ["nl", "nl-NL"]] as const) {
+        for (const letters of [["a", "b", "c"], ["a", "b", "c", "d"]]) {
+          const kit = yield* startTestModule(remindersModule, { household: { home: { HOME_LANGUAGE: home } } })
+          const store = kit.moduleStore().collection(reminders)
+          const now = yield* kit.now
+          const at = now + H + 25 * MIN // 11:25
+          for (const c of letters) yield* store.insert({ text: c.repeat(60), whose: "household", state: "open", dueAt: at, nextAt: at })
+          const r = yield* gather(kit, SAM, { language: lang, maxSentences: 1 })
+          const s: string = r.sentences[0]
+          assert.isAtMost(s.length, 300, s)
+          const time = speakTime({ hour: 11, minute: 25 }, lang)!
+          // Three whole items in English are 300 characters and more: one item fewer, and the rest counted ("… and two more.").
+          // Three fit in Dutch; four fit in neither.
+          if (lang === "nl" && letters.length === 3) assert.isTrue(s.endsWith(` om ${time}.`), s)
+          else assert.match(s, new RegExp(lang === "en" ? ` at ${time} and two more\\.$` : ` om ${time} en nog twee\\.$`))
+          // Every item named is whole: its 60 letters and its time.
+          for (const run of s.match(/([a-d])\1{9,}/g) ?? []) assert.strictEqual(run.length, 60, s)
+        }
+      }
     }))
 })
 
@@ -690,115 +664,25 @@ describe("failures are said, and leave nothing half done", () => {
       const set = yield* kit.tool("reminders_set", { text: "never saved", when: "in two hours", scope: "household" }, { device: SAM })
       assert.include(set.content, "I couldn't save that reminder.")
       faults.storeWrites = false
-      assert.strictEqual((yield* rows(kit)).length, 1)
-      assert.strictEqual((yield* kit.jobs).filter((j: any) => j.handler === "due" && j.state === "scheduled").length, 1)
+      assert.strictEqual((yield* allRows(kit)).length, 1)
+      assert.strictEqual((yield* liveJobs(kit)).filter((j) => j.handler === "due").length, 1)
       faults.storeReads = true
-      const list = yield* kit.tool("reminders_list", {}, { device: SAM })
-      assert.include(list.content, "I couldn't read the reminders.")
-      const cancel = yield* kit.tool("reminders_cancel", { which: "bins" }, { device: SAM })
-      assert.include(cancel.content, "I couldn't save that reminder.")
+      assert.include((yield* kit.tool("reminders_list", {}, { device: SAM })).content, "I couldn't read the reminders.")
+      assert.include((yield* kit.tool("reminders_cancel", { which: "bins" }, { device: SAM })).content, "I couldn't save that reminder.")
       faults.storeReads = false
-      assert.strictEqual((yield* rows(kit))[0]?.value.state, "open")
+      assert.strictEqual((yield* theRow(kit)).value.state, "open")
     }))
 
   it.effect("a press whose write fails changes nothing and says to try again; pressed again it works", () =>
     Effect.gen(function*() {
       const faults = nofaults()
       const kit = yield* startTestModule(faulty(faults))
-      yield* kit.tool("reminders_set", { text: "bins", when: "in a minute", scope: "household" }, { device: SAM })
-      yield* kit.advance(2 * MIN)
-      const [n] = yield* kit.notify.all
+      const n = yield* ring(kit, "bins", "in a minute", "household")
       faults.storeWrites = true
-      const failed = yield* kit.notify.press(n!.id, "done", { device: SAM })
-      assert.strictEqual(failed.say, "That didn't work. Try again in a moment.")
+      assert.strictEqual((yield* kit.notify.press(n.id, "done", { device: SAM })).say, "That didn't work. Try again in a moment.")
       faults.storeWrites = false
-      assert.strictEqual((yield* rows(kit))[0]?.value.state, "open")
-      assert.deepStrictEqual(yield* kit.notify.press(n!.id, "done", { device: SAM }), { ok: true, say: "Done." })
-    }))
-
-  it.effect("a one-off whose delivery fails is retried and delivered once", () =>
-    Effect.gen(function*() {
-      const faults = nofaults()
-      const kit = yield* startTestModule(faulty(faults))
-      yield* kit.tool("reminders_set", { text: "bins", when: "in a minute", scope: "household" }, { device: SAM })
-      faults.sendFails = 2
-      yield* kit.advance(MIN + 1_000)
-      assert.deepStrictEqual(yield* kit.notify.all, [])
-      yield* kit.advance(40_000)
-      assert.strictEqual((yield* kit.notify.all).length, 1)
-      assert.strictEqual((yield* rows(kit))[0]?.value.notifiedFor, (yield* rows(kit))[0]?.value.dueAt)
-    }))
-})
-
-describe("jobs", () => {
-  it.effect("a reminder called off while its job is delivering: the call waits its turn, then takes the ring down and nothing is left", () =>
-    Effect.gen(function*() {
-      const faults = nofaults()
-      const kit = yield* startTestModule(faulty(faults))
-      yield* kit.tool("reminders_set", { text: "bins", when: "in ten minutes", scope: "household" }, { device: SAM })
-      faults.gate = yield* Deferred.make<void>()
-      faults.entered = yield* Deferred.make<void>()
-      // The job starts at its time and its delivery waits at the gate.
-      const running = yield* Effect.forkChild(kit.advance(10 * MIN + 1_000))
-      yield* Deferred.await(faults.entered)
-      const cancelling = yield* Effect.forkChild(kit.tool("reminders_cancel", { which: "bins" }, { device: SAM }))
-      yield* Effect.yieldNow
-      // The cancel is waiting behind the job: nothing is cancelled yet.
-      assert.strictEqual((yield* rows(kit))[0]?.value.state, "open")
-      yield* Deferred.succeed(faults.gate, undefined)
-      yield* Fiber.join(running)
-      const cancelled = yield* Fiber.join(cancelling)
-      assert.deepStrictEqual(cancelled.value, { spoken: "Cancelled: bins." })
-      yield* kit.present.settle
-      assert.strictEqual((yield* rows(kit))[0]?.value.state, "cancelled")
-      assert.deepStrictEqual((yield* kit.notify.all).map((n) => n.state), ["resolved"])
-      assert.deepStrictEqual(kit.present.shown(SAM), [])
-      assert.deepStrictEqual((yield* kit.jobs).filter((j) => j.state === "scheduled" && j.handler !== "tidy"), [])
-    }))
-
-  it.effect("a job for a reminder that was changed, cancelled or finished meanwhile does nothing", () =>
-    Effect.gen(function*() {
-      const kit = yield* startTestModule(remindersModule)
-      yield* kit.tool("reminders_set", { text: "bins", when: "in ten minutes", scope: "household" }, { device: SAM })
-      const job = (yield* kit.jobs).find((j: any) => j.handler === "due")!
-      const [row] = yield* rows(kit)
-      // Cancelled by the store, as if it had been called off while the job waited: the job runs and finds the row finished.
-      yield* kit.moduleStore().collection(reminders).update(row!.id, (v) => ({ ...v, state: "cancelled" as const, endedAt: 1 }))
-      yield* kit.runJob(job.id)
-      assert.deepStrictEqual(yield* kit.notify.all, [])
-      // Moved to another time: the old occurrence is not delivered.
-      yield* kit.moduleStore().collection(reminders).update(row!.id, (v) => ({ ...v, state: "open" as const, dueAt: v.dueAt + H }))
-      yield* kit.runJob(job.id)
-      assert.deepStrictEqual(yield* kit.notify.all, [])
-    }))
-
-  it.effect("a write made by a job carries the job as its actor", () =>
-    Effect.gen(function*() {
-      const kit = yield* startTestModule(remindersModule)
-      yield* kit.tool("reminders_set", { text: "bins", when: "in a minute", scope: "household" }, { device: SAM })
-      yield* kit.advance(2 * MIN)
-      const job = (yield* kit.jobs).find((j: any) => j.handler === "due")!
-      const events = kit.events.filter((e: any) => e.type === "reminders.reminders.changed")
-      assert.deepStrictEqual(events.at(-1)?.actor, { kind: "job", jobId: job.id })
-    }))
-
-  it.effect("the daily clean-up lapses what was delivered a week ago and removes finished ones after the kept days, in batches", () =>
-    Effect.gen(function*() {
-      const kit = yield* startTestModule(remindersModule, { settings: { keepDays: 3 } })
-      const store = kit.moduleStore().collection(reminders)
-      const now = yield* kit.now
-      const old = now - 10 * DAY
-      yield* store.insert({ text: "unanswered", whose: "household", state: "open", dueAt: old, notifiedFor: old })
-      yield* store.insert({ text: "not yet", whose: "household", state: "open", dueAt: now + DAY })
-      for (let i = 0; i < 30; i++) yield* store.insert({ text: `done ${i}`, whose: "household", state: "done", dueAt: old, endedAt: now - 5 * DAY + i })
-      yield* store.insert({ text: "fresh done", whose: "household", state: "done", dueAt: now, endedAt: now - DAY })
-      yield* store.insert({ text: "old cancelled", whose: "household", state: "cancelled", dueAt: old, endedAt: now - 9 * DAY })
-      const tidy = (yield* kit.jobs).find((j: any) => j.handler === "tidy")!
-      assert.strictEqual(tidy.cron, "0 4 * * *")
-      yield* kit.runJob(tidy.id)
-      const left = yield* store.list({ limit: 12 })
-      assert.deepStrictEqual(left.map((r) => r.value.text).sort(), ["fresh done", "not yet", "unanswered"])
-      assert.strictEqual(left.find((r) => r.value.text === "unanswered")?.value.state, "lapsed")
+      assert.strictEqual((yield* theRow(kit)).value.state, "open")
+      assert.deepStrictEqual(yield* kit.notify.press(n.id, "done", { device: SAM }), { ok: true, say: "Done." })
     }))
 })
 
@@ -825,14 +709,6 @@ describe("settings and the module off", () => {
       yield* kit.advance(MIN)
       assert.strictEqual((yield* kit.notify.all).length, 1)
     }))
-
-  it.effect("no result, spoken line or stored row of the module holds a secret it was given", () =>
-    Effect.gen(function*() {
-      const kit = yield* startTestModule(remindersModule)
-      const set = yield* kit.tool("reminders_set", { text: "bins", when: "in an hour" }, { device: SAM })
-      const list = yield* kit.tool("reminders_list", {}, { device: SAM })
-      yield* kit.expectNoSecrets(set, list, yield* rows(kit))
-    }))
 })
 
 describe("Dutch", () => {
@@ -841,33 +717,33 @@ describe("Dutch", () => {
   it.effect("every path speaks Dutch: setting, questions, refusals, listing, changing, cancelling, done, snooze", () =>
     Effect.gen(function*() {
       const kit = yield* startTestModule(remindersModule, nl)
-      const say = (r: any) => (r.value as { spoken: string }).spoken
-      assert.strictEqual(say(yield* kit.tool("reminders_set", { text: "bel mama", when: "over tien minuten" }, { device: SAM })), "Herinnering gezet voor vandaag om tien over tien 's ochtends: bel mama.")
-      assert.strictEqual(say(yield* kit.tool("reminders_set", { text: "x", when: "morgen" }, { device: SAM })), "Hoe laat?")
-      assert.strictEqual(say(yield* kit.tool("reminders_set", { text: "x", when: "gisteren om vijf uur" }, { device: SAM })), "Dat moment is al voorbij.")
-      assert.strictEqual(say(yield* kit.tool("reminders_set", { text: "x", when: "ooit" }, { device: SAM })), "Wanneer moet ik je herinneren? Ik begreep niet wanneer.")
-      assert.strictEqual(say(yield* kit.tool("reminders_set", { text: "wachtwoord 123456", when: "over een uur" }, { device: SAM })), "Ik bewaar geen codes of wachtwoorden in herinneringen.")
-      assert.strictEqual(say(yield* kit.tool("reminders_set", { text: "x", when: "over een uur", scope: "me" }, { device: HALL })), "Van wie is de herinnering? Ik weet hier niet wie het vraagt.")
-      const rep = say(yield* kit.tool("reminders_set", { text: "vuilnis", when: "elke maandag om zeven uur 's avonds", scope: "household" }, { device: SAM }))
+      assert.strictEqual(spoken(yield* kit.tool("reminders_set", { text: "bel mama", when: "over tien minuten" }, { device: SAM })), "Herinnering gezet voor vandaag om tien over tien 's ochtends: bel mama.")
+      assert.strictEqual(spoken(yield* kit.tool("reminders_set", { text: "x", when: "morgen" }, { device: SAM })), "Hoe laat?")
+      assert.strictEqual(spoken(yield* kit.tool("reminders_set", { text: "x", when: "gisteren om vijf uur" }, { device: SAM })), "Dat moment is al voorbij.")
+      assert.strictEqual(spoken(yield* kit.tool("reminders_set", { text: "x", when: "ooit" }, { device: SAM })), "Wanneer moet ik je herinneren? Ik begreep niet wanneer.")
+      assert.strictEqual(spoken(yield* kit.tool("reminders_set", { text: "wachtwoord 123456", when: "over een uur" }, { device: SAM })), "Ik bewaar geen codes of wachtwoorden in herinneringen.")
+      assert.strictEqual(spoken(yield* kit.tool("reminders_set", { text: "x", when: "over een uur", scope: "me" }, { device: HALL })), "Van wie is de herinnering? Ik weet hier niet wie het vraagt.")
+      const rep = spoken(yield* kit.tool("reminders_set", { text: "vuilnis", when: "elke maandag om zeven uur 's avonds", scope: "household" }, { device: SAM }))
       assert.include(rep, "Terugkerende herinnering voor het huishouden, elke maandag")
-      const list = JSON.parse((yield* kit.tool("reminders_list", {}, { device: SAM })).content.split("\n")[0]!)
-      assert.strictEqual(list.covers, "die van jou en van het huishouden")
-      assert.strictEqual(say(yield* kit.tool("reminders_cancel", { which: "ooit" }, { device: SAM })), "Ik heb geen herinnering met ooit.")
-      assert.strictEqual(say(yield* kit.tool("reminders_change", { which: "mama" }, { device: SAM })), "Wat moet ik veranderen: de woorden of de tijd?")
+      assert.strictEqual(forModel(yield* kit.tool("reminders_list", {}, { device: SAM })).covers, "die van jou en van het huishouden")
+      assert.strictEqual(spoken(yield* kit.tool("reminders_cancel", { which: "ooit" }, { device: SAM })), "Ik heb geen herinnering met ooit.")
+      assert.strictEqual(spoken(yield* kit.tool("reminders_change", { which: "mama" }, { device: SAM })), "Wat moet ik veranderen: de woorden of de tijd?")
+      const skip = spoken(yield* kit.tool("reminders_done", { which: "vuilnis" }, { device: SAM }))
+      assert.match(skip, /^Klaar: ik sla die van .* over\. De volgende is .*\.$/)
       yield* kit.advance(11 * MIN)
       const [n] = yield* kit.notify.all
       assert.strictEqual(n?.title, "Herinnering")
       assert.deepStrictEqual(n?.actions.map((a) => a.label), ["Klaar", "Uitstellen"])
       assert.deepStrictEqual(yield* kit.notify.press(n!.id, "snooze", { device: SAM }), { ok: true, say: "Ik herinner je er over 10 minuten weer aan." })
       yield* kit.advance(11 * MIN)
-      const second = (yield* kit.notify.all).find((x) => x.state === "open")!
+      const second = (yield* openNotes(kit))[0]!
       assert.deepStrictEqual(yield* kit.notify.press(second.id, "done", { device: SAM }), { ok: true, say: "Klaar." })
-      assert.strictEqual(say(yield* kit.tool("reminders_done", { which: "mama" }, { device: SAM })), "Ik heb geen herinnering met mama.")
-      assert.strictEqual(say(yield* kit.tool("reminders_cancel", { which: "vuilnis" }, { device: SAM })), "Geannuleerd: vuilnis.")
+      assert.strictEqual(spoken(yield* kit.tool("reminders_done", { which: "mama" }, { device: SAM })), "Ik heb geen herinnering met mama.")
+      assert.strictEqual(spoken(yield* kit.tool("reminders_cancel", { which: "vuilnis" }, { device: SAM })), "Geannuleerd: vuilnis.")
       assert.deepStrictEqual((yield* kit.tool("reminders_list", {}, { device: SAM })).value, { spoken: "Je hebt geen herinneringen." })
     }))
 
-  it.effect("the card and the failures in Dutch", () =>
+  it.effect("the card, a change while it rings, a cleanup still owed and the failures in Dutch", () =>
     Effect.gen(function*() {
       const faults = nofaults()
       const kit = yield* startTestModule(faulty(faults), nl)
@@ -876,8 +752,11 @@ describe("Dutch", () => {
       yield* kit.present.settle
       const [card] = kit.present.shown(SAM)
       assert.strictEqual(card?.content.kind === "card" ? card.content.title : "", "Herinnering")
+      assert.strictEqual(spoken(yield* kit.tool("reminders_change", { which: "mama", text: "bel papa" }, { device: SAM })), "Veranderd: bel papa. Hij gaat nu opnieuw af met de nieuwe woorden.")
+      yield* kit.advance(1_000)
+      faults.resolveFails = 1
+      assert.strictEqual(spoken(yield* kit.tool("reminders_cancel", { which: "papa" }, { device: SAM })), "Geannuleerd: bel papa. De melding wordt nog weggehaald; ik blijf het proberen.")
       faults.storeReads = true
-      const failed = yield* kit.tool("reminders_list", {}, { device: SAM })
-      assert.include(failed.content, "Ik kon de herinneringen niet lezen.")
+      assert.include((yield* kit.tool("reminders_list", {}, { device: SAM })).content, "Ik kon de herinneringen niet lezen.")
     }))
 })
