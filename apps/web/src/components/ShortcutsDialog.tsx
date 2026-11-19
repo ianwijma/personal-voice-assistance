@@ -1,6 +1,5 @@
 "use client"
 import { useRef } from "react"
-import { NotificationCards } from "./NotificationCards.tsx"
 import { useClient, useClientState, usePrefs } from "./context.tsx"
 import { SHORTCUTS } from "./shortcuts.ts"
 import { PanelHeader, useDialog } from "./ui/Panel.tsx"
@@ -16,21 +15,21 @@ export function ShortcutsDialog() {
   const open = useClientState((s) => s.ui.shortcutsOpen)
   const ref = useRef<HTMLDivElement>(null)
   const close = () => client.store.dispatch({ type: "local/ui", patch: { shortcutsOpen: false } })
-  useDialog(ref, open, close)
+  useDialog(ref, open, close, undefined, { extraFocus: "#voice-notifications" })
   if (!open) return null
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-bg/60 p-4" onClick={close}>
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-bg/60 p-4 pt-[var(--pva-notifications-space,88px)]" onClick={close}>
       <div
         ref={ref}
         role="dialog"
         aria-modal="true"
+        aria-owns="voice-notifications"
         aria-labelledby="shortcuts-title"
         data-testid="help-dialog"
         onClick={(e) => e.stopPropagation()}
-        className="flex max-h-[calc(100dvh-32px)] w-full max-w-[420px] flex-col overflow-hidden rounded-lg border border-line bg-surface shadow-panel animate-[pva-rise_200ms_var(--ease-out)]"
+        className="flex max-h-[calc(100dvh-var(--pva-notifications-space,88px)-32px)] w-full max-w-[420px] flex-col overflow-hidden rounded-lg border border-line bg-surface shadow-panel animate-[pva-rise_200ms_var(--ease-out)]"
       >
         <PanelHeader title="Help" titleId="shortcuts-title" onClose={close} />
-        <NotificationCards inPanel />
         <div className="min-h-0 flex-1 overflow-y-auto scrollbar-quiet">
           <ShortcutList />
           <div className="border-t border-line px-5 py-4">

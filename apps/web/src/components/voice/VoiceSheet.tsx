@@ -4,7 +4,6 @@ import { VoiceAudio } from "@/lib/audio/VoiceAudio.ts"
 import { displayPhrase, visualState } from "@/lib/state.ts"
 import { shallowEqual } from "@/lib/store.ts"
 import { defaultAssistantId, reachText } from "@/lib/voiceSetup.ts"
-import { NotificationCards } from "../NotificationCards.tsx"
 import { useClient, useClientState, usePrefs } from "../context.tsx"
 import { inputClass } from "../fields/types.ts"
 import { Icon, Spinner } from "../ui/Icon.tsx"
@@ -28,7 +27,7 @@ export function VoiceSheet() {
   const open = useClientState((s) => s.ui.sheetOpen)
   const ref = useRef<HTMLElement>(null)
   const close = () => client.store.dispatch({ type: "local/ui", patch: { sheetOpen: false } })
-  useDialog(ref, open, close)
+  useDialog(ref, open, close, undefined, { extraFocus: "#voice-notifications" })
   if (!open) return null
   return (
     <>
@@ -37,19 +36,19 @@ export function VoiceSheet() {
         ref={ref}
         role="dialog"
         aria-modal="true"
+        aria-owns="voice-notifications"
         aria-labelledby="sheet-title"
         data-testid="voice-sheet"
         className={cx(
           "fixed z-40 flex flex-col overflow-hidden border-line bg-surface shadow-panel",
-          "inset-x-0 bottom-0 max-h-[88dvh] rounded-t-lg border-t animate-[pva-sheet-up_320ms_var(--ease-out)]",
-          "sm:inset-x-auto sm:bottom-0 sm:right-0 sm:top-0 sm:max-h-none sm:w-[400px] sm:rounded-none sm:border-l sm:border-t-0 sm:animate-[pva-slide-in_320ms_var(--ease-out)]"
+          "inset-x-0 bottom-0 max-h-[min(88dvh,calc(100dvh-var(--pva-notifications-space,88px)))] rounded-t-lg border-t animate-[pva-sheet-up_320ms_var(--ease-out)]",
+          "sm:inset-x-auto sm:bottom-0 sm:right-0 sm:top-[var(--pva-notifications-space,88px)] sm:max-h-none sm:w-[400px] sm:rounded-none sm:border-l sm:border-t-0 sm:animate-[pva-slide-in_320ms_var(--ease-out)]"
         )}
       >
         <div className="mx-auto mt-2 h-1 w-10 shrink-0 rounded-full bg-line sm:hidden" aria-hidden="true" />
         <div className="pt-[env(safe-area-inset-top)] max-sm:pt-0">
           <PanelHeader title="Settings" titleId="sheet-title" onClose={close} />
         </div>
-        <NotificationCards inPanel />
         <div className="min-h-0 flex-1 overflow-y-auto overscroll-contain px-5 pb-[max(20px,env(safe-area-inset-bottom))] pt-5 scrollbar-quiet">
           <SheetBody />
         </div>

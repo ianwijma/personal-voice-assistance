@@ -4,7 +4,6 @@ import { useEffect, useLayoutEffect, useRef, useState } from "react"
 import { formatRemaining, remainingMs } from "@/lib/countdown.ts"
 import { type HeldPresentation, pageClock } from "@/lib/state.ts"
 import { useClient, useClientState } from "./context.tsx"
-import { NotificationCards } from "./NotificationCards.tsx"
 import { cx } from "./ui/controls.tsx"
 
 /**
@@ -14,18 +13,16 @@ import { cx } from "./ui/controls.tsx"
  * box, its canvas and the focus it is given are exactly as before:
  * the stage only adds bottom padding to the page's scroll area (`--pva-present-h`) so captions can scroll clear of it.
  *
- * It holds the notification cards first (P9, unchanged: `NotificationCards`), then the presentations, a transient one
- * first, then the pinned ones. Open page menus and dialogs hide ordinary presentations and render notification cards
- * inside their own surface instead. Every word the host shows comes from the server in the household's language
+ * It holds presentations, a transient one first, then the pinned ones. Open page menus and dialogs hide them;
+ * notifications have their own fixed region above those surfaces. Every word the host shows comes from the server in the household's language
  * (`texts`); every text of a presentation passed the server's page boundary and is put on the page as text, never as
  * markup. An image is only ever `/media/<token>`, the server's copy.
  */
 export function PresentationStage({ obscured = false }: { readonly obscured?: boolean }) {
-  const shownCards = useClientState((s) => s.notifications.some((c) => c.show))
   const items = useClientState((s) => s.presentations)
   const chatOpen = useClientState((s) => s.ui.chatOpen)
   const inner = useRef<HTMLDivElement>(null)
-  const empty = !shownCards && items.length === 0
+  const empty = items.length === 0
   // The stage's scroll area keeps the region's height clear at its bottom (captions scroll above it).
   useLayoutEffect(() => {
     const root = typeof document === "undefined" ? undefined : document.documentElement
@@ -59,8 +56,6 @@ export function PresentationStage({ obscured = false }: { readonly obscured?: bo
         ref={inner}
         className="pointer-events-auto flex max-h-[max(160px,min(42dvh,calc(100dvh-540px)))] w-full max-w-[420px] flex-col gap-2 overflow-y-auto overscroll-contain scrollbar-quiet pt-1"
       >
-        {/* An open menu or dialog owns these controls, including its keyboard scope. */}
-        {!obscured ? <NotificationCards /> : null}
         {ordered.length > 0
           ? (
             <section

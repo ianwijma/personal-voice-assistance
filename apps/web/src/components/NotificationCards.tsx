@@ -1,31 +1,26 @@
 "use client"
 import { type ClientState, ringingCard } from "@/lib/state.ts"
 import { useClient, useClientState } from "./context.tsx"
-import { useActivePageMenu } from "./voice/PageMenus.tsx"
 import { cx } from "./ui/controls.tsx"
 
 /**
  * P9: the notification cards of this device (docs/NOTIFICATIONS.md "The voice page"): a plain card per notification the
  * server says to show, with its title, its text and its buttons (`stop` first). Every word on it comes from the server,
- * in the household's language (the card's `texts` and labels). Since P10 it is drawn first in the presentation stage
- * (`PresentationStage.tsx`), or inside the open page menu or dialog so its keyboard scope includes Stop. These regions scroll within
- * the viewport (every Stop reachable, long text wrapped), so every character keeps drawing exactly as before
- * (docs/CHARACTERS.md). A press goes to the server (`notification.action`):
- * Stop is always usable, a module action disables only its own button while it is pending, and an answer that comes
- * after the card is gone is ignored. Pending actions and replies live with the held notification across placements;
- * every region reserves a button-height strip, with the actions first, and the draft yields space inside chat.
+ * in the household's language (the card's `texts` and labels). The voice shell gives them a fixed, scrollable strip
+ * above menus and dialogs, reserved even while empty. Rings never move existing controls or enter an open menu.
+ * Stop is always usable, a module action disables only its own button while pending, and an answer after withdrawal
+ * is ignored. Pending actions and replies live with the held notification across chat and dialog changes.
  */
-export function NotificationCards({ inPanel = false, menu }: { readonly inPanel?: boolean; readonly menu?: string }) {
-  const activeMenu = useActivePageMenu()
+export function NotificationCards() {
   const cards = useClientState((s) => s.notifications)
   const audioOn = useClientState((s) => s.audio.phase === "running")
   const shown = cards.filter((c) => c.show)
-  if (shown.length === 0 || activeMenu !== menu) return null
+  if (shown.length === 0) return null
   return (
     <section
       aria-label={shown[0]!.texts.region}
       data-testid="notification-cards"
-      className={cx("flex max-h-[max(160px,min(42dvh,calc(100dvh-540px)))] min-h-[72px] w-full flex-col items-center gap-2 overflow-y-auto overscroll-contain", inPanel ? "shrink" : "shrink-0")}
+      className="flex h-full max-h-full w-full flex-col items-center gap-2 overflow-y-auto overscroll-contain"
     >
       {shown.map((card) => <Card key={card.id} card={card} audioOn={audioOn} />)}
     </section>
@@ -38,7 +33,7 @@ function Card({ card, audioOn }: { readonly card: ClientState["notifications"][n
     if (actionId !== "stop" && card.pendingActions?.some((p) => p.actionId === actionId)) return
     const press = { actionId }
     client.store.dispatch({ type: "local/notification-pressed", id: card.id, press })
-    // The exact pending request belongs to this holding, even if chat moves its component. After withdrawal its
+    // The exact pending request belongs to this holding, across chat and dialog changes. After withdrawal its
     // completion is ignored, including when the server has shown the same notification id again in the meantime.
     void client.request({ type: "notification.action", id: card.id, actionId }).then((r) => {
       client.store.dispatch({ type: "local/notification-answered", id: card.id, press, answer: { say: r.say ?? (r.ok ? undefined : r.error?.message) } })

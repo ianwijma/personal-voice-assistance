@@ -1,6 +1,5 @@
 "use client"
 import { type ReactNode, useEffect, useId, useRef, useState } from "react"
-import { NotificationCards } from "../NotificationCards.tsx"
 import { usePageMenu } from "./PageMenus.tsx"
 import { Icon } from "../ui/Icon.tsx"
 import { cx } from "../ui/controls.tsx"
@@ -45,7 +44,7 @@ export function PopMenu({
   readonly children: ReactNode
 }) {
   const [open, setOpen] = useState(false)
-  const menuId = usePageMenu(open, setOpen)
+  usePageMenu(open, setOpen)
   const wrap = useRef<HTMLDivElement>(null)
   const trigger = useRef<HTMLButtonElement>(null)
   const menu = useRef<HTMLDivElement>(null)
@@ -93,7 +92,7 @@ export function PopMenu({
     else if (e.key === "ArrowUp") go(i - 1)
     else if (e.key === "Home") go(0)
     else if (e.key === "End") go(all.length - 1)
-    else if (e.key === "Tab" && !wrap.current?.querySelector("[data-testid=notification-cards]")) close(true)
+    else if (e.key === "Tab") close(true)
   }
 
   return (
@@ -130,7 +129,6 @@ export function PopMenu({
             menuClass
           )}
         >
-          <NotificationCards inPanel menu={menuId} />
           <div role="menu" aria-label={menuLabel} className="min-h-0 overflow-y-auto">
             {items.map((item) => (
               <div key={item.value}>

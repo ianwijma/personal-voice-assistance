@@ -83,9 +83,13 @@ for (const keyboard of [false, true]) {
     const send = page.getByTestId("send")
     await expect(send).toBeEnabled()
     await send.click({ trial: true })
+    const panelBefore = await page.getByTestId("chat-panel").boundingBox()
+    const sendBefore = await send.boundingBox()
     await mock.send([serverExamples["notification.ring"]])
     const stop = page.getByRole("button", { name: "Stop", exact: true })
     await expect(stop).toBeVisible()
+    expect(await page.getByTestId("chat-panel").boundingBox()).toEqual(panelBefore)
+    expect(await send.boundingBox()).toEqual(sendBefore)
     // Wait out the notification's entrance animation and the textarea's resize layout.
     await page.getByTestId("notification-card").evaluate(async (el) => { await Promise.all(el.getAnimations().map((a) => a.finished)) })
     await expect.poll(async () => send.evaluate((el) => {
@@ -292,14 +296,14 @@ test("r6: the conversation menu keeps Stop above a phone keyboard without cleari
   expect((await mock.log()).messages.filter((m) => m.type === "text.send")).toHaveLength(0)
 })
 
-test("r6: resizing past the phone More menu returns Stop to the visible stage", async ({ page, baseURL }) => {
+test("r6: resizing past the phone More menu keeps Stop in the fixed notification region", async ({ page, baseURL }) => {
   await page.setViewportSize({ width: 375, height: 667 })
   await page.emulateMedia({ reducedMotion: "reduce" })
   await page.goto(appUrl(baseURL))
   await expect(page.getByTestId("start")).toBeVisible()
   await page.getByTestId("dock-more").click()
   await mock.send([serverExamples["notification.ring"]])
-  await expect(page.getByTestId("dock-menu").getByRole("button", { name: "Stop", exact: true })).toBeVisible()
+  await expect(page.getByTestId("voice-notifications").getByRole("button", { name: "Stop", exact: true })).toBeVisible()
   await page.setViewportSize({ width: 1280, height: 700 })
   await expect(page.getByTestId("dock-menu")).toHaveCount(0)
   const stop = page.getByRole("button", { name: "Stop", exact: true })
@@ -308,3 +312,76 @@ test("r6: resizing past the phone More menu returns Stop to the visible stage", 
   await stop.click()
   await expect.poll(async () => (await mock.log()).messages.filter((m) => m.type === "notification.action" && m.actionId === "stop").length).toBe(1)
 })
+
+for (const surface of ["assistant", "more", "conversation"] as const) {
+  test(`r7 b1: a ring never replaces the aimed-at ${surface} menu item`, async ({ page, baseURL }, info) => {
+    await mock.device({ assistants: [{ assistant: "jeff", phrases: [] }, { assistant: "t3", phrases: ["hey t3"] }], withoutPhrase: { mode: "assistant", assistant: "jeff" } })
+    await page.setViewportSize({ width: 375, height: 667 })
+    await page.emulateMedia({ reducedMotion: "reduce" })
+    await page.goto(appUrl(baseURL))
+    await expect(page.getByTestId("start")).toBeVisible()
+    if (surface === "conversation") await ui(page, { chatOpen: true })
+    await page.getByTestId(surface === "assistant" ? "assistant-menu-button" : surface === "more" ? "dock-more" : "conversation-switcher").click()
+    const menu = page.getByTestId(surface === "assistant" ? "assistant-menu-button-menu" : surface === "more" ? "dock-menu" : "conversation-switcher-menu")
+    const item = surface === "more" ? page.getByTestId("dock-new-conversation") : surface === "assistant" ? page.getByTestId("assistant-jeff") : menu.getByRole("menuitemradio").last()
+    // Save the stable target after the menu (and its containing chat sheet) has finished opening.
+    await menu.evaluate(async (el) => { await Promise.all(el.getAnimations({ subtree: true }).map((a) => a.finished)) })
+    if (surface === "conversation") await page.getByTestId("chat-panel").evaluate(async (el) => { await Promise.all(el.getAnimations().map((a) => a.finished)) })
+    const before = await item.boundingBox()
+    const menuBefore = await menu.boundingBox()
+    const labels = await menu.getByRole(surface === "more" ? "menuitem" : "menuitemradio").allTextContents()
+    const request = surface === "assistant" ? "device.pick" : surface === "more" ? "conversation.new" : "conversation.read"
+    const countBefore = (await mock.log()).messages.filter((m) => m.type === request).length
+    if (before === null) throw new Error("Menu item has no box")
+    await page.screenshot({ path: info.outputPath(`${surface}-before-ring.png`) })
+    await mock.send([serverExamples["notification.ring"]])
+    await expect(page.getByRole("button", { name: "Stop", exact: true })).toHaveCount(1)
+    await expect(menu).toBeVisible()
+    expect(await menu.boundingBox()).toEqual(menuBefore)
+    expect(await item.boundingBox()).toEqual(before)
+    expect(await menu.getByRole(surface === "more" ? "menuitem" : "menuitemradio").allTextContents()).toEqual(labels)
+    await expect(menu.getByTestId("notification-cards")).toHaveCount(0)
+    await expect.poll(() => page.getByRole("button", { name: "Stop", exact: true }).evaluate(tappable)).toBe(true)
+    await page.screenshot({ path: info.outputPath(`${surface}-after-ring.png`) })
+    // Removing and re-showing a ring must preserve the same menu and tap target too.
+    await mock.send([{ type: "notification.resolved", id: serverExamples["notification.ring"].notification.id, outcome: "stop" }])
+    await expect(page.getByTestId("notification-card")).toHaveCount(0)
+    expect(await item.boundingBox()).toEqual(before)
+    await mock.send([serverExamples["notification.ring"]])
+    await expect(page.getByTestId("notification-card")).toHaveCount(1)
+    expect(await menu.boundingBox()).toEqual(menuBefore)
+    expect(await item.boundingBox()).toEqual(before)
+    // Press the originally aimed-at coordinates, not a locator that follows a moved item.
+    await page.mouse.click(before.x + before.width / 2, before.y + before.height / 2)
+    await expect.poll(async () => (await mock.log()).messages.filter((m) => m.type === request).length).toBe(countBefore + 1)
+    expect((await mock.log()).messages.filter((m) => m.type === "notification.action")).toHaveLength(0)
+  })
+}
+
+
+for (const modal of ["sheetOpen", "shortcutsOpen"] as const) {
+  test(`r7 b1: ${modal} includes the fixed ring in its keyboard scope while chat is covered`, async ({ page, baseURL }) => {
+    await page.setViewportSize({ width: 375, height: 667 })
+    await page.emulateMedia({ reducedMotion: "reduce" })
+    await page.goto(appUrl(baseURL))
+    await expect(page.getByTestId("start")).toBeVisible()
+    await ui(page, { chatOpen: true })
+    await page.locator("#chat-input").fill("Keep this draft")
+    await ui(page, { [modal]: true })
+    const dialog = page.getByTestId(modal === "sheetOpen" ? "voice-sheet" : "help-dialog")
+    await expect(dialog).toBeVisible()
+    await dialog.evaluate(async (el) => { await Promise.all(el.getAnimations().map((a) => a.finished)) })
+    const before = await dialog.boundingBox()
+    await mock.send([serverExamples["notification.ring"]])
+    const stop = page.getByRole("button", { name: "Stop", exact: true })
+    await expect(stop).toHaveCount(1)
+    expect(await dialog.boundingBox()).toEqual(before)
+    for (let i = 0; i < 25 && !(await stop.evaluate((el) => el === document.activeElement)); i++) await page.keyboard.press("Tab")
+    await expect(stop).toBeFocused()
+    await expect.poll(() => stop.evaluate(tappable)).toBe(true)
+    await page.keyboard.press("Enter")
+    await expect.poll(async () => (await mock.log()).messages.filter((m) => m.type === "notification.action" && m.actionId === "stop").length).toBe(1)
+    await expect(dialog).toBeVisible()
+    await expect(page.locator("#chat-input")).toHaveValue("Keep this draft")
+  })
+}

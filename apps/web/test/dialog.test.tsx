@@ -117,3 +117,27 @@ describe("dialog focus (review round 3)", () => {
     expect(v.getByTestId("behind").inert).not.toBe(true)
   })
 })
+
+
+it("r7 b1: modal Tab includes arriving fixed notification controls without moving them inside the dialog", () => {
+  function Host({ ring }: { readonly ring: boolean }) {
+    const ref = useRef<HTMLDivElement>(null)
+    useDialog(ref, true, () => undefined, undefined, { extraFocus: "#fixed-notifications" })
+    return <>
+      <div id="fixed-notifications">{ring && <><button data-testid="stop">Stop</button><button disabled>Snooze</button></>}</div>
+      <div ref={ref}><button data-testid="first">First</button><button data-testid="last">Last</button></div>
+    </>
+  }
+  const v = render(<Host ring={false} />)
+  v.getByTestId("last").focus()
+  v.rerender(<Host ring />)
+  expect(document.activeElement).toBe(v.getByTestId("last"))
+  fireEvent.keyDown(document.activeElement!, { key: "Tab" })
+  expect(document.activeElement).toBe(v.getByTestId("stop"))
+  fireEvent.keyDown(document.activeElement!, { key: "Tab" })
+  expect(document.activeElement).toBe(v.getByTestId("first"))
+  fireEvent.keyDown(document.activeElement!, { key: "Tab", shiftKey: true })
+  expect(document.activeElement).toBe(v.getByTestId("stop"))
+  fireEvent.keyDown(document.activeElement!, { key: "Tab", shiftKey: true })
+  expect(document.activeElement).toBe(v.getByTestId("last"))
+})

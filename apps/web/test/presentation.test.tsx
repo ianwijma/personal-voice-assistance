@@ -2,7 +2,7 @@
 // sends (show, update, dismiss; emptied at a welcome and when the session ends), one renderer per kind with every word
 // the host shows from the server, both themes and both languages, ticks and buttons sent as present.action with the
 // answer shown while it is held, a countdown to the server's instant on a page whose clock is off, long and many, the
-// notification cards first in the same stage, and the page's declaration of the kinds.
+// notification cards separate from the presentation stage, and the page's declaration of the kinds.
 import { act, cleanup, fireEvent, render, screen } from "@testing-library/react"
 import { afterEach, describe, expect, it, vi } from "vitest"
 import { MAX_PRESENTATIONS_PER_PAGE, PRESENT_KIND_VERSIONS, type PresentationWire, type ServerMessage } from "@pva/protocol"
@@ -232,8 +232,8 @@ describe("a page without its server", () => {
   })
 })
 
-describe("long and many, and the notification cards in the same stage", () => {
-  it("many long presentations and cards stay in one region that scrolls within the viewport; long text wraps; the cards come first", () => {
+describe("long and many, with notifications in their own fixed region", () => {
+  it("many long presentations scroll within the viewport; long text wraps; rings do not enter the stage", () => {
     const longCard = (i: number): PresentationWire => wire(`c${i}`, { kind: "card", title: "T".repeat(60), text: "x".repeat(300), facts: Array.from({ length: 6 }, () => ({ label: "L".repeat(30), value: "V".repeat(60) })) }, { shownAt: i })
     const ring: ServerMessage = { ...serverExamples["notification.ring"], notification: { ...serverExamples["notification.ring"].notification, id: "n1" } }
     mount(run([ring, ...Array.from({ length: MAX_PRESENTATIONS_PER_PAGE }, (_, i) => show(longCard(i)))]))
@@ -242,9 +242,8 @@ describe("long and many, and the notification cards in the same stage", () => {
     expect(scroller.className).toContain("overflow-y-auto")
     expect(scroller.className).toMatch(/max-h-/)
     expect(screen.getAllByTestId("presentation")).toHaveLength(MAX_PRESENTATIONS_PER_PAGE)
-    // The notification cards first, then the presentations.
-    const order = [...scroller.querySelectorAll("[data-testid=notification-card],[data-testid=presentation]")].map((e) => e.getAttribute("data-testid"))
-    expect(order[0]).toBe("notification-card")
+    // A ring must not change this stage's size or move presentations underneath an aimed-at pointer.
+    expect(screen.queryByTestId("notification-card")).toBeNull()
     expect(screen.getAllByRole("heading").every((h) => h.className.includes("overflow-wrap:anywhere"))).toBe(true)
   })
 
@@ -257,7 +256,7 @@ describe("long and many, and the notification cards in the same stage", () => {
     expect(screen.getAllByTestId("presentation").map((e) => e.getAttribute("data-lifetime"))).toEqual(["transient", "pinned", "pinned"])
     expect(screen.getAllByRole("heading").map((h) => h.textContent)).toEqual(["Now", "Older", "Newer"])
     cleanup()
-    mount(initialState)
+    mount(run([serverExamples["notification.ring"]]))
     expect(screen.queryByTestId("present-stage")).toBeNull()
   })
 })

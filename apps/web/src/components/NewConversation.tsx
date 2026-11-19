@@ -3,7 +3,6 @@ import { useEffect, useRef, useState } from "react"
 import { nameOf, newConversationTip, newConversationToast, viewedId } from "@/lib/voiceSetup.ts"
 import { useClient, useClientState } from "./context.tsx"
 import { useMediaQuery } from "./useMediaQuery.ts"
-import { NotificationCards } from "./NotificationCards.tsx"
 import { usePageMenu } from "./voice/PageMenus.tsx"
 import { Icon, Spinner } from "./ui/Icon.tsx"
 import { cx } from "./ui/controls.tsx"
@@ -60,7 +59,7 @@ export function DockOverflow({ className }: { readonly className: string }) {
   const menuText = useClientState((s) => ((s.setup?.assistants.length ?? 0) > 1 ? `New conversation with ${nameOf(s, viewedId(s))}` : "New conversation"))
   const [open, setOpen] = useState(false)
   const phone = !useMediaQuery("(min-width: 640px)")
-  const menuId = usePageMenu(open && phone, setOpen)
+  usePageMenu(open && phone, setOpen)
   const wrap = useRef<HTMLDivElement>(null)
   const trigger = useRef<HTMLButtonElement>(null)
   const item = useRef<HTMLButtonElement>(null)
@@ -107,11 +106,10 @@ export function DockOverflow({ className }: { readonly className: string }) {
         <div
           data-testid="dock-menu"
           onKeyDown={(e) => {
-            if (e.key === "Tab" && !wrap.current?.querySelector("[data-testid=notification-cards]")) setOpen(false)
+            if (e.key === "Tab") setOpen(false)
           }}
           className="absolute bottom-full right-0 mb-3 flex max-h-[calc(100dvh-128px)] w-max min-w-48 max-w-[calc(100vw-32px)] flex-col overflow-hidden rounded-lg border border-line bg-surface p-1 shadow-panel animate-[pva-rise_160ms_var(--ease-out)]"
         >
-          <NotificationCards inPanel menu={menuId} />
           <div role="menu" aria-label="More" className="min-h-0 overflow-y-auto">
             <button
               ref={item}

@@ -81,7 +81,10 @@ it("r4 b2: narrow chat includes exactly one ringing Stop in its modal focus scop
   act(() => store.dispatch({ type: "local/ui", patch: { chatOpen: true } }))
   act(() => store.dispatch(serverExamples["notification.ring"]))
   const stop = screen.getByRole("button", { name: /^Stop$/ })
-  expect(screen.getByTestId("chat-panel").contains(stop)).toBe(true)
+  expect(screen.getByTestId("chat-panel").getAttribute("aria-owns")).toBe("voice-notifications")
+  expect(screen.getByTestId("voice-notifications").contains(stop)).toBe(true)
+  expect(screen.getByTestId("chat-panel").contains(stop)).toBe(false)
+  expect(stop.closest("[inert]")).toBeNull()
   expect(screen.getAllByTestId("notification-cards")).toHaveLength(1)
 })
 
