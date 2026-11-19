@@ -89,6 +89,8 @@ describe("the ringing window", () => {
     const kit = yield* startTestModule(egg.definition)
     yield* kit.phrases.say("boil an egg", { device: "kitchen-display" })
     assert.strictEqual(kit.notify.engine.ringingOn("kitchen-display").length, 1)
+    // Its answer ("Egg timer for 6 minutes.") was spoken there: the window opens once its echo tail is over.
+    yield* kit.advance(ECHO_TAIL_MS)
     return { egg, kit }
   })
 
