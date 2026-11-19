@@ -4,13 +4,14 @@
 import { assert, describe, it } from "@effect/vitest"
 import { type KnownDevice, PresentError, StoreError, type StoreTx } from "@pva/core"
 import { startTestModule, type TestDevice } from "@pva/core/testing"
-import { Clock, Effect } from "effect"
+import { Clock, Deferred, Effect, Fiber } from "effect"
 import { vi } from "vitest"
 import { MEMBERS_MS, PIN_MS, retryIn } from "../src/checklist.ts"
 import { pins } from "../src/data.ts"
 import { listsModule } from "../src/index.ts"
 
 vi.setConfig({ testTimeout: 30_000 })
+const HOUR_MS = 3_600_000
 
 const DEVICES: ReadonlyArray<TestDevice> = [
   { id: "kitchen-display", name: "Kitchen display", room: "Kitchen", privacy: "shared", defaultPerson: "p-sam" },
@@ -289,5 +290,136 @@ describe("a live pin until its actual end (finding 7)", () => {
       yield* kit.present.settle
       assert.deepStrictEqual(kit.present.shown("kitchen-display"), [])
       assert.deepStrictEqual(yield* pinRows(kit), [])
+    }))
+})
+
+// Review round 2 (reports/modules/follow-lists-r2.md): the row is written before the screen is touched, and a new
+// signal is never erased by an older lookup.
+describe("review round 2", () => {
+  it.effect("a first show is owed before it is shown: interrupted right after the host accepted it, a restart finishes it and the checklist follows its list and closes", () =>
+    Effect.gen(function*() {
+      const accepted = yield* Deferred.make<void>()
+      let interruptNext = true
+      const kit = yield* startTestModule(withShared((ctx) => ({
+        ...ctx,
+        present: {
+          ...ctx.present,
+          show: (...args: ReadonlyArray<unknown>) =>
+            ctx.present.show(...args).pipe(Effect.tap(() =>
+              Effect.gen(function*() {
+                if (!interruptNext) return
+                interruptNext = false
+                yield* Deferred.succeed(accepted, undefined)
+                yield* Effect.never
+              })
+            ))
+        }
+      })), { household: HOUSEHOLD })
+      yield* kit.action("add", { items: "milk" })
+      const pending = yield* Effect.forkScoped(kit.action("show", {}, { device: "kitchen-display" }))
+      yield* Deferred.await(accepted)
+      yield* Fiber.interrupt(pending)
+      yield* kit.present.settle
+      // On the screen, and a row that says a show is owed.
+      assert.deepStrictEqual(textsOn(kit, "kitchen-display"), ["milk"])
+      assert.deepStrictEqual((yield* pinRows(kit)).map((r) => [r.value.device, r.value.owed]), [["kitchen-display", "show"]])
+      yield* kit.restart
+      yield* kit.present.settle
+      assert.deepStrictEqual((yield* pinRows(kit)).map((r) => [r.value.device, r.value.owed]), [["kitchen-display", undefined]])
+      yield* kit.action("add", { items: "eggs" })
+      yield* kit.present.settle
+      assert.deepStrictEqual(textsOn(kit, "kitchen-display"), ["milk", "eggs"])
+      assert.deepStrictEqual(yield* kit.action("hide", {}, { device: "kitchen-display" }), { ok: true, say: "Closed what I showed on this screen." })
+      yield* kit.present.settle
+      assert.deepStrictEqual(kit.present.shown("kitchen-display"), [])
+    }))
+
+  it.effect("a new change signal is not erased by a lookup of pins that was already under way", () =>
+    Effect.gen(function*() {
+      const readDone = yield* Deferred.make<void>()
+      const release = yield* Deferred.make<void>()
+      let pauseNext = false
+      const kit = yield* startTestModule(withShared((ctx) => ({
+        ...ctx,
+        store: {
+          ...ctx.store,
+          collection: (c: { readonly name: string }) => {
+            const inner = ctx.store.collection(c)
+            if (c.name !== "pins") return inner
+            return {
+              ...inner,
+              list: (query: { readonly where?: { readonly list?: string } }) =>
+                inner.list(query).pipe(Effect.flatMap((rows: ReadonlyArray<unknown>) =>
+                  Effect.gen(function*() {
+                    if (pauseNext && query.where?.list === "shopping" && rows.length === 0) {
+                      pauseNext = false
+                      yield* Deferred.succeed(readDone, undefined)
+                      yield* Deferred.await(release)
+                    }
+                    return rows
+                  })
+                ))
+            }
+          }
+        }
+      })), { household: HOUSEHOLD })
+      yield* kit.present.settle
+      pauseNext = true
+      yield* kit.action("add", { items: "milk" }, { device: "hall-screen" })
+      yield* Deferred.await(readDone)
+      yield* kit.action("show", {}, { device: "kitchen-display" })
+      yield* kit.action("add", { items: "eggs" }, { device: "hall-screen" })
+      yield* Deferred.succeed(release, undefined)
+      yield* kit.present.settle
+      assert.deepStrictEqual(textsOn(kit, "kitchen-display"), ["milk", "eggs"])
+    }))
+
+  it.effect("a changed content is recorded before it is shown: a failed write after the show does not renew the end at the retry", () =>
+    Effect.gen(function*() {
+      const refuse = { on: false }
+      const kit = yield* startTestModule(withShared((ctx) => ({
+        ...ctx,
+        store: {
+          ...ctx.store,
+          transaction: (body: (tx: StoreTx) => unknown) =>
+            ctx.store.transaction((tx: StoreTx) =>
+              body({
+                ...tx,
+                collection: (c) => {
+                  const h = tx.collection(c)
+                  return c.name !== "pins" ? h : {
+                    ...h,
+                    // Only the write that clears the owed work (the one after the show) is refused.
+                    update: (id: string, f: (v: any) => any, ...rest: Array<any>) => {
+                      const cur = h.get(id)
+                      if (refuse.on && cur !== undefined && f(cur.value).owed === undefined) {
+                        refuse.on = false
+                        throw new StoreError({ reason: "busy", message: "injected write after the show" })
+                      }
+                      return (h.update as any)(id, f, ...rest)
+                    }
+                  }
+                }
+              })
+            )
+        }
+      })), { household: HOUSEHOLD })
+      yield* kit.action("show", {}, { device: "kitchen-display" })
+      yield* kit.present.settle
+      yield* kit.advance(HOUR_MS)
+      refuse.on = true
+      yield* kit.action("add", { items: "milk" })
+      yield* kit.present.settle
+      const changedAt = yield* Clock.currentTimeMillis
+      assert.deepStrictEqual(textsOn(kit, "kitchen-display"), ["milk"])
+      assert.strictEqual(endOn(kit, "kitchen-display"), changedAt + PIN_MS)
+      assert.strictEqual((yield* pinRows(kit))[0]!.value.until, changedAt + PIN_MS)
+      yield* kit.advance(retryIn(1))
+      yield* kit.present.settle
+      // The retry is the same content: the end did not move, and the owed show is cleared.
+      assert.strictEqual(endOn(kit, "kitchen-display"), changedAt + PIN_MS)
+      const row = (yield* pinRows(kit))[0]!.value
+      assert.strictEqual(row.until, changedAt + PIN_MS)
+      assert.strictEqual(row.owed, undefined)
     }))
 })

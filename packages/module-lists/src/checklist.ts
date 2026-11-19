@@ -255,17 +255,26 @@ export const makeChecklists = (ctx: {
         const changed = pin.shown !== shown
         if (!changed && pin.owed === undefined && handles.has(device)) return { next: pin.until, down: false }
         const until = changed ? now + PIN_MS : pin.until
-        if (until - now < PRESENT_MIN_EXPIRY_MS) return { next: pin.until, down: false }
+        if (!changed && until - now < PRESENT_MIN_EXPIRY_MS) return { next: pin.until, down: false }
+        // The row first: a changed content is recorded (new signature, new end, `show` owed) before the screen is touched,
+        // so a failed write after a successful show cannot make the retry look like another change.
+        let current: Row<Pin> = row
+        if (changed) {
+          const recorded: Pin = { device, list: pin.list, key: pin.key, until, shown, owed: "show", next: now + retryIn(1) }
+          yield* write(recorded)
+          current = { ...row, value: recorded }
+        }
         const r = yield* put(device, pin.key, built, until - now)
-        if (r.kind === "error") return { next: yield* owe(row, "show", now, { shown, until }), down: false }
+        if (r.kind === "error") return { next: yield* owe(current, "show", now), down: false }
         if (r.kind === "cannot") {
           yield* Effect.ignore(r.handle.dismiss)
           dismissed.add(device)
           handles.delete(device)
-          return yield* removeRow(row, now, true)
+          return yield* removeRow(current, now, true)
         }
         handles.set(device, r.handle)
-        if (changed || pin.owed !== undefined) yield* write({ device, list: pin.list, key: pin.key, until, shown })
+        // Owed work done: cleared without touching the end.
+        if (current.value.owed !== undefined) yield* write({ device, list: pin.list, key: pin.key, until, shown })
         return { next: until, down: false }
       })
 
@@ -325,19 +334,25 @@ export const makeChecklists = (ctx: {
       for (const [d, t] of due) if (t <= now || removedDevice(d)) asked.add(d)
       if (lookups(now)) {
         lookupAt = undefined
+        // A signal is consumed before its lookup starts (and put back when the lookup fails): a signal that arrives
+        // while the lookup is paused is a new one, which the lookup in progress cannot clear.
         if (askedAll) {
+          askedAll = false
           const all = yield* Effect.exit(devicesOf(undefined))
-          if (Exit.isSuccess(all)) {
-            askedAll = false
-            for (const d of all.value) asked.add(d)
-          } else lookupAt = now + retryIn(1)
+          if (Exit.isSuccess(all)) for (const d of all.value) asked.add(d)
+          else {
+            askedAll = true
+            lookupAt = now + retryIn(1)
+          }
         }
         for (const list of [...askedLists]) {
+          askedLists.delete(list)
           const found = yield* Effect.exit(devicesOf(list))
-          if (Exit.isSuccess(found)) {
-            askedLists.delete(list)
-            for (const d of found.value) asked.add(d)
-          } else lookupAt = now + retryIn(1)
+          if (Exit.isSuccess(found)) for (const d of found.value) asked.add(d)
+          else {
+            askedLists.add(list)
+            lookupAt = now + retryIn(1)
+          }
         }
       }
       for (const d of [...asked]) {
@@ -409,31 +424,43 @@ export const makeChecklists = (ctx: {
           const built = yield* build(list, l, readItems)
           if (built === undefined) return { kind: "gone" } as const
           const key = pinKeyOf(device)
+          // The row first, with what is wanted and `show` owed, in one write; only then the screen. An interruption or a
+          // restart in between leaves a row that reconciliation finishes: a checklist is never on a screen without a row.
+          const until = now + PIN_MS
+          const shown = hashOf(built, l)
+          const recorded: Pin = { device, list, key, until, shown, owed: "show", next: now + retryIn(1) }
+          const kept = yield* Effect.exit(write(recorded))
+          if (Exit.isFailure(kept)) return { kind: "failed" } as const
           const r = yield* put(device, key, built, PIN_MS)
-          if (r.kind === "error") return r.reason === "limit" ? ({ kind: "limit" } as const) : ({ kind: "failed" } as const)
+          if (r.kind === "error") {
+            // Refused, so the screen is as it was: the row goes back to what it was (none: removed), or is tried again later.
+            const back = yield* Effect.exit(engine.rawStore.transaction((tx) => {
+              const c = tx.collection(pins)
+              const id = pinIdOf(device)
+              if (before === undefined) c.remove(id)
+              else c.update(id, () => before.value)
+            }))
+            if (Exit.isFailure(back)) {
+              due.set(device, now + retryIn(1))
+              poke()
+            }
+            return r.reason === "limit" ? ({ kind: "limit" } as const) : ({ kind: "failed" } as const)
+          }
           const spoken = built.presentation.spoken
           if (r.kind === "cannot") {
             // Nothing is kept for a device that cannot show a checklist (an earlier one under its key is gone with it).
             yield* Effect.ignore(r.handle.dismiss)
             handles.delete(device)
-            if (before !== undefined) {
-              dismissed.add(device)
-              ask(device)
-            }
+            dismissed.add(device)
+            ask(device)
             return { kind: "not-shown", spoken, why: r.why } as const
-          }
-          const kept = yield* Effect.exit(write({ device, list, key, until: now + PIN_MS, shown: hashOf(built, l) }))
-          if (Exit.isFailure(kept)) {
-            // Not kept, so not shown: an earlier checklist of the device is put back by its own row.
-            yield* Effect.ignore(r.handle.dismiss)
-            handles.delete(device)
-            if (before !== undefined) ask(device)
-            return { kind: "failed" } as const
           }
           handles.set(device, r.handle)
           dismissed.delete(device)
           failures.delete(device)
-          due.set(device, now + PIN_MS)
+          // Done: the owed show is cleared. A failure here leaves it owed; the next reconcile shows it again and clears it.
+          const cleared = yield* Effect.exit(write({ device, list, key, until, shown }))
+          due.set(device, Exit.isSuccess(cleared) ? until : now + retryIn(1))
           poke()
           const b = before?.value
           const replaced = b !== undefined && b.list !== list && b.owed !== "dismiss" && b.owed !== "remove" && now < b.until ? b.list : undefined
