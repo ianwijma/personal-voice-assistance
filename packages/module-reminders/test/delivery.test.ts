@@ -10,7 +10,9 @@ import {
   type Kit, allRows, DAY, faulty, forModel, gather, H, jobOf, liveJobs, MIN, nofaults, openNotes, ring, ROBIN, rowByText, SAM, spoken, theRow
 } from "./helpers.ts"
 
-vi.setConfig({ testTimeout: 60_000 })
+// The tests that move the clock by months take 37 s alone on a 16-core machine (every simulated hour runs the host's
+// hourly jobs) and passed 60 s on the two-core CI machine.
+vi.setConfig({ testTimeout: 180_000 })
 
 /** 18 November 2026, the kit's day; Amsterdam is UTC+1 then. */
 const at = (iso: string) => Date.parse(iso)
