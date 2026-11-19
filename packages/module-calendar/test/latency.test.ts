@@ -5,7 +5,7 @@
 // the reviewer's refresh inputs also in the kit, as the module runs there.
 import { join } from "node:path"
 import { assert, describe, it } from "@effect/vitest"
-import type { ModuleHostApi } from "@pva/core"
+import { type ModuleHostApi, presentationProblem, type Presentation } from "@pva/core"
 import { makeOfflineNet, offThreadWorkers } from "@pva/core/testing"
 import { Effect } from "effect"
 import { TestClock } from "effect/testing"
@@ -18,7 +18,7 @@ import { ICS_MAX_BYTES, LIMITS } from "../src/provider.ts"
 import { makeReader } from "../src/read.ts"
 import { makeRefresh } from "../src/refresh.ts"
 import { makeTools } from "../src/tools.ts"
-import { advanceAndRefresh, AMS, calendar, FAMILY, familyOnly, heartbeat, ics, served, startCalendar } from "./fixtures.ts"
+import { advanceAndRefresh, answerOf, AMS, calendar, FAMILY, familyOnly, heartbeat, ics, served, startCalendar } from "./fixtures.ts"
 
 const bench = (line: string) => {
   if (process.env.CALENDAR_BENCH === "1") process.stderr.write(`${line}\n`)
@@ -122,13 +122,43 @@ describe("calendar: the main thread while a turn reads the calendars, on SQLite 
       for (let run = 0; run < 4; run++) {
         for (const [name, effect] of cases) {
           const { value, longest } = yield* heartbeat(effect)
-          if (name.startsWith("calendar_agenda")) assert.strictEqual((value as { more: number }).more, 2_800 - 12)
+          if (name.startsWith("calendar_agenda")) assert.strictEqual((value as { forModel: { more: number } }).forModel.more, 2_800 - 12)
           if (name.startsWith("calendar_next")) assert.include((value as { spoken: string }).spoken, "I found nothing called Never up to")
           worst.set(name, [...(worst.get(name) ?? []), longest])
         }
       }
       for (const [name, times] of worst) bench(`calendar (SQLite, turn): ${name}: longest stop ${times.map((t) => t.toFixed(1)).join(", ")} ms`)
       for (const [name, times] of worst) for (const t of times) assert.isBelow(t, bound(10), `${name} held the main thread ${t.toFixed(1)} ms`)
+    })), 120_000)
+})
+
+describe("calendar: the answer with its presentation", () => {
+  const crowded = ics(Array.from({ length: 2_800 }, (_, i) => {
+    const d = new Date(Date.UTC(2026, 10, 19 + (i % 14)))
+    const ymd = `${d.getUTCFullYear()}${String(d.getUTCMonth() + 1).padStart(2, "0")}${String(d.getUTCDate()).padStart(2, "0")}`
+    return { uid: String(i), summary: "😀".repeat(50), start: `${ymd}T090000Z`, end: `${ymd}T093000Z` }
+  }))
+
+  it.effect("the agenda over 14 days, its list built and checked as the Presenter checks it: no stop over the bound, the list at its bound", () =>
+    Effect.scoped(Effect.gen(function*() {
+      const { refresh, tools } = yield* onSqlite(() => crowded)
+      yield* refresh.run({ kind: "job", jobId: "test" }, true)
+      const agenda = tools.find((t) => t.name === "calendar_agenda")!
+      const worst: Array<number> = []
+      let last: { forModel: { more: number }; present: Presentation } | undefined
+      for (let run = 0; run < 4; run++) {
+        const { value, longest } = yield* heartbeat(agenda.execute({ day: "tomorrow", days: 14 } as never) as Effect.Effect<unknown, unknown, never>)
+        last = value as typeof last
+        assert.strictEqual(last!.forModel.more, 2_800 - 12)
+        worst.push(longest)
+      }
+      bench(`calendar (SQLite, turn): calendar_agenda over 14 days with its list: longest stop ${worst.map((t) => t.toFixed(1)).join(", ")} ms`)
+      for (const t of worst) assert.isBelow(t, bound(10), `the agenda with its list held the main thread ${t.toFixed(1)} ms`)
+      const p = last!.present
+      assert.isUndefined(presentationProblem(p, Date.UTC(2026, 10, 18, 9, 0)))
+      assert.strictEqual(p.kind === "list" ? p.items.length : 0, 12)
+      assert.strictEqual(p.kind === "list" ? p.items.at(-1)?.text : "", "and 2789 more")
+      assert.isAtMost(p.spoken.length, 300)
     })), 120_000)
 })
 
@@ -207,7 +237,7 @@ describe("calendar: the main thread while a calendar is read (finding 1)", () =>
       bench(`calendar: impossible rule ${state.error ?? `read, ${state.unreadable} unreadable`} after ${took.toFixed(0)} ms, longest stop ${run.longest.toFixed(1)} ms`)
       // The library never returns from the rule: the worker is ended at the time limit, the last generation stays.
       assert.strictEqual(state.error, "too-slow")
-      const today = (yield* kit.tool("calendar_agenda", {})).value as { stale?: string }
+      const today = (yield* answerOf(kit, "calendar_agenda", {})).value as { stale?: string }
       assert.deepStrictEqual(eventsOf(today), ["Dentist two o'clock"])
       assert.include(today.stale!, "could not be refreshed")
       // Two tries (the job's one retry), each ended at its limit.

@@ -202,6 +202,54 @@ that are never found 1.2 to 2.4 ms, a search 1.7 to 4.0 ms, free time 1.0 to 1.7
 yields between pages); the tests fail above 10 ms (30 ms on CI). The worker's own start-up
 (docs/MODULES.md §15) is paid on its thread, once per calendar per refresh.
 
+## On a screen
+
+Two things are returned with the answer to be shown on the screen of the device that asked, when it has one
+(docs/PRESENTING.md): `calendar_agenda` and `calendar_next` for "me" return `{ forModel, present }`, the action
+`calendar.my_next` returns `{ say, present }`. `forModel` and `say` are exactly the result and the sentence the module
+always gave. The tools and the action stay `speculative` (they may run before their turn is committed): nothing in them
+calls `ctx.present` or remembers a handle, and the Presenter shows what they return only when the turn is promoted and
+drops it when the turn is discarded (a discarded turn shows nothing and withdraws nothing). Both are transient (30 seconds, the newest of a
+device takes its place).
+
+| What | Returned by | Example |
+|---|---|---|
+| A **list** (`list`, bullets) of the agenda: a line per event in the tool's order ("Standup at half past nine"; with several days, "tomorrow: Bins out, all day"), "and N more" for the events the list does not show, the answer's notes as lines. An answer with nothing in it is an empty list titled "Friday: nothing on the calendar." (or "… on Sam's calendar."), so an earlier list does not stay | `calendar_agenda` (the model asks it for "what do we have this weekend?", "what's on Friday?") | "What do we have this weekend?" |
+| A **card** (`card`): the event as the title, with "When" as a fact, and the notes as its text; with nothing coming up, "My next appointment" and the sentence that says so. The tool's card also has "Where" and "Calendar" (its result has them); the action's has only what its sentence says | "My next appointment": the action `calendar.my_next`, and `calendar_next` for "me" without words. Not for the household's next event, a named event, a busy time, a question ("Whose calendar?") or a refusal | "When is my next appointment?", "wat is mijn volgende afspraak" |
+
+The typed actions "what's on today" and "what's on tomorrow" show nothing yet (they speak at most five events and three
+busy times; a list of them would show more than they said).
+
+**The same decision as the answer.** Only what the asking turn may see is built into either, and a screen has no reduced
+form: a title only of an event shown in full, and for everything else only an anonymous count. Where the answer reduces
+another member's event to busy time ("Robin is busy from two o'clock to three o'clock") the list says "1 event of someone
+else is not shown here." and names nobody (in what is shown and in `spoken`); withheld personal events are counted the
+same way ("Personal events not shown here: 2."). A presentation with a member's events is marked as that member's: the
+Presenter asks `Privacy.mayReveal` for the device again each time it would show it, and withdraws it where the answer is
+no. An answer about one person's calendar ("Sam's Friday", "my next appointment") is that person's also when it holds no
+event. A list holds one member's events at most (the request's person, else the first member whose event the answer
+shows); another member's events on a private device are counted in the same line, not listed. A list of the household's
+events and counts only is household-level.
+
+**The same notes.** What the answer says beside its events (`coverage`) is on the screen as short lines built from it, in
+its order, naming no calendar: "Not refreshed since today at ten o'clock.", "Some events could not be read: 1.", "Some
+calendars have not been read yet.", "Read in part; there may be more.", "Some go on after Friday.", the withheld count.
+"and 19 more" is the total minus what the list shows (the filtered members' events are in their own line), and "and at
+least 190 more" when the scan was cut.
+
+**Bounds.** Whole lines are chosen before anything is drawn: at most twelve lines, the notes keep their places and the
+events share the rest with "and N more"; a title is cut at a code point boundary inside the limit (80 characters a line,
+60 a title, 60 a fact, 300 a text) and marked with "…"; notes that do not fit a card or the spoken text are kept whole or
+replaced by "There are more notes; ask me aloud.". Every presentation has a spoken text (at most 300 characters), a
+sentence: "Today: Bins out at eleven o'clock.", "Today: A and B.", "Today: A, B, C and 3 more." (as many events as fit,
+with the true total), or the sentence that says nothing is on, then the notes.
+
+**When it goes away.** A list or card is a snapshot of its answer. It ends by its 30 seconds or is replaced by the next
+presentation on that device (an empty answer is one too). Nothing the module does later takes it down: a refresh that
+changes the calendars does not, and nothing here follows the data after the answer.
+
+Nothing of this has a button, a tick or a notification, so there is no press handler to register.
+
 ## What it needs
 
 - `requires`: `{ network: "internet" }` (the ICS addresses), with a `health` check.
@@ -213,10 +261,10 @@ yields between pages); the tests fail above 10 ms (30 ms on CI). The worker's ow
 
 ## What was left out
 
-**For wave B** (needs P7, P9 or P10, which do not exist yet):
+**For wave B** (reminders need notifications; the phrase commands need the phrase matcher):
 
 - Reminders before events (the research's reminder planner): notifications, P9.
-- The agenda as a list or a week table on screens, the created-event card: presentations, P10.
+- A week table on screens and the created-event card (there is no calendar to add to): presentations, P10. The agenda as a list and the next appointment as a card are done: see "On a screen".
 - Phrase commands for "what's on today": P7. The typed actions above serve the intent path meanwhile.
 - "And after that?" continuing a read agenda: conversation state of the reading session.
 

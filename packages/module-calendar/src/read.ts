@@ -6,6 +6,7 @@ import { yieldToLoop } from "./answer.ts"
 import { addressOf, type CalendarConfig, type CalendarSettings, type OwnerOf, ownerOf } from "./config.ts"
 import { WINDOW_DAYS } from "./refresh.ts"
 import { allStates, batchOf, linkPrint, type Occurrence, occurrences, ownerKey, ROWS_PAGE, type SourceState, sources } from "./store.ts"
+import { cutPoints } from "./text.ts"
 import { texts } from "./texts.ts"
 import { dateOf, dateOfDayNumber, dayNumber, daysBetween, homeZone, type LocalDate, parseIsoDate, wallTimeOf } from "./time.ts"
 
@@ -54,6 +55,9 @@ export const isSpoken = (u: unknown): u is Spoken => typeof u === "object" && u 
 const ALL_WORDS = new Set(["everyone", "everybody", "all", "anyone", "iedereen", "allemaal", "alle"])
 const HOUSEHOLD_WORDS = new Set(["household", "family", "home", "the family", "the household", "huishouden", "gezin", "familie", "het gezin", "de familie", "het huishouden"])
 const ME_WORDS = new Set(["me", "my", "mine", "myself", "i", "ik", "mij", "mijn", "mezelf"])
+
+/** Whether `who` says the asking person ("me", "mijn"). */
+export const isMe = (who: string | undefined): boolean => who !== undefined && ME_WORDS.has(who.trim().toLowerCase())
 
 export const capital = (s: string) => (s.length === 0 ? s : s[0]!.toUpperCase() + s.slice(1))
 
@@ -300,7 +304,8 @@ export const makeReader = (env: ReadEnv) => {
       const at = dateOf(isEnd ? instant - 1 : instant, m.zone)
       return daysBetween(at, d) === 0 ? timeOf(instant) : momentWords(instant)
     }
-    const titleOf = (r: Row<Occurrence>, max = 120) => (r.value.title === "" ? say(texts, m.lang, "untitled") : r.value.title.slice(0, max))
+    /** The title as said, cut at a code point boundary inside `max`; `mark`: a cut title ends in "…" (on a screen). */
+    const titleOf = (r: Row<Occurrence>, max = 120, mark = false) => (r.value.title === "" ? say(texts, m.lang, "untitled") : cutPoints(r.value.title, max, mark))
     const calendarOf = (r: Row<Occurrence>) => calOf(r)?.name ?? r.value.source
 
     /** The local days an occurrence covers, first and last. */
@@ -340,8 +345,8 @@ export const makeReader = (env: ReadEnv) => {
     }
 
     /** An event as a spoken item on day `d`: "standup at half past nine", "trip, all day from Saturday to Monday". */
-    const item = (d: LocalDate, r: Row<Occurrence>, max = 120) => {
-      const title = titleOf(r, max)
+    const item = (d: LocalDate, r: Row<Occurrence>, max = 120, mark = false) => {
+      const title = titleOf(r, max, mark)
       const v = r.value
       const { first, last } = span(r)
       const beyond = beyondDay(r)
@@ -352,6 +357,29 @@ export const makeReader = (env: ReadEnv) => {
       if (beyond !== undefined) return say(texts, m.lang, "fromAfter", { title, from: momentWords(v.start), day: dayWords(beyond) })
       if (daysBetween(first, last) === 0 && daysBetween(first, d) === 0) return say(texts, m.lang, "at", { title, time: timeOf(v.start) })
       return say(texts, m.lang, "fromUntil", { title, from: onDay(v.start, d), to: onDay(v.end, d, true) })
+    }
+
+    /**
+     * The notes of an answer as short lines for a screen, one for each note `coverage` gives for the same arguments and in
+     * the same order (it asks `coverage`, so a note added there is never left off a screen): no calendar is named (a
+     * personal one may not be shown here), counts are the counts the answer has.
+     */
+    const screenNotes = (covered: ReadonlyArray<Cal>, extra: { readonly cut?: boolean; readonly withheld?: number; readonly continuesAfter?: LocalDate } = {}): Array<string> => {
+      const n = coverage(covered, extra)
+      const out: Array<string> = []
+      if (n.withheld !== undefined) out.push(say(texts, m.lang, "screenWithheld", { count: extra.withheld! }))
+      if (n.stale !== undefined) {
+        const oldest = Math.min(...covered.filter((c) => c.usable && c.state?.error !== undefined).map((c) => c.state!.okAt ?? c.state!.triedAt))
+        out.push(say(texts, m.lang, "screenStale", { time: momentWords(oldest) }))
+      }
+      if (n.notRead !== undefined) out.push(say(texts, m.lang, "screenNotRead"))
+      if (n.incomplete !== undefined) {
+        const count = covered.filter((c) => c.usable && (c.state?.unreadable ?? 0) > 0).reduce((k, c) => k + (c.state?.unreadable ?? 0), 0)
+        out.push(say(texts, m.lang, "screenIncomplete", { count }))
+      }
+      if (n.cut !== undefined) out.push(say(texts, m.lang, "screenCut"))
+      if (n.continues !== undefined) out.push(say(texts, m.lang, "screenContinues", { day: dayWords(extra.continuesAfter!) }))
+      return out
     }
 
     /** A list as it is said, its true total counted: "a, b, c, d and 196 more". */
@@ -374,6 +402,7 @@ export const makeReader = (env: ReadEnv) => {
       relevant,
       precheck,
       coverage,
+      screenNotes,
       unsearched,
       beyondDay,
       timeOf,

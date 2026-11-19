@@ -298,3 +298,24 @@ export const allFixtures: OfflineFixtures = {
   "https://cal.example.org/sam.ics": served(SAM),
   "https://cal.example.org/robin.ics": served(ROBIN)
 }
+
+/**
+ * A tool's answer for the model as the module's tests have always read it. `calendar_agenda` (and `calendar_next` for
+ * "me") now return `{ forModel, present }`: the kit's content is then the unchanged answer followed by the note of what the
+ * server decided about the screen, `[Screen: …]`. This takes the note off and reads the answer as before (`value`); the
+ * presentation itself is asserted in screen.test.ts.
+ */
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+export const answerOf = (kit: { readonly tool: (name: string, input: unknown, as?: any) => Effect.Effect<any, any, any> }, name: string, input: unknown, as?: unknown) =>
+  Effect.map(kit.tool(name, input, as), (r: { readonly ok: boolean; readonly content: string; readonly value: unknown }) => {
+    const at = r.content.lastIndexOf("\n[Screen: ")
+    if (at < 0 || !r.content.endsWith("]")) return r
+    const content = r.content.slice(0, at)
+    let value: unknown = content
+    try {
+      value = JSON.parse(content)
+    } catch {
+      // Plain text.
+    }
+    return { ...r, content, value }
+  })
