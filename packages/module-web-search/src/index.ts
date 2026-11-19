@@ -1,4 +1,4 @@
-import { ActionError, defineAction, defineModule, makeTool, offThread, offThreadTask, Setting, ToolError, type ModuleDefinition, type Setting as SettingOf } from "@pva/core"
+import { ActionError, CurrentTurn, defineAction, defineModule, makeTool, offThread, offThreadTask, Setting, ToolError, type ModuleDefinition, type PresentHandle, type Setting as SettingOf } from "@pva/core"
 import { speakNumber } from "@pva/language"
 import { homeLanguage, isLine, say, StoredText } from "@pva/module-contracts"
 import { type Connector, type ContentTypePolicy, nodeConnector, nodeResolver, type Resolver, safeFetch, userAgent } from "@pva/net"
@@ -6,12 +6,14 @@ import { Clock, Effect, Schema } from "effect"
 import { blockEntry, canonicalHost, hostOf, isBlocked, siteOf } from "./clean.ts"
 import { charsetOf, PAGE_MAX_BYTES, PAGE_TASK_MEMORY_MB, PAGE_TASK_RESULT_BYTES, PAGE_TASK_TIMEOUT_MS } from "./page.ts"
 import { makeBrave, makeSearxng, type NetDeps, type RawResult, type Recency, type SafeSearch, SearchError, type SearchProvider } from "./providers.ts"
+import { sourcesList } from "./sources.ts"
 import { texts } from "./texts.ts"
 import { bump, dayKey, reserve, summarize, usage, zoneOf } from "./usage.ts"
 
 export { blockEntry, canonicalHost, hostOf } from "./clean.ts"
 export { cleanText, makeBrave, makeSearxng, MAX_RESULTS, toResults } from "./providers.ts"
 export type { NetDeps, RawResult, SearchProvider } from "./providers.ts"
+export { cutText, sourceLine, sourcesList, spokenSources } from "./sources.ts"
 export { texts } from "./texts.ts"
 export { usage } from "./usage.ts"
 
@@ -245,6 +247,36 @@ export const webSearchModule = (deps: NetDeps = {}) =>
         const home = () => ctx.host.view().home
         const day = (now: number) => dayKey(now, zoneOf(home()))
 
+        // The list of sources each device was last shown (in memory: a transient presentation does not outlive this run, so
+        // nothing is kept across a restart). A newer answer replaces it, and an answer without sources takes it down.
+        const shown = new Map<string, PresentHandle>()
+        const PERSON = /^[a-z0-9][a-z0-9_-]{0,39}$/
+        const withdraw = (device: string) =>
+          Effect.gen(function*() {
+            const handle = shown.get(device)
+            if (handle === undefined) return
+            shown.delete(device)
+            yield* handle.dismiss
+          }).pipe(Effect.ignore, Effect.catchDefect(() => Effect.void))
+        /** The sources of this answer on the device that asked: a failure of any kind never touches the answer. */
+        const showSources = (answer: { readonly results: ReadonlyArray<RawResult> } | undefined) =>
+          Effect.gen(function*() {
+            const turn = yield* CurrentTurn
+            const device = turn?.deviceId
+            if (device === undefined) return
+            // What is on that screen no longer applies: it is withdrawn whatever the new answer is (the next show also replaces it).
+            yield* withdraw(device)
+            if (answer === undefined) return
+            // A person's search is that person's: the screen is decided for them like any personal content (a public screen shows
+            // nothing of it). Nobody identified: the household's, as the spoken answer is.
+            const owner = turn?.person?.id !== undefined && PERSON.test(turn.person.id) ? turn.person.id : undefined
+            const list = sourcesList(answer.results, lang(), owner)
+            if (list === undefined) return
+            const handle = yield* ctx.present.show("origin", list, { lifetime: "transient" })
+            if (shown.size >= 64) shown.delete(shown.keys().next().value!)
+            shown.set(device, handle)
+          }).pipe(Effect.ignore, Effect.catchDefect(() => Effect.void))
+
         const search = makeTool({
           name: "web_search",
           description:
@@ -261,7 +293,14 @@ export const webSearchModule = (deps: NetDeps = {}) =>
           speculative: !paidPossible,
           risk: "read",
           latency: "slow",
-          execute: ({ query, recency, count, site }) =>
+          execute: (input) =>
+            searchAnswer(input).pipe(
+              Effect.tap((answer) => showSources("results" in answer ? answer : undefined)),
+              Effect.tapError(() => showSources(undefined))
+            )
+        })
+
+        const searchAnswer = ({ query, recency, count, site }: { readonly query: string; readonly recency?: Recency; readonly count?: number; readonly site?: string }) =>
             Effect.gen(function*() {
               const language = lang()
               const chain = chainOf(cfg, home())
@@ -299,7 +338,6 @@ export const webSearchModule = (deps: NetDeps = {}) =>
               if (failure !== undefined) return yield* new ToolError({ message: failureText(language, failure) })
               return yield* new ToolError({ message: say(texts, language, capped === "monthly" ? "monthlyCap" : "dailyCap") })
             })
-        })
 
         const readPage = makeTool({
           name: "read_page",

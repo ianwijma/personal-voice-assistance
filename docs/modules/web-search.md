@@ -72,7 +72,7 @@ named, never an address read out). The module is **off by default**.
 | `web_search` | `query` (2–200 characters, one line), `recency?` (`day`, `week`, `month`, `year`), `count?` (1–5, default from settings), `site?` (a domain) | `read` (speculative only when no paid provider can answer) | `{ notice, results: [{ n, title, site, snippet, url, published? }], provider }`, or a `spoken` "I found nothing for that." |
 | `read_page` | `url`, `focus?` (what to look for) | `read` (never speculative: it fetches an address a model chose) | `{ notice, title, site, text, truncated }` |
 
-Example phrases (the model decides which tool; there is no phrase-command path): "who won the Dutch Grand Prix this
+Example phrases (the model decides which tool; there is no phrase-command path, and a phrase would add nothing to a search): "who won the Dutch Grand Prix this
 year?" → `web_search`; "is the A12 still closed this weekend?" → `web_search` with `recency: "week"`; "what does that
 article say?" → `read_page` on result 1. "Wie won de Grand Prix van Nederland?" works the same; every sentence the module
 itself speaks (errors, caps, refusals) is in English and Dutch by `HOME_LANGUAGE`.
@@ -87,6 +87,37 @@ Dutch.
 | Action | Examples | Says |
 |---|---|---|
 | `web-search.usage` | "how many searches have I used", "how much web search budget is left", "hoeveel zoekopdrachten heb ik gebruikt" | "Today 3 of 100 searches are used. This month 41 searches, and the paid ones cost about 0.2 of the 5 dollars allowed." Numbers are worded by `@pva/language` (`speakNumber`: "0,2" in Dutch); a spend under half a cent is "less than 0.01" |
+
+## Sources on screen
+
+After a search that found something, the **sources** are shown with the answer on the screen of the device that asked,
+when it has one: a transient `list` (bullets, no ticks, no buttons) titled "Sources" ("Bronnen"), one line per source,
+**title, a dash and the site's name** ("Dutch GP report — nos.nl"), at most the number of results the tool returned (1 to
+5). It is made by the module from the results it already returned (no second request), and nothing else goes on the screen:
+never a snippet, a date or an address. A title that is itself an address (`https://…`, `www.…`, a host with a path) is
+replaced by the site's name alone. Every text is plain: markup is removed, every line is one line of at most 80
+characters and cut at a code point boundary (an emoji at the cut is never split; the site's name is cut to 40 characters
+first so a long title keeps room).
+
+- **Where.** On the asking device only (`ctx.present.show("origin", …)`); a device without a screen, or whose page does not
+  draw lists, shows nothing, and the answer is exactly the same as without this (the tool's result is not changed: no
+  note, no extra field). Showing is the Presenter's work and costs the answer one synchronous write.
+- **Privacy.** The same rule as for any personal content, decided at the moment of showing for the device that would show
+  it (`Privacy.mayReveal`): when the turn knows who is asking, the list belongs to that person (`sensitivity: { personal }`),
+  so a public screen, or a shared one that is not that person's, shows nothing of it (the spoken answer is still given);
+  when nobody is identified it is the household's, like the answer. The module stores nothing of it; the Presenter's
+  own record of a live list (the titles and sites, with its owner) lives for at most 30 seconds and is removed shortly
+  after it ends.
+- **Lifetime.** Transient: it ends by itself after 30 seconds, and a device shows one at a time, so a newer answer on that
+  device replaces it. It is taken down at once when the next search on that device finds nothing, fails or is refused
+  (an old list never stays beside a different answer); the module keeps each device's handle in memory only, so after a
+  restart (which also removes transient presentations) there is nothing to take down. Another device's list is never touched.
+- **Fallback.** The list's `spoken` text, for where nothing can be shown, is "The sources are: nos.nl, bbc.com." ("De
+  bronnen zijn: nos.nl, bbc.com."), whole site names only, with "and two more" ("en nog twee") when they do not all fit in
+  300 characters.
+
+Example: "who won the Dutch Grand Prix?" on the kitchen display: the answer is spoken, and a "Sources" list with the sites of
+the results stays beside the character for half a minute.
 
 ## Settings
 
@@ -114,7 +145,9 @@ button is the network check).
 Counters only. No query text, no result and no page is stored anywhere; no person or device is named in a row (every write
 names the module as its actor, so the store's "last written by" is not whoever searched). A row holds a month, a day, the
 provider's name and numbers, and its id is the month and the provider (`2026-11:brave`), so nothing a search could be
-recovered from (tested with a provider whose answer repeats a personal query). A query does leave the house: the
+recovered from (tested with a provider whose answer repeats a personal query). The one exception is not the module's data:
+the list of sources on screen (above) is a transient presentation the Presenter keeps in its own collection, with its
+owner, while it is live (at most 30 seconds, removed shortly after). A query does leave the house: the
 provider sees it, with the server's address.
 
 | Collection | Scope | `maxChars` | Indexes | Rows a list reads | Holds |
@@ -137,8 +170,9 @@ one bounded read of at most 12 of the oldest rows through the `month` index, tho
 
 Left out for wave B (needs something that does not exist yet):
 
-- **Sources on screen** and **`search_sources`**: the `list` presentation of the sources and the QR hand-off (P10), and
-  sending the sources to a phone (P9 notifications). The `url` in each result is there for the model, which never reads it out.
+- **`search_sources`** as a tool of its own, the QR hand-off (P10) and sending the sources to a phone (P9 notifications).
+  The sources are on screen already (above); the `url` in each result is there for the model, which never reads it out, and
+  no address is shown on a screen.
 - **Spoken filler** ("let me look that up") from the module: `ctx.speech` does not exist. The tool's `latency` is `slow`
   and its instructions line asks the model for a short lead-in.
 
