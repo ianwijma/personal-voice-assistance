@@ -55,7 +55,7 @@ describe("@pva/module-images", () => {
       const r = yield* kit.tool("image_find", { query: "okapi" }, { device: "kitchen-display" })
       assert.isTrue(r.ok)
       const [model, note] = (r.value as string).split("\n")
-      assert.include(note, "[Screen: Shown on \"Kitchen display\".")
+      assert.include(note, "[Screen: Showing on \"Kitchen display\".")
       const told = JSON.parse(model!)
       assert.strictEqual(told.notice, UNTRUSTED_NOTICE)
       assert.deepStrictEqual(told.picture, { title: "Okapi", description: "Giraffid native to the Congo" })
@@ -109,21 +109,21 @@ describe("@pva/module-images", () => {
       assert.strictEqual(url.hash, "")
     }))
 
-  it.effect("a device without a screen: what was found, that it cannot be shown here, nothing shown, and the module itself asks for no image", () =>
+  it.effect("a device without a screen: what was found, that it cannot be shown here, nothing shown, and no image is fetched by anyone", () =>
     Effect.gen(function*() {
       const { kit, net, media } = yield* start(standardWorld, SPEAKER)
       const r = yield* kit.tool("image_find", { query: "okapi" }, { device: "office-speaker" })
       assert.isTrue(r.ok)
       const text = r.value as string
-      assert.include(text, "[Screen: Not shown: \"Office speaker\" has no display; say it instead.]")
+      // The note now carries the sentence to say, word for word the presentation's spoken text.
+      assert.include(text, "[Screen: Not showing it: \"Office speaker\" has no display. Say this instead: I found a picture of Okapi: Giraffid native to the Congo. I can't show it here.]")
       // What the model says: what was found and that it can't be shown here; where it could is the Presenter's note, not a guess.
       assert.include(text, "I found a picture of Okapi: Giraffid native to the Congo. I can't show it here.")
       yield* kit.present.settle
       assert.deepStrictEqual(kit.present.shown("office-speaker"), [])
-      // The module never asks for an image (only the two APIs). Known limit of the Presenter, not asserted here: it still hands
-      // the address to the image cache although nothing shows it (`media.urls`); a test of "no cache fetch" belongs with its repair.
+      // The module never asks for an image (only the two APIs), and the Presenter hands the cache nothing: no page would show it.
       assert.isFalse(hosts(net.requests).includes("upload.wikimedia.org"))
-      void media
+      assert.deepStrictEqual(media.urls, [])
       // In Dutch.
       const dutch = yield* start(standardWorld, { household: { ...SPEAKER.household, ...NL.household } })
       const nl = yield* dutch.kit.tool("image_find", { query: "okapi" }, { device: "office-speaker" })
@@ -135,7 +135,7 @@ describe("@pva/module-images", () => {
       const { kit } = yield* start()
       for (const device of ["kitchen-display", "robins-phone", "hall-screen"]) {
         const r = yield* kit.tool("image_find", { query: "okapi" }, { device })
-        assert.include(r.value as string, "Shown on")
+        assert.include(r.value as string, "Showing on")
         yield* kit.present.settle
         assert.strictEqual(kit.present.shown(device).length, 1, device)
       }
@@ -160,7 +160,7 @@ describe("@pva/module-images", () => {
       // The person says "the bird": the exact name finds the page, and the picture comes.
       assert.deepStrictEqual(v.options.map((o) => o.wiki), ["en", "en", "en"])
       const bird = yield* kit.tool("image_find", { query: "kiwi", page: v.options[0]!.title, wiki: "en" }, { device: "kitchen-display" })
-      assert.include(bird.value as string, "Shown on \"Kitchen display\"")
+      assert.include(bird.value as string, "Showing on \"Kitchen display\"")
       assert.include(bird.value as string, "\"title\":\"Kiwi (bird)\"")
       assert.include(bird.value as string, "Denis Bin, Public domain")
       // In Dutch the question is Dutch.
@@ -459,7 +459,7 @@ describe("@pva/module-images", () => {
       yield* kit.tool("image_find", { query: "okapi" }, { device: "kitchen-display" })
       yield* kit.restart
       const again = yield* kit.tool("image_find", { query: "kiwifruit" }, { device: "kitchen-display" })
-      assert.include(again.value as string, "Shown on \"Kitchen display\"")
+      assert.include(again.value as string, "Showing on \"Kitchen display\"")
       assert.deepStrictEqual(yield* kit.jobs, [])
     }))
 
@@ -498,7 +498,7 @@ describe("@pva/module-images", () => {
         "https://commons.wikimedia.org/w/api.php": (request) => ({ body: fileAnswer([{ title: `File:${request.url.searchParams.get("titles")}` }]) })
       })
       const kit2 = yield* startTestModule(imagesModule({ resolver: inside.resolver, connector: inside.connector }), { media: fakeMedia().media })
-      assert.include(((yield* kit2.tool("image_find", { query: "okapi" }, { device: "kitchen-display" })).value) as string, "Shown on")
+      assert.include(((yield* kit2.tool("image_find", { query: "okapi" }, { device: "kitchen-display" })).value) as string, "Showing on")
     }))
 
   it.effect("[2] a page with no picture is marked as outside text like every other result, in both languages", () =>
@@ -577,7 +577,7 @@ describe("@pva/module-images", () => {
       for (const artist of ["$'".repeat(90), "$& and {licence} and $1 $$ $`", "{who}"]) {
         const { kit } = yield* start({ ...standardWorld, files: { "Okapi2.jpg": { title: "File:Okapi2.jpg", artist, licence: "CC0" } } })
         const r = yield* kit.tool("image_find", { query: "okapi" }, { device: "kitchen-display" })
-        assert.include(r.value as string, "Shown on", artist.slice(0, 10))
+        assert.include(r.value as string, "Showing on", artist.slice(0, 10))
         yield* kit.present.settle
         const [shown] = kit.present.shown("kitchen-display")
         const credit = shown?.content.kind === "image" ? shown.content.credit : ""
@@ -592,7 +592,7 @@ describe("@pva/module-images", () => {
       const name = `${"A".repeat(210)}.jpg`
       const { kit, net } = yield* start({ en: { okapi: [{ ...OKAPI, pageimage: name }] }, files: { [name]: { title: `File:${name}`, artist: "Jane" } } }, { settings: { commonsFallback: false } })
       const r = yield* kit.tool("image_find", { query: "okapi" }, { device: "kitchen-display" })
-      assert.include(r.value as string, "Shown on")
+      assert.include(r.value as string, "Showing on")
       assert.strictEqual(new URL(net.requests[1]!.url).searchParams.get("titles"), `File:${name}`)
       // A name that cannot be used as it is, is not used: no fabricated lookup.
       const bad = yield* start({ en: { okapi: [{ ...OKAPI, pageimage: "A".repeat(256) }] }, files: {} }, { settings: { commonsFallback: false } })
@@ -607,7 +607,7 @@ describe("@pva/module-images", () => {
         const title = `${"a".repeat(at)}\u{1F600}b${"c".repeat(40)}`
         const { kit } = yield* start({ en: { okapi: [{ ...OKAPI, title, description: `${"d".repeat(150)}\u{1F600}\u{1F600}${"e".repeat(30)}` }] }, files: { "Okapi2.jpg": { title: "File:Okapi2.jpg", artist: `${"j".repeat(at + 60)}\u{1F600}\u{1F600}${"k".repeat(90)}` } } })
         const r = yield* kit.tool("image_find", { query: "okapi" }, { device: "kitchen-display" })
-        assert.include(r.value as string, "Shown on", String(at))
+        assert.include(r.value as string, "Showing on", String(at))
         const told = JSON.parse((r.value as string).split("\n")[0]!)
         for (const text of [told.picture.title, told.picture.description, told.credit, told.ifNotShown]) assert.isTrue(wellFormed(text), `${at}: ${text}`)
         yield* kit.present.settle
@@ -633,7 +633,7 @@ describe("@pva/module-images", () => {
         assert.strictEqual(options[0]?.title, longTitle)
         const chosen = yield* kit.tool("image_find", { query: "term", page: options[0]!.title, wiki: options[0]!.wiki }, { device: "kitchen-display" })
         assert.isTrue(chosen.ok, chosen.content)
-        assert.include(chosen.value as string, "Shown on")
+        assert.include(chosen.value as string, "Showing on")
         const last = net.requests.filter((r) => r.url.includes("wikipedia"))
         assert.strictEqual(new URL(last.at(-1)!.url).searchParams.get("titles"), longTitle)
       }
