@@ -273,6 +273,10 @@ interface Hooks {
   gate?: Promise<void> | undefined
   /** The next `notify.resolve` fails: once. */
   failNextResolve?: boolean | undefined
+  /** What the module's live settings say from now on (as the host's latest accepted state would), over its own. */
+  settingsOverride?: Record<string, unknown> | undefined
+  /** What the module's own job row says its state is (a job called off or replaced meanwhile is `cancelled`). */
+  jobState?: "cancelled" | undefined
   failed: number
 }
 
@@ -301,6 +305,14 @@ const hookedOn = (hooks: Hooks, net: ReturnType<typeof makeOfflineNet>): ModuleD
       m.shared!({
         ...ctx,
         store: hookStore(ctx.store, hooks),
+        settingsFor: (assistant) => {
+          const v = ctx.settingsFor(assistant)
+          return hooks.settingsOverride === undefined || v === undefined ? v : { ...v, ...hooks.settingsOverride }
+        },
+        scheduler: {
+          ...ctx.scheduler,
+          get: (id) => (hooks.jobState === undefined ? ctx.scheduler.get(id) : Effect.map(ctx.scheduler.get(id), (row) => (row === undefined ? row : { ...row, state: hooks.jobState! })))
+        },
         notify: {
           ...ctx.notify,
           resolve: (target, outcome) => {
@@ -453,7 +465,52 @@ describe("review: everything is decided at the moment of sending", () => {
     }
   }
 
-  it.effect("the reminder switched off while the handler waits: nothing is sent", () =>
+  /**
+   * The handler waits (on the copy's read) after it read the settings; what the module then sees as its live state changes;
+   * the handler goes on. `change` is what the host's latest accepted state or the job's row would say by then.
+   */
+  const waitingWhile = (change: (hooks: Hooks) => void, net: ReturnType<typeof makeOfflineNet>, run: (kit: Kit) => Effect.Effect<void> = () => Effect.void) =>
+    Effect.gen(function*() {
+      const hooks = newHooks()
+      const kit = yield* hooksKit(hooks, net)
+      const open = gated(hooks)
+      yield* quietTo(kit, atLocal(18, 19, 0))
+      change(hooks)
+      open()
+      yield* advance(kit, 10_000)
+      yield* run(kit)
+      return kit
+    })
+
+  it.effect("the reminder switched off while the handler waits: nothing is sent; the same wait with nothing changed sends (so it was the check)", () =>
+    Effect.gen(function*() {
+      const { net } = switchable()
+      assert.deepStrictEqual(yield* sent(yield* waitingWhile((h) => void (h.settingsOverride = { remindAt: "off" }), net)), [])
+      assert.deepStrictEqual((yield* sent(yield* waitingWhile(() => undefined, net))).map((n) => n.key), ["bin-day:20261119"])
+    }))
+
+  it.effect("the time changed while the handler waits ends that run: nothing is sent; the reminder comes at the new time", () =>
+    Effect.gen(function*() {
+      const { net } = switchable()
+      const kit = yield* waitingWhile((h) => void (h.settingsOverride = { remindAt: "20:00" }), net)
+      assert.deepStrictEqual(yield* sent(kit), [])
+    }))
+
+  it.effect("the link changed while the handler waits: the old link's calendar is not announced", () =>
+    Effect.gen(function*() {
+      const { net } = switchable()
+      const kit = yield* waitingWhile((h) => void (h.settingsOverride = { icsUrl: `${calendarUrl}&other=1` }), net)
+      assert.deepStrictEqual(yield* sent(kit), [])
+    }))
+
+  it.effect("the job called off or replaced while its handler runs (its row is no longer the running one): nothing is sent", () =>
+    Effect.gen(function*() {
+      const { net } = switchable()
+      const kit = yield* waitingWhile((h) => void (h.jobState = "cancelled"), net)
+      assert.deepStrictEqual(yield* sent(kit), [])
+    }))
+
+  it.effect("the real thing: the reminder switched off in the settings while the handler waits sends nothing (the host ends the old run)", () =>
     Effect.gen(function*() {
       const hooks = newHooks()
       const { net } = switchable()
@@ -461,36 +518,6 @@ describe("review: everything is decided at the moment of sending", () => {
       const open = gated(hooks)
       yield* quietTo(kit, atLocal(18, 19, 0))
       yield* kit.configure({ remindAt: "off" })
-      open()
-      yield* advance(kit, 10_000)
-      assert.deepStrictEqual(yield* sent(kit), [])
-    }))
-
-  it.effect("the time changed while the handler waits ends that run: the reminder comes at the new time, once", () =>
-    Effect.gen(function*() {
-      const hooks = newHooks()
-      const { net } = switchable()
-      const kit = yield* hooksKit(hooks, net)
-      const open = gated(hooks)
-      yield* quietTo(kit, atLocal(18, 19, 0))
-      yield* kit.configure({ remindAt: "20:00" })
-      open()
-      yield* advance(kit, 10_000)
-      assert.deepStrictEqual(yield* sent(kit), [])
-      yield* advanceTo(kit, atLocal(18, 20, 1))
-      assert.deepStrictEqual((yield* sent(kit)).map((n) => n.key), ["bin-day:20261119"])
-    }))
-
-  it.effect("the link changed while the handler waits: the old link's calendar is not announced (the new link's calendar has nothing tomorrow)", () =>
-    Effect.gen(function*() {
-      const hooks = newHooks()
-      const net = makeOfflineNet({
-        [calendarPath]: (request: { readonly url: URL }) => ({ body: request.url.searchParams.has("other") ? ics([allDay("r", "20261125", "Restafval")]) : householdCalendar, headers: icsHeaders })
-      })
-      const kit = yield* hooksKit(hooks, net)
-      const open = gated(hooks)
-      yield* quietTo(kit, atLocal(18, 19, 0))
-      yield* kit.configure({ icsUrl: `${calendarUrl}&other=1` })
       open()
       yield* advance(kit, 10_000)
       assert.deepStrictEqual(yield* sent(kit), [])
