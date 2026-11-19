@@ -29,7 +29,7 @@ describe("serve mode's phrase sets (E3)", () => {
           snapshot: () => snapshot as never,
           issues: { set: (_s: string, list: ReadonlyArray<unknown>) => void issues.push(list), all: () => [], subscribe: () => () => undefined } as never,
           gateway: makeExecutionGateway(),
-          pageText: (_m, t) => String(t),
+          pageText: (_m: string, t: unknown) => String(t),
           service: () => undefined,
           subscribe: (l: () => void) => ((listener = l), () => undefined)
         } as never,

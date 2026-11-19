@@ -104,7 +104,7 @@ describe("one settlement for every outcome (E4)", () => {
     Effect.gen(function*() {
       const kit = yield* startTestModule(probe())
       const r = yield* kit.phrases.say("shout it", { interrupting })
-      assert.deepStrictEqual([did(r), said(r)], ["failed", `That didn't work. ${interrupting}`])
+      assert.deepStrictEqual([did(r), said(r), r.taken && r.outcome.why], ["failed", `That didn't work. ${interrupting}`, "its announce threw"])
     }))
 
   it.effect("b6: stop that selected a ring says the reply its own start of speech interrupted again; one that selected the reply does not", () =>
