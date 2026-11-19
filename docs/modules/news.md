@@ -80,9 +80,50 @@ Typed actions (they run without the language model; the model is also offered ea
 
 | Action (tool) | Risk | Says | Examples |
 |---|---|---|---|
-| `news.top` (`news_top`) | read | The newest stories (the headlines setting) as one spoken text, with a sentence when the read was cut or feeds could not be reached, and remembers them as the last list. | "what's the news", "geef me de koppen" |
+| `news.top` (`news_top`) | read | The newest stories (the headlines setting) as one spoken text, with a sentence when the read was cut or feeds could not be reached, and remembers them as the last list. Also a phrase command and a list on the screen (below). | "what's the news", "geef me de koppen" |
 | `news.unsubscribe` (`news_unsubscribe`) | change | As `feed_unsubscribe`. | "unsubscribe from NOS", "zeg NU.nl op" |
 | `news.feeds` (`news_feeds`) | read | "You follow A, B and three more." | "which news feeds do I follow", "welke nieuwsfeeds volg ik" |
+
+**Phrase command.** `news.top` is also a phrase command (docs/PHRASES.md): said after the wake phrase it runs the action
+without the language model, with the same sentences as the typed action. Nothing else of the module has phrases.
+
+| Language | Phrases |
+|---|---|
+| English | "what's the news", "what is the news", "give me the headlines" |
+| Dutch | "wat is het nieuws", "geef me de koppen", "wat zijn de nieuwskoppen" |
+
+Matching is exact on words (case, accents and punctuation do not count): "what's the news today", "the news" and "news"
+are not the command and go on to the assistant. The action's own sentences are reached through the phrase: no feeds,
+"I haven't fetched the news yet", "I couldn't reach your news feeds", nothing new. A repeat of one phrase invocation (the
+same assistant, conversation, turn, device and connection) is answered with its first outcome and reads, remembers and
+shows nothing again; a new invocation acts again. The memory is in this run of the module and holds the newest 64.
+
+**The list on the screen.** Whenever `news.top` tells stories (by phrase, or by the intent agent), the headlines that were
+read out are also shown on the screen of the device that asked, as a transient `list` titled "News" (docs/PRESENTING.md):
+a title and its source a line ("Storm hits the coast – BBC News"), at most 80 characters a line, the source at most 24 of
+them and the title giving way first. The two notes the answer carries are lines of the list in a few words: "Older stories
+were not read." when the read was cut, and "1 of 3 feeds not reached." (or "Feeds not reached; these are the last
+headlines.") when feeds could not be reached. Nothing the answer did not say is on it ("and N more" is not said, so it is
+not shown). Text from feeds is plain text there: one line, no brackets, control or bidirectional characters, cut at a
+code point boundary (one function, `cutCodePoints`, so an emoji at the limit is never split). Its `spoken` text, which the
+model says where the asking device shows nothing, is the answer's own sentences, whole, within 300 characters: stories go
+from the end first, the notes stay.
+
+- **Privacy.** The news is household data, so the list is a `household` presentation: the Presenter decides for each
+  device, at the moment of showing, and shows it on a shared, a private and a public screen alike, as the spoken answer is
+  the same on every device. A device without a display, one that is offline or one whose page cannot draw a list is
+  shown nothing, and that changes nothing about the answer. There is nothing personal in it to ask `Privacy.mayReveal` about.
+- **Withdrawn when it no longer applies.** A device shows one transient list at a time, and it ends by itself after 30
+  seconds. It is taken down earlier when: a feed whose stories are on it is unsubscribed (a feed whose stories are not on
+  it changes nothing); a later `news.top` found nothing (an empty answer clears what the device still shows); or the model
+  tells headlines of its own with `news_headlines` (the conversation's last list is then another list). A later answer on
+  the same device replaces it. The module keeps the handle of each device's list (the newest 64 devices, this run only).
+  After a restart of the module its transient lists are gone from every page, as the Presenter does for any module part
+  that stops, and nothing is brought back; a page that lost its connection clears what it showed and shows it again only
+  with the next answer.
+- **No buttons and no ticks**, so no press handler: the list is only to read.
+- Cost: showing is one enqueue after the answer. Over the largest cache (1,425 items, five headlines) the answer with its
+  list held the main thread at most 2.6 to 3.9 ms (`test/latency.test.ts`, three runs, bound 10 ms, 30 ms on CI).
 
 The action is called `top`, not `headlines`, because the host generates a tool `news_<action>` for every action and
 `news_headlines` is the tool above.
@@ -109,8 +150,8 @@ There are no secrets. Invalid values put the module down with the reason (the ad
 ## What it stores
 
 **Nothing in this module is about one person**: every row is household data, no row has an owner, and the module
-answers every device alike (a shared, a private and a public screen get the same news), so it asks `Privacy.mayReveal`
-about nothing. There are no person-scoped feeds or topics in this version. The module never stores secrets; a
+answers every device alike (a shared, a private and a public screen get the same news, and the same list on the screen), so
+it asks `Privacy.mayReveal` about nothing. There are no person-scoped feeds or topics in this version. The module never stores secrets; a
 subscription address with credentials in it is refused.
 
 | Collection | Scope | `maxChars` | Rows of one list page | Indexes | Holds |
@@ -165,12 +206,11 @@ Cut from the first version after review:
 - **Paywall detection.** The article tool says what it could read; when that is very little it says so and why it cannot
   tell more. It never claims a page is behind a paywall.
 
-Left out for wave B (they need a phrase command, a presentation, a notification or the module's own speech, which do
-not exist yet):
+Left out of the phrase command and presentation (the first piece of wave B, above, is in; these are not):
 
-- Phrase commands for "what's the news" and "unsubscribe from X" without the model (the typed actions above are matched
-  from their examples by the intent agent; the phrase command is the faster path of P7).
-- The headline `list` of cards, the story `card` with its QR hand-off, and the ticker (P10).
+- A phrase for "unsubscribe from X" (the typed action is matched from its examples by the intent agent; a name is text and
+  is resolved in the action), and phrases with a topic or a source.
+- The story `card` with its QR hand-off, and the ticker (P10).
 - Reading a long article aloud through a read-aloud engine, and "save for later" (`news_article` gives the text to the
   model instead).
 - Alert notifications (P9), and a spoken notice outside a reply that feeds could not be reached.

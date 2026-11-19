@@ -117,3 +117,21 @@ export const cleanArticle = (raw: string, max: number): { readonly text: string;
 /** A title as two equal stories compare it: lower case, no accents, no punctuation, single spaces. */
 export const titleKey = (title: string): string =>
   title.normalize("NFKD").replace(/[̀-ͯ]/g, "").toLowerCase().replace(/[^\p{L}\p{N}]+/gu, " ").trim()
+
+/**
+ * `text` as one line of plain text for a screen: control, line-separator and bidirectional characters, lone surrogates
+ * and brackets become a space, runs of space become one. Text from a feed is bounded and never markup there.
+ */
+export const oneLine = (text: string): string => text.replace(CONTROLS, " ").replace(/[<>]/g, " ").replace(/\s+/g, " ").trim()
+
+/**
+ * `text` of at most `max` code points: cut at a code point boundary (never inside a surrogate pair), at a word when one
+ * lies in the second half, with "…" counted in the `max`. The one cut every text of a presentation goes through.
+ */
+export const cutCodePoints = (text: string, max: number): string => {
+  const points = Array.from(text)
+  if (points.length <= max) return text
+  const head = points.slice(0, Math.max(0, max - 1))
+  const space = head.lastIndexOf(" ")
+  return `${(space > max / 2 ? head.slice(0, space) : head).join("").trimEnd()}…`
+}
