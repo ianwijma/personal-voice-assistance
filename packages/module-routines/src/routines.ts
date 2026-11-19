@@ -3,6 +3,7 @@
 import { PHRASE_LIMITS, phraseProblems, phraseWords, Setting } from "@pva/core"
 import { isLine } from "@pva/module-contracts"
 import { Exit, Schema } from "effect"
+import { createHash } from "node:crypto"
 
 /**
  * The most routines: one phrase-command action each, and an instance may have at most 16 actions with phrases, one of
@@ -27,7 +28,7 @@ export const PARAM_TEXT_CHARS = 200
 export const CANCEL_PHRASES = { en: ["cancel the routine"], nl: ["annuleer de routine"] } as const
 
 /** `<moduleId>.<actionId>`, as an action's identity is written (docs/MODULES.md §10). */
-const CALL_ID = /^([a-z0-9][a-z0-9-]{0,63})\.([a-z][a-z0-9_]{0,39})$/
+const CALL_ID = /^([a-z][a-z0-9-]{0,39})\.([a-z][a-z0-9_]{0,39})$/
 const PARAM_NAME = /^[A-Za-z][A-Za-z0-9_]{0,39}$/
 
 // ---------------------------------------------------------------------------------------------------------------------
@@ -38,7 +39,7 @@ const line = (max: number, what: string) => Schema.String.check(Schema.makeFilte
 const SayStep = Schema.Struct({ say: line(SAY_CHARS, "say") })
 const ParamValue = Schema.Union([line(PARAM_TEXT_CHARS, "a text value"), Schema.Finite, Schema.Boolean])
 const CallStep = Schema.Struct({
-  call: Schema.String.check(Schema.makeFilter((t: string) => CALL_ID.test(t) || "call: an action written module.action, such as lamp.switch")),
+  call: Schema.String.check(Schema.makeFilter((t: string) => (t.length <= 64 && CALL_ID.test(t)) || "call: an action written module.action, such as lamp.switch")),
   params: Schema.optionalKey(
     Schema.Record(Schema.String.check(Schema.makeFilter((k: string) => PARAM_NAME.test(k) || "a parameter name is a letter, then letters, digits or _")), ParamValue).check(
       Schema.makeFilter((r: Readonly<Record<string, unknown>>) => Object.keys(r).length <= MAX_PARAMS || `params: at most ${MAX_PARAMS}`)
@@ -87,6 +88,12 @@ const stepOf = (raw: unknown, n: number): Step | string => {
     if (Exit.isFailure(exit)) return `step ${n}: "stop_if_failed" is true`
     return n === 1 ? `step 1 cannot be "stop_if_failed": it stops after a step that did not work` : { kind: "stop_if_failed" }
   }
+  // Record decoding drops keys that do not match its key schema: validate the submitted keys before that can happen.
+  const params = (raw as { readonly params?: unknown }).params
+  if (typeof params === "object" && params !== null && !Array.isArray(params)) {
+    const names = Object.keys(params)
+    if (names.length > MAX_PARAMS || names.some((name) => !PARAM_NAME.test(name))) return `step ${n}: ${HINT.call}`
+  }
   const exit = decodeCall(raw)
   if (Exit.isFailure(exit)) return `step ${n}: ${HINT.call}`
   const [, moduleId, actionId] = CALL_ID.exec(exit.value.call)!
@@ -121,7 +128,7 @@ export const parseSteps = (text: string): ReadonlyArray<Step> | string => {
 export const wordsKey = (text: string): string => phraseWords(text).map((w) => w.norm).join(" ")
 
 /** Words dropped before a spoken name is matched ("run the bedtime routine" → "bedtime"). */
-const FILLERS = new Set(["the", "a", "an", "my", "our", "routine", "de", "het", "een", "mijn", "onze", "please", "graag"])
+const FILLERS = new Set(["the", "one", "a", "an", "my", "our", "routine", "de", "het", "een", "mijn", "onze", "please", "graag"])
 
 /** A name's words without fillers, for matching what someone said. */
 export const nameWords = (text: string): ReadonlyArray<string> => phraseWords(text).map((w) => w.norm).filter((w) => !FILLERS.has(w))
@@ -129,7 +136,11 @@ export const nameWords = (text: string): ReadonlyArray<string> => phraseWords(te
 /** The action id of a routine (`routines.<id>`): `r_` and its name's words, ASCII only. */
 const slugOf = (key: string): string => {
   const slug = key.replace(/[^a-z0-9 ]/g, "").trim().replace(/\s+/g, "_").slice(0, 38).replace(/_+$/, "")
-  return slug === "" ? "r_routine" : `r_${slug}`
+  const base = slug === "" ? "r_routine" : `r_${slug}`
+  if (slug === key.replaceAll(" ", "_")) return base
+  // Lossy names (non-ASCII or truncated) keep their own identity across reordering and unrelated additions. A double
+  // underscore cannot occur in a lossless words slug, so it also keeps this namespace separate from ordinary names.
+  return `${base.slice(0, 18).replace(/_+$/, "")}__${createHash("sha256").update(key).digest("hex").slice(0, 20)}`
 }
 
 // ---------------------------------------------------------------------------------------------------------------------
@@ -192,25 +203,55 @@ const explainSteps = (text: string): string | undefined => {
   return typeof steps === "string" ? steps : undefined
 }
 
+const routinesSetting = Setting.records({
+  label: "Routines",
+  description:
+    `At most ${MAX_ROUTINES}. Each has a name, up to ${MAX_PHRASES} phrases per language that start it after the wake phrase with no model, and its steps as JSON: ` +
+    "{ \"say\": \"text\" } speaks on the device that started it, { \"call\": \"module.action\", \"params\": { … } } runs an action of that assistant, " +
+    "{ \"stop_if_failed\": true } stops when the step before did not work. Each step is decided when it runs; the routine stops where one is refused. An action's answer is never read out.",
+  itemLabel: "routine",
+  titleKey: "name",
+  maxItems: MAX_ROUTINES,
+  orderable: true,
+  item: {
+    name: Setting.text({ label: "Name", maxLength: NAME_CHARS, check: (t) => (isLine(t, NAME_CHARS) && t.trim() !== "" ? undefined : "One line of 1 to 40 characters") }),
+    phrasesEn: Setting.textList({ label: "English phrases", description: "Said after the wake phrase, word for word.", maxItems: MAX_PHRASES, itemMaxLength: PHRASE_LIMITS.charsPerPhrase }),
+    phrasesNl: Setting.textList({ label: "Dutch phrases", description: "Used when the household's language is Dutch.", maxItems: MAX_PHRASES, itemMaxLength: PHRASE_LIMITS.charsPerPhrase }),
+    steps: Setting.text({ label: "Steps (JSON)", multiline: true, maxLength: STEPS_CHARS, check: explainSteps })
+  },
+  check: routinesProblem
+})
+
+/** Preserve the submitted phrase lists long enough to reject repetitions the text-list decoder would fold away. */
+const decodeRoutines: typeof routinesSetting.decode = (raw) => {
+  const decoded = routinesSetting.decode(raw)
+  if (!decoded.ok) return decoded
+  for (const [i, entry] of (raw as ReadonlyArray<SavedRoutine>).entries()) {
+    for (const [field, label] of [["phrasesEn", "English"], ["phrasesNl", "Dutch"]] as const) {
+      const seen = new Set<string>()
+      for (const phrase of entry[field] ?? []) {
+        const key = wordsKey(phrase)
+        if (key === "") continue
+        if (seen.has(key)) return { ok: false, error: `Routine "${decoded.value[i]!.name}" has the ${label} phrase "${phrase.trim()}" twice` }
+        seen.add(key)
+      }
+    }
+  }
+  return decoded
+}
+
 export const settings = {
-  routines: Setting.records({
-    label: "Routines",
-    description:
-      `At most ${MAX_ROUTINES}. Each has a name, up to ${MAX_PHRASES} phrases per language that start it after the wake phrase with no model, and its steps as JSON: ` +
-      "{ \"say\": \"text\" } speaks on the device that started it, { \"call\": \"module.action\", \"params\": { … } } runs an action of that assistant, " +
-      "{ \"stop_if_failed\": true } stops when the step before did not work. Each step is decided when it runs; the routine stops where one is refused. An action's answer is never read out.",
-    itemLabel: "routine",
-    titleKey: "name",
-    maxItems: MAX_ROUTINES,
-    orderable: true,
-    item: {
-      name: Setting.text({ label: "Name", maxLength: NAME_CHARS, check: (t) => (isLine(t, NAME_CHARS) && t.trim() !== "" ? undefined : "One line of 1 to 40 characters") }),
-      phrasesEn: Setting.textList({ label: "English phrases", description: "Said after the wake phrase, word for word.", maxItems: MAX_PHRASES, itemMaxLength: PHRASE_LIMITS.charsPerPhrase }),
-      phrasesNl: Setting.textList({ label: "Dutch phrases", description: "Used when the household's language is Dutch.", maxItems: MAX_PHRASES, itemMaxLength: PHRASE_LIMITS.charsPerPhrase }),
-      steps: Setting.text({ label: "Steps (JSON)", multiline: true, maxLength: STEPS_CHARS, check: explainSteps })
-    },
-    check: routinesProblem
-  }),
+  routines: {
+    ...routinesSetting,
+    decode: decodeRoutines,
+    fromEnv: (text: string) => {
+      try {
+        return decodeRoutines(JSON.parse(text))
+      } catch {
+        return { ok: false as const, error: "Must be JSON: a list of objects" }
+      }
+    }
+  },
   goodMorning: Setting.boolean({
     label: "Good morning routine",
     description:
@@ -245,21 +286,13 @@ export const nameIn = (name: StepText, language: "en" | "nl"): string => (typeof
 
 /** The routines of saved settings, in their order, with the template last when it is on and fits. Saved values were checked. */
 export const routinesOf = (values: { readonly routines: ReadonlyArray<SavedRoutine>; readonly goodMorning: boolean }): ReadonlyArray<Routine> => {
-  const ids = new Set<string>()
   const out: Array<Routine> = []
-  const idFor = (key: string) => {
-    const base = slugOf(key)
-    let id = base
-    for (let n = 2; ids.has(id); n++) id = `${base.slice(0, 36)}_${n}`
-    ids.add(id)
-    return id
-  }
   for (const r of values.routines) {
     const steps = parseSteps(r.steps)
     // A saved list was checked when it was saved; one that does not parse is never run.
     if (typeof steps === "string") continue
     const key = wordsKey(r.name)
-    out.push({ key, actionId: idFor(key), name: r.name, phrases: { en: r.phrasesEn, nl: r.phrasesNl }, steps, template: false })
+    out.push({ key, actionId: slugOf(key), name: r.name, phrases: { en: r.phrasesEn, nl: r.phrasesNl }, steps, template: false })
   }
   if (values.goodMorning && out.length < MAX_ROUTINES) {
     const keys = new Set(out.map((r) => r.key))
@@ -267,7 +300,7 @@ export const routinesOf = (values: { readonly routines: ReadonlyArray<SavedRouti
     const clash = [GOOD_MORNING.name.en, GOOD_MORNING.name.nl].some((n) => keys.has(wordsKey(n))) ||
       GOOD_MORNING.phrases.en.some((p) => shapes.has(`en:${wordsKey(p)}`)) || GOOD_MORNING.phrases.nl.some((p) => shapes.has(`nl:${wordsKey(p)}`))
     if (!clash) {
-      out.push({ key: wordsKey(GOOD_MORNING.name.en), actionId: idFor(wordsKey(GOOD_MORNING.name.en)), name: GOOD_MORNING.name, phrases: GOOD_MORNING.phrases, steps: GOOD_MORNING.steps, template: true })
+      out.push({ key: wordsKey(GOOD_MORNING.name.en), actionId: slugOf(wordsKey(GOOD_MORNING.name.en)), name: GOOD_MORNING.name, phrases: GOOD_MORNING.phrases, steps: GOOD_MORNING.steps, template: true })
     }
   }
   return out
