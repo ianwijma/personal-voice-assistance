@@ -62,7 +62,7 @@ describe("GPT review Round 4", () => {
     const reply = entry === "action"
       ? actionSay(yield* k.action("ringing_snooze", {}, as))
       : (yield* k.notify.press(old.id, "snooze", as)).say
-    assert.strictEqual(reply, "A newer reminder is waiting for delivery. Snooze that one when it arrives.")
+    assert.strictEqual(reply, "Use Snooze on the newer notification once you see it.")
     assert.deepStrictEqual((yield* theRow(k)).value, before.value)
     assert.deepStrictEqual(yield* jobOf(k, before.id), jobs)
     assert.deepStrictEqual((yield* openNotes(k)).map(n => n.id), [old.id])

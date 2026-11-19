@@ -649,10 +649,10 @@ describe("the briefing's section", () => {
           const s: string = r.sentences[0]
           assert.isAtMost(s.length, 300, s)
           const time = speakTime({ hour: 11, minute: 25 }, lang)!
-          // Three whole items in English are 300 characters and more: one item fewer, and the rest counted ("… and two more.").
+          // Three whole items exceed the English budget: try two complete items and count the remainder.
           // Three fit in Dutch; four fit in neither.
           if (lang === "nl" && letters.length === 3) assert.isTrue(s.endsWith(` om ${time}.`), s)
-          else assert.match(s, new RegExp(lang === "en" ? ` at ${time} and two more\\.$` : ` om ${time} en nog twee\\.$`))
+          else assert.match(s, new RegExp(lang === "en" ? ` at ${time} and ${letters.length === 3 ? "one" : "two"} more\\.$` : ` om ${time} en nog twee\\.$`))
           // Every item named is whole: its 60 letters and its time.
           for (const run of s.match(/([a-d])\1{9,}/g) ?? []) assert.strictEqual(run.length, 60, s)
         }
@@ -744,6 +744,7 @@ describe("Dutch", () => {
       yield* kit.advance(11 * MIN)
       const second = (yield* openNotes(kit))[0]!
       assert.deepStrictEqual(yield* kit.notify.press(second.id, "done", { device: SAM }), { ok: true, say: "Klaar." })
+      assert.strictEqual(spoken(yield* kit.tool("reminders_done", { which: "mama" }, { device: SAM })), "Die was al klaar.")
       assert.strictEqual(spoken(yield* kit.tool("reminders_done", { which: "mama" }, { device: SAM })), "Ik heb geen herinnering met mama.")
       assert.strictEqual(spoken(yield* kit.tool("reminders_cancel", { which: "vuilnis" }, { device: SAM })), "Geannuleerd: vuilnis.")
       assert.deepStrictEqual((yield* kit.tool("reminders_list", {}, { device: SAM })).value, { spoken: "Je hebt geen herinneringen." })

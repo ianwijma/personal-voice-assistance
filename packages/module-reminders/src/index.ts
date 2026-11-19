@@ -325,15 +325,18 @@ export const remindersModule = defineModule({
         readonly send: boolean
         /** Try the cleanup owed now, whatever its time (a tool or a button tries it once, in line). */
         readonly forceStop?: boolean
+        /** The host owns this active press; its notification is checked by the later row job. */
+        readonly deferNote?: number
       }
 
       /** Takes down the notifications and the card still owed; what fails is tried again later, a bounded number of times. */
-      const takeDown = (row: Row<Reminder>, now: number, actor: Actor | undefined) =>
+      const takeDown = (row: Row<Reminder>, now: number, actor: Actor | undefined, deferNote?: number) =>
         Effect.gen(function*() {
           const s = row.value.stop!
           const left: Array<number> = []
           let why = ""
           for (const at of s.notes) {
+            if (at === deferNote) { left.push(at); continue }
             const failed = yield* ctx.notify.resolve({ key: noteKey(row.id, at) }).pipe(Effect.as(undefined), Effect.catchTag("NotifyError", (e) => Effect.succeed(e.reason)))
             if (failed !== undefined) {
               left.push(at)
@@ -352,6 +355,8 @@ export const remindersModule = defineModule({
             }
           }
           if (left.length === 0 && !card) return yield* write(row, (v) => without(v, "stop"), { actor, housekeeping: true })
+          // An active host claim is not a failed cleanup try. Keep its verification durable without resolving it inline.
+          if (why === "") return yield* write(row, (v) => ({ ...v, stop: { notes: left, card: false, attempts: s.attempts, tryAt: now + STOP_RETRY_MS } }), { actor, housekeeping: true })
           const attempts = s.attempts + 1
           if (attempts >= MAX_STOP_TRIES) {
             return yield* write(row, (v) => ({ ...without(v, "stop"), stopFailed: true }), {
@@ -427,7 +432,7 @@ export const remindersModule = defineModule({
             const r: Reminder = row.value
             if (r.stop !== undefined && (force || r.stop.tryAt <= now)) {
               force = false
-              row = yield* takeDown(row, now, opts.actor)
+              row = yield* takeDown(row, now, opts.actor, opts.deferNote)
               continue
             }
             if (r.state !== "open") break
@@ -629,7 +634,9 @@ export const remindersModule = defineModule({
           Effect.map((open) => open.some((n) => n.key === noteKey(id, at)))
         )
 
-      const stopping = (row: Row<Reminder> | undefined, l: Language) =>
+      const stopping = (row: Row<Reminder> | undefined, l: Language, deferNote?: number) =>
+        // A successful handler leaves only verification of the host's closure; that is not a failed take-down.
+        deferNote !== undefined && row?.value.stop?.card === false && row.value.stop.attempts === 0 && row.value.stop.notes.length === 1 && row.value.stop.notes[0] === deferNote ? "" :
         row?.value.stop !== undefined ? ` ${say(texts, l, "stopping")}` : row?.value.stopFailed === true ? ` ${say(texts, l, "stopFailed")}` : ""
 
       // ---- answering: done, snooze ---------------------------------------------------------------------------------
@@ -644,6 +651,8 @@ export const remindersModule = defineModule({
           const l = lang()
           const z = zone()
           const actor = by.actor
+          const pressed = by.viaNotification === true ? by.at : undefined
+          const deferred = pressed === undefined ? {} : { deferNote: pressed }
           const reply = (spoken: string, keepOpen = false): Reply => ({ spoken, ...(keepOpen ? { keepOpen } : {}) })
           const entry = yield* board.get(id)
           if (entry === undefined) return reply(say(texts, l, "gone"))
@@ -652,19 +661,22 @@ export const remindersModule = defineModule({
           if (!allowed()) return reply(say(texts, l, "unreadableHere"), true)
           // Capture this before reconciliation can finish a runnable cleanup and erase its evidence.
           const cleanupOnly = by.at === undefined && entry.value.ring === undefined && entry.value.owed === undefined && entry.value.stop !== undefined
-          let row = yield* reconcileLocked(id, { actor, send: false, ...(cleanupOnly ? { forceStop: true } : {}) })
+          let row = yield* reconcileLocked(id, { actor, send: false, ...deferred, ...(cleanupOnly ? { forceStop: true } : {}) })
           if (row === undefined) return reply(say(texts, l, "gone"))
           const now = yield* Clock.currentTimeMillis
           const r: Reminder = row.value
+          const cleanupAt = pressed === undefined ? now : now + STOP_RETRY_MS
+          const cleanupOpts = { actor, send: false, forceStop: true, ...deferred }
+          const status = () => stopping(row, l, pressed)
           // Only successful confirmations may become a generic Done when permission changes during the write.
-          const confirmed = (sentence: () => string, safe = `${say(texts, l, "done")}${stopping(row, l)}`): Reply => ({
+          const confirmed = (sentence: () => string, safe = `${say(texts, l, "done")}${status()}`): Reply => ({
             spoken: sentence(), privateSpoken: safe, ...(r.owner !== undefined ? { owner: r.owner } : {})
           })
           if (r.state !== "open") {
-            if (!cleanupOnly && r.stop !== undefined) row = yield* reconcileLocked(id, { actor, send: false, forceStop: true })
-            return reply(`${say(texts, l, kind === "done" ? "doneAgain" : "snoozeEnded")}${stopping(row, l)}`)
+            if (!cleanupOnly && r.stop !== undefined) row = yield* reconcileLocked(id, cleanupOpts)
+            return reply(`${say(texts, l, kind === "done" ? "doneAgain" : "snoozeEnded")}${status()}`)
           }
-          if (cleanupOnly) return reply(`${say(texts, l, "doneAgain")}${stopping(row, l)}`)
+          if (cleanupOnly) return reply(`${say(texts, l, "doneAgain")}${status()}`)
           if (by.pressId !== undefined && r.handled === by.pressId) return reply(say(texts, l, "snoozedAlready"))
 
           // Admit an occurrence-bound answer once: its card and its selected notification must still be current and open.
@@ -677,13 +689,12 @@ export const remindersModule = defineModule({
           }
           // The notification lookup can wait too: check immediately before accepting the mutation.
           if (!allowed()) return reply(say(texts, l, "unreadableHere"), true)
-          const pressed = by.viaNotification === true ? by.at : undefined
           const current = by.at !== undefined
             ? (by.at === r.ring?.at || (by.at === r.owed?.at && r.owed.attempts > 0) ? by.at : undefined)
             : r.ring?.at ?? r.owed?.at
           // A successfully delivered newer attempt supersedes the old ring even if recording the new ring failed.
           const older = current === r.owed?.at && r.ring !== undefined && r.ring.at !== current ? r.ring.at : undefined
-          const notes = current === undefined ? [] : [...(current === pressed ? [] : [current]), ...(older === undefined ? [] : [older])]
+          const notes = current === undefined ? [] : [current, ...(older === undefined ? [] : [older])]
           if (kind === "done") {
             if (current !== undefined && (by.at === undefined || by.at === current)) {
               const clear = (v: Reminder) => {
@@ -693,16 +704,16 @@ export const remindersModule = defineModule({
                 return next
               }
               const goesOn = r.dueAt !== undefined || (r.owed !== undefined && r.owed.at !== current)
-              row = yield* write(row, (v) => withStop(goesOn ? clear(v) : { ...clear(v), state: "done" as const, endedAt: now }, addStop(v.stop, notes, true, now, current)), { actor })
-              row = yield* afterCommit(row, { actor, send: false, forceStop: true })
+              row = yield* write(row, (v) => withStop(goesOn ? clear(v) : { ...clear(v), state: "done" as const, endedAt: now }, addStop(v.stop, notes, true, cleanupAt, current)), { actor })
+              row = yield* afterCommit(row, cleanupOpts)
               const next = row?.value.owed === undefined ? row?.value.dueAt : undefined
-              return confirmed(() => `${next !== undefined ? say(texts, l, "doneRepeat", { when: momentText(next, l, z, now) }) : say(texts, l, "done")}${stopping(row, l)}`)
+              return confirmed(() => `${next !== undefined ? say(texts, l, "doneRepeat", { when: momentText(next, l, z, now) }) : say(texts, l, "done")}${status()}`)
             }
             if (by.at !== undefined) return reply(say(texts, l, "answeredAlready"))
             if (!isRepeat(r) || r.dueAt === undefined) {
               row = yield* write(row, (v) => ({ ...without(v, "dueAt"), state: "done" as const, endedAt: now }), { actor })
               row = yield* afterCommit(row, { actor, send: false })
-              return confirmed(() => `${say(texts, l, "done")}${stopping(row, l)}`)
+              return confirmed(() => `${say(texts, l, "done")}${status()}`)
             }
             // A repeat that is not ringing: done for its next time, which is skipped; the series goes on after it.
             const skipped = r.dueAt
@@ -718,10 +729,10 @@ export const remindersModule = defineModule({
           const ms = by.ms ?? snoozeMs()
           const until = now + ms
           if (r.dueAt !== undefined && until >= r.dueAt) return { ...reply(say(texts, l, "snoozeOvertaken"), true), ...(r.owner !== undefined ? { owner: r.owner } : {}) }
-          row = yield* write(row, (v) => withStop({ ...(v.owed?.at === ring.at ? without(v, "owed") : v), ring: { ...ring, snoozeUntil: until }, ...(by.pressId !== undefined ? { handled: by.pressId } : {}) }, addStop(v.stop, notes, true, now, ring.at)), { actor })
-          row = yield* afterCommit(row, { actor, send: false, forceStop: true })
-          const spoken = `${say(texts, l, "snoozed", { duration: speakDuration(ms, l, { natural: true }) ?? `${Math.round(ms / 60_000)}` })}${stopping(row, l)}`
-          return confirmed(() => spoken, `${say(texts, l, "snoozedPrivate")}${stopping(row, l)}`)
+          row = yield* write(row, (v) => withStop({ ...(v.owed?.at === ring.at ? without(v, "owed") : v), ring: { ...ring, snoozeUntil: until }, ...(by.pressId !== undefined ? { handled: by.pressId } : {}) }, addStop(v.stop, notes, true, cleanupAt, ring.at)), { actor })
+          row = yield* afterCommit(row, cleanupOpts)
+          const spoken = `${say(texts, l, "snoozed", { duration: speakDuration(ms, l, { natural: true }) ?? `${Math.round(ms / 60_000)}` })}${status()}`
+          return confirmed(() => spoken, `${say(texts, l, "snoozedPrivate")}${status()}`)
         })
 
       const answer = (kind: Kind, id: string, by: By) => exclusive(answerLocked(kind, id, by))
@@ -792,7 +803,7 @@ export const remindersModule = defineModule({
                 ? say(texts, l, count === 1 ? "briefAtLeastOne" : "briefAtLeast", { count: counted, list })
                 : say(texts, l, count === 1 ? "briefOne" : "briefMany", { count: counted, list })
             let sentence = ""
-            for (const shown of [count <= 3 ? count : 2, 1]) {
+            for (const shown of (count <= 3 ? [count, 2, 1] : [2, 1])) {
               const preview = speakList(items.slice(0, shown), l) ?? items[0]!
               const rest = count - shown
               const list = rest === 0 ? preview : say(texts, l, "remainder", { list: items.slice(0, shown).join(", "), count: rest <= 20 ? speakNumber(rest, l, { words: true }) ?? String(rest) : String(rest) })
@@ -967,8 +978,12 @@ export const remindersModule = defineModule({
               return { spoken: `${say(texts, l, "snoozeEnded")}${sh.stopping(row, l)}`, ...(owner !== undefined ? { owner } : {}) }
             }
             const r = row.value
-            const ring = r.ring
             const attempted = r.owed !== undefined && r.owed.attempts > 0 ? [r.owed.at] : []
+            // The send may have succeeded before recording its ring failed. An open attempt is the same resend case.
+            const openAttempt = said === undefined && r.owed !== undefined && r.owed.attempts > 0 && (yield* sh.isOpen(id, r.owed.at))
+            const ring: Reminder["ring"] = openAttempt && r.owed !== undefined
+              ? { at: r.owed.at, deliveredAt: now, ...(owedDueAt(r, r.owed) !== r.owed.at ? { from: owedDueAt(r, r.owed) } : {}) }
+              : r.ring
             let resend = false
             if (said !== undefined) {
               // A new time ends a ring (its notification and card go) and an owed delivery, and replaces the series.
@@ -979,10 +994,10 @@ export const remindersModule = defineModule({
                 dueAt: said.at,
                 ...(said.kind === "repeat" ? { rrule: said.rrule, dtstart: said.dtstart, timeZone: said.timeZone } : {})
               }, notes.length > 0 || ring !== undefined ? addStop(v.stop, notes, true, now) : v.stop))
-            } else if (ring !== undefined && ring.snoozeUntil === undefined && (yield* sh.isOpen(id, ring.at))) {
+            } else if (ring !== undefined && ring.snoozeUntil === undefined && (openAttempt || (yield* sh.isOpen(id, ring.at)))) {
               // New words while it rings: its notification and card go, and the same occurrence is sent again with them.
               resend = r.owed === undefined || r.owed.at === ring.at
-              row = yield* sh.write(row, (v) => withStop({ ...(resend ? v : without(v, "ring")), text: text!, ...(resend ? { owed: { at: ring.at, from: now, attempts: 0, tryAt: now } } : {}) }, addStop(v.stop, [ring.at, ...attempted], true, now)))
+              row = yield* sh.write(row, (v) => withStop({ ...(resend ? { ...v, ring } : without(v, "ring")), text: text!, ...(resend ? { owed: { at: ring.at, from: now, attempts: 0, tryAt: now } } : {}) }, addStop(v.stop, [ring.at, ...attempted, ...(r.ring === undefined ? [] : [r.ring.at])], true, now)))
             } else if (ring !== undefined && ring.snoozeUntil === undefined) {
               // Its notification is gone already (stopped on the host), its card may be on a screen with the old words: it goes.
               row = yield* sh.write(row, (v) => withStop({ ...v, text: text! }, addStop(v.stop, attempted, true, now)))
