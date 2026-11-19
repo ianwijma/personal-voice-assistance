@@ -172,6 +172,8 @@ describe("Home and module instances (WP-12a/12b)", () => {
     expect(moduleOf(admin, "clock")!.instances!.map((i) => [i.assistants, i.own])).toEqual([[["alpha"], []], [["bravo"], ["locale"]]])
     expect(moduleOf(admin, "clock")!.settings.fields.map((f) => [f.key, f.overridable === true])).toEqual([["timeZone", true], ["locale", true]])
 
+    // Weather restarts with Home as well (it has a shared part now): wait for it too, or Alpha's tools are not yet published.
+    await until(() => moduleOf(admin, "weather")?.state === "running")
     await typed(page, "second", "alpha")
     await typed(page, "third", "bravo")
     const home = "Home: Utrecht, Netherlands; time zone Asia/Tokyo; language nl-NL."
@@ -182,7 +184,7 @@ describe("Home and module instances (WP-12a/12b)", () => {
     // The clock's context: Alpha in Home's date format (en-US), Bravo in its own (nl-NL); both in Home's zone.
     expect(llm.requests[1]!.context).toMatch(/It is [A-Z][a-z]+day, [A-Z][a-z]+ \d{1,2}, \d{4}, .* local time \(Asia\/Tokyo\)\./)
     expect(llm.requests[2]!.context).toMatch(/It is [a-z]+dag \d{1,2} [a-z]+ \d{4}, .* local time \(Asia\/Tokyo\)\./)
-    expect(llm.requests[1]!.tools).toEqual(["current_time", "clock_time_now", "weather"])
+    expect(llm.requests[1]!.tools).toEqual(["current_time", "clock_time_now", "weather", "weather_rain_soon", "weather_forecast"])
     expect(llm.requests[2]!.tools).toEqual(["current_time", "clock_time_now"])
 
     // The weather tool without a place looks up Home, in Home's units.

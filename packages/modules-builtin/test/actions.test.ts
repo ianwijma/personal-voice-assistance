@@ -174,11 +174,12 @@ describe("weather.today", () => {
       assert.match(error.message, /set a home location/)
     }))
 
-  it.effect("the module offers the action but no generated tool (the weather tool exists)", () =>
+  it.effect("the module offers its actions but no generated tool (each has a tool of its own, or is for the typed path only)", () =>
     Effect.scoped(Effect.gen(function*() {
       const host = yield* makeModuleHost({ catalog: [weatherModule({ fetch })], persistence: readOnlyPersistence(), env: {} })
       yield* host.startEnabled
-      assert.deepStrictEqual(host.snapshot().registry.specs.map((s) => s.name), ["weather"])
-      assert.deepStrictEqual(host.snapshot().actions.map((a) => a.id), ["weather.today"])
+      // `weather` and the two tools of the local-info extension; the three actions are not also tools.
+      assert.deepStrictEqual(host.snapshot().registry.specs.map((s) => s.name), ["weather", "weather_rain_soon", "weather_forecast"])
+      assert.deepStrictEqual(host.snapshot().actions.map((a) => a.id), ["weather.today", "weather.rain_soon", "weather.tomorrow"])
     })))
 })
