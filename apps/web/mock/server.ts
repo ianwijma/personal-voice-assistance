@@ -61,7 +61,7 @@
  * POST /mock/present {"presentation", "options"? (lifetime, expiresInMs), "id"?, "deviceId"?, "handlerDown"?} (P10: a
  * presentation shown as the server does: the shared checks, bounds, decision and selection, again after each hello while
  * live; household content only and no `key`: refused with a 400 that says the mock does not model them),
- * POST /mock/present/dismiss {"id"},
+ * POST /mock/present/dismiss {"id"}, POST /mock/present/clear (tests: end every presentation, so a test starts from none),
  * POST /mock/drop (terminate every socket), POST /mock/offline {"ms": 3000} (drop and refuse connections for a while),
  * POST /mock/admin/end {"reason": "idle" | "expired"} (end every admin session), POST /mock/wake {"phrase", "armed"}
  * (the owner said the wake phrase), POST /mock/heard {"text", "matched"?, "accepted"?, "source"?} (a tester line; `accepted: null` or `source: null` leaves that field out), POST /mock/state
@@ -3749,6 +3749,12 @@ const http = createServer((req, res) => {
         })
         reconcilePresentEverywhere()
         return json(res, 200, { id, lifetime, expiresAt })
+      }
+      case "/mock/present/clear": {
+        // Tests: every presentation ends (pages reconciled), so a test starts from none whatever an earlier one left.
+        const ids = [...mockPresentations.keys()]
+        for (const id of ids) endMockPresentation(id)
+        return json(res, 200, { cleared: ids.length })
       }
       case "/mock/present/dismiss": {
         const id = typeof payload.id === "string" ? payload.id : ""
