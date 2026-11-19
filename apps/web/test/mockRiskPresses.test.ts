@@ -106,10 +106,10 @@ describe("the mock decides presses by the saved risk policy", () => {
         })
         expect(list.id, JSON.stringify(list)).toBeTypeOf("string")
         expect(card.id, JSON.stringify(card)).toBeTypeOf("string")
-        await voice.wait("present.show", (m) => m.presentation.id === list.id)
-        await voice.wait("present.show", (m) => m.presentation.id === card.id)
-        const tick = await voice.request({ type: "present.action", id: list.id, action: "tick", item: "milk", done: true })
-        const button = await voice.request({ type: "present.action", id: card.id, action: "on" })
+        const shownList = await voice.wait("present.show", (m) => m.presentation.id === list.id)
+        const shownCard = await voice.wait("present.show", (m) => m.presentation.id === card.id)
+        const tick = await voice.request({ type: "present.action", id: list.id, revision: shownList.presentation.revision, action: "tick", item: "milk", done: true })
+        const button = await voice.request({ type: "present.action", id: card.id, revision: shownCard.presentation.revision, action: "on" })
         const n = await post("/mock/notify", { title: "Pasta", ring: true, deviceId, actions: [{ id: "snooze", label: "Snooze" }] })
         await voice.wait("notification.ring", (m) => m.notification.id === n.id)
         const snooze = await voice.request({ type: "notification.action", id: n.id, actionId: "snooze" })
@@ -123,7 +123,7 @@ describe("the mock decides presses by the saved risk policy", () => {
         expect(await voice.request({ type: "notification.action", id: ringing.id, actionId: "stop" })).toMatchObject({ ok: true })
         // A page that does not hold the card is refused by the holder check first, whatever the policy says.
         const other = await peer(url, "voice", { id: "d-risk-press-02", kind: "web-voice", name: "Other" })
-        expect(await other.request({ type: "present.action", id: card.id, action: "on" })).toMatchObject({ ok: false, error: { code: "bad_message" } })
+        expect(await other.request({ type: "present.action", id: card.id, revision: shownCard.presentation.revision, action: "on" })).toMatchObject({ ok: false, error: { code: "bad_message" } })
         other.ws.terminate()
       }
     } finally {
