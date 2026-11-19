@@ -207,8 +207,9 @@ yields between pages); the tests fail above 10 ms (30 ms on CI). The worker's ow
 Two things are returned with the answer to be shown on the screen of the device that asked, when it has one
 (docs/PRESENTING.md): `calendar_agenda` and `calendar_next` for "me" return `{ forModel, present }`, the action
 `calendar.my_next` returns `{ say, present }`. `forModel` and `say` are exactly the result and the sentence the module
-always gave. The tools and the action stay `speculative`: nothing in them touches a screen while they run, and the
-Presenter takes what a speculative call returns when its turn is promoted. Both are transient (30 seconds, the newest of a
+always gave. The tools and the action stay `speculative` (they may run before their turn is committed): nothing in them
+calls `ctx.present` or remembers a handle, and the Presenter shows what they return only when the turn is promoted and
+drops it when the turn is discarded (a discarded turn shows nothing and withdraws nothing). Both are transient (30 seconds, the newest of a
 device takes its place).
 
 | What | Returned by | Example |
