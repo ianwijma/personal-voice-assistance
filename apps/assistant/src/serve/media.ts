@@ -4,7 +4,7 @@ import { MEDIA_HASH, MEDIA_TOKEN } from "@pva/protocol"
 import { Deferred, Effect, Exit, type Scope } from "effect"
 import { createHash, randomBytes } from "node:crypto"
 import { chmodSync, mkdirSync, readdirSync, readFileSync, renameSync, statSync, unlinkSync, utimesSync, writeFileSync } from "node:fs"
-import { chmod, mkdir, opendir, readFile, rename, stat, unlink as unlinkAsync, utimes, writeFile } from "node:fs/promises"
+import { chmod, mkdir, opendir, readFile, rename, rmdir, stat, unlink as unlinkAsync, utimes, writeFile } from "node:fs/promises"
 import type http from "node:http"
 import { join } from "node:path"
 
@@ -77,6 +77,7 @@ export interface MediaFs {
   readonly stat: (path: string) => Promise<{ readonly size: number; readonly mtimeMs: number; isFile(): boolean }>
   readonly readFile: (path: string) => Promise<Buffer>
   readonly unlink: (path: string) => Promise<void>
+  readonly rmdir: (path: string) => Promise<void>
   readonly writeFile: (path: string, body: Uint8Array, options: { readonly mode: number }) => Promise<void>
   readonly utimes: (path: string, at: number, mtime: number) => Promise<void>
   readonly rename: (from: string, to: string) => Promise<void>
@@ -90,7 +91,7 @@ export interface MediaFs {
   readonly renameSync: typeof renameSync
   readonly unlinkSync: typeof unlinkSync
 }
-const NODE_FS: MediaFs = { mkdir, chmod, opendir, writeFile, utimes, rename, stat: (p) => stat(p), readFile: (p) => readFile(p), unlink: unlinkAsync, mkdirSync, chmodSync, readdirSync: (p) => readdirSync(p), statSync: (p) => statSync(p), readFileSync: (p) => readFileSync(p), writeFileSync, utimesSync, renameSync, unlinkSync }
+const NODE_FS: MediaFs = { mkdir, chmod, rmdir, opendir, writeFile, utimes, rename, stat: (p) => stat(p), readFile: (p) => readFile(p), unlink: unlinkAsync, mkdirSync, chmodSync, readdirSync: (p) => readdirSync(p), statSync: (p) => statSync(p), readFileSync: (p) => readFileSync(p), writeFileSync, utimesSync, renameSync, unlinkSync }
 
 /** Entries one inventory looks at, at most (what it removes makes the next one shorter). */
 const MAX_INVENTORY_ENTRIES = 4_096
@@ -182,8 +183,12 @@ export const makeMediaCache = (options: MediaCacheOptions): Effect.Effect<MediaC
       let complete = true
       const t = now()
       const found: Array<Kept> = []
-      const remove = async (path: string) => {
-        try { await fs.unlink(path); return true }
+      const remove = async (path: string, directory = false) => {
+        try {
+          if (directory) await fs.rmdir(path)
+          else await fs.unlink(path)
+          return true
+        }
         catch (e) {
           if ((e as { code?: unknown }).code === "ENOENT") return true
           fault(`${path} could not be removed (${code(e)})`)
@@ -204,7 +209,7 @@ export const makeMediaCache = (options: MediaCacheOptions): Effect.Effect<MediaC
           const m = /^([0-9a-f]{64})\.([a-z]+)$/.exec(name)
           const type = m === null ? undefined : EXTENSIONS[m[2]!]
           if (!entry.isFile() || m === null || type === undefined) {
-            await remove(path)
+            await remove(path, entry.isDirectory())
           } else {
             try {
               const st = await fs.stat(path)
@@ -304,24 +309,26 @@ export const makeMediaCache = (options: MediaCacheOptions): Effect.Effect<MediaC
         const is = sniffImage(r.body)
         if (MEDIA_TYPES[said] === undefined || is !== said) return { refused: "type" } satisfies MediaOutcome
         const hash = createHash("sha256").update(r.body).digest("hex")
-        // A sweep may already be running with an earlier clock sample. Recheck the matching entry after waiting,
-        // while holding the admission lane; an expired copy is retired before these bytes become a new admission.
+        // A sweep may already be running with an earlier clock sample. Recheck expiry in the admission lane:
+        // unrelated expired files also make room for the incoming bytes.
         yield* Effect.promise(sweep)
         return yield* Effect.promise(() => withDisk(async (): Promise<MediaOutcome> => {
           if (!sure) return { refused: "unavailable" }
-          let already = kept.get(hash)
-          if (already !== undefined && already.at + MEDIA_KEEP_MS <= now()) {
-            try { await fs.unlink(fileOf(already)) }
+          const version = faultVersion
+          for (const expired of kept.values()) {
+            if (expired.at + MEDIA_KEEP_MS > now()) continue
+            try { await fs.unlink(fileOf(expired)) }
             catch (e) {
               if ((e as { code?: unknown }).code !== "ENOENT") {
                 fault(`an expired image could not be removed (${code(e)})`)
                 return { refused: "unavailable" }
               }
             }
-            kept.delete(hash)
-            bytes -= already.bytes
-            already = undefined
+            kept.delete(expired.hash)
+            bytes -= expired.bytes
           }
+          if (!sure || version !== faultVersion) return { refused: "unavailable" }
+          const already = kept.get(hash)
           if (already === undefined) {
             if (kept.size >= maxFiles || bytes + r.body.length > maxBytes) return { refused: "full" }
             const t = now()
@@ -337,6 +344,9 @@ export const makeMediaCache = (options: MediaCacheOptions): Effect.Effect<MediaC
               try { await fs.unlink(tmp) } catch { /* The inventory removes it. */ }
               return { refused: "fetch" }
             }
+            // A concurrent held-image read can fault while disk I/O yields. Inventory must account for this file
+            // before its hash or address is published.
+            if (!sure || version !== faultVersion) return { refused: "unavailable" }
             kept.set(hash, k)
             bytes += k.bytes
           }
@@ -399,7 +409,9 @@ export const makeMediaCache = (options: MediaCacheOptions): Effect.Effect<MediaC
         fault(`${fileOf(k)} no longer matches the kept image`)
         return notFound(res)
       }
-      if (resolve(token) !== hash || kept.get(k.hash) !== k || k.at + MEDIA_KEEP_MS <= now()) return notFound(res)
+      const current = kept.get(k.hash)
+      // A clean inventory replaces metadata objects. The authorized, validated image remains usable across it.
+      if (resolve(token) !== hash || current === undefined || current.bytes !== body.length || current.type !== k.type || current.at + MEDIA_KEEP_MS <= now()) return notFound(res)
       res.writeHead(200, {
         "Content-Type": k.type,
         "Content-Length": String(body.length),

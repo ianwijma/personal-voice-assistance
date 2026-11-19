@@ -651,3 +651,132 @@ it("r2 b4: a successfully read but corrupted live image is refused, invalidated 
     expect(w.requests).toHaveLength(3)
   } finally { await run(close) }
 })
+
+const mediaGate = () => {
+  let resolve: () => void = () => undefined
+  const promise = new Promise<void>((done) => { resolve = done })
+  return { promise, resolve }
+}
+
+it.each([false, true])("r3 b2: inventory removes an empty foreign directory and safely refuses a nonempty one (%s)", async (nonempty) => {
+  const { mkdir, rm, writeFile } = await import("node:fs/promises")
+  const w = world(), dir = mkdtempSync(join(tmpdir(), "pva-media-directory-"))
+  const foreign = join(dir, "old-cache")
+  await mkdir(foreign)
+  if (nonempty) await writeFile(join(foreign, "foreign.txt"), "Keep this")
+  w.routes.set("img.example/new.png", () => reply(200, PNG, { "content-type": "image/png" }))
+  const { cache, close } = await run(open(w, dir))
+  try {
+    expect(cache.stats().sure).toBe(!nonempty)
+    if (nonempty) {
+      expect(await run(cache.fetch("https://img.example/new.png"))).toEqual({ refused: "unavailable" })
+      expect(await readFile(join(foreign, "foreign.txt"), "utf8")).toBe("Keep this")
+      await unlink(join(foreign, "foreign.txt"))
+      await cache.sweep()
+    }
+    expect("hash" in await run(cache.fetch("https://img.example/new.png"))).toBe(true)
+    expect(readdirSync(dir)).toHaveLength(1)
+    expect(cache.stats()).toMatchObject({ files: 1, sure: true })
+  } finally { await run(close); await rm(dir, { recursive: true, force: true }) }
+})
+
+it.each(["GET", "HEAD"])("r3 b3: inventory during a valid held %s does not turn recovery into a missing image", async (method) => {
+  const w = world()
+  w.routes.set("img.example/held.png", () => reply(200, PNG, { "content-type": "image/png" }))
+  const begun = mediaGate(), resume = mediaGate()
+  let failRead = false, delayRead = false
+  const { cache, close } = await run(open(w, undefined, undefined, { fs: { readFile: async (path) => {
+    if (failRead) { failRead = false; throw Object.assign(new Error("injected read"), { code: "EIO" }) }
+    const body = await readFile(path)
+    if (delayRead) { delayRead = false; begun.resolve(); await resume.promise }
+    return body
+  } } }))
+  try {
+    const { hash } = await run(cache.fetch("https://img.example/held.png")) as { hash: string }
+    failRead = true
+    expect((await serveOnce(cache, `/media/${TOKEN}`, only(hash))).status).toBe(404)
+    delayRead = true
+    const retry = serveOnce(cache, `/media/${TOKEN}`, only(hash), method)
+    await begun.promise
+    await cache.sweep()
+    expect(cache.stats().sure).toBe(true)
+    resume.resolve()
+    const response = await retry
+    expect(response.status).toBe(200)
+    expect(response.body).toEqual(method === "HEAD" ? undefined : Buffer.from(PNG))
+    expect((await serveOnce(cache, `/media/${TOKEN}`, only(hash))).status).toBe(200)
+  } finally { resume.resolve(); await run(close) }
+})
+
+it("r3 b4: a held read fault during an image write closes admission until inventory accounts for the renamed file", async () => {
+  const { writeFile } = await import("node:fs/promises")
+  const w = world(), issues = makeIssueRegistry()
+  w.routes.set("img.example/held.png", () => reply(200, PNG, { "content-type": "image/png" }))
+  w.routes.set("img.example/new.png", () => reply(200, Uint8Array.from([...PNG, 1]), { "content-type": "image/png" }))
+  const begun = mediaGate(), resume = mediaGate()
+  let failRead = false, delayWrite = false
+  const { cache, dir, close } = await run(open(w, undefined, undefined, { issues, fs: {
+    readFile: async (path) => {
+      if (failRead) { failRead = false; throw Object.assign(new Error("injected read"), { code: "EIO" }) }
+      return readFile(path)
+    },
+    writeFile: async (path, body, options) => {
+      if (delayWrite) { delayWrite = false; begun.resolve(); await resume.promise }
+      await writeFile(path, body, options)
+    }
+  } }))
+  try {
+    const { hash } = await run(cache.fetch("https://img.example/held.png")) as { hash: string }
+    delayWrite = true
+    const pending = run(cache.fetch("https://img.example/new.png"))
+    await begun.promise
+    failRead = true
+    expect((await serveOnce(cache, `/media/${TOKEN}`, only(hash))).status).toBe(404)
+    resume.resolve()
+    expect(await pending).toEqual({ refused: "unavailable" })
+    expect(cache.stats()).toMatchObject({ files: 1, sure: false })
+    expect(readdirSync(dir)).toHaveLength(2)
+    expect(issues.all().map((i) => i.id)).toEqual(["media.cache"])
+    expect((await serveOnce(cache, `/media/${TOKEN}`, only(hash))).status).toBe(200)
+    await cache.sweep()
+    expect(cache.stats()).toMatchObject({ files: 2, sure: true })
+    expect(issues.all()).toEqual([])
+    expect("hash" in await run(cache.fetch("https://img.example/new.png"))).toBe(true)
+  } finally { resume.resolve(); await run(close) }
+})
+
+it("r3 b5: admission retires unrelated bytes that expired naturally while a sweep was waiting", async () => {
+  const { performance: monotonic } = await import("node:perf_hooks")
+  const w = world(), begun = mediaGate(), resume = mediaGate()
+  let delayRemoval = false
+  const old = Uint8Array.from([...PNG, 1]), next = Uint8Array.from([...PNG, 2, 3])
+  const oldHash = createHash("sha256").update(old).digest("hex")
+  w.routes.set("img.example/old.png", () => reply(200, old, { "content-type": "image/png" }))
+  w.routes.set("img.example/held.png", () => reply(200, PNG, { "content-type": "image/png" }))
+  w.routes.set("img.example/new.png", () => reply(200, next, { "content-type": "image/png" }))
+  const { cache, close } = await run(open(w, undefined, { bytes: old.length + PNG.length }, { fs: { unlink: async (path) => {
+    if (delayRemoval && path.endsWith(`${oldHash}.png`)) { begun.resolve(); await resume.promise }
+    await unlink(path)
+  } } }))
+  try {
+    await run(cache.fetch("https://img.example/old.png"))
+    // Seed the second image so its day ends a little after the sweep starts.
+    w.clock.now += 100
+    await run(cache.fetch("https://img.example/held.png"))
+    w.clock.now += MEDIA_KEEP_MS - 100
+    // From here the wall clock runs forward normally; no correction is injected.
+    const at = w.clock.now, start = monotonic.now()
+    Object.defineProperty(w.clock, "now", { get: () => at + monotonic.now() - start })
+    delayRemoval = true
+    const sweeping = cache.sweep()
+    await begun.promise
+    await new Promise<void>((resolve) => setTimeout(resolve, 110))
+    const pending = run(cache.fetch("https://img.example/new.png"))
+    resume.resolve()
+    await sweeping
+    const result = await pending
+    expect("hash" in result).toBe(true)
+    expect(cache.stats()).toMatchObject({ files: 1, bytes: next.length, sure: true })
+    if ("hash" in result) expect((await serveOnce(cache, `/media/${TOKEN}`, only(result.hash))).status).toBe(200)
+  } finally { resume.resolve(); await run(close) }
+})
