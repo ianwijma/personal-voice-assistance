@@ -33,8 +33,8 @@ passed and none failed, the latency tests the way CI runs them pass (37 files, 4
 last fix rounds of #108, #114, #115, #117, #122 and #129 were not reviewed. They get a review by GPT Astra; what it
 finds is fixed by GPT Sol on a separate branch `<branch>-gpt-review` with its own pull request "[GPT Review] …" into
 the reviewed branch; then Astra looks again, at most ten rounds. Everything for it is prepared (the briefs are under
-`briefs/gpt/` in the working notes). **It has not run yet: the reviewer's (Codex) allowance is used up**; the first
-attempt at 21:28 ended at once with "usage limit was reached". Until it has run, those six are as described under
+`briefs/gpt/` in the working notes). **It is running** (started 2026-11-19 late evening, after the reviewer's allowance was reset; round 1: seven
+reviews, the presentation layer in two parts). Until a pull request's cycle has ended, it is as described under
 "Known gaps kept on purpose".
 
 **Two ways to merge.** Either #130 alone (it contains every commit of #87 to #129; the others can then be
