@@ -522,13 +522,16 @@ export const alarmsModule = defineModule({
        * The times an alarm is known by: its next occurrence, its snooze, and the nominal time of the occurrence its owed ring,
        * its ring or its ring being taken away is for (finding 8: the time it was set for, not when the ring was sent).
        */
-      const timesOf = (v: Alarm, open: Open): Array<ClockTime> => [
-        ...(v.next !== undefined ? [timeOf(v.next.time)] : []),
-        ...(v.ring?.again !== undefined ? [localOf(v.ring.again, v.timeZone).time] : []),
-        ...(v.owed !== undefined ? [timeOf(v.owed.time), ...(v.owed.snoozed === true ? [localOf(v.owed.at, v.timeZone).time] : [])] : []),
-        ...(v.ring !== undefined ? [timeOf(v.ring.time), ...(v.ring.snoozedAt !== undefined && open.ids.has(v.ring.notification) ? [localOf(v.ring.snoozedAt, v.timeZone).time] : [])] : []),
-        ...(v.withdraw !== undefined ? [timeOf(v.withdraw.time), ...(v.withdraw.at !== undefined ? [localOf(v.withdraw.at, v.timeZone).time] : [])] : [])
-      ]
+      const timesOf = (row: Row<Alarm>, open: Open, now: number): Array<ClockTime> => {
+        const v = row.value
+        return [
+          ...(v.next !== undefined ? [timeOf(v.next.time)] : []),
+          ...(v.ring?.again !== undefined ? [localOf(v.ring.again, v.timeZone).time] : []),
+          ...(v.owed !== undefined ? [timeOf(v.owed.time), ...(v.owed.snoozed === true && (now - v.owed.at <= DELIVER_WITHIN_MS || ringingNow(row, open)) ? [localOf(v.owed.at, v.timeZone).time] : [])] : []),
+          ...(v.ring !== undefined ? [timeOf(v.ring.time), ...(v.ring.snoozedAt !== undefined && open.ids.has(v.ring.notification) ? [localOf(v.ring.snoozedAt, v.timeZone).time] : [])] : []),
+          ...(v.withdraw !== undefined ? [timeOf(v.withdraw.time), ...(v.withdraw.at !== undefined && open.ids.has(v.withdraw.notification) ? [localOf(v.withdraw.at, v.timeZone).time] : [])] : [])
+        ]
+      }
 
       /**
        * Which alarm `which` means: a name of an alarm of this device (names are not matched on other devices: they are not
@@ -547,12 +550,10 @@ export const alarmsModule = defineModule({
             if (read.rows.length === 0) return read.cut ? yield* Effect.fail(unreadable()) : answer(say(texts, lang, "none"))
             return ask(read.rows, read.cut)
           }
-          const byName = read.rows.filter((r) => r.value.deviceId === here && r.value.name !== undefined && nameKey(r.value.name) === key)
-          if (byName.length === 1) return one(byName[0]!)
-          if (byName.length > 1) return ask(byName, false)
+          // A time request matches times, even when a local name has the same words.
           const time = parseTimeOfDay(which!, lang, { band: ALARM_BAND })
           if (time.kind === "ok") {
-            const at = read.rows.filter((r) => timesOf(r.value, read.open).some((t) => t.hour === time.value.hour && t.minute === time.value.minute))
+            const at = read.rows.filter((r) => timesOf(r, read.open, now).some((t) => t.hour === time.value.hour && t.minute === time.value.minute))
             if (at.length === 1) {
               const row = at[0]!
               const ring = row.value.ring
@@ -567,6 +568,9 @@ export const alarmsModule = defineModule({
             const words = timeWords({ hour: time.value.hour, minute: time.value.minute }, lang)
             return read.cut ? yield* Effect.fail(unreadable()) : answer(say(texts, lang, "noTimeMatch", { time: words }))
           }
+          const byName = read.rows.filter((r) => r.value.deviceId === here && r.value.name !== undefined && nameKey(r.value.name) === key)
+          if (byName.length === 1) return one(byName[0]!)
+          if (byName.length > 1) return ask(byName, false)
           return read.cut ? yield* Effect.fail(unreadable()) : answer(say(texts, lang, "unknown", { name: cut(which!, NAME_CHARS) }))
         })
 

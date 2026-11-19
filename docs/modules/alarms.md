@@ -145,8 +145,9 @@ alarms still being withdrawn appear only in cancellation choices. Their labels s
 
 - From any device it can be cancelled by its time: the time it was set for, also when it rang late or next to a
   daylight-saving change.
-- A pending snooze, an open snooze ring and its unfinished withdrawal also match the snooze time. Once that ring has
-  stopped, its former snooze time no longer selects the series.
+- A snooze matches its snooze time while it can still ring (through its 15-minute delivery window), or while its
+  notification is open, including an unfinished withdrawal. Once it can no longer ring and has no open notification,
+  that snooze time no longer selects the series.
 - On its own device it can also be cancelled by its name.
 
 ### Only the next, or all
@@ -158,9 +159,9 @@ Only the next one, or all of them?", and nothing changes (docs/MODULES-PLAN.md �
   in the answer. An occurrence already outside the 15-minute late window is reported as missed by its job; it is not
   the ring being skipped. The answer says "… is skipped; the next one is Friday at quarter to seven in the
   morning." When a snooze is still to ring, that snooze is the next ring: "The snoozed alarm is cancelled; the next
-  one is tomorrow at …". An owed snooze is still matched by its snooze time, and cancelling again while its withdrawal
-  is unfinished finishes that withdrawal before skipping a later series occurrence. Selecting an open snooze by its
-  snooze time stops that ring and keeps tomorrow's regular occurrence; selecting the regular time still skips the next
+  one is tomorrow at …". An owed snooze matches its snooze time while still eligible to ring or already open, and
+  cancelling again while its withdrawal is unfinished finishes that withdrawal before skipping a later series occurrence.
+  Selecting an open snooze by its snooze time stops that ring and keeps tomorrow's regular occurrence; selecting the regular time still skips the next
   series occurrence.
 - **"All"** ends the series.
 
@@ -179,8 +180,9 @@ the owed ring forgotten.
 
 ### Which alarm
 
-- by name, on its own device;
-- or by its time ("6:45": its next occurrence, its snooze, or the time its owed or ringing occurrence was set for);
+- a time request matches times only ("6:45": its next occurrence, an eligible or open snooze, or the time its owed or
+  ringing occurrence was set for), even if a local alarm has that name;
+- a name request matches names on its own device;
 - or the only one there is;
 - otherwise a question that lists them. Never the first of several.
 
