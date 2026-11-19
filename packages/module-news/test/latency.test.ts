@@ -150,7 +150,9 @@ describe("@pva/module-news: the main thread is never held long", () => {
       console.log(`news latency: the phrase with its list over ${ids.length * MAX_ENTRIES} cached items, longest main-thread stop ${longest.toFixed(2)} ms`)
       assert.isTrue(result.taken)
       const [shown] = kit.present.shown("kitchen-display")
-      assert.strictEqual(shown?.content.kind === "list" ? shown.content.items.length : 0, 6)
+      // The phrase says whole headlines within what a phrase may say (the titles here are at their longest): one, and the cut note.
+      assert.strictEqual(shown?.content.kind === "list" ? shown.content.items.length : 0, 2)
+      assert.isAtMost(kit.phrases.spoken.at(-1)!.text.length, 300)
       assert.isBelow(longest, bound(10))
     }))
 

@@ -7,7 +7,7 @@ import { Effect } from "effect"
 import { vi } from "vitest"
 import { feeds, items, SCAN_ITEMS, texts } from "../src/index.ts"
 import { cutCodePoints, oneLine } from "../src/text.ts"
-import { ARS, BBC, GUARDIAN, idle, refreshed, rss, startNews, xml, type Kit } from "./helpers.ts"
+import { ARS, BBC, GUARDIAN, NOS, NOW, NU, refreshed, rss, startNews, value, xml, type Kit } from "./helpers.ts"
 
 vi.setConfig({ testTimeout: 30_000 })
 
@@ -169,109 +169,157 @@ describe("@pva/module-news: the list of headlines on a screen", () => {
       assert.isAtMost(spoken!.length, 300)
     }))
 
-  it.effect("long titles and sources, markup and emoji: every line is one plain line of at most 80 characters, a cut never splits an emoji, and the spoken fallback fits", () =>
+  it.effect("a source name with characters outside the basic plane: kept as it is, cut inside 80 UTF-16 units at a code point boundary, and the list is shown", () =>
     Effect.gen(function*() {
-      const long = `${"Rainfall record broken across the whole of the northern provinces ".repeat(3)}😀😀😀`
-      const source = `${"The Very Long Named Regional Broadcasting Company ".repeat(1)}<b>of 😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀</b>`
-      const { kit } = yield* startNews(
-        { [BBC]: xml(rss("BBC News", [{ title: long, link: "https://bbc.example/a", ago: 5 }, { title: `Second story ${"😀".repeat(40)}`, link: "https://bbc.example/b", ago: 6 }])) },
-        { household }
-      )
+      const { kit } = yield* startNews({ [BBC]: xml(rss("BBC News", [{ title: "First ordinary headline", link: "https://bbc.example/a", ago: 5 }, { title: "Second ordinary headline", link: "https://bbc.example/b", ago: 6 }])) }, { household })
       yield* refreshed(kit)
       yield* kit.tool("feed_unsubscribe", { name: "Ars Technica" })
       yield* kit.tool("feed_unsubscribe", { name: "The Guardian" })
-      // The household's own name for the feed (stored text) may hold anything: the screen still gets one plain line.
       const store = kit.moduleStore()
       const row = (yield* store.collection(feeds).list({ where: { url: BBC } }))[0]!
-      yield* store.transaction((tx) => void tx.collection(feeds).update(row.id, (v) => ({ ...v, label: source.slice(0, 60) })))
+      const rename = (name: string) => store.transaction((tx) => void tx.collection(feeds).update(row.id, (v) => ({ ...v, label: name })))
+      // The whole name fits: kept, in every privacy class of device.
+      yield* rename("𠮷野家")
+      for (const device of ["kitchen-display", "robins-phone", "hall-screen"]) {
+        yield* kit.phrases.say("what's the news", { device })
+        yield* kit.present.settle
+        assert.deepStrictEqual(itemsOf(kit, device), ["First ordinary headline – 𠮷野家", "Second ordinary headline – 𠮷野家"], device)
+      }
+      // A name whose 24th unit falls inside a pair: the cut is before the pair, the line is a valid, bounded list.
+      yield* rename(`${"A".repeat(22)}𠮷野家`)
+      yield* kit.advance(31_000)
       yield* kit.phrases.say("what's the news", { device: "kitchen-display" })
       yield* kit.present.settle
       const shown = itemsOf(kit, "kitchen-display")
-      assert.strictEqual(shown.length, 2)
+      assert.deepStrictEqual(shown, [`First ordinary headline – ${"A".repeat(22)}…`, `Second ordinary headline – ${"A".repeat(22)}…`])
       for (const l of shown) {
-        assert.isAtMost(Array.from(l).length, 80)
-        assert.notMatch(l, /[<>\n\t]/)
+        assert.isAtMost(l.length, 80)
         assert.notMatch(l, /[\ud800-\udbff](?![\udc00-\udfff])|(?<![\ud800-\udbff])[\udc00-\udfff]/)
       }
-      const [spoken] = yield* spokenOf(kit)
-      assert.isAtMost(spoken!.length, 300)
-      assert.isAbove(spoken!.length, 0)
-      assert.isTrue(spoken!.startsWith("The news:") || spoken!.includes("says"))
+      // A name of pairs that crosses the 24-unit cut exactly.
+      yield* rename("😀".repeat(30))
+      yield* kit.advance(31_000)
+      yield* kit.phrases.say("what's the news", { device: "kitchen-display" })
+      yield* kit.present.settle
+      const emoji = itemsOf(kit, "kitchen-display")
+      assert.strictEqual(emoji[0], `First ordinary headline – ${"😀".repeat(11)}…`)
+      for (const l of emoji) assert.isAtMost(l.length, 80)
+      assert.strictEqual(lists(kit, "kitchen-display").length, 1)
     }))
 
-  it("the cut is at a code point boundary and the line is plain text", () => {
+  it("the cut counts UTF-16 units, at a code point boundary, and the line is plain text; valid pairs stay, lone surrogates go", () => {
     const emoji = "😀".repeat(100)
     const cut = cutCodePoints(emoji, 80)
-    assert.strictEqual(Array.from(cut).length, 80)
-    assert.notMatch(cut, /[\ud800-\udbff](?![\udc00-\udfff])/)
+    assert.isAtMost(cut.length, 80)
+    assert.strictEqual(cut, `${"😀".repeat(39)}…`)
     assert.strictEqual(cutCodePoints("short", 80), "short")
+    assert.strictEqual(oneLine("𠮷野家"), "𠮷野家")
+    assert.strictEqual(oneLine("😀"), "😀")
+    assert.strictEqual(oneLine("a\ud800b\udc00c"), "a b c")
     assert.strictEqual(oneLine("a <b>x</b>\n\tb\u202e c"), "a b x /b b c")
     assert.notMatch(oneLine("<script>alert(1)</script> news\u2028here"), /[<>\u2028]/)
   })
 })
 
-describe("@pva/module-news: what is on a screen follows the data", () => {
-  it.effect("a feed that is unsubscribed takes its headlines off every screen that shows them, and only those", () =>
+describe("@pva/module-news: what a phrase may say", () => {
+  const long = (k: number, len: number) => `Story ${k} ${"with a rather long headline about the northern provinces ".repeat(3)}`.slice(0, len).trim()
+  const fixtures = (a: string, b: string, len: number) => ({
+    [a]: xml(rss("A", [1, 2, 3, 4, 5].map((k) => ({ title: long(k, len), link: `https://a.example/${k}`, ago: 5 + k })))),
+    [b]: down
+  })
+  const bulk = (kit: Kit, source: string) =>
+    Effect.gen(function*() {
+      const store = kit.moduleStore()
+      const now = yield* kit.now
+      const feed = (yield* store.collection(feeds).list({ where: { url: source } }))[0]!
+      yield* store.transaction((tx) => {
+        for (let n = 0; n < SCAN_ITEMS + 20; n++) tx.collection(items).insert({ feedId: feed.id, title: `Bulk story number ${n.toString(36)}x${"q".repeat(3)}`, summary: "", url: `https://a.example/b${n}`, published: now - 3_600_000 - n })
+      })
+    })
+
+  // 80 characters: a whole headline fits beside the notes; 150 (the reviewer's boundary): not even one does, so its title is shortened.
+  for (const len of [80, 150]) {
+    for (const [lang, source, other, says, phrase, more] of [
+      ["en", BBC, GUARDIAN, "says BBC News.", "what's the news", /There (is one|are \w+) more; ask me for the headlines\.$/],
+      ["nl", NOS, NU, "meldt NOS.", "wat is het nieuws", /Er (is er nog één|zijn er nog \w+); vraag me om de koppen\.$/]
+    ] as const) {
+      it.effect(`${lang}, ${len}-character headlines, a cut read and a feed down: the phrase answer fits 300 characters with the notes and the rest, and the list and "the second one" are exactly what was said`, () =>
+        Effect.gen(function*() {
+          const { kit } = yield* startNews(fixtures(source, other, len), { household: { ...household, home: { HOME_LANGUAGE: lang === "nl" ? "nl-NL" : "en-GB" } }, settings: { headlines: 5 } })
+          yield* refreshed(kit)
+          yield* bulk(kit, source)
+          const outcome = yield* kit.phrases.say(phrase, { device: "kitchen-display" })
+          yield* kit.present.settle
+          assert.isTrue(outcome.taken)
+          const spoken = phraseSaid(kit).at(-1)!
+          assert.isAtMost(spoken.length, 300)
+          const told = (spoken.match(/Story \d /g) ?? []).map((m) => Number(m.slice(6, 7)))
+          assert.isAbove(told.length, 0)
+          assert.isBelow(told.length, 5)
+          assert.deepStrictEqual(told, [1, 2, 3, 4, 5].slice(0, told.length))
+          if (len === 80) {
+            // Whole headlines: each one said is complete, with its source.
+            for (const k of told) assert.include(spoken, `${long(k, len)}, ${lang === "nl" ? "meldt" : "says"} ${lang === "nl" ? "NOS" : "BBC News"}.`)
+            assert.strictEqual(spoken.split(says).length - 1, told.length)
+          }
+          // The honest notes, and the closing sentence about the rest.
+          assert.include(spoken, lang === "nl" ? "Ik heb de nieuwste" : "I read the newest")
+          assert.match(spoken, lang === "nl" ? /van je \w+ nieuwsfeeds kon ik nu niet bereiken\./ : /of your \w+ news feeds could not be reached just now\./)
+          assert.match(spoken, more)
+          // The list shows exactly what was said, and its notes.
+          const lines = itemsOf(kit, "kitchen-display")
+          assert.strictEqual(lines.length, told.length + 2)
+          for (const [i, k] of told.entries()) assert.isTrue(lines[i]!.startsWith(`Story ${k} `))
+          // What "the second one" means is what was said: a story past the spoken ones was never listed.
+          assert.strictEqual(value(yield* kit.tool("news_story", { ref: told.length })).title.slice(0, 8), `Story ${told.length} `)
+          const past = value(yield* kit.tool("news_story", { ref: told.length + 1 })).spoken as string
+          assert.strictEqual(past, told.length === 1 ? texts[lang].badrefOne : texts[lang].badref.replace("{count}", lang === "nl" ? ["", "één", "twee", "drie", "vier"][told.length]! : ["", "one", "two", "three", "four"][told.length]!))
+        }))
+    }
+  }
+
+  it.effect("outside a phrase turn the action answers as before, in full, with every selected headline", () =>
+    Effect.gen(function*() {
+      const { kit } = yield* startNews(fixtures(BBC, GUARDIAN, 150), { household, settings: { headlines: 5 } })
+      yield* refreshed(kit)
+      const said = ((yield* kit.action("top")) as { say: string }).say
+      assert.isAbove(said.length, 600)
+      for (const k of [1, 2, 3, 4, 5]) assert.include(said, `Story ${k} `)
+      assert.notMatch(said, /ask me for the headlines/)
+    }))
+})
+
+describe("@pva/module-news: the list is a snapshot of the answer", () => {
+  it.effect("it is returned with the answer; the tools never touch a screen: unsubscribing a feed and the model's own headlines leave it until its lifetime ends", () =>
     Effect.gen(function*() {
       const { kit } = yield* startNews(world, { household })
       yield* refreshed(kit)
       yield* kit.phrases.say("what's the news", { device: "kitchen-display" })
-      yield* kit.phrases.say("what's the news", { device: "hall-screen" })
       yield* kit.present.settle
+      const [first] = lists(kit, "kitchen-display")
       assert.strictEqual(lists(kit, "kitchen-display").length, 1)
-      assert.strictEqual(lists(kit, "hall-screen").length, 1)
-      // Ars Technica's story is the fourth, not one of the three told: leaving it changes nothing on the screens.
-      yield* kit.tool("feed_unsubscribe", { name: "Ars Technica" })
-      yield* kit.present.settle
-      assert.strictEqual(lists(kit, "kitchen-display").length, 1)
-      assert.strictEqual(lists(kit, "hall-screen").length, 1)
-      // The Guardian's is one of them: both screens lose their list at once.
+      const sent = kit.present.messages.length
+      // The model reads headlines of its own, and a feed whose stories are on the list is unsubscribed: nothing is sent to a screen.
+      yield* kit.tool("news_headlines", { topic: "tech" }, { device: "kitchen-display", turnId: 20 })
       yield* kit.tool("feed_unsubscribe", { name: "The Guardian" })
       yield* kit.present.settle
-      assert.deepStrictEqual(kit.present.shown("kitchen-display"), [])
-      assert.deepStrictEqual(kit.present.shown("hall-screen"), [])
-    }))
-
-  it.effect("a feed whose stories are not on the screen leaves it alone", () =>
-    Effect.gen(function*() {
-      const { kit } = yield* startNews(
-        { ...world, [ARS]: xml(rss("Ars Technica", [{ title: "Old chip story", link: "https://ars.example/old", ago: 600 }])) },
-        { household, settings: { headlines: 2 } }
-      )
-      yield* refreshed(kit)
-      yield* kit.phrases.say("what's the news", { device: "kitchen-display" })
-      yield* kit.present.settle
-      assert.strictEqual(itemsOf(kit, "kitchen-display").length, 2)
-      yield* kit.tool("feed_unsubscribe", { name: "Ars Technica" })
-      yield* kit.present.settle
-      assert.strictEqual(lists(kit, "kitchen-display").length, 1)
-      yield* kit.tool("feed_unsubscribe", { name: "The Guardian" })
+      assert.strictEqual(kit.present.messages.length, sent)
+      assert.deepStrictEqual(lists(kit, "kitchen-display").map((p) => p.id), [first!.id])
+      // It ends by its 30 seconds.
+      yield* kit.advance(31_000)
       yield* kit.present.settle
       assert.deepStrictEqual(kit.present.shown("kitchen-display"), [])
     }))
 
-  it.effect("a later answer replaces the list on the device; the model's own headlines and an empty answer take it down", () =>
+  it.effect("a later answer replaces the list on that device; an empty answer shows nothing new and leaves the earlier list to its lifetime", () =>
     Effect.gen(function*() {
       const { kit } = yield* startNews(world, { household })
       yield* refreshed(kit)
       yield* kit.phrases.say("what's the news", { device: "kitchen-display" })
       yield* kit.present.settle
-      const first = lists(kit, "kitchen-display")
-      assert.strictEqual(first.length, 1)
-      // Asked again: still one list on that screen.
       yield* kit.phrases.say("what's the news", { device: "kitchen-display" })
       yield* kit.present.settle
       assert.strictEqual(kit.present.shown("kitchen-display").length, 1)
-      // The model's own list replaces the conversation's last list: what the screen shows is not it any more.
-      yield* kit.tool("news_headlines", { topic: "tech" }, { device: "kitchen-display" })
-      yield* kit.present.settle
-      assert.deepStrictEqual(kit.present.shown("kitchen-display"), [])
-      // Shown again, then the news is gone: three days on there is nothing new, and the screen is cleared by the empty answer.
-      yield* kit.phrases.say("what's the news", { device: "kitchen-display" })
-      yield* kit.present.settle
-      assert.strictEqual(kit.present.shown("kitchen-display").length, 1)
-      // The stories are gone from the cache (the clean-up took them): the next answer finds nothing, says so, and the screen it
-      // left on is cleared by that empty answer, not left showing what is no longer there.
       const store = kit.moduleStore()
       yield* store.transaction((tx) => {
         for (const r of tx.collection(items).list({})) tx.collection(items).remove(r.id)
@@ -279,10 +327,13 @@ describe("@pva/module-news: what is on a screen follows the data", () => {
       yield* kit.phrases.say("what's the news", { device: "kitchen-display" })
       yield* kit.present.settle
       assert.notStrictEqual(phraseSaid(kit).at(-1), SAID)
+      assert.strictEqual(kit.present.shown("kitchen-display").length, 1)
+      yield* kit.advance(31_000)
+      yield* kit.present.settle
       assert.deepStrictEqual(kit.present.shown("kitchen-display"), [])
     }))
 
-  it.effect("it is transient: it ends by itself, and it does not come back after a restart of the module", () =>
+  it.effect("it is transient: it does not come back after a restart of the module", () =>
     Effect.gen(function*() {
       const { kit } = yield* startNews(world, { household })
       yield* refreshed(kit)
@@ -292,27 +343,25 @@ describe("@pva/module-news: what is on a screen follows the data", () => {
       yield* kit.restart
       yield* kit.present.settle
       assert.deepStrictEqual(kit.present.shown("kitchen-display"), [])
-      // After the restart a new question shows it again.
-      yield* kit.phrases.say("what's the news", { device: "kitchen-display" })
-      yield* kit.present.settle
-      assert.strictEqual(lists(kit, "kitchen-display").length, 1)
-      yield* kit.advance(31_000)
-      yield* kit.present.settle
-      assert.deepStrictEqual(kit.present.shown("kitchen-display"), [])
     }))
 
-  it.effect("a page that lost its connection shows nothing, and the next answer shows it again", () =>
+  it.effect("a page that lost its connection shows nothing; a list still within its lifetime comes back when the page reconnects, before any new question, and not after it ended", () =>
     Effect.gen(function*() {
       const { kit } = yield* startNews(world, { household })
       yield* refreshed(kit)
       yield* kit.phrases.say("what's the news", { device: "kitchen-display" })
       yield* kit.present.settle
+      const [first] = lists(kit, "kitchen-display")
       yield* kit.notify.disconnect("kitchen-display")
       assert.deepStrictEqual(kit.present.shown("kitchen-display"), [])
       yield* kit.notify.connect("kitchen-display")
-      yield* kit.phrases.say("what's the news", { device: "kitchen-display" })
       yield* kit.present.settle
-      assert.strictEqual(lists(kit, "kitchen-display").length, 1)
+      assert.deepStrictEqual(kit.present.shown("kitchen-display").map((p) => p.id), [first!.id])
+      yield* kit.notify.disconnect("kitchen-display")
+      yield* kit.advance(31_000)
+      yield* kit.notify.connect("kitchen-display")
+      yield* kit.present.settle
+      assert.deepStrictEqual(kit.present.shown("kitchen-display"), [])
     }))
 })
 
@@ -326,15 +375,13 @@ describe("@pva/module-news: the same invocation twice acts once", () => {
       yield* kit.present.settle
       assert.strictEqual(first.say, SAID)
       assert.strictEqual(lists(kit, "kitchen-display").length, 1)
-      // The screen's list is taken down (another turn's tool), then the same invocation arrives again.
-      yield* kit.tool("news_headlines", { topic: "tech" }, { device: "kitchen-display", turnId: 702 })
+      // The list ended; the same invocation arrives again: the same words, nothing shown.
+      yield* kit.advance(31_000)
       yield* kit.present.settle
       assert.deepStrictEqual(kit.present.shown("kitchen-display"), [])
-      const messages = kit.present.messages.length
       const again = (yield* kit.action("top", {}, as)) as { say: string }
       yield* kit.present.settle
       assert.deepStrictEqual(again, first)
-      assert.strictEqual(kit.present.messages.length, messages)
       assert.deepStrictEqual(kit.present.shown("kitchen-display"), [])
       // Another invocation (its own turn) acts: it says and shows again.
       const next = (yield* kit.action("top", {}, { ...as, turnId: 703 })) as { say: string }
@@ -345,6 +392,14 @@ describe("@pva/module-news: the same invocation twice acts once", () => {
       yield* kit.action("top", {}, { ...as, device: "hall-screen" })
       yield* kit.present.settle
       assert.strictEqual(lists(kit, "hall-screen").length, 1)
+      // A model call (voice) twice with one turn id runs both times.
+      yield* kit.advance(31_000)
+      yield* kit.action("top", {}, { device: "kitchen-display", source: "voice", turnId: 9 })
+      yield* kit.present.settle
+      yield* kit.advance(31_000)
+      yield* kit.action("top", {}, { device: "kitchen-display", source: "voice", turnId: 9 })
+      yield* kit.present.settle
+      assert.strictEqual(lists(kit, "kitchen-display").length, 1)
     }))
 
   it.effect("the memory of invocations is bounded: past 64 the oldest is forgotten and acts again", () =>
@@ -354,10 +409,9 @@ describe("@pva/module-news: the same invocation twice acts once", () => {
       const as = (turnId: number) => ({ device: "kitchen-display", source: "phrase" as const, turnId })
       yield* kit.action("top", {}, as(1))
       for (let i = 2; i <= 70; i++) yield* kit.action("top", {}, as(i))
+      yield* kit.advance(31_000)
       yield* kit.present.settle
       // A repeat of the last one is still remembered: nothing is shown again.
-      yield* kit.tool("news_headlines", { topic: "tech" }, { device: "kitchen-display", turnId: 900 })
-      yield* kit.present.settle
       yield* kit.action("top", {}, as(70))
       yield* kit.present.settle
       assert.deepStrictEqual(kit.present.shown("kitchen-display"), [])
@@ -365,5 +419,27 @@ describe("@pva/module-news: the same invocation twice acts once", () => {
       yield* kit.action("top", {}, as(1))
       yield* kit.present.settle
       assert.strictEqual(lists(kit, "kitchen-display").length, 1)
+    }))
+
+  it.effect("one record for the module: invocations of another assistant (other settings) push the oldest out, and each runs with its own settings", () =>
+    Effect.gen(function*() {
+      const two = {
+        ...household,
+        assistants: [{ id: "jeff", modules: { news: { own: { headlines: 1 } } } }, { id: "astra", modules: { news: { own: { headlines: 3 } } } }],
+        devices: household.devices!.map((d) => ({ ...d, assistants: [d.id === "hall-screen" ? "astra" : "jeff"] }))
+      }
+      const { kit } = yield* startNews(world, { household: two })
+      yield* refreshed(kit)
+      const jeff = { device: "kitchen-display", assistant: "jeff", source: "phrase" as const, turnId: 1 }
+      const first = (yield* kit.action("top", {}, jeff)) as { say: string }
+      assert.strictEqual(first.say, "The news: Rail strike called off, says The Guardian.")
+      for (let i = 2; i <= 65; i++) {
+        const r = (yield* kit.action("top", {}, { device: "hall-screen", assistant: "astra", source: "phrase" as const, turnId: i })) as { say: string }
+        assert.strictEqual(r.say, SAID)
+      }
+      // Something newer arrives; the first invocation, forgotten, runs again with its own settings and says it.
+      yield* kit.moduleStore().transaction((tx) => void tx.collection(items).insert({ feedId: (tx.collection(feeds).list({ where: { url: GUARDIAN } })[0]!).id, title: "Breaking newer headline", summary: "", published: NOW }))
+      const again = (yield* kit.action("top", {}, jeff)) as { say: string }
+      assert.strictEqual(again.say, "The news: Breaking newer headline, says The Guardian.")
     }))
 })

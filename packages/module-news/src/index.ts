@@ -1,6 +1,6 @@
 import {
   ActionError, type Actor, CurrentJob, CurrentTurn, defineAction, defineCollection, defineModule, type HostView, type ModuleDefinition, makeTool, offThread,
-  type OffThreadError, offThreadTask, Param, type PresentHandle, type Presentation, type Row, Setting, ToolError
+  type OffThreadError, offThreadTask, Param, PHRASE_ANSWER_CHARS, type Presentation, type Row, Setting, ToolError
 } from "@pva/core"
 import { speakList, speakNumber } from "@pva/language"
 import { BriefingSectionError, type BriefingRequest, type BriefingSectionResult, BriefingSections, defineTexts, homeLanguage, isLine, type Language, say, StoredText } from "@pva/module-contracts"
@@ -72,7 +72,9 @@ export const texts = defineTexts({
     screenTitle: "News",
     screenCut: "Older stories were not read.",
     screenDownAll: "Feeds not reached; these are the last headlines.",
-    screenDownSome: "{count} of {total} feeds not reached."
+    screenDownSome: "{count} of {total} feeds not reached.",
+    moreHeadlines: "There are {count} more; ask me for the headlines.",
+    moreHeadlinesOne: "There is one more; ask me for the headlines."
   },
   nl: {
     nofeeds: "Er zijn nog geen nieuwsfeeds ingesteld. Zeg \"abonneer op\" en het adres van een feed, of voeg er een toe in de instellingen.",
@@ -128,7 +130,9 @@ export const texts = defineTexts({
     screenTitle: "Nieuws",
     screenCut: "Oudere berichten zijn niet gelezen.",
     screenDownAll: "Feeds niet bereikt; dit zijn de laatste koppen.",
-    screenDownSome: "{count} van {total} feeds niet bereikt."
+    screenDownSome: "{count} van {total} feeds niet bereikt.",
+    moreHeadlines: "Er zijn er nog {count}; vraag me om de koppen.",
+    moreHeadlinesOne: "Er is er nog één; vraag me om de koppen."
   }
 })
 
@@ -160,15 +164,13 @@ export const CLEANUP_BATCHES = 100
 /** Batches one run of a feed's purge removes before it continues in a next run. */
 export const PURGE_BATCHES = 20
 
-/** A line of the list on a screen: at most 80 characters (the presentation's bound); the source keeps 24 of them at most. */
+/** A line of the list on a screen: at most 80 UTF-16 units (the presentation protocol's bound); the source keeps 24 of them at most. */
 const SCREEN_LINE = 80
 const SCREEN_SOURCE = 24
 /** What a presentation's `spoken` text may be, at most. */
 const SPOKEN_MAX = 300
 /** Invocations of the phrase command remembered, to answer a repeat of one with its first outcome. */
 const REPLAYS = 64
-/** Devices whose news list on screen is remembered, to take it down when the news it shows changes. */
-const SCREENS = 64
 
 const HOUR = 3_600_000
 const TIME = Schema.Int.check(Schema.isBetween({ minimum: 0, maximum: 8_640_000_000_000_000 }))
@@ -309,11 +311,11 @@ const fitted = (lang: Language, key: TextKey, params: Record<string, string>, ma
   return say(texts, lang, key, { ...params, title: bare(cutAtWord(params.title!, Math.max(20, room))) })
 }
 
-/** One line of the list: the title and its source, in at most `SCREEN_LINE` code points, the title giving way first. */
+/** One line of the list: the title and its source, in at most `SCREEN_LINE` UTF-16 units, the title giving way first. */
 const screenLine = (title: string, source: string): string => {
   const s = cutCodePoints(oneLine(source), SCREEN_SOURCE)
   const joiner = s === "" ? "" : " – "
-  const room = SCREEN_LINE - Array.from(s).length - joiner.length
+  const room = SCREEN_LINE - s.length - joiner.length
   return `${cutCodePoints(oneLine(title), Math.max(10, room))}${joiner}${s}`
 }
 
@@ -741,31 +743,26 @@ export const newsModule = (deps: NewsDeps = {}) =>
             return { _tag: "story", row, source: feed.value.label } as const
           })
 
-        // --- the news lists on screens ---------------------------------------------------------------------------------
+        // --- phrase invocations answered once ---------------------------------------------------------------------------
         /**
-         * The list of headlines each device was last shown (by `news.top`), with the feeds its stories came from: a list on
-         * a screen is taken down when the news it shows stops applying (a feed it shows was unsubscribed, a later answer
-         * found nothing or replaced it). Kept for this run of the module only: a transient presentation leaves with its
-         * part, so a restart shows nothing from before. Bounded: the oldest device is forgotten past `SCREENS`.
+         * The record of finished phrase invocations, one for the whole module (every settings instance of the start part
+         * uses it): the outcome of the first run of one identity (the gateway's turn: assistant, conversation, turn, device,
+         * connection) is what a repeat gets. Phrase turns only. One at a time, so two runs of one identity cannot both
+         * act; the work is the caller's own (its settings, its language). Bounded: the oldest is forgotten past `REPLAYS`.
          */
-        const screens = new Map<string, { readonly handle: PresentHandle; readonly feedIds: ReadonlySet<string> }>()
-        const takeDown = (pick: (device: string, feedIds: ReadonlySet<string>) => boolean) =>
-          Effect.forEach(
-            [...screens.entries()].filter(([device, shown]) => pick(device, shown.feedIds)),
-            ([device, shown]) => {
-              if (screens.get(device) === shown) screens.delete(device)
-              return shown.handle.dismiss.pipe(Effect.ignoreCause)
-            },
-            { discard: true }
-          )
-        const screen = {
-          keep: (device: string, handle: PresentHandle, feedIds: ReadonlySet<string>) => {
-            screens.delete(device)
-            if (screens.size >= SCREENS) screens.delete(screens.keys().next().value!)
-            screens.set(device, { handle, feedIds })
-          },
-          dismissOn: (device: string | undefined) => (device === undefined ? Effect.void : takeDown((d) => d === device)),
-          dismissFeed: (feedId: string) => takeDown((_, feedIds) => feedIds.has(feedId))
+        const replays = new Map<string, { readonly say: string }>()
+        const replaying = Semaphore.makeUnsafe(1)
+        const replay = {
+          once: <E>(identity: string, work: Effect.Effect<{ readonly say: string; readonly present?: Presentation }, E>) =>
+            replaying.withPermits(1)(Effect.gen(function*() {
+              const first = replays.get(identity)
+              if (first !== undefined) return first
+              const done = yield* work
+              if (replays.size >= REPLAYS) replays.delete(replays.keys().next().value!)
+              // What is kept is what was said: the presentation was handed over with the first outcome.
+              replays.set(identity, { say: done.say })
+              return done
+            }))
         }
 
         // --- subscribing -----------------------------------------------------------------------------------------------
@@ -835,8 +832,6 @@ export const newsModule = (deps: NewsDeps = {}) =>
               tx.collection(feeds).remove(feed.id)
               if (purge._tag === "Some") purge.value.writeIn(tx)
             })
-            // What a screen shows of this feed is no longer the news.
-            yield* screen.dismissFeed(feed.id)
             return say(texts, lang, "unsubscribed", { name: feed.value.label })
           })
 
@@ -876,13 +871,13 @@ export const newsModule = (deps: NewsDeps = {}) =>
         }
 
         return {
-          value: { feedStore, itemStore, gate, allFeeds, readStories, emptyText, downText, remember, storyOf, subscribe, unsubscribe, screen },
+          value: { feedStore, itemStore, gate, allFeeds, readStories, emptyText, downText, remember, storyOf, subscribe, unsubscribe, replay },
           contributions: [BriefingSections.of(section)]
         }
       }),
     start: (ctx) =>
       Effect.gen(function*() {
-        const { allFeeds, downText, emptyText, gate, readStories, remember, screen, storyOf, subscribe, unsubscribe } = ctx.shared
+        const { allFeeds, downText, emptyText, gate, readStories, remember, replay, storyOf, subscribe, unsubscribe } = ctx.shared
         const lang = () => languageOf(ctx.host.view())
         const contact = () => {
           const c = ctx.host.view().home.HOME_API_CONTACT
@@ -917,22 +912,50 @@ export const newsModule = (deps: NewsDeps = {}) =>
         /**
          * The news as one spoken text (the typed action): the same reading, said without the model, and the list of the
          * headlines that were read out for a screen: a title and its source a line, the same notes (cut, feeds that could not
-         * be reached) as lines of their own. `screen` is absent when no story was told.
+         * be reached) as lines of their own. `presentation` is absent when no story was told.
+         *
+         * With a `budget` (a phrase turn: what a phrase may say) the answer is built inside it, in whole headlines in order,
+         * with room kept for the notes and, when headlines do not fit, for one closing sentence saying how many more there
+         * are. The list and the remembered selection (what "the second one" means) are exactly the headlines spoken.
          */
-        const wordedHeadlines = (language: Language, max: number) =>
+        const wordedHeadlines = (language: Language, max: number, budget?: number) =>
           Effect.gen(function*() {
             const now = yield* Clock.currentTimeMillis
             const read = yield* readStories({ hours: DEFAULT_WINDOW_HOURS, now })
             if (read._tag !== "stories") return { said: say(texts, language, "nofeeds") }
             if (read.stories.length === 0) return { said: emptyText(language, read, {}) }
-            const shown = read.stories.slice(0, max)
-            yield* remember(shown)
+            const selected = read.stories.slice(0, max)
             const down = downText(language, read)
             const paramsOf = (s: Story) => ({ title: bare(titleOf(language, s.row.value)), source: s.source })
-            const lines = shown.map((s) => say(texts, language, "line", paramsOf(s)))
-            const cutLine = read.cut ? say(texts, language, "cut", { count: num(SCAN_ITEMS, language) }) : undefined
+            const lineOf = (s: Story) => say(texts, language, "line", paramsOf(s))
             const intro = say(texts, language, "intro")
-            const notes = [...(cutLine !== undefined ? [cutLine] : []), ...(down !== undefined ? [down] : [])]
+            const notes = [...(read.cut ? [say(texts, language, "cut", { count: num(SCAN_ITEMS, language) })] : []), ...(down !== undefined ? [down] : [])]
+            const moreOf = (left: number) => left === 0 ? [] : [left === 1 ? say(texts, language, "moreHeadlinesOne") : say(texts, language, "moreHeadlines", { count: num(left, language) })]
+            let spokenStories = selected
+            let said = [intro, ...selected.map(lineOf), ...notes].join(" ")
+            if (budget !== undefined) {
+              let fit: string | undefined
+              for (let n = selected.length; n >= 1; n--) {
+                const whole = [intro, ...selected.slice(0, n).map(lineOf), ...notes, ...moreOf(selected.length - n)].join(" ")
+                if (whole.length <= budget) {
+                  spokenStories = selected.slice(0, n)
+                  fit = whole
+                  break
+                }
+              }
+              if (fit === undefined) {
+                // Not even one whole headline beside the notes: the first, its title shortened at a word.
+                spokenStories = selected.slice(0, 1)
+                const tail = [...notes, ...moreOf(selected.length - 1)]
+                const room = budget - [intro, ...tail].join(" ").length - 1
+                const first = fitted(language, "line", paramsOf(selected[0]!), Math.max(40, room))
+                fit = [intro, first, ...tail].join(" ")
+                if (fit.length > budget) fit = [first, ...tail].join(" ")
+                if (fit.length > budget) fit = fitted(language, "line", paramsOf(selected[0]!), budget)
+              }
+              said = fit
+            }
+            yield* remember(spokenStories)
             const all = read.down > 0 && read.down === read.relevant
             const screenNotes = [
               ...(read.cut ? [{ id: "note_cut", text: say(texts, language, "screenCut") }] : []),
@@ -945,17 +968,17 @@ export const newsModule = (deps: NewsDeps = {}) =>
               title: say(texts, language, "screenTitle"),
               style: "bullets",
               items: [
-                ...shown.map((s, i) => ({ id: `s${i + 1}`, text: screenLine(titleOf(language, s.row.value), s.source) })),
+                ...spokenStories.map((s, i) => ({ id: `s${i + 1}`, text: screenLine(titleOf(language, s.row.value), s.source) })),
                 ...screenNotes.map((n) => ({ id: n.id, text: cutCodePoints(oneLine(n.text), SCREEN_LINE) }))
               ],
-              // What the model says where nothing is shown: the same sentences, whole, within the bound.
-              spoken: spokenWithin(intro, lines, notes, SPOKEN_MAX, (room) => fitted(language, "line", paramsOf(shown[0]!), room)),
+              // What the model says where nothing is shown: in a phrase turn the answer itself, else the same sentences,
+              // whole, within the bound.
+              spoken: budget !== undefined
+                ? said
+                : spokenWithin(intro, selected.map(lineOf), notes, SPOKEN_MAX, (room) => fitted(language, "line", paramsOf(selected[0]!), room)),
               sensitivity: "household"
             }
-            return {
-              said: [intro, ...lines, ...notes].join(" "),
-              screen: { presentation, feedIds: new Set(shown.map((s) => s.row.value.feedId)) }
-            }
+            return { said, presentation }
           })
 
         const found = (language: Language, f: { readonly _tag: "nolist" | "gone" } | { readonly _tag: "badref"; readonly count: number }) =>
@@ -977,11 +1000,7 @@ export const newsModule = (deps: NewsDeps = {}) =>
           speculative: true,
           latency: "instant",
           execute: ({ topic, source, max, sinceHours }) =>
-            // The list the model tells replaces the conversation's last list: what an earlier answer left on this screen is no longer it.
-            Effect.andThen(
-              Effect.flatMap(CurrentTurn, (turn) => screen.dismissOn(turn?.deviceId)),
-              headlines(topic, source, sinceHours ?? DEFAULT_WINDOW_HOURS, max ?? ctx.settings.headlines, lang())
-            ).pipe(
+            headlines(topic, source, sinceHours ?? DEFAULT_WINDOW_HOURS, max ?? ctx.settings.headlines, lang()).pipe(
               Effect.mapError(() => new ToolError({ message: say(texts, lang(), "unreadable") }))
             )
         })
@@ -1146,11 +1165,6 @@ export const newsModule = (deps: NewsDeps = {}) =>
         })
 
         // --- typed actions: no language model ----------------------------------------------------------------------------
-        // A phrase invocation is answered once: the outcome of the first run of one identity (the gateway's turn: assistant,
-        // conversation, turn, device, connection) is what a repeat gets, nothing is read, remembered or shown again. One at
-        // a time, so two runs of one identity cannot both act. Bounded: the oldest is forgotten past `REPLAYS`.
-        const replays = new Map<string, { readonly say: string }>()
-        const once = Semaphore.makeUnsafe(1)
         const topAction = defineAction({
           id: "top",
           label: "Tell the news",
@@ -1164,33 +1178,19 @@ export const newsModule = (deps: NewsDeps = {}) =>
           params: {},
           speculative: true,
           risk: "read",
+          // The list of the headlines is returned with the answer (`present`): the host shows it when the turn is committed.
           run: () =>
-            once.withPermits(1)(Effect.gen(function*() {
-              const language = lang()
+            Effect.gen(function*() {
               const turn = yield* CurrentTurn
-              const identity = turn?.source === "phrase"
-                ? [turn.assistantId ?? "", turn.conversationId, turn.turnId, turn.deviceId ?? "", turn.connection?.id ?? ""].join("\u0000")
-                : undefined
-              const first = identity === undefined ? undefined : replays.get(identity)
-              if (first !== undefined) return first
-              const answer = yield* wordedHeadlines(language, ctx.settings.headlines)
-              const device = turn?.deviceId
-              if (answer.screen === undefined) {
-                // An empty answer shows nothing, and what an earlier answer left on this screen is no longer true.
-                yield* screen.dismissOn(device)
-              } else {
-                // A device that cannot show it changes nothing about the answer: the outcome of showing is not read.
-                const handle = yield* ctx.present.show("origin", answer.screen.presentation).pipe(Effect.option)
-                if (handle._tag === "Some" && device !== undefined) screen.keep(device, handle.value, answer.screen.feedIds)
-                else yield* screen.dismissOn(device)
-              }
-              const outcome = { say: answer.said }
-              if (identity !== undefined) {
-                if (replays.size >= REPLAYS) replays.delete(replays.keys().next().value!)
-                replays.set(identity, outcome)
-              }
-              return outcome
-            })).pipe(Effect.mapError(() => new ActionError({ message: say(texts, lang(), "unreadable") })))
+              const phrase = turn?.source === "phrase"
+              const work = wordedHeadlines(lang(), ctx.settings.headlines, phrase ? PHRASE_ANSWER_CHARS : undefined).pipe(
+                Effect.map((a) => ({ say: a.said, ...(a.presentation !== undefined ? { present: a.presentation } : {}) }))
+              )
+              if (!phrase) return yield* work
+              // A phrase invocation is answered once, by the module's one record (`shared`): assistant, conversation, turn, device, connection.
+              const identity = [turn.assistantId ?? "", turn.conversationId, turn.turnId, turn.deviceId ?? "", turn.connection?.id ?? ""].join("\u0000")
+              return yield* replay.once(identity, work)
+            }).pipe(Effect.mapError(() => new ActionError({ message: say(texts, lang(), "unreadable") })))
         })
 
         const unsubscribeAction = defineAction({

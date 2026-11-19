@@ -85,7 +85,7 @@ Typed actions (they run without the language model; the model is also offered ea
 | `news.feeds` (`news_feeds`) | read | "You follow A, B and three more." | "which news feeds do I follow", "welke nieuwsfeeds volg ik" |
 
 **Phrase command.** `news.top` is also a phrase command (docs/PHRASES.md): said after the wake phrase it runs the action
-without the language model, with the same sentences as the typed action. Nothing else of the module has phrases.
+without the language model. Nothing else of the module has phrases.
 
 | Language | Phrases |
 |---|---|
@@ -94,33 +94,45 @@ without the language model, with the same sentences as the typed action. Nothing
 
 Matching is exact on words (case, accents and punctuation do not count): "what's the news today", "the news" and "news"
 are not the command and go on to the assistant. The action's own sentences are reached through the phrase: no feeds,
-"I haven't fetched the news yet", "I couldn't reach your news feeds", nothing new. A repeat of one phrase invocation (the
-same assistant, conversation, turn, device and connection) is answered with its first outcome and reads, remembers and
-shows nothing again; a new invocation acts again. The memory is in this run of the module and holds the newest 64.
+"I haven't fetched the news yet", "I couldn't reach your news feeds", nothing new.
 
-**The list on the screen.** Whenever `news.top` tells stories (by phrase, or by the intent agent), the headlines that were
-read out are also shown on the screen of the device that asked, as a transient `list` titled "News" (docs/PRESENTING.md):
-a title and its source a line ("Storm hits the coast – BBC News"), at most 80 characters a line, the source at most 24 of
-them and the title giving way first. The two notes the answer carries are lines of the list in a few words: "Older stories
-were not read." when the read was cut, and "1 of 3 feeds not reached." (or "Feeds not reached; these are the last
-headlines.") when feeds could not be reached. Nothing the answer did not say is on it ("and N more" is not said, so it is
-not shown). Text from feeds is plain text there: one line, no brackets, control or bidirectional characters, cut at a
-code point boundary (one function, `cutCodePoints`, so an emoji at the limit is never split). Its `spoken` text, which the
-model says where the asking device shows nothing, is the answer's own sentences, whole, within 300 characters: stories go
-from the end first, the notes stay.
+- **What a phrase may say.** A phrase answer is at most 300 characters (`PHRASE_ANSWER_CHARS`) and the host cuts what is
+  longer. So in a phrase turn (and only there) the action builds its answer inside that limit: whole headlines, in order,
+  with room kept for the honest notes (the read was cut short, feeds could not be reached) and, when not every selected
+  headline fits, one closing sentence: "There are three more; ask me for the headlines." ("Er zijn er nog drie; vraag me
+  om de koppen."). When not even one whole headline fits beside the notes, the first one is said with its title shortened
+  at a word. The list on the screen and what "the second one" refers to are exactly the headlines that were spoken.
+  Outside a phrase turn (the typed action, the model's `news_top`, the tools) the answer is exactly as it was: every
+  selected headline.
+- **Said once.** A repeat of one phrase invocation (the same assistant, conversation, turn, device and connection) is
+  answered with its first words and reads, remembers and shows nothing again; a new invocation acts again. The record is
+  one for the whole module, in `shared`, used by every assistant whatever its settings; a repeat runs nothing, and a new
+  invocation runs with its own assistant's settings. It holds the newest 64 finished phrase invocations, this run of the
+  module only. Calls that are not phrase turns (the model's, a routine's) are never remembered.
 
+**The list on the screen.** When `news.top` tells stories, it returns the headlines that were read out with its answer
+(`{ say, present }`; as the model's tool `news_top`, `{ forModel, present }`): a transient `list` titled "News"
+(docs/PRESENTING.md), shown on the screen of the device that asked once the turn is committed. A title and its source a
+line ("Storm hits the coast – BBC News"), at most 80 UTF-16 units a line, the source at most 24 of them and the title
+giving way first. The two notes the answer carries are lines of the list in a few words: "Older stories were not read."
+when the read was cut, and "1 of 3 feeds not reached." (or "Feeds not reached; these are the last headlines.") when feeds
+could not be reached. Nothing the answer did not say is on it. Text from feeds is plain text there: one line, no
+brackets, control or bidirectional characters, lone surrogates dropped and every valid character (also outside the
+basic plane: "𠮷野家") kept; cut at a code point boundary inside the unit bound (one function, `cutCodePoints`). Its
+`spoken` text, which the model says where the asking device shows nothing, is the answer's own sentences (in a phrase
+turn, the answer itself), whole, within 300 characters.
+
+- **A snapshot of the answer.** The module never touches a screen from inside a tool, and holds no handle: the list is
+  what the answer said when it said it. It ends by its own 30 seconds, or when the next presentation on that device
+  replaces it. It is **not** taken down when a feed it shows is unsubscribed, when a later answer finds nothing, or when
+  the model reads headlines of its own: it simply ends within 30 seconds. A later answer on the same device replaces it.
+- **Reconnecting and restarting.** A page that lost its connection clears what it showed; a list that is still within
+  its lifetime comes back when the page reconnects, with no new question, and a list that ended does not. A restart of
+  the module takes its transient lists off every page and nothing is brought back.
 - **Privacy.** The news is household data, so the list is a `household` presentation: the Presenter decides for each
   device, at the moment of showing, and shows it on a shared, a private and a public screen alike, as the spoken answer is
   the same on every device. A device without a display, one that is offline or one whose page cannot draw a list is
   shown nothing, and that changes nothing about the answer. There is nothing personal in it to ask `Privacy.mayReveal` about.
-- **Withdrawn when it no longer applies.** A device shows one transient list at a time, and it ends by itself after 30
-  seconds. It is taken down earlier when: a feed whose stories are on it is unsubscribed (a feed whose stories are not on
-  it changes nothing); a later `news.top` found nothing (an empty answer clears what the device still shows); or the model
-  tells headlines of its own with `news_headlines` (the conversation's last list is then another list). A later answer on
-  the same device replaces it. The module keeps the handle of each device's list (the newest 64 devices, this run only).
-  After a restart of the module its transient lists are gone from every page, as the Presenter does for any module part
-  that stops, and nothing is brought back; a page that lost its connection clears what it showed and shows it again only
-  with the next answer.
 - **No buttons and no ticks**, so no press handler: the list is only to read.
 - Cost: showing is one enqueue after the answer. Over the largest cache (1,425 items, five headlines) the answer with its
   list held the main thread at most 2.6 to 3.9 ms (`test/latency.test.ts`, three runs, bound 10 ms, 30 ms on CI).
