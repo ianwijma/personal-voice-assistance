@@ -8,6 +8,8 @@ import {
   MAX_IMAGE_URL_CHARS,
   MAX_LIST_ITEM_CHARS,
   MAX_LIST_ITEMS,
+  MAX_LIVE_PER_MODULE,
+  MAX_LIVE_TOTAL,
   MAX_PINNED_PER_DEVICE,
   MAX_PRESENT_BUTTONS,
   MAX_PRESENT_FACTS,
@@ -61,11 +63,8 @@ import type { ConnectionRef, TurnPerson } from "./TurnContext.ts"
 
 /** The owner of the service's collection in the household store. */
 export const PRESENT_OWNER = "core.present" as const
-/** Live presentations of all modules together at most; one more is refused `limit`. */
-export const MAX_LIVE_TOTAL = 32
-/** Live presentations of one module at most (transient and pinned); one more is refused `limit`. */
-export const MAX_LIVE_PER_MODULE = 8
-export { MAX_PINNED_PER_DEVICE }
+// The live bounds live in `@pva/protocol` (the web mock admits with the same ones).
+export { MAX_LIVE_PER_MODULE, MAX_LIVE_TOTAL, MAX_PINNED_PER_DEVICE }
 // What a module shows, its lifetimes and its checks live in `@pva/protocol` (the web mock runs the same ones).
 export {
   type CardPresentation,
@@ -175,7 +174,7 @@ export interface PresentPressHandler {
  * `failed`: the store said no.
  */
 export class PresentError extends Schema.TaggedError<PresentError>()("PresentError", {
-  reason: Schema.Literals(["unavailable", "invalid", "limit", "busy", "failed"]),
+  reason: Schema.Literals(["unavailable", "invalid", "limit", "busy", "failed", "uncommitted"]),
   message: Schema.String
 }) {}
 

@@ -69,6 +69,25 @@ export const CurrentTurn = Context.Reference<TurnContext | undefined>("@pva/core
 })
 
 /**
+ * Whether the turn a call runs in is committed (R8, review round 2 of P10). A speculative turn (started from
+ * `EagerEndOfTurn`) may still be discarded; its speculative tools run before it is. `Conversation` provides this for the
+ * calls of a turn; absent (a job, a press, a route, the CLI modes, tests without a conversation): committed. The
+ * gateway clears it for a call made as another principal than a turn.
+ */
+export interface TurnCommit {
+  /** True once the turn is committed (at once for a normal turn, at promotion for a speculative one). */
+  readonly committed: () => boolean
+  /**
+   * Run `f` when the turn is committed: now when it is already, at promotion otherwise; never when the turn is
+   * discarded. `f` is synchronous and must not throw (a throw is ignored).
+   */
+  readonly whenCommitted: (f: () => void) => void
+}
+export const CurrentTurnCommit = Context.Reference<TurnCommit | undefined>("@pva/core/CurrentTurnCommit", {
+  defaultValue: () => undefined
+})
+
+/**
  * Where a job's call comes from (P6's scheduler provides it as `CurrentJob` around a job's work): the job, the module
  * that owns it, and, when the job acts for someone, the assistant, device and person it was made for.
  */

@@ -1433,6 +1433,10 @@ What a module shows on a device's screen goes through the Presenter, never a mod
   `spoken`>"), and the presentation goes to the device the call came from in one enqueue (nothing else on the turn's
   path); once accepted it is written, retried if the store refuses, until it is or no longer applies. An action returns
   `{ say, present }`. A presentation that is not valid or passes a bound is not accepted and the note says why.
+- **Speculative tools** (R8): a tool that may run speculatively returns its presentation with its result and never calls
+  `ctx.present.show` or dismisses in its run. Its result's presentation is held until the turn is committed (dropped if
+  the turn is discarded); a `show` made from inside a turn that is not committed yet is refused `uncommitted`, and
+  `update` and `dismiss` there change nothing (`undefined`, `false`).
 - **From other code** (a job, a press handler), `ctx.present.show(target, presentation, options?)` answers a handle
   with `update` and `dismiss` (they die with `ModuleStopped` once the part has closed); `target` is `"origin"`, a
   `{ device }` or a `{ room }`.
