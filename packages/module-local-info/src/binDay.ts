@@ -561,7 +561,8 @@ export const binDayModule = (deps: NetDeps = {}) =>
         // The evening-before reminder: a job of the module's own (the notification service never sends later). A daily job at
         // the owner's time looks at the copy and sends, now, one `normal` notification to every screen for tomorrow's collection.
         yield* ctx.scheduler.handle("remind", {
-          payload: Schema.Struct({}),
+          // The link and names the job was made for: a change of either replaces the job, so a run of the old one can tell.
+          payload: Schema.Struct({ source: Schema.String.check(Schema.isMaxLength(16)) }),
           // The reminder is delivered at least once: a run that fails between the delivery and its receipt is run again, finds
           // no receipt, and sends under the same key (an open card with that key is not delivered again: `send` answers it).
           idempotent: true,
@@ -614,6 +615,11 @@ export const binDayModule = (deps: NetDeps = {}) =>
               const sendZone = homeZone(ctx.host.view().home)
               if (sendAt - due.dueAt > REMIND_LATE_MS || dayIn(due.dueAt, sendZone) !== evening || dayIn(sendAt, sendZone) !== evening) return
               if (sendAt - copy.readAt >= STALE_AFTER_MS) return
+              // A job called off or replaced while it ran is not interrupted, and a part that has been replaced still sees the
+              // settings it started with: the job's own row is the module's live state (MODULES §6). Off, a new time, a new link
+              // or new names all cancel or replace this job, so only a run whose job is still the running one may send.
+              const row = job === undefined ? undefined : yield* ctx.scheduler.get(job.jobId).pipe(Effect.orElseSucceed(() => undefined))
+              if (job !== undefined && (row === undefined || row.state !== "running")) return
               yield* ctx.notify.send({
                 ...request,
                 priority: "normal",
@@ -636,8 +642,12 @@ export const binDayModule = (deps: NetDeps = {}) =>
           const cron = `${wanted.minute} ${wanted.hour} * * *`
           // The live job is kept when it is already this one: replacing it at a restart would lose an occurrence due during an outage.
           const live = yield* ctx.scheduler.list().pipe(Effect.orElseSucceed(() => []))
-          const same = live.some((j) => j.key === REMIND_JOB && j.cron === cron && typeof j.late === "object" && j.late.withinMs === REMIND_LATE_MS)
-          if (!same) yield* ctx.scheduler.schedule({ handler: "remind", key: REMIND_JOB, cron, late: { withinMs: REMIND_LATE_MS } }).pipe(Effect.orDie)
+          const link = (ctx.settings.icsUrl ?? "").trim()
+          const source = link === "" ? "none" : sourceOf(link, rulesOf(ctx.settings.names))
+          const same = live.some((j) =>
+            j.key === REMIND_JOB && j.cron === cron && typeof j.late === "object" && j.late.withinMs === REMIND_LATE_MS && (j.payload as { readonly source?: string } | undefined)?.source === source
+          )
+          if (!same) yield* ctx.scheduler.schedule({ handler: "remind", key: REMIND_JOB, cron, payload: { source }, late: { withinMs: REMIND_LATE_MS } }).pipe(Effect.orDie)
         }
 
         // At start: a reminder from before a restart is compared with the calendar as it is.

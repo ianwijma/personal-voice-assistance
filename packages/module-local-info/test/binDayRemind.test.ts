@@ -269,8 +269,8 @@ describe("bin-day: the reminder the evening before", () => {
 interface Hooks {
   /** The next transaction fails with this (the receipt write): once. */
   failNextTransaction?: StoreError | undefined
-  /** Every read of a collection waits this long on the test clock first (the handler is "running" meanwhile). */
-  delayGetMs?: number | undefined
+  /** Every read of the calendar's copy waits for this first, in real time (the handler is "running" meanwhile, after it read the settings). */
+  gate?: Promise<void> | undefined
   /** The next `notify.resolve` fails: once. */
   failNextResolve?: boolean | undefined
   failed: number
@@ -281,7 +281,7 @@ const hookStore = (raw: ModuleStore, hooks: Hooks): ModuleStore => ({
   readOnly: raw.readOnly,
   collection: (c) => {
     const h = raw.collection(c)
-    return { ...h, get: (id, o) => Effect.andThen(hooks.delayGetMs === undefined ? Effect.void : Effect.sleep(hooks.delayGetMs), h.get(id, o)) }
+    return { ...h, get: (id, o) => Effect.andThen(hooks.gate === undefined || c.name !== "copy" ? Effect.void : Effect.promise(() => hooks.gate!), h.get(id, o)) }
   },
   transaction: (f) =>
     Effect.suspend(() => {
@@ -443,16 +443,25 @@ describe("review: a reminder that stopped being true is taken away", () => {
 })
 
 describe("review: everything is decided at the moment of sending", () => {
+  /** A gate the handler's read of the copy waits on, in real time; `open()` lets it go on. */
+  const gated = (hooks: Hooks) => {
+    let open: () => void = () => undefined
+    hooks.gate = new Promise<void>((resolve) => (open = resolve))
+    return () => {
+      hooks.gate = undefined
+      open()
+    }
+  }
+
   it.effect("the reminder switched off while the handler waits: nothing is sent", () =>
     Effect.gen(function*() {
       const hooks = newHooks()
       const { net } = switchable()
       const kit = yield* hooksKit(hooks, net)
-      hooks.delayGetMs = 5_000
+      const open = gated(hooks)
       yield* quietTo(kit, atLocal(18, 19, 0))
-      yield* kit.advance(1_000)
       yield* kit.configure({ remindAt: "off" })
-      hooks.delayGetMs = undefined
+      open()
       yield* advance(kit, 10_000)
       assert.deepStrictEqual(yield* sent(kit), [])
     }))
@@ -462,11 +471,10 @@ describe("review: everything is decided at the moment of sending", () => {
       const hooks = newHooks()
       const { net } = switchable()
       const kit = yield* hooksKit(hooks, net)
-      hooks.delayGetMs = 5_000
+      const open = gated(hooks)
       yield* quietTo(kit, atLocal(18, 19, 0))
-      yield* kit.advance(1_000)
       yield* kit.configure({ remindAt: "20:00" })
-      hooks.delayGetMs = undefined
+      open()
       yield* advance(kit, 10_000)
       assert.deepStrictEqual(yield* sent(kit), [])
       yield* advanceTo(kit, atLocal(18, 20, 1))
@@ -480,11 +488,10 @@ describe("review: everything is decided at the moment of sending", () => {
         [calendarPath]: (request: { readonly url: URL }) => ({ body: request.url.searchParams.has("other") ? ics([allDay("r", "20261125", "Restafval")]) : householdCalendar, headers: icsHeaders })
       })
       const kit = yield* hooksKit(hooks, net)
-      hooks.delayGetMs = 5_000
+      const open = gated(hooks)
       yield* quietTo(kit, atLocal(18, 19, 0))
-      yield* kit.advance(1_000)
       yield* kit.configure({ icsUrl: `${calendarUrl}&other=1` })
-      hooks.delayGetMs = undefined
+      open()
       yield* advance(kit, 10_000)
       assert.deepStrictEqual(yield* sent(kit), [])
     }))
@@ -497,11 +504,12 @@ describe("review: everything is decided at the moment of sending", () => {
       yield* advanceTo(kit, atLocal(18, 21, 30))
       yield* kit.stop
       yield* quietTo(kit, atLocal(18, 23, 59) + 58_000)
-      hooks.delayGetMs = 5_000
+      const open = gated(hooks)
       yield* kit.start
-      yield* kit.advance(1_000)
-      hooks.delayGetMs = undefined
-      yield* advance(kit, 10_000)
+      // The handler began at 23:59:58 (within its late rule); the clock reaches midnight while it waits.
+      yield* kit.advance(5_000)
+      open()
+      yield* advance(kit, 1_000)
       assert.isAbove(yield* kit.now, atLocal(19, 0))
       assert.deepStrictEqual(yield* sent(kit), [])
     }))
