@@ -1,7 +1,7 @@
 # Modules: where the work stands
 
 Status of the work planned in [MODULES-PLAN.md](MODULES-PLAN.md), kept here so it does not depend on any one working
-session. Updated 2026-11-19. Nothing below is merged into `main`; the owner merges.
+session. Updated 2026-11-19 (afternoon). Nothing below is merged into `main`; the owner merges.
 
 ## The stack
 
@@ -20,7 +20,7 @@ findings fixed; it does not mean merged.
 | P11 scaffold, contracts, test kit, guide | #94 | `t3/modules-11-scaffold` | `5bfeca0d` | closed; CI green |
 | P9 notifications, speech, ringing | #106 | `t3/modules-09-notify` | `a7fccff9` | closed after three review rounds; carries the scaffold's last store fix |
 | P7 phrase commands, essential controls | #107 | `t3/modules-07-phrases` | `471d0d5e` | closed after two review rounds (24, then 8 findings, all fixed); CI was green at `86ab9161`, the head adds a merge of P9 |
-| P10 presentation | #108 | `t3/modules-10-present` | `8a27cb59` | P7 merged in (base is now #107); first review found 30 problems; fix round running |
+| P10 presentation | #108 | `t3/modules-10-present` | `d6f7034d` | P7 merged in (base is now #107); first review found 30 problems, all addressed in one fix round; two deciding reviews running |
 | P8 risk policy in admin | #115 | `t3/modules-08-risk` | `46fd00da` | built on P10 as it was before the merge; first review running |
 
 **Fixes to P1 to P6 code found later live on the scaffold branch**, not on their own branches: the worker-thread
@@ -51,10 +51,11 @@ its own pull request on the scaffold.
 
 CI is green on all eleven at these heads. They carry the whole scaffold (`5bfeca0d`); their heads moved with that merge (see each pull request).
 
-**Integration branch**: `t3/modules-12-wave-a`, pull request #116 (`d673421f`): the phrases branch (P7) with the eleven
-module branches merged in, merges only, no conflict; `pnpm check` and `pnpm test` pass on it (8,976 tests). It is the
-base for the small follow-up pull requests below. P10 and P8 are merged into it when they close, and it is then
-retargeted to the top of the stack.
+**Integration branch**: `t3/modules-12-wave-a`, pull request #116 (`33ea5b77`): the presentation branch (P10, after its
+fix round) with the eleven module branches merged in, merges only, no conflict. `pnpm check` passes; the full local
+test run had 9,143 passing and one failing (the calendar latency test could not read its store in the parallel run; it
+passes alone, three times out of three). It is the base for the follow-up pull requests below. P8 is merged into it
+when it closes, and it is then retargeted to the top of the stack.
 
 ## Wave B: the modules that need P7 to P10
 
@@ -63,12 +64,12 @@ Each sits on the newest part it needs for now and moves on top of P8 at the end.
 | Module | Pull request | Branch | Head | State |
 |---|---|---|---|---|
 | assistant controls | #109 | `t3/module-assistant-controls` | `634952dc` | closed (review found three test gaps and a doc note, fixed); CI green |
-| notifications | #110 | `t3/module-notifications` | `b9474d8e` | reviewed (10 findings); fix round running |
-| images and photos | #111 | `t3/module-images` | `5d49eb1f` | reviewed (15 findings), fixed; one small step left once P10's fix round lands |
-| broadcast | #112 | `t3/module-broadcast` | `8cfcad64` | reviewed (8 findings and a note), fixed; one small step left once P10's fix round lands |
+| notifications | #110 | `t3/module-notifications` | `c797062e` | reviewed (10 findings), fixed; deciding review running (it leaves out the hook's token handling, which the lead checked by hand, because the review provider refused that part) |
+| images and photos | #111 | `t3/module-images` | `5d49eb1f` | reviewed (15 findings), fixed; adapting to P10's fix round, then a deciding review |
+| broadcast | #112 | `t3/module-broadcast` | `8cfcad64` | reviewed (8 findings and a note), fixed; adapting to P10's fix round, then closed |
 | music | #113 | `t3/module-music` | `4e262782` | reviewed (16 findings); fix round running |
-| reminders | #114 | `t3/module-reminders` | `f27f18af` | review running |
-| timers and alarms | none yet | `t3/module-timers` | | being built |
+| reminders | #114 | `t3/module-reminders` | `f27f18af` | reviewed (22 findings); fix round running (one state and one job per reminder); a deciding review follows |
+| timers and alarms | #117 | `t3/module-timers` | `3e942aa2` | reviewed (14 findings); fix round running (one state and one job per timer and alarm); a deciding review follows |
 | routines and automations | none yet | `t3/module-routines` | | starts when P8 is reviewed and holds P10 and P7 |
 
 ## What is left, in order
@@ -79,7 +80,9 @@ Each sits on the newest part it needs for now and moves on top of P8 at the end.
 4. Wave B, one pull request per module (table above): finish the review and fix rounds, build timers and routines,
    move every one on top of P8, CI green.
 5. The phrase commands and presentations wave A left out: one small pull request per module on
-   `t3/modules-12-wave-a` (#116), each reviewed and fixed. They start when P10's contract is settled.
+   `t3/modules-12-wave-a` (#116), branches `t3/follow-<module>`, each reviewed and fixed. Started 2026-11-19 on the
+   fixed P10: lists, kitchen, smart home, calendar, memory and local info are being built; presence, briefing, news,
+   web search and core tools start as those report.
 6. Deferred, with a plan of their own ([MODULES-DEFERRED-PLAN.md](MODULES-DEFERRED-PLAN.md): sixteen pull requests in order, with eighteen decisions for the owner and a recommendation for each): google, t3-code, mcp-client, calls and intercom, CalDAV; connections and
    OAuth (the rest of P8); streaming and WebSocket to an owner-typed address.
 
@@ -94,6 +97,20 @@ Each sits on the newest part it needs for now and moves on top of P8 at the end.
 - **A main-thread write right behind the store's checkpoint worker** waits about 24 ms on a desktop disk (a few
   hundred on an SD card), on a timer, without blocking the event loop (`docs/STORING-DATA.md` on the scaffold).
 - **The order of P7 to P10 and the two waves** was the lead's decision, reported to the owner and not confirmed.
+
+## Found by the wave B reviews, for one follow-up below the modules
+
+- **Send once.** The notification service forgets a notification's key when it is resolved, so a module cannot make a
+  delivery exactly once across a crash between sending and recording. Reminders, timers and alarms therefore deliver
+  at least once (a ring that was already stopped can sound again after such a crash; none is lost), and say so.
+- **Stop against a press in flight.** A notification's action handler is not told that its notification was ended
+  before its outcome was recorded, so "five more minutes" pressed in the same instant as Stop can win.
+- `ctx.present.dismiss({ key })` for a module's own presentation after a restart; a bound per kind or per device
+  instead of eight live presentations per module (a ninth timer has no countdown).
+- The test kit has no fault option for the store or the notification service, and no way to run a module's latency
+  test on the SQLite store.
+- Music wants `music_assistant.search` on the smart-home allow-list (a real name-only lookup, naming the match) and a
+  fresh read of one entity in the Home Assistant contract (a relative `Playback.changeVolume`).
 
 ## Gaps reported below the modules
 
