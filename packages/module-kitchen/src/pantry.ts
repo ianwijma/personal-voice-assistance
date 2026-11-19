@@ -6,7 +6,7 @@
 import { type Actor, type ModuleHostApi, type ModuleStore, type Row, StoreError, type StoreFailure, type StoreTx } from "@pva/core"
 import { type Language, speakAmount, speakList, type UnitId } from "@pva/language"
 import { isLine, Lists, type ListsError, say, useService } from "@pva/module-contracts"
-import { Effect, Option, Semaphore } from "effect"
+import { Deferred, Effect, Option, Semaphore } from "effect"
 import Fuse from "fuse.js"
 import { randomUUID } from "node:crypto"
 import { type BaseUnit, type Booking, type BookingKind, bookings, forgotten, MAX_AMOUNT, names, type Product, products, scan } from "./data.ts"
@@ -16,6 +16,8 @@ import { keyOf } from "./words.ts"
 /** The most products one answer reads: 20 pages of 25. A turn never reads further, and says so when it was cut. */
 export const PRODUCT_SCAN = 500
 export const PRODUCT_PAGE = 25
+/** The most low products one answer reads: four pages of 25. */
+export const LOW_SCAN = 100
 /** An undo reaches the asking device's last booking, made at most this long ago. */
 export const UNDO_WINDOW_MS = 10 * 60_000
 /** A call to the shopping list waits at most this long: the booking stands whatever the list does. */
@@ -313,7 +315,40 @@ export const makePantry = (deps: { readonly store: ModuleStore; readonly host: M
     )
   }
 
-  return { productStore, nameStore, bookingStore, find, all, suggest, followList }
+  /** The low products, in name order, at most `LOW_SCAN` (and whether the read was cut). */
+  const low = () => scan(productStore, { where: { low: true }, orderBy: { field: "key", direction: "asc" } }, PRODUCT_PAGE, LOW_SCAN)
+
+  // A phrase heard once acts once, also when two copies overlap: the identity (assistant, conversation, turn, device) is
+  // claimed before anything runs, and a second copy waits for the first's outcome and gets it. A claim that has not
+  // finished is never dropped; finished ones are kept, a bounded few.
+  const claims = new Map<string, { done: boolean; readonly wait: Deferred.Deferred<{ readonly say: string }, unknown> }>()
+  const FINISHED = 64
+  const once = <E>(identity: string | undefined, run: Effect.Effect<{ readonly say: string }, E>): Effect.Effect<{ readonly say: string }, E> =>
+    identity === undefined
+      ? run
+      : Effect.suspend(() => {
+        const held = claims.get(identity)
+        if (held !== undefined) return Deferred.await(held.wait) as Effect.Effect<{ readonly say: string }, E>
+        const claim = { done: false, wait: Deferred.makeUnsafe<{ readonly say: string }, unknown>() }
+        claims.set(identity, claim)
+        return run.pipe(Effect.onExit((exit) =>
+          Effect.sync(() => {
+            claim.done = true
+            Deferred.doneUnsafe(claim.wait, exit)
+            let finished = 0
+            for (const c of claims.values()) if (c.done) finished++
+            for (const [key, c] of claims) {
+              if (finished <= FINISHED) break
+              if (c.done) {
+                claims.delete(key)
+                finished--
+              }
+            }
+          })
+        ))
+      })
+
+  return { productStore, nameStore, bookingStore, find, all, suggest, followList, low, once }
 }
 
 export type Pantry = ReturnType<typeof makePantry>

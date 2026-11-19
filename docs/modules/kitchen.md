@@ -85,6 +85,50 @@ is safe by construction rather than clever:
 
 Diets are met only when a recipe declares them ("vegan" satisfies "vegetarian"). A dislike only lowers a recipe.
 
+## Phrases
+
+One phrase command, for what people say with their hands full: that something has run out. It runs the existing action
+`stock_out` with no model call, after the wake phrase (docs/PHRASES.md): same parameter (`what`, taken as text and
+resolved in the action), same refusals, same sentences, same risk class (`change`). In both languages, exact words:
+
+| Language | Phrases (`{what}` is the product) | Example, and what is said |
+|---|---|---|
+| English | "we're out of {what}", "we are out of {what}", "we ran out of {what}", "we've run out of {what}", "we have run out of {what}" | "we're out of rice": "Okay, no rice left. Rice is on the shopping list." |
+| Dutch | "we hebben geen {what} meer", "de {what} is op", "het {what} is op" | "we hebben geen rijst meer": "Oké, geen rijst meer. Rijst staat op het boodschappenlijstje." |
+
+The household's language decides which set is heard. A near miss is not a phrase and goes to the assistant ("we're
+almost out of rice", "the rice is gone", "we hebben geen rijst", "rijst is op"). The slot is read as the tool reads
+it, so "rice and milk" is "One thing at a time, please: how much of what?", an unknown product is a question ("There's
+no basmati in the pantry."), and the usual fillers at its end ("please") are dropped. A phrase is one invocation: the
+same phrase run twice with the identity the gateway gave it (assistant, conversation, turn, device) acts once and
+returns its first answer. The identity is claimed before anything runs, so two copies that overlap book once and the
+second waits for the first's outcome; a claim that has not finished is never dropped, finished ones are kept, the last
+64, in the shared part (not across a restart: a spoken phrase is never retried). Two utterances are two invocations
+and act twice. It applies only to a call whose turn came in as a phrase command: the model's tool and a routine run
+every time, also twice in one turn.
+
+## On a screen
+
+`stock_low` also puts **a list of what is low or missing on the screen of the device that asked**
+(`docs/PRESENTING.md`, a plain `list`, no ticks). It is returned with the answer (`{ say, present }`), never shown from
+inside the action: `stock_low` may run before the turn is committed, and the host shows what a speculative call returns
+only when the turn is promoted: a discarded turn shows nothing and withdraws nothing.
+
+- **It shows what the answer says, and nothing more**: the products the answer names, in its order (all of them up to
+  six; else the first five), then the answer's own "and 25 more" ("and more" when the read was cut) and, for a cut read,
+  its line "I read the first 100 of them; there are more." Texts are cut at a character boundary inside the limit. The
+  sentence the model says where nothing can be shown is the answer's own (with fewer names when it would pass 300
+  characters). The answer and the tool's result are exactly what they were; the host adds its note of what it did with
+  the screen on a line after the tool's answer.
+- **Privacy**: household data, like the spoken answer; the decision is the Presenter's, at each moment of showing, for
+  each device. It is shown on the shared, the private and the public screen alike, as the answer is said on all of them;
+  a device with no display shows nothing and nothing else changes. It shows no recipe, so the allergy rules have nothing
+  to leave out. An empty answer shows nothing.
+- **Transient**: on the screen for the default 30 seconds, and a newer transient one of any module takes the screen.
+  An empty answer does not withdraw an earlier list, and a discarded turn withdraws nothing: a list ends by its
+  lifetime or is replaced by the next one on that device. Nothing else manages it: it is not updated when the stock changes (the answer was the stock at that moment) and the
+  module holds no handle.
+
 ## Tools
 
 Typed actions (they run without the model from their examples; the model gets each as the tool `kitchen_<id>`):
@@ -93,10 +137,10 @@ Typed actions (they run without the model from their examples; the model gets ea
 |---|---|---|---|
 | `stock_add` / `kitchen_stock_add` (`what`) | "I bought a kilo of rice", "ik heb een kilo rijst gekocht" | change | "Added 1 kilogram of rice. You now have 1.2 kilograms of rice." |
 | `stock_use` / `kitchen_stock_use` (`what`) | "I used 250 grams of rice", "I used some of the cheese" | change | "Okay, 950 grams of rice left." (plus the shopping list line when it went low); after "some" or "about": that the amount is not known now |
-| `stock_out` / `kitchen_stock_out` (`what`) | "we're out of rice", "we hebben geen rijst meer" | change | "Okay, no rice left. Rice is on the shopping list." |
+| `stock_out` / `kitchen_stock_out` (`what`) | "we're out of rice", "we hebben geen rijst meer" (also a phrase command: see "Phrases") | change | "Okay, no rice left. Rice is on the shopping list." |
 | `stock_set` / `kitchen_stock_set` (`what`) | "there is a kilo of rice left" | change | "Okay, you have 1 kilogram of rice." (exact: known again); "about a kilo" is noted and stays not known exactly |
 | `stock_query` / `kitchen_stock_query` (`item`, optional) | "how much rice is left", "hoeveel rijst hebben we nog" | read | "You have 950 grams of rice." / not known: "I don't know exactly how much rice there is; last I knew, about …" / with no item: "In the pantry: …" |
-| `stock_low` / `kitchen_stock_low` | "what are we running low on" | read | "Running low: rice and milk." |
+| `stock_low` / `kitchen_stock_low` | "what are we running low on" | read | "Running low: rice and milk." (and a plain list on the asking device's screen: see "On a screen") |
 | `undo` / `kitchen_undo` | "undo that", "maak dat ongedaan" | change | "Undone. You now have 1 kilogram of rice." / more than ten minutes old, or the product changed since: refused, "tell me how much there is instead" |
 | `keep_minimum` / `kitchen_keep_minimum` (`what`) | "always keep two kilos of rice" | change | "Okay, I'll keep at least 2 kilograms of rice in stock." |
 | `what_to_make` (not offered as a tool: the model has `kitchen_what_can_i_make`) | "what can I cook within 15 minutes", "wat kan ik maken" | read | "You could make Egg fried rice, short of spring onion." with every note (a cut read, what was left out) and the allergy sentence last |
@@ -206,12 +250,17 @@ screen with and without a default person, and a shared screen with nobody.
 
 ## What was left out
 
-Waits for wave B (P7, P9, P10 do not exist yet):
+Added since the first version: the phrase "we're out of …" and the plain low-stock list (above). Still left out:
 
-- **Presentations**: the `facts` stock answer, the low and expiring `list` checklist with ticks, the "what can I make"
-  `list` with pick, the recipe `card`, the `steps` view (research §8).
+- **The checklist that can be kept and ticked** (a tick puts the product on the shopping list; a list kept on the
+  screen, updated as the stock changes and withdrawn when nothing is low). It waits for three things the host does not
+  offer yet: (a) finding or dismissing a presentation by its key after a restart, (b) an id on a press, so a tick can be
+  answered once, and (c) a handle for a presentation returned with a result, so an action's list can be updated.
+
+- **Presentations**: the `facts` stock answer, the expiring part of the checklist (there are no expiry dates), the
+  "what can I make" `list` with pick, the recipe `card`, the `steps` view (research §8).
 - **Notifications**: the expiry check, the daily low-stock inbox line, the thaw reminder (§9).
-- **Phrase commands** and the hands-free cooking window ("next", "back") (§12).
+- **Other phrase commands** and the hands-free cooking window ("next", "back") (§12).
 
 Left for later by the plan's row: URL import, scaling, guided cooking (sessions, step timers through `Timers`), the
 meal plan and shopping for it, the Chef template, outside providers (Grocy, Mealie, Tandoor) and their outbox,

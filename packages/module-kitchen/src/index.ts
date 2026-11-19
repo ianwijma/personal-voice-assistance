@@ -96,7 +96,8 @@ export const kitchenModule = defineModule({
       // outage before it ran. The kitchen has no other job, so its one page of live jobs holds it if it is there.
       const live = yield* ctx.scheduler.list().pipe(Effect.orDie)
       if (!live.some((j) => j.key === "tidy" && j.cron === TIDY_CRON)) yield* ctx.scheduler.schedule({ handler: "tidy", key: "tidy", cron: TIDY_CRON }).pipe(Effect.orDie)
-      return { value: makePantry({ store: ctx.store, host: ctx.host }) }
+      const pantry = makePantry({ store: ctx.store, host: ctx.host })
+      return { value: pantry }
     }),
   start: (ctx) =>
     Effect.sync(() => {

@@ -47,7 +47,8 @@ const statefulLists = () => {
 const withLists = (lists: ReturnType<typeof listsStub>, extra: Parameters<typeof startTestModule>[1] = {}) =>
   startTestModule(kitchenModule, { ...extra, provide: [provide("lists", { services: [Lists.of(lists.service)] })] })
 
-const said = (r: { readonly value: unknown }) => r.value as string
+// The tool's answer without the host's note of what it did with the screen (a line after it, only for `stock_low`).
+const said = (r: { readonly value: unknown }) => (r.value as string).split("\n[Screen:")[0]!
 /** What an action said, or why it did not run. */
 const spoken = (r: { readonly ok: boolean; readonly say?: string | undefined; readonly message?: string }) => (r.ok ? r.say : `not run: ${r.message}`)
 const dutch = { household: { home: { HOME_LANGUAGE: "nl-NL" } } }

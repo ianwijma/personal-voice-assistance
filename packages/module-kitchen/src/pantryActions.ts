@@ -10,11 +10,11 @@ import {
   amountText, book, createProduct, drainForgotten, fits, FORGET_NOW, lastKnownText, listText, lowOf, overviewText, type Pantry, type PantrySettings, PRODUCT_PAGE,
   PRODUCT_SCAN, removeProduct, round, saidText, stockSentence, stockText, storeFailureText, undoable
 } from "./pantry.ts"
+import { lowPresentation, lowSay } from "./lowScreen.ts"
 import { texts, type TextKey, unitWords } from "./texts.ts"
 import { cleanPhrase, KEY_CHARS, keyOf, readPhrase } from "./words.ts"
 
-/** The most low products one answer reads: four pages of 25. */
-export const LOW_SCAN = 100
+export { LOW_SCAN } from "./pantry.ts"
 
 /** What the pantry's actions read of the module's settings (all shared fields: a change restarts the module). */
 export interface KitchenSettings extends PantrySettings {
@@ -221,21 +221,36 @@ export const pantryActions = (deps: PantryDeps) => {
     description: "Set a product's stock to none: it ran out (\"we're out of rice\"). Puts it on the shopping list.",
     examples: ["we're out of rice", "we ran out of milk", "there are no eggs left", "we hebben geen rijst meer", "de melk is op"],
     params: { what: whatParam("What ran out", ["of", "no", "geen", "de", "het"]) },
+    // What people say with their hands full: said after the wake phrase it runs this action, with no model call.
+    phrases: {
+      en: ["we're out of {what}", "we are out of {what}", "we ran out of {what}", "we've run out of {what}", "we have run out of {what}"],
+      nl: ["we hebben geen {what} meer", "de {what} is op", "het {what} is op"]
+    },
     risk: "change",
     run: ({ what }) =>
       Effect.gen(function*() {
-        const l = lang()
-        const device = yield* deviceOf
-        const r = readPhrase(what, l, cupMl)
-        if (r.kind === "several") return { say: say(texts, l, "several") }
-        if (r.kind === "unclear") return { say: say(texts, l, "unclear") }
-        const outcome = yield* transact(l, (tx, now): Outcome => {
-          const row = lookup(tx, r.item)
-          if (row === undefined) return { kind: "unknown", item: r.item }
-          const b = book(tx, row, { kind: "set", delta: -row.value.stock, approx: false, unknown: false, said: cleanPhrase(what).slice(0, 80), ...(device !== undefined ? { device } : {}) }, now)
-          return { kind: "booked", id: row.id, ...b, created: false, main: say(texts, l, "none", { item: row.value.name }) }
-        })
-        return yield* finish(outcome, l)
+        const turn = yield* CurrentTurn
+        // The same phrase invocation twice acts once: keyed by the identity the gateway gave it (a spoken phrase has a
+        // fresh turn each time, so two utterances still act twice). A model's or a routine's call is not keyed: it
+        // books as before.
+        const identity = turn?.source === "phrase" ? [turn.assistantId ?? "", turn.conversationId, turn.turnId, turn.deviceId ?? ""].join("|") : undefined
+        return yield* pantry.once(
+          identity,
+          Effect.gen(function*() {
+            const l = lang()
+            const device = yield* deviceOf
+            const r = readPhrase(what, l, cupMl)
+            if (r.kind === "several") return { say: say(texts, l, "several") }
+            if (r.kind === "unclear") return { say: say(texts, l, "unclear") }
+            const outcome = yield* transact(l, (tx, now): Outcome => {
+              const row = lookup(tx, r.item)
+              if (row === undefined) return { kind: "unknown", item: r.item }
+              const b = book(tx, row, { kind: "set", delta: -row.value.stock, approx: false, unknown: false, said: cleanPhrase(what).slice(0, 80), ...(device !== undefined ? { device } : {}) }, now)
+              return { kind: "booked", id: row.id, ...b, created: false, main: say(texts, l, "none", { item: row.value.name }) }
+            })
+            return yield* finish(outcome, l)
+          })
+        )
       })
   })
 
@@ -315,12 +330,11 @@ export const pantryActions = (deps: PantryDeps) => {
     run: () =>
       Effect.gen(function*() {
         const l = lang()
-        const { rows, cut } = yield* scan(pantry.productStore, { where: { low: true }, orderBy: { field: "key", direction: "asc" } }, PRODUCT_PAGE, LOW_SCAN).pipe(
-          Effect.mapError(() => new ActionError({ message: say(texts, l, "unreadable") }))
-        )
+        const { rows, cut } = yield* pantry.low().pipe(Effect.mapError(() => new ActionError({ message: say(texts, l, "unreadable") })))
         if (rows.length === 0) return { say: say(texts, l, "lowNone") }
-        const main = say(texts, l, "low", { list: listText(rows.map((r) => r.value.name), l, cut) })
-        return { say: cut ? `${main} ${say(texts, l, "lowCut", { count: LOW_SCAN })}` : main }
+        // The answer, unchanged, and with it a plain list of exactly what it names: the host shows it when the turn is
+        // promoted (this run may be speculative), and it ends by itself. A device that cannot show it changes nothing.
+        return { say: lowSay(rows, cut, l), present: lowPresentation(rows, cut, l) }
       })
   })
 

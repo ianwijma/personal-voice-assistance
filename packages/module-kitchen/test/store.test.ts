@@ -12,7 +12,8 @@ import { LOW_SCAN } from "../src/pantryActions.ts"
 import { tidy } from "../src/tidy.ts"
 
 const DAY = 86_400_000
-const said = (r: { readonly value: unknown }) => r.value as string
+// The tool's answer without the host's note of what it did with the screen (a line after it, only for `stock_low`).
+const said = (r: { readonly value: unknown }) => (r.value as string).split("\n[Screen:")[0]!
 const product = (name: string, stock: number, extra: { readonly min?: number; readonly low?: boolean; readonly unknown?: boolean } = {}) => ({
   name,
   key: name,
