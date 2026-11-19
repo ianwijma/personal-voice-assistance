@@ -44,3 +44,53 @@ export const stepReplyVolume = (level: number, direction: "louder" | "quieter"):
   const next = replyVolumeLevel(now + (direction === "louder" ? REPLY_VOLUME.step : -REPLY_VOLUME.step))
   return next === now ? { level: now, atLimit: true } : { level: next, atLimit: false }
 }
+
+/** The most devices whose level is kept (the levels that are not the default). */
+export const MAX_KEPT_VOLUMES = 256
+
+/** Every device's reply volume that is not the default, the oldest change first (the server's memory; the mock's). */
+export type ReplyVolumes = ReadonlyMap<string, number>
+
+export const NO_REPLY_VOLUMES: ReplyVolumes = new Map()
+
+/** A device's level in `volumes` (the default when it has none). */
+export const replyVolumeOf = (volumes: ReplyVolumes, deviceId: string): number => volumes.get(deviceId) ?? REPLY_VOLUME.default
+
+/** One change of a device's reply volume: the new state, the change's answer, and what to send in this step. */
+export interface VolumeTransition {
+  readonly volumes: ReplyVolumes
+  readonly change: { readonly level: number; readonly atLimit: boolean }
+  /** `output.volume` to every voice page of each device named, in the same step as the change. */
+  readonly sends: ReadonlyArray<{ readonly deviceId: string; readonly volume: number }>
+}
+
+/**
+ * THE volume state machine (docs/PHRASES.md "Louder and quieter"; review round 1, E9), pure, used by the server and the
+ * web mock. "louder"/"quieter": one step (`stepReplyVolume`), `atLimit` at the bound (nothing changes). `{ to }`: the
+ * nearest step within the bounds, `atLimit` when that is the level already (nothing changes). The device's level moves
+ * to the newest place; the default is not kept. Past `cap` levels the oldest is dropped, and that device is sent the
+ * default in the same step, so a page never keeps a level the server forgot.
+ */
+export const changeReplyVolume = (
+  volumes: ReplyVolumes,
+  deviceId: string,
+  change: "louder" | "quieter" | { readonly to: number },
+  cap: number = MAX_KEPT_VOLUMES
+): VolumeTransition => {
+  const before = replyVolumeOf(volumes, deviceId)
+  const next = typeof change === "string" ? stepReplyVolume(before, change) : (() => {
+    const level = replyVolumeLevel(change.to)
+    return { level, atLimit: level === before }
+  })()
+  if (next.level === before) return { volumes, change: next, sends: [] }
+  const after = new Map(volumes)
+  after.delete(deviceId)
+  if (next.level !== REPLY_VOLUME.default) after.set(deviceId, next.level)
+  const sends: Array<{ readonly deviceId: string; readonly volume: number }> = [{ deviceId, volume: next.level }]
+  while (after.size > Math.max(1, cap)) {
+    const oldest = after.keys().next().value!
+    after.delete(oldest)
+    sends.push({ deviceId: oldest, volume: REPLY_VOLUME.default })
+  }
+  return { volumes: after, change: next, sends }
+}

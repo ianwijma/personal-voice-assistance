@@ -17,6 +17,9 @@ import type { RouteResult, RouteTarget } from "./RouteGate.ts"
  * turn holds such a call until it is promoted, which a blank final never does). The final of an utterance that is not
  * taken goes through the gates exactly as before; what the decision adds to it is a bounded, synchronous match.
  *
+ * An utterance that was cancelled before its final (the page's Stop, a new conversation) is never taken: no command and
+ * no control runs for it.
+ *
  * The route, in order (the windows of the plan's later text that are not built are left out):
  * 1. a wake phrase at the start leaves every window (step 5 then decides);
  * 2. the **ringing window** (the host's only window): while something rings on the device (the caller reads it now,
@@ -59,6 +62,11 @@ export interface UtteranceFacts {
   readonly gates: (final: SttEvent) => ReadonlyArray<RouteResult>
   /** The commands of `assistant` now (`undefined`: the host's controls alone). Called at most once. */
   readonly commandsFor: (assistant: string | undefined) => CommandSet
+  /**
+   * The utterance was cancelled between its first events and its final (the page's Stop, a new conversation): nothing
+   * takes it (review round 1, E5); its final goes through the gates as before, and the conversations swallow it.
+   */
+  readonly cancelled?: boolean
 }
 
 export interface UtteranceDecision {
@@ -73,7 +81,7 @@ const blankFinal = (final: Extract<SttEvent, { readonly _tag: "EndOfTurn" }>): S
 /** THE decision (see the module comment). Pure but for the two callbacks, each called at most once. */
 export const decideUtterance = (facts: UtteranceFacts): UtteranceDecision => {
   const text = facts.final.text
-  if (text.trim().length === 0) return { results: facts.gates(facts.final) }
+  if (text.trim().length === 0 || facts.cancelled === true) return { results: facts.gates(facts.final) }
   if (facts.ringing !== undefined && facts.ringing.length > 0 && !facts.wakeAtStart(text)) {
     const match = matchRinging(facts.language, text, facts.ringing)
     if (match !== undefined) return { results: facts.gates(blankFinal(facts.final)), taken: { by: "ringing", match } }

@@ -289,8 +289,14 @@ const paramSchema = (param: ActionParam): Schema.Codec<unknown, unknown> => {
 }
 
 /** Check and convert one tool input value to what `run` expects. */
+/**
+ * What a parameter that was not given receives, on every path (a tool call, a typed action, a phrase command): its
+ * declared default, `false` for a yes/no parameter, else `undefined`.
+ */
+export const omittedParamValue = (param: ActionParam): unknown => (param.kind === "boolean" ? false : "default" in param ? param.default : undefined)
+
 const toParamValue = (name: string, param: ActionParam, value: unknown): unknown => {
-  if (value === undefined) return param.kind === "boolean" ? false : "default" in param ? param.default : undefined
+  if (value === undefined) return omittedParamValue(param)
   switch (param.kind) {
     case "choice":
       return value

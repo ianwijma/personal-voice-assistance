@@ -1,5 +1,5 @@
-import { type ActionParam, type ActionParams, paramOptions, type RegisteredAction, resolveOption } from "./Actions.ts"
-import { type Word, words } from "./TextMatching.ts"
+import { type ActionParam, type ActionParams, omittedParamValue, type RegisteredAction } from "./Actions.ts"
+import { normalizeWord } from "./TextMatching.ts"
 import { readUtterance } from "./Utterance.ts"
 import { numericSpans, parseValues, unitFits } from "./ValueParsing.ts"
 
@@ -7,16 +7,21 @@ import { numericSpans, parseValues, unitFits } from "./ValueParsing.ts"
  * Phrase commands (docs/MODULES-PLAN.md §4 P7, first version; docs/PHRASES.md): a closed set of phrases per language,
  * with optional typed slots, that run without the language model. This file is the pure part: the host's essential
  * controls and their reserved phrases, the declaration check (`phraseProblems`, run when a module starts), the
- * per-assistant set (`buildCommandSet`) and the matcher (`matchCommand`, `matchRinging`). No Effect, no I/O, no clock:
- * synchronous and bounded (every bound is in `PHRASE_LIMITS`), so it can sit on the path of every final transcript.
+ * per-assistant set (`buildCommandSet`, or step by step in `PhraseSets.ts`) and the matcher (`matchCommand`,
+ * `matchRinging`). No Effect, no I/O, no clock: synchronous and bounded (every bound is in `PHRASE_LIMITS`), so it can
+ * sit on the path of every final transcript.
  *
- * **Matching is exact on words.** A phrase and an utterance are compared as their normalised words (`words` in
- * `TextMatching.ts`, the normalisation wake phrases use: case, accents, apostrophes and punctuation do not count;
- * `@pva/language` exports no normaliser of its own, its tokenizer is internal). There is no fuzzy matching of a
- * phrase's words in this version: no edit distance, no sounds-alike, no skipped fillers, no stemming. A slot is read by
- * the existing parser of its `Param` kind (`resolveOption` for a choice or a dynamic list, which tolerates what it
- * always did; core's number and duration reader; the words as said for text), and a slot that does not read means the
- * phrase does not match. The longest phrase (most literal words) wins.
+ * **Everything the matcher reads is prepared when the set is built** (review round 1, E1): literal words normalised, a
+ * choice's values, labels and aliases as lookup keys, a number's or duration's bounds. A match makes no call into module
+ * code and normalises nothing but the utterance. A slot is a number, a duration, a fixed choice (at most 32 options) or
+ * text; a parameter whose options come from a callback (`Param.dynamic`) cannot be a slot.
+ *
+ * **Exact about what it was given, failing closed** (E2): literal words are compared normalised (`phraseWords`: case,
+ * accents, apostrophes and punctuation do not count, and composed and decomposed accents give the same word; there is
+ * no fuzzy matching, no stemming, no skipped fillers). A slot's value is the original characters between its
+ * neighbouring words (a sign, a leading decimal point, a percent or degree sign, `#`, `+` and `.` included): its own
+ * parser decides, and a value it does not accept means the phrase does not match. A search that spent its budget is
+ * not taken. A parameter the phrase leaves out gets what every other path gives it (`omittedParamValue`).
  */
 
 /** The two languages a phrase is declared in (the household's language, `HOME_LANGUAGE`, picks which set is matched). */
@@ -51,10 +56,13 @@ export const PHRASE_LIMITS = {
   utteranceChars: 300,
   /** Words one slot may take (a text slot: its `maxWords`, at most this). */
   slotWords: 8,
+  /** Options of a choice parameter that is a slot (its values, labels and aliases are prepared when the set is built). */
+  choiceOptions: 32,
   /**
-   * Slot readings one utterance may cost over every phrase of the set (a reading runs a slot's parser on words whose
-   * alignment already covers the whole utterance). Ordinary sentences need a few; once spent, no further phrase can
-   * match that utterance (it goes on as not taken), so a sentence built to make many alignments costs a bounded time.
+   * Slot readings one utterance may cost over every phrase of the set (a reading runs a slot's parser on the characters
+   * of a span whose alignment already covers every word). Ordinary sentences need one or two. A search that spends them
+   * all has proved nothing: the utterance is not taken (it goes on to the assistant), and no shorter match found before
+   * is returned. It bounds the parser calls; the alignment itself is at most 8 positions per slot, 2 slots, per phrase.
    */
   slotReads: 64
 } as const
@@ -90,12 +98,52 @@ export const HOST_CONTROL_PHRASES: Readonly<Record<PhraseLanguage, Readonly<Reco
 }
 
 // ---------------------------------------------------------------------------------------------------------------------
+// Words
+
+/** One word of a phrase or an utterance: its normal form, and where it sits in the original text. */
+export interface PhraseWord {
+  readonly norm: string
+  readonly start: number
+  readonly end: number
+}
+
+/** A word: a letter or digit, then letters, combining marks, digits and inner apostrophes (so a decomposed accent stays in its word). */
+const WORD = /[\p{L}\p{N}][\p{L}\p{M}\p{N}'’]*/gu
+
+/**
+ * The words of a text, normalised (`normalizeWord`: canonical decomposition, marks removed, lower case, apostrophes
+ * removed), with their places in the text as given: composed ("é") and decomposed ("e" + U+0301) accents give the same
+ * word and the offsets still point into the original.
+ */
+export const phraseWords = (text: string): Array<PhraseWord> => {
+  const out: Array<PhraseWord> = []
+  for (const m of text.matchAll(WORD)) {
+    const norm = normalizeWord(m[0])
+    if (norm.length > 0) out.push({ norm, start: m.index, end: m.index + m[0].length })
+  }
+  return out
+}
+
+const normal = (text: string) => phraseWords(text).map((w) => w.norm).join(" ")
+
+// ---------------------------------------------------------------------------------------------------------------------
 // Declarations
 
 const SLOT = /^\{([A-Za-z][A-Za-z0-9_]{0,39})\}$/
+const LEADING_ARTICLE = /^(the|de|het|a|an|een) /
 
-/** One part of a phrase: a word (normalised), or a slot naming a parameter of the action. */
-export type PhrasePart = string | { readonly slot: string; readonly param: ActionParam }
+/** A choice's name as a lookup key: its words, without a leading article. */
+const choiceKey = (text: string) => normal(text).replace(LEADING_ARTICLE, "")
+
+/** How a slot is read, prepared from its parameter when the set is built. */
+export type SlotReader =
+  | { readonly kind: "choice"; readonly keys: ReadonlyMap<string, string> }
+  | { readonly kind: "number"; readonly min?: number; readonly max?: number; readonly integer: boolean; readonly unit?: string }
+  | { readonly kind: "duration"; readonly minMs?: number; readonly maxMs?: number }
+  | { readonly kind: "text"; readonly maxWords: number }
+
+/** One part of a phrase: a word (normalised), or a slot naming a parameter of the action, with its prepared reader. */
+export type PhrasePart = string | { readonly slot: string; readonly reader: SlotReader }
 
 /** Whose a compiled phrase is. */
 export type PhraseOwner =
@@ -111,6 +159,37 @@ export interface CompiledPhrase {
   readonly parts: ReadonlyArray<PhrasePart>
   /** Literal words: the longer phrase wins. */
   readonly literals: number
+  /** What each parameter the phrase leaves out receives (`omittedParamValue`), prepared. */
+  readonly defaults: Readonly<Record<string, unknown>>
+}
+
+/** The reader of a parameter that is a slot, or why it cannot be one. */
+const readerOf = (name: string, param: ActionParam): SlotReader | { readonly problem: string } => {
+  switch (param.kind) {
+    case "boolean":
+      return { problem: `the slot {${name}} is a yes/no parameter, which a phrase cannot fill` }
+    case "dynamic":
+      return {
+        problem: `the slot {${name}} is a list the module fills while it runs, which a phrase cannot read: make the parameter text (Param.text) and resolve the name in the action`
+      }
+    case "choice": {
+      if (param.options.length > PHRASE_LIMITS.choiceOptions) return { problem: `the slot {${name}} is a choice of ${param.options.length} options; a phrase reads at most ${PHRASE_LIMITS.choiceOptions}` }
+      const keys = new Map<string, string>()
+      for (const o of param.options) {
+        for (const n of [o.value, o.label, ...(o.aliases ?? [])]) {
+          const k = choiceKey(n)
+          if (k.length > 0 && !keys.has(k)) keys.set(k, o.value)
+        }
+      }
+      return { kind: "choice", keys }
+    }
+    case "number":
+      return { kind: "number", integer: param.integer === true, ...(param.min !== undefined ? { min: param.min } : {}), ...(param.max !== undefined ? { max: param.max } : {}), ...(param.unit !== undefined ? { unit: param.unit } : {}) }
+    case "duration":
+      return { kind: "duration", ...(param.minMs !== undefined ? { minMs: param.minMs } : {}), ...(param.maxMs !== undefined ? { maxMs: param.maxMs } : {}) }
+    case "text":
+      return { kind: "text", maxWords: Math.min(param.maxWords ?? 8, PHRASE_LIMITS.slotWords) }
+  }
 }
 
 /** The words of a phrase as written, or why it is not a phrase. */
@@ -127,12 +206,13 @@ const parsePhrase = (text: string, params: ActionParams | undefined): { readonly
       const name = slot[1]!
       const param = params === undefined ? undefined : Object.hasOwn(params, name) ? params[name] : undefined
       if (param === undefined) return { problem: `the slot {${name}} names no parameter of the action` }
-      if (param.kind === "boolean") return { problem: `the slot {${name}} is a yes/no parameter, which a phrase cannot fill` }
-      parts.push({ slot: name, param })
+      const reader = readerOf(name, param)
+      if ("problem" in reader) return reader
+      parts.push({ slot: name, reader })
       continue
     }
     if (token.includes("{") || token.includes("}")) return { problem: `"${token}": a slot is a whole word, written {name}` }
-    for (const w of words(token)) parts.push(w.norm)
+    for (const w of phraseWords(token)) parts.push(w.norm)
   }
   return { parts }
 }
@@ -141,31 +221,30 @@ const shapeOf = (parts: ReadonlyArray<PhrasePart>) => parts.map((p) => (typeof p
 
 /** The reserved shapes per language: the host's phrases, normalised. */
 const RESERVED: Readonly<Record<PhraseLanguage, ReadonlyMap<string, HostControl>>> = {
-  en: new Map(HOST_CONTROLS.flatMap((c) => HOST_CONTROL_PHRASES.en[c].map((p) => [words(p).map((w) => w.norm).join(" "), c] as const))),
-  nl: new Map(HOST_CONTROLS.flatMap((c) => HOST_CONTROL_PHRASES.nl[c].map((p) => [words(p).map((w) => w.norm).join(" "), c] as const)))
+  en: new Map(HOST_CONTROLS.flatMap((c) => HOST_CONTROL_PHRASES.en[c].map((p) => [normal(p), c] as const))),
+  nl: new Map(HOST_CONTROLS.flatMap((c) => HOST_CONTROL_PHRASES.nl[c].map((p) => [normal(p), c] as const)))
 }
 
 /** The host control a phrase's words are reserved for in `language`, if any. */
-export const reservedFor = (language: PhraseLanguage, phrase: string): HostControl | undefined =>
-  RESERVED[language].get(words(phrase).map((w) => w.norm).join(" "))
+export const reservedFor = (language: PhraseLanguage, phrase: string): HostControl | undefined => RESERVED[language].get(normal(phrase))
 
-/** Why one phrase of an action may not be declared, or `undefined`. */
-const phraseProblem = (language: PhraseLanguage, text: string, params: ActionParams): string | undefined => {
+/** One phrase of an action compiled, or why it may not be declared. */
+const compilePhrase = (language: PhraseLanguage, text: string, params: ActionParams): { readonly parts: ReadonlyArray<PhrasePart> } | { readonly problem: string } => {
   const parsed = parsePhrase(text, params)
-  if ("problem" in parsed) return parsed.problem
+  if ("problem" in parsed) return parsed
   const { parts } = parsed
-  if (parts.length > PHRASE_LIMITS.wordsPerPhrase) return `a phrase has at most ${PHRASE_LIMITS.wordsPerPhrase} words (a slot is one)`
+  if (parts.length > PHRASE_LIMITS.wordsPerPhrase) return { problem: `a phrase has at most ${PHRASE_LIMITS.wordsPerPhrase} words (a slot is one)` }
   const slots = parts.filter((p): p is Exclude<PhrasePart, string> => typeof p !== "string")
-  if (slots.length === parts.length) return "a phrase needs at least one word that is not a slot"
-  if (slots.length > PHRASE_LIMITS.slotsPerPhrase) return `a phrase has at most ${PHRASE_LIMITS.slotsPerPhrase} slots`
-  if (new Set(slots.map((s) => s.slot)).size !== slots.length) return "a slot appears twice in one phrase"
-  for (let i = 1; i < parts.length; i++) if (typeof parts[i] !== "string" && typeof parts[i - 1] !== "string") return "two slots need a word between them"
+  if (slots.length === parts.length) return { problem: "a phrase needs at least one word that is not a slot" }
+  if (slots.length > PHRASE_LIMITS.slotsPerPhrase) return { problem: `a phrase has at most ${PHRASE_LIMITS.slotsPerPhrase} slots` }
+  if (new Set(slots.map((s) => s.slot)).size !== slots.length) return { problem: "a slot appears twice in one phrase" }
+  for (let i = 1; i < parts.length; i++) if (typeof parts[i] !== "string" && typeof parts[i - 1] !== "string") return { problem: "two slots need a word between them" }
   for (const [name, param] of Object.entries(params)) {
-    if (param.kind !== "boolean" && param.optional !== true && !slots.some((s) => s.slot === name)) return `the required parameter ${name} has no slot in it`
+    if (param.kind !== "boolean" && param.optional !== true && !slots.some((s) => s.slot === name)) return { problem: `the required parameter ${name} has no slot in it` }
   }
   const reserved = RESERVED[language].get(shapeOf(parts))
-  if (reserved !== undefined) return `it is one of the assistant's own "${HOST_CONTROL_PHRASES[language][reserved][0]}" phrases, which no module may use`
-  return undefined
+  if (reserved !== undefined) return { problem: `it is one of the assistant's own "${HOST_CONTROL_PHRASES[language][reserved][0]}" phrases, which no module may use` }
+  return { parts }
 }
 
 /**
@@ -197,13 +276,12 @@ export const phraseProblems = (moduleId: string, actions: ReadonlyArray<{ readon
       if (list.length > PHRASE_LIMITS.phrasesPerAction) out.push(`${moduleId}.${a.id}: ${list.length} ${language} phrases; at most ${PHRASE_LIMITS.phrasesPerAction}`)
       const shapes = new Set<string>()
       for (const text of list.slice(0, PHRASE_LIMITS.phrasesPerAction + 1)) {
-        const problem = phraseProblem(language, text, a.params)
-        if (problem !== undefined) {
-          out.push(`${moduleId}.${a.id}: "${String(text).slice(0, PHRASE_LIMITS.charsPerPhrase)}" (${language}): ${problem}`)
+        const compiled = compilePhrase(language, text, a.params)
+        if ("problem" in compiled) {
+          out.push(`${moduleId}.${a.id}: "${String(text).slice(0, PHRASE_LIMITS.charsPerPhrase)}" (${language}): ${compiled.problem}`)
           continue
         }
-        const parsed = parsePhrase(text, a.params) as { readonly parts: ReadonlyArray<PhrasePart> }
-        const shape = shapeOf(parsed.parts)
+        const shape = shapeOf(compiled.parts)
         if (shapes.has(shape)) out.push(`${moduleId}.${a.id}: "${text}" (${language}) is given twice`)
         shapes.add(shape)
       }
@@ -236,59 +314,101 @@ const hostPhrases: Readonly<Record<PhraseLanguage, ReadonlyArray<CompiledPhrase>
 function compileControls(language: PhraseLanguage): ReadonlyArray<CompiledPhrase> {
   return HOST_CONTROLS.flatMap((control) =>
     HOST_CONTROL_PHRASES[language][control].map((text): CompiledPhrase => {
-      const parts = words(text).map((w) => w.norm)
-      return { owner: { kind: "control", control }, text, shape: parts.join(" "), parts, literals: parts.length }
+      const parts = phraseWords(text).map((w) => w.norm)
+      return { owner: { kind: "control", control }, text, shape: parts.join(" "), parts, literals: parts.length, defaults: {} }
     })
   )
 }
 
-/** The host's controls alone (a `decide` target, whose assistant is not known yet; a device that answers nobody). */
+/** The host's controls alone (a `decide` target, whose assistant is not known yet; a set that is not ready yet). */
 export const hostCommandSet = (language: PhraseLanguage): CommandSet => ({ language, phrases: hostPhrases[language], conflicts: [] })
 
-const actionName = (a: RegisteredAction) => a.id
+/** An action's phrases in `language`, compiled (a declaration that is not valid, which refused its start, is skipped). */
+export const compileActionPhrases = (language: PhraseLanguage, action: RegisteredAction): Array<CompiledPhrase> => {
+  const list = (action.definition.phrases as ActionPhrases | undefined)?.[language]
+  if (!Array.isArray(list)) return []
+  const params = action.definition.params as ActionParams
+  const out: Array<CompiledPhrase> = []
+  for (const text of list.slice(0, PHRASE_LIMITS.phrasesPerAction)) {
+    const compiled = compilePhrase(language, text, params)
+    if ("problem" in compiled) continue
+    const parts = compiled.parts
+    const named = new Set(parts.flatMap((p) => (typeof p === "string" ? [] : [p.slot])))
+    const defaults: Record<string, unknown> = {}
+    for (const [name, param] of Object.entries(params)) if (!named.has(name)) defaults[name] = omittedParamValue(param)
+    out.push({ owner: { kind: "action", action }, text, shape: shapeOf(parts), parts, literals: parts.filter((p) => typeof p === "string").length, defaults })
+  }
+  return out
+}
 
 /**
- * One assistant's set: the host's controls, then the phrases in `language` of `actions` (its modules' actions, in
- * catalog order, as its parts in the module snapshot hold them). Two phrases of one shape from different actions are
- * both left out (a conflict); a phrase of a host control's shape is left out (a module start refuses it already);
- * once `phrasesPerAssistant` module phrases are in, every further module is left out whole (a conflict naming them).
- * A declaration that is not valid (it would have refused the start) is skipped.
+ * The set from compiled module phrases, in catalog order (`modules`), and the modules already past the bound (`over`):
+ * the host's controls first; two phrases of one shape from different actions both left out (a conflict); a phrase of a
+ * host control's shape left out; once `phrasesPerAssistant` module phrases are in, every further module left out whole.
  */
-export const buildCommandSet = (language: PhraseLanguage, actions: ReadonlyArray<RegisteredAction>): CommandSet => {
-  const byModule = new Map<string, Array<CompiledPhrase>>()
-  for (const action of actions) {
-    const list = (action.definition.phrases as ActionPhrases | undefined)?.[language]
-    if (!Array.isArray(list)) continue
-    for (const text of list.slice(0, PHRASE_LIMITS.phrasesPerAction)) {
-      if (phraseProblem(language, text, action.definition.params as ActionParams) !== undefined) continue
-      const parsed = parsePhrase(text, action.definition.params as ActionParams) as { readonly parts: ReadonlyArray<PhrasePart> }
-      const parts = parsed.parts
-      const own = byModule.get(action.moduleId) ?? []
-      byModule.set(action.moduleId, own)
-      own.push({ owner: { kind: "action", action }, text, shape: shapeOf(parts), parts, literals: parts.filter((p) => typeof p === "string").length })
-    }
-  }
+export const assembleCommandSet = (
+  language: PhraseLanguage,
+  modules: ReadonlyArray<{ readonly moduleId: string; readonly phrases: ReadonlyArray<CompiledPhrase> }>,
+  over: ReadonlyArray<string> = []
+): CommandSet => {
   const kept: Array<CompiledPhrase> = []
-  const over: Array<string> = []
-  for (const [moduleId, list] of byModule) {
-    if (over.length > 0 || kept.length + list.length > PHRASE_LIMITS.phrasesPerAssistant) over.push(moduleId)
-    else kept.push(...list)
+  const left: Array<string> = []
+  for (const m of modules) {
+    if (left.length > 0 || kept.length + m.phrases.length > PHRASE_LIMITS.phrasesPerAssistant) left.push(m.moduleId)
+    else kept.push(...m.phrases)
   }
+  left.push(...over)
   const byShape = new Map<string, Array<CompiledPhrase>>()
   for (const p of kept) byShape.set(p.shape, [...(byShape.get(p.shape) ?? []), p])
   const conflicts: Array<PhraseConflict> = []
   const phrases: Array<CompiledPhrase> = [...hostPhrases[language]]
   for (const [shape, list] of byShape) {
-    const owners = [...new Set(list.map((p) => (p.owner.kind === "action" ? actionName(p.owner.action) : "")))]
     if (RESERVED[language].has(shape)) continue
+    const owners = [...new Set(list.map((p) => (p.owner.kind === "action" ? p.owner.action.id : "")))]
     if (owners.length > 1) {
       conflicts.push({ kind: "duplicate", language, shape, actions: owners })
       continue
     }
     phrases.push(list[0]!)
   }
-  if (over.length > 0) conflicts.push({ kind: "over-bound", language, modules: over })
+  if (left.length > 0) conflicts.push({ kind: "over-bound", language, modules: left })
   return { language, phrases, conflicts }
+}
+
+/** The actions grouped by module, in their order. */
+export const actionsByModule = (actions: ReadonlyArray<RegisteredAction>): Array<{ readonly moduleId: string; readonly actions: Array<RegisteredAction> }> => {
+  const out: Array<{ readonly moduleId: string; readonly actions: Array<RegisteredAction> }> = []
+  for (const a of actions) {
+    const last = out.at(-1)
+    if (last !== undefined && last.moduleId === a.moduleId) last.actions.push(a)
+    else out.push({ moduleId: a.moduleId, actions: [a] })
+  }
+  return out
+}
+
+/**
+ * One assistant's set, all at once (the kit, tests; serve mode prepares sets step by step ahead of use,
+ * `PhraseSets.ts`): the host's controls, then the phrases in `language` of `actions` (its modules' actions, in catalog
+ * order, as its registry holds them). Modules past the bound are named without compiling their phrases.
+ */
+export const buildCommandSet = (language: PhraseLanguage, actions: ReadonlyArray<RegisteredAction>): CommandSet => {
+  const modules: Array<{ readonly moduleId: string; readonly phrases: ReadonlyArray<CompiledPhrase> }> = []
+  const over: Array<string> = []
+  let count = 0
+  for (const m of actionsByModule(actions)) {
+    if (over.length > 0) {
+      if (m.actions.some((a) => a.definition.phrases?.[language] !== undefined)) over.push(m.moduleId)
+      continue
+    }
+    const phrases = m.actions.flatMap((a) => compileActionPhrases(language, a))
+    if (phrases.length === 0) continue
+    if (count + phrases.length > PHRASE_LIMITS.phrasesPerAssistant) over.push(m.moduleId)
+    else {
+      count += phrases.length
+      modules.push({ moduleId: m.moduleId, phrases })
+    }
+  }
+  return assembleCommandSet(language, modules, over)
 }
 
 // ---------------------------------------------------------------------------------------------------------------------
@@ -299,68 +419,92 @@ export type PhraseMatch =
   | { readonly kind: "control"; readonly control: HostControl; readonly phrase: string }
   | { readonly kind: "command"; readonly action: RegisteredAction; readonly values: Readonly<Record<string, unknown>>; readonly phrase: string }
 
-/** A slot's words, read by its parameter kind's parser; `undefined`: they do not read as a value of it. */
-const readSlot = (param: ActionParam, text: string, count: number): unknown => {
-  switch (param.kind) {
+/** The work one match did (the latency test counts it; tests read why a match failed). */
+export interface MatchStats {
+  /** Words of the utterance. */
+  words: number
+  /** Phrases whose words were aligned with the utterance (not rejected by length or first word). */
+  phrases: number
+  /** Slot readings (parser calls). */
+  reads: number
+  /** The budget of readings ran out: the utterance is not taken. */
+  exhausted: boolean
+}
+
+/** Sentence punctuation that ends an utterance, and the separators beside a slot, which belong to no slot. */
+const TRAILING_AT_END = /[\s.!?,;:…]+$/u
+const SEPARATORS_BEFORE = /^[\s,;:]+/u
+const SEPARATORS_AFTER = /[\s,;:]+$/u
+
+/**
+ * The characters of a slot that covers words `[from, to)`: everything between its neighbouring words in the original
+ * text (or the text's start and end), without the spaces and separators (`, ; :`) beside it and, at the end of the
+ * utterance, without its closing punctuation. A sign, a leading decimal point, `%`, `°`, `#`, `+` and an inner or
+ * leading `.` stay: the slot's parser decides.
+ */
+const slotText = (text: string, ws: ReadonlyArray<PhraseWord>, from: number, to: number): string => {
+  const left = from === 0 ? 0 : ws[from - 1]!.end
+  const atEnd = to === ws.length
+  const right = atEnd ? text.length : ws[to]!.start
+  let span = text.slice(left, right).replace(SEPARATORS_BEFORE, "")
+  span = atEnd ? span.replace(TRAILING_AT_END, "") : span.replace(SEPARATORS_AFTER, "")
+  return span
+}
+
+/** A slot's characters, read by its prepared reader; `undefined`: they do not read as a value of it. */
+const readSlot = (reader: SlotReader, text: string, count: number): unknown => {
+  switch (reader.kind) {
     case "choice":
-    case "dynamic": {
-      let options
-      try {
-        // A dynamic list is the module's own synchronous cache; one that throws matches nothing.
-        options = paramOptions(param)
-      } catch {
-        return undefined
-      }
-      return resolveOption(options, text)?.value
-    }
+      return reader.keys.get(choiceKey(text))
     case "number":
     case "duration": {
       const { text: canonical, words: ws } = readUtterance(text)
       const spans = numericSpans(canonical, ws)
       // One expression, and the whole slot: "ten" is a number, "ten past" is not.
       if (spans.length !== 1 || spans[0]!.from !== 0 || spans[0]!.to !== ws.length) return undefined
-      const found = parseValues(param.kind, text)
+      const found = parseValues(reader.kind, text)
       if (found.length !== 1 || !Number.isFinite(found[0]!.value)) return undefined
       const value = found[0]!.value
-      if (param.kind === "number") {
-        if (!unitFits(param.unit, found[0]!.unit)) return undefined
-        if (param.integer === true && !Number.isInteger(value)) return undefined
-        if ((param.min !== undefined && value < param.min) || (param.max !== undefined && value > param.max)) return undefined
+      if (reader.kind === "number") {
+        if (!unitFits(reader.unit, found[0]!.unit)) return undefined
+        if (reader.integer && !Number.isInteger(value)) return undefined
+        if ((reader.min !== undefined && value < reader.min) || (reader.max !== undefined && value > reader.max)) return undefined
         return value
       }
-      if (value < 0 || (param.minMs !== undefined && value < param.minMs) || (param.maxMs !== undefined && value > param.maxMs)) return undefined
+      if (found[0]!.unit !== undefined) return undefined
+      if (value < 0 || (reader.minMs !== undefined && value < reader.minMs) || (reader.maxMs !== undefined && value > reader.maxMs)) return undefined
       return value
     }
     case "text":
-      return count <= Math.min(param.maxWords ?? 8, PHRASE_LIMITS.slotWords) ? text : undefined
-    case "boolean":
-      return undefined
+      return count <= reader.maxWords && text.length > 0 ? text : undefined
   }
 }
 
-/** How many slot readings one utterance may cost in all (see `matchCommand`); one read is one parser call. */
-interface Budget {
-  reads: number
-}
+/** Out of readings: the search proved nothing. */
+const EXHAUSTED = Symbol("exhausted")
 
 /**
- * The values of `phrase`'s slots if it matches the whole utterance, else `undefined`. The words are aligned first
- * (string comparisons only); the slots are read only for an alignment that covers every word, leftmost first, each
- * read counted against `budget` (none is made once it is spent).
+ * The values of `phrase`'s slots if it matches the whole utterance, `undefined` if it does not, or `EXHAUSTED`. The
+ * words are aligned first (string comparisons only); the slots are read only for an alignment that covers every word,
+ * leftmost first, each read counted against `stats` (none is made once the budget is spent).
  */
-const align = (phrase: CompiledPhrase, text: string, ws: ReadonlyArray<Word>, budget: Budget): Record<string, unknown> | undefined => {
+const align = (phrase: CompiledPhrase, text: string, ws: ReadonlyArray<PhraseWord>, stats: MatchStats): Record<string, unknown> | undefined | typeof EXHAUSTED => {
   const parts = phrase.parts
   const spans: Array<readonly [number, number]> = []
   let found: Record<string, unknown> | undefined
+  let exhausted = false
   const readAll = (): boolean => {
-    const values: Record<string, unknown> = {}
+    const values: Record<string, unknown> = { ...phrase.defaults }
     let s = 0
     for (const part of parts) {
       if (typeof part === "string") continue
       const [from, to] = spans[s++]!
-      if (budget.reads <= 0) return false
-      budget.reads--
-      const value = readSlot(part.param, text.slice(ws[from]!.start, ws[to - 1]!.end), to - from)
+      if (stats.reads >= PHRASE_LIMITS.slotReads) {
+        exhausted = true
+        return true
+      }
+      stats.reads++
+      const value = readSlot(part.reader, slotText(text, ws, from, to), to - from)
       if (value === undefined) return false
       values[part.slot] = value
     }
@@ -381,7 +525,8 @@ const align = (phrase: CompiledPhrase, text: string, ws: ReadonlyArray<Word>, bu
     }
     return false
   }
-  return step(0, 0) ? found : undefined
+  step(0, 0)
+  return exhausted ? EXHAUSTED : found
 }
 
 const ownerKey = (o: PhraseOwner) => (o.kind === "control" ? `control:${o.control}` : `action:${o.action.id}`)
@@ -390,22 +535,27 @@ const ownerKey = (o: PhraseOwner) => (o.kind === "control" ? `control:${o.contro
  * What the whole utterance matches in `set`: the phrase with the most literal words. Ties between phrases of one
  * owner take the first; a host control beats a module's phrase of the same length; a tie between two modules' commands
  * matches nothing (the utterance goes on as if no phrase had matched). An utterance over `utteranceWords` or
- * `utteranceChars` matches nothing. A slot's values: the leftmost reading that parses. At most `slotReads` slot readings
- * are made for one utterance over every phrase; past them nothing more can match it.
+ * `utteranceChars` matches nothing, and so does a search that spent its `slotReads` (it proved nothing). A slot's
+ * values: the leftmost reading that parses; a parameter the phrase leaves out gets its `omittedParamValue`.
  */
-export const matchCommand = (set: CommandSet, text: string): PhraseMatch | undefined => {
+export const matchCommand = (set: CommandSet, text: string, stats: MatchStats = { words: 0, phrases: 0, reads: 0, exhausted: false }): PhraseMatch | undefined => {
   if (text.length > PHRASE_LIMITS.utteranceChars) return undefined
-  const ws = words(text)
+  const ws = phraseWords(text)
+  stats.words = ws.length
   if (ws.length === 0 || ws.length > PHRASE_LIMITS.utteranceWords) return undefined
   let best: Array<{ readonly phrase: CompiledPhrase; readonly values: Readonly<Record<string, unknown>> }> = []
   let bestLiterals = 0
-  const budget: Budget = { reads: PHRASE_LIMITS.slotReads }
   for (const phrase of set.phrases) {
     // Cheap rejections first: a phrase longer than the utterance, or whose first word cannot be where it must be.
     if (phrase.parts.length > ws.length || phrase.literals < bestLiterals) continue
     const first = phrase.parts[0]
     if (typeof first === "string" && ws[0]!.norm !== first) continue
-    const values = align(phrase, text, ws, budget)
+    stats.phrases++
+    const values = align(phrase, text, ws, stats)
+    if (values === EXHAUSTED) {
+      stats.exhausted = true
+      return undefined
+    }
     if (values === undefined) continue
     if (phrase.literals > bestLiterals) {
       best = [{ phrase, values }]
@@ -433,8 +583,6 @@ export interface RingingCard {
 export type RingingMatch =
   | { readonly kind: "stop"; readonly phrase: string }
   | { readonly kind: "action"; readonly notificationId: string; readonly actionId: string; readonly label: string }
-
-const normal = (text: string) => words(text).map((w) => w.norm).join(" ")
 
 /**
  * The ringing window's phrases (§4 P7: "stop" and the ringing notification's action phrases): the whole utterance is

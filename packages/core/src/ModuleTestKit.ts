@@ -18,9 +18,11 @@
  */
 import {
   BUILT_IN_PLACE,
-  REPLY_VOLUME,
+  changeReplyVolume,
+  NO_REPLY_VOLUMES,
+  type ReplyVolumes,
+  replyVolumeOf,
   ringingWithoutWake,
-  stepReplyVolume,
   type DeviceCapabilities,
   type DevicePrivacy,
   type HealthIssue,
@@ -44,7 +46,7 @@ import { makePrivacy, Privacy } from "./Privacy.ts"
 import { defaultRiskPolicy } from "./RiskPolicy.ts"
 import type { JobRow, ModuleScheduler, SchedulerHook } from "./Scheduler.ts"
 import { NOT_ONE_LINE } from "./SettingsExtra.ts"
-import { makeToolRegistry, withoutOffTools } from "./ToolRegistry.ts"
+import { makeToolRegistry, offeredActions, withoutOffTools } from "./ToolRegistry.ts"
 import { type ConnectionRef, CurrentTurn, makeConnectionRef, type Principal, type TurnContext, type TurnSource } from "./TurnContext.ts"
 import { connectStoreToBus, type HouseholdEvent, makeEventBus } from "./EventBus.ts"
 import { makeIssueRegistry } from "./Issues.ts"
@@ -56,9 +58,12 @@ import { type DecisionRecord, makeNotifyEngine, notificationView, type NotifyMes
 import { deviceOutputsFrom } from "./Notify.ts"
 import { notifyLanguageOf } from "./NotifyTexts.ts"
 import { decideUtterance, type Taken } from "./PhraseDecision.ts"
-import { type PhraseOutcome, runTaken } from "./PhraseRunner.ts"
-import { buildCommandSet, type CommandSet, phraseLanguageOf } from "./Phrases.ts"
+import { type CommandSlot, type KeptReply, keptReplyText, makeCommandSlot, type PhraseOutcome, type PhrasePorts, type PhraseTrace, runTaken } from "./PhraseRunner.ts"
+import { type CommandSet, hostCommandSet, phraseLanguageOf } from "./Phrases.ts"
+import { makePhraseSets } from "./PhraseSets.ts"
 import { Playback } from "./Playback.ts"
+import { DeviceControl, SessionControl } from "./SessionControl.ts"
+import { ECHO_TAIL_MS } from "./EchoGate.ts"
 import type { RouteTarget } from "./RouteGate.ts"
 import type { RegisteredAction } from "./Actions.ts"
 
@@ -493,6 +498,10 @@ export interface KitPhraseInput {
   readonly wake?: boolean
   /** The text of a reply this utterance cut short (it was playing when the utterance began): said again after "louder". */
   readonly interrupting?: string
+  /** Whose reply `interrupting` is (default: the addressed assistant). */
+  readonly interruptedBy?: string
+  /** The utterance was cancelled before its final (the page's Stop, a new conversation): nothing takes it. */
+  readonly cancelled?: boolean
 }
 
 /** What one phrase came to: not taken (it would go on to the assistant as a turn), or what took it and what happened. */
@@ -592,6 +601,23 @@ export const startTestModule = (definition: ModuleDefinition<any>, options: Star
     const replying = new Map<string, Deferred.Deferred<void>>()
     /** The announcement being played on a device: its cut, by a reply or by the device's page going. */
     const playing = new Map<string, Deferred.Deferred<"reply" | "disconnected">>()
+    /** P7: when the device's last reply or announcement ended plus the echo tail: audible until then (test clock). */
+    const quietFrom = new Map<string, number>()
+    /** A reply starts (`true`) or ends on the device: announcements wait for it, one playing is cut (as serve mode's lease). */
+    const setReplying = (deviceId: string, on: boolean) =>
+      Effect.flatMap(Clock.currentTimeMillis, (at) => Effect.sync(() => {
+        const d = replying.get(deviceId)
+        if (on && d === undefined) replying.set(deviceId, Deferred.makeUnsafe<void>())
+        if (on) {
+          const cut = playing.get(deviceId)
+          if (cut !== undefined) Deferred.doneUnsafe(cut, Effect.succeed("reply" as const))
+        }
+        if (!on && d !== undefined) {
+          replying.delete(deviceId)
+          quietFrom.set(deviceId, at + ECHO_TAIL_MS)
+          Deferred.doneUnsafe(d, Effect.void)
+        }
+      }))
     const speechMs = options.speechMs ?? 2_000
     const speech: SpeechPort = {
       speak: (deviceId, text, o) =>
@@ -614,7 +640,11 @@ export const startTestModule = (definition: ModuleDefinition<any>, options: Star
             playing.set(deviceId, cut)
             const how = yield* Effect.raceFirst(Effect.as(Effect.sleep(speechMs), "played" as const), Deferred.await(cut)).pipe(
               Effect.onInterrupt(() => Effect.sync(() => void (record.outcome = "stopped"))),
-              Effect.ensuring(Effect.sync(() => void (playing.get(deviceId) === cut && playing.delete(deviceId))))
+              Effect.ensuring(Effect.flatMap(Clock.currentTimeMillis, (at) => Effect.sync(() => {
+                if (playing.get(deviceId) === cut) playing.delete(deviceId)
+                // P7: the device is audible until its echo tail is over (the ringing window stays closed meanwhile).
+                quietFrom.set(deviceId, at + ECHO_TAIL_MS)
+              })))
             )
             if (how === "reply") {
               record.outcome = "stopped"
@@ -691,6 +721,67 @@ export const startTestModule = (definition: ModuleDefinition<any>, options: Star
     }
     // Home-linked defaults exactly as serve mode resolves them (`linkedModuleDefaults` over the Home values).
     const homeDefaults = (moduleId: string) => linkedModuleDefaults(homeValuesOf((key) => home[key]))[moduleId]
+    // ---- P7: the kit's session and reply volume: what the phrase controls act on, and what modules get as the core's
+    // `SessionControl` and `DeviceControl` (serve mode's are the voice sessions' and `makeReplyVolumes`).
+    const language = () => phraseLanguageOf(home.HOME_LANGUAGE)
+    const outcomes: Array<{ readonly deviceId: string; readonly text: string; readonly outcome: PhraseOutcome }> = []
+    const spoken: Array<KitSpoken> = []
+    const sessionCalls: Array<{ readonly deviceId: string; readonly call: "stop" | "cancel" }> = []
+    const phraseTraces: Array<PhraseTrace & { readonly deviceId: string }> = []
+    const lastReplies = new Map<string, KeptReply>()
+    let volumes: ReplyVolumes = NO_REPLY_VOLUMES
+    const volumeSends: Array<{ readonly deviceId: string; readonly volume: number }> = []
+    const slots = new Map<string, CommandSlot>()
+    const slotOf = (deviceId: string) => {
+      let slot = slots.get(deviceId)
+      if (slot === undefined) {
+        slot = makeCommandSlot()
+        slots.set(deviceId, slot)
+      }
+      return slot
+    }
+    let conversations = 0
+    const firstAssistant = (deviceId: string) => people.assistantsOn(deviceId)[0]
+    /** A reply as the kit keeps it: serve mode's rule (`keptReplyText`) over its sentences as clauses. */
+    const kept = (assistant: string, text: string): KeptReply => ({ assistant, text: keptReplyText(text.split(/(?<=[.!?])\s+/)) })
+    const kitSay = (deviceId: string, assistant: string | undefined, text: string) =>
+      Effect.sync(() => {
+        spoken.push({ deviceId, assistant, text })
+        lastReplies.set(deviceId, kept(assistant ?? firstAssistant(deviceId) ?? "jeff", text))
+        return "done" as const
+      })
+    const kitVolume = (deviceId: string, change: "louder" | "quieter" | { readonly to: number }) =>
+      Effect.sync(() => {
+        const t = changeReplyVolume(volumes, deviceId, change)
+        volumes = t.volumes
+        volumeSends.push(...t.sends)
+        return t.change
+      })
+    const kitStopReply = (deviceId: string) =>
+      Effect.suspend(() => {
+        sessionCalls.push({ deviceId, call: "stop" })
+        const was = replying.has(deviceId)
+        return Effect.as(setReplying(deviceId, false), was)
+      })
+    const kitCancel = (deviceId: string) =>
+      Effect.suspend(() => {
+        sessionCalls.push({ deviceId, call: "cancel" })
+        const was = replying.has(deviceId)
+        return Effect.as(setReplying(deviceId, false), was)
+      })
+    const kitServices: ReadonlyArray<ProvidedService> = [
+      SessionControl.of({
+        stopReply: (deviceId) => Effect.zipWith(kitStopReply(deviceId), notify.stopSpeech(deviceId), (a, b) => a || b),
+        cancelPending: kitCancel,
+        repeatLast: (deviceId) =>
+          Effect.suspend(() => {
+            const last = lastReplies.get(deviceId)
+            return last === undefined ? Effect.succeed(false) : Effect.as(kitSay(deviceId, last.assistant, last.text), true)
+          }),
+        newConversation: (deviceId) => Effect.sync(() => (deviceIds.has(deviceId) ? `kit-conversation-${++conversations}` : undefined))
+      }),
+      DeviceControl.of({ replyVolume: (deviceId) => replyVolumeOf(volumes, deviceId), changeReplyVolume: kitVolume })
+    ]
     const host = yield* makeModuleHost({
       catalog,
       defaults: homeDefaults,
@@ -703,7 +794,7 @@ export const startTestModule = (definition: ModuleDefinition<any>, options: Star
       household: { store, events: recording.bus },
       scheduler: observedScheduler(engine, schedulerUses),
       notify,
-      coreServices: people.coreServices,
+      coreServices: [...people.coreServices, ...kitServices],
       issues,
       localPrincipal: false,
       gatewayHooks: { riskPolicy: defaultRiskPolicy },
@@ -756,82 +847,79 @@ export const startTestModule = (definition: ModuleDefinition<any>, options: Star
      * has on, each without the tools it switched off (`withoutOffTools`, the function serve mode uses), the risk
      * policy applied by the gateway's `offers`.
      */
-    const offeredFor = (t: TurnContext) => {
-      const assistant = assistants.find((a) => a.id === t.assistantId)
-      const parts = (host.snapshot().assistantParts.get(t.assistantId ?? "") ?? []).flatMap((p) => {
+    const offeredParts = (assistantId: string | undefined) => {
+      const assistant = assistants.find((a) => a.id === assistantId)
+      return (host.snapshot().assistantParts.get(assistantId ?? "") ?? []).flatMap((p) => {
         const choice = assistant === undefined ? undefined : choiceOf(assistant, p.moduleId)
         return choice === undefined ? [] : [withoutOffTools(p.module, choice.offTools ?? [])]
       })
-      return makeToolRegistry(parts, { gateway: host.gateway })
     }
+    const offeredFor = (t: TurnContext) => makeToolRegistry(offeredParts(t.assistantId), { gateway: host.gateway })
 
-    // ---- P7: phrase commands, on the real decision, matcher, runner and gateway
-    const language = () => phraseLanguageOf(home.HOME_LANGUAGE)
-    const outcomes: Array<{ readonly deviceId: string; readonly text: string; readonly outcome: PhraseOutcome }> = []
-    const spoken: Array<KitSpoken> = []
-    const sessionCalls: Array<{ readonly deviceId: string; readonly call: "stop" | "cancel" }> = []
-    const lastReplies = new Map<string, { readonly assistant: string; readonly text: string }>()
-    const volumes = new Map<string, number>()
+    // ---- P7: phrase commands, on the real decision, matcher, sets, runner and gateway (the helpers serve mode uses)
     let phraseTurns = 1000
-    /** An assistant's set as serve mode builds it: its registry's actions (modules on, switched-off and refused tools out). */
-    const commandsFor = (assistant: string): CommandSet => buildCommandSet(language(), offeredFor(turn({ assistant })).actions ?? [])
-    const isPublished = (assistant: string, action: RegisteredAction) => (offeredFor(turn({ assistant })).actions ?? []).includes(action)
-    /** The decision for one final, with the route the kit stands in for: the wake phrase's assistant, or nobody. */
-    const decidePhrase = (text: string, as: KitPhraseInput): { readonly deviceId: string; readonly taken: Taken | undefined } => {
-      const deviceId = as.device ?? deviceList[0]?.id ?? "kitchen-display"
-      const assistant = as.assistant ?? people.assistantsOn(deviceId)[0] ?? "jeff"
-      const wake = as.wake !== false
-      const route: RouteTarget = wake ? { assistant, by: "phrase", phrase: "hey jeff" } : { by: "dropped", reason: "asleep" }
-      // The window is closed while a reply is spoken there (its own line may be what was heard), and by the setting.
-      const open = !replying.has(deviceId) && ringingWithoutWake(people.devices.get(deviceId)?.place)
-      const d = decideUtterance({
-        final: { _tag: "EndOfTurn", text },
-        language: language(),
-        ringing: open ? notify.ringingOn(deviceId) : undefined,
-        wakeAtStart: () => wake,
-        gates: (final) => [{ events: [final], target: route }],
-        commandsFor: (a) => commandsFor(a ?? assistant)
+    const actionsOf = (assistant: string) => offeredActions(offeredParts(assistant), host.gateway)
+    const phraseSets = yield* makePhraseSets({
+      language,
+      assistants: () => assistants.map((a) => ({ id: a.id, name: a.id })),
+      inputKey: (assistant) => `${host.snapshot().version}|${language()}|${running}`,
+      actionsOf
+    }, { yieldStep: Effect.yieldNow }).pipe(Scope.provide(lifetime))
+    const isPublished = (assistant: string, action: RegisteredAction) => actionsOf(assistant).includes(action)
+    /** The decision for one final, with the route the kit stands in for: the wake phrase's assistant, or nobody; once the sets are ready. */
+    const decidePhrase = (text: string, as: KitPhraseInput): Effect.Effect<{ readonly deviceId: string; readonly taken: Taken | undefined }> =>
+      Effect.gen(function*() {
+        yield* phraseSets.settled
+        const at = yield* Clock.currentTimeMillis
+        const deviceId = as.device ?? deviceList[0]?.id ?? "kitchen-display"
+        const assistant = as.assistant ?? firstAssistant(deviceId) ?? "jeff"
+        const wake = as.wake !== false
+        const route: RouteTarget = wake ? { assistant, by: "phrase", phrase: "hey jeff" } : { by: "dropped", reason: "asleep" }
+        // Closed while a reply or an announcement is audible there, or in its echo tail (its own line may be what was
+        // heard), and by the device's setting.
+        const audible = replying.has(deviceId) || playing.has(deviceId) || at < (quietFrom.get(deviceId) ?? 0)
+        const open = !audible && ringingWithoutWake(people.devices.get(deviceId)?.place)
+        const d = decideUtterance({
+          final: { _tag: "EndOfTurn", text },
+          language: language(),
+          ringing: open ? notify.ringingOn(deviceId) : undefined,
+          wakeAtStart: () => wake,
+          gates: (final) => [{ events: [final], target: route }],
+          commandsFor: (a) => phraseSets.ready(a ?? assistant) ?? hostCommandSet(language()),
+          ...(as.cancelled === true ? { cancelled: true } : {})
+        })
+        return { deviceId, taken: d.taken }
       })
-      return { deviceId, taken: d.taken }
-    }
-    const phrasePorts = (deviceId: string, as: KitPhraseInput) => ({
+    const phrasePorts = (deviceId: string, as: KitPhraseInput): PhrasePorts => ({
       deviceId,
       language,
       notify: () => notify,
+      slot: slotOf(deviceId),
       session: {
         replyActive: () => replying.has(deviceId) || as.interrupting !== undefined,
-        stopReply: Effect.suspend(() => {
-          sessionCalls.push({ deviceId, call: "stop" })
-          const was = replying.has(deviceId) || as.interrupting !== undefined
-          return Effect.as(Effect.andThen(harness.notify.replying(deviceId, false), notify.stopSpeech(deviceId)), was)
-        }),
-        cancelPending: Effect.suspend(() => {
-          sessionCalls.push({ deviceId, call: "cancel" })
-          const was = replying.has(deviceId) || as.interrupting !== undefined
-          return Effect.as(harness.notify.replying(deviceId, false), was)
-        }),
+        announcementActive: () => playing.has(deviceId),
+        stopReply: kitStopReply(deviceId),
+        stopAnnouncement: notify.stopSpeech(deviceId),
+        cancelPending: kitCancel(deviceId),
         lastReply: () => lastReplies.get(deviceId),
-        interruptedReply: () => (as.interrupting === undefined ? undefined : { assistant: as.assistant ?? people.assistantsOn(deviceId)[0] ?? "jeff", text: as.interrupting }),
-        answering: () => people.assistantsOn(deviceId)[0],
-        say: (assistant: string | undefined, text: string) =>
-          Effect.sync(() => {
-            spoken.push({ deviceId, assistant, text })
-            lastReplies.set(deviceId, { assistant: assistant ?? people.assistantsOn(deviceId)[0] ?? "jeff", text })
-          })
+        interruptedReply: Effect.sync(() => (as.interrupting === undefined ? undefined : kept(as.interruptedBy ?? as.assistant ?? firstAssistant(deviceId) ?? "jeff", as.interrupting))),
+        answering: () => firstAssistant(deviceId),
+        say: (assistant, text) => kitSay(deviceId, assistant, text)
       },
-      volume: (direction: "louder" | "quieter") =>
-        Effect.sync(() => {
-          const change = stepReplyVolume(volumes.get(deviceId) ?? REPLY_VOLUME.default, direction)
-          volumes.set(deviceId, change.level)
-          return change
-        }),
+      volume: (direction) => kitVolume(deviceId, direction),
       playback: () => host.service(Playback),
       room: () => people.devices.get(deviceId)?.room,
       gateway: () => host.gateway,
-      turn: (assistant: string) => turn({ device: deviceId, assistant, source: "phrase", turnId: ++phraseTurns }),
+      turn: (assistant) => turn({ device: deviceId, assistant, source: "phrase", turnId: ++phraseTurns }),
       isPublished,
-      pageText: (moduleId: string, text: unknown, max: number) => host.pageText(moduleId, text, max)
+      pageText: (moduleId, text, max) => host.pageText(moduleId, text, max),
+      trace: (t) => void phraseTraces.push({ ...t, deviceId })
     })
+    const runPhrase = (taken: Taken, deviceId: string, as: KitPhraseInput, text: string) =>
+      Effect.andThen(Effect.andThen(settle, driven(`the phrase "${text}"`, runTaken(taken, phrasePorts(deviceId, as)))), (outcome) => {
+        outcomes.push({ deviceId, text, outcome })
+        return Effect.as(settle, outcome)
+      })
 
     const harness = {
       host,
@@ -967,47 +1055,39 @@ export const startTestModule = (definition: ModuleDefinition<any>, options: Star
         /**
          * Say `text` on a device as its recogniser's final transcript: after the wake phrase (the default), or without
          * it (only the ringing window can take it then: open while the kit's notification service says something rings
-         * there, the device's "while ringing" is on, and no reply is being spoken there, `notify.replying`).
+         * there, the device's "while ringing" is on, and no reply or announcement is audible there). The sets are made
+         * ready first, as a final in serve mode comes after their preparation.
          */
         say: (text: string, as: KitPhraseInput = {}): Effect.Effect<KitPhraseResult> =>
-          checked(`after saying "${text}"`, Effect.andThen(settle, Effect.flatMap(Effect.sync(() => decidePhrase(text, as)), (d) => {
+          checked(`after saying "${text}"`, Effect.flatMap(Effect.andThen(settle, decidePhrase(text, as)), (d) => {
             if (d.taken === undefined) return Effect.succeed<KitPhraseResult>({ taken: false })
             const taken = d.taken
             const by = taken.by === "ringing" ? "ringing" as const : taken.match.kind === "control" ? "control" as const : "command" as const
-            return Effect.map(
-              Effect.andThen(driven(`the phrase "${text}"`, runTaken(taken, phrasePorts(d.deviceId, as))), (outcome) => Effect.as(settle, outcome)),
-              (outcome): KitPhraseResult => {
-                outcomes.push({ deviceId: d.deviceId, text, outcome })
-                return { taken: true, by, outcome }
-              }
-            )
-          }))),
+            return Effect.map(runPhrase(taken, d.deviceId, as, text), (outcome): KitPhraseResult => ({ taken: true, by, outcome }))
+          })),
         /**
          * The decision alone, as serve mode takes it at the final (nothing runs): what would take `text`, if anything. With
          * `run`, a test can change something between the decision and the run (serve mode runs it a moment later).
          */
-        decide: (text: string, as: KitPhraseInput = {}): Taken | undefined => decidePhrase(text, as).taken,
+        decide: (text: string, as: KitPhraseInput = {}): Effect.Effect<Taken | undefined> => Effect.map(decidePhrase(text, as), (d) => d.taken),
         /** Run what took an utterance (from `decide`) on the device, as serve mode does. */
-        run: (taken: Taken, as: KitPhraseInput = {}): Effect.Effect<PhraseOutcome> => {
-          const deviceId = as.device ?? deviceList[0]?.id ?? "kitchen-display"
-          return checked(
-            "after running a phrase",
-            Effect.andThen(Effect.andThen(settle, driven("a phrase's run", runTaken(taken, phrasePorts(deviceId, as)))), (outcome) => {
-              outcomes.push({ deviceId, text: taken.by === "phrase" ? taken.text : taken.match.kind === "stop" ? taken.match.phrase : taken.match.label, outcome })
-              return Effect.as(settle, outcome)
-            })
-          )
-        },
+        run: (taken: Taken, as: KitPhraseInput = {}): Effect.Effect<PhraseOutcome> =>
+          checked("after running a phrase", runPhrase(taken, as.device ?? deviceList[0]?.id ?? "kitchen-display", as, taken.by === "phrase" ? taken.text : taken.match.kind === "stop" ? taken.match.phrase : taken.match.label)),
         /** What every taken phrase came to, in order. */
         answered: outcomes as ReadonlyArray<{ readonly deviceId: string; readonly text: string; readonly outcome: PhraseOutcome }>,
         /** Every line the kit's devices said for phrases, in order (canned replies in serve mode). */
         spoken: spoken as ReadonlyArray<KitSpoken>,
-        /** A reply was spoken on the device (what "repeat" says again; serve mode keeps the last committed reply). */
-        replied: (deviceId: string, text: string, assistant?: string) => void lastReplies.set(deviceId, { assistant: assistant ?? people.assistantsOn(deviceId)[0] ?? "jeff", text }),
+        /** Every taken utterance's execution trace (serve mode publishes it in admin's latency list). */
+        traces: phraseTraces as ReadonlyArray<PhraseTrace & { readonly deviceId: string }>,
+        /** A reply was spoken on the device (what "repeat" says again), kept by serve mode's rule (2,000 characters, whole sentences). */
+        replied: (deviceId: string, text: string, assistant?: string) => void lastReplies.set(deviceId, kept(assistant ?? firstAssistant(deviceId) ?? "jeff", text)),
         /** The device's reply volume now (`REPLY_VOLUME`; what serve mode would send as `output.volume`). */
-        volume: (deviceId: string): number => volumes.get(deviceId) ?? REPLY_VOLUME.default,
-        /** The assistant's set now, as serve mode builds it (with its conflicts, which serve mode names on the Health page). */
-        commandsFor: (assistant?: string): CommandSet => commandsFor(assistant ?? assistants[0]?.id ?? "jeff"),
+        volume: (deviceId: string): number => replyVolumeOf(volumes, deviceId),
+        /** Every `output.volume` serve mode would send, in order (to every voice page of the device). */
+        volumeSends: volumeSends as ReadonlyArray<{ readonly deviceId: string; readonly volume: number }>,
+        /** The assistant's set once ready, as serve mode prepares it (with its conflicts, which serve mode names on the Health page). */
+        commandsFor: (assistant?: string): Effect.Effect<CommandSet> =>
+          Effect.map(phraseSets.settled, () => phraseSets.ready(assistant ?? assistants[0]?.id ?? "jeff") ?? hostCommandSet(language())),
         /** What the session control was asked to do (stop, cancel): the kit has no conversation, so it records the calls. */
         sessionCalls: sessionCalls as ReadonlyArray<{ readonly deviceId: string; readonly call: "stop" | "cancel" }>
       },
@@ -1053,20 +1133,7 @@ export const startTestModule = (definition: ModuleDefinition<any>, options: Star
          * A reply starts on the device (`true`) or has ended: announcements there wait for it, and one being spoken is
          * cut (`stopped`, why "a reply"), as serve mode's output lease does.
          */
-        replying: (deviceId: string, on: boolean) =>
-          Effect.suspend(() => {
-            const d = replying.get(deviceId)
-            if (on && d === undefined) replying.set(deviceId, Deferred.makeUnsafe<void>())
-            if (on) {
-              const cut = playing.get(deviceId)
-              if (cut !== undefined) Deferred.doneUnsafe(cut, Effect.succeed("reply" as const))
-            }
-            if (!on && d !== undefined) {
-              replying.delete(deviceId)
-              Deferred.doneUnsafe(d, Effect.void)
-            }
-            return settle
-          }),
+        replying: (deviceId: string, on: boolean) => Effect.andThen(setReplying(deviceId, on), settle),
         /** A page of the device says hello (it is given what is open for it), or its page goes; `Devices` sees the same. */
         connect: (deviceId: string) =>
           Effect.suspend(() => {

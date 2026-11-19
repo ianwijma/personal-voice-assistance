@@ -144,6 +144,12 @@ export interface ActionCallOptions extends GatewayCallOptions {
    * runs: a change of the assistant's choices meanwhile refuses it. A failure here refuses the call.
    */
   readonly holdUntil?: Effect.Effect<void, ActionError>
+  /**
+   * P7 (a phrase command's execution trace): told the admission's outcome once it is decided, before the action runs:
+   * the class the call was judged as (absent when it was refused before its risk was judged) and the refusal, if any.
+   * Must not throw (a throw is ignored).
+   */
+  readonly onDecision?: (decision: { readonly risk?: ToolRisk; readonly refused?: string }) => void
 }
 
 export interface ExecutionGateway {
@@ -175,6 +181,15 @@ export interface ExecutionGateway {
 }
 
 const decoders = new WeakMap<Tool, (u: unknown) => Effect.Effect<unknown, Schema.SchemaError>>()
+
+/** Tell an action call's observer the admission's outcome; an observer that throws changes nothing. */
+const tellDecision = (options: ActionCallOptions, decision: { readonly risk?: ToolRisk; readonly refused?: string }) => {
+  try {
+    options.onDecision?.(decision)
+  } catch {
+    // An observer must not change the call.
+  }
+}
 
 /**
  * The tool's input decoder (the JSON Schema sent to the model describes the canonical JSON form), made once per tool.
@@ -325,10 +340,16 @@ export const makeExecutionGateway = (options: GatewayOptions = {}): ExecutionGat
   const admitCall = (
     call: Omit<GatewayCall, "risk">,
     meta: ToolMetadata & { readonly speculative?: boolean | undefined }
-  ): Effect.Effect<string | undefined> =>
-    Effect.suspend(() => {
+  ): Effect.Effect<string | undefined> => Effect.map(judgeCall(call, meta), (j) => j.refused)
+
+  /** `admitCall` with the class it judged the call as (for an observer). */
+  const judgeCall = (
+    call: Omit<GatewayCall, "risk">,
+    meta: ToolMetadata & { readonly speculative?: boolean | undefined }
+  ): Effect.Effect<{ readonly refused?: string; readonly risk?: ToolRisk }> =>
+    Effect.suspend((): Effect.Effect<{ readonly refused?: string; readonly risk?: ToolRisk }> => {
       const problem = accessProblem(call)
-      if (problem !== undefined) return Effect.succeed(problem)
+      if (problem !== undefined) return Effect.succeed({ refused: problem })
       let risk: ToolRisk | undefined
       let failure: string | undefined
       // Only a risk function of the input (module code) has the budget. A fixed or inferred risk is the host's own
@@ -345,11 +366,12 @@ export const makeExecutionGateway = (options: GatewayOptions = {}): ExecutionGat
       const ms = performance.now() - started
       if (failure === undefined && judgedByModule && ms > RISK_BUDGET_MS) failure = `its risk function took ${ms.toFixed(1)} ms (at most ${RISK_BUDGET_MS} ms)`
       if (failure !== undefined || risk === undefined) {
-        return Effect.as(Effect.logWarning(`Execution gateway: ${call.name} (module ${call.moduleId ?? "none"}) refused: ${failure}`), UNJUDGED)
+        return Effect.as(Effect.logWarning(`Execution gateway: ${call.name} (module ${call.moduleId ?? "none"}) refused: ${failure}`), { refused: UNJUDGED })
       }
-      const verdict = riskPolicy?.(risk)
-      if (verdict !== undefined && verdict.outcome !== "allow") return Effect.succeed(verdict.reason)
-      return Effect.map(runHooks({ ...call, risk }), (decision) => (decision._tag === "Allow" ? undefined : decision.reason))
+      const judged = risk
+      const verdict = riskPolicy?.(judged)
+      if (verdict !== undefined && verdict.outcome !== "allow") return Effect.succeed({ refused: verdict.reason, risk: judged })
+      return Effect.map(runHooks({ ...call, risk: judged }), (decision) => (decision._tag === "Allow" ? { risk: judged } : { refused: decision.reason, risk: judged }))
     })
 
   const resolve = (explicit: Principal | undefined): Effect.Effect<Resolved> => (explicit !== undefined ? Effect.succeed(explicit) : principalNow)
@@ -395,14 +417,22 @@ export const makeExecutionGateway = (options: GatewayOptions = {}): ExecutionGat
     Effect.gen(function*() {
       const def = registered.definition
       const principal = yield* resolve(actionOptions.principal)
-      if ("refused" in principal) return yield* refusedAction(principal.refused)
-      if (!confirmed && needsYes(registered)) return yield* refusedAction(CONFIRMATION_OFF)
+      if ("refused" in principal) {
+        tellDecision(actionOptions, { refused: principal.refused })
+        return yield* refusedAction(principal.refused)
+      }
+      if (!confirmed && needsYes(registered)) {
+        tellDecision(actionOptions, { refused: CONFIRMATION_OFF })
+        return yield* refusedAction(CONFIRMATION_OFF)
+      }
       const call = callOf(
         { kind: "action", moduleId: registered.moduleId, name: actionToolName(registered.moduleId, def.id), input: values, confirmed, action: registered },
         def,
         principal
       )
-      const refused = yield* admitCall(call, def)
+      const judged = yield* judgeCall(call, def)
+      tellDecision(actionOptions, judged)
+      const refused = judged.refused
       if (refused !== undefined) return yield* refusedAction(refused)
       if (actionOptions.onAdmitted !== undefined) yield* actionOptions.onAdmitted
       if (actionOptions.holdUntil !== undefined) {
