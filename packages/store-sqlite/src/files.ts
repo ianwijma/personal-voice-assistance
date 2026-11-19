@@ -107,18 +107,16 @@ export const copyDatabase = async (source: string, path: string): Promise<string
     } finally {
       from.close()
     }
-    const copy = new DatabaseSync(part)
-    try {
-      copy.exec("PRAGMA journal_mode = DELETE")
-    } finally {
-      copy.close()
-    }
+    // One file without a log: on a thread of its own, since the change writes and syncs a journal and syncs the
+    // directory (an 87 ms and a 62 ms sync on the development machine's busy disk), which on the main thread stopped it.
+    await toRollbackJournal(part)
     await narrow(part)
     await fsyncFile(part)
     await rename(part, path)
     await fsyncDir(dirname(path))
   } catch (e) {
-    await rm(part, { force: true }).catch(() => undefined)
+    // The temporary copy and what SQLite may have left beside it (a failed conversion leaves its log and index).
+    for (const f of [part, `${part}-wal`, `${part}-shm`, `${part}-journal`]) await rm(f, { force: true }).catch(() => undefined)
     throw e
   }
   return problem
@@ -146,6 +144,29 @@ export const copyFilePrivately = async (from: string, path: string): Promise<str
   return problem
 }
 
+/**
+ * Tests only (`@pva/store-sqlite/testing`): a pause inside the journal conversion of a backup's copy (the step that
+ * must not run on the main thread), and something to do to the copy just before it. Zero and none in the app.
+ */
+export const journalConversionHooks: { pauseMs: number; before: ((file: string) => void) | undefined } = { pauseMs: 0, before: undefined }
+
+/** Set a database file's journal mode to DELETE on a short-lived worker thread (the copy of a backup). */
+const toRollbackJournal = (file: string): Promise<void> =>
+  new Promise<void>((resolve, reject) => {
+    journalConversionHooks.before?.(file)
+    const w = new Worker(JOURNAL_TO_DELETE, { eval: true, workerData: { file, pauseMs: journalConversionHooks.pauseMs } })
+    let settled = false
+    const done = (error?: Error) => {
+      if (settled) return
+      settled = true
+      if (error === undefined) resolve()
+      else reject(error)
+    }
+    w.once("message", (m: { ok: boolean; error?: string }) => done(m.ok ? undefined : new Error(m.error ?? "the journal mode could not be set")))
+    w.once("error", (e) => done(e))
+    w.once("exit", (code) => done(code === 0 ? new Error("the journal mode worker ended without an answer") : new Error(`the journal mode worker ended with code ${code}`)))
+  })
+
 // ---- Checkpoints: a worker thread with a connection of its own
 
 /** The size the write-ahead log's file is cut back to when a log starts again (`PRAGMA journal_size_limit`). */
@@ -166,6 +187,26 @@ export const WORKER_WARNING_FILTER = `
     if (type === "ExperimentalWarning" && sqlite.test(text)) return
     original(warning, ...rest)
   }
+}
+`
+
+const JOURNAL_TO_DELETE = `
+const { parentPort, workerData } = require("node:worker_threads")
+${WORKER_WARNING_FILTER}
+const { DatabaseSync } = require("node:sqlite")
+try {
+  const db = new DatabaseSync(workerData.file)
+  try {
+    // Tests only: the step made slow (zero in the app).
+    if (workerData.pauseMs > 0) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, workerData.pauseMs)
+    db.exec("PRAGMA journal_mode = DELETE")
+  } finally {
+    db.close()
+  }
+  parentPort.postMessage({ ok: true })
+} catch (e) {
+  // SQLite's message as it was when this ran on the main thread ("disk I/O error"), not "Error: disk I/O error".
+  parentPort.postMessage({ ok: false, error: e instanceof Error ? e.message : String(e) })
 }
 `
 
