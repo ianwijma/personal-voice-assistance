@@ -36,9 +36,9 @@ const bulletOf = (sentences: ReadonlyArray<string>, title: string): string => {
  * Sensitivity is the briefing's: personal with the asker as owner when any personal content is in it, so the Presenter
  * asks `Privacy.mayReveal` for the device that would show it, at the moment of showing.
  */
-export const briefingList = (briefing: Briefing, language: Language): Presentation | undefined => {
+export const briefingList = (briefing: Briefing, language: Language, omitted = 0): Presentation | undefined => {
   const speaking = briefing.sections.filter((s) => s.sentences.length > 0)
-  if (speaking.length === 0) return undefined
+  if (speaking.length === 0 && omitted === 0) return undefined
   const notes: Array<string> = []
   if (briefing.prefsUnread) notes.push(say(texts, language, "listPrefs"))
   if (briefing.failed.length > 0) {
@@ -52,13 +52,14 @@ export const briefingList = (briefing: Briefing, language: Language): Presentati
   if (briefing.withheld > 0) notes.push(say(texts, language, "listWithheld"))
   const room = LIST_ITEMS - notes.length
   // All of them when they fit; else one place is kept for the count of those not shown.
-  const shown = speaking.length <= room ? speaking : speaking.slice(0, room - 1)
+  const total = speaking.length + omitted
+  const shown = total <= room ? speaking : speaking.slice(0, room - 1)
   const items = [
     ...shown.map((s, i) => ({ id: `s${i + 1}`, text: bulletOf(s.sentences, s.title) })),
-    ...(shown.length < speaking.length ? [{ id: "more", text: say(texts, language, "listMore", { count: wording(speaking.length - shown.length, language) }) }] : []),
+    ...(shown.length < total ? [{ id: "more", text: say(texts, language, "listMore", { count: wording(total - shown.length, language) }) }] : []),
     ...notes.map((text, i) => ({ id: `n${i + 1}`, text }))
   ]
-  const titles = speakList(speaking.map((s) => s.title.toLocaleLowerCase(language)), language, { max: 4 })
+  const titles = speaking.length === 0 ? undefined : speakList(speaking.map((s) => s.title.toLocaleLowerCase(language)), language, { max: 4 })
   const covers = titles === undefined ? undefined : say(texts, language, "listCovers", { sections: titles })
   return {
     kind: "list",

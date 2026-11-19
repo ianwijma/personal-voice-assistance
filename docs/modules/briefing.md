@@ -80,33 +80,52 @@ same sentences, same risk class `read`) on the device that heard them:
 
 | Language | Phrases |
 |---|---|
-| English | "good morning" and "good evening" (`good {kind}`), "brief me", "give me my briefing" |
+| English | "good morning", "good evening", "brief me", "give me my briefing" |
 | Dutch | "goedemorgen", "goedenavond", "geef me mijn briefing" |
 
-Matching is exact on words: "good night", "good morning please", "brief me about the news" and "goede morgen" are not
-phrases and go on to the assistant. A refusal or an empty answer is the action's own ("There is nothing to tell you
-right now." after the greeting). **A phrase cannot fix a parameter's value**, so the English "good {kind}" reads
-morning or evening from the words, but the Dutch "goedemorgen" and "goedenavond" run the action with the kind left out:
-the same briefing without the "Goedemorgen." in front. (A phrase that could carry a value would fix that.)
+Matching is exact on words: "good night", "good morning please", "good any time", "good the morning", "brief me about
+the news" and "goede morgen" are not phrases and go on to the assistant. A refusal or an empty answer is the action's
+own ("There is nothing to tell you right now."). **A phrase cannot fix a parameter's value**, so the greetings (both
+languages) are plain words that run the action with the kind left out: the same briefing without the "Good morning." /
+"Goedemorgen." sentence in front. (That gap stays: a phrase that could carry a fixed value would close it.)
 
-**A list on the screen.** Whenever the action answers (by phrase or from the intent agent) it also shows a transient
-`list` on the asking device, 60 seconds, titled "Your briefing" / "Je briefing": one bullet per section that spoke, in
-the briefing's order (lead first), each the section's first sentence when it fits an item whole (80 characters), else
-the section's title (never cut). After the sections, short notes of what the answer also said: preferences that could
-not be read, how many sources failed, how many sections were left out by the cap, and "Some personal items are not
-shown here." With more bullets than fit the twelve items, the first ones are kept and "And seven more." says the rest.
-The text is data: shown as text, never markup. Its `spoken` fallback is "Your briefing covers weather, calendar and
-news." (at most four names, then "and two more"), which the model says where nothing is shown.
+**A phrase's answer fits what a phrase may say.** The host cuts a phrase command's spoken answer at 300 characters. In a
+phrase turn (`CurrentTurn.source === "phrase"`) the action therefore builds its answer inside that limit: whole
+sections in the briefing's order, with room kept for what it always says (what failed, the cap, what was held back)
+and for one closing sentence when something does not fit: "There is more: three more sections. Ask me for the full
+briefing." / "Er is meer: nog drie onderdelen. Vraag me om de volledige briefing." A sentence is never cut and nothing
+is left out silently; one section that alone is longer than the limit is counted, not cut. What fits whole is exactly
+the briefing as before. In any other kind of turn (the intent agent, the model, a routine) the action and the tool
+answer exactly as before.
+
+**A phrase heard once acts once.** A call in a phrase turn is remembered by its full identity (assistant, conversation,
+turn, device, the action and its resolved input) in a bounded record in the module's shared part (256 finished calls;
+one still running is never dropped): a repeat, also one at the same moment, returns the first outcome and shows nothing
+again. A new utterance is a new turn and runs again; a call in any other kind of turn runs every time.
+
+**A list on the screen.** Whenever the action answers it also shows a transient `list` on the asking device, 60
+seconds, titled "Your briefing" / "Je briefing": one bullet per section that was spoken, in the briefing's order (lead
+first), each the section's first sentence when it fits an item whole (80 characters), else the section's title (never
+cut). In a phrase answer that did not fit, the list holds exactly the sections that were spoken and counts the rest
+("And three more."). After the sections come short notes of what the answer also said: preferences that could not be
+read, how many sources failed, how many sections were left out by the cap, and "Some personal items are not shown
+here." With more bullets than fit the twelve items, the first ones are kept and "And seven more." says the rest. The
+text is data: shown as text, never markup. The presentation's `spoken` ("Your briefing covers weather, calendar and
+news.", at most four names, then "and two more") is its fallback text, for a caller that shows it through the
+Presenter's note; this action does not hand it to the model: where nothing can be shown it keeps its ordinary spoken
+briefing, unchanged.
 
 - **Privacy** is the spoken briefing's: each section already decided what it may say for the asking device, and the list
   holds only that. When any personal content is in, the list is personal with the asker as owner, so the Presenter asks
   `Privacy.mayReveal` for the device that would show it, at the moment of showing: a public screen gets none of it (the
   household's lines too: one list is one decision), a private phone of the owner gets it. A device without a screen
   shows nothing and the spoken answer is unchanged.
-- **Updated and withdrawn**: a later briefing on that device replaces the list; one with nothing to list (an empty or
-  unknown answer) takes the earlier list down. The module keeps the handle of the last list of at most 64 devices in
-  memory; a restart forgets them and the Presenter takes a stopped module's transient lists down, so nothing is left to
-  withdraw. It has no buttons, ticks or handlers, and sends no notification.
+- **Updated and withdrawn**: the module keeps one record of the last list of at most 64 devices in its shared part,
+  used by every assistant's instance under one lock. A later briefing on that device, by any assistant, replaces the
+  list; one with nothing to list (an empty or unknown answer) takes the earlier list down; and when the new list cannot
+  be shown, the old one is taken down too (the handle is kept for another try if even that fails), so the screen never
+  keeps an outdated list. A restart forgets the record and the Presenter takes a stopped module's transient lists
+  down, so nothing is left to withdraw. It has no buttons, ticks or handlers, and sends no notification.
 - The model's `briefing` tool shows nothing; only the action does.
 
 ## Settings
