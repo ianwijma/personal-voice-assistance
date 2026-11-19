@@ -992,62 +992,90 @@ SpeechPort    = { speak(deviceId, text, { cue, gate: () => "go" | "wait" | NotDe
 ### Phrase commands, the essential controls, the ringing window (docs/MODULES-PLAN.md §4 P7, first version; how to use it: [docs/PHRASES.md](PHRASES.md))
 
 ```ts
-// packages/core: Actions.ts, Phrases.ts, PhraseDecision.ts, PhraseRunner.ts, PhraseTexts.ts, SessionControl.ts, Playback.ts
+// packages/core: Actions.ts, Phrases.ts, PhraseSets.ts, PhraseDecision.ts, PhraseRunner.ts, PhraseTexts.ts, SessionControl.ts, Playback.ts
 ActionDefinition.phrases?: { en?: string[]; nl?: string[] }      // words and {param} slots; checked when the module starts
 ActionDefinition.endsReply?: boolean                            // run over a reply, the reply is not said again (default false)
+omittedParamValue(param)                                        // what a parameter not given receives, on every path (default, false, undefined)
 PHRASE_LIMITS = { phrasesPerAction: 8, actionsPerModule: 16, wordsPerPhrase: 8, charsPerPhrase: 80, slotsPerPhrase: 2,
-                  phrasesPerAssistant: 256, utteranceWords: 24, utteranceChars: 300, slotWords: 8, slotReads: 64 }
+                  phrasesPerAssistant: 256, utteranceWords: 24, utteranceChars: 300, slotWords: 8, choiceOptions: 32, slotReads: 64 }
 PHRASE_ANSWER_CHARS = 300
 HostControl = "stop" | "never-mind" | "repeat" | "louder" | "quieter";  HOST_CONTROLS; HOST_CONTROL_PHRASES[lang][control]
+phraseWords(text): PhraseWord[]                                  // normalised words (composed = decomposed) with offsets into `text`
 phraseProblems(moduleId, actions): string[]                     // the registration check (a "phrase" registrar in the host)
 reservedFor(lang, phrase): HostControl | undefined
-buildCommandSet(lang, actions: RegisteredAction[]): CommandSet  // host controls + the actions' phrases; duplicates out
-hostCommandSet(lang): CommandSet                                // the host's controls alone
-CommandSet = { language; phrases: CompiledPhrase[]; conflicts: PhraseConflict[] }
+SlotReader = choice (prepared keys, ≤ 32 options) | number | duration | text      // Param.dynamic and boolean are no slot
+compileActionPhrases(lang, action); assembleCommandSet(lang, modules, over); actionsByModule(actions)
+buildCommandSet(lang, actions: RegisteredAction[]): CommandSet  // all at once (the kit, tests); serve mode prepares ahead
+hostCommandSet(lang): CommandSet                                // the host's controls alone (no assistant; a set not ready)
+CommandSet = { language; phrases: CompiledPhrase[]; conflicts: PhraseConflict[] }   // CompiledPhrase.defaults: the omitted parameters
 PhraseConflict = { kind: "duplicate"; language; shape; actions } | { kind: "over-bound"; language; modules }
-matchCommand(set, text): PhraseMatch | undefined                // pure, synchronous, bounded
+matchCommand(set, text, stats?: MatchStats): PhraseMatch | undefined     // pure, synchronous, bounded; no module code
+MatchStats = { words; phrases; reads; exhausted }               // exhausted: not taken (no provisional match is returned)
 PhraseMatch = { kind: "control"; control; phrase } | { kind: "command"; action: RegisteredAction; values; phrase }
 matchRinging(lang, text, ringing: RingingCard[]): RingingMatch | undefined
 RingingMatch = { kind: "stop"; phrase } | { kind: "action"; notificationId; actionId; label }
 phraseLanguageOf(HOME_LANGUAGE): "en" | "nl";  phraseConflictIssues(assistant, set): Issue[];  phraseText(lang, key)
+makePhraseSets(PhraseSetInputs, { yieldStep?, onPrepared? }): Effect<PhraseSets, never, Scope>   // prepared ahead, in steps
+PhraseSetInputs = { language(); assistants(); inputKey(assistant); actionsOf(assistant) };  macrotask (the default step's yield)
+PhraseSets = { ready(assistant): CommandSet | undefined; changed(); settled; issues(); stats() }
+offeredActions(modules, gateway): RegisteredAction[]            // a registry's `actions`, without building one (ToolRegistry.ts)
 decideUtterance(UtteranceFacts): UtteranceDecision              // THE one decision per utterance, at its final
-UtteranceFacts = { final; language; ringing: RingingCard[] | undefined; wakeAtStart(text); gates(final): RouteResult[]; commandsFor(assistant?) }
+UtteranceFacts = { final; language; ringing: RingingCard[] | undefined; wakeAtStart(text); gates(final): RouteResult[]; commandsFor(assistant?); cancelled? }
 UtteranceDecision = { results: RouteResult[]; taken?: Taken }
 Taken = { by: "ringing"; match: RingingMatch } | { by: "phrase"; assistant: string | undefined; route: RouteTarget; match: PhraseMatch; text }
-runTaken(taken, PhrasePorts): Effect<PhraseOutcome>             // serve mode and the kit run the same function
-PhrasePorts = { deviceId; language(); notify(); session: PhraseSessionPort; volume(dir); playback(); room(); gateway(); turn(assistant); isPublished(assistant, action); pageText }
-PhraseSessionPort = { replyActive(); stopReply; cancelPending; lastReply(); interruptedReply(); answering(); say(assistant?, text) }
-PhraseOutcome = { taken; did: "stopped-ring" | "pressed" | "stopped-reply" | "paused-media" | "cancelled" | "repeated" | "volume" | "ran" | "nothing" | "refused" | "not-running" | "failed" | "busy"; said?; why? }
+runTaken(taken, PhrasePorts): Effect<PhraseOutcome>             // the operation, then THE settlement; serve mode and the kit
+PhrasePorts = { deviceId; language(); notify(); session: PhraseSessionPort; volume(dir); playback(); room(); gateway(); turn(assistant);
+                isPublished(assistant, action); pageText; slot: CommandSlot; trace?(PhraseTrace) }
+PhraseSessionPort = { replyActive(); announcementActive(); stopReply; stopAnnouncement; cancelPending; lastReply(); interruptedReply: Effect<KeptReply | undefined>;
+                      answering(); say(assistant?, text): Effect<"done" | "cut"> }
+CommandSlot = { take(); give() };  makeCommandSlot()            // one module action at a time per device; controls never busy
+KeptReply = { assistant; text };  keptReplyText(clauses);  MAX_KEPT_REPLY_CHARS = 2_000
+PhraseTrace = { by; name; turn?; tool?; risk?; refused?; actionMs?; totalMs; did; why? }
+PhraseOutcome = { taken; did: "stopped-ring" | "pressed" | "stopped-announcement" | "stopped-reply" | "paused-media" | "cancelled" | "repeated" | "volume"
+                  | "ran" | "nothing" | "refused" | "not-running" | "failed" | "busy"; said?; why? }
+ActionCallOptions.onDecision?({ risk?, refused? })              // Gateway.ts: the admission's outcome, for the trace
+RouteGate.cancelReply()                                         // "never mind": the reply playing counts no more, windows close
 SessionControl (ServiceKey "core.session-control") = { stopReply(deviceId); cancelPending(deviceId); repeatLast(deviceId); newConversation(deviceId) }
 DeviceControl (ServiceKey "core.device-control")   = { replyVolume(deviceId): number; changeReplyVolume(deviceId, "louder" | "quieter" | { to }): Effect<VolumeChange> }
 Playback (ServiceKey "playback") = { pause(room); changeVolume(room, { to } | { by }) }   // moved here from @pva/module-contracts, which re-exports it
-// @pva/protocol: volume.ts (additive within 11), capabilities.ts
+// @pva/protocol: volume.ts, capabilities.ts, snapshot.ts (all additive within 11)
 REPLY_VOLUME = { min: 0.2, max: 1, step: 0.2, default: 1 };  stepReplyVolume(level, dir);  replyVolumeLevel(level)
+changeReplyVolume(volumes: ReplyVolumes, deviceId, change, cap = MAX_KEPT_VOLUMES (256)): { volumes; change; sends }   // THE state machine
+ReplyVolumes; NO_REPLY_VOLUMES; replyVolumeOf(volumes, deviceId)
 output.volume { volume }  (server → the voice connections of one device);  DevicePlace.ringingWithoutWake?: boolean (absent = on)
-// serve mode: VoiceSessionOptions.phrases: SessionPhrases = { language(); commandsFor(assistant?); ringing(); ports; onOutcome? }
-//             VoiceSession.control = { stopReply; cancelPending; repeatLast; lastReply() };  HubOptions.replyVolume(deviceId)
-//             phraseCommands.ts: makeServePhrases (sets cached per snapshot, assistant, language; Health source "phrases"), makeReplyVolumes
-// the kit: harness.phrases = { say(text, { device?, assistant?, wake?, interrupting? }); decide; run; spoken; answered; replied; volume; commandsFor; sessionCalls }
+TraceInfo.phrase?: PhraseTraceInfo = { by; name; did; why?; risk?; refused?; person?; actionMs? }   // a taken utterance's execution trace
+// serve mode: VoiceSessionOptions.phrases: SessionPhrases = { language(); commandsFor(assistant?); ringing(); ports; onOutcome? }; onPhraseTrace(info)
+//             VoiceSession.control = { stopReply; cancelPending; repeatLast; lastReply() }; VoiceSession.phraseSlot; HubOptions.replyVolume(deviceId)
+//             INTERRUPTED_REPLY_WAIT_MS (2 s), CANNED_REPLY_WAIT_MS (3 min)
+//             phraseCommands.ts: makeServePhrases (an Effect: the sets of makePhraseSets; Health source "phrases"), makeReplyVolumes (the state machine)
+// the kit: harness.phrases = { say(text, { device?, assistant?, wake?, interrupting?, interruptedBy?, cancelled? }); decide; run; spoken; answered; traces;
+//          replied; volume; volumeSends; commandsFor; sessionCalls }; the module gets the kit's SessionControl and DeviceControl
 ```
 
 - **A command is an action with phrases**, registered with the instance that returns it: published and withdrawn with the
   module through the snapshot, run through the execution gateway (admission, the risk policy, `ACTION_TIMEOUT_MS`) as a
   `phrase` turn. The host's `phrase` registrar (`ModuleHost.ts`, beside the routes) refuses a start whose phrases break a
-  bound, name no parameter or are the host's. An assistant's set is built from the registry its turns get
-  (`modulesFor(...).registry.actions` in serve mode, `offeredFor` in the kit), so its module and tool switches and the
-  risk policy's offers apply.
-- **One decision per utterance**, in `VoiceSession.onStt` at the utterance's final (`decideUtterance`): the ringing
-  window before the echo gate, then the gates once, then the after-wake match on the route gate's result. A taken
-  utterance's final reaches the dispatcher with no words (never a turn, never in the history, no non-speculative tool);
-  the run is forked in the session's scope after the final is dispatched, one at a time per device. Not taken: the
-  results are the gates' own, unchanged.
+  bound, name no parameter, use a `Param.dynamic` or a choice of more than 32 options, or are the host's. An assistant's
+  set is built from the actions its turns are offered (`offeredActions`: its module and tool switches, the risk
+  policy's offers), **prepared ahead** in bounded steps whenever those change (`makePhraseSets`), keyed by what it
+  depends on; a final reads a ready set, or the host's controls alone.
+- **One decision per utterance**, in `VoiceSession.onStt` at the utterance's final (`decideUtterance`): nothing for an
+  utterance cancelled before its final; the ringing window before the echo gate, then the gates once, then the
+  after-wake match on the route gate's result. A taken utterance's final reaches the dispatcher with no words (never a
+  turn, never in the history, no non-speculative tool); the run is forked in the session's scope after the final is
+  dispatched. Not taken: the results are the gates' own, unchanged.
+- **The run** (`runTaken`): the operation (module actions one at a time per device; controls never busy), then one
+  settlement for every outcome: the answer in the addressed assistant's voice, then, unless the outcome ends the reply,
+  the reply this utterance interrupted, found by its turn (waiting for its end, at most 2 s), in its own assistant's
+  voice, after the first finished. Each run publishes an execution trace (`TraceInfo.phrase`).
 - **What it reads, when**: what rings (`NotifyEngine.ringingOn`) at the final, and again inside `stopRinging` and `press`
-  (which admit only a device that holds the card); whether a reply is active; whether the action is still published
-  (before the gateway and again on a failure); the volume; the room. The interrupted reply is the reply that played when
-  the utterance began (the session keeps the last committed reply's prepared text, at most 2,000 characters).
+  (which admit only a device that holds the card); whether a reply or an announcement is active; whether the action is
+  still published (before the gateway and again on a failure); the volume; the room.
 - **The ringing window** is closed for an utterance during which the device was audible (the echo gate's audible window:
   a reply or an announcement playing there, plus its tail), and while `place.ringingWithoutWake` is `false`.
-- **Turn path**: a cached set read (serve mode) and one bounded match per final. Measured: docs/PHRASES.md "Latency".
+- **"Never mind"** (and `cancelPending`) keeps the cancelled reply's end (by its turn) from opening a follow-up window
+  (`RouteGate.cancelReply`, and no `replyEnded` for that turn).
+- **Turn path**: a ready set read and one bounded match per final (no module code, no set built). Measured: docs/PHRASES.md "Latency".
 
 Adding a feature = one new file exporting `defineModule({...})` + one line in `moduleCatalog` in `apps/assistant/src/modules.ts` (the module packages of docs/MODULES-PLAN.md §5.1 are already listed there, each by its package's `catalog`: their PRs touch only their package and `docs/modules/<id>.md`; docs/MODULES.md). Adding a provider = one new package implementing a core interface + one line in `apps/assistant/src/providers.ts`. Adding a voice provider = an adapter with `layerConfig` (`Tts`) and `makeVoices` (`TtsVoices`), and one entry in `ttsProviders`, `ttsProviderInfo` and (hosted) `hostedTtsVoices` in `providers.ts`. A voice needs no code: it is chosen by its key.
 

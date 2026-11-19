@@ -27,11 +27,13 @@ export const lampModule = defineModule({
         description: "Switch the lamp in a room on or off.",
         examples: ["kitchen lamp on", "lamp uit in de keuken"],
         params: {
-          room: Param.dynamic({ label: "Room", options: () => rooms }),
+          // A slot reads a fixed choice (at most 32 options, prepared when the set is built), a number, a duration or text;
+          // never a list the module fills while it runs (take such a name as text and resolve it in `run`).
+          room: Param.choice({ label: "Room", options: rooms }),
           to: Param.choice({ label: "On or off", options: [{ value: "on", label: "on", aliases: ["aan"] }, { value: "off", label: "off", aliases: ["uit"] }] })
         },
         // Said after the wake phrase (or in a follow-up window), these run the action with no model call. Words are
-        // matched exactly; each slot is read by its parameter's parser (a room by name or alias, on/off by label).
+        // matched exactly; each slot is read by its parameter's parser (a room by value, name or alias, on/off by label).
         phrases: { en: ["{room} lamp {to}", "turn the {room} lamp {to}"], nl: ["lamp {to} in de {room}"] },
         risk: "change",
         run: ({ room, to }) =>

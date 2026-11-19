@@ -947,7 +947,9 @@ rely on, with every bound and id.
 | `Playback` | service: pause, volume | music (wave B) | the host's "stop" (P7; volume later) | `playback.ts` (defined in `@pva/core` since P7, re-exported) |
 | `BriefingSections` | contribution | weather, bin-day, calendar, news; reminders later | briefing | `briefing.ts` |
 
-The core's own are `People`, `Privacy`, `Devices` in `@pva/core` (later `SessionControl`, `DeviceControl`). The
+The core's own are `People`, `Privacy`, `Devices`, and since P7 `SessionControl` (stop the reply, cancel what is pending,
+repeat the last reply, a new conversation) and `DeviceControl` (the reply volume), in `@pva/core` ([PHRASES.md](PHRASES.md)
+"Session and device control"); each call names the device it acts on (a tool passes its turn's `deviceId`). The
 calendar module keeps its own provider interface (ICS) inside its package: no other module provides a calendar in
 this wave.
 
@@ -1432,9 +1434,11 @@ An action can be said **without the language model**: give it `phrases` per lang
 ([PHRASES.md](PHRASES.md) has the rules, the bounds and what is left out). After the wake phrase (or in a follow-up
 window, or on a device whose assistant answers without a phrase), an utterance that is one of the phrases of the
 household's language runs the action through the gateway as a `phrase` turn of that device, and its `say` is spoken as
-a canned reply: the utterance never becomes a turn and nothing of it enters the history. Words are matched exactly (case
-and punctuation aside); each slot is read by its parameter's own parser, and one that does not read means no match. The
-longest phrase wins. The host's essential controls ("stop", "never mind", "repeat", "louder", "quieter", with their
+a canned reply: the utterance never becomes a turn and nothing of it enters the history. Words are matched exactly (case,
+accents and punctuation aside); a slot is a number, a duration, a fixed choice (at most 32 options) or text, read from the
+characters said by its parameter's own parser, and one that does not read means no match (a parameter whose options
+come from a callback cannot be a slot: take it as text and resolve it in `run`). A parameter the phrase leaves out gets
+its default, as on every path. The longest phrase wins. The host's essential controls ("stop", "never mind", "repeat", "louder", "quieter", with their
 variants, in both languages) are reserved: a phrase of yours that is one of them refuses your module's start, like any
 phrase outside the bounds (8 a language, 8 words, 2 slots with a word between them, every required parameter a slot).
 Two modules with the same phrase for one assistant are both left out for it and named on the Health page.
@@ -1461,11 +1465,13 @@ export const lampModule = defineModule({
         description: "Switch the lamp in a room on or off.",
         examples: ["kitchen lamp on", "lamp uit in de keuken"],
         params: {
-          room: Param.dynamic({ label: "Room", options: () => rooms }),
+          // A slot reads a fixed choice (at most 32 options, prepared when the set is built), a number, a duration or text;
+          // never a list the module fills while it runs (take such a name as text and resolve it in `run`).
+          room: Param.choice({ label: "Room", options: rooms }),
           to: Param.choice({ label: "On or off", options: [{ value: "on", label: "on", aliases: ["aan"] }, { value: "off", label: "off", aliases: ["uit"] }] })
         },
         // Said after the wake phrase (or in a follow-up window), these run the action with no model call. Words are
-        // matched exactly; each slot is read by its parameter's parser (a room by name or alias, on/off by label).
+        // matched exactly; each slot is read by its parameter's parser (a room by value, name or alias, on/off by label).
         phrases: { en: ["{room} lamp {to}", "turn the {room} lamp {to}"], nl: ["lamp {to} in de {room}"] },
         risk: "change",
         run: ({ room, to }) =>
@@ -1526,7 +1532,7 @@ values), `startAt`, `started`. It returns handles:
 | `stop`, `start`, `restart`, `configure(values, secrets?)` | switched off for every assistant, on again; one real restart of the module with its demand kept (the same host and store: not a restart of the server); a settings change as the owner saves it |
 | `info()`, `issues()`, `checkHealth`, `toolNames(as?)` | the admin page's view of it, its Health issues (health run now), the tools the turn's model is sent: as serve mode offers them, without the tools and action tools the assistant switched off and those the risk policy refuses |
 | `expectNoSecrets(...values)` | fails when the value of a secret given to the kit is in any string of the `values` you pass (tool results, action outcomes, spoken lines, **the rows your test read**), decoded: every key and string, and a string that is JSON parsed and walked too, so an escaped secret is found; it also looks at every event and the admin page. It reads no collection itself: pass it the rows your module wrote |
-| `phrases` | P7: `say(text, { device, wake?, interrupting? })` as the recogniser's final after the wake phrase (or without it, where only the ringing window can take it), `decide` / `run`, `spoken`, `answered`, `replied`, `volume`, `commandsFor` ([PHRASES.md](PHRASES.md) "Testing") |
+| `phrases` | P7: `say(text, { device, assistant, wake?, interrupting?, interruptedBy?, cancelled? })` as the recogniser's final after the wake phrase (or without it, where only the ringing window can take it), `decide` / `run` (Effects: a test may change something between them), `spoken`, `answered`, `traces`, `replied`, `volume`, `volumeSends`, `commandsFor` (an Effect: the set once prepared), `sessionCalls`; the module also gets the kit's `SessionControl` and `DeviceControl` ([PHRASES.md](PHRASES.md) "Testing") |
 | `notify` | P9: the real notification service: `all`, `messages` (what each page was sent), `decisions` (where it would go, and why not), `press(id, action, { device })`, `announced`, `replying(device, on)`, `connect` / `disconnect`, `dnd()`, `settle`, `engine` ([NOTIFICATIONS.md](NOTIFICATIONS.md) "Testing") |
 | `moduleStore()`, `store`, `events`, `people`, `schedulerUses` | the module's store, the household store, every event on the bus, the household's core services, what the kit saw of the scheduler |
 
@@ -1708,9 +1714,11 @@ check` behind the shared lock (`flock /workspace/build-cache/ian/pva-heavy.lock 
 
 - Its own package (§19) under `packages/module-<pkg>/` (source, tests, `package.json`).
 - **Its own pages, `docs/modules/<id>.md`** (one per module id), filled in under the stub's headings: what it does, its
-  tools, settings, what it stores, what it needs, and what was left out. **In wave A, "Left out" lists every part of
-  the plan's row that needs a phrase command or a presentation (P7, P10): they do not exist yet, and come with wave
-  B.** Notifications and a module's speech exist since P9 (§16). This replaces the plan's "own section in `docs/MODULES.md`", so twenty pull
+  tools, settings, what it stores, what it needs, and what was left out. **"Left out" lists every part of the plan's
+  row that needs a presentation (P10): it does not exist yet, and comes with wave B.** Notifications and a module's
+  speech exist since P9, and phrase commands (`phrases` on an action), the host's controls and the ringing window since
+  P7 (§16, [PHRASES.md](PHRASES.md)): build those parts of your row now, within their first version (a slot is a
+  number, a duration, a fixed choice or text). This replaces the plan's "own section in `docs/MODULES.md`", so twenty pull
   requests never edit the same file.
 - `pnpm-lock.yaml`, only when it adds a dependency the scaffold did not foresee; the description names it.
 - **Nothing else.** The scaffold has created the package, registered it in the catalogue, added the dependencies of

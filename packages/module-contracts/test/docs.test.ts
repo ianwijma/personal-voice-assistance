@@ -35,6 +35,13 @@ describe("docs/MODULES.md", () => {
   })
 
 
+  it("says nothing stale about what exists (P7 review round 1, a15)", () => {
+    const text = readFileSync(guide, "utf8")
+    for (const stale of ["(later `SessionControl`, `DeviceControl`)", "a phrase command or a presentation (P7, P10): they do not exist yet", "Phrase commands and\n> presentations"]) {
+      expect(text.includes(stale), stale).toBe(false)
+    }
+  })
+
   it("quotes the regions of the files it names, exactly", () => {
     const text = readFileSync(guide, "utf8")
     const marks = [...text.matchAll(MARK)]
