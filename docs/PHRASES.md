@@ -37,22 +37,27 @@ defineAction({
   (not `optional`, not a yes/no one) is a slot in every phrase. A parameter a phrase leaves out gets what every other
   path gives it, before the risk class is judged: its declared `default`, `false` for a yes/no parameter, else
   `undefined`. Two slots need a word between them; a phrase needs at least one word that is not a slot.
-- **What a slot can be: a number, a duration, a fixed choice (at most 32 options) or text.** A `boolean` cannot be a slot,
+- **What a slot can be: a number, a duration, a fixed choice (at most 32 options and 96 names, counting values, labels
+  and aliases, each at most 40 characters) or text.** A `boolean` cannot be a slot,
   and neither can a parameter whose options come from a callback (`Param.dynamic`): the module's start is refused with a
   sentence saying to make it text and resolve the name in the action (which runs off the matching path, within the
   action's time limit). Everything the matcher reads is prepared when the set is built: a choice's values, labels and
   aliases become lookup keys (case, accents, punctuation and a leading article do not count; no sound-alikes, no edit
-  distance), a number's and a duration's bounds are kept. **A match makes no call into module code and normalises
+  distance), made once per choice however many phrases read it (the start's check only counts and measures the names),
+  a number's and a duration's bounds are kept. **A match makes no call into module code and normalises
   nothing but the utterance.** Why: in the first version a slot of a 255-option list was resolved by `resolveOption` on
   every reading (sound-alike keys and edit distance for every option), and a sentence aligned with 256 two-slot phrases
   spent its 64 readings in 220–238 ms of main thread (review round 1, a1); the same aligned case now takes a median
   0.21 ms (see "Latency").
 - **A slot's value is what was said.** The characters between the slot's neighbouring words (a sign, a leading decimal
-  point, `%`, `°`, `#`, `+` and `.` included; the separators `, ; :` beside it and an utterance's closing punctuation
-  not) go to the slot's parser, which decides: "set −5" is −5 for a number that allows it, "set .5" is 0.5, "dim 40%" is
-  40 for a percent parameter and nothing for a unitless one, "wait -5 minutes" is no duration, "note C++" is "C++". A
-  number or duration must be the whole slot, one expression, within its bounds and with no other unit than the
-  parameter's; text is at most its `maxWords` (and 8). A slot that does not read means the phrase does not match.
+  point or comma, `%`, `°`, `#`, `+` and `.` included; the separators `, ; :` beside it and an utterance's closing
+  punctuation not, but a comma glued to the first digit group, ",5", is the number's) go to the slot's parser, which
+  decides: "set −5" is −5 for a number that allows it, "set .5" and "zet ,5" are 0.5, "dim 40%" is 40 for a percent
+  parameter and nothing for a unitless one, "wait -5 minutes" and "wait ,5 minutes" are no duration, "note C++" is
+  "C++". A number or duration must be the whole slot: one expression, which covers every character of the slot that is
+  not a space (so "#5", "$5", "+5", "5+" and "5/" are no number; a sign the parser reads, a leading decimal mark, "%"
+  and "°" are part of the expression), within its bounds and with no other unit than the parameter's; text is at most
+  its `maxWords` (and 8). A slot that does not read means the phrase does not match.
 - **Matching is exact on words.** Case, accents, apostrophes, punctuation and spacing do not count (`phraseWords`: a word
   keeps its combining marks while it is cut out, so composed and decomposed accents, "één" either way, give the same
   word, and a slot's characters still come from the original text; `@pva/language` exports no normaliser of its own).
@@ -86,6 +91,7 @@ defineAction({
 | the same phrase (shape) from two modules in one assistant's set | — | both left out for that assistant, named on the Health page |
 | an utterance | 24 words, 300 characters | it matches nothing |
 | options of a choice that is a slot | 32 | the module does not start |
+| names of a choice that is a slot (its values, labels and aliases, counted) | 96, each at most 40 characters | the module does not start (the sentence names the slot and the count or the name) |
 | a parameter whose options come from a callback (`Param.dynamic`) as a slot | — | the module does not start (make it text) |
 | words of one slot | 8 (a text slot: its `maxWords`, at most 8) | that reading does not match |
 | slot readings for one utterance, over every phrase (a reading: one parser call on a span whose words are aligned) | 64 (`slotReads`) | the search proved nothing: **not taken**, it goes on to the assistant; no shorter match found earlier is used |
@@ -117,8 +123,15 @@ defineAction({
   something cut the first short. The commands that end the reply: an action declared `endsReply: true`, a "stop" that
   selected the reply, and "never mind". The interrupted reply is the one playing when the utterance began, found by its
   turn; when the page's report that it stopped has not come yet, the settlement waits for it (at most 2 s).
-- **A cancelled utterance runs nothing**: when the page's Stop or a new conversation cancelled the utterance between its
-  first words and its final, no command and no control runs for it.
+- **A cancelled reply is not brought back.** When the interrupted reply is cancelled while the settlement waits (a
+  "stop" that selects it, the page's Stop, "never mind" or `cancelPending`, a new conversation of its assistant), it is
+  not said again: checked after every wait and right before it would be said. The command's own sentence is still said,
+  and the lines of such a settlement open no follow-up window. "repeat" still says the last reply when asked. A "stop"
+  said while such a settlement is pending selects that reply still to come (it counts as the reply).
+- **A cancelled utterance runs nothing, and is no turn**: when the page's Stop or a new conversation cancelled the
+  utterance between its first words and its final, no command and no control runs for it, and its final reaches the
+  conversations with no words (as a taken utterance's does), so it never becomes a turn, even when the stop came before
+  the conversation had opened the utterance (with or without phrase commands).
 - **Idempotent?** A command runs once per utterance; there is no retry.
 
 ## The host's essential controls
@@ -138,9 +151,13 @@ no module may declare these words in that language):
   ring the device holds, through the notification service's `stopRinging`, the same admission as the card's Stop); the
   announcement being spoken there (`stopSpeech`); a reply being prepared or spoken (every conversation of the device, as
   the page's Stop; a reply this utterance's own start of speech cut off counts); media the `Playback` service says it
-  paused in the device's room (`pause(room)`, within its 3 s; with no provider, or no room, this step does nothing). It
-  says nothing itself. When it selected a ring or an announcement, the reply its start of speech interrupted is said
-  again (the settlement); when it selected the reply, that reply stays stopped.
+  paused in the device's room (`pause(room)`, within its 3 s; with no provider, no room, or no player for the room, this
+  step does nothing). It says nothing itself. When it selected a ring or an announcement, the reply its start of speech
+  interrupted is said again (the settlement); when it selected the reply, that reply stays stopped. **Once a step is
+  selected, the utterance is about that one**: when stopping it fails (the notification service reports the ring could
+  not be stopped, the announcement's stop fails, the media's pause fails or takes longer than 3 s), it says "I couldn't
+  stop that." ("Dat kon ik niet stoppen."), nothing else is stopped in its place, and the interrupted reply is said
+  again.
 - **never mind** cancels a pending interaction: a reply being prepared or spoken, and the armed and follow-up windows,
   including the one the cancelled reply would open when its end is reported, late or not (the reply is known by its
   turn; a later reply opens its own window as before). Rings, announcements and media are left alone. It says nothing.
@@ -213,7 +230,9 @@ is active, whether the action is still published, the volume, the room.
 
 A final only **reads** a set; it never builds one. Each switched-on assistant's set is prepared ahead (`PhraseSets.ts`),
 whenever something it depends on changes (the modules publish or withdraw, a settings save, the household's language),
-in bounded steps (one module's phrases at a time, at most 128) with a real yield to the event loop between them. A set
+in bounded steps with a real yield to the event loop between them: a step is measured by the normalising it did (a unit
+per phrase or choice name, each at most 80 characters) and ends after 256 units (`PREPARE_STEP_WORK`), so a module of
+16 actions with two full choices per phrase is prepared over a dozen steps, not one. A set
 is keyed by exactly what it depends on: the module snapshot's version, the language and the assistant's module choices
 (on, the tools switched off), never by the identity of an assistant object; and inside, by the published actions with
 phrases, so a change that keeps the same actions keeps the same set without compiling it again. A final whose set is
@@ -227,7 +246,12 @@ Every taken utterance leaves an **execution trace**, published where turn traces
 message), and no conversation turn or history entry: `TraceInfo` with `phrase` (additive within protocol 11): what took
 it (`by`: ringing, control, command; `name`), the outcome (`did`, `why`), for a command the class the gateway judged it
 as and its refusal (`risk`, `refused`), the person it ran for, how long the action ran (`actionMs`, and the tool in
-`tools`), and the whole run (`totalMs`). Also for a silent action, and a failed, refused or timed-out one.
+`tools`), and the whole run (`totalMs`). Also for a silent action, and a failed, refused or timed-out one. Exactly one
+per taken utterance: its identity (the addressed assistant, else the device's answering one; the principal, the turn a
+command runs as, with its person; the control or command and its tool) is fixed before anything can return early, so a
+busy or withdrawn command has it too; its outcome is what happened (a risk only when the gateway judged the call); it
+is published from a finaliser, so also when the session ends during the action (`did: "interrupted"`) or while its
+answer is spoken (`why: "interrupted while speaking"`).
 
 In `manual` interrupt mode the microphone counts for nothing while a reply plays (as before), so a control said over a
 reply is not heard; in `confirm` mode the echo gate passes it once it is two words or more that the reply did not just
@@ -246,7 +270,7 @@ real notification service:
 
 | Handle | What it does |
 |---|---|
-| `say(text, { device?, assistant?, wake?, interrupting?, interruptedBy?, cancelled? })` | the recogniser's final on a device, once the sets are ready: after the wake phrase (default), or `wake: false` (only the ringing window can take it: open while the kit's service says something rings there, the device's "while ringing" is on, and no reply (`notify.replying`) or announcement is audible there or in its 300 ms echo tail). `interrupting`: the text of a reply the utterance cut off (kept by serve mode's rule), `interruptedBy`: whose; `cancelled`: the utterance was cancelled before its final. Answers `{ taken: false }` or `{ taken: true, by: "ringing" \| "control" \| "command", outcome }` (`did`, `said`, `why`) |
+| `say(text, { device?, assistant?, wake?, interrupting?, interruptedBy?, cancelled? })` | the recogniser's final on a device, once the sets are ready: after the wake phrase (default), or `wake: false` (only the ringing window can take it: open while the kit's service says something rings there, the device's "while ringing" is on, and no reply (`notify.replying`), announcement or line the kit itself spoke (a command's answer, a repeat, a reply said again) is audible there or in its 300 ms echo tail, serve mode's own rule (`EchoGate`): advance the clock 300 ms after a phrase whose answer was spoken before testing the window; and the utterance did not interrupt a reply). `interrupting`: the text of a reply the utterance cut off (kept by serve mode's rule), `interruptedBy`: whose; `cancelled`: the utterance was cancelled before its final. Interrupting the call (the test's fiber) interrupts the command's action as in serve mode: its clean-up runs, nothing is said afterwards, the device's slot is free again. Answers `{ taken: false }` or `{ taken: true, by: "ringing" \| "control" \| "command", outcome }` (`did`, `said`, `why`) |
 | `decide(text, as)`, `run(taken, as)` | the decision alone, and running it later (Effects: change something in between, as a module that restarts) |
 | `spoken`, `answered`, `traces` | every line said (with its assistant), every outcome, every execution trace |
 | `replied(device, text)` | a reply was spoken (what "repeat" says), kept as serve mode keeps it (2,000 characters, whole sentences) |
@@ -271,15 +295,20 @@ alias each, and a duration; plus the host's 37 English controls).
 
 | What | Number |
 |---|---|
-| a near miss: 24 words, 257 phrases aligned (the 256 and "please stop"), no reading; 500 utterances | median 0.033 ms, p95 0.049 ms, worst 0.083 ms; longest stop 1.11 ms |
-| a match: 11 words, 2 readings; 500 utterances | median 0.040 ms, p95 0.072 ms, worst 0.31 ms; longest stop 1.16 ms |
-| the reviewers' aligned worst case: 9 alternating words against 256 two-slot phrases over those words (number and duration slots), 80 aligned, the full 64 readings, not taken; 200 utterances | median 0.207 ms, p95 0.371 ms, worst 0.467 ms; longest stop 1.42 ms (220–238 ms in the first version, with a 255-option list resolved per reading) |
-| preparing one assistant's set from 4,096 declarations (32 modules × 16 actions × 8 phrases; 256 kept), 10 preparations | median 2.1 ms of wall time each, in steps; longest stop 1.9 ms |
-| a 24-word turn that is no command, something ringing, its set invalidated before every final (the final read the host's controls while the set was prepared again: 120 of 120), `TurnTrace`, 100 turns × 4 counterbalanced runs, the real `Conversation`, the model's first token at 5 ms | end of turn → first audio 5.413 ms without the decision, 5.411 ms with it (p95 5.70 / 5.78); the recogniser's final → first audio 5.432 / 5.496 ms (p95 5.73 / 5.92) |
+| a near miss: 24 words, 257 phrases aligned (the 256 and "please stop"), no reading; 500 utterances | median 0.032 ms, p95 0.039 ms, worst 0.061 ms; longest stop 1.03 ms |
+| a match: 11 words, 2 readings; 500 utterances | median 0.039 ms, p95 0.056 ms, worst 0.23 ms; longest stop 1.09 ms |
+| the reviewers' aligned worst case: 9 alternating words against 256 two-slot phrases over those words (number and duration slots), 80 aligned, the full 64 readings, not taken; 200 utterances | median 0.217 ms, p95 0.356 ms, worst 0.496 ms; longest stop 1.24 ms (220–238 ms in the first version, with a 255-option list resolved per reading) |
+| the maximum choice-bearing module (16 actions × 8 phrases, each phrase two slots that are choices at the full budget: 32 options, 96 names of 40 characters, every action its own two choices; new objects each time, as after a start): the start's declaration check, 30 times | median 0.52 ms, worst 1.04 ms, in one synchronous step |
+| the same module's set prepared, 10 preparations after 10 starts | median 5.6 ms of wall time each, in 90 steps; longest step 1.24 ms; longest stop 2.0 ms |
+| preparing one assistant's set from 4,096 declarations (32 modules × 16 actions × 8 phrases, a duration slot; 256 kept), 10 preparations | median 2.3 ms of wall time each, in steps; longest stop 2.6 ms |
+| a 24-word turn that is no command, something ringing, its set invalidated before every final (the final read the host's controls while the set was prepared again: 120 of 120), `TurnTrace`, 100 turns × 4 counterbalanced runs, the real `Conversation`, the model's first token at 5 ms | end of turn → first audio 5.424 ms without the decision, 5.421 ms with it (p95 5.68 / 5.57); the recogniser's final → first audio 5.440 / 5.522 ms (p95 5.70 / 5.69) |
 
-So a turn that is not a command moved by a median 0.06 ms from the recogniser's final (the test asserts under 1 ms),
-and a final never compiles a set. Run as CI runs it (`CI=1`, two cores): the aligned worst case median 0.214 ms, worst
-4.1 ms, longest stop 4.8 ms; a preparation's longest stop 2.7 ms; the turn's final → first audio 5.442 / 5.531 ms.
+So a turn that is not a command moved by a median 0.08 ms from the recogniser's final (the test asserts under 1 ms),
+and a final never compiles a set. Run as CI runs it (`CI=1`, two cores): the aligned worst case median 0.217 ms, worst
+3.3 ms, longest stop 3.9 ms; the choice-bearing module's check worst 3.3 ms, its preparation's longest step 1.8 ms and
+longest stop 2.6 ms; the 4,096-declaration preparation's longest stop 3.5 ms; the turn's final → first audio 5.423 /
+5.541 ms. (Before review round 2 the choice-bearing module's check took 27–115 ms and its preparation stopped the main
+thread for 18–99 ms in one step, with one to ten aliases per option.)
 
 ## Not now
 

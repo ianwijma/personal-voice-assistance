@@ -59,6 +59,13 @@ export const PHRASE_LIMITS = {
   /** Options of a choice parameter that is a slot (its values, labels and aliases are prepared when the set is built). */
   choiceOptions: 32,
   /**
+   * Names of a choice that is a slot, in all: its values, labels and aliases counted (32 options with a value and a label
+   * leave 32 aliases). Each choice's names are prepared once (one lookup key each) and reused by every phrase using it.
+   */
+  choiceNames: 96,
+  /** Characters of one name of a choice that is a slot (a value, a label or an alias). */
+  choiceNameChars: 40,
+  /**
    * Slot readings one utterance may cost over every phrase of the set (a reading runs a slot's parser on the characters
    * of a span whose alignment already covers every word). Ordinary sentences need one or two. A search that spends them
    * all has proved nothing: the utterance is not taken (it goes on to the assistant), and no shorter match found before
@@ -163,8 +170,74 @@ export interface CompiledPhrase {
   readonly defaults: Readonly<Record<string, unknown>>
 }
 
-/** The reader of a parameter that is a slot, or why it cannot be one. */
-const readerOf = (name: string, param: ActionParam): SlotReader | { readonly problem: string } => {
+/**
+ * The work of preparing phrases, in units of normalising one name or one phrase (each at most 80 characters): the
+ * preparation of a set yields to the event loop after `PREPARE_STEP_WORK` units (`PhraseSets.ts`), so no step is long.
+ */
+export interface PhraseWork {
+  units: number
+}
+
+/** Units of work between two yields while a set is prepared (one choice's names, at most 96, may come on top). */
+export const PREPARE_STEP_WORK = 256
+
+type ChoiceParam = Extract<ActionParam, { readonly kind: "choice" }>
+
+/** Why a choice cannot be a slot (without the slot's name), by the choice: judged once, with no normalising. */
+const choiceVerdicts = new WeakMap<ChoiceParam, string | null>()
+/** A choice's prepared lookup keys, by the choice: made once and reused by every phrase that reads it. */
+const choiceReaders = new WeakMap<ChoiceParam, SlotReader>()
+
+const namesOf = (o: ChoiceParam["options"][number]): ReadonlyArray<unknown> => [o.value, o.label, ...(Array.isArray(o.aliases) ? o.aliases : [])]
+
+const choiceProblem = (param: ChoiceParam): string | undefined => {
+  const known = choiceVerdicts.get(param)
+  if (known !== undefined) return known ?? undefined
+  let problem: string | undefined
+  if (param.options.length > PHRASE_LIMITS.choiceOptions) problem = `is a choice of ${param.options.length} options; a phrase reads at most ${PHRASE_LIMITS.choiceOptions}`
+  else {
+    let names = 0
+    for (const o of param.options) {
+      for (const n of namesOf(o)) {
+        names++
+        if (typeof n !== "string" || n.length > PHRASE_LIMITS.choiceNameChars) {
+          problem ??= `has the name "${String(n).slice(0, PHRASE_LIMITS.choiceNameChars)}…" of more than ${PHRASE_LIMITS.choiceNameChars} characters; a phrase reads names (values, labels, aliases) of at most ${PHRASE_LIMITS.choiceNameChars}`
+        }
+      }
+    }
+    if (problem === undefined && names > PHRASE_LIMITS.choiceNames) {
+      problem = `is a choice of ${names} names (values, labels and aliases counted); a phrase reads at most ${PHRASE_LIMITS.choiceNames}: drop aliases, or make the parameter text (Param.text) and resolve the name in the action`
+    }
+  }
+  choiceVerdicts.set(param, problem ?? null)
+  return problem
+}
+
+/** A valid choice's reader, its keys made the first time any phrase reads it (counted in `work`). */
+const choiceReader = (param: ChoiceParam, work: PhraseWork): SlotReader => {
+  const known = choiceReaders.get(param)
+  if (known !== undefined) return known
+  const keys = new Map<string, string>()
+  for (const o of param.options) {
+    for (const n of namesOf(o)) {
+      work.units++
+      const k = choiceKey(n as string)
+      if (k.length > 0 && !keys.has(k)) keys.set(k, o.value)
+    }
+  }
+  const reader: SlotReader = { kind: "choice", keys }
+  choiceReaders.set(param, reader)
+  return reader
+}
+
+/** The reader the declaration check gives a valid choice: it judges the choice and never prepares its keys. */
+const CHECKED_CHOICE: SlotReader = { kind: "choice", keys: new Map() }
+
+/**
+ * The reader of a parameter that is a slot, or why it cannot be one. `work` absent: the declaration check (a choice is
+ * judged by its counts and lengths, its keys are not made); present: compiling for a set (a choice's keys are made once).
+ */
+const readerOf = (name: string, param: ActionParam, work: PhraseWork | undefined): SlotReader | { readonly problem: string } => {
   switch (param.kind) {
     case "boolean":
       return { problem: `the slot {${name}} is a yes/no parameter, which a phrase cannot fill` }
@@ -173,15 +246,9 @@ const readerOf = (name: string, param: ActionParam): SlotReader | { readonly pro
         problem: `the slot {${name}} is a list the module fills while it runs, which a phrase cannot read: make the parameter text (Param.text) and resolve the name in the action`
       }
     case "choice": {
-      if (param.options.length > PHRASE_LIMITS.choiceOptions) return { problem: `the slot {${name}} is a choice of ${param.options.length} options; a phrase reads at most ${PHRASE_LIMITS.choiceOptions}` }
-      const keys = new Map<string, string>()
-      for (const o of param.options) {
-        for (const n of [o.value, o.label, ...(o.aliases ?? [])]) {
-          const k = choiceKey(n)
-          if (k.length > 0 && !keys.has(k)) keys.set(k, o.value)
-        }
-      }
-      return { kind: "choice", keys }
+      const problem = choiceProblem(param)
+      if (problem !== undefined) return { problem: `the slot {${name}} ${problem}` }
+      return work === undefined ? CHECKED_CHOICE : choiceReader(param, work)
     }
     case "number":
       return { kind: "number", integer: param.integer === true, ...(param.min !== undefined ? { min: param.min } : {}), ...(param.max !== undefined ? { max: param.max } : {}), ...(param.unit !== undefined ? { unit: param.unit } : {}) }
@@ -193,7 +260,7 @@ const readerOf = (name: string, param: ActionParam): SlotReader | { readonly pro
 }
 
 /** The words of a phrase as written, or why it is not a phrase. */
-const parsePhrase = (text: string, params: ActionParams | undefined): { readonly parts: ReadonlyArray<PhrasePart> } | { readonly problem: string } => {
+const parsePhrase = (text: string, params: ActionParams | undefined, work: PhraseWork | undefined): { readonly parts: ReadonlyArray<PhrasePart> } | { readonly problem: string } => {
   if (typeof text !== "string") return { problem: "a phrase is text" }
   if (text.trim().length === 0) return { problem: "a phrase is empty" }
   if (text.length > PHRASE_LIMITS.charsPerPhrase) return { problem: `a phrase has at most ${PHRASE_LIMITS.charsPerPhrase} characters` }
@@ -206,7 +273,7 @@ const parsePhrase = (text: string, params: ActionParams | undefined): { readonly
       const name = slot[1]!
       const param = params === undefined ? undefined : Object.hasOwn(params, name) ? params[name] : undefined
       if (param === undefined) return { problem: `the slot {${name}} names no parameter of the action` }
-      const reader = readerOf(name, param)
+      const reader = readerOf(name, param, work)
       if ("problem" in reader) return reader
       parts.push({ slot: name, reader })
       continue
@@ -228,9 +295,10 @@ const RESERVED: Readonly<Record<PhraseLanguage, ReadonlyMap<string, HostControl>
 /** The host control a phrase's words are reserved for in `language`, if any. */
 export const reservedFor = (language: PhraseLanguage, phrase: string): HostControl | undefined => RESERVED[language].get(normal(phrase))
 
-/** One phrase of an action compiled, or why it may not be declared. */
-const compilePhrase = (language: PhraseLanguage, text: string, params: ActionParams): { readonly parts: ReadonlyArray<PhrasePart> } | { readonly problem: string } => {
-  const parsed = parsePhrase(text, params)
+/** One phrase of an action compiled (with `work`: its readers prepared), or why it may not be declared. */
+const compilePhrase = (language: PhraseLanguage, text: string, params: ActionParams, work?: PhraseWork): { readonly parts: ReadonlyArray<PhrasePart> } | { readonly problem: string } => {
+  if (work !== undefined) work.units++
+  const parsed = parsePhrase(text, params, work)
   if ("problem" in parsed) return parsed
   const { parts } = parsed
   if (parts.length > PHRASE_LIMITS.wordsPerPhrase) return { problem: `a phrase has at most ${PHRASE_LIMITS.wordsPerPhrase} words (a slot is one)` }
@@ -323,23 +391,27 @@ function compileControls(language: PhraseLanguage): ReadonlyArray<CompiledPhrase
 /** The host's controls alone (a `decide` target, whose assistant is not known yet; a set that is not ready yet). */
 export const hostCommandSet = (language: PhraseLanguage): CommandSet => ({ language, phrases: hostPhrases[language], conflicts: [] })
 
-/** An action's phrases in `language`, compiled (a declaration that is not valid, which refused its start, is skipped). */
-export const compileActionPhrases = (language: PhraseLanguage, action: RegisteredAction): Array<CompiledPhrase> => {
+/** An action's declared phrases in `language` (at most `phrasesPerAction`; not checked). */
+export const actionPhraseTexts = (language: PhraseLanguage, action: RegisteredAction): ReadonlyArray<string> => {
   const list = (action.definition.phrases as ActionPhrases | undefined)?.[language]
-  if (!Array.isArray(list)) return []
-  const params = action.definition.params as ActionParams
-  const out: Array<CompiledPhrase> = []
-  for (const text of list.slice(0, PHRASE_LIMITS.phrasesPerAction)) {
-    const compiled = compilePhrase(language, text, params)
-    if ("problem" in compiled) continue
-    const parts = compiled.parts
-    const named = new Set(parts.flatMap((p) => (typeof p === "string" ? [] : [p.slot])))
-    const defaults: Record<string, unknown> = {}
-    for (const [name, param] of Object.entries(params)) if (!named.has(name)) defaults[name] = omittedParamValue(param)
-    out.push({ owner: { kind: "action", action }, text, shape: shapeOf(parts), parts, literals: parts.filter((p) => typeof p === "string").length, defaults })
-  }
-  return out
+  return Array.isArray(list) ? list.slice(0, PHRASE_LIMITS.phrasesPerAction) : []
 }
+
+/** One phrase of an action compiled for a set (a declaration that is not valid, which refused its start, gives `undefined`). */
+export const compileActionPhrase = (language: PhraseLanguage, action: RegisteredAction, text: string, work: PhraseWork): CompiledPhrase | undefined => {
+  const params = action.definition.params as ActionParams
+  const compiled = compilePhrase(language, text, params, work)
+  if ("problem" in compiled) return undefined
+  const parts = compiled.parts
+  const named = new Set(parts.flatMap((p) => (typeof p === "string" ? [] : [p.slot])))
+  const defaults: Record<string, unknown> = {}
+  for (const [name, param] of Object.entries(params)) if (!named.has(name)) defaults[name] = omittedParamValue(param)
+  return { owner: { kind: "action", action }, text, shape: shapeOf(parts), parts, literals: parts.filter((p) => typeof p === "string").length, defaults }
+}
+
+/** An action's phrases in `language`, compiled (a declaration that is not valid, which refused its start, is skipped). */
+export const compileActionPhrases = (language: PhraseLanguage, action: RegisteredAction, work: PhraseWork = { units: 0 }): Array<CompiledPhrase> =>
+  actionPhraseTexts(language, action).flatMap((text) => compileActionPhrase(language, action, text, work) ?? [])
 
 /**
  * The set from compiled module phrases, in catalog order (`modules`), and the modules already past the bound (`over`):
@@ -439,17 +511,24 @@ const SEPARATORS_AFTER = /[\s,;:]+$/u
 /**
  * The characters of a slot that covers words `[from, to)`: everything between its neighbouring words in the original
  * text (or the text's start and end), without the spaces and separators (`, ; :`) beside it and, at the end of the
- * utterance, without its closing punctuation. A sign, a leading decimal point, `%`, `°`, `#`, `+` and an inner or
- * leading `.` stay: the slot's parser decides.
+ * utterance, without its closing punctuation. A sign, a leading decimal point or comma, `%`, `°`, `#`, `+` and an
+ * inner or leading `.` stay: the slot's parser decides (a number or duration only when its expression covers them all).
  */
 const slotText = (text: string, ws: ReadonlyArray<PhraseWord>, from: number, to: number): string => {
   const left = from === 0 ? 0 : ws[from - 1]!.end
   const atEnd = to === ws.length
   const right = atEnd ? text.length : ws[to]!.start
-  let span = text.slice(left, right).replace(SEPARATORS_BEFORE, "")
-  span = atEnd ? span.replace(TRAILING_AT_END, "") : span.replace(SEPARATORS_AFTER, "")
-  return span
+  const raw = text.slice(left, right)
+  let cut = SEPARATORS_BEFORE.exec(raw)?.[0].length ?? 0
+  // A decimal comma of the first digit group (",5", one half, in both languages) is the number's, not a separator: a
+  // comma glued to a digit after it and to no letter or digit before it (the value parser's own rule, `prefixOf`).
+  if (cut > 0 && raw[cut - 1] === "," && DIGIT.test(raw[cut] ?? "") && !ALNUM.test(text[left + cut - 2] ?? "")) cut--
+  const span = raw.slice(cut)
+  return atEnd ? span.replace(TRAILING_AT_END, "") : span.replace(SEPARATORS_AFTER, "")
 }
+
+const DIGIT = /\p{Nd}/u
+const ALNUM = /[\p{L}\p{N}]/u
 
 /** A slot's characters, read by its prepared reader; `undefined`: they do not read as a value of it. */
 const readSlot = (reader: SlotReader, text: string, count: number): unknown => {
@@ -460,8 +539,11 @@ const readSlot = (reader: SlotReader, text: string, count: number): unknown => {
     case "duration": {
       const { text: canonical, words: ws } = readUtterance(text)
       const spans = numericSpans(canonical, ws)
-      // One expression, and the whole slot: "ten" is a number, "ten past" is not.
+      // One expression, and the whole slot: "ten" is a number, "ten past" is not; and every significant character of
+      // the slot is the expression's ("#5", "$5", "5+", "5/" are not 5; a sign, a leading decimal mark, "%" and "°" are
+      // part of it when the parser reads them).
       if (spans.length !== 1 || spans[0]!.from !== 0 || spans[0]!.to !== ws.length) return undefined
+      if (canonical.slice(0, spans[0]!.start).trim() !== "" || canonical.slice(spans[0]!.end).trim() !== "") return undefined
       const found = parseValues(reader.kind, text)
       if (found.length !== 1 || !Number.isFinite(found[0]!.value)) return undefined
       const value = found[0]!.value
