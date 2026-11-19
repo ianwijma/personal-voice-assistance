@@ -12,24 +12,122 @@ This page belongs to the module's pull request, which touches its package and th
 
 ## What it does
 
-To be written.
+Says a short message in the assistant's voice, with a chime first, on the other devices of the house: every device, or
+the devices of one room. **Never on the device that asked** (the sender is already there). It goes through
+`ctx.speech`, so the one delivery decision of [NOTIFICATIONS.md](../NOTIFICATIONS.md) applies to each device: a device
+that is not connected, one that may not speak, do not disturb. The answer says where it was queued and where it was
+not, and why, from what the service decided for each device (`SpeechHandle.deliveries`), never from what was hoped.
+
+- **Queued, not said.** A tool inside a turn does not wait for an announcement (it fails `in-turn`; the reply it belongs
+  to is what the announcement waits for). So the answer says "Announcing on …": it is queued on those devices and is
+  said after whatever is being said there. It does not say that it was heard.
+- **A card.** The message is also put on the screens in the target, as a transient `card` (30 seconds) titled
+  "Announcement" (or "Announcement for the room") with the message and a "From" line naming the device that asked.
+  A card goes to a screen where the message is queued, and to a screen that cannot speak it (a display with no
+  speaker); never to a device that is not connected, nor under do not disturb (nothing is said and nothing is shown
+  then). A device's card is replaced in place by the next broadcast (one `key` per device), and at most 8 cards are
+  made per broadcast, the most the Presenter lets one module hold live. Whatever was not shown is said in the answer.
+  A setting turns cards off.
+- **A room is text.** The name is matched against the rooms of the devices the house knows: spelling, case, accents,
+  apostrophes and a leading "the"/"de"/"het" are ignored; an exact name wins ("Kitchen" over "Kitchen annex"); else the
+  rooms whose words contain the spoken words (or the other way round: "kids room" for "Kids' room upstairs"). **No
+  match, or more than one: it asks** (it names up to eight rooms) and announces nowhere. "Everyone", "everywhere",
+  "the house", "iedereen", "overal" and similar mean no room.
+- **Nobody else there.** If the asking device is the only one in the room (or in the house), nothing is announced and
+  it says so.
+- **At most 64 devices** are queued per broadcast (one enqueue each); a house with more says how many it left out.
+- **The message is what the person said**: one line, 1 to 200 characters, never reworded. It is the sender's own
+  content, so **household content, not personal**: it is announced and shown on every device the delivery decision
+  allows, **including a public device**, exactly like any other broadcast. Nothing about the sender's person is
+  attached (the card names the sending *device*), and the module stores the message nowhere. Anyone who says something
+  personal in a broadcast says it to the house.
+
+Risk class: **`change`**. Speaking and showing on the house's own devices changes something in the house and sends
+nothing outside it; `message` is for people outside the house (docs/MODULES.md §4, plan §2 decision 5), and would be
+refused here as needing a confirmation the assistant cannot ask for yet.
 
 ## Tools
 
-To be written: each tool and action, its parameters, its risk class, and what it answers (its `spoken` line).
+| Tool | Parameters | Answers (`spoken`) | Example phrases |
+|---|---|---|---|
+| `broadcast_send` (`change`, quick) | `message` (one line, ≤ 200), `room?` (text, ≤ 40) | "Announcing on Hall screen, Kids tablet and three more. Not announced on Attic node (not connected) and Garage screen (cannot speak). Also showing it on Garage screen." | "tell everyone dinner is ready"; "tell the kids' room it's lights out"; "zeg tegen de keuken dat ik eraan kom" |
+| `broadcast_chime` (`change`, quick) | `room?` | the same, for the chime | "ring the dinner bell"; "bel de gong in de studeerkamer" |
+
+Other answers: "I don't know a room called Garden. The rooms are …"; "Which room do you mean: Guest bedroom and Master
+bedroom?"; "Do not disturb is on, so nothing was announced."; "Study has no device but this one, and announcements
+never go to the device that asked, so nothing was announced."; "What should I announce?". A device whose speech call
+failed is listed as "(failed)". Every sentence is in English and Dutch (`src/texts.ts`); lists go through
+`@pva/language`.
+
+**The chime alone is not built.** `ctx.speech.say` refuses an empty line (a chime is only played with one), so
+`broadcast_chime` plays the chime and **one word** after it ("Attention." / "Aandacht."). Its description says so, so
+the model is not told otherwise. No card is shown for a chime.
+
+### Typed actions (no model)
+
+| Action | Parameters | Examples |
+|---|---|---|
+| `broadcast.send` | `message` (the words after "everyone"/"iedereen"/"announce"/"omroepen") | "tell everyone dinner is ready"; "announce that the film starts"; "zeg tegen iedereen dat het eten klaar is" |
+| `broadcast.chime` | none | "ring the dinner bell"; "bel de gong" |
+
+Actions are `change`, not offered to the model as tools of their own (`offerAsTool: false`: the two tools above are
+the model's). They always mean the whole house: a room has to be asked and resolved, which a typed action cannot do (see
+"Left out"). They return `{ say }` with the same sentences.
 
 ## Settings
 
-To be written.
+| Setting | Default | What it does |
+|---|---|---|
+| Show the message on screens (`showCard`) | on | The card on the screens the message goes to. Off: the announcement is the same, nothing is shown. |
+
+Nothing else: the house's rooms, devices, do not disturb and privacy are the core's (Devices, Notifications).
 
 ## What it stores
 
-To be written: each collection, its scope, its `maxChars` and indexes, and how long rows stay.
+**Nothing.** No collection, no job, no event, nothing personal: the message lives in the announcement queue of the
+notification service and in a transient presentation, both of the core, and leaves with them. (So there is no
+data version and no migration.) What a presentation or an announcement keeps, and for how long, is on
+[NOTIFICATIONS.md](../NOTIFICATIONS.md) and [PRESENTING.md](../PRESENTING.md).
 
 ## What it needs
 
-To be written: `requires`, `uses`, the services and contributions it provides or consumes, outside services.
+`requires`: nothing outside the process (no network, no program). Uses the core's `Devices` service (to read the
+rooms and which devices have a screen; when it is not there it says "I can't see the house's devices"), `ctx.speech` and
+`ctx.present`. It provides no service and no contribution, and uses no other module. In the CLI modes, where there is
+no notification service, the tools say "I can't announce anything on this installation."
+
+Off by default; with it off nothing changes for anyone.
+
+## Latency and bounds
+
+A broadcast reads the device list once (a cached snapshot), matches a room by words over the devices' rooms, and makes
+one `speech.say` (a synchronous enqueue, a fraction of a millisecond) per device, at most 64, and one `present.show`
+per screen, at most 8. Nothing waits for an announcement, nothing touches the store or the network, and nothing
+runs through `offThread`.
 
 ## What was left out
 
-To be written.
+Because the preparation parts' first versions do not have it:
+
+- **The reply `capture` window** on each target (a 30-second window in which the next thing a person says there is
+  routed back to the sender, and not on a device that is in a call): [NOTIFICATIONS.md](../NOTIFICATIONS.md) "Not now"
+  (no `capture` window; ringing phrases are P7's).
+- **Quiet rooms, quiet hours and devices that accept nothing from others**: the same page's "Not now" (no quiet
+  hours or rooms, no acceptance settings). Today the only things that keep a device quiet are do not disturb for the
+  house, a device that cannot speak and a device that is not connected.
+- **Phrase commands** (`phrases` on an action, so "tell everyone …" runs without a language model, with the room taken
+  as text and resolved with its own "I don't know a room called …" sentence): not in this branch's base (there is no
+  `docs/PHRASES.md` and `defineAction` has no `phrases`). The typed actions above are matched from their `examples`
+  meanwhile. The room form, with the room resolved in the action, comes with phrases.
+- **The chime alone** (above).
+
+By the plan's row: the speaker's own voice, voice messages, scheduled broadcasts and phones.
+
+## Ambiguities in the contracts, and the reading chosen
+
+- Whether a broadcast to a room means the *devices in the room* or the *room's other devices*: the latter (the asking
+  device is excluded in both the room and "everyone").
+- Whether do not disturb should keep a *silent card* from appearing: the conservative reading, it does (no card where
+  the announcement was held back by do not disturb or the device is offline); a display that merely cannot speak still
+  gets the card, since that is what it is for.
+- `SpeechHandle.deliveries` says "queued", not "will be heard": the answer is worded as queued.
