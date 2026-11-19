@@ -1,7 +1,15 @@
 # Modules: where the work stands
 
 Status of the work planned in [MODULES-PLAN.md](MODULES-PLAN.md), kept here so it does not depend on any one working
-session. Updated 2026-11-19, 17:10. Nothing below is merged into `main`; the owner merges.
+session. Updated 2026-11-19, 17:40. Nothing below is merged into `main`; the owner merges.
+
+**How it is being finished (owner's instruction, 2026-11-19 afternoon).** Wrap up so that testing can start: one
+review round per pull request, a second or third only where something is badly broken. Every pull request below has
+had at least one complete review. From here a pull request closes when its running fix round is pushed and CI is
+green; the further checks that were planned for reminders, timers, routines and the follow-ups are dropped (three
+that had just started were stopped). Only the checks already running on the presentation layer (P10) and on the
+rebuilt pinned checklist (lists follow-up) are allowed to finish, and only what would break use is fixed from them.
+Everything is then merged together on one branch for testing (see "One branch with everything").
 
 ## The stack
 
@@ -57,6 +65,13 @@ one test fails under load and passes alone (the calendar module's latency test c
 suite runs beside it; CI runs latency tests one at a time and has passed it). It is the base for the follow-up pull
 requests. P8 is merged into it when it closes, and it is then retargeted to the top of the stack.
 
+**One branch with everything**: being put together as the pieces close (`t3/modules-13-all`, not pushed yet): the
+integration branch above plus every wave B module, routines, P8 and every follow-up, merges only. So far it holds
+assistant controls, notifications, images, broadcast, music, reminders and the briefing, core tools, kitchen and
+presence follow-ups: no merge conflicts, `pnpm check` passes. When the last fix rounds are in it gets the full test
+run and the browser tests once, and a pull request of its own, so that the whole can be tried out and merged in one
+step if the owner prefers that to merging the stack one by one.
+
 ## Wave B: the modules that need P7 to P10
 
 Each sits on the newest part it needs for now and moves on top of P8 at the end.
@@ -68,7 +83,7 @@ Each sits on the newest part it needs for now and moves on top of P8 at the end.
 | images and photos | #111 | `t3/module-images` | `4965a03d` | closed: two reviews (15, then 3 findings), all fixed, CI green |
 | broadcast | #112 | `t3/module-broadcast` | `5e84f110` | closed: reviewed (8 findings and a note), fixed, adapted to P10's fix round |
 | music | #113 | `t3/module-music` | `081edbdb` | closed: two reviews (16, then 4 findings), all fixed, CI green |
-| reminders | #114 | `t3/module-reminders` | `9a328183` | two reviews (22, then 9 findings); rebuilt around one state and one job per reminder; second fix round running |
+| reminders | #114 | `t3/module-reminders` | `806bd328` | closed: two reviews (22, then 9 findings), both fix rounds done (84 tests), the fixed P10 merged in; no third check (owner's instruction) |
 | timers and alarms | #117 | `t3/module-timers` | `cc2788e3` | two reviews (14, then 13 findings); rebuilt around one state and one job per timer and alarm; second fix round running (changing an alarm is cut: cancel and set again; one ring per timer or alarm at a time) |
 | routines and automations | #129 | `t3/module-routines` | `49bc910c` | first review found 8 problems; fix round running. The contract changed where the host offers nothing to build on: a routine is checked step by step and stops, with a true sentence, where a step is refused; a called action's answer is not read out; it gets its own way to be cancelled |
 
@@ -83,17 +98,20 @@ Each sits on the newest part it needs for now and moves on top of P8 at the end.
    `t3/modules-12-wave-a` (#116), branches `t3/follow-<module>`, each reviewed and fixed. Started 2026-11-19 on the
    fixed P10: lists, kitchen, smart home, calendar, memory and local info are being built; presence, briefing, news,
    web search and core tools start as those report.
-   State: all eleven have a pull request and a first review; every one had findings. Closed: briefing #118.
-   Fixed, and now taking in P10's rule about speculative turns (the list or card is returned with the answer and is a
-   snapshot of it), each with a short check to follow: memory #119, kitchen #120 (cut down to the phrase and a plain
-   list), presence #121 (a list only for one person or the reduced form), calendar #123, web search #124 (its list
-   comes back now that the rule exists), smart home #125 (cut down to the room-less phrases and a snapshot list),
-   core tools #126 (complete second review done, one test fix), news #127. Lists #122: the pinned checklist rebuilt as
-   one saved state per device, deciding review running. Local info #128: fix round running.
+   State: all eleven have a pull request and a complete review; every one had findings, and every one is fixed or
+   in its last fix round. Closed: briefing #118 (CI green), core tools #126 (`748f6205`), kitchen #120 (`c0bd38f5`,
+   cut down to the phrase and a plain list), presence #121 (`cdc7da9a`). Taking in P10's rule about speculative
+   turns now (the list or card is returned with the answer and is a snapshot of it), then closed: memory #119,
+   calendar #123, web search #124 (its list comes back now that the rule exists), smart home #125 (cut down to the
+   room-less phrases and a snapshot list), news #127. Lists #122: the pinned checklist rebuilt as one saved state per
+   device, its check running. Local info #128: fix round running.
 6. Deferred, with a plan of their own ([MODULES-DEFERRED-PLAN.md](MODULES-DEFERRED-PLAN.md): sixteen pull requests in order, with eighteen decisions for the owner and a recommendation for each): google, t3-code, mcp-client, calls and intercom, CalDAV; connections and
    OAuth (the rest of P8); streaming and WebSocket to an owner-typed address.
 
 ## Open points
+
+- Two tests of the presentation layer's development mock (`apps/web/test/mockServer.test.ts`) depend on real time
+  and on each other and failed once on CI under load (on #121); they are being made independent of load on P10.
 
 - **Not run against a real Home Assistant**: the smart-home module's templates (they use `regex_replace`, `unique`
   and `abs`) are only tested against the fake server.
