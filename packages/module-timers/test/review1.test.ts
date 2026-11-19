@@ -118,7 +118,7 @@ describe("finding 1 (its fix): an owed ring is sent only on the timer's own devi
       hooks.sendFail = limitFailure()
       yield* kit.advance(MIN)
       assert.strictEqual(said(yield* kit.action("list", {}, { device: "hall-screen", conversationId: "c-hall" })), "2 timers: tea timer is done and waiting to ring and bread timer with 59 minutes left.")
-      yield* kit.action("adjust", { amount: "1 minute", name: "bread" }, { device: "hall-screen", conversationId: "c-hall" })
+      yield* kit.action("adjust", { amount: "1 minute", name: "bread", change: "add" }, { device: "hall-screen", conversationId: "c-hall" })
       hooks.sendFail = undefined
       yield* kit.advance(30_000)
       assert.strictEqual(ringing(kit, "robins-phone").length, 1)
@@ -287,7 +287,7 @@ describe("finding 5: withdrawing a ring that fails", () => {
       yield* kit.action("start", { duration: "1 minute", name: "tea" })
       yield* kit.advance(MIN)
       hooks.resolveFail = busyFailure()
-      assert.strictEqual(said(yield* kit.action("adjust", { amount: "2 minutes" })), "Tea timer runs again: 2 minutes. Its old ring is still being stopped.")
+      assert.strictEqual(said(yield* kit.action("adjust", { amount: "2 minutes", change: "add" })), "Tea timer runs again: 2 minutes. Its old ring is still being stopped.")
       assert.strictEqual(ringing(kit).length, 1)
       yield* kit.restart
       hooks.resolveFail = undefined
@@ -307,7 +307,7 @@ describe("finding 5: withdrawing a ring that fails", () => {
       yield* kit.action("start", { duration: "5 minutes", name: "rice" })
       yield* kit.advance(MIN)
       hooks.resolveFail = busyFailure()
-      assert.strictEqual(said(yield* kit.action("cancel", { all: true })), "Cancelled 2 timers; a ring or a countdown is still being taken away, and I keep trying.")
+      assert.strictEqual(said(yield* kit.action("cancel", { all: true, bulk: "timers" })), "Cancelled 2 timers; a ring or a countdown is still being taken away, and I keep trying.")
       assert.strictEqual(ringing(kit).length, 1)
       yield* kit.restart
       hooks.resolveFail = undefined
@@ -356,11 +356,11 @@ describe("finding 6: the countdown when showing or taking it down fails", () => 
       const kit = yield* timerKit(hooks)
       yield* kit.action("start", { duration: "1 hour", name: "bread" })
       hooks.dismissFail = presentFailure()
-      assert.strictEqual(said(yield* kit.action("pause", {})), "Bread timer paused with 1 hour left; its countdown is still being taken off the screen.")
+      assert.strictEqual(said(yield* kit.action("pause", { name: "timer" })), "Bread timer paused with 1 hour left; its countdown is still being taken off the screen.")
       yield* kit.present.settle
       assert.strictEqual(kit.present.shown("kitchen-display").length, 1)
       // Paused again: the clean-up is tried again, and still said.
-      assert.strictEqual(said(yield* kit.action("pause", {})), "Bread timer paused with 1 hour left; its countdown is still being taken off the screen.")
+      assert.strictEqual(said(yield* kit.action("pause", { name: "timer" })), "Bread timer paused with 1 hour left; its countdown is still being taken off the screen.")
       yield* kit.restart
       hooks.dismissFail = undefined
       yield* kit.advance(MIN)
@@ -391,7 +391,7 @@ describe("finding 6: the countdown when showing or taking it down fails", () => 
       const kit = yield* timerKit(hooks)
       yield* kit.action("start", { duration: "1 hour", name: "bread" })
       hooks.showFail = presentFailure()
-      assert.strictEqual(said(yield* kit.action("adjust", { amount: "10 minutes" })), "Bread timer: 1 hour 10 minutes left.")
+      assert.strictEqual(said(yield* kit.action("adjust", { amount: "10 minutes", change: "add" })), "Bread timer: 1 hour 10 minutes left.")
       yield* kit.present.settle
       const shown = () => kit.present.shown("kitchen-display").map((p) => (p.content.kind === "timer" ? p.content.endsAt : 0))
       const start = yield* kit.now
@@ -551,10 +551,10 @@ describe("finding 12: an old job's handler, run itself, does nothing", () => {
           assert.strictEqual(after.rev, before.rev)
           assert.deepStrictEqual(yield* kit.notify.all, [])
         })
-      yield* kit.action("pause", {})
+      yield* kit.action("pause", { name: "timer" })
       yield* runOld(MIN)
-      yield* kit.action("resume", {})
-      yield* kit.action("adjust", { amount: "10 minutes" })
+      yield* kit.action("resume", { name: "timer" })
+      yield* kit.action("adjust", { amount: "10 minutes", change: "add" })
       yield* runOld(MIN)
       yield* kit.action("cancel", {})
       yield* runOld(MIN)

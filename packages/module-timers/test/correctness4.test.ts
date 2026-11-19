@@ -21,7 +21,7 @@ for (const named of [false, true]) it.effect(`1: overdue timer ${named ? "named"
   assert.strictEqual(hooks.txFail.times, 0)
   const input = named ? { name: "Tea" } : {}
   const listed = yield* kit.action("list", input)
-  const paused = yield* kit.action("pause", input)
+  const paused = yield* kit.action("pause", named ? input : { name: "timer" })
   assert.isTrue(listed.ok)
   assert.isTrue(paused.ok)
   assert.include(listed.say!, "could not be sent yet")

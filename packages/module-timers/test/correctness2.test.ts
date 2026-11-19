@@ -54,7 +54,7 @@ it.effect("2: a committed cancel-all confirms its batch and continues cleanup af
   for (const name of ["tea", "rice"]) yield* kit.action("start", { duration: "5 minutes", name })
   fault.reads = 0
   fault.armed = true
-  const reply = yield* kit.action("cancel", { all: true })
+  const reply = yield* kit.action("cancel", { all: true, bulk: "timers" })
   assert.strictEqual(fault.failed, 1)
   assert.strictEqual(fault.reads, 2, "cleanup continues with the other row")
   assert.isTrue(reply.ok)

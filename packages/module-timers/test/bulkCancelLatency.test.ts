@@ -32,7 +32,7 @@ it.effect("4: cancelling 190 expired timers keeps a 1ms heartbeat below the main
     try {
       yield* Effect.promise(() => new Promise<void>((resolve) => setTimeout(resolve, 3)))
       active = true
-      const outcome = yield* kit.action("cancel", { all: true })
+      const outcome = yield* kit.action("cancel", { all: true, bulk: "timers" })
       yield* Effect.promise(() => new Promise<void>((resolve) => setTimeout(resolve, 3)))
       assert.isTrue(outcome.ok)
       assert.include(outcome.say!, "190 timers")

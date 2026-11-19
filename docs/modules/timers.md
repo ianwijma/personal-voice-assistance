@@ -183,19 +183,31 @@ that changes something is `change`; `list` is a plain read. Each answers with on
 
 | Tool | Parameters | Example | Answer |
 |---|---|---|---|
-| `timers_start` | `duration` (a duration), `name?` (text) | "set a pasta timer for eight minutes" | "Pasta timer, 8 minutes." / "Timer set for 10 minutes." |
+| `timers_start` | `duration` (a duration), `name?` (text), `inlineName?` (the complete named timer clause) | "set a pasta timer for eight minutes" | "Pasta timer, 8 minutes." / "Timer set for 10 minutes." |
 | `timers_list` | `name?` | "how long is left on the pasta" | "Pasta timer: 6 minutes 10 seconds left." |
-| `timers_adjust` | `amount` (a duration), `change?` (`add`, `remove`), `name?` | "add five minutes to the pasta timer" | "Pasta timer: a quarter of an hour left." |
-| `timers_pause` | `name?` | "pause the timer" | "Pasta timer paused with 4 minutes 10 seconds left." |
-| `timers_resume` | `name?` | "start the pasta timer again" | "Pasta timer runs again: 4 minutes 10 seconds left." |
-| `timers_cancel` | `name?`, `all?` (yes/no) | "cancel the eggs timer" | "Eggs timer cancelled." / a ringing one: "Eggs timer stopped." |
+| `timers_adjust` | `amount` (a duration), `change` (`add`, `remove`), `name?` | "add five minutes to the pasta timer" | "Pasta timer: a quarter of an hour left." |
+| `timers_pause` | `name` | "pause the timer" | "Pasta timer paused with 4 minutes 10 seconds left." |
+| `timers_resume` | `name` | "start the pasta timer again" | "Pasta timer runs again: 4 minutes 10 seconds left." |
+| `timers_cancel` | `name?`, `all?` (yes/no), `bulk?` (explicit all-timers target) | "cancel the eggs timer" | "Eggs timer cancelled." / a ringing one: "Eggs timer stopped." |
+
+The typed path preserves names after “my”, “our”, “the”, “mijn”, “onze”, “de”, and explicit naming words.
+These named requests never fall back to a different sole timer. Pause and resume require a target; if the typed
+path cannot extract it, they ask. Structured calls can use `name: "timer"` for an unqualified timer target.
+Cancellation requires the literal bulk target after “all” or “alle” (`bulk: "timers"` in a structured call);
+an uncertain `all: true` alone asks for a target. A name and an explicit bulk target together also ask. Adjustment requires its direction; “take a minute off” means
+subtraction, and an unresolved direction asks instead of adding by default. Structured adjustment calls supply
+`change: "add"` or `change: "remove"`.
+
+Named “set” and “start” phrases preserve the entire name. If the typed fallback reads the same words as both a
+named timer clause and its duration, core hands the complete request to the conversational agent without creating
+an unnamed or partly named timer.
 
 **Phrase commands.** A name is a text slot of at most three words, resolved by the action with its own "I don't know a
 timer called …" sentence.
 
 | Action | English | Dutch |
 |---|---|---|
-| start | "set a timer for {duration}", "set a {name} timer for {duration}", "start a timer for {duration}", "timer for {duration}", "set the timer for {duration}" | "zet een timer op {duration}", "zet een timer van {duration}", "zet een timer voor {duration}", "timer van {duration}", "timer op {duration}", "zet een {name} timer op {duration}" |
+| start | "set a timer for {duration}", "set a {name} timer for {duration}", "start a timer for {duration}", "start a {name} timer for {duration}", "timer for {duration}", "set the timer for {duration}" | "zet een timer op {duration}", "zet een timer van {duration}", "zet een timer voor {duration}", "timer van {duration}", "timer op {duration}", "zet een {name} timer op {duration}" |
 | list | "how long is left", "how much time is left", "how long is left on the timer", "how long is left on the {name}", "how long is left on the {name} timer" | "hoe lang nog", "hoeveel tijd is er nog", "hoe lang duurt de timer nog", "hoe lang duurt de {name} nog", "hoe lang duurt de {name} timer nog", "hoeveel tijd heeft de {name} timer nog" |
 | cancel | "cancel the timer", "cancel the {name} timer", "cancel timer", "stop the timer", "stop the {name} timer", "delete the timer" | "annuleer de timer", "annuleer de {name} timer", "annuleer de timer {name}", "stop de timer", "zet de timer uit", "zet de {name} timer uit" |
 

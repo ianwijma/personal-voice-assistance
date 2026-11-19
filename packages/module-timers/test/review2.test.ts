@@ -35,7 +35,7 @@ describe("finding 2 (U3): more time for a ring that was sent but not recorded", 
       assert.isUndefined((yield* timerRows(kit))[0]!.value.ring)
       assert.strictEqual(ringing(kit).length, 1)
       hooks.writesFail = undefined
-      assert.strictEqual(said(yield* kit.action("adjust", { name: "tea", amount: "2 minutes" })), "Tea timer runs again: 2 minutes.")
+      assert.strictEqual(said(yield* kit.action("adjust", { name: "tea", amount: "2 minutes", change: "add" })), "Tea timer runs again: 2 minutes.")
       yield* kit.notify.settle
       assert.deepStrictEqual(ringing(kit), [])
       assert.strictEqual(said(yield* kit.action("cancel", { name: "tea" })), "Tea timer cancelled.")
@@ -235,7 +235,7 @@ describe("finding 9 (U6): cancelling again finishes the clean-up", () => {
       hooks.resolveFail = busyFailure()
       yield* kit.action("cancel", { name: "eggs" })
       hooks.resolveFail = undefined
-      assert.strictEqual(said(yield* kit.action("cancel", { all: true })), "Cancelled 1 timers.")
+      assert.strictEqual(said(yield* kit.action("cancel", { all: true, bulk: "timers" })), "Cancelled 1 timers.")
       yield* kit.notify.settle
       assert.deepStrictEqual(ringing(kit), [])
     }))

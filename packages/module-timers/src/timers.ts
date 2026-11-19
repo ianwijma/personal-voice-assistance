@@ -222,6 +222,11 @@ type Target =
 
 const fail = (message: string) => new ActionError({ message })
 
+const timerTarget = (name: string | undefined): string | undefined => {
+  if (name === undefined || /^(?:timer|timers)$/iu.test(name)) return undefined
+  return name.replace(/^timer\s+(?:called|named|genaamd)\s+/iu, "")
+}
+
 /** The shared part's operations (`ctx.shared`): every read and change of a timer goes through them, one at a time. */
 export interface TimersOps {
   readonly start: (input: { readonly durationMs: number; readonly name?: string | undefined }) => Effect.Effect<string, ActionError>
@@ -774,7 +779,7 @@ export const timersModule = defineModule({
           locked(Effect.gen(function*() {
             const lang = language()
             const now = yield* Clock.currentTimeMillis
-            if (all) {
+            if (all && name === undefined) {
               const read = yield* readAll.pipe(Effect.mapError(unreadable))
               // Timers still owing clean-up are cancelled again too: their clean-up is tried now (finding 9).
               const rows = [...read.active, ...read.ringing, ...read.waiting, ...read.cleanup]
@@ -954,14 +959,15 @@ export const timersModule = defineModule({
           examples: ["set a timer for ten minutes", "set a pasta timer for 8 minutes", "zet een timer op tien minuten", "zet een eieren timer op zes minuten"],
           params: {
             duration: Param.duration({ label: "Duration", minMs: TIMERS_LIMITS.minMs, maxMs: TIMERS_LIMITS.maxMs }),
-            name: Param.text({ label: "Name", after: ["called", "named", "genaamd"], optional: true, maxWords: 3 })
+            name: Param.text({ label: "Name", after: ["called", "named", "genaamd"], optional: true, maxWords: 3 }),
+            inlineName: Param.text({ label: "Named timer clause", after: ["a", "an", "een"], optional: true, maxWords: 64 })
           },
           phrases: {
-            en: ["set a timer for {duration}", "set a {name} timer for {duration}", "start a timer for {duration}", "timer for {duration}", "set the timer for {duration}"],
+            en: ["set a timer for {duration}", "set a {name} timer for {duration}", "start a timer for {duration}", "start a {name} timer for {duration}", "timer for {duration}", "set the timer for {duration}"],
             nl: ["zet een timer op {duration}", "zet een timer van {duration}", "zet een timer voor {duration}", "timer van {duration}", "timer op {duration}", "zet een {name} timer op {duration}"]
           },
           risk: "change",
-          run: ({ duration, name }) => Effect.map(ctx.shared.start({ durationMs: duration, name }), (s) => ({ say: s }))
+          run: ({ duration, name, inlineName }) => Effect.map(ctx.shared.start({ durationMs: duration, name: name ?? inlineName?.match(/^(.+?)\s+timer\s+(?:for|op|van|voor)\s+/iu)?.[1] }), (s) => ({ say: s }))
         }),
         defineAction({
           id: "list",
@@ -983,29 +989,29 @@ export const timersModule = defineModule({
           examples: ["add five minutes to the pasta timer", "take a minute off the timer", "doe er vijf minuten bij"],
           params: {
             amount: Param.duration({ label: "Amount", minMs: 1_000, maxMs: TIMERS_LIMITS.maxMs }),
-            change: Param.choice({ label: "Add or take off", options: [{ value: "add", label: "add", aliases: ["erbij"] }, { value: "remove", label: "take off", aliases: ["eraf", "minder"] }], default: "add", optional: true }),
-            name: Param.text({ label: "Name", after: ["to", "from", "off", "bij", "van"], optional: true, maxWords: 3 })
+            change: Param.choice({ label: "Add or take off", options: [{ value: "add", label: "add", aliases: ["erbij"] }, { value: "remove", label: "take off", aliases: ["off", "subtract", "remove", "eraf", "minder"] }] }),
+            name: Param.text({ label: "Name", after: ["the", "my", "our", "de", "mijn", "onze"], optional: true, maxWords: 64 })
           },
           risk: "change",
-          run: ({ amount, change, name }) => Effect.map(ctx.shared.adjust(name, change === "remove" ? -amount : amount), (s) => ({ say: s }))
+          run: ({ amount, change, name }) => Effect.map(ctx.shared.adjust(timerTarget(name), change === "remove" ? -amount : amount), (s) => ({ say: s }))
         }),
         defineAction({
           id: "pause",
           label: "Pause a timer",
           description: "Pause a running timer; it keeps what it has left until it is resumed.",
           examples: ["pause the timer", "pause the pasta timer", "pauzeer de timer"],
-          params: { name: Param.text({ label: "Name", after: ["the"], optional: true, maxWords: 3 }) },
+          params: { name: Param.text({ label: "Name", after: ["the", "my", "our", "de", "mijn", "onze", "called", "named", "genaamd"], maxWords: 64 }) },
           risk: "change",
-          run: ({ name }) => Effect.map(ctx.shared.pause(name), (s) => ({ say: s }))
+          run: ({ name }) => Effect.map(ctx.shared.pause(timerTarget(name)), (s) => ({ say: s }))
         }),
         defineAction({
           id: "resume",
           label: "Resume a timer",
           description: "Let a paused timer run again from what it had left.",
           examples: ["resume the timer", "start the pasta timer again", "laat de timer weer lopen"],
-          params: { name: Param.text({ label: "Name", after: ["the"], optional: true, maxWords: 3 }) },
+          params: { name: Param.text({ label: "Name", after: ["the", "my", "our", "de", "mijn", "onze", "called", "named", "genaamd"], maxWords: 64 }) },
           risk: "change",
-          run: ({ name }) => Effect.map(ctx.shared.resume(name), (s) => ({ say: s }))
+          run: ({ name }) => Effect.map(ctx.shared.resume(timerTarget(name)), (s) => ({ say: s }))
         }),
         defineAction({
           id: "cancel",
@@ -1013,15 +1019,23 @@ export const timersModule = defineModule({
           description: "Cancel a timer (a ringing one stops), or every timer when all is asked for.",
           examples: ["cancel the timer", "cancel the eggs timer", "cancel all timers", "annuleer de timer"],
           params: {
-            name: Param.text({ label: "Name", after: ["the"], optional: true, maxWords: 3 }),
-            all: Param.boolean({ label: "All timers", question: "Does the speaker want every timer cancelled?" })
+            name: Param.text({ label: "Name", after: ["the", "my", "our", "de", "mijn", "onze", "called", "named", "genaamd"], optional: true, maxWords: 64 }),
+            all: Param.boolean({ label: "All timers", question: "Does the speaker want every timer cancelled?" }),
+            bulk: Param.text({ label: "Explicit all target (timers)", after: ["all", "alle"], optional: true, maxWords: 64 })
           },
           phrases: {
             en: ["cancel the timer", "cancel the {name} timer", "cancel timer", "stop the timer", "stop the {name} timer", "delete the timer"],
             nl: ["annuleer de timer", "annuleer de {name} timer", "annuleer de timer {name}", "stop de timer", "zet de timer uit", "zet de {name} timer uit"]
           },
           risk: "change",
-          run: ({ name, all }) => Effect.map(ctx.shared.cancel(name, all), (s) => ({ say: s }))
+          run: ({ name, all, bulk }) => {
+            const target = timerTarget(name)
+            const explicitAll = bulk !== undefined && /^(?:(?:the|my|our|de|mijn|onze)\s+)?timers$/iu.test(bulk)
+            if ((bulk !== undefined && !explicitAll) || (explicitAll && target !== undefined) || (all && target === undefined && !explicitAll)) {
+              return Effect.succeed({ say: say(texts, homeLanguage(ctx.host.view()), "cancelTarget") })
+            }
+            return Effect.map(ctx.shared.cancel(target, explicitAll && target === undefined), (s) => ({ say: s }))
+          }
         })
       ]
     })

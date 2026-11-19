@@ -137,7 +137,7 @@ it.effect("7: a committed adjustment confirms success despite the countdown outc
   const kit = yield* startTestModule(hooked(timersModule, hooks))
   yield* kit.action("start", { duration: "10 minutes", name: "tea" })
   hooks.failAfterShow = busy()
-  assert.strictEqual(said(yield* kit.action("adjust", { name: "tea", amount: "2 minutes" })), "Tea timer: 12 minutes left.")
+  assert.strictEqual(said(yield* kit.action("adjust", { name: "tea", amount: "2 minutes", change: "add" })), "Tea timer: 12 minutes left.")
   assert.strictEqual((yield* timerRows(kit))[0]!.value.dueAt, (yield* kit.now) + 12 * MIN)
   yield* kit.restart
   yield* kit.advance(12 * MIN)
@@ -241,11 +241,11 @@ it.effect("13: cancel-all uses one open-card snapshot for 100 timers and keeps t
   }
   lists = 0
   hooks.throwAtWrite = { n: 2, failure: busy() }
-  assert.isFalse((yield* kit.action("cancel", { all: true })).ok)
+  assert.isFalse((yield* kit.action("cancel", { all: true, bulk: "timers" })).ok)
   assert.strictEqual(lists, 1)
   assert.strictEqual(ringing(kit).length, 10)
   lists = 0
-  assert.include(said(yield* kit.action("cancel", { all: true })), "100 timers")
+  assert.include(said(yield* kit.action("cancel", { all: true, bulk: "timers" })), "100 timers")
   assert.strictEqual(lists, 1)
   assert.strictEqual(ringing(kit).length, 0)
 }))

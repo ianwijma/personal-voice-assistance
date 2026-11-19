@@ -83,7 +83,7 @@ it.effect("2: rearming an overdue row counts the resulting 50 timers, not 51", (
   hooks.txFail = { times: 1, failure: busy() }
   yield* kit.advance(62_000)
   assert.strictEqual(hooks.txFail.times, 0)
-  const adjusted = yield* kit.action("adjust", { amount: "5 minutes", name: "Tea" })
+  const adjusted = yield* kit.action("adjust", { amount: "5 minutes", name: "Tea", change: "add" })
   assert.isTrue(adjusted.ok)
   assert.include(adjusted.say!, "runs again: 5 minutes")
   const full = yield* kit.action("start", { duration: "3 minutes", name: "extra" })

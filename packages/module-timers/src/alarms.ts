@@ -544,6 +544,8 @@ export const alarmsModule = defineModule({
           const one = (row: Row<Alarm>, snoozed = false): Target => ({ kind: "one", row, snoozed, ringing: ringingNow(row, read.open) })
           const ask = (rows: ReadonlyArray<Row<Alarm>>, cutShort: boolean): Target =>
             answer(say(texts, lang, cutShort ? "whichCut" : "which", { count: rows.length, list: listOf(rows.map((r) => itemOf(r, here, read.open, now, lang)), lang) }))
+          which = which?.replace(/^(?:alarm|wekker)\s+(?:at|om|called|named|genaamd)\s+/iu, "").replace(/\s+(?:alarm|wekker)$/iu, "")
+          if (/^(?:alarm|wekker)$/iu.test(which ?? "")) which = undefined
           const key = which === undefined ? "" : nameKey(which)
           if (which === undefined) {
             if (read.rows.length === 1 && !read.cut) return one(read.rows[0]!)
@@ -776,14 +778,14 @@ export const alarmsModule = defineModule({
           id: "set",
           label: "Set an alarm",
           description:
-            "Set an alarm on this device, once (\"seven\", \"tomorrow at 6:30\") or repeating (\"every weekday at 6:45\"). Pass when exactly as said. A time without morning or evening is between 05:00 and 16:59. To move an alarm, cancel it first and then set it again.",
+            "Set an alarm on this device, once (\"seven\", \"tomorrow at 6:30\") or repeating (\"every weekday at 6:45\"). Pass when exactly as said. A time without morning or evening is between 05:00 and 16:59.",
           examples: ["wake me at seven", "set an alarm for every weekday at quarter to seven", "zet een wekker om half acht", "maak me elke werkdag om zeven uur wakker"],
           params: {
-            when: Param.text({ label: "When", after: ["at", "for", "om", "op"], maxWords: 8 }),
+            when: Param.text({ label: "When", after: ["alarm", "me", "wekker"], maxWords: 64 }),
             name: Param.text({ label: "Name", after: ["called", "named", "genaamd"], optional: true, maxWords: 3 })
           },
           risk: "change",
-          run: ({ when, name }) => Effect.map(ctx.shared.set(when, name), (s) => ({ say: s }))
+          run: ({ when, name }) => Effect.map(ctx.shared.set(when.replace(/^(?:at|for|om|op)\s+/iu, "").replace(/\s+wakker$/iu, ""), name), (s) => ({ say: s }))
         }),
         defineAction({
           id: "list",
@@ -798,10 +800,11 @@ export const alarmsModule = defineModule({
           id: "cancel",
           label: "Cancel an alarm",
           description:
-            "Cancel an alarm (a snoozed or ringing one too), named or by its time. For a repeating alarm the scope must be what the person said: only the next one, or all of them; leave it out otherwise and the person is asked. To move an alarm: cancel it, then set it again at the new time.",
+            "Cancel an alarm (a snoozed or ringing one too), named or by its time. For a repeating alarm the scope must be what the person said: only the next one, or all of them; leave it out otherwise and the person is asked.",
           examples: ["cancel the alarm", "cancel tomorrow's alarm only", "cancel the weekday alarm for good", "annuleer de wekker"],
           params: {
-            which: Param.text({ label: "Which alarm", after: ["the", "de"], optional: true, maxWords: 4 }),
+            which: Param.text({ label: "Which alarm", after: ["the", "my", "our", "de", "mijn", "onze"], optional: true, maxWords: 64 }),
+            date: Param.text({ label: "Date-qualified target", after: ["tomorrow", "tomorrow's", "tomorrow’s", "today", "today's", "today’s", "morgen", "vandaag"], optional: true, maxWords: 64 }),
             scope: Param.choice({
               label: "Only the next or all",
               options: [{ value: "next", label: "only the next one", aliases: ["alleen de volgende"] }, { value: "all", label: "all of them", aliases: ["allemaal", "for good"] }],
@@ -809,7 +812,9 @@ export const alarmsModule = defineModule({
             })
           },
           risk: "change",
-          run: ({ which, scope }) => Effect.map(ctx.shared.cancel(which, scope), (s) => ({ say: s }))
+          run: ({ which, scope, date }) => date === undefined
+            ? Effect.map(ctx.shared.cancel(which, scope), (s) => ({ say: s }))
+            : Effect.succeed({ say: say(texts, homeLanguage(ctx.host.view()), "dateTarget") })
         })
       ]
     })

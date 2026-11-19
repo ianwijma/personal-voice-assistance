@@ -204,7 +204,13 @@ the model is offered each as `alarms_<id>`. There are no phrase commands: the pl
 |---|---|---|---|
 | `alarms_set` | `when` (text, as said), `name?` | "wake me at seven" | "Alarm set for tomorrow at seven o'clock in the morning." |
 | `alarms_list` | none | "which alarms are set" | "2 alarms: tomorrow at quarter to seven in the morning, every weekday and tomorrow at nine o'clock in the morning." |
-| `alarms_cancel` | `which?` (a name or a time), `scope?` (`next`, `all`) | "cancel tomorrow's alarm only" | "The alarm for tomorrow at quarter to seven in the morning is skipped; the next one is Friday at quarter to seven in the morning." |
+| `alarms_cancel` | `which?` (a name or a time), `date?` (a date-qualified target), `scope?` (`next`, `all`) | "cancel the noon alarm" | "The alarm for today at noon is cancelled." |
+
+The typed setting parameter keeps the date or repetition before the clock time: “tomorrow at noon” and
+“every weekday at noon” reach the date and recurrence parsers intact. Cancellation strips an optional alarm noun
+before comparing a clock time, preserving punctuation such as the colon in “12:00”. A date-only cancellation
+such as “cancel tomorrow's alarm only” asks which alarm is meant and changes nothing; it cannot select today's
+sole alarm by dropping “tomorrow”.
 
 Dutch: "zet een wekker om half acht" answers "Wekker gezet voor morgen om half acht 's ochtends.". A repeating one
 without a scope answers "Die wekker herhaalt elke werkdag. Alleen de volgende, of allemaal?".
