@@ -691,7 +691,7 @@ export const examplePresentation = {
   content: { kind: "list", title: "Shopping", style: "checklist", items: [{ id: "milk", text: "Milk", done: false }, { id: "eggs", text: "Eggs", done: false }] },
   buttons: [{ id: "clear", label: "Clear ticked" }],
   interactive: true,
-  texts: { region: "On screen", loading: "Loading the image…", imageMissing: "The image is not available.", timerDone: "Done", credit: "Image:", high: "High", low: "Low" }
+  texts: { region: "On screen", loading: "Loading the image…", imageMissing: "The image is not available.", failed: "That didn't work.", timerDone: "Done", credit: "Image:", high: "High", low: "Low" }
 } as const
 
 export const serverExamples: { readonly [T in ServerMessageType]: Extract<ServerMessage, { readonly type: T }> } = {

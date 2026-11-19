@@ -99,8 +99,11 @@ function PresentationCard({ p }: { readonly p: HeldPresentation }) {
     // continuation(identity): shows this presentation's own answer, only while it is still held.
     void client.request({ type: "present.action", id: p.id, revision: p.revision, ...message }).then((r) => {
       done()
-      if (current()) setSaid(r.say ?? (r.ok ? undefined : r.error?.message))
-    }, done)
+      if (current()) setSaid(r.say ?? (r.ok ? undefined : p.texts.failed))
+    }, () => {
+      done()
+      if (current()) setSaid(p.texts.failed)
+    })
   }
   return (
     <article

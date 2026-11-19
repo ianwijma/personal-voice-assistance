@@ -257,11 +257,10 @@ transient the decision allows.
   device of its target would show it. The row says `loading` until the outcome is written (the content hash, or why
   not: shown without the image, with the server's sentence); an outcome whose write fails is written again a minute
   later; an image left loading by a restart is fetched again when a page is to show it. None stays loading. A fetch
-  belongs to its address: a key shown again with the same address while it is fetched gets that fetch's outcome; a
-  key shown again with another address fetches its own, and an outcome not yet written for an older address does not
-  hold it back (review round 2). A fresh show resolves its address through the cache again off the turn path, so an
-  expired file or a temporary refusal from a previous show is not reused; a content update of the same show keeps its
-  resolved image.
+  is shared by address only while it is in flight: a key shown again with the same address during the fetch gets its
+  outcome. Completed outcomes awaiting a store retry belong to that showing; a fresh showing resolves its own address
+  off the turn path, so it cannot inherit an older showing's refusal or reuse an expired file. A content update of the
+  same show keeps its resolved image.
 - **The cache** fetches through `safeFetch` (public addresses only, redirects checked again; never the owner-configured
   helper, for anything a model or a page supplies) with its own image policy, checks the type the response says and the
   bytes it is against each other, and its size, keeps it as `data/media/<sha256>.<ext>` (directory `0700`, files `0600`,
@@ -273,8 +272,9 @@ transient the decision allows.
 - **The directory is the truth** (review round 2, R6). An **inventory** reads the directory as it is, removes temporary
   files (an interrupted write), foreign files, invalid image signatures or digests, duplicate suffixes and what is past
   its age, then, oldest first, what is over the bounds, and
-  rebuilds the counts and bytes from surviving physical files. Directory iteration and file reads, stats and removals
-  are asynchronous, one entry at a time, with a yield between entries; only one inventory runs, and admission stays
+  rebuilds the counts and bytes from surviving physical files. Non-regular entries, including dangling links, are removed
+  without following them. Directory iteration and file reads, stats and removals are asynchronous, one entry at a time,
+  with a yield between entries; only one inventory runs, and admission stays
   closed until it completes. It runs at start, and after any fault every minute (and before
   the next admission) until it succeeds. **Any file operation of the cache that fails** (a write, setting its time, the
   rename, a removal, reading an entry or the directory, reading a file to serve it) makes the cache **not sure**: nothing
@@ -282,9 +282,11 @@ transient the decision allows.
   cache could not be read or cleaned", until an inventory has read every entry, removed what it had to and what remains
   is inside 256 files and 64 MiB. An unreadable entry is never taken as absent. There is no list of files to remove
   later: a file is removed by an inventory that sees it expired at that moment, so a copy admitted since is never
-  removed by an old retry. While it is not sure, an image already kept is still served if its file can be read: a read
-  that fails while serving keeps the entry (the cache becomes not sure, and the inventory decides), and a read that works
-  again serves it again at once (round 3). *Known gap* (round 3): while the cache is not sure, a request is still
+  removed by an old retry. Writes and GET/HEAD reads are asynchronous too; admissions serialize their capacity checks
+  with disk mutations, and a read rechecks the page's token and the image's expiry before sending bytes. While it is not
+  sure, an image already kept is still served if its bytes match its kept size, signature and digest. A read that throws
+  keeps the retryable entry; a successful read proving corruption invalidates its address hits and closes admission until
+  inventory repairs it. A later valid read of a retained entry serves it again at once (round 3). *Known gap* (round 3): while the cache is not sure, a request is still
   fetched from the network before it is refused `unavailable` (the refusal comes after the response). The
   files **survive a restart**: what the inventory at start keeps is served for the rest of its day.
 - **The response headers**, exactly: `Content-Type` (the kept type), `Content-Length`, `X-Content-Type-Options:
@@ -305,7 +307,8 @@ transient the decision allows.
   put on the page as text, never as markup; long text, button labels and weather values wrap. **Every word the host
   shows** (the region's name, "Loading the image…", "The image is not available.", the timer's "Done", "Image:", "High",
   "Low", and every answer to a press) **comes from the server in the household's language** (`PresentationWire.texts`,
-  English and Dutch).
+  English and Dutch). If a press has no server answer, the page uses the presentation's localized `texts.failed`,
+  including on a transport timeout or rejection. Older servers may omit it, in which case no fallback is shown.
 - **A page without its server shows nothing from it** (review round 1, G10): when the connection is lost the page clears
   its presentations (the notification cards follow their own rule from P9); after the next welcome the server sends what
   applies now. It also empties them at every welcome and when its session ends, and keeps every presentation it is sent
@@ -361,12 +364,12 @@ boundary.
 
 | What | Number |
 |---|---|
-| end of turn → first audio (`TurnTrace`, the real `Conversation`, a tool round through the host's registry and gateway, zero-delay synthesis and output, the model's tokens 5 ms after each request; median of 80 turns × 4 counterbalanced runs; 31 other presentations live, 8 pinned on the turn's device) | without a presentation 10.708 ms (p95 11.646); with the worst legal presentation in the tool's result 11.031 ms (p95 12.037) |
-| `show` as a tool calls it (200 calls, a transient replacing the last) | median 0.482 ms, p95 0.616 ms, worst 0.932 ms; longest main-thread stop across the whole workload 1.54 ms |
-| a page saying hello with 9 presentations | longest main-thread stop 0.83 ms |
-| reconciling every device with real fan-out (64 devices in one room, 8 pinned and 1 transient room-wide, 64 fresh pages: 576 frames, 2.02 MiB encoded) | longest main-thread stop 1.13 ms |
+| end of turn → first audio (`TurnTrace`, the real `Conversation`, a tool round through the host's registry and gateway, zero-delay synthesis and output, the model's tokens 5 ms after each request; median of 80 turns × 4 counterbalanced runs; 31 other presentations live, 8 pinned on the turn's device) | without a presentation 10.771 ms (p95 11.984); with the worst legal presentation in the tool's result 11.002 ms (p95 11.749) |
+| `show` as a tool calls it (200 calls, a transient replacing the last) | median 0.518 ms, p95 0.669 ms, worst 1.025 ms; longest main-thread stop across the whole workload 1.69 ms |
+| a page saying hello with 9 presentations | longest main-thread stop 0.98 ms |
+| reconciling every device with real fan-out (64 devices in one room, 8 pinned and 1 transient room-wide, 64 fresh pages: 576 frames, 2.03 MiB encoded) | longest main-thread stop 2.00 ms |
 
-So a tool's presentation at the stated maximum moved the turn's first audio by a median 0.323 ms, not zero: the turn
+So a tool's presentation at the stated maximum moved the turn's first audio by a median 0.231 ms, not zero: the turn
 itself pays the validation, the decision and the note (way 1), and the writer and the reconciliation of the turn's device
 run on the same thread while the model thinks. The test asserts the difference stays under 2 ms and the longest stops
 under 10 ms.

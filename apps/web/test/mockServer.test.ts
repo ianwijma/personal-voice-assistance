@@ -436,12 +436,19 @@ describe("the mock, through its handlers, as the server", { timeout: 30_000 }, (
   it("b8: null and other non-object requests return 400 and consume no presentation id", async () => {
     await clearPresentations()
     const http = url.replace(/^ws/, "http").replace(/\/ws$/, "")
+    const generated = async () => {
+      const response = await fetch(`${http}/mock/present`, { method: "POST", body: JSON.stringify({ presentation: { kind: "card", title: "Valid", spoken: "Valid" } }) })
+      expect(response.status).toBe(200)
+      const { id } = await response.json() as { id: string }
+      expect(id).toMatch(/^p-mock-\d+$/)
+      return Number(id.slice("p-mock-".length))
+    }
+    const before = await generated()
     for (const value of [null, [], 1, "text"]) {
       const response = await fetch(`${http}/mock/present`, { method: "POST", body: JSON.stringify(value) })
       expect(response.status, JSON.stringify(value)).toBe(400)
     }
-    const valid = await fetch(`${http}/mock/present`, { method: "POST", body: JSON.stringify({ id: "after-null", presentation: { kind: "card", title: "Valid", spoken: "Valid" } }) })
-    expect(valid.status).toBe(200)
+    expect(await generated()).toBe(before + 1)
   })
 
   it("P7: the reply volume as the server keeps it: output.volume to the device's voice pages, again after a welcome, with the server's step and bounds", async () => {

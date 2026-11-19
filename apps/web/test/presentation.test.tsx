@@ -21,8 +21,8 @@ afterEach(() => {
   document.documentElement.classList.remove("dark")
 })
 
-const EN = { region: "On screen", loading: "Loading the image…", imageMissing: "The image is not available.", timerDone: "Done", credit: "Image:", high: "High", low: "Low" }
-const NL = { region: "Op het scherm", loading: "De afbeelding wordt geladen…", imageMissing: "De afbeelding is niet beschikbaar.", timerDone: "Klaar", credit: "Afbeelding:", high: "Hoog", low: "Laag" }
+const EN = { region: "On screen", loading: "Loading the image…", imageMissing: "The image is not available.", timerDone: "Done", credit: "Image:", high: "High", low: "Low", failed: "That didn't work." }
+const NL = { region: "Op het scherm", loading: "De afbeelding wordt geladen…", imageMissing: "De afbeelding is niet beschikbaar.", timerDone: "Klaar", credit: "Afbeelding:", high: "Hoog", low: "Laag", failed: "Dat lukte niet." }
 
 const wire = (id: string, content: PresentationWire["content"], extra: Partial<PresentationWire> = {}): PresentationWire => ({
   id,
@@ -278,4 +278,21 @@ it("a replacement clears a pending press and ignores its reply, and clears an an
   expect(screen.getByText("Coffee selected.")).toBeTruthy()
   await act(async () => store.dispatch(update(drink("Water", "water:3"))))
   expect(screen.queryByText("Coffee selected.")).toBeNull()
+})
+
+
+it.each(["timeout", "rejection"])("r2 b5: a Dutch presentation uses its localized fallback after a transport %s", async (fault) => {
+  const request = vi.fn(() => fault === "timeout"
+    ? Promise.resolve({ ok: false, error: { message: "The assistant did not answer in time." } })
+    : Promise.reject(new Error("Connection lost")))
+  mount(run([show(wire("dutch", CARD, { texts: NL, buttons: [{ id: "choose", label: "Kies" }] }))]), request)
+  await act(async () => fireEvent.click(screen.getByRole("button", { name: "Kies" })))
+  expect(screen.getByRole("status").textContent).toBe(NL.failed)
+  expect((screen.getByRole("button") as HTMLButtonElement).disabled).toBe(false)
+})
+
+it("r2 b5: a server's press answer takes precedence over the transport fallback", async () => {
+  mount(run([show(wire("dutch", CARD, { texts: NL, buttons: [{ id: "choose", label: "Kies" }] }))]), async () => ({ ok: false, say: "Probeer straks opnieuw.", error: { message: "Diagnostic" } }))
+  await act(async () => fireEvent.click(screen.getByRole("button")))
+  expect(screen.getByRole("status").textContent).toBe("Probeer straks opnieuw.")
 })

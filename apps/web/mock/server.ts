@@ -1601,8 +1601,8 @@ const mockPresentIds = new Set<string>()
 const MOCK_IMAGE = Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==", "base64")
 /** The Presenter's own words, in the saved household language (as `PresentTexts` in packages/core: the test compares the two). */
 const MOCK_PRESENT_TEXTS = {
-  en: { region: "On screen", loading: "Loading the image…", imageMissing: "The image is not available.", timerDone: "Done", credit: "Image:", high: "High", low: "Low", done: "Done.", cantNow: "I can't do that right now." },
-  nl: { region: "Op het scherm", loading: "De afbeelding wordt geladen…", imageMissing: "De afbeelding is niet beschikbaar.", timerDone: "Klaar", credit: "Afbeelding:", high: "Hoog", low: "Laag", done: "Klaar.", cantNow: "Dat kan ik nu niet doen." }
+  en: { region: "On screen", loading: "Loading the image…", imageMissing: "The image is not available.", timerDone: "Done", credit: "Image:", high: "High", low: "Low", done: "Done.", failed: "That didn't work.", cantNow: "I can't do that right now." },
+  nl: { region: "Op het scherm", loading: "De afbeelding wordt geladen…", imageMissing: "De afbeelding is niet beschikbaar.", timerDone: "Klaar", credit: "Afbeelding:", high: "Hoog", low: "Laag", done: "Klaar.", failed: "Dat lukte niet.", cantNow: "Dat kan ik nu niet doen." }
 } as const
 const mockPresentTexts = () => (String(valueOf("HOME_LANGUAGE") ?? "").toLowerCase().startsWith("nl") ? MOCK_PRESENT_TEXTS.nl : MOCK_PRESENT_TEXTS.en)
 /** The shared decision for one presentation for one connection now, with the kinds its own page declared (as the server). */
@@ -1624,7 +1624,7 @@ const mockWire = (id: string, p: { readonly presentation: Presentation; readonly
     content: presentWireContent(p.presentation, token === undefined ? undefined : { state: "ready", token }),
     buttons: (p.presentation.buttons ?? []).map((b) => ({ id: b.id, label: b.label })),
     interactive: interactive && p.presentation.handler !== undefined,
-    texts: { region: texts.region, loading: texts.loading, imageMissing: texts.imageMissing, timerDone: texts.timerDone, credit: texts.credit, high: texts.high, low: texts.low }
+    texts: { region: texts.region, loading: texts.loading, imageMissing: texts.imageMissing, failed: texts.failed, timerDone: texts.timerDone, credit: texts.credit, high: texts.high, low: texts.low }
   }
 }
 const isPresentationWire = Schema.is(PresentationWire)
