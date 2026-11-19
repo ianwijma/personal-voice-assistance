@@ -7,9 +7,10 @@
  * Enter skips it. Without the keys, a provider that needs one fails with "X is not set (the key vault is locked …)".
  */
 import type { ModuleDefinition } from "@pva/core"
-import type { Assistant } from "@pva/protocol"
+import type { Assistant, RiskLanguage } from "@pva/protocol"
 import { ConfigProvider, Context, Effect } from "effect"
 import * as readline from "node:readline"
+import { effectiveRiskLanguage } from "./serve/riskPolicy.ts"
 import { makeSections } from "./serve/sections.ts"
 import { loadSettingsStore, type SettingsStore } from "./serve/SettingsStore.ts"
 import { openVault, type Vault } from "./serve/Vault.ts"
@@ -19,6 +20,8 @@ export interface CliSettings {
   readonly store: SettingsStore | undefined
   readonly vaultState: "none" | "locked" | "unlocked"
   readonly vaultPath: string
+  /** Home's language resolved from typed settings and environment, captured before provider string encoding. */
+  readonly riskLanguage: RiskLanguage
   /**
    * The assistant a CLI mode answers as (docs/ASSISTANTS.md §4.4): `assistantId` if it exists, else the first
    * switched-on one, with the environment applied to the migrated one as in serve mode. A version-3 data directory
@@ -90,7 +93,7 @@ export const loadCliSettings = (options: LoadCliOptions): Effect.Effect<{ readon
       Effect.catchCause((cause) => Effect.as(Effect.logWarning("Could not read the saved settings; using the environment and defaults", cause), undefined))
     )
     return {
-      settings: { store, vaultState, vaultPath: options.vaultPath, assistant: store === undefined ? undefined : cliAssistant(store, options.assistantId) },
+      settings: { store, vaultState, vaultPath: options.vaultPath, riskLanguage: effectiveRiskLanguage({ stored: store?.settings().assistant ?? {}, env: options.env }), assistant: store === undefined ? undefined : cliAssistant(store, options.assistantId) },
       configProvider: store === undefined ? fromEnv() : cliConfigProvider(store, options.env)
     }
   })

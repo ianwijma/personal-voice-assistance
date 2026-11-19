@@ -596,7 +596,6 @@ export const makeExecutionGateway = (options: GatewayOptions = {}): ExecutionGat
    * defect (a crash) cannot be asked about, so no.
    */
   const mayRevealFailure = (meta: ToolMetadata, call: Omit<GatewayCall, "risk">, record: GatewayDecisionRecord | undefined, typed: boolean): boolean => {
-    if (mayReveal === undefined) return true
     const declared = declaredSensitivity(meta)
     const ok = declared === "per-result" ? typed : declared.kind === "household" || mayRevealOwner(declared.owner, call)
     if (!ok) markWithheld(record)
@@ -609,7 +608,7 @@ export const makeExecutionGateway = (options: GatewayOptions = {}): ExecutionGat
    * passes through.
    */
   const guardedRun = <A>(meta: ToolMetadata, call: Omit<GatewayCall, "risk">, record: GatewayDecisionRecord | undefined, run: Effect.Effect<A, ToolError>): Effect.Effect<A, ToolError> =>
-    mayReveal === undefined ? run : run.pipe(
+    mayReveal === undefined && declaredSensitivity(meta) !== "per-result" ? run : run.pipe(
       Effect.catch((error) => (mayRevealFailure(meta, call, record, true) ? Effect.fail(error) : Effect.fail(new ToolError({ message: riskWithheld(languageNow()) })))),
       Effect.catchDefect((defect) => (mayRevealFailure(meta, call, record, false) ? Effect.die(defect) : Effect.fail(new ToolError({ message: riskWithheld(languageNow()) }))))
     )
