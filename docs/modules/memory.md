@@ -100,8 +100,11 @@ whose block holds them all clears it. Raise "Room for pinned memories", or forge
 On a device with a display, two things the module already did are also shown (docs/PRESENTING.md). Nothing about the
 answer changes: the model gets the same result as before, a device that shows nothing (a speaker, a page that cannot
 draw the kind, a device that may not be told) changes nothing about what is said, and a screen that fails to show it
-says nothing. The module hands them to the Presenter from its shared part (`ctx.present.show`, by key), on the device
-the turn came from, after the answer was made.
+says nothing. The card comes from `memory_remember`, which changes something and is not speculative: the module shows it
+from its shared part (`ctx.present.show`, by key) on the device the turn came from, after the answer was made. The lists
+come from `memory_recall` and `memory_read_notes`, which may run before their turn is committed: they return the list
+with their result, and the host shows it only when the turn is promoted and drops it when the turn is discarded
+(docs/PRESENTING.md, "Speculative turns").
 
 **The "Remembered" card, with Undo.** After a memory was *stored* (by `memory_remember` or the typed action "remember";
 a memory it already knew shows nothing), a transient card appears (30 seconds, one at a time per device, like every
@@ -125,19 +128,19 @@ characters each, cut between whole characters, line breaks made spaces), titled 
 the answer's own honest notes as items: "and 2 more" (how many more matched), "Only the newest 500 entries were
 searched; there may be more." when the scan was cut, "There are older notes too." for a notes read, and "Personal
 items are kept for their owner's devices." where a person asked on a device that may not be told theirs (no count, and
-none of their text). The spoken fallback is the answer's own sentence (the count alone if that would not fit 300). It
-is replaced in place by the next list on the same device (one key per device), taken down by an answer that found
-nothing, and taken down when any memory or note is forgotten (a list may hold it). It shows what the answer said and is
-not kept in step with new memories.
+none of their text). The spoken fallback is the answer's own sentence (the count alone if that would not fit 300).
+**A recall or notes list is a snapshot of its answer.** It is returned with the result, so nothing keeps a handle to it:
+the next transient on that device replaces it, and otherwise it ends after its 30 seconds. An answer that found nothing
+does not take an earlier list down, and forgetting does not either (a list shown a moment ago may still name what was
+forgotten until it ends). It is not kept in step with later changes.
 
-**Nothing from a read that a change overtook.** The module counts every change to stored memories and notes (a memory
-stored or pinned, a note saved, anything forgotten, an Undo). A recall, a notes read and a card take the count before
-they read; right before showing, under the module's one-at-a-time lock, they compare it. If it moved, they read again
-(twice at most); after that the answer is given and nothing is shown. Forgetting, its bump and what it takes off the
-screens are one step under the same lock, so a list built from a read taken before a forget is never shown after it.
-The handles of what was shown are kept only for presentations that may still be showing: a device shows one transient
-at a time, so a new card or list on a device drops the handles it replaced, what ended by itself is dropped, and if the
-bound is still reached a presentation is dismissed before its handle is forgotten. A presentation's spoken text is used
+**Nothing from a read that a change overtook (the card).** The module counts every change to stored memories and notes
+(a memory stored or pinned, a note saved, anything forgotten, an Undo). The card takes the count and reads the memory
+again; right before showing, under the module's one-at-a-time lock, it compares the count. If it moved, it reads again
+(twice at most); after that nothing is shown. Forgetting, its bump and the withdrawal of the memory's card are one step
+under the same lock. The handles of the cards are kept only for presentations that may still be showing: a device shows
+one transient at a time, so a new card on a device drops the handle it replaced, what ended by itself is dropped, and if
+the bound is still reached a card is dismissed before its handle is forgotten. A presentation's spoken text is used
 only if it is well-formed text within the bound (a note whose text has an emoji at the answer's own cut still gets its
 list, with a repaired spoken sentence in place of the answer's).
 
@@ -148,8 +151,8 @@ made only where the confirmation repeated it, and is marked personal to its owne
 be told, it is not shown and carries nothing of the text. A list with a person's own items is marked the same way. A
 household memory shows on any screen.
 
-Limits: at most eight live presentations of the module at once (a card per memory in the last 30 seconds, a list per
-device), the handles held for them are bounded the same. Showing is one write on the turn's path (docs/PRESENTING.md,
+Limits: at most eight live presentations of the module at once (a card or a list per device in the last 30 seconds);
+the handles held for cards are bounded the same. Showing is one write on the turn's path (docs/PRESENTING.md,
 Latency: median 0.5 ms); the module has no latency test of its own beyond the event-loop test above, which a card does
 not change.
 

@@ -4,7 +4,7 @@ import { homeLanguage, isLine, say, StoredText } from "@pva/module-contracts"
 import { Clock, Data, Effect, Schema, Semaphore } from "effect"
 import { dateFormatter, looksSecret, MAX_QUERY_WORDS, matcher, normalise, NOTEBOOK_CHARS, notebookName, queryWords, tidy } from "./words.ts"
 import { texts } from "./texts.ts"
-import { cardKeyOf, forgottenCard, isListKey, listKeyOf, listPresentation, memoryOfKey, rememberedCard, UNDO_BUTTON, UNDO_HANDLER } from "./present.ts"
+import { cardKeyOf, forgottenCard, listPresentation, memoryOfKey, rememberedCard, UNDO_BUTTON, UNDO_HANDLER } from "./present.ts"
 
 export { texts } from "./texts.ts"
 
@@ -147,6 +147,8 @@ interface Outcome {
   readonly data?: Readonly<Record<string, unknown>>
   /** The owner of personal content in `data`. */
   readonly owner?: string
+  /** A list the answer is shown as: returned with the result of a tool that may run speculatively (the host shows it at promotion). */
+  readonly present?: Presentation
   /** A memory this operation just stored (not one it already knew): what the card with Undo shows. */
   readonly saved?: { readonly id: string; readonly text: string; readonly owner?: string }
 }
@@ -252,12 +254,11 @@ export const memoryModule: ModuleDefinition<typeof settings> = defineModule({
         live.delete(key)
         return e === undefined ? Effect.void : quietly(e.handle.dismiss)
       }
-      /** What a memory or note that is gone no longer applies to: its own card and every list (a list may hold it). */
+      /** What a memory that is gone no longer applies to: its own card. (A list is a snapshot, returned with its answer: nothing keeps it.) */
       const withdraw = (kind: "memory" | "note", id: string) =>
         Effect.gen(function*() {
           const card = kind === "memory" ? cardKeyOf(id) : undefined
           if (card !== undefined) yield* dismissKey(card)
-          for (const key of [...live.keys()]) if (isListKey(key)) yield* dismissKey(key)
         })
 
       // --- taking one away: the single path ------------------------------------------------------------------------------
@@ -304,19 +305,6 @@ export const memoryModule: ModuleDefinition<typeof settings> = defineModule({
             if (shown) return
           }
         }))
-      /**
-       * The list of an answer on the asking device, replacing the one it showed there; an empty answer takes it down. `taken`
-       * is the generation before the answer read anything: when a change overtook the read, nothing is shown and this answers
-       * `false` (the caller reads again).
-       */
-      const showList = (device: string | undefined, taken: number, list: Parameters<typeof listPresentation>[1] | undefined) =>
-        lock.withPermit(Effect.suspend(() => {
-          if (generation !== taken) return Effect.succeed(false)
-          if (device === undefined) return Effect.succeed(true)
-          const key = listKeyOf(device)
-          return Effect.as(list === undefined ? dismissKey(key) : showKeyed(device, key, listPresentation(lang(), list)), true)
-        }))
-
       // --- the card's Undo: the same removal as forget by id, once per card ------------------------------------------------
       const answered = new Map<string, string>()
       const MAX_ANSWERED = 64
@@ -356,7 +344,7 @@ export const memoryModule: ModuleDefinition<typeof settings> = defineModule({
           }))
       }).pipe(Effect.orDie)
 
-      return { value: { lock, removeItem, forgetId, showRemembered, showList, bump, generation: () => generation } }
+      return { value: { lock, removeItem, forgetId, showRemembered, bump, generation: () => generation } }
     }),
   start: (ctx) =>
     Effect.gen(function*() {
@@ -560,25 +548,9 @@ export const memoryModule: ModuleDefinition<typeof settings> = defineModule({
         return words.length === 0 ? spoken(l, ask) : words
       }
 
-      /**
-       * An answer that shows a list reads, then shows under the lock only if no change to memories or notes came in between;
-       * when one did, it reads again (twice at most), and after that it answers without showing anything.
-       */
-      const retried = <A, E, R>(once: (state: { current: boolean }) => Effect.Effect<A, E, R>) =>
-        Effect.gen(function*() {
-          let state = { current: true }
-          let out = yield* once(state)
-          for (let i = 0; i < 2 && !state.current; i++) {
-            state = { current: true }
-            out = yield* once(state)
-          }
-          return out
-        })
-      const recall = (input: { readonly query: string; readonly in?: "memories" | "notes" | undefined }) => retried((state) => recallOnce(input, state))
-      const recallOnce = (input: { readonly query: string; readonly in?: "memories" | "notes" | undefined }, state: { current: boolean }) =>
+      const recall = (input: { readonly query: string; readonly in?: "memories" | "notes" | undefined }) =>
         Effect.gen(function*() {
           yield* follow
-          const taken = present.generation()
           const l = lang()
           const words = wordsOf(input.query, l, "askRecall")
           if (!Array.isArray(words)) return words as Outcome
@@ -587,11 +559,8 @@ export const memoryModule: ModuleDefinition<typeof settings> = defineModule({
           const cut = found.cut ? say(texts, l, "cut", { count: count(found.looked, l) }) : undefined
           const withheld = found.withheld ? say(texts, l, "withheld") : undefined
           const extra = { ...(cut !== undefined ? { cut } : {}), ...(withheld !== undefined ? { withheld } : {}) }
-          const device = yield* deviceOf
           if (items.length === 0) {
             const none = sentences([say(texts, l, "nothingFound"), cut, withheld])
-            // What an earlier answer showed on this screen no longer holds: it is taken down.
-            state.current = yield* present.showList(device, taken, undefined)
             return { spoken: none, data: { spoken: none, found: 0, ...extra } } satisfies Outcome
           }
           const lines = items.map((i) => i.text)
@@ -600,8 +569,9 @@ export const memoryModule: ModuleDefinition<typeof settings> = defineModule({
             : say(texts, l, "foundMany", { count: count(found.total, l), items: listOf(lines.slice(0, 3), l) })
           const owner = items.some((i) => i.mine === true) ? found.person : undefined
           const said = sentences([head, cut])
-          // The list shows what the answer said: the same items, the same count of the rest, the same notes.
-          state.current = yield* present.showList(device, taken, {
+          // The list is a snapshot of what the answer said: the same items, the same count of the rest, the same notes. It is
+          // returned with the result (the host shows it when the turn is promoted), never shown from this run.
+          const list = listPresentation(l, {
             title: "listFound",
             items: lines,
             more: found.total - items.length,
@@ -611,15 +581,13 @@ export const memoryModule: ModuleDefinition<typeof settings> = defineModule({
             ...(owner !== undefined ? { owner } : {}),
             spokenCandidates: [said, head]
           })
-          return { spoken: said, data: { items, more: found.total - items.length, ...extra }, ...(owner !== undefined ? { owner } : {}) } satisfies Outcome
+          return { spoken: said, data: { items, more: found.total - items.length, ...extra }, present: list, ...(owner !== undefined ? { owner } : {}) } satisfies Outcome
         })
 
       // --- read_notes ----------------------------------------------------------------------------------------------------
-      const readNotes = (input: { readonly notebook?: string | undefined; readonly limit?: number | undefined }) => retried((state) => readNotesOnce(input, state))
-      const readNotesOnce = (input: { readonly notebook?: string | undefined; readonly limit?: number | undefined }, state: { current: boolean }) =>
+      const readNotes = (input: { readonly notebook?: string | undefined; readonly limit?: number | undefined }) =>
         Effect.gen(function*() {
           yield* follow
-          const taken = present.generation()
           const { person, mayShow } = yield* asker
           const l = lang()
           const n = Math.min(MAX_ITEMS, Math.max(1, input.limit ?? 5))
@@ -638,15 +606,13 @@ export const memoryModule: ModuleDefinition<typeof settings> = defineModule({
           const show = mayShow()
           const withheld = person !== undefined && !show ? say(texts, l, "withheld") : undefined
           const items = itemsOf(rows.slice(0, n).map((r) => ({ kind: "note" as const, id: r.id, text: r.value.text, at: r.value.at, notebook: r.value.notebook, ...(r.value.owner !== undefined ? { owner: r.value.owner } : {}) })), show)
-          const device = yield* deviceOf
           if (items.length === 0) {
             const none = sentences([say(texts, l, "noNotes"), withheld])
-            state.current = yield* present.showList(device, taken, undefined)
             return { spoken: none, data: { spoken: none, found: 0, ...(withheld !== undefined ? { withheld } : {}) } } satisfies Outcome
           }
           const owner = items.some((i) => i.mine === true) ? person : undefined
           const said = sentences([say(texts, l, "newestNotes", { items: listOf(items.map((i) => i.text), l, 3) }), more ? say(texts, l, "olderNotes") : undefined])
-          state.current = yield* present.showList(device, taken, {
+          const list = listPresentation(l, {
             title: "listNotes",
             items: items.map((i) => i.text),
             more: 0,
@@ -659,6 +625,7 @@ export const memoryModule: ModuleDefinition<typeof settings> = defineModule({
           return {
             spoken: said,
             data: { items, more, ...(withheld !== undefined ? { withheld } : {}) },
+            present: list,
             ...(owner !== undefined ? { owner } : {})
           } satisfies Outcome
         })
@@ -703,18 +670,23 @@ export const memoryModule: ModuleDefinition<typeof settings> = defineModule({
       // --- tools --------------------------------------------------------------------------------------------------------
       const asSay = (e: Effect.Effect<Outcome, Failed>) =>
         e.pipe(
-          Effect.map((o) => ({ say: o.spoken })),
+          Effect.map((o) => (o.present === undefined ? { say: o.spoken } : { say: o.spoken, present: o.present })),
           Effect.mapError((f) => new ActionError({ message: f.message }))
         )
       /** A result that holds a person's own items says whose, for the gateway's sensitivity (the code checked the device already). */
       const sensitivity = (result: unknown) => {
-        const owner = (result as { readonly owner?: string } | undefined)?.owner
+        const r = result as { readonly owner?: string; readonly forModel?: { readonly owner?: string } } | undefined
+        const owner = r?.forModel !== undefined ? r.forModel.owner : r?.owner
         return owner === undefined ? ({ kind: "household" } as const) : ({ kind: "personal", owner } as const)
       }
       /** Run an operation as a tool; the owner of personal content goes into the result for `sensitivity`. */
       const runTool = (e: Effect.Effect<Outcome, Failed>) =>
         e.pipe(
-          Effect.map((o) => ({ ...(o.data ?? { spoken: o.spoken }), ...(o.owner !== undefined ? { owner: o.owner } : {}) })),
+          Effect.map((o) => {
+            const forModel = { ...(o.data ?? { spoken: o.spoken }), ...(o.owner !== undefined ? { owner: o.owner } : {}) }
+            // A list goes with the result: the host shows it when the turn is promoted and drops it when it is discarded.
+            return o.present === undefined ? forModel : { forModel, present: o.present }
+          }),
           Effect.mapError((f) => new ToolError({ message: f.message }))
         )
 

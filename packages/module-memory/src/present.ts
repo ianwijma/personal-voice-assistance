@@ -52,17 +52,6 @@ export const cardKeyOf = (memoryId: string): string | undefined => {
 /** The memory a card key names. */
 export const memoryOfKey = (key: string | undefined): string | undefined => (key !== undefined && key.startsWith(CARD_KEY) ? key.slice(CARD_KEY.length) : undefined)
 
-/** The key of a device's list: one per device, so a list on one screen never replaces another's. */
-export const listKeyOf = (deviceId: string): string => {
-  const key = `list:${deviceId}`
-  if (/^[A-Za-z0-9_.:@/-]{1,64}$/.test(key)) return key
-  // A device id is at most 64 characters: a longer key is made from a short hash of it.
-  let h = 0x811c9dc5
-  for (let i = 0; i < deviceId.length; i++) h = Math.imul(h ^ deviceId.charCodeAt(i), 0x01000193) >>> 0
-  return `list:h${h.toString(16)}`
-}
-export const isListKey = (key: string) => key.startsWith("list:")
-
 const sensitivity = (owner: string | undefined) => (owner === undefined ? {} : { sensitivity: { personal: owner } })
 
 /** "Remembered: …" with one button, Undo. `text` is the memory's own text. */
