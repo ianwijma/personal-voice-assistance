@@ -159,7 +159,9 @@ more are open than are shown, so what is not shown is counted and never hidden):
 - **A device that cannot show it** (no screen, a page that cannot draw a list) changes nothing about the answer: it
   says "This device can't show it." and then the read-out sentence of the list ("The shopping list has 3 things: …",
   which is also the presentation's spoken fallback), and nothing is kept for that device (an earlier checklist there
-  is taken down). The model's tool says the same.
+  is taken down). The spoken sentence is at most 300 characters: it uses whole item names, within `readItems`, and
+  counts the items left out; the separate 80-character visual limit does not shorten speech. If no whole item fits,
+  the sentence says how many were not read out. The model's tool says the same.
 - **Privacy.** A list is household data, read out on shared, private and public devices alike, so its presentation is
   the household's (`sensitivity` is not personal) and is shown on every device that has a screen; the rule is the one
   that lets the same list be read out there. Nothing about a person is put on it.
@@ -181,11 +183,14 @@ more are open than are shown, so what is not shown is counted and never hidden):
   leaves what the screen holds as it is (title and items) sends nothing; a real change is shown again under the key
   with a new end, 24 hours from then. Deleting a list takes its checklists down; undoing the delete does not put them
   back. The deletion records a store revision cutoff on the list, kept by undo: pins that existed then stay
-  cancelled, while a later explicit show establishes a new pin without scanning pins on the deletion's turn.
+  cancelled, including when a refused replacement restores their row; a press on a cancelled pin changes no item.
+  A later explicit show establishes a new pin without scanning pins on the deletion's turn.
 - **When something fails.** A step that fails (the host busy, the store busy) leaves its work owed in the row with a
-  later try for that pin alone (5 s, 20 s, 80 s, 320 s, then every 10 minutes); it never holds up another pin or a
-  later change, and a new change of the pin's list tries it again at once. A checklist that was taken down while its
-  row could not be removed leaves the row saying so, and the next try removes it: rows never pile up.
+  later try for that pin alone (5 s, 20 s, 80 s, 320 s, then every 10 minutes). A new change of the pin's list asks
+  for another try at once. After a failed read, the next change to any checklist can reach its screen up to five
+  seconds late. A checklist that was taken down while its row could not be removed leaves the row saying so, and
+  the next try removes it: rows never pile up. If the Presenter refuses a replacement and restoring the previous pin
+  also fails, the replacement can still be shown on a retry; it then follows the ordinary close and expiry rules.
 - **When a device is offline.** A change while the device's page is disconnected is still a success: the host keeps
   the pinned presentation, updated, and gives it back when the page reconnects (docs/PRESENTING.md); the pin stays.
   Showing a list on a device that is offline at that moment keeps the pin too, and answers "I can't show it here right
@@ -207,8 +212,9 @@ more are open than are shown, so what is not shown is counted and never hidden):
   a checklist is closed by showing it empty under the same key, which the host ends three seconds later.
 - **When it ends.** At its end the host takes it down by itself, and the worker removes the pin then (it is due at
   `until`). Remaining lifetime is computed immediately before every call to the Presenter, including refreshes and
-  restarts. At the fixed end the worker dismisses a still-live handle before removing its row. Before that moment
-  the pin is never treated as ended.
+  restarts. At the fixed end the worker dismisses a still-live handle before removing its row; it never shows an
+  empty replacement then, and an owed show whose end has passed is dropped. Before that moment the pin is never
+  treated as ended.
 - **A tick** on an item is the press handler `lists` (registered in `shared`). It completes that item by its id through
   the same engine call as `lists_complete` (so under the one-at-a-time rule) and answers what it committed: "Ticked off
   eggs on the shopping list." The item and its list's count are attributed to the UI device (`actor: { kind: "ui", deviceId }`). Bringing the screens up to date is owed work of the pins (the commit names the list); a
