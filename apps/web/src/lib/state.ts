@@ -279,8 +279,10 @@ export interface ClientState {
   /**
    * P10: the presentations on this device (`present.show` / `present.update` until `present.dismiss`), in the order the
    * server gave them; never cut here (the server sends a page at most `MAX_PRESENTATIONS_PER_PAGE`). Emptied at every
-   * welcome and when the session ends: the server sends what applies again after a hello. `clockOffset`: the server's
-   * clock minus this page's when the message arrived, so a countdown runs from the server's instant on this clock.
+   * welcome, when the session ends and when the connection is lost (review round 1, G10: a page without its server shows
+   * nothing from it): the server sends what applies again after a hello. `receivedMono`: this page's monotonic clock
+   * when the message arrived, so a countdown runs from the server's instant (`serverNow`) without reading the wall clock
+   * again; it is taken again at every update.
    */
   readonly presentations: ReadonlyArray<HeldPresentation>
   readonly toasts: ReadonlyArray<Toast>
@@ -306,10 +308,10 @@ export interface ClientState {
 }
 
 /** A presentation as the page holds it: the server's form and the clock offset taken when it arrived. */
-export type HeldPresentation = PresentationWire & { readonly clockOffset: number }
+export type HeldPresentation = PresentationWire & { readonly receivedMono: number }
 
-/** The page's clock (epoch ms); tests move it. */
-export const pageClock = { now: (): number => Date.now() }
+/** The page's clocks: the wall clock (epoch ms) and a monotonic one (ms, `performance.now()`); tests move them. */
+export const pageClock = { now: (): number => Date.now(), mono: (): number => performance.now() }
 
 export const MAX_TURNS = 300
 export const MAX_TRACES = 50
@@ -720,7 +722,7 @@ const server: ServerHandlers = {
 }
 
 const withPresentation = (s: ClientState, p: PresentationWire): ClientState => {
-  const held: HeldPresentation = { ...p, clockOffset: p.serverNow - pageClock.now() }
+  const held: HeldPresentation = { ...p, receivedMono: pageClock.mono() }
   const i = s.presentations.findIndex((x) => x.id === p.id)
   if (i === -1) return { ...s, presentations: [...s.presentations, held] }
   const presentations = s.presentations.slice()
@@ -733,11 +735,12 @@ const local = (s: ClientState, a: LocalAction): ClientState => {
     case "local/connection":
       // Outdated: the page shows its own notice with Reload, so the server's "out of date" error toast goes.
       return a.status === "outdated"
-        ? { ...s, toasts: [], connection: { ...s.connection, status: a.status, attempt: a.attempt } }
-        : { ...s, connection: { ...s.connection, status: a.status, attempt: a.attempt } }
+        ? { ...s, toasts: [], presentations: [], connection: { ...s.connection, status: a.status, attempt: a.attempt } }
+        : { ...s, ...(a.status !== "open" ? { presentations: [] } : {}), connection: { ...s.connection, status: a.status, attempt: a.attempt } }
     case "local/socket-lost":
-      // Requests in flight will never be answered on this socket; the player was flushed.
-      return { ...s, pending: {}, audio: withoutPlaying(s.audio), liveTranscript: "" }
+      // Requests in flight will never be answered on this socket; the player was flushed. P10: what the server showed
+      // goes too (it may have ended or been withdrawn meanwhile); after the next welcome the server sends what applies.
+      return { ...s, pending: {}, audio: withoutPlaying(s.audio), liveTranscript: "", presentations: [] }
     case "local/notification-pressed":
       return { ...s, notifications: s.notifications.map((n) => (n.id === a.id ? { ...n, quiet: true } : n)) }
     case "local/session-ended":

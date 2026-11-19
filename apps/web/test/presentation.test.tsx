@@ -55,7 +55,7 @@ const IMAGE = (state: "loading" | "ready" | "failed"): PresentationWire["content
   alt: "A heron",
   credit: "Wikimedia Commons, CC BY-SA",
   caption: "Grey heron",
-  image: state === "ready" ? { state, hash: "a".repeat(64) } : { state }
+  image: state === "ready" ? { state, token: "a".repeat(32) } : { state }
 })
 const WEATHER: PresentationWire["content"] = {
   kind: "weather",
@@ -66,10 +66,10 @@ const WEATHER: PresentationWire["content"] = {
 
 describe("what the page keeps", () => {
   it("holds a presentation from show until dismiss, replaces it on update in place, and empties at a welcome and when the session ends", () => {
-    vi.spyOn(pageClock, "now").mockReturnValue(500)
+    vi.spyOn(pageClock, "mono").mockReturnValue(500)
     const s1 = run([show(wire("a", CARD)), show(wire("b", LIST))])
     expect(s1.presentations.map((p) => p.id)).toEqual(["a", "b"])
-    expect(s1.presentations[0]!.clockOffset).toBe(500)
+    expect(s1.presentations[0]!.receivedMono).toBe(500)
     const s2 = run([update(wire("a", { ...CARD, title: "Changed" }))], s1)
     expect(s2.presentations.map((p) => [p.id, p.content.kind === "card" ? p.content.title : ""])).toEqual([["a", "Changed"], ["b", ""]])
     expect(run([dismiss("a")], s2).presentations.map((p) => p.id)).toEqual(["b"])
@@ -113,7 +113,7 @@ describe("one renderer per kind, in both themes and both languages", () => {
         expect(screen.getByRole("timer").textContent).toBe("5:00")
         expect(screen.getAllByTestId("image-state").map((e) => e.textContent)).toEqual([texts.loading, texts.imageMissing])
         const img = screen.getByAltText("A heron") as HTMLImageElement
-        expect(img.getAttribute("src")).toBe(`/media/${"a".repeat(64)}`)
+        expect(img.getAttribute("src")).toBe(`/media/${"a".repeat(32)}`)
         expect(screen.getAllByText(`${texts.credit} Wikimedia Commons, CC BY-SA`)).toHaveLength(3)
         expect(screen.getByText("12°")).toBeTruthy()
         expect(screen.getAllByText(`${texts.high}`, { exact: false }).length).toBeGreaterThan(0)
@@ -163,28 +163,71 @@ describe("ticks and buttons", () => {
 })
 
 describe("the countdown", () => {
-  it("counts down to the server's instant on a page whose clock is ten minutes off, and says the server's word at zero", () => {
+  it("counts down to the server's instant on a page whose wall clock is off, on its monotonic clock, and says the server's word at zero", () => {
     vi.useFakeTimers()
     try {
-      // The server's clock is 10 minutes ahead of the page's: it ends 5 minutes from the server's now.
+      // The server says it ends 5 minutes from its own now; the page's wall clock is ten minutes behind and is not read.
       const serverNow = Date.UTC(2026, 10, 19, 12)
-      const page = serverNow - 10 * 60_000
-      let now = page
-      vi.spyOn(pageClock, "now").mockImplementation(() => now)
+      let mono = 1_000
+      vi.spyOn(pageClock, "now").mockReturnValue(serverNow - 10 * 60_000)
+      vi.spyOn(pageClock, "mono").mockImplementation(() => mono)
       mount(run([show(wire("t", { kind: "timer", label: "Pasta", endsAt: serverNow + 5 * 60_000 }, { serverNow, texts: NL }))]))
       expect(screen.getByRole("timer").textContent).toBe("5:00")
-      now += 61_000
+      mono += 61_000
       act(() => void vi.advanceTimersByTime(250))
       expect(screen.getByRole("timer").textContent).toBe("3:59")
-      now += 4 * 60_000
+      mono += 4 * 60_000
       act(() => void vi.advanceTimersByTime(250))
       expect(screen.getByRole("timer").textContent).toBe("Klaar")
     } finally {
       vi.useRealTimers()
     }
-    expect(remainingMs(10_000, 2_000, 5_000)).toBe(3_000)
+    expect(remainingMs(10_000, 2_000, 100, 5_100)).toBe(3_000)
     expect(formatRemaining(3_723_400)).toBe("1:02:04")
     expect(formatRemaining(0)).toBe("0:00")
+  })
+
+  it("b6: a jump of the page's wall clock, forward past zero and back, neither ends nor freezes a running countdown", () => {
+    vi.useFakeTimers()
+    try {
+      const serverNow = Date.UTC(2026, 10, 19, 12)
+      let wall = serverNow
+      let mono = 0
+      vi.spyOn(pageClock, "now").mockImplementation(() => wall)
+      vi.spyOn(pageClock, "mono").mockImplementation(() => mono)
+      mount(run([show(wire("t", { kind: "timer", label: "Tea", endsAt: serverNow + 60_000 }, { serverNow }))]))
+      expect(screen.getByRole("timer").textContent).toBe("1:00")
+      wall += 3_600_000
+      mono += 1_000
+      act(() => void vi.advanceTimersByTime(250))
+      expect(screen.getByRole("timer").textContent).toBe("0:59")
+      wall -= 3_600_000
+      mono += 9_000
+      act(() => void vi.advanceTimersByTime(250))
+      expect(screen.getByRole("timer").textContent).toBe("0:50")
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+})
+
+describe("a page without its server", () => {
+  it("b2: losing the connection clears what the server showed (the notification cards keep their own rule); a welcome starts afresh", () => {
+    const ring: ServerMessage = { ...serverExamples["notification.ring"], notification: { ...serverExamples["notification.ring"].notification, id: "n1" } }
+    const held = run([ring, show(wire("t", CARD, { lifetime: "transient" })), show(wire("p", CARD))])
+    const lost = run([{ type: "local/socket-lost" } as Action], held)
+    expect(lost.presentations).toEqual([])
+    expect(lost.notifications.map((n) => n.id)).toEqual(held.notifications.map((n) => n.id))
+    expect(run([{ type: "local/connection", status: "reconnecting", attempt: 1 } as Action], held).presentations).toEqual([])
+  })
+
+  it("b7: an image the browser cannot load shows the server's sentence for a missing image, with its caption and credit", () => {
+    mount(run([show(wire("i", IMAGE("ready")))]))
+    fireEvent.error(screen.getByAltText("A heron"))
+    expect(screen.queryByAltText("A heron")).toBeNull()
+    expect(screen.getByTestId("image-state").textContent).toBe(EN.imageMissing)
+    expect(screen.getByText("Grey heron")).toBeTruthy()
+    expect(screen.getByText(`${EN.credit} Wikimedia Commons, CC BY-SA`)).toBeTruthy()
   })
 })
 
