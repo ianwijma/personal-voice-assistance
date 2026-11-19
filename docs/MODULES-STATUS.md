@@ -152,7 +152,8 @@ Found by the last checks and written down instead of fixed:
   to stop), the bin-day reminder test "a copy too old to trust"; and in local full runs under load the SQLite
   `logStart` test ("database is locked"), the calendar latency test and one timers test ("the repeating series moves
   on although its ring is refused": the alarm's row was not there yet when the test looked; it passes alone 5 times
-  out of 5). Four full local runs of the whole: none failed twice, two were clean, two had one such test each.
+  out of 5). Of the three full local runs of the whole after its fixes, one was clean and two had one such test
+  each (a different one each time).
 
 - **Not run against a real Home Assistant**: the smart-home module's templates (they use `regex_replace`, `unique`
   and `abs`) are only tested against the fake server.
