@@ -273,8 +273,10 @@ export const timersModule = defineModule({
             const next = nextAtOf(e.value, now)
             const job = next === undefined ? undefined : yield* ctx.scheduler.prepare({ handler: "due", key: `timer:${e.id}`, payload: { id: e.id }, at: next, origin: { deviceId: e.value.deviceId } })
             prepared.push({ row: e.row, id: e.id, planned: { ...e.value, pending: next !== undefined, nextAt: next ?? 0 }, job })
+            if (prepared.length % PAGE === 0) yield* Effect.yieldNow
           }
           const options = yield* actorNow(actor)
+          if (entries.length > 1) yield* Effect.yieldNow
           const written = yield* ctx.store.transaction((tx) => {
             const c = tx.collection(timers)
             const rows = prepared.map((p) => {
@@ -286,7 +288,12 @@ export const timersModule = defineModule({
             for (const j of extra) j.writeIn(tx)
             return rows
           })
-          for (const p of prepared) if (p.job === undefined && p.row?.value.pending === true) yield* Effect.ignore(ctx.scheduler.cancel({ key: `timer:${p.id}` }))
+          if (entries.length > 1) yield* Effect.yieldNow
+          for (let i = 0; i < prepared.length; i++) {
+            const p = prepared[i]!
+            if (p.job === undefined && p.row?.value.pending === true) yield* Effect.ignore(ctx.scheduler.cancel({ key: `timer:${p.id}` }))
+            if ((i + 1) % PAGE === 0) yield* Effect.yieldNow
+          }
           return written
         })
 

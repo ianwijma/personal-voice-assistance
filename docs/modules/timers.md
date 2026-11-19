@@ -298,6 +298,11 @@ earliest due time on the runtime's timer (at most 10 s at a time, comparing the 
 SQLite on a file is not measured here either; the store's own latency tests give a `schedule` a 0.3 ms median and a
 notification `send` a 0.37 ms median.
 
+The cancel-all check in `packages/module-timers/test/bulkCancelLatency.test.ts` samples a real 1 ms heartbeat while
+cancelling 100 expired timers (two batches of 50, expired a minute apart), four rounds on the in-memory store. It
+asserts the longest gap stays below `bound(10)` ms, including the one atomic batch write and the keyed job
+cancellations. Preparation and cleanup yield in batches so audio can keep running between them.
+
 ## Contract readings
 
 - **"At most 50 running timers"** is read as active timers: running, snoozed and paused, not counting one that rang. A
