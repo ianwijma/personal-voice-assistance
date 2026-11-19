@@ -15,6 +15,11 @@ import { BRIEFING_BUDGET_MS, makeWeatherExtras } from "../../modules-builtin/src
 import { coverage, periodsOf } from "../../modules-builtin/src/weather/rain.ts"
 import { texts } from "../../modules-builtin/src/weather/words.ts"
 import { FORECAST, forecast, type ForecastOptions, GEOCODE, geocoding, json, T0, utrecht } from "./weatherFixtures.ts"
+import { vi } from "vitest"
+
+// Several of these tests start three or four whole test households each: on a slow two-core CI runner one of them can
+// take longer than the default five seconds.
+vi.setConfig({ testTimeout: 30_000 })
 
 type Spec = Parameters<typeof makeOfflineNet>[0]
 const world = (over: ForecastOptions & { forecastBody?: unknown } = {}): Spec => ({
