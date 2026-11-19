@@ -3,7 +3,7 @@ import { Effect, Schema } from "effect"
 import { ACTION_TIMEOUT_MS, ActionError, type ActionOutcome, actionToolName, actionValues, type RegisteredAction } from "./Actions.ts"
 import { ToolError } from "./Errors.ts"
 import { actionRunnerOf, registerConfirmedRunner, toolRunnerOf } from "./GatewayPrivate.ts"
-import { declaredSensitivity, riskOf, type Sensitivity, sensitivityOf, type Tool, type ToolLatency, type ToolMetadata, toolMetadata, type ToolRisk } from "./Module.ts"
+import { declaredSensitivity, riskOf, type Sensitivity, sensitivityOf, type Tool, type ToolLatency, type ToolMetadata, toolMetadata, type ToolRisk, UNKNOWN_OWNER } from "./Module.ts"
 import { isPresentResult } from "./Present.ts"
 import {
   type ConnectionRef,
@@ -311,19 +311,25 @@ const needsYes = (registered: RegisteredAction) => registered.definition.confirm
  * The generated tool's result for an action that ran: its `say`, else its `announce`, else "ok"; with `present` (P10),
  * that and the presentation, for the Presenter's split.
  */
-const runForTool = (registered: RegisteredAction, values: Readonly<Record<string, unknown>>): Effect.Effect<unknown, ToolError> => {
+const runForTool = (registered: RegisteredAction, values: Readonly<Record<string, unknown>>): Effect.Effect<ActionOutcome | void, ToolError> => {
   const def = registered.definition
   return Effect.suspend(() => actionRunnerOf(registered)(values)).pipe(
     Effect.timeoutOrElse({
       duration: ACTION_TIMEOUT_MS,
       orElse: () => Effect.fail(new ActionError({ message: `${def.label} did not finish within ${ACTION_TIMEOUT_MS / 1000} s` }))
     }),
-    Effect.mapError((error) => new ToolError({ message: error.message, cause: error })),
-    Effect.map((outcome) => {
-      const said = outcome?.say ?? def.announce?.(values as never) ?? "ok"
-      return outcome?.present === undefined ? said : { forModel: said, present: outcome.present, ...(outcome.show !== undefined ? { show: outcome.show } : {}) }
-    })
+    Effect.mapError((error) => new ToolError({ message: error.message, cause: error }))
   )
+}
+
+/**
+ * The generated tool's result for an action's outcome (P8, review round 1 H2: made only after the outcome itself was
+ * judged by its sensitivity): its `say`, else its `announce`, else "ok"; with `present`, that and the presentation.
+ */
+const formatForTool = (registered: RegisteredAction, values: Readonly<Record<string, unknown>>, outcome: ActionOutcome | void): unknown => {
+  const def = registered.definition
+  const said = outcome?.say ?? def.announce?.(values as never) ?? "ok"
+  return outcome?.present === undefined ? said : { forModel: said, present: outcome.present, ...(outcome.show !== undefined ? { show: outcome.show } : {}) }
 }
 
 /** A result that asks to show something, without a Presenter here: `forModel`, and the note that nothing is shown. */
@@ -559,20 +565,52 @@ export const makeExecutionGateway = (options: GatewayOptions = {}): ExecutionGat
    * this result) is revealed only where `mayReveal` allows it for the call's device. Otherwise the model gets the fixed
    * sentence, and the decision's record says so.
    */
-  const revealed = (meta: ToolMetadata, call: Omit<GatewayCall, "risk">, record: GatewayDecisionRecord | undefined, value: unknown): unknown => {
-    if (mayReveal === undefined) return value
-    const sensitivity = sensitivityOf(meta, value)
-    if (sensitivity.kind === "household") return value
-    let ok = false
+  /** May personal content of `owner` go to the call's device? An unknown owner is never anyone's (H4). */
+  const mayRevealOwner = (owner: string, call: Omit<GatewayCall, "risk">): boolean => {
+    if (mayReveal === undefined) return true
+    if (owner === UNKNOWN_OWNER) return false
     try {
-      ok = mayReveal(sensitivity.owner, call.deviceId) === true
+      return mayReveal(owner, call.deviceId) === true
     } catch {
-      ok = false
+      return false
     }
-    if (ok) return value
-    if (record !== undefined) (record as { withheld?: boolean }).withheld = true
-    return riskWithheld(languageNow())
   }
+  const markWithheld = (record: GatewayDecisionRecord | undefined) => {
+    if (record !== undefined) (record as { withheld?: boolean }).withheld = true
+  }
+
+  /** Whether the executor's own result `value` may go back to the model (it is marked withheld otherwise). */
+  const mayRevealResult = (meta: ToolMetadata, call: Omit<GatewayCall, "risk">, record: GatewayDecisionRecord | undefined, value: unknown): boolean => {
+    if (mayReveal === undefined) return true
+    const sensitivity = sensitivityOf(meta, value)
+    if (sensitivity.kind === "household" || mayRevealOwner(sensitivity.owner, call)) return true
+    markWithheld(record)
+    return false
+  }
+
+  /**
+   * H3: whether an admitted executor's failure or defect may go back to the model, by the decision its result would have
+   * had: a fixed household sensitivity yes; a fixed personal one where its result could be shown; a classifier of the
+   * result cannot be asked about a failure, so no.
+   */
+  const mayRevealFailure = (meta: ToolMetadata, call: Omit<GatewayCall, "risk">, record: GatewayDecisionRecord | undefined): boolean => {
+    if (mayReveal === undefined) return true
+    const declared = declaredSensitivity(meta)
+    const ok = declared !== "per-result" && (declared.kind === "household" || mayRevealOwner(declared.owner, call))
+    if (!ok) markWithheld(record)
+    return ok
+  }
+
+  /**
+   * `run` (an admitted executor) with its failure and its defect under the reveal decision (H3): one that may not be
+   * revealed is replaced by the fixed withheld sentence as a failure (`isError` kept), never its text. An interruption
+   * passes through.
+   */
+  const guardedRun = <A>(meta: ToolMetadata, call: Omit<GatewayCall, "risk">, record: GatewayDecisionRecord | undefined, run: Effect.Effect<A, ToolError>): Effect.Effect<A, ToolError> =>
+    mayReveal === undefined ? run : run.pipe(
+      Effect.catch((error) => (mayRevealFailure(meta, call, record) ? Effect.fail(error) : Effect.fail(new ToolError({ message: riskWithheld(languageNow()) })))),
+      Effect.catchDefect((defect) => (mayRevealFailure(meta, call, record) ? Effect.die(defect) : Effect.fail(new ToolError({ message: riskWithheld(languageNow()) }))))
+    )
 
   /** What an action call's observer is told about an admission. */
   const decisionNote = (a: { readonly refusal: Refusal | undefined; readonly record: GatewayDecisionRecord | undefined; readonly risk?: ToolRisk }): ActionDecisionNote => ({
@@ -618,17 +656,23 @@ export const makeExecutionGateway = (options: GatewayOptions = {}): ExecutionGat
         const call = callOf({ kind: "tool", moduleId, name: t.name, input: values, confirmed: false, action: registered }, def, principal)
         const admitted = yield* admitCall(call, def)
         if (admitted.refusal !== undefined) return yield* refusedTool(admitted.refusal)
-        const ran = yield* asPrincipal(principal, runForTool(registered, values))
-        const shown = revealed(def, call, admitted.record, ran)
-        return shown === ran ? yield* split(moduleId, principal, ran) : shown
+        // H2: the action's own outcome is judged by its sensitivity first; only an admitted one is formatted and shown.
+        const record = admitted.record
+        const formatted = yield* guardedRun(def, call, record, Effect.gen(function*() {
+          const outcome = yield* asPrincipal(principal, runForTool(registered, values))
+          if (!mayRevealResult(def, call, record, outcome)) return { withheld: true as const }
+          return { value: formatForTool(registered, values, outcome) }
+        }))
+        if ("withheld" in formatted) return riskWithheld(languageNow())
+        return yield* split(moduleId, principal, formatted.value)
       }
       const call = callOf({ kind: "tool", moduleId, name: t.name, input, confirmed: false }, t, principal)
       const admitted = yield* admitCall(call, t)
       if (admitted.refusal !== undefined) return yield* refusedTool(admitted.refusal)
       // Suspended: a tool that throws while building its effect is a defect, as before.
-      const value = yield* asPrincipal(principal, Effect.suspend(() => toolRunnerOf(t)(input)))
-      const shown = revealed(t, call, admitted.record, value)
-      return shown === value ? yield* split(moduleId, principal, value) : shown
+      const value = yield* guardedRun(t, call, admitted.record, asPrincipal(principal, Effect.suspend(() => toolRunnerOf(t)(input))))
+      if (!mayRevealResult(t, call, admitted.record, value)) return riskWithheld(languageNow())
+      return yield* split(moduleId, principal, value)
     })
 
   const runAction = (
