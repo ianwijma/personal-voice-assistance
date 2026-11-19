@@ -302,7 +302,16 @@ transient the decision allows.
   `devicePresentFrom`): `POST /mock/present` takes what a module passes to `show` and refuses before it changes
   anything; a presentation ends at its end; every saved settings change reconciles every page; images show the mock's
   built-in picture through `/media/<token>`, with the server's rule and headers; a tick from a holder updates every page
-  (the mock acts as the module).
+  (the mock acts as the module). Review round 2 (R7): the whole request (its fields, an explicit `id` matching the
+  protocol's id, a known `deviceId`, the presentation, the options and the page message it would make) is checked before
+  any id is consumed or anything changes, so a refused request leaves what pages hold and the capacity as they were;
+  admission uses the server's own bounds (`MAX_LIVE_PER_MODULE`, `MAX_LIVE_TOTAL`, `MAX_PINNED_PER_DEVICE`, from
+  `@pva/protocol`; the mock counts as one module; the transients a new one ends do not count), given back by a dismissal
+  or an end. **What the mock does not model it refuses with a 400 and a sentence**, rather than doing it differently:
+  personal content ("the mock shows household presentations only (it has no privacy model): …"; it has no privacy
+  model) and `options.key` ("the mock does not replace by key: …"; it has no keyed replacement). Both were refused
+  because refusing is smaller than implementing them through the shared functions; test those against the kit
+  (`startTestModule`), which runs the real Presenter.
 
 ## Testing
 
