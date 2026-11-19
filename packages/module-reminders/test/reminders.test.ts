@@ -160,7 +160,7 @@ describe("setting a reminder", () => {
       const E = 8_640_000_000_000_000
       const big: Reminder = {
         text, whose: "personal", owner: "p".repeat(40), state: "done", dueAt: E, owed: { at: E, from: E, attempts: 20, tryAt: E },
-        ring: { at: E, deliveredAt: E, snoozeUntil: E }, stop: { notes: [E, E, E, E], card: true, attempts: 20, tryAt: E }, nextAt: E,
+        ring: { at: E, from: E, deliveredAt: E, snoozeUntil: E }, stop: { notes: [E, E, E, E], card: true, cardAt: E, attempts: 20, tryAt: E }, nextAt: E,
         deviceId: "\"".repeat(64), assistantId: "\"".repeat(40), setBy: "\"".repeat(40), rrule: "\"".repeat(100), dtstart: "\"".repeat(70),
         timeZone: "\"".repeat(64), handled: "\"".repeat(64), dropped: { at: E, why: "superseded", when: E }, endedAt: E
       }

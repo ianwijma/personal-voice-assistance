@@ -32,6 +32,8 @@ export type Owed = typeof Owed.Type
 export const Ring = Schema.Struct({
   at: Epoch,
   deliveredAt: Epoch,
+  /** Effective deadline displayed after a snooze; `at` remains the stable occurrence key. */
+  from: Schema.optionalKey(Epoch),
   /** Put off until then: its notification and card were taken down, and it is sent again at that moment. */
   snoozeUntil: Schema.optionalKey(Epoch)
 })
@@ -41,6 +43,8 @@ export type Ring = typeof Ring.Type
 export const Stop = Schema.Struct({
   notes: Schema.Array(Epoch).check(Schema.isMaxLength(STOP_NOTES)),
   card: Schema.Boolean,
+  /** When present, only the card of this occurrence is owed cleanup. */
+  cardAt: Schema.optionalKey(Epoch),
   attempts: Count,
   tryAt: Epoch
 })
@@ -120,7 +124,7 @@ export const planOf = (r: Reminder): number | undefined => {
 /** The moment a reminder next speaks (its owed occurrence, its snooze, its next occurrence); absent when it only waits for an answer. */
 export const speaksAt = (r: Reminder): number | undefined => {
   let min: number | undefined
-  for (const t of [r.owed?.at, r.ring?.snoozeUntil, r.dueAt]) if (t !== undefined && (min === undefined || t < min)) min = t
+  for (const t of [r.owed?.from, r.ring?.snoozeUntil, r.dueAt]) if (t !== undefined && (min === undefined || t < min)) min = t
   return min
 }
 

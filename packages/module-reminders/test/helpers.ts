@@ -48,6 +48,7 @@ export interface Faults {
   failTransactions: number
   onRead?: ((q: any) => void) | undefined
   listFails?: number
+  /** Pause one captured notification-list snapshot for each supplied gate. */
   listGate?: Deferred.Deferred<void>
   listEntered?: Deferred.Deferred<void>
   sendFails: number
@@ -72,6 +73,7 @@ export interface Faults {
 export const nofaults = (): Faults => ({ storeWrites: false, storeReads: false, failTransactions: 0, sendFails: 0, resolveFails: 0, dismissFails: 0, handlers: {}, runs: {}, results: {}, shows: 0 })
 
 export const faulty = (faults: Faults): ModuleDefinition<any> => {
+  let heldListGate: Deferred.Deferred<void> | undefined
   const bad = (what: string) => Effect.fail(new StoreError({ reason: "busy", message: what }))
   const wrapStore = (store: any) => ({
     ...store,
@@ -127,8 +129,12 @@ export const faulty = (faults: Faults): ModuleDefinition<any> => {
           faults.listFails!--
           return Effect.fail(new NotifyError({ reason: "busy", message: "injected" }))
         }
-        return Effect.flatMap(ctx.notify.list(), (ns: any) => faults.listGate === undefined ? Effect.succeed(ns) :
-          Effect.andThen(Deferred.succeed(faults.listEntered!, undefined), Effect.as(Deferred.await(faults.listGate), ns)))
+        return Effect.flatMap(ctx.notify.list(), (ns: any) => {
+          const gate = faults.listGate
+          if (gate === undefined || gate === heldListGate) return Effect.succeed(ns)
+          heldListGate = gate
+          return Effect.andThen(Deferred.succeed(faults.listEntered!, undefined), Effect.as(Deferred.await(gate), ns))
+        })
       }),
       resolve: (...a: Array<any>) => (faults.resolveFails > 0 ? (faults.resolveFails--, Effect.fail(new NotifyError({ reason: "busy", message: "injected" }))) : ctx.notify.resolve(...a)),
       send: (r: any) => {
