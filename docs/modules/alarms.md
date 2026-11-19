@@ -15,8 +15,8 @@ This page belongs to the module's pull request, which touches its package and th
 Alarms that ring on the device they were set on, either once ("wake me at seven", "tomorrow at 6:30") or repeating
 ("every weekday at quarter to seven", "elke werkdag om half zeven"). Up to 50 at once.
 
-**An alarm is not changed.** To move one, it is cancelled and set again (`alarms_cancel`, then `alarms_set`). The tool
-descriptions and the instructions say so, so the model does exactly that.
+**An alarm is not changed.** To move one, it is cancelled and set again (`alarms_cancel`, then `alarms_set`). The module
+instructions tell the model to cancel and set again.
 
 It is a separate module from `timers`, so an assistant can have one without the other.
 
@@ -34,7 +34,9 @@ Some requests are a question or a refusal instead:
 
 - an ambiguous moment ("next Friday at 7") is a question;
 - a rule with no time ("every Monday") is a question;
-- a moment that has passed, or one more than a year ahead, is refused.
+- a moment that has passed, or one beyond the same local date and time next year, is refused (29 February clamps to
+  28 February when needed). The same limit applies to the first ring of a repeating alarm; later occurrences of an
+  accepted series are not capped.
 
 The answer says the day and the time with its part of the day, so a mistake is heard: "Alarm set for tomorrow at seven
 o'clock in the morning.", or "Alarm set every weekday; the first one is tomorrow at quarter to seven in the morning.".
@@ -70,7 +72,8 @@ That job, every action, every button and the hourly sweep **reconcile** the row:
 
 - **An occurrence that is due becomes owed, and the series moves on in the same write**, whatever then becomes of the
   delivery. A busy notification service can delay a ring; it never loses the series.
-- A snooze that is due becomes the next owed ring.
+- A snooze that is due becomes the next owed ring, unless a newer series occurrence is already due; the latest due
+  instant wins.
 - The owed ring is sent.
 - Old rings are taken away.
 
@@ -103,13 +106,18 @@ planned after now, never in the past. A ring up to 15 minutes late rings, and sa
   sent beside the old card. The notification key is per occurrence (`alarm:<id>:<number>`).
 - **Snooze and Five more minutes** set the row's ring to ring again; the series is not moved.
 - **The buttons act only on the alarm's current ring.** A press of any other card is answered "That ring has ended."
-  and changes nothing. A press is done once per notification.
+  and changes nothing. A press is done once per notification; replaying it reports the committed time still left,
+  even when a different button was pressed. Reactivating a one-off obeys the 50-set limit and keeps its card on refusal.
 - **Stop** is the host's: the card, "stop", and "stop" without the wake phrase while it rings.
 
 **Delivery is at least once.** The order is: write the owed ring, send it under its key, write that it was sent. If the
-server fails between the send and that last write, the next reconcile records the ring when its card is still open.
+server fails between the send and that last write, the next reconcile records the ring when its card is still open,
+even beyond the delivery window, keeping the existing expiry. If the open-card lookup fails, delivery stays owed.
 If **Stop was pressed in that moment, it sends it again: a ring can sound a second time, and it is never lost.** A cancel
 in that moment finds the card by its key and takes it away.
+
+An open ring recovered after a lost outcome write remains available to voice cancellation and is not reported missed.
+This also covers a refused first send followed by a successful retry whose outcome write failed across the deadline.
 
 **Stop and a button pressed at the same moment.** When Stop and Snooze or Five more minutes are pressed for the same
 ring at the same moment, the card follows whichever the notification service recorded first. **The alarm may still
@@ -129,12 +137,17 @@ The ring goes only to its own device. The decision is made when answering, for t
 
 ### Snoozed and ringing alarms
 
-A snoozed alarm is part of its row: it is listed with when it rings again ("One alarm: tea, ringing again today at ten
-past ten in the morning."), and a ringing one is listed as ringing. Either can be cancelled by voice, also after a
-restart: "The snoozed alarm is cancelled.".
+A snoozed alarm is part of its row: it is listed with its nominal time and when it rings again ("One alarm: tea today
+at ten oh one in the morning, ringing again today at ten past ten in the morning."), and a ringing one is listed as
+ringing. Either can be cancelled by voice, also after a
+restart: "The snoozed alarm is cancelled.". Ringing and waiting one-offs keep their nominal time in lists and cancellation choices, including on other devices;
+alarms still being withdrawn appear only in cancellation choices. Their labels stay on their own device.
 
 - From any device it can be cancelled by its time: the time it was set for, also when it rang late or next to a
   daylight-saving change.
+- A snooze matches its snooze time while it can still ring (through its 15-minute delivery window), or while its
+  notification is open, including an unfinished withdrawal. Once it can no longer ring and has no open notification,
+  that snooze time no longer selects the series.
 - On its own device it can also be cancelled by its name.
 
 ### Only the next, or all
@@ -142,9 +155,14 @@ restart: "The snoozed alarm is cancelled.".
 Cancelling a repeating alarm must say which. Without it the answer is the question "That alarm repeats every weekday.
 Only the next one, or all of them?", and nothing changes (docs/MODULES-PLAN.md §2 row 6).
 
-- **"Only the next"** skips that occurrence ("… is skipped; the next one is Friday at quarter to seven in the
-  morning."). When a snooze is still to ring, that snooze is the next ring: "The snoozed alarm is cancelled; the next
-  one is tomorrow at …".
+- **"Only the next"** catches the series up to now first, then skips the occurrence that would ring next and names it
+  in the answer. An occurrence already outside the 15-minute late window is reported as missed by its job; it is not
+  the ring being skipped. The answer says "… is skipped; the next one is Friday at quarter to seven in the
+  morning." When a snooze is still to ring, that snooze is the next ring: "The snoozed alarm is cancelled; the next
+  one is tomorrow at …". An owed snooze matches its snooze time while still eligible to ring or already open, and
+  cancelling again while its withdrawal is unfinished finishes that withdrawal before skipping a later series occurrence.
+  Selecting an open snooze by its snooze time stops that ring and keeps tomorrow's regular occurrence; selecting the regular time still skips the next
+  series occurrence.
 - **"All"** ends the series.
 
 ### Clean-up
@@ -162,8 +180,9 @@ the owed ring forgotten.
 
 ### Which alarm
 
-- by name, on its own device;
-- or by its time ("6:45": its next occurrence, its snooze, or the time its owed or ringing occurrence was set for);
+- a time request matches times only ("6:45": its next occurrence, an eligible or open snooze, or the time its owed or
+  ringing occurrence was set for), even if a local alarm has that name;
+- a name request matches names on its own device;
 - or the only one there is;
 - otherwise a question that lists them. Never the first of several.
 
@@ -176,7 +195,7 @@ Everything is local: no outside service, no network.
 
 ## Tools
 
-There are three typed actions, each with English and Dutch `examples`. The intent path runs them without the model, and
+There are three typed actions, each with English and Dutch `examples`. The intent path can run them directly, and
 the model is offered each as `alarms_<id>`. There are no phrase commands: the plan gives phrases to the timers only.
 `set` and `cancel` are `change`; `list` is a plain read. **Moving an alarm is `alarms_cancel` followed by
 `alarms_set`.**
@@ -185,7 +204,26 @@ the model is offered each as `alarms_<id>`. There are no phrase commands: the pl
 |---|---|---|---|
 | `alarms_set` | `when` (text, as said), `name?` | "wake me at seven" | "Alarm set for tomorrow at seven o'clock in the morning." |
 | `alarms_list` | none | "which alarms are set" | "2 alarms: tomorrow at quarter to seven in the morning, every weekday and tomorrow at nine o'clock in the morning." |
-| `alarms_cancel` | `which?` (a name or a time), `scope?` (`next`, `all`) | "cancel tomorrow's alarm only" | "The alarm for tomorrow at quarter to seven in the morning is skipped; the next one is Friday at quarter to seven in the morning." |
+| `alarms_cancel` | `which?` (a name or a time), `date?` (a date-qualified target), `scope?` (`next`, `all`) | "cancel the noon alarm" | "The alarm for today at noon is cancelled." |
+
+The typed setting parameter keeps the date or repetition before the clock time: “tomorrow at noon” and
+“every weekday at noon” reach the date and recurrence parsers intact. Cancellation strips an optional alarm noun
+before comparing a clock time, preserving punctuation such as the colon in “12:00”. A date-only cancellation
+such as “cancel tomorrow's alarm only” asks which alarm is meant and changes nothing; it cannot select today's
+sole alarm by dropping “tomorrow”. Every day or date the module's date reader understands, also in Dutch, takes
+precedence over names; calendar spans such as “this weekend” and “next week” ask too. These selectors ask and cancel
+nothing, even when an alarm has that name; say “named This Weekend” (or “genaamd Dit Weekend”) to select the name
+explicitly. An unparsed explicit clock also asks. An implicit name must match the complete captured selector,
+ignoring case and surrounding whitespace; a leftover alarm noun or unknown qualifier asks instead of falling back
+to a shorter name or the only alarm. For example, “half past noon alarm” cannot select an alarm named Half Past Noon.
+A recognized clock such as “at 12:30” still selects by time.
+
+The direct path understands “wake me at seven” / “zet een wekker om half acht”, complete date/repetition clauses
+such as “set an alarm every weekday at noon”, and cancellation by clock time or a name after an article, possessive
+or alarm noun. “Named”, “called” and “genaamd” explicitly select a name, even a name such as Noon. Qualifiers before
+an alarm noun are retained; unsupported clauses such as “a weekday alarm at noon” ask instead of creating a one-off.
+Unresolved captured targets and dates ask or leave the whole request to the assistant's model. Actions receive only
+declared parameters, not the utterance, so they cannot inspect words extraction never supplied.
 
 Dutch: "zet een wekker om half acht" answers "Wekker gezet voor morgen om half acht 's ochtends.". A repeating one
 without a scope answers "Die wekker herhaalt elke werkdag. Alleen de volgende, of allemaal?".
@@ -254,7 +292,7 @@ nothing of them; the ringing card goes only to the alarm's device.
 
 - `requires`: nothing outside the process; `uses`: nothing.
 - **Core services**: the scheduler, the notification service, `Devices` (device names in answers).
-- **`@pva/language`**: `parseRecurrence`, `parseDateTime`, `parseTimeOfDay`, `nextOccurrence`, `occurrencesAfter`,
+- **`@pva/language`**: `parseRecurrence`, `parseDateTime`, `parseTimeOfDay`, `nextOccurrence`,
   `parseDtstart`, `describeRRule`, `speakMoment`, `speakTime`, `normalizeTimeZone`.
 
 ## What was left out

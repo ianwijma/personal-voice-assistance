@@ -74,7 +74,15 @@ describe("finding 1: ten rings open and one more", () => {
       yield* kit.action("set", { when: "every day at 10:02", name: "daily" })
       yield* kit.advance(3 * MIN)
       assert.strictEqual(ringing(kit).length, 10)
-      const daily = (yield* alarmRows(kit)).find((r) => r.value.name === "daily")!
+      // There are eleven rows: include them all, and wait boundedly for the daily row.
+      let daily: Row<Alarm> | undefined
+      for (let attempt = 0; attempt < 100 && daily === undefined; attempt++) {
+        const first = yield* alarmRows(kit)
+        daily = first.find((r) => r.value.name === "daily")
+        if (daily === undefined && first.length === 10) daily = (yield* kit.moduleStore().collection(alarms).list({ orderBy: { field: "createdAt", direction: "asc" }, after: first.at(-1)!, limit: 10 })).find((r) => r.value.name === "daily")
+        if (daily === undefined) yield* Effect.promise(() => new Promise<void>((resolve) => setImmediate(resolve)))
+      }
+      assert.ok(daily, "daily alarm row must be written within 100 attempts")
       // The series is planned for tomorrow already, with today's ring owed.
       assert.strictEqual(daily.value.next?.at, at(19, 10, 2))
       assert.strictEqual(daily.value.owed?.at, at(18, 10, 2))
@@ -118,7 +126,7 @@ describe("finding 1 (its fix): an owed ring is sent only on the timer's own devi
       hooks.sendFail = limitFailure()
       yield* kit.advance(MIN)
       assert.strictEqual(said(yield* kit.action("list", {}, { device: "hall-screen", conversationId: "c-hall" })), "2 timers: tea timer is done and waiting to ring and bread timer with 59 minutes left.")
-      yield* kit.action("adjust", { amount: "1 minute", name: "bread" }, { device: "hall-screen", conversationId: "c-hall" })
+      yield* kit.action("adjust", { amount: "1 minute", name: "bread", change: "add" }, { device: "hall-screen", conversationId: "c-hall" })
       hooks.sendFail = undefined
       yield* kit.advance(30_000)
       assert.strictEqual(ringing(kit, "robins-phone").length, 1)
@@ -287,7 +295,7 @@ describe("finding 5: withdrawing a ring that fails", () => {
       yield* kit.action("start", { duration: "1 minute", name: "tea" })
       yield* kit.advance(MIN)
       hooks.resolveFail = busyFailure()
-      assert.strictEqual(said(yield* kit.action("adjust", { amount: "2 minutes" })), "Tea timer runs again: 2 minutes. Its old ring is still being stopped.")
+      assert.strictEqual(said(yield* kit.action("adjust", { amount: "2 minutes", change: "add" })), "Tea timer runs again: 2 minutes. Its old ring is still being stopped.")
       assert.strictEqual(ringing(kit).length, 1)
       yield* kit.restart
       hooks.resolveFail = undefined
@@ -307,7 +315,7 @@ describe("finding 5: withdrawing a ring that fails", () => {
       yield* kit.action("start", { duration: "5 minutes", name: "rice" })
       yield* kit.advance(MIN)
       hooks.resolveFail = busyFailure()
-      assert.strictEqual(said(yield* kit.action("cancel", { all: true })), "Cancelled 2 timers; a ring or a countdown is still being taken away, and I keep trying.")
+      assert.strictEqual(said(yield* kit.action("cancel", { all: true, bulk: "timers" })), "Cancelled 2 timers; a ring or a countdown is still being taken away, and I keep trying.")
       assert.strictEqual(ringing(kit).length, 1)
       yield* kit.restart
       hooks.resolveFail = undefined
@@ -356,11 +364,11 @@ describe("finding 6: the countdown when showing or taking it down fails", () => 
       const kit = yield* timerKit(hooks)
       yield* kit.action("start", { duration: "1 hour", name: "bread" })
       hooks.dismissFail = presentFailure()
-      assert.strictEqual(said(yield* kit.action("pause", {})), "Bread timer paused with 1 hour left; its countdown is still being taken off the screen.")
+      assert.strictEqual(said(yield* kit.action("pause", { name: "timer" })), "Bread timer paused with 1 hour left; its countdown is still being taken off the screen.")
       yield* kit.present.settle
       assert.strictEqual(kit.present.shown("kitchen-display").length, 1)
       // Paused again: the clean-up is tried again, and still said.
-      assert.strictEqual(said(yield* kit.action("pause", {})), "Bread timer paused with 1 hour left; its countdown is still being taken off the screen.")
+      assert.strictEqual(said(yield* kit.action("pause", { name: "timer" })), "Bread timer paused with 1 hour left; its countdown is still being taken off the screen.")
       yield* kit.restart
       hooks.dismissFail = undefined
       yield* kit.advance(MIN)
@@ -391,7 +399,7 @@ describe("finding 6: the countdown when showing or taking it down fails", () => 
       const kit = yield* timerKit(hooks)
       yield* kit.action("start", { duration: "1 hour", name: "bread" })
       hooks.showFail = presentFailure()
-      assert.strictEqual(said(yield* kit.action("adjust", { amount: "10 minutes" })), "Bread timer: 1 hour 10 minutes left.")
+      assert.strictEqual(said(yield* kit.action("adjust", { amount: "10 minutes", change: "add" })), "Bread timer: 1 hour 10 minutes left.")
       yield* kit.present.settle
       const shown = () => kit.present.shown("kitchen-display").map((p) => (p.content.kind === "timer" ? p.content.endsAt : 0))
       const start = yield* kit.now
@@ -427,11 +435,11 @@ describe("finding 7: a snoozed or ringing alarm is listed and can be cancelled",
       const kit = yield* alarmKit(makeHooks())
       yield* kit.action("set", { when: "10:01", name: "tea" })
       yield* kit.advance(MIN)
-      assert.strictEqual(said(yield* kit.action("list", {})), "One alarm: tea, ringing now.")
+      assert.strictEqual(said(yield* kit.action("list", {})), "One alarm: tea today at ten oh one in the morning, ringing now.")
       const [ring] = ringing(kit)
       yield* kit.notify.press(ring!.id, "snooze", { device: "kitchen-display" })
-      assert.strictEqual(said(yield* kit.action("list", {})), "One alarm: tea, ringing again today at ten past ten in the morning.")
-      assert.strictEqual(said(yield* kit.action("list", {}, { device: "hall-screen", conversationId: "c-hall" })), "One alarm: the alarm on Kitchen display, ringing again today at ten past ten in the morning.")
+      assert.strictEqual(said(yield* kit.action("list", {})), "One alarm: tea today at ten oh one in the morning, ringing again today at ten past ten in the morning.")
+      assert.strictEqual(said(yield* kit.action("list", {}, { device: "hall-screen", conversationId: "c-hall" })), "One alarm: today at ten oh one in the morning on Kitchen display, ringing again today at ten past ten in the morning.")
       yield* kit.restart
       assert.strictEqual(said(yield* kit.action("cancel", {}, { device: "hall-screen", conversationId: "c-hall" })), "The snoozed alarm is cancelled.")
       yield* kit.advance(20 * MIN)
@@ -445,7 +453,7 @@ describe("finding 7: a snoozed or ringing alarm is listed and can be cancelled",
       yield* kit.action("set", { when: "every day at 10:01" })
       yield* kit.advance(MIN)
       yield* kit.notify.press(ringing(kit)[0]!.id, "more", { device: "kitchen-display" })
-      assert.strictEqual(said(yield* kit.action("list", {})), "One alarm: tomorrow at ten oh one in the morning, every day, ringing again today at ten oh six in the morning.")
+      assert.strictEqual(said(yield* kit.action("list", {})), "One alarm: today at ten oh one in the morning, every day, ringing again today at ten oh six in the morning.")
       assert.strictEqual(said(yield* kit.action("cancel", { scope: "next" })), "The snoozed alarm is cancelled; the next one is tomorrow at ten oh one in the morning.")
       yield* kit.advance(10 * MIN)
       assert.deepStrictEqual(ringing(kit), [])
@@ -551,10 +559,10 @@ describe("finding 12: an old job's handler, run itself, does nothing", () => {
           assert.strictEqual(after.rev, before.rev)
           assert.deepStrictEqual(yield* kit.notify.all, [])
         })
-      yield* kit.action("pause", {})
+      yield* kit.action("pause", { name: "timer" })
       yield* runOld(MIN)
-      yield* kit.action("resume", {})
-      yield* kit.action("adjust", { amount: "10 minutes" })
+      yield* kit.action("resume", { name: "timer" })
+      yield* kit.action("adjust", { amount: "10 minutes", change: "add" })
       yield* runOld(MIN)
       yield* kit.action("cancel", {})
       yield* runOld(MIN)

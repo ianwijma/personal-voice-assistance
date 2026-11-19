@@ -50,11 +50,13 @@ export interface ClockTime {
  * Nuuk's spring gap is 00:30 the next day), and the nominal date is the one before the shift.
  */
 export const nominalDateOf = (instant: number, time: ClockTime, zone: string): LocalDate => {
-  const local = localOf(instant, zone).time
-  let diff = local.hour * 60 + local.minute - (time.hour * 60 + time.minute)
+  const local = localOf(instant, zone)
+  let diff = local.time.hour * 60 + local.time.minute - (time.hour * 60 + time.minute)
   if (diff > 720) diff -= 1440
   if (diff <= -720) diff += 1440
-  return localOf(instant - diff * 60_000, zone).date
+  // Undo the gap on the local calendar, without crossing the zone's offset change a second time.
+  const nominal = new Date(Date.UTC(local.date.year, local.date.month - 1, local.date.day, local.time.hour, local.time.minute) - diff * 60_000)
+  return { year: nominal.getUTCFullYear(), month: nominal.getUTCMonth() + 1, day: nominal.getUTCDate() }
 }
 
 /** "2026-11-18" ⇄ a local date. */
@@ -81,7 +83,8 @@ const KIND_WORDS = new Set(["timer", "timers", "alarm", "alarms", "wekker", "wek
 
 /**
  * A name as it is compared: lower case, without accents and punctuation, without a leading article and a trailing
- * "timer" / "alarm" / "wekker" ("the Pasta timer" and "pasta" are one name). Exact comparison only: no sound-alikes.
+ * "timer" / "alarm" / "wekker" ("the Pasta timer" and "pasta" are one name). If no words remain, use the supplied
+ * label itself, ignoring case. Exact comparison only: no sound-alikes.
  */
 export const nameKey = (text: string): string => {
   const words = text
@@ -94,7 +97,7 @@ export const nameKey = (text: string): string => {
     .filter((w) => w !== "")
   while (words.length > 0 && ARTICLES.has(words[0]!)) words.shift()
   while (words.length > 0 && KIND_WORDS.has(words.at(-1)!)) words.pop()
-  return words.join(" ")
+  return words.join(" ") || text.trim().toLowerCase()
 }
 
 /** "pasta" → "Pasta": a name at the start of a sentence. */
@@ -118,7 +121,12 @@ export const speakLeft = (ms: number, language: Language): string => {
 }
 
 /** A spoken list of at most `max` items, "and N more" past it. */
-export const listOf = (items: ReadonlyArray<string>, language: Language, max = 4): string => speakList(items.map((i) => cut(i, 200)), language, { max }) ?? items.join(", ")
+export const listOf = (items: ReadonlyArray<string>, language: Language, max = 3): string => {
+  const first = items.slice(0, max).map((i) => cut(i, 200))
+  const more = items.length - first.length
+  const list = more > 0 ? first.join(", ") : speakList(first, language) ?? first.join(", ")
+  return more > 0 ? `${list}${language === "nl" ? " en" : " and"} ${more} ${language === "nl" ? "meer" : "more"}` : list
+}
 
 /** One page read of a collection's list, for the bounded scan. */
 export type ListPage<A> = (q: { readonly limit: number; readonly after?: Row<A> }) => Effect.Effect<ReadonlyArray<Row<A>>, StoreFailure>
@@ -137,6 +145,7 @@ export const scan = <A>(list: ListPage<A>, page: number, max: number): Effect.Ef
       rows.push(...got)
       if (got.length < want) return { rows, cut: false }
       after = got.at(-1)
+      yield* Effect.yieldNow
     }
     const beyond = yield* list({ limit: 1, ...(after !== undefined ? { after } : {}) })
     return { rows, cut: beyond.length > 0 }
