@@ -1,4 +1,4 @@
-import { ActionError, defineAction, defineModule, makeTool, offThread, offThreadTask, Setting, ToolError, type ModuleDefinition, type Setting as SettingOf } from "@pva/core"
+import { ActionError, CurrentTurn, defineAction, defineModule, makeTool, offThread, offThreadTask, Setting, ToolError, type ModuleDefinition, type Setting as SettingOf } from "@pva/core"
 import { speakNumber } from "@pva/language"
 import { homeLanguage, isLine, say, StoredText } from "@pva/module-contracts"
 import { type Connector, type ContentTypePolicy, nodeConnector, nodeResolver, type Resolver, safeFetch, userAgent } from "@pva/net"
@@ -6,12 +6,14 @@ import { Clock, Effect, Schema } from "effect"
 import { blockEntry, canonicalHost, hostOf, isBlocked, siteOf } from "./clean.ts"
 import { charsetOf, PAGE_MAX_BYTES, PAGE_TASK_MEMORY_MB, PAGE_TASK_RESULT_BYTES, PAGE_TASK_TIMEOUT_MS } from "./page.ts"
 import { makeBrave, makeSearxng, type NetDeps, type RawResult, type Recency, type SafeSearch, SearchError, type SearchProvider } from "./providers.ts"
+import { sourcesList } from "./sources.ts"
 import { texts } from "./texts.ts"
 import { bump, dayKey, reserve, summarize, usage, zoneOf } from "./usage.ts"
 
 export { blockEntry, canonicalHost, hostOf } from "./clean.ts"
 export { cleanText, makeBrave, makeSearxng, MAX_RESULTS, toResults } from "./providers.ts"
 export type { NetDeps, RawResult, SearchProvider } from "./providers.ts"
+export { cutText, sourceLine, sourcesList, spokenSources } from "./sources.ts"
 export { texts } from "./texts.ts"
 export { usage } from "./usage.ts"
 
@@ -294,7 +296,16 @@ export const webSearchModule = (deps: NetDeps = {}) =>
                   continue
                 }
                 if (outcome.length === 0) return { spoken: say(texts, language, "noResults") }
-                return present(outcome, wanted, provider.id)
+                const answer = present(outcome, wanted, provider.id)
+                // The sources go with the result as a presentation (never shown by this run: the host shows it when the turn is
+                // committed and drops it when the turn is discarded, since the search may run speculatively). `forModel` is the
+                // answer exactly as it was. A snapshot: it ends by its lifetime or is replaced by the next one on that device.
+                const turn = yield* CurrentTurn
+                const person = turn?.person?.id
+                // A person's search is that person's (decided for the device at the moment of showing); nobody identified: the household's.
+                const owner = person !== undefined && /^[a-z0-9][a-z0-9_-]{0,39}$/.test(person) ? person : undefined
+                const list = sourcesList(answer.results, language, owner)
+                return list === undefined ? answer : { forModel: answer, present: list, show: { lifetime: "transient" as const } }
               }
               if (failure !== undefined) return yield* new ToolError({ message: failureText(language, failure) })
               return yield* new ToolError({ message: say(texts, language, capped === "monthly" ? "monthlyCap" : "dailyCap") })

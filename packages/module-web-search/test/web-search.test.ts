@@ -3,13 +3,39 @@
 // test reaches the network: the kit's offline network answers named hosts only.
 import { assert, describe, it } from "@effect/vitest"
 import { StoreError } from "@pva/core"
-import { checkModule, type OfflineResponse, makeOfflineNet, offThreadWorkers, startTestModule } from "@pva/core/testing"
+import { checkModule, type OfflineResponse, makeOfflineNet, offThreadWorkers, startTestModule as startKit } from "@pva/core/testing"
 import { say } from "@pva/module-contracts"
 import type { Connector, ConnectRequest } from "@pva/net"
 import { Effect, Fiber } from "effect"
 import { bound } from "../../store-sqlite/test/latencyBound.ts"
 import { blockEntry, catalog, makeBrave, makeSearxng, texts, toResults, usage, webSearchModule } from "../src/index.ts"
 import { PAGE_TEXT_MAX, plainPage } from "../src/page.ts"
+
+/**
+ * The search result now carries its sources as a presentation, so the model's content is the answer followed by a line
+ * "[Screen: …]" (docs/PRESENTING.md). The tests read the answer itself, unchanged: `value` is the content before that line.
+ */
+const startTestModule = ((definition: Parameters<typeof startKit>[0], options?: Parameters<typeof startKit>[1]) =>
+  startKit(definition, options).pipe(
+    Effect.map((kit) =>
+      Object.assign(Object.create(kit), {
+        tool: (...args: Parameters<typeof kit.tool>) =>
+          kit.tool(...args).pipe(
+            Effect.map((r) => {
+              const cut = r.content.lastIndexOf("\n[Screen: ")
+              if (cut === -1) return r
+              let value: unknown = r.content.slice(0, cut)
+              try {
+                value = JSON.parse(value as string)
+              } catch {
+                // Plain text.
+              }
+              return { ...r, value }
+            })
+          )
+      }) as typeof kit
+    )
+  )) as typeof startKit
 
 const SEARX = "http://searx.lan:8080"
 const LAN = { lan: { "searx.lan": "192.168.1.5" } }

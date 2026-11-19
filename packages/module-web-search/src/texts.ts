@@ -31,6 +31,10 @@ export const texts = defineTexts({
     usagePaid: "Today {today} of {cap} searches are used. This month {month} searches, and the paid ones cost about {spent} of the {budget} dollars allowed.",
     usageFailed: "I couldn't read the search counts.",
     usageTooLarge: "The search counts are too large for me to say.",
+    sourcesTitle: "Sources",
+    sourcesSpoken: "The sources are: {list}.",
+    sourcesSpokenMore: "The sources are: {list} and {more} more.",
+    sourcesSpokenCount: "Number of sources: {count}.",
     usagePaidUnderCent: "Today {today} of {cap} searches are used. This month {month} searches, and the paid ones cost less than {cent} of the {budget} dollars allowed."
   },
   nl: {
@@ -62,6 +66,10 @@ export const texts = defineTexts({
     usagePaid: "Vandaag zijn {today} van {cap} zoekopdrachten gebruikt. Deze maand {month} zoekopdrachten, en de betaalde kostten ongeveer {spent} van de {budget} dollar die mag.",
     usageFailed: "Ik kon de zoektellingen niet lezen.",
     usageTooLarge: "De zoektellingen zijn te groot om uit te spreken.",
+    sourcesTitle: "Bronnen",
+    sourcesSpoken: "De bronnen zijn: {list}.",
+    sourcesSpokenMore: "De bronnen zijn: {list} en nog {more}.",
+    sourcesSpokenCount: "Aantal bronnen: {count}.",
     usagePaidUnderCent: "Vandaag zijn {today} van {cap} zoekopdrachten gebruikt. Deze maand {month} zoekopdrachten, en de betaalde kostten minder dan {cent} van de {budget} dollar die mag."
   }
 })
