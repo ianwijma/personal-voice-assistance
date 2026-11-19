@@ -11,7 +11,7 @@ import {
   type Row,
   Setting
 } from "@pva/core"
-import { homeLanguage, type Language, say, StoredText, Timers, TIMERS_LIMITS, TimersError, type TimersService, type TimerInfo } from "@pva/module-contracts"
+import { homeLanguage, isLine, type Language, say, StoredText, Timers, TIMERS_LIMITS, TimersError, type TimersService, type TimerInfo } from "@pva/module-contracts"
 import { Clock, Effect, Option, Schema, Semaphore } from "effect"
 import { randomUUID } from "node:crypto"
 import { capitalise, cleanName, cut, isBusy, listOf, MAX_INSTANT, NAME_CHARS, nameKey, scan, speakLeft } from "./common.ts"
@@ -373,7 +373,8 @@ export const timersModule = defineModule({
               return oneAnswer(t.row, t.ringing, now, lang)
             }
             const all = yield* readAll.pipe(Effect.mapError(unreadable))
-            const items = [...all.ringing.map((row) => ({ row, ringing: true })), ...all.active.map((row) => ({ row, ringing: false }))]
+            // Ringing first, then the soonest to ring (a paused one by what it has left).
+            const items = [...all.ringing.map((row) => ({ row, ringing: true })), ...[...all.active].sort((x, y) => leftOf(x.value, now) - leftOf(y.value, now)).map((row) => ({ row, ringing: false }))]
             if (items.length === 0) {
               if (all.cut) return yield* Effect.fail(unreadable())
               return say(texts, lang, "none")
@@ -603,7 +604,8 @@ export const timersModule = defineModule({
             if (typeof request !== "object" || request === null) return yield* Effect.fail(invalid("not a request"))
             const { durationMs, label, ringOn } = request
             if (!Number.isInteger(durationMs) || durationMs < TIMERS_LIMITS.minMs || durationMs > TIMERS_LIMITS.maxMs) return yield* Effect.fail(invalid("durationMs out of bounds"))
-            if (label !== undefined && (typeof label !== "string" || label.length < 1 || cleanName(label) === false || label.length > TIMERS_LIMITS.labelChars)) {
+            // One line as given (a line break is not collapsed away here: the contract refuses it), 1 to 60 characters.
+            if (label !== undefined && (!isLine(label, TIMERS_LIMITS.labelChars) || label.trim() === "")) {
               return yield* Effect.fail(invalid("label is not one line of 1 to 60 characters"))
             }
             if (ringOn !== undefined && (typeof ringOn !== "object" || ringOn === null || typeof ringOn.deviceId !== "string" || !/^[A-Za-z0-9_-]{8,64}$/.test(ringOn.deviceId))) {
