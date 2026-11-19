@@ -19,7 +19,7 @@ import { cx } from "./ui/controls.tsx"
  * (`texts`); every text of a presentation passed the server's page boundary and is put on the page as text, never as
  * markup. An image is only ever `/media/<hash>`, the server's copy.
  */
-export function PresentationStage() {
+export function PresentationStage({ obscured = false }: { readonly obscured?: boolean }) {
   const shownCards = useClientState((s) => s.notifications.some((c) => c.show))
   const items = useClientState((s) => s.presentations)
   const chatOpen = useClientState((s) => s.ui.chatOpen)
@@ -43,7 +43,7 @@ export function PresentationStage() {
       ro.disconnect()
       root.style.setProperty("--pva-present-h", "0px")
     }
-  }, [empty])
+  }, [empty, obscured])
   if (empty) return null
   const ordered = [...items.filter((p) => p.lifetime === "transient"), ...items.filter((p) => p.lifetime === "pinned").sort((a, b) => a.shownAt - b.shownAt)]
   return (
@@ -61,7 +61,13 @@ export function PresentationStage() {
         <NotificationCards />
         {ordered.length > 0
           ? (
-            <section aria-label={ordered[0]!.texts.region} data-testid="presentations" className="flex w-full flex-col gap-2">
+            <section
+              aria-label={ordered[0]!.texts.region}
+              data-testid="presentations"
+              hidden={obscured}
+              inert={obscured}
+              className={cx("w-full flex-col gap-2", obscured ? "hidden" : "flex")}
+            >
               {ordered.map((p) => <PresentationCard key={`${p.id}:${p.revision}`} p={p} />)}
             </section>
           )

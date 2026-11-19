@@ -38,7 +38,8 @@ export function VoiceApp() {
 
 /**
  * While a modal panel is open (the settings sheet, Help, or the chat as a sheet below 1024 px) everything behind it is
- * `inert`; toasts and the screen-reader announcers stay outside, above every panel.
+ * `inert`; notification ring controls remain available over chat. Toasts and the screen-reader announcers stay outside,
+ * above every panel.
  */
 function Shell() {
   useShortcuts()
@@ -62,7 +63,7 @@ function Shell() {
       </div>
       <div className="contents" inert={modal}>
         {/* P10: the presentation stage beside the character: P9's notification cards first, then the presentations. */}
-        <PresentationStage />
+        <PresentationStage obscured={ui.chat && !wide} />
       </div>
       <VoiceSheet />
       <ShortcutsDialog />
