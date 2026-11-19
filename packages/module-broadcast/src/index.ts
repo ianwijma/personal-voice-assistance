@@ -83,6 +83,8 @@ const broadcast = (
     const chime = input.message === undefined
     const message = chime ? say(texts, lang, "chimeWord") : input.message.trim()
     if (message === "") return { kind: "asked", text: say(texts, lang, "noMessage") } as const
+    // A tool's schema has checked this already; an action's words have not been (one line, at most the bound).
+    if (!isLine(message, MESSAGE_MAX)) return { kind: "asked", text: say(texts, lang, "badMessage", { max: MESSAGE_MAX }) } as const
     const known = ctx.host.service(Devices)
     if (known === undefined) return { kind: "failed", text: say(texts, lang, "noDevices") } as const
     // Every device is read now and decided again at every call: nothing of the house is kept between broadcasts.
@@ -170,6 +172,9 @@ const broadcast = (
     return { kind: "said", text: parts.join(" ") } as const
   })
 
+const actionResult = (outcome: Effect.Effect<Outcome>) =>
+  Effect.flatMap(outcome, (o) => (o.kind === "failed" ? Effect.fail(new ActionError({ message: o.text })) : Effect.succeed({ say: o.text })))
+
 const toolResult = (lang: Lang, outcome: Outcome) =>
   outcome.kind === "failed" ? Effect.fail(new ToolError({ message: outcome.text })) : Effect.succeed({ spoken: outcome.text })
 
@@ -213,24 +218,44 @@ export const broadcastModule = defineModule({
       actions: [
         defineAction({
           id: "send",
-          label: "Announce a message to the house",
-          description: "Announce what was said on every other device in the house, with a chime. Not for one room (that is broadcast_send with a room).",
-          examples: ["tell everyone dinner is ready", "announce that the film starts", "zeg tegen iedereen dat het eten klaar is", "omroepen dat we gaan eten"],
-          params: { message: Param.text({ label: "Message", after: ["everyone", "iedereen", "announce", "omroepen"], maxWords: 30 }) },
+          label: "Announce a message to the house or a room",
+          description: "Announce what was said on every other device in the house, or only in one room, with a chime.",
+          examples: [
+            "tell everyone dinner is ready",
+            "announce that the film starts",
+            "tell the kitchen that I'm coming",
+            "zeg tegen iedereen dat het eten klaar is",
+            "omroepen het eten is klaar",
+            "zeg tegen de keuken dat ik eraan kom"
+          ],
+          params: {
+            message: Param.text({ label: "Message", after: ["everyone", "iedereen", "announce", "omroepen", "that", "dat"], maxWords: 8 }),
+            room: Param.text({ label: "Room", after: ["in", "tegen", "naar"], maxWords: 4, optional: true })
+          },
+          // Words and slots, no language model: a name (the room) is text, and `broadcast` resolves it and asks when it
+          // matches none or several. A message is at most eight words here; a longer one goes to the assistant, which
+          // calls the tool.
+          phrases: {
+            en: ["tell everyone {message}", "tell everyone that {message}", "announce {message}", "announce that {message}", "tell the {room} that {message}", "announce in the {room} that {message}"],
+            nl: ["zeg tegen iedereen {message}", "zeg tegen iedereen dat {message}", "omroepen {message}", "zeg tegen de {room} dat {message}", "omroepen in de {room} dat {message}"]
+          },
           risk: "change",
           offerAsTool: false,
-          run: ({ message }) =>
-            broadcast(ctx, showCard(), { message }).pipe(Effect.flatMap((o) => (o.kind === "failed" ? Effect.fail(new ActionError({ message: o.text })) : Effect.succeed({ say: o.text }))))
+          run: ({ message, room }) => actionResult(broadcast(ctx, showCard(), { message, ...(room !== undefined ? { room } : {}) }))
         }),
         defineAction({
           id: "chime",
-          label: "Ring the chime in the house",
-          description: "Play the announcement chime (followed by one word) on every other device in the house.",
-          examples: ["ring the dinner bell", "sound the chime", "bel de gong"],
-          params: {},
+          label: "Ring the chime in the house or a room",
+          description: "Play the announcement chime (followed by one word) on every other device in the house, or only in one room.",
+          examples: ["ring the dinner bell", "sound the chime", "ring the bell in the kitchen", "bel de gong", "bel de gong in de keuken"],
+          params: { room: Param.text({ label: "Room", after: ["in"], maxWords: 4, optional: true }) },
+          phrases: {
+            en: ["ring the dinner bell", "sound the chime", "ring the bell in the {room}"],
+            nl: ["bel de gong", "luid de bel", "bel de gong in de {room}"]
+          },
           risk: "change",
           offerAsTool: false,
-          run: () => broadcast(ctx, showCard(), {}).pipe(Effect.flatMap((o) => (o.kind === "failed" ? Effect.fail(new ActionError({ message: o.text })) : Effect.succeed({ say: o.text }))))
+          run: ({ room }) => actionResult(broadcast(ctx, showCard(), { ...(room !== undefined ? { room } : {}) }))
         })
       ]
     })

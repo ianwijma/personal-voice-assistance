@@ -63,16 +63,24 @@ failed is listed as "(failed)". Every sentence is in English and Dutch (`src/tex
 `broadcast_chime` plays the chime and **one word** after it ("Attention." / "Aandacht."). Its description says so, so
 the model is not told otherwise. No card is shown for a chime.
 
-### Typed actions (no model)
+### Typed actions and phrase commands (no model)
 
-| Action | Parameters | Examples |
-|---|---|---|
-| `broadcast.send` | `message` (the words after "everyone"/"iedereen"/"announce"/"omroepen") | "tell everyone dinner is ready"; "announce that the film starts"; "zeg tegen iedereen dat het eten klaar is" |
-| `broadcast.chime` | none | "ring the dinner bell"; "bel de gong" |
+Both actions have `phrases`, so after the wake phrase (or in a follow-up window) the words run them without the
+language model ([PHRASES.md](../PHRASES.md)); the answer is a canned reply on the device that asked. A message is a text
+slot, so **at most eight words** this way (a longer one goes to the assistant, which calls the tool); the room is a text
+slot too, **resolved in the action** with the same "I don't know a room called …" and "Which room do you mean …?"
+sentences as the tool (a room cannot be a choice: the rooms are not known when the module starts).
 
-Actions are `change`, not offered to the model as tools of their own (`offerAsTool: false`: the two tools above are
-the model's). They always mean the whole house: a room has to be asked and resolved, which a typed action cannot do (see
-"Left out"). They return `{ say }` with the same sentences.
+| Action | Parameters | Phrases (English) | Phrases (Dutch) |
+|---|---|---|---|
+| `broadcast.send` | `message`, `room?` (text) | "tell everyone dinner is ready", "tell everyone that …", "announce …", "announce that …", "tell the kitchen that …", "announce in the kitchen that …" | "zeg tegen iedereen het eten is klaar", "zeg tegen iedereen dat …", "omroepen …", "zeg tegen de keuken dat …", "omroepen in de keuken dat …" |
+| `broadcast.chime` | `room?` (text) | "ring the dinner bell", "sound the chime", "ring the bell in the kitchen" | "bel de gong", "luid de bel", "bel de gong in de keuken" |
+
+The words of a phrase are the message as said, never reworded: after "that"/"dat" the message starts, so "zeg tegen
+iedereen dat het eten klaar is" announces "het eten klaar is". The longest phrase wins ("announce in the kitchen that
+…" over "announce …"). Both are `change`, not offered to the model as tools of their own (`offerAsTool: false`: the two
+tools above are the model's). An action's text is checked like the tool's (one line, at most 200 characters, else "I
+announce one line of at most 200 characters."). They return `{ say }` with the same sentences as the tools.
 
 ## Settings
 
@@ -115,10 +123,8 @@ Because the preparation parts' first versions do not have it:
 - **Quiet rooms, quiet hours and devices that accept nothing from others**: the same page's "Not now" (no quiet
   hours or rooms, no acceptance settings). Today the only things that keep a device quiet are do not disturb for the
   house, a device that cannot speak and a device that is not connected.
-- **Phrase commands** (`phrases` on an action, so "tell everyone …" runs without a language model, with the room taken
-  as text and resolved with its own "I don't know a room called …" sentence): not in this branch's base (there is no
-  `docs/PHRASES.md` and `defineAction` has no `phrases`). The typed actions above are matched from their `examples`
-  meanwhile. The room form, with the room resolved in the action, comes with phrases.
+- **A message of more than eight words as a phrase command** ([PHRASES.md](../PHRASES.md): a text slot is at most
+  eight words): it goes to the assistant, which calls `broadcast_send`.
 - **The chime alone** (above).
 
 By the plan's row: the speaker's own voice, voice messages, scheduled broadcasts and phones.

@@ -1,5 +1,5 @@
 import { assert, describe, it } from "@effect/vitest"
-import { type DeviceCapabilities, type ModuleNotify, SpeechError } from "@pva/core"
+import { type ModuleNotify, type SpeechTarget, SpeechError } from "@pva/core"
 import { checkModule, KIT_PAGE_CAPABILITIES, startTestModule, type TestDevice } from "@pva/core/testing"
 import { Effect } from "effect"
 import { MAX_CARDS, MAX_TARGETS, broadcastModule, catalog } from "../src/index.ts"
@@ -8,7 +8,7 @@ import { matchRoom, meansEveryone, roomKey } from "../src/rooms.ts"
 
 const { speaker: _speaker, ...NO_SPEAKER } = KIT_PAGE_CAPABILITIES
 const PAGE = KIT_PAGE_CAPABILITIES
-const SPEAKER_ONLY: DeviceCapabilities = { v: 1, speaker: { media: ["speech", "audio"] }, microphone: { farField: false } }
+const SPEAKER_ONLY: typeof KIT_PAGE_CAPABILITIES = { v: 1, speaker: { media: ["speech", "audio"] }, microphone: { farField: false } }
 
 /** A house with several rooms: a screen that cannot speak, a speaker with no screen, a public hall screen, a phone. */
 const HOUSE: ReadonlyArray<TestDevice> = [
@@ -269,7 +269,7 @@ describe("broadcast", () => {
     Effect.gen(function*() {
       const speechWith = (say: (id: string) => Effect.Effect<never, SpeechError>): typeof broadcastModule => ({
         ...broadcastModule,
-        start: (ctx) => broadcastModule.start({ ...ctx, speech: { say: (target) => say((target as { device: string }).device) } })
+        start: (ctx) => broadcastModule.start({ ...ctx, speech: { say: (target: SpeechTarget) => say((target as { device: string }).device) } } as never)
       })
       const closed = yield* startTestModule(speechWith(() => Effect.fail(new SpeechError({ reason: "unavailable", message: "no speech here" }))), { household: HOUSE_ONLY_TWO })
       const refused = yield* closed.tool("broadcast_send", { message: "Dinner" }, { device: "kitchen-display" })
@@ -278,6 +278,50 @@ describe("broadcast", () => {
       assert.deepStrictEqual(yield* closed.action("send", { message: "Dinner" }, { device: "kitchen-display" }), { ok: false, code: "failed", message: "I can't announce anything on this installation." })
       const gone = yield* startTestModule(speechWith(() => Effect.fail(new SpeechError({ reason: "no-device", message: "gone" }))), { household: HOUSE_ONLY_TWO })
       assert.strictEqual(said(yield* gone.tool("broadcast_send", { message: "Dinner" }, { device: "kitchen-display" })), "Nothing was announced: Study tablet (failed).")
+    }))
+
+  it.effect("phrase commands: said after the wake phrase they run without the model; the room is text, resolved in the action", () =>
+    Effect.gen(function*() {
+      const kit = yield* startTestModule(broadcastModule, { household: { devices: HOUSE } })
+      const everyone = yield* kit.phrases.say("Tell everyone that dinner is ready", { device: "kitchen-display" })
+      assert.isTrue(everyone.taken)
+      yield* kit.advance(5_000)
+      assert.isTrue(kit.notify.announced.every((a) => a.text === "dinner is ready"))
+      assert.notInclude(where(kit), "kitchen-display")
+      assert.strictEqual(kit.phrases.spoken.at(-1)?.text.startsWith("Announcing on"), true)
+      // A room, taken as text and found among the rooms; the longest phrase wins ("announce in the … that …").
+      yield* kit.phrases.say("announce in the Kids' room that lights out", { device: "kitchen-display" })
+      yield* kit.advance(5_000)
+      assert.deepStrictEqual(kit.notify.announced.filter((a) => a.text === "lights out").map((a) => a.deviceId), ["kids-tablet"])
+      // A room nobody has: its own sentence, nothing announced.
+      const before = kit.notify.announced.length
+      yield* kit.phrases.say("tell the garden that hello", { device: "kitchen-display" })
+      assert.strictEqual(kit.phrases.spoken.at(-1)?.text.startsWith("I don't know a room called garden."), true)
+      yield* kit.advance(5_000)
+      assert.strictEqual(kit.notify.announced.length, before)
+      // The chime, with and without a room.
+      yield* kit.phrases.say("ring the dinner bell", { device: "kitchen-display" })
+      yield* kit.phrases.say("ring the bell in the study", { device: "kitchen-display" })
+      yield* kit.advance(5_000)
+      assert.deepStrictEqual(kit.notify.announced.filter((a) => a.text === "Attention.").map((a) => a.deviceId).filter((d) => d === "study-tablet").length, 2)
+      // Words that are not a phrase of it are not taken.
+      assert.deepStrictEqual(yield* kit.phrases.say("what is the weather", { device: "kitchen-display" }), { taken: false })
+    }))
+
+  it.effect("phrase commands in Dutch", () =>
+    Effect.gen(function*() {
+      const kit = yield* startTestModule(broadcastModule, { household: { devices: HOUSE, home: { HOME_LANGUAGE: "nl-NL" } } })
+      yield* kit.phrases.say("zeg tegen iedereen dat het eten klaar is", { device: "kitchen-display" })
+      yield* kit.phrases.say("zeg tegen de Study dat het eten klaar is", { device: "kitchen-display" })
+      yield* kit.phrases.say("zeg tegen de tuin dat het eten klaar is", { device: "kitchen-display" })
+      yield* kit.phrases.say("bel de gong", { device: "kitchen-display" })
+      yield* kit.advance(5_000)
+      assert.strictEqual(kit.phrases.spoken[2]?.text.startsWith("Ik ken geen kamer die tuin heet."), true)
+      assert.include(kit.notify.announced.map((a) => a.text), "het eten klaar is")
+      assert.include(kit.notify.announced.map((a) => a.text), "Aandacht.")
+      // The action's own words are checked too: a line over the bound is refused with a sentence, nothing announced.
+      const long = yield* kit.action("send", { message: "y".repeat(201) }, { device: "kitchen-display" })
+      assert.deepStrictEqual(long, { ok: true, say: "Ik roep één regel van hooguit 200 tekens om." })
     }))
 
   it.effect("both languages on every path: Dutch", () =>
