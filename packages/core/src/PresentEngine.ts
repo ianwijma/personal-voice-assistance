@@ -470,6 +470,8 @@ export const makePresentEngine = (options: PresentEngineOptions): Effect.Effect<
     const put = (e: Entry) => {
       const before = index.get(e.id)
       if (before?.key !== undefined && byKey.get(keyOf(before.module, before.key)) === e.id) byKey.delete(keyOf(before.module, before.key))
+      // An address change retires its completed outcome even if the handle later returns to that address.
+      if (before?.imageUrl !== e.imageUrl) imageOutcomes.delete(e.id)
       index.set(e.id, e)
       if (e.key !== undefined) byKey.set(keyOf(e.module, e.key), e.id)
       doomed.delete(e.id)
@@ -869,6 +871,7 @@ export const makePresentEngine = (options: PresentEngineOptions): Effect.Effect<
     /** Write an outcome on the presentation's current show if it wants that address unresolved; else wake it. */
     const writeImage = (id: string, w: { readonly showId: string; readonly url: string; readonly outcome: MediaOutcome }) =>
       tx((p): Row<StoredPresentation> | "stale" | undefined => {
+        if (imageOutcomes.get(id) !== w) return "stale"
         const row = p.get(id)
         if (row === undefined || row.value.ended === true) return undefined
         const c = row.value.content
@@ -878,7 +881,7 @@ export const makePresentEngine = (options: PresentEngineOptions): Effect.Effect<
         p.update(id, (v) => ({ ...v, content: { ...content, ...("hash" in w.outcome ? { hash: w.outcome.hash } : { failed: w.outcome.refused }) } }), { expectRev: row.rev })
         return p.get(id)
       }, (row) => {
-        if (imageOutcomes.get(id)?.showId === w.showId && imageOutcomes.get(id)?.url === w.url) imageOutcomes.delete(id)
+        if (imageOutcomes.get(id) === w) imageOutcomes.delete(id)
         if (row !== undefined && row !== "stale" && index.get(id)?.showId === row.value.showId) put(entryOf(row))
         // Written, or not wanted any more: whoever holds it (or would) is reconciled; a show that wants another address
         // fetches its own there.

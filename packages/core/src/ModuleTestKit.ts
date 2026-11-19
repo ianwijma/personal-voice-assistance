@@ -161,7 +161,7 @@ const cleanDiet = (diet: Partial<Diet> | undefined, whose: string): Diet => {
   return out
 }
 
-/** The connection the kit's turns on a device come in on: one per device, the same for every turn of the test. */
+/** A standalone test turn's connection; a kit starts with it and renews its connection when the page reconnects. */
 export const testConnectionOf = (deviceId: string): ConnectionRef => makeConnectionRef(`kit-connection-${deviceId}`)
 
 /**
@@ -170,7 +170,7 @@ export const testConnectionOf = (deviceId: string): ConnectionRef => makeConnect
  * over the devices' places and Members) and `Devices` (`makeDevices`). Throws when the household is not one serve
  * mode could have (a default person who is not a member, a diet the server would have cleaned).
  */
-export const makeTestPeople = (input: TestHouseholdInput = {}, live?: { readonly connected: (deviceId: string) => boolean }) => {
+export const makeTestPeople = (input: TestHouseholdInput = {}, live?: { readonly connected: (deviceId: string) => boolean; readonly connection?: (deviceId: string) => ConnectionRef }) => {
   const people = new Map<string, Person>(
     (input.people ?? DEFAULT_TEST_HOUSEHOLD.people).map((p) => [p.id, { id: p.id, name: p.name, aliases: [...(p.aliases ?? [])], pronunciation: "", diet: cleanDiet(p.diet, p.name) }])
   )
@@ -225,11 +225,12 @@ export const makeTestPeople = (input: TestHouseholdInput = {}, live?: { readonly
     assistantsOn: (deviceId: string) => assistantsOf.get(deviceId) ?? [],
     isMember: (id: string) => people.has(id),
     /**
-     * The device a connection of the kit's belongs to (`testConnectionOf`), or `undefined`; with `live`, `undefined` too
+     * The device a current connection of the kit's belongs to, or `undefined`; with `live`, `undefined` too
      * while that device is disconnected (serve mode's lookup of a closed connection).
      */
     deviceOfConnection: (connection: ConnectionRef) => {
-      const id = connections.get(connection.id)
+      const currentConnection = live?.connection
+      const id = currentConnection === undefined ? connections.get(connection.id) : [...devices.keys()].find((id) => currentConnection(id).id === connection.id)
       return id !== undefined && (live === undefined || live.connected(id)) ? id : undefined
     }
   }
@@ -601,7 +602,10 @@ export const startTestModule = (definition: ModuleDefinition<any>, options: Star
     // P9: which devices have a page connected now (live state: the kit's Devices and notification service read this one).
     const deviceInputs = input.devices ?? DEFAULT_TEST_HOUSEHOLD.devices
     const connectedNow = new Set(deviceInputs.filter((d) => d.connected !== false).map((d) => d.id))
-    const people = makeTestPeople(input, { connected: (id) => connectedNow.has(id) })
+    const connectionsNow = new Map(deviceInputs.map((d) => [d.id, testConnectionOf(d.id)]))
+    let connectionSeq = 0
+    const connectionOf = (deviceId: string) => connectionsNow.get(deviceId) ?? testConnectionOf(deviceId)
+    const people = makeTestPeople(input, { connected: (id) => connectedNow.has(id), connection: connectionOf })
     const assistants = input.assistants ?? DEFAULT_TEST_HOUSEHOLD.assistants
     const deviceList = input.devices ?? DEFAULT_TEST_HOUSEHOLD.devices
 
@@ -738,7 +742,7 @@ export const startTestModule = (definition: ModuleDefinition<any>, options: Star
       privacy: people.privacy,
       // One page per connected device, as a tab of it.
       outlet: () => ({
-        connections: (deviceId) => (connectedNow.has(deviceId) ? [{ id: testConnectionOf(deviceId).id, send: (message) => void pageMessages.push({ deviceId, message }) }] : [])
+        connections: (deviceId) => (connectedNow.has(deviceId) ? [{ id: connectionOf(deviceId).id, send: (message) => void pageMessages.push({ deviceId, message }) }] : [])
       }),
       speech: () => speech,
       gateway: () => hostRef?.gateway,
@@ -770,7 +774,7 @@ export const startTestModule = (definition: ModuleDefinition<any>, options: Star
       outputs: (d) => devicePresentFrom({ capabilities: { noDisplay: false, noSpeaker: false, excludeKinds: [] } }, declaredOf.get(d.id) ?? KIT_PAGE_CAPABILITIES),
       privacy: people.privacy,
       outlet: () => ({
-        connections: (deviceId) => (connectedNow.has(deviceId) ? [{ id: testConnectionOf(deviceId).id, send: (message) => recordPresent(deviceId, message) }] : [])
+        connections: (deviceId) => (connectedNow.has(deviceId) ? [{ id: connectionOf(deviceId).id, send: (message) => recordPresent(deviceId, message) }] : [])
       }),
       ...(options.media !== undefined ? { media: () => options.media } : {}),
       gateway: () => hostRef?.gateway,
@@ -950,14 +954,17 @@ export const startTestModule = (definition: ModuleDefinition<any>, options: Star
       const deviceId = t.device ?? deviceList[0]?.id
       const device = deviceId === undefined ? undefined : people.devices.get(deviceId)
       const person = t.person === undefined ? device?.place.defaultPerson ?? null : t.person
-      return makeTestTurn({
-        ...t,
-        ...(deviceId !== undefined ? { device: deviceId } : {}),
-        ...(device !== undefined ? { deviceName: device.name } : {}),
-        ...(device?.room !== undefined ? { room: device.room } : {}),
-        assistant: t.assistant ?? (deviceId === undefined ? assistants[0]?.id : people.assistantsOn(deviceId)[0]) ?? "jeff",
-        person
-      })
+      return {
+        ...makeTestTurn({
+          ...t,
+          ...(deviceId !== undefined ? { device: deviceId } : {}),
+          ...(device !== undefined ? { deviceName: device.name } : {}),
+          ...(device?.room !== undefined ? { room: device.room } : {}),
+          assistant: t.assistant ?? (deviceId === undefined ? assistants[0]?.id : people.assistantsOn(deviceId)[0]) ?? "jeff",
+          person
+        }),
+        connection: connectionOf(deviceId ?? "kitchen-display")
+      }
     }
     /** A whole `TurnContext` is used as given (the gateway checks it like serve mode); a `TestTurnInput` is built by `turn`. */
     const asTurn = (t: TurnContext | TestTurnInput | undefined) => (t !== undefined && "turnId" in t && "source" in t && "conversationId" in t ? (t as TurnContext) : turn(t as TestTurnInput | undefined))
@@ -1261,10 +1268,11 @@ export const startTestModule = (definition: ModuleDefinition<any>, options: Star
          */
         press: (notificationId: string, actionId: string, as: { readonly device?: string } = {}): Effect.Effect<PressAnswer> => {
           const deviceId = as.device ?? deviceList[0]?.id ?? "kitchen-display"
+          const connection = connectionOf(deviceId)
           const work = checked(
             `after pressing ${actionId}`,
             Effect.andThen(
-              Effect.andThen(settle, driven(`the press of ${actionId}`, notify.press({ notificationId, actionId, deviceId, connection: testConnectionOf(deviceId) }))),
+              Effect.andThen(settle, driven(`the press of ${actionId}`, notify.press({ notificationId, actionId, deviceId, connection }))),
               (a) => Effect.as(settle, a)
             )
           )
@@ -1278,6 +1286,7 @@ export const startTestModule = (definition: ModuleDefinition<any>, options: Star
         /** A page of the device says hello (it is given what is open for it), or its page goes; `Devices` sees the same. */
         connect: (deviceId: string) =>
           Effect.suspend(() => {
+            if (!connectedNow.has(deviceId)) connectionsNow.set(deviceId, makeConnectionRef(`kit-reconnect-${++connectionSeq}-${deviceId}`))
             connectedNow.add(deviceId)
             // A new session: announcements from now on wait in it, not in the one that ended.
             if (sessions.get(deviceId) !== undefined && Deferred.isDoneUnsafe(sessions.get(deviceId)!)) sessions.delete(deviceId)
@@ -1330,6 +1339,7 @@ export const startTestModule = (definition: ModuleDefinition<any>, options: Star
           const deviceId = as.device ?? deviceList[0]?.id ?? "kitchen-display"
           return Effect.suspend(() => {
             const revision = presentPages.get(deviceId)?.get(presentationId)?.revision ?? "missing"
+            const connection = connectionOf(deviceId)
             return admitPress(deviceId, checked(`after pressing ${action}`, Effect.gen(function*() {
               yield* settle
               const answer = yield* driven(`the press of ${action}`, present.press({
@@ -1339,7 +1349,7 @@ export const startTestModule = (definition: ModuleDefinition<any>, options: Star
                 ...(as.item !== undefined ? { item: as.item } : {}),
                 ...(as.done !== undefined ? { done: as.done } : {}),
                 deviceId,
-                connection: testConnectionOf(deviceId)
+                connection
               }))
               yield* settle
               return answer

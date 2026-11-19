@@ -1040,7 +1040,7 @@ ActionCallOptions.onDecision({ risk?, refused?, presented? })      // P7's trace
   (`@pva/core/present-contract`, the contract suite and its world: several tabs with their own kinds, a fault-injecting
   store with a busy gate), `apps/assistant/src/serve/media.ts` (the image cache and `/media/<token>`).
 - **The index is the truth of what is eligible** (review round 1): the live presentations without their content (show
-  id, rev, module, key, part, lifetime, target, owner, kind, handler, times), loaded at start by a scan of the whole
+  id, rev, module, key, part, lifetime, target, owner, kind, desired image URL, handler, times), loaded at start by a scan of the whole
   collection in bounded steps with yields ("loaded" only at its end; until then nothing is shown or withdrawn and shows
   are refused `busy`), and changed only from what a committed transaction wrote (the entry is derived from the committed
   row). An end, a dismissal, a replacement and a stopped part take a presentation out of it at once and reconcile its
