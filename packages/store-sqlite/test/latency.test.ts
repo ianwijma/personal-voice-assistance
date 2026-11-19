@@ -129,6 +129,9 @@ describe("SQLite store latency on 100,000 rows of ~1 KB", () => {
       // Writes: one row each, one synchronous transaction each.
       const worstWrite = yield* worstOf(30, Effect.suspend(() => c.update(`n${50_000 + Math.floor(Math.random() * 1000)}`, (v) => ({ ...v, state: "running" }))))
       results.push(`update one row (its own transaction): worst ${worstWrite.toFixed(2)} ms`)
+      // Background work is bounded by the main thread's longest stop while it runs (a heartbeat, with a turn's read every
+      // 2 ms beside it), not by how long the work takes: that is the disk's (and on a busy or slow disk far longer,
+      // with nothing wrong). What it must not do is stop the main thread.
       const background: Record<string, Effect.Effect<unknown, unknown>> = { "backup (own connection, worker thread)": store.backup() }
       let worstBackground = 0
       for (const [name, work] of Object.entries(background)) {
