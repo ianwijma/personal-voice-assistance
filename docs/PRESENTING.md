@@ -360,6 +360,6 @@ under 10 ms.
 `facts` as its own kind, `table`, `gallery`, `progress`, `confirm`, `handoff`, the built-in `show` and `show_on` tools,
 `present.status` (a page's report of a failed load, and the next turn's context), the reveal rule tied to clauses,
 resizing images (`sharp`), a reduced form of personal content on a shared screen, a presentation on "wherever this is
-already shown", moving or shrinking the character's box, a close button on the page, a risk class and a trace for a
-press handler (the gateway has no call kind for registered handlers yet), and keeping the image cache's address index
-across a restart.
+already shown", moving or shrinking the character's box, a close button on the page, and keeping the image cache's
+address index across a restart. (A press handler's risk class and its decision's record exist since P8: see "What a press
+is" above and docs/MODULES.md §4.)

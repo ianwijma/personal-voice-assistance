@@ -1204,9 +1204,10 @@ export const startTestModule = (definition: ModuleDefinition<any>, options: Star
         checked("after the settings change", driven(`the settings change of ${id}`, host.configure(id, { values, secrets }))),
       /**
        * P7: phrase commands as serve mode runs them (docs/PHRASES.md "Testing"): the real decision (`decideUtterance`),
-       * the real matcher over the assistant's set as serve mode builds it (its registry's actions: the modules it has on,
-       * without what it switched off or the risk policy refuses, the host's controls first), and the real runner through
-       * the gateway, the notification service and the volume step.
+       * the real matcher over the assistant's set as serve mode builds it (every published action of the modules it has
+       * on, without what it switched off, whatever the risk policy says: the gateway decides a command's action when it
+       * runs; the host's controls first), and the real runner through the gateway, the notification service and the
+       * volume step.
        */
       phrases: {
         /**

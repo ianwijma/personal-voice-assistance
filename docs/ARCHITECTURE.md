@@ -325,9 +325,11 @@ CurrentPrincipal: Context.Reference<Principal | undefined>       // the admitted
 - **The execution gateway** (`packages/core/src/Gateway.ts`) is the one way to `Tool.execute` and `ActionDefinition.run`:
   `ToolRegistry.run` (core's tool loop, the Claude Code bridge), `ToolRegistry.runAction` (the intent agent) and
   `host.actions.run`, and phrase commands (P7: `runTaken` in `PhraseRunner.ts` calls `ExecutionGateway.action` as a
-  `phrase` turn of the device, with the risk policy and the 5 s limit); later taps and routine steps (a notification's
-  action handler, P9, is admitted by `ExecutionGateway.principal` with the notification principal, as a job's handler
-  is). Every tool and action the
+  `phrase` turn of the device, with the risk policy and the 5 s limit); a press on a notification (P9) or a presentation
+  (P10) runs the module's registered handler after `ExecutionGateway.handler` admitted it (P8: the press's principal,
+  then the risk policy on the handler's declared `risk`, inferred `change`, recorded as a decision of kind `handler`; a
+  refusal answers `{ ok: false, say: <the policy's spoken sentence>, code: "refused" }`); a job's handler is admitted by
+  `ExecutionGateway.principal`; routine steps later. Every tool and action the
   host publishes is **sealed**: its own `execute`/`run` only refuses, and the real one (inside the host's in-flight
   tracking) is reachable only from the gateway (`GatewayPrivate.ts`, not exported from the package); a generated
   action tool's `execute` refuses too. Sealing stops **accidental** direct calls; it is not a security boundary against
@@ -421,7 +423,8 @@ CurrentPrincipal: Context.Reference<Principal | undefined>       // the admitted
   `Sections` publish its result into an in-memory record when they are made, in the settings store's first commit
   listener (`SettingsStore.onCommitted(…, { first: true })`: the synchronous step that makes a new state the committed
   one, before every other commit listener, before the save's caller and before any other fiber runs again; computed
-  from the committed values alone) and on `announceAll`; the gateway hook
+  from the committed values alone) and on `announceAll`, together with the language of its sentences
+  (`effectiveRiskLanguage`, the Home section's `HOME_LANGUAGE` field alone; `serveLanguageReader`); the gateway hook
   (`servePolicyReader`) reads that record as a field: no section definitions are built and no file is touched on a
   call. The settings `ConfigProvider` serves the policy's keys as the reader resolves them, and the CLI start runs the
   same function over what it reads. **What is checked when:** the policy at every decision (each call, each held
@@ -973,7 +976,7 @@ ModuleNotify (ctx.notify) = {
   send(NotifyRequest): Effect<{ notification: Notification; deduped: boolean }, NotifyError>      // delivered now (no sending later)
   resolve(id | { key }, outcome? = "resolved"): Effect<boolean, NotifyError>
   list({ after?, limit? ≤ MAX_NOTIFY_PAGE (12) }?): Effect<ReadonlyArray<Notification>, NotifyError>   // the module's open ones; `after`: a view list returned
-  handle(name, { run(ActionPress): Effect<ActionAnswer | void, unknown> }): Effect<void, NotifyError>    // in shared: a registration
+  handle(name, { run(ActionPress): Effect<ActionAnswer | void, unknown>; risk?: ToolRisk | RiskByInput<ActionPress> }): Effect<void, NotifyError>    // in shared: a registration; risk (P8): absent = change
   dnd: { get: Effect<DndState, NotifyError>; set({ until? }?): Effect<DndState, NotifyError>; clear: Effect<DndState, NotifyError> }
 }
 NotifyRequest = { title (one line ≤ 60); text? (≤ 200); priority?: "normal" | "ring"; owner?: PersonId; target?: "origin" | "everywhere";
@@ -999,7 +1002,7 @@ NotifyEngine  = NotifyHook & { reconcile(deviceId); reconcileAll(); press(PressR
                                ringingOn(deviceId): RingingNotification[]; stopRinging(deviceId): Effect<number, NotifyError>; stopSpeech(deviceId): Effect<boolean>;
                                onRingingChanged(listener): () => void; dnd(): DndState & { known }; busyAnswer(): PressAnswer;
                                maintenanceScheduled(); plannedAt(); planNow; maintainNow; settled }
-PressRequest  = { notificationId, actionId, deviceId, connection?, person? }   PressAnswer = { ok, say, code?: "not_running" | "unknown" | "busy" | "failed" }
+PressRequest  = { notificationId, actionId, deviceId, connection?, person? }   PressAnswer = { ok, say, code?: "not_running" | "unknown" | "busy" | "failed" | "refused" }   // refused: P8, the risk policy
 makeNotifyEngine({ store, scheduler, devices, outputs(device): DeviceOutputs, privacy, outlet: () => NotifyOutlet?, speech: () => SpeechPort?,
                    gateway, pageText, language, issues?, log?, newId?, onDecision?, observe?, outcomeRetryMs?, now? }): Effect<NotifyEngine, never, Scope>
 NotifyOutlet  = { connections(deviceId): [{ id, send(NotifyMessage) }] }        // serve mode: the hub's voice connections of the device
@@ -1039,8 +1042,9 @@ SpeechPort    = { speak(deviceId, text, { cue, gate: () => "go" | "wait" | NotDe
   `notify.handle` succeeds, every other call fails `unavailable` (`closedModuleNotify`).
 - **Presses**: admitted only for a connection that holds the card and while the decision allows it; a module action is
   claimed on the row in one transaction, then the handler runs through `PartRunner.inFlight` with the notification
-  principal (`asPrincipal`), admitted by `ExecutionGateway.principal` first, within 5 s; the outcome is written with
-  retries; `stop` is the host's and wins.
+  principal (`asPrincipal`), admitted by `ExecutionGateway.handler` first (P8: the principal, then the risk policy on
+  the handler's `risk`, inferred `change`; a refusal answers with the policy's spoken sentence, `code: "refused"`, and
+  releases the claim), within 5 s; the outcome is written with retries; `stop` is the host's, wins and is never refused.
 - **Speech**: `VoiceSession.announce.speak` makes the voice ready (`TurnSetup.tts`, `ttsReady`), waits until no play holds
   the output lease, no turn is in flight, no utterance is open in the recogniser and the state is not hearing, then plays
   with `OutputLease.playIfFree`, which checks under the lease's lock, in the step the play starts, that nothing plays and
@@ -1060,7 +1064,7 @@ SpeechPort    = { speak(deviceId, text, { cue, gate: () => "go" | "wait" | NotDe
 ```ts
 ModulePresent (ctx.present) = {
   show(target: "origin" | { device } | { room }, Presentation, { lifetime?: "transient" | "pinned", expiresInMs?, key? }?): Effect<PresentHandle, PresentError>
-  handle(name, { run(PresentPress): Effect<{ say? } | void, unknown> }): Effect<void, PresentError>      // in shared: a registration
+  handle(name, { run(PresentPress): Effect<{ say? } | void, unknown>; risk?: ToolRisk | RiskByInput<PresentPress> }): Effect<void, PresentError>      // in shared: a registration; risk (P8): absent = change
 }
 Presentation  = (card { title, text?, facts? } | list { title, style?, items } | timer { label, endsAt } | image { url, alt, credit, caption? }
                  | weather { place, now, days? }) & { kind, spoken, sensitivity?: "household" | { personal }, buttons?, handler? }
@@ -1086,7 +1090,7 @@ makePresentEngine({ store, scheduler, devices, outputs(device, declaredKinds?): 
 PresentOutlet = { connections(deviceId): [{ id, send(PresentMessage), kinds?(): Record<kind, version> | undefined }] }   // kinds: that page's own
 MediaPort     = { fetch(url): Effect<{ hash } | { refused: "type" | "size" | "busy" | "full" | "fetch" | "blocked" | "unavailable" }> }
 GatewayOptions.present = fromResult                                 // the gateway's split of { forModel, present }
-ActionCallOptions.onDecision({ risk?, refused?, presented? })      // P7's trace; P10 adds presented: true (TraceInfo.phrase.presented)
+ActionCallOptions.onDecision(ActionDecisionNote = { risk?, refused?, presented?, outcome?, by? })   // P7's trace; P10 adds presented: true; P8 the risk policy's decision (outcome, by)
 // @pva/protocol: presentationProblem, showOptionsProblem, presentLifetime, presentWireContent (the server and the mock);
 // ImageState.ready = { token }: a page's own address /media/<token>, never a hash
 ```
@@ -1188,10 +1192,10 @@ PhraseSessionPort = { replyActive(); announcementActive(); stopReply; stopAnnoun
                       replyCancelled(); answering(); say(assistant?, text): Effect<"done" | "cut"> }   // replyCancelled: read after each wait (b1)
 CommandSlot = { take(); give() };  makeCommandSlot()            // one module action at a time per device; controls never busy
 KeptReply = { assistant; text };  keptReplyText(clauses);  MAX_KEPT_REPLY_CHARS = 2_000
-PhraseTrace = { by; name; turn?; tool?; risk?; refused?; actionMs?; totalMs; did: PhraseDid | "interrupted"; why? }   // once, from a finaliser; identity first
+PhraseTrace = { by; name; turn?; tool?; risk?; refused?; decision?: { outcome; by }; actionMs?; totalMs; did: PhraseDid | "interrupted"; why? }   // once, from a finaliser; identity first; decision: P8
 PhraseOutcome = { taken; did: "stopped-ring" | "pressed" | "stopped-announcement" | "stopped-reply" | "paused-media" | "cancelled" | "repeated" | "volume"
                   | "ran" | "nothing" | "refused" | "not-running" | "failed" | "busy"; said?; why? }
-ActionCallOptions.onDecision?({ risk?, refused? })              // Gateway.ts: the admission's outcome, for the trace
+ActionCallOptions.onDecision?(ActionDecisionNote)                // Gateway.ts: the admission's outcome (class, refusal, P8's decision), for the trace
 NotifyEngine.stopRinging(deviceId): Effect<number, NotifyError>  // fails (busy, failed) when a ring it found could not be stopped
 RouteGate.cancelReply()                                         // "never mind": the reply playing counts no more, windows close
 SessionControl (ServiceKey "core.session-control") = { stopReply(deviceId); cancelPending(deviceId); repeatLast(deviceId); newConversation(deviceId) }
@@ -1202,7 +1206,7 @@ REPLY_VOLUME = { min: 0.2, max: 1, step: 0.2, default: 1 };  stepReplyVolume(lev
 changeReplyVolume(volumes: ReplyVolumes, deviceId, change, cap = MAX_KEPT_VOLUMES (256)): { volumes; change; sends }   // THE state machine
 ReplyVolumes; NO_REPLY_VOLUMES; replyVolumeOf(volumes, deviceId)
 output.volume { volume }  (server → the voice connections of one device);  DevicePlace.ringingWithoutWake?: boolean (absent = on)
-TraceInfo.phrase?: PhraseTraceInfo = { by; name; did; why?; risk?; refused?; person?; actionMs? }   // a taken utterance's execution trace
+TraceInfo.phrase?: PhraseTraceInfo = { by; name; did; why?; risk?; refused?; decision?: { outcome; by }; person?; actionMs?; presented? }   // a taken utterance's execution trace (decision: P8, additive)
 // serve mode: VoiceSessionOptions.phrases: SessionPhrases = { language(); commandsFor(assistant?); ringing(); ports; onOutcome? }; onPhraseTrace(info)
 //             VoiceSession.control = { stopReply; cancelPending; repeatLast; lastReply() }; VoiceSession.phraseSlot; HubOptions.replyVolume(deviceId)
 //             INTERRUPTED_REPLY_WAIT_MS (2 s), CANNED_REPLY_WAIT_MS (3 min)
@@ -1216,8 +1220,10 @@ TraceInfo.phrase?: PhraseTraceInfo = { by; name; did; why?; risk?; refused?; per
   `phrase` turn. The host's `phrase` registrar (`ModuleHost.ts`, beside the routes) refuses a start whose phrases break a
   bound, name no parameter, use a `Param.dynamic` or a choice of more than 32 options or 96 names (or a name over 40
   characters), or are the host's; the check makes no lookup keys, so it is one short synchronous step. An assistant's
-  set is built from the actions its turns are offered (`offeredActions`: its module and tool switches, the risk
-  policy's offers), **prepared ahead** in steps of bounded work whenever those change (`makePhraseSets`; a yield after
+  set is built from every published, enabled action of the modules it has on, without the tools and action tools it
+  switched off (`offeredActions` without the policy's gateway): what the risk policy refuses stays in the set (P8), so
+  its phrase is taken and the decision is taken when the command runs (the same decision and spoken refusal as the
+  model's call of that action). It is **prepared ahead** in steps of bounded work whenever those change (`makePhraseSets`; a yield after
   `PREPARE_STEP_WORK` units), keyed by what it depends on; a final reads a ready set, or the host's controls alone.
 - **One decision per utterance**, in `VoiceSession.onStt` at the utterance's final (`decideUtterance`): nothing for an
   utterance cancelled before its final, whose final the session sends to the dispatcher with no words (with or without
