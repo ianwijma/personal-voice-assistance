@@ -120,16 +120,23 @@ const prepared = (store: HouseholdStore) => Effect.as(store.prepare([], [schedul
  * the maintenance sweep); `dnd`, the reads of do not disturb; `jobs`, the scheduler's job inserts (the maintenance job).
  */
 export const notifyFaultyStore = (inner: HouseholdStore) => {
-  /** `skipReads`: reads let through before `reads` starts failing. */
-  const faults = { writes: 0, counts: 0, reads: 0, skipReads: 0, dnd: 0, jobs: 0, failed: 0 }
+  /**
+   * `skipReads`: reads let through before `reads` starts failing. `gets` / `skipGets`: the same for the reader's `get`
+   * alone (a held card read again), not its `list`. `jobUpdates`: the scheduler's updates of job rows (a cancellation).
+   */
+  const faults = { writes: 0, counts: 0, reads: 0, skipReads: 0, gets: 0, skipGets: 0, dnd: 0, jobs: 0, jobUpdates: 0, failed: 0 }
   /**
    * A wait before one of the service's transactions (as a busy store's retry wait is): `wait` is taken by the
    * transaction after `skip` more have gone through, which then waits for it before it begins.
    */
   const gate: { skip: number; wait: Deferred.Deferred<void> | undefined } = { skip: 0, wait: undefined }
-  const fault = (k: "writes" | "counts" | "reads" | "dnd" | "jobs") => {
+  const fault = (k: "writes" | "counts" | "reads" | "gets" | "dnd" | "jobs" | "jobUpdates") => {
     if (k === "reads" && faults.reads > 0 && faults.skipReads > 0) {
       faults.skipReads--
+      return
+    }
+    if (k === "gets" && faults.gets > 0 && faults.skipGets > 0) {
+      faults.skipGets--
       return
     }
     if (faults[k] <= 0) return
@@ -186,7 +193,7 @@ export const notifyFaultyStore = (inner: HouseholdStore) => {
   const reader: HouseholdStore["reader"] = (owner, c) => {
     const r = inner.reader(owner, c)
     if (r === undefined || owner !== NOTIFY_OWNER || c.name !== notifications.name) return r
-    return { ...r, get: (id, scope) => (fault("reads"), r.get(id, scope)), list: (q) => (fault("reads"), r.list(q)) }
+    return { ...r, get: (id, scope) => (fault("gets"), fault("reads"), r.get(id, scope)), list: (q) => (fault("reads"), r.list(q)) }
   }
   const wrapHost = (htx: HostTx): HostTx => ({
     ...htx,
@@ -198,7 +205,7 @@ export const notifyFaultyStore = (inner: HouseholdStore) => {
         collection: ((c: Parameters<StoreTx["collection"]>[0]) => {
           const col = t.collection(c)
           if (c.name !== jobs.name) return col
-          return { ...col, insert: (v: never, o?: never) => (fault("jobs"), col.insert(v, o)) }
+          return { ...col, insert: (v: never, o?: never) => (fault("jobs"), col.insert(v, o)), update: (id: string, f: never, o?: never) => (fault("jobUpdates"), col.update(id, f, o)) }
         }) as StoreTx["collection"]
       }
     }
@@ -232,6 +239,8 @@ export const notifyWorld = (
     readonly speech?: Parameters<typeof makeNotifyEngine>[0]["speech"]
     /** The wall clock's offset from the test clock (ms), shared with the case: a correction moves it alone. */
     readonly wall?: { offset: number }
+    /** The household's zone (`HOME_TIME_ZONE`) the scheduler plans cron jobs in. */
+    readonly timeZone?: string
     /** A wait before the service's next `schedule` call (a slow store under the scheduler), taken by that call. */
     readonly scheduleGate?: { wait: Deferred.Deferred<void> | undefined }
   } = {}
@@ -252,7 +261,7 @@ export const notifyWorld = (
     let hostRef: { readonly gateway: ExecutionGateway; readonly pageText: (m: string, t: unknown, max: number) => string } | undefined
     const wall = o.wall ?? { offset: 0 }
     const made = yield* Scope.provide(scope)(Effect.gen(function*() {
-      const scheduler = yield* makeSchedulerEngine({ store, issues, retryBaseMs: SECOND, outcomeRetryMs: [100, 200], gateway: () => hostRef?.gateway })
+      const scheduler = yield* makeSchedulerEngine({ store, issues, retryBaseMs: SECOND, outcomeRetryMs: [100, 200], gateway: () => hostRef?.gateway, ...(o.timeZone !== undefined ? { timeZone: () => o.timeZone } : {}) })
       const notify = yield* makeNotifyEngine({
         store,
         scheduler: o.scheduleGate === undefined ? scheduler : {
@@ -797,6 +806,135 @@ export const notifyContract = (name: string, open: OpenNotifyStore) =>
         assert.deepStrictEqual(world.issues.all(), [])
         assert.strictEqual(yield* dueJobAt(world), (yield* world.rows)[0]!.value.finishedAt! + KEEP_RESOLVED_MS)
         assert.strictEqual(ring.notification.id, (yield* world.rows)[0]!.id)
+      }))
+
+    it.effect("r3-1: a run that succeeded plans what became due while it ran for now: two expiries a millisecond apart, the clock crossing the second during the run", () =>
+      Effect.gen(function*() {
+        yield* TestClock.setTime(WALL_START)
+        const wall = { offset: 0 }
+        let armed = false
+        const { world } = yield* start({
+          wall,
+          observe: (e) => {
+            // During the run (after its expiry scan), the wall clock moves 2 ms on: the second expiry has passed.
+            if (e.kind === "retention" && armed) {
+              armed = false
+              wall.offset += 2
+            }
+          }
+        })
+        const first = yield* world.sendOn("kitchen-display", { title: "First", priority: "ring", expiresInMs: 1_000 })
+        const second = yield* world.sendOn("kitchen-display", { title: "Second", priority: "ring", expiresInMs: 1_001 })
+        armed = true
+        yield* world.advance(1_000)
+        const state = (id: string) => Effect.map(world.rows, (rows) => rows.find((r) => r.id === id)?.value.outcome ?? "open")
+        assert.strictEqual(yield* state(first.notification.id), "expired")
+        assert.strictEqual(yield* state(second.notification.id), "open")
+        // Planned for now by the wall clock (the run succeeded: nothing failed), not a minute later.
+        assert.strictEqual(world.notify.plannedAt(), (yield* Clock.currentTimeMillis) + 2)
+        yield* world.advance(2)
+        assert.strictEqual(yield* state(second.notification.id), "expired")
+      }))
+
+    it.effect("r3-2: the hourly safety net is in UTC: the night the clocks go back (25 October 2026, Europe/Amsterdam) a lost plan is repaired within the hour", () =>
+      Effect.gen(function*() {
+        yield* TestClock.setTime(Date.parse("2026-10-25T00:00:01Z"))
+        const { world, faults } = yield* startFaulty({ timeZone: "Europe/Amsterdam" })
+        const hourly = (yield* notifyJobs(world)).find((j) => j.handler === HOURLY_HANDLER)!
+        assert.strictEqual(hourly.timeZone, "UTC")
+        assert.strictEqual(new Date(hourly.dueAt).toISOString(), "2026-10-25T01:00:00.000Z")
+        // The plan is lost (the due job cannot be written): only the hourly run expires the ring.
+        faults.jobs = 1
+        const ring = yield* world.sendOn("kitchen-display", { title: "Lost plan", priority: "ring", expiresInMs: MINUTE })
+        assert.deepStrictEqual(world.issues.all().map((i) => i.id), ["core.notify.plan"])
+        yield* world.advance(Date.parse("2026-10-25T01:00:00Z") - (yield* Clock.currentTimeMillis) - 1)
+        assert.strictEqual((yield* world.rows)[0]?.value.state, "open")
+        yield* world.advance(1)
+        const row = (yield* world.rows)[0]!
+        assert.strictEqual(row.value.outcome, "expired")
+        assert.isAtMost(row.value.finishedAt! - ring.notification.expiresAt, HOUR)
+        assert.deepStrictEqual(world.issues.all(), [])
+      }))
+
+    it.effect("r3-3: a due job left in the store (a cancel that failed, then a restart) is cancelled once nothing is due; the Health issue stays up until it is", () =>
+      Effect.gen(function*() {
+        const { world, faults, opened } = yield* startFaulty()
+        const t0 = yield* Clock.currentTimeMillis
+        yield* world.bell().dnd.set({ until: t0 + 10 * MINUTE })
+        yield* world.settle
+        assert.strictEqual(yield* dueJobAt(world), t0 + 10 * MINUTE)
+        faults.jobUpdates = 1
+        yield* world.bell().dnd.clear
+        yield* world.settle
+        assert.strictEqual(faults.jobUpdates, 0)
+        assert.strictEqual(yield* dueJobAt(world), t0 + 10 * MINUTE)
+        assert.deepStrictEqual(world.issues.all().map((i) => i.id), ["core.notify.plan"])
+        yield* world.stop
+        // A restart with a healthy store and nothing due: the stored job goes, though this process never planned one.
+        const again = yield* notifyWorld(yield* prepared(yield* opened.reopen))
+        yield* again.settle
+        assert.isUndefined(yield* dueJobAt(again))
+        assert.deepStrictEqual((yield* notifyJobs(again)).map((j) => j.handler), [HOURLY_HANDLER])
+        assert.deepStrictEqual(again.issues.all(), [])
+      }))
+
+    it.effect("r3-4: a failed pass repaired by another trigger plans again: its retry job goes without an unrelated change", () =>
+      Effect.gen(function*() {
+        const { world, faults } = yield* startFaulty({ connected: [] })
+        assert.isUndefined(yield* dueJobAt(world))
+        faults.reads = 1
+        yield* world.open("kitchen-display")
+        assert.strictEqual(faults.reads, 0)
+        assert.strictEqual(yield* dueJobAt(world), (yield* Clock.currentTimeMillis) + MINUTE)
+        // A healthy reconciliation (a hello, say): the pass succeeds, and the retry is no longer planned.
+        world.notify.reconcile("kitchen-display")
+        yield* world.settle
+        assert.isUndefined(yield* dueJobAt(world))
+        assert.isUndefined(world.notify.plannedAt())
+      }))
+
+    it.effect("r3-5: a withdrawal that succeeded in the capacity clean-up is told to the ringing listeners although the next read in that step fails", () =>
+      Effect.gen(function*() {
+        const modules = Array.from({ length: 7 }, (_, i) => `m${i}`)
+        const { world, faults } = yield* startFaulty({ modules, connected: ["kitchen-display"] })
+        const ids: Array<string> = []
+        // The ring first, delivered alone, so it is the first card the page holds (the one the clean-up reads first).
+        for (let i = 0; i < MAX_OPEN_TOTAL; i++) {
+          ids.push((yield* world.bell(modules[Math.floor(i / 10)]!).send({ title: `Card ${i}`, priority: i === 0 ? "ring" : "normal", target: "everywhere" })).notification.id)
+          if (i === 0) yield* world.settle
+        }
+        yield* world.settle
+        assert.deepStrictEqual(world.notify.ringingOn("kitchen-display").map((r) => r.id), [ids[0]])
+        const changes: Array<string> = []
+        world.notify.onRingingChanged((d) => changes.push(d))
+        // Resolved and replaced in one go; the clean-up reads the ended ring (withdrawn), then the next held card's read fails.
+        yield* world.bell(modules[0]!).resolve(ids[0]!)
+        faults.skipGets = 1
+        faults.gets = 1
+        yield* world.bell(modules[0]!).send({ title: "Replacement", target: "everywhere" })
+        yield* world.settle
+        assert.strictEqual(faults.gets, 0)
+        assert.deepStrictEqual(world.notify.ringingOn("kitchen-display"), [])
+        assert.deepStrictEqual(changes, ["kitchen-display"])
+      }))
+
+    it.effect("r3-5: a withdrawal that succeeded in the held-but-unseen tail of a pass is told although the next read there fails", () =>
+      Effect.gen(function*() {
+        const { world, faults } = yield* startFaulty({ connected: ["kitchen-display"] })
+        const a = yield* world.sendOn("kitchen-display", { title: "A", priority: "ring" })
+        const b = yield* world.sendOn("kitchen-display", { title: "B", priority: "ring" })
+        assert.strictEqual(world.notify.ringingOn("kitchen-display").length, 2)
+        const changes: Array<string> = []
+        world.notify.onRingingChanged((d) => changes.push(d))
+        // Both resolved before a pass: the pass finds no open row, then reads A (withdrawn) and fails reading B.
+        yield* world.bell().resolve(a.notification.id)
+        yield* world.bell().resolve(b.notification.id)
+        faults.skipGets = 1
+        faults.gets = 1
+        yield* world.settle
+        assert.strictEqual(faults.gets, 0)
+        assert.deepStrictEqual(world.notify.ringingOn("kitchen-display").map((r) => r.id), [b.notification.id])
+        assert.deepStrictEqual(changes, ["kitchen-display"])
       }))
 
     it.effect("a7: a wall-clock correction (the wall clock alone moves): forwards, the next run resolves what expired; backwards, nothing expires early", () =>

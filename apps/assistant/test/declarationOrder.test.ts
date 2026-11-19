@@ -106,15 +106,27 @@ describe("review round 2: declarations in the order they arrived", () => {
       await tab.client!.waitFor("welcome", () => true, { timeoutMs: 10_000 })
     }
     const detail = () => `seed ${seed}, ops ${ops.join(" ")}`
+    const devices = server.handle.devices
+    /**
+     * Settled on `last`: the record holds it and the registry has nothing left to write. The record alone is not
+     * enough: it can equal `last` from an earlier write while an older declaration's write is still to land, and the
+     * newest one only after the writer's gap.
+     */
+    const settledOn = (last: string) => JSON.stringify(store.settings().devices[D]?.declared?.capabilities) === last && !devices.writing()
+    let pings = 0
     /** Past every tab's coalescing and the writer's gap: the record has the declaration that arrived last. */
     const checkpoint = async () => {
-      // What was sent has reached the server (and the wrapper's log) before "last" is read.
-      await sleep(150)
+      // What was sent has reached the server (and the wrapper's log) before "last" is read: a connection's messages
+      // are answered in order, so each open tab's pong comes after everything it sent before.
+      for (const tab of tabs.filter(open)) {
+        const id = ++pings
+        tab.client!.send({ type: "ping", id })
+        await tab.client!.waitFor("pong", (m) => m.id === id, { from: 0, timeoutMs: 10_000 }).catch(() => undefined)
+      }
       for (const id of forgets) await admin.waitFor("result", (m) => m.requestId === id, { from: 0, timeoutMs: 10_000 })
       if (store.settings().devices[D] === undefined || arrived.length === 0) return
       const last = arrived.at(-1)!
-      for (let i = 0; i < 250 && JSON.stringify(store.settings().devices[D]?.declared?.capabilities) !== last; i++) await sleep(10)
-      await sleep(700)
+      for (let i = 0; i < 500 && store.settings().devices[D] !== undefined && !settledOn(last); i++) await sleep(10)
       if (store.settings().devices[D] === undefined) return
       if (debug) console.log(`[decl] checkpoint: record v${variants.findIndex((v) => JSON.stringify(v) === JSON.stringify(store.settings().devices[D]?.declared?.capabilities))}, last v${variants.findIndex((v) => JSON.stringify(v) === last)}`)
       expect(store.settings().devices[D]?.declared?.capabilities, detail()).toEqual(JSON.parse(last))
@@ -178,9 +190,8 @@ describe("review round 2: declarations in the order they arrived", () => {
       const lists = admin.messages.flatMap((m) => (m.type === "devices" ? [m.devices] : m.type === "admin.snapshot" ? [m.snapshot.devices] : [])) as Array<ReadonlyArray<DeviceListInfo>>
       return lists.at(-1)?.find((d) => d.id === D)?.declared?.capabilities
     }
-    const settled = () => JSON.stringify(store.settings().devices[D]?.declared?.capabilities) === JSON.stringify(last)
-    for (let i = 0; i < 400 && !settled(); i++) await sleep(10)
-    await sleep(1200)
+    for (let i = 0; i < 500 && !settledOn(JSON.stringify(last)); i++) await sleep(10)
+    expect(devices.writing(), detail()).toBe(false)
     expect(store.settings().devices[D]?.declared?.capabilities, detail()).toEqual(last)
     // Admin's list (pushed after the last change) says the same.
     admin.send({ type: "wake.test", requestId: `w${++requestCounter}`, on: false } as ClientMessage)

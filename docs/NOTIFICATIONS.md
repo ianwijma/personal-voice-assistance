@@ -84,8 +84,8 @@ SpeechHandle = { id, deliveries: [{ deviceId, queued, why? }], done: Effect<[{ d
 | open notifications of one module | 10 (`MAX_OPEN_PER_MODULE`) | `limit`; a resolved one frees its place |
 | open notifications in all | 64 (`MAX_OPEN_TOTAL`, also the most a page is sent: at that bound reconciliation withdraws before it adds) | `limit` |
 | expiry, and do not disturb's end | see above; on time (the `due` job), at most an hour late after a lost plan (the `hourly` job) | `invalid` past the bounds |
-| the service's scheduler jobs | 2 at most: `core.notify/hourly` (cron `0 * * * *`, by key, scheduled at every start) and `core.notify/due` (one-shot, by key, only while something is due) | `hourly` not scheduled: a Health issue, tried again at the next send or hello; `due` not planned: a Health issue, planned again at the next change, `hourly` meanwhile |
-| one maintenance run | at most 120 open rows read for expiry and stale claims, at most 120 resolved rows removed, each in transactions of one page (12) with a yield between | the rest at once (the next `due` run); a run that failed, a minute later |
+| the service's scheduler jobs | 2 at most: `core.notify/hourly` (cron `0 * * * *` in UTC, by key, scheduled at every start) and `core.notify/due` (one-shot, by key, only while something is due) | `hourly` not scheduled: a Health issue, tried again at the next send or hello; `due` not planned: a Health issue, planned again at the next change, `hourly` meanwhile |
+| one maintenance run | at most 120 open rows read for expiry and stale claims, at most 120 resolved rows removed, each in transactions of one page (12) with a yield between | a run that succeeded: what is overdue when it plans (the rest past its bound, or what became due while it ran), at once; a run that failed, a minute later |
 | a resolved row | removed a day after it was resolved (`KEEP_RESOLVED_MS`), on time | (the next run) |
 | a module action under way | one per notification (a claim on the row). A claim of a run alive in this process is never released or taken over because the wall clock moved: the run's own limit (5 s, monotonic) ends it. A claim no run here holds (its outcome could not be written, or after a restart) is released by maintenance 15 s after it was taken by the wall clock (`CLAIM_RELEASE_MS`), or at once when it is dated in the future (the clock went back) | "That is being handled already." |
 | a handler's run | 5 s (`NOTIFY_ACTION_TIMEOUT_MS`) | it fails: "That didn't work.", nothing changes |
@@ -149,16 +149,22 @@ speaker and no display gets the cue and no card.
   do not disturb (a minute from now while it is unknown), the time the oldest resolved row leaves retention, the time a
   stale claim may be released, and a minute from now while a device is marked for another pass. Its reads are bounded
   and indexed: the open rows (at most 64, a page of 12 at a time, by `[state, sentAt]`) and the first resolved row by
-  `[state, finishedAt]`. It then makes the one-shot job `core.notify/due` (fixed key `due`) match: none when nothing is
-  due, scheduled, or moved. It is idempotent and serialised (one at a time in the service's own fiber; a change while
-  one runs plans once more after it). It runs after every change that can move the time: a send, a resolve, a press's
-  outcome, do not disturb set, cleared or unknown, a device marked for another pass, the end of every maintenance run,
-  and at start.
+  `[state, finishedAt]`. It then makes the one-shot job `core.notify/due` (fixed key `due`) match the store: none when
+  nothing is due, scheduled, or moved. "None" is made so in the store whenever this process does not know there is no
+  job (at start, after a cancel or schedule that failed, after an hourly run): a job left from before is cancelled even
+  though this process never planned it, and the Health issue stays up until that has succeeded. It is idempotent and
+  serialised (one at a time in the service's own fiber; a change while one runs plans once more after it). It runs
+  after every change that can move the time: a send, a resolve, a press's outcome, do not disturb set, cleared or
+  unknown, a device marked for another pass, a failed pass that was repaired (by any trigger: its retry goes), the end
+  of every maintenance run, and at start.
 - **A maintenance run** (the `due` job, the `hourly` job, `maintainNow`): do not disturb's end, expiry and stale claims,
-  retention (bounded as in the table), a reconciliation of every device, then `plan()`. What it leaves overdue because it
-  failed is tried again a minute later (or by the `hourly` job), never in a tight loop; what it left because it reached
-  its bound runs at once.
-- **`core.notify/hourly`** (cron `0 * * * *`) does the same full pass every hour, whatever this process believes is
+  retention (bounded as in the table), a reconciliation of every device, then `plan()`. The two ends are kept apart: after
+  a run that **succeeded**, whatever is overdue when it plans (what it left at its bound, or what became due while it
+  ran) is planned for now; after a run that **failed**, what is overdue is tried again a minute later (or by the
+  `hourly` job), never in a tight loop.
+- **`core.notify/hourly`** (cron `0 * * * *` **in UTC**, whatever the household's zone: it counts elapsed hours, so the
+  night the clocks go back cannot put two hours between runs; module jobs keep the household's zone) does the same full
+  pass every hour, whatever this process believes is
   planned. It exists so that **a lost plan cannot leave anything overdue for more than an hour**: a `plan()` that fails
   (the store failed its reads, or the job could not be written) raises the Health issue "Notifications' maintenance
   could not be planned", is tried again at the next change, and the hourly run plans again (the issue goes when a plan
@@ -246,8 +252,9 @@ speaker and no display gets the cue and no card.
 
 - P7 (`ringing` window, the spoken "stop"; built: [PHRASES.md](PHRASES.md)): `engine.ringingOn(deviceId)` (what rings there, with its actions),
   `engine.onRingingChanged(listener)` (open and close the window: called whenever what rings on a device differs from
-  what it last told, after each step of a pass that succeeded, also when a later step fails, and when a closed page's
-  cards are dropped), `engine.stopRinging(deviceId)` (what rings there is recorded in one step and each ring stopped
+  what it last told: at the end of every step of a pass that can change what a page holds, also a step that failed
+  part-way (the clean-up at a page's bound and the held-but-unseen tail included), and when a closed page's cards are
+  dropped), `engine.stopRinging(deviceId)` (what rings there is recorded in one step and each ring stopped
   through the same admission as a press, in work the service owns: a caller that is interrupted leaves none of it
   undone; it answers how many it stopped), `engine.stopSpeech(deviceId)`, `engine.press(…)` for a ringing phrase of an
   action, and `engine.busyAnswer()` (the refusal of a press over an admission bound, in the household's language).
@@ -283,7 +290,9 @@ announcement playing is cut, as serve mode's lease does; announcements wait), `c
 `Devices` service sees the same), `dnd()`, `settle`, and `engine` (`ringingOn`, `stopRinging`, `stopSpeech`,
 `maintainNow`, `planNow`, `plannedAt`). Announcements take `speechMs` (2 s) of test-clock time. `disconnect` does what
 serve mode's does: the device's connection is gone (`deviceOfConnection` answers nothing, a tool call made with it is
-refused) and an announcement being spoken there fails ("audio client disconnected"); `connect` restores it. A test
+refused), an announcement being spoken there fails ("audio client disconnected"), one still waiting (behind a reply, for
+quiet) fails as serve mode's does ("the voice session ended"), and the reply that was being spoken there is retired;
+`connect` starts a new session, whose queue moves on. A test
 that advances the clock pays for the service's maintenance: the `hourly` job runs 24 times per advanced day plus one
 run per thing due (a week with one ring: 170 runs), about 0.6 ms each, about 15 ms per advanced day in the kit (whose
 own clock advance costs about 64 ms per day without it), so a month-long advance takes about 2.4 s. **Where the kit differs from serve mode**: one
