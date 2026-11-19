@@ -3,7 +3,8 @@
 // function, and the module's own sentences come from `texts`. Nothing here decides who may see what: the module asks
 // `Privacy.mayReveal` for the asking device when it answers, and the Presenter decides again for each device it shows on.
 import type { Presentation } from "@pva/core"
-import { isLine, say } from "@pva/module-contracts"
+import { isLine, say, StoredText } from "@pva/module-contracts"
+import { Schema } from "effect"
 import { texts } from "./texts.ts"
 import { tidy } from "./words.ts"
 
@@ -87,6 +88,23 @@ export const forgottenCard = (l: Lang, owner: string | undefined): Presentation 
 /** A spoken fallback is a whole sentence of at most 300: one that is longer is replaced by the short one, never sliced. */
 const cutSpoken = (spoken: string): string => (spoken.length <= SPOKEN_CHARS && spoken.trim() !== "" ? spoken : "…")
 
+const validSpoken = Schema.is(StoredText(SPOKEN_CHARS))
+const LONE_SURROGATE = /[\ud800-\udbff](?![\udc00-\udfff])|(?<![\ud800-\udbff])[\udc00-\udfff]/g
+/**
+ * The first candidate that is well-formed text within the Presenter's bound; failing that, the first one repaired (a split
+ * character dropped, cut between code points); failing that, the last (a fixed sentence). The tool's own sentences are
+ * never changed: only what the presentation says in their place.
+ */
+const spokenOf = (candidates: ReadonlyArray<string>): string => {
+  const whole = candidates.find((c) => c.trim() !== "" && validSpoken(c))
+  if (whole !== undefined) return whole
+  for (const c of candidates) {
+    const repaired = cutPoints(c.replace(LONE_SURROGATE, "").trim(), SPOKEN_CHARS)
+    if (repaired.trim() !== "" && validSpoken(repaired)) return repaired
+  }
+  return candidates.at(-1)!
+}
+
 export interface ListInput {
   readonly title: "listFound" | "listNotes"
   /** The items the answer carries, newest first (at most `MAX_ITEMS`). */
@@ -113,7 +131,7 @@ export const listPresentation = (l: Lang, input: ListInput): Presentation => {
   if (input.olderNotes === true) rows.push(lineText(say(texts, l, "olderNotes"), LIST_ITEM_CHARS))
   if (input.cutAt !== undefined) rows.push(lineText(say(texts, l, "listCut", { count: input.cutAt }), LIST_ITEM_CHARS))
   if (input.withheld) rows.push(lineText(say(texts, l, "listWithheld"), LIST_ITEM_CHARS))
-  const spoken = [...input.spokenCandidates, say(texts, l, "listSpoken", { count: input.total })].find((s) => s.length <= SPOKEN_CHARS && s.trim() !== "")!
+  const spoken = spokenOf([...input.spokenCandidates, say(texts, l, "listSpoken", { count: input.total })])
   return {
     kind: "list",
     title: say(texts, l, input.title),

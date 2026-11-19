@@ -3,8 +3,9 @@
 // them: each on the shared, private and public devices of the household and on a device without a screen; an update and
 // a withdrawal; Undo pressed twice, from a device that does not hold it, and across a restart of the module.
 import { assert, describe, it } from "@effect/vitest"
+import { PresentError, StoreError } from "@pva/core"
 import { startTestModule } from "@pva/core/testing"
-import { Effect } from "effect"
+import { Deferred, Effect, Fiber } from "effect"
 import { vi } from "vitest"
 import { memories, memoryModule, notes, SCAN_ROWS, type Memory, type Note } from "../src/index.ts"
 import { cutPoints, lineText } from "../src/present.ts"
@@ -165,7 +166,9 @@ describe("memory: Undo", () => {
       assert.deepStrictEqual(yield* kit.present.press(card.id, "undo", as(kitchen)), { ok: true, say: "Forgotten: Sam is allergic to nuts. Backups keep it for up to 14 days." })
       assert.deepStrictEqual(yield* memoriesNow(kit), [])
       const after = cardOf(kit, "kitchen-display")
-      assert.strictEqual(after?.id, card.id)
+      // The Remembered card is taken down with the row; the confirmation is a new card, without a button.
+      assert.notStrictEqual(after?.id, card.id)
+      assert.isUndefined(kit.present.shown("kitchen-display").find((p) => p.id === card.id))
       assert.deepStrictEqual(after?.buttons, [])
       assert.strictEqual(after?.content.kind === "card" ? after.content.title : "", "Forgotten")
       assert.notInclude(JSON.stringify(after), "nuts")
@@ -392,5 +395,222 @@ describe("memory: the list of a recall and of a notes read", () => {
       const l = listOf(kit, "kitchen-display")
       assert.strictEqual(l?.content.kind === "list" ? l.content.title : "", "Wat ik vond")
       assert.strictEqual(itemTexts(kit, "kitchen-display")?.at(-1), "en nog 2")
+    }))
+})
+
+// --- Review round 1 --------------------------------------------------------------------------------------------------
+
+/** The module with its shared part's store and presenter wrapped, to fail or pause what the shared part calls. */
+interface Hooks {
+  readonly failGet?: { on: boolean }
+  readonly failShow?: { on: boolean }
+  /** Called after the shared part's `memories.get` returns, before it answers (the first call only, then cleared). */
+  gateGet?: Effect.Effect<void>
+  readonly handlers?: Map<string, (press: any) => Effect.Effect<any, any>>
+}
+const withShared = (hooks: Hooks): typeof memoryModule => ({
+  ...memoryModule,
+  shared: (ctx: any) =>
+    memoryModule.shared!({
+      ...ctx,
+      store: {
+        ...ctx.store,
+        collection: (c: any) => {
+          const h = ctx.store.collection(c)
+          return {
+            ...h,
+            get: (...a: Array<any>) =>
+              hooks.failGet?.on === true
+                ? Effect.fail(new StoreError({ reason: "busy", message: "busy (test)" }))
+                : Effect.flatMap(h.get(...a), (row: unknown) => {
+                  const gate = hooks.gateGet
+                  hooks.gateGet = undefined
+                  return gate === undefined ? Effect.succeed(row) : Effect.as(gate, row)
+                })
+          }
+        }
+      },
+      present: {
+        ...ctx.present,
+        show: (...a: Array<any>) => (hooks.failShow?.on === true ? Effect.fail(new PresentError({ reason: "busy", message: "busy (test)" })) : ctx.present.show(...a)),
+        handle: (name: string, handler: any) => {
+          hooks.handlers?.set(name, handler.run)
+          return ctx.present.handle(name, handler)
+        }
+      }
+    })
+}) as typeof memoryModule
+
+describe("memory: review round 1", () => {
+  it.effect("1. the handles follow what is on screens: churn on one device never loses another device's list", () =>
+    Effect.gen(function*() {
+      const kit = yield* start()
+      const now = yield* kit.now
+      const rows = kit.moduleStore().collection(memories)
+      const plumber = yield* rows.insert(memory("The plumber is called Joost", now - 1_000))
+      yield* kit.tool("memory_recall", { query: "plumber" }, as(kitchen))
+      yield* kit.present.settle
+      assert.isDefined(listOf(kit, "kitchen-display"))
+      // Eight cards on Robin's phone, each replacing the one before, with no time passing: two presentations are live.
+      for (let i = 0; i < 8; i++) yield* kit.tool("memory_remember", { text: `Churn fact number ${i}` }, as(robin))
+      yield* kit.present.settle
+      assert.strictEqual(kit.present.engine.live().length, 2)
+      // Forgetting from the phone takes the kitchen's list down.
+      assert.include((yield* kit.tool("memory_forget", { id: plumber.id }, as(robin))).content, "Forgotten")
+      yield* kit.present.settle
+      assert.isUndefined(listOf(kit, "kitchen-display"))
+      // And an empty answer takes a list down after the same churn.
+      yield* kit.tool("memory_recall", { query: "churn" }, as(kitchen))
+      yield* kit.present.settle
+      assert.isDefined(listOf(kit, "kitchen-display"))
+      for (let i = 8; i < 16; i++) yield* kit.tool("memory_remember", { text: `Churn fact number ${i}` }, as(robin))
+      yield* kit.tool("memory_recall", { query: "zebra" }, as(kitchen))
+      yield* kit.present.settle
+      assert.isUndefined(listOf(kit, "kitchen-display"))
+    }))
+
+  it.effect("2a. a recall that a forget overtakes shows nothing of the forgotten item", () =>
+    Effect.gen(function*() {
+      const kit = yield* start()
+      const now = yield* kit.now
+      const store = kit.moduleStore().collection(memories)
+      const plumber = yield* store.insert(memory("The plumber is called Joost", now))
+      for (let i = 0; i < 34; i++) yield* store.insert(memory(`filler ${i}`, now - 100_000 + i))
+      yield* Effect.all([kit.tool("memory_recall", { query: "plumber" }, as(kitchen)), kit.tool("memory_forget", { id: plumber.id }, as(robin))], { concurrency: "unbounded" })
+      yield* kit.present.settle
+      assert.notInclude(JSON.stringify(kit.present.shown("kitchen-display")), "Joost")
+      assert.notInclude(yield* memoriesNow(kit), "The plumber is called Joost")
+    }))
+
+  it.effect("2b. a notes read that a forget overtakes shows nothing of the forgotten note", () =>
+    Effect.gen(function*() {
+      const kit = yield* start()
+      const now = yield* kit.now
+      const store = kit.moduleStore().collection(notes)
+      const first = yield* store.insert(note("Valve note", now))
+      yield* Effect.all([kit.tool("memory_read_notes", {}, as(kitchen)), kit.tool("memory_forget", { id: first.id }, as(robin))], { concurrency: "unbounded" })
+      yield* kit.present.settle
+      assert.notInclude(JSON.stringify(kit.present.shown("kitchen-display")), "Valve")
+    }))
+
+  it.effect("2c. an Undo pressed while a recall reads leaves no list with the undone memory", () =>
+    Effect.gen(function*() {
+      const kit = yield* start()
+      const now = yield* kit.now
+      const store = kit.moduleStore().collection(memories)
+      for (let i = 0; i < 34; i++) yield* store.insert(memory(`filler ${i}`, now - 100_000 + i))
+      yield* kit.tool("memory_remember", { text: "The plumber is called Joost" }, as(kitchen))
+      yield* kit.present.settle
+      const card = cardOf(kit, "kitchen-display")!
+      yield* Effect.all([kit.present.press(card.id, "undo", as(kitchen)), kit.tool("memory_recall", { query: "plumber" }, as(robin))], { concurrency: "unbounded" })
+      yield* kit.present.settle
+      assert.notInclude(JSON.stringify(kit.present.shown("robins-phone")), "Joost")
+      assert.notInclude(JSON.stringify(kit.present.shown("kitchen-display")), "Joost")
+      assert.notInclude(yield* memoriesNow(kit), "The plumber is called Joost")
+    }))
+
+  it.effect("2d. a card whose memory was forgotten between its storing and its showing is not shown", () =>
+    Effect.gen(function*() {
+      const hooks: Hooks = {}
+      const kit = yield* startTestModule(withShared(hooks), house)
+      const at = yield* Deferred.make<void>()
+      const go = yield* Deferred.make<void>()
+      hooks.gateGet = Effect.andThen(Deferred.succeed(at, undefined), Deferred.await(go))
+      const remembering = yield* Effect.forkChild(kit.tool("memory_remember", { text: "The plumber is called Joost" }, as(kitchen)))
+      yield* Deferred.await(at)
+      // The memory is stored and the card is about to be shown: forget it now.
+      yield* kit.tool("memory_forget", { query: "plumber" }, as(robin))
+      yield* Deferred.succeed(go, undefined)
+      yield* Fiber.join(remembering)
+      yield* kit.present.settle
+      assert.deepStrictEqual(kit.present.shown("kitchen-display"), [])
+      assert.deepStrictEqual(yield* memoriesNow(kit), [])
+    }))
+
+  for (const [name, options, unreadable, forgotten] of [["English", house, "I can't read my notes right now. Try again in a moment.", "Forgotten:"], ["Dutch", dutch, "Ik kan mijn notities nu niet lezen. Probeer het zo nog eens.", "Vergeten:"]] as const) {
+    it.effect(`3. an Undo whose read fails says it could not read (${name}), records nothing, and works when pressed again`, () =>
+      Effect.gen(function*() {
+        const hooks: Hooks = { failGet: { on: false } }
+        const kit = yield* startTestModule(withShared(hooks), options)
+        yield* kit.tool("memory_remember", { text: "The boiler is in the cellar" }, as(kitchen))
+        yield* kit.present.settle
+        const card = cardOf(kit, "kitchen-display")!
+        hooks.failGet!.on = true
+        assert.deepStrictEqual(yield* kit.present.press(card.id, "undo", as(kitchen)), { ok: true, say: unreadable })
+        assert.deepStrictEqual(yield* memoriesNow(kit), ["The boiler is in the cellar"])
+        assert.strictEqual(cardOf(kit, "kitchen-display")?.buttons.length, 1)
+        hooks.failGet!.on = false
+        const again = yield* kit.present.press(card.id, "undo", as(kitchen))
+        assert.isTrue(again.ok)
+        assert.include(again.say, forgotten)
+        assert.deepStrictEqual(yield* memoriesNow(kit), [])
+      }))
+  }
+
+  it.effect("4. an Undo whose confirmation cannot be shown still leaves neither the text nor the button on the screen", () =>
+    Effect.gen(function*() {
+      const hooks: Hooks = { failShow: { on: false } }
+      const kit = yield* startTestModule(withShared(hooks), house)
+      yield* kit.tool("memory_remember", { text: "The boiler is in the cellar" }, as(kitchen))
+      yield* kit.present.settle
+      const card = cardOf(kit, "kitchen-display")!
+      hooks.failShow!.on = true
+      const answer = yield* kit.present.press(card.id, "undo", as(kitchen))
+      assert.isTrue(answer.ok)
+      assert.include(answer.say, "Forgotten")
+      assert.deepStrictEqual(yield* memoriesNow(kit), [])
+      yield* kit.present.settle
+      assert.deepStrictEqual(kit.present.shown("kitchen-display"), [])
+    }))
+
+  it.effect("the module's record makes the same presentation id act once (the handler called twice, as the host would not)", () =>
+    Effect.gen(function*() {
+      const hooks: Hooks = { handlers: new Map() }
+      const kit = yield* startTestModule(withShared(hooks), house)
+      yield* kit.tool("memory_remember", { text: "The boiler is in the cellar" }, as(kitchen))
+      yield* kit.present.settle
+      const card = cardOf(kit, "kitchen-display")!
+      const key = kit.present.engine.live()[0]!.key
+      const run = hooks.handlers!.get("memory_undo")!
+      const press = { presentationId: card.id, key, deviceId: "kitchen-display", action: "undo" }
+      const first = yield* run(press)
+      yield* kit.tool("memory_remember", { text: "The boiler is in the cellar" }, as(kitchen))
+      const second = yield* run(press)
+      assert.deepStrictEqual(second, first)
+      assert.deepStrictEqual(yield* memoriesNow(kit), ["The boiler is in the cellar"])
+    }))
+
+  for (const [name, options] of [["English", house], ["Dutch", dutch]] as const) {
+    it.effect(`5. a note whose text has an emoji at the spoken helper's cut still gets its list, in recall and in a notes read (${name})`, () =>
+      Effect.gen(function*() {
+        const kit = yield* start(options)
+        const now = yield* kit.now
+        const text = `${"a".repeat(118)}😀 trailing note`
+        yield* kit.moduleStore().collection(notes).insert(note(text, now))
+        yield* kit.tool("memory_read_notes", {}, as(kitchen))
+        yield* kit.present.settle
+        assert.isDefined(listOf(kit, "kitchen-display"), "notes read")
+        yield* kit.tool("memory_recall", { query: "trailing" }, as(kitchen))
+        yield* kit.present.settle
+        assert.isDefined(listOf(kit, "kitchen-display"), "recall")
+        // The answer to the model is what it was: the stored text, whole.
+        const read = yield* kit.tool("memory_read_notes", {}, as(kitchen))
+        assert.include(read.content, "trailing note")
+      }))
+  }
+
+  it.effect("a public device where the asker's own default person is Sam: Sam's personal memory is not shown there, nor its text", () =>
+    Effect.gen(function*() {
+      const kit = yield* start()
+      const now = yield* kit.now
+      yield* kit.moduleStore().collection(memories).insert(memory("Sam keeps spare keys under the pot", now - 500, { scopeKey: "p:p-sam", owner: "p-sam" }))
+      yield* kit.moduleStore().collection(memories).insert(memory("The spare room is blue", now - 1_000))
+      yield* kit.tool("memory_recall", { query: "spare" }, as(hall))
+      yield* kit.present.settle
+      assert.deepStrictEqual(itemTexts(kit, "hall-screen"), ["The spare room is blue", "Personal items are kept for their owner's devices."])
+      assert.notInclude(JSON.stringify(kit.present.messages), "keys under")
+      yield* kit.tool("memory_recall", { query: "spare" }, as(kitchen))
+      yield* kit.present.settle
+      assert.include(itemTexts(kit, "kitchen-display")!.join("|"), "keys under the pot")
     }))
 })

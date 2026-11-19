@@ -107,13 +107,16 @@ the turn came from, after the answer was made.
 a memory it already knew shows nothing), a transient card appears (30 seconds, one at a time per device, like every
 transient presentation): the title "Remembered" ("Onthouden"), the memory's own text (cut between whole characters at
 300), and one button, **Undo** ("Ongedaan maken"). Its spoken fallback is "Remembered: …". Pressing Undo forgets that
-memory, exactly as `memory_forget` does by its id (one removal path for the tool, the action and the button), and the
-card becomes "Forgotten" with "Backups keep it for up to 14 days." (no button, no text of the memory), so nothing
-stays that could be pressed again. The press runs under the module's one-at-a-time lock, answers with the same sentence
+memory, exactly as `memory_forget` does by its id (one removal path for the tool, the action and the button). The
+removal takes the Remembered card down with the row, whatever happens next, and then a new card says "Forgotten" with
+"Backups keep it for up to 14 days." (no button, no text of the memory); if that confirmation cannot be shown, nothing of
+the old card is left on the screen, and the answer still says it was forgotten. A store that fails to read is not a
+memory that is gone: Undo then says "I can't read my notes right now. Try again in a moment." (Dutch likewise), records
+nothing, and pressing again works. The press runs under the module's one-at-a-time lock, answers with the same sentence
 `memory_forget` speaks ("Forgotten: …"), and is remembered by the presentation's id (a bounded record of 64), so the
 same card acts once. A card pressed after its memory was forgotten another way (it was taken down then), after the
 module restarted (a transient card leaves when the module stops), from a device that does not hold it, or after the
-module is stopped, changes nothing: the page is told "I can't do that right now." Pressing a card whose memory is gone
+module is stopped, changes nothing: the page is told "I can't do that right now." Pressing a card whose memory is really gone
 says "That is already gone." A card pressed on a device that may not be told a personal memory does not act on it.
 
 **The list of a recall and of a notes read.** After `memory_recall` (or the action "recall") and `memory_read_notes`
@@ -126,6 +129,17 @@ none of their text). The spoken fallback is the answer's own sentence (the count
 is replaced in place by the next list on the same device (one key per device), taken down by an answer that found
 nothing, and taken down when any memory or note is forgotten (a list may hold it). It shows what the answer said and is
 not kept in step with new memories.
+
+**Nothing from a read that a change overtook.** The module counts every change to stored memories and notes (a memory
+stored or pinned, a note saved, anything forgotten, an Undo). A recall, a notes read and a card take the count before
+they read; right before showing, under the module's one-at-a-time lock, they compare it. If it moved, they read again
+(twice at most); after that the answer is given and nothing is shown. Forgetting, its bump and what it takes off the
+screens are one step under the same lock, so a list built from a read taken before a forget is never shown after it.
+The handles of what was shown are kept only for presentations that may still be showing: a device shows one transient
+at a time, so a new card or list on a device drops the handles it replaced, what ended by itself is dropped, and if the
+bound is still reached a presentation is dismissed before its handle is forgotten. A presentation's spoken text is used
+only if it is well-formed text within the bound (a note whose text has an emoji at the answer's own cut still gets its
+list, with a repaired spoken sentence in place of the answer's).
 
 **Privacy.** The answer decides who may be told what, at the moment it is made, for the asking device
 (`Privacy.mayReveal`); the card and the list are made from that answer and nothing more. A personal memory's card is

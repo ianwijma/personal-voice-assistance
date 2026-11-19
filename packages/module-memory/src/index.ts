@@ -218,62 +218,104 @@ export const memoryModule: ModuleDefinition<typeof settings> = defineModule({
       /** What went wrong on a screen never changes an answer: a refusal, a device that shows nothing, a stopped part. */
       const quietly = <A, E>(e: Effect.Effect<A, E>): Effect.Effect<void> => e.pipe(Effect.asVoid, Effect.ignore, Effect.catchDefect(() => Effect.void))
 
-      // --- on screen: the handles of what this part showed, by key (at most the module's eight live presentations) ---------
-      const live = new Map<string, PresentHandle>()
+      // --- on screen: the handles of what this part showed, by key -------------------------------------------------------------
+      // One entry per presentation that may still be showing: a device shows one transient at a time, so a new show on a
+      // device drops the handles it superseded; what ended by itself (its time, plus a margin) is dropped; and if the bound
+      // (the module's eight live presentations) is still reached, a presentation is dismissed before its handle is forgotten.
+      const live = new Map<string, { readonly device: string; readonly until: number; readonly handle: PresentHandle }>()
       const MAX_LIVE = 8
+      const SHOW_MS = 30_000
+      const MARGIN_MS = 2_000
+      /** Bumped by every change to stored memories and notes: a read taken before a bump is not shown after it. */
+      let generation = 0
+      const bump = () => {
+        generation++
+      }
       const showKeyed = (device: string | undefined, key: string | undefined, presentation: Presentation) =>
         device === undefined || key === undefined
           ? Effect.void
-          : quietly(Effect.tap(ctx.present.show({ device }, presentation, { key }), (h) => Effect.sync(() => {
-            live.delete(key)
-            live.set(key, h)
-            for (const k of live.keys()) if (live.size > MAX_LIVE) live.delete(k)
-          })))
+          : quietly(Effect.gen(function*() {
+            const now = yield* Clock.currentTimeMillis
+            for (const [k, e] of [...live]) if (e.until <= now) live.delete(k)
+            const handle = yield* ctx.present.show({ device }, presentation, { key, expiresInMs: SHOW_MS })
+            for (const [k, e] of [...live]) if (k === key || e.device === device) live.delete(k)
+            live.set(key, { device, until: now + SHOW_MS + MARGIN_MS, handle })
+            while (live.size > MAX_LIVE) {
+              const [oldest, e] = live.entries().next().value!
+              live.delete(oldest)
+              yield* quietly(e.handle.dismiss)
+            }
+          }))
       /** Takes the presentation of a key down, when this part showed one that is still up. */
       const dismissKey = (key: string) => {
-        const h = live.get(key)
+        const e = live.get(key)
         live.delete(key)
-        return h === undefined ? Effect.void : quietly(h.dismiss)
+        return e === undefined ? Effect.void : quietly(e.handle.dismiss)
       }
       /** What a memory or note that is gone no longer applies to: its own card and every list (a list may hold it). */
-      const withdraw = (kind: "memory" | "note", id: string, except?: string) =>
+      const withdraw = (kind: "memory" | "note", id: string) =>
         Effect.gen(function*() {
           const card = kind === "memory" ? cardKeyOf(id) : undefined
-          if (card !== undefined && card !== except) yield* dismissKey(card)
-          for (const key of [...live.keys()]) if (isListKey(key) && key !== except) yield* dismissKey(key)
+          if (card !== undefined) yield* dismissKey(card)
+          for (const key of [...live.keys()]) if (isListKey(key)) yield* dismissKey(key)
         })
 
       // --- taking one away: the single path ------------------------------------------------------------------------------
       const failedForget = () => new Failed({ message: say(texts, lang(), "unforgotten") })
-      /** Deletes one row and says so; repeats personal text only where it may be revealed. `except` is a key the caller shows again itself. */
-      const removeItem = (stores: Stores, mayShow: () => boolean, l: Lang, kind: "memory" | "note", id: string, text: string, personal: boolean, except?: string) =>
-        Effect.gen(function*() {
+      /**
+       * Deletes one row and says so; repeats personal text only where it may be revealed. The removal, the bump and the
+       * withdrawal are one step under the module's lock (`held`: the caller has it), so what a read took before it is never
+       * shown after it, and what is on a screen goes with the row.
+       */
+      const removeItem = (stores: Stores, mayShow: () => boolean, l: Lang, kind: "memory" | "note", id: string, text: string, personal: boolean, held = false) => {
+        const body = Effect.gen(function*() {
           yield* (kind === "memory" ? stores.mem.remove(id) : stores.nts.remove(id)).pipe(Effect.mapError(failedForget))
-          yield* withdraw(kind, id, except)
+          bump()
+          yield* withdraw(kind, id)
           return personal && !mayShow() ? spokenOf(l, "forgotQuiet") : spokenOf(l, "forgot", { text: cutText(text, 120) })
         })
+        return held ? body : lock.withPermit(body)
+      }
       /** Forgets what `id` names (a memory, else a note), when it is the household's or the asker's own. */
-      const forgetId = (stores: Stores, who: { readonly person: string | undefined; readonly mayShow: () => boolean }, l: Lang, id: string, except?: string) =>
-        Effect.gen(function*() {
+      const forgetId = (stores: Stores, who: { readonly person: string | undefined; readonly mayShow: () => boolean }, l: Lang, id: string, held = false) => {
+        const body = Effect.gen(function*() {
           const mine = (scopeKey: string) => scopeKey === HOUSEHOLD || (who.person !== undefined && scopeKey === personKey(who.person))
           const unreadable = () => new Failed({ message: say(texts, lang(), "unreadable") })
           const m = yield* stores.mem.get(id).pipe(Effect.mapError(unreadable))
-          if (m !== undefined && mine(m.value.scopeKey)) return yield* removeItem(stores, who.mayShow, l, "memory", m.id, m.value.text, m.value.owner !== undefined, except)
+          if (m !== undefined && mine(m.value.scopeKey)) return yield* removeItem(stores, who.mayShow, l, "memory", m.id, m.value.text, m.value.owner !== undefined, true)
           const n = yield* stores.nts.get(id).pipe(Effect.mapError(unreadable))
-          if (n !== undefined && mine(n.value.scopeKey)) return yield* removeItem(stores, who.mayShow, l, "note", n.id, n.value.text, n.value.owner !== undefined, except)
+          if (n !== undefined && mine(n.value.scopeKey)) return yield* removeItem(stores, who.mayShow, l, "note", n.id, n.value.text, n.value.owner !== undefined, true)
           return spokenOf(l, "gone")
         })
+        return held ? body : lock.withPermit(body)
+      }
 
       // --- showing ------------------------------------------------------------------------------------------------------
       /** The card after a memory was stored: only where the answer repeated it (the caller decided), on the asking device. */
       const showRemembered = (device: string | undefined, saved: { readonly id: string; readonly text: string; readonly owner?: string }) =>
-        showKeyed(device, cardKeyOf(saved.id), rememberedCard(lang(), saved.text, saved.owner))
-      /** The list of an answer on the asking device, replacing the one it showed there; an empty answer takes it down. */
-      const showList = (device: string | undefined, list: Parameters<typeof listPresentation>[1] | undefined) => {
-        if (device === undefined) return Effect.void
-        const key = listKeyOf(device)
-        return list === undefined ? dismissKey(key) : showKeyed(device, key, listPresentation(lang(), list))
-      }
+        quietly(Effect.gen(function*() {
+          // The memory may be gone by now (forgotten between its storing and this show): look again, up to twice more, and
+          // show only what is still there at the moment of showing, under the lock.
+          for (let attempt = 0; attempt < 3; attempt++) {
+            const taken = generation
+            const row = yield* mem.get(saved.id)
+            if (row === undefined) return
+            const shown = yield* lock.withPermit(Effect.suspend(() => generation !== taken ? Effect.succeed(false) : Effect.as(showKeyed(device, cardKeyOf(saved.id), rememberedCard(lang(), saved.text, saved.owner)), true)))
+            if (shown) return
+          }
+        }))
+      /**
+       * The list of an answer on the asking device, replacing the one it showed there; an empty answer takes it down. `taken`
+       * is the generation before the answer read anything: when a change overtook the read, nothing is shown and this answers
+       * `false` (the caller reads again).
+       */
+      const showList = (device: string | undefined, taken: number, list: Parameters<typeof listPresentation>[1] | undefined) =>
+        lock.withPermit(Effect.suspend(() => {
+          if (generation !== taken) return Effect.succeed(false)
+          if (device === undefined) return Effect.succeed(true)
+          const key = listKeyOf(device)
+          return Effect.as(list === undefined ? dismissKey(key) : showKeyed(device, key, listPresentation(lang(), list)), true)
+        }))
 
       // --- the card's Undo: the same removal as forget by id, once per card ------------------------------------------------
       const answered = new Map<string, string>()
@@ -291,25 +333,30 @@ export const memoryModule: ModuleDefinition<typeof settings> = defineModule({
             }
             const id = memoryOfKey(press.key)
             if (press.action !== UNDO_BUTTON || id === undefined) return remember(say(texts, l, "undoGone"))
-            const row = yield* mem.get(id).pipe(Effect.orElseSucceed(() => undefined))
+            // A store that fails is not a memory that is gone: it answers that it could not read, and records nothing.
+            const read = yield* mem.get(id).pipe(Effect.map((r) => ({ row: r, failed: false })), Effect.catch(() => Effect.succeed({ row: undefined, failed: true })))
+            if (read.failed) return { say: say(texts, l, "unreadable") }
+            const row = read.row
             if (row === undefined) return remember(say(texts, l, "undoGone"))
             // A personal memory is undone only where the device may be told it, asked now for the device pressed on.
             const owner = row.value.owner
             const may = owner === undefined || ctx.host.service(Privacy)?.mayReveal(owner, press.deviceId) === true
             const key = cardKeyOf(id)
-            const outcome = yield* forgetId(own, { person: may ? owner : undefined, mayShow: () => may }, l, id, key).pipe(
+            const outcome = yield* forgetId(own, { person: may ? owner : undefined, mayShow: () => may }, l, id, true).pipe(
               Effect.map((o) => ({ ...o, failed: false })),
               Effect.catchTag("Failed", (f) => Effect.succeed({ spoken: f.message, failed: true }))
             )
             // A failed removal is not remembered: pressing again tries again.
             if (outcome.failed) return { say: outcome.spoken }
             const sentence = outcome.spoken
+            // The removal took the Remembered card down with the row; this only confirms. If it cannot be shown, nothing
+            // old is left on the screen.
             if (key !== undefined && may) yield* showKeyed(press.deviceId, key, forgottenCard(l, owner))
             return remember(sentence)
           }))
       }).pipe(Effect.orDie)
 
-      return { value: { lock, removeItem, forgetId, showRemembered, showList } }
+      return { value: { lock, removeItem, forgetId, showRemembered, showList, bump, generation: () => generation } }
     }),
   start: (ctx) =>
     Effect.gen(function*() {
@@ -383,6 +430,7 @@ export const memoryModule: ModuleDefinition<typeof settings> = defineModule({
             const k: Row<Memory> = known
             if (room && k.value.pinnedAt === 0) {
               yield* mem.update(k.id, (v) => ({ ...v, pinnedAt: now })).pipe(Effect.mapError(failed("unsaved")))
+              present.bump()
               return quiet ? spoken(l, "savedPrivatelyPinned") : spoken(l, "savedPinned", { text })
             }
             const pinFull = input.pinned && !room && k.value.pinnedAt === 0
@@ -390,6 +438,7 @@ export const memoryModule: ModuleDefinition<typeof settings> = defineModule({
           }
           const value: Memory = { text, kind: input.kind, scopeKey, at: now, pinnedAt: room ? now : 0, ...(owner !== undefined ? { owner } : {}) }
           const row = yield* mem.insert(value).pipe(Effect.mapError(failed("unsaved")))
+          present.bump()
           // The confirmation repeats personal text only where it may be revealed, asked now for this device.
           const saved = quiet ? say(texts, l, room ? "savedPrivatelyPinned" : "savedPrivately") : say(texts, l, room ? "savedPinned" : "saved", { text })
           // The card repeats it under the same rule: nothing for a personal memory the device may not be told.
@@ -423,6 +472,7 @@ export const memoryModule: ModuleDefinition<typeof settings> = defineModule({
           const scopeKey = owner === undefined ? HOUSEHOLD : personKey(owner)
           const value: Note = { text, notebook, shelf: `${scopeKey}/${notebook}`, scopeKey, at: yield* Clock.currentTimeMillis, ...(owner !== undefined ? { owner } : {}) }
           yield* nts.insert(value).pipe(Effect.mapError(failed("unsaved")))
+          present.bump()
           const quiet = owner !== undefined && !mayShow()
           return quiet ? spoken(l, "notedPrivately") : spoken(l, "noted", { notebook })
         })
@@ -510,9 +560,25 @@ export const memoryModule: ModuleDefinition<typeof settings> = defineModule({
         return words.length === 0 ? spoken(l, ask) : words
       }
 
-      const recall = (input: { readonly query: string; readonly in?: "memories" | "notes" | undefined }) =>
+      /**
+       * An answer that shows a list reads, then shows under the lock only if no change to memories or notes came in between;
+       * when one did, it reads again (twice at most), and after that it answers without showing anything.
+       */
+      const retried = <A, E, R>(once: (state: { current: boolean }) => Effect.Effect<A, E, R>) =>
+        Effect.gen(function*() {
+          let state = { current: true }
+          let out = yield* once(state)
+          for (let i = 0; i < 2 && !state.current; i++) {
+            state = { current: true }
+            out = yield* once(state)
+          }
+          return out
+        })
+      const recall = (input: { readonly query: string; readonly in?: "memories" | "notes" | undefined }) => retried((state) => recallOnce(input, state))
+      const recallOnce = (input: { readonly query: string; readonly in?: "memories" | "notes" | undefined }, state: { current: boolean }) =>
         Effect.gen(function*() {
           yield* follow
+          const taken = present.generation()
           const l = lang()
           const words = wordsOf(input.query, l, "askRecall")
           if (!Array.isArray(words)) return words as Outcome
@@ -525,7 +591,7 @@ export const memoryModule: ModuleDefinition<typeof settings> = defineModule({
           if (items.length === 0) {
             const none = sentences([say(texts, l, "nothingFound"), cut, withheld])
             // What an earlier answer showed on this screen no longer holds: it is taken down.
-            yield* present.showList(device, undefined)
+            state.current = yield* present.showList(device, taken, undefined)
             return { spoken: none, data: { spoken: none, found: 0, ...extra } } satisfies Outcome
           }
           const lines = items.map((i) => i.text)
@@ -535,7 +601,7 @@ export const memoryModule: ModuleDefinition<typeof settings> = defineModule({
           const owner = items.some((i) => i.mine === true) ? found.person : undefined
           const said = sentences([head, cut])
           // The list shows what the answer said: the same items, the same count of the rest, the same notes.
-          yield* present.showList(device, {
+          state.current = yield* present.showList(device, taken, {
             title: "listFound",
             items: lines,
             more: found.total - items.length,
@@ -549,9 +615,11 @@ export const memoryModule: ModuleDefinition<typeof settings> = defineModule({
         })
 
       // --- read_notes ----------------------------------------------------------------------------------------------------
-      const readNotes = (input: { readonly notebook?: string | undefined; readonly limit?: number | undefined }) =>
+      const readNotes = (input: { readonly notebook?: string | undefined; readonly limit?: number | undefined }) => retried((state) => readNotesOnce(input, state))
+      const readNotesOnce = (input: { readonly notebook?: string | undefined; readonly limit?: number | undefined }, state: { current: boolean }) =>
         Effect.gen(function*() {
           yield* follow
+          const taken = present.generation()
           const { person, mayShow } = yield* asker
           const l = lang()
           const n = Math.min(MAX_ITEMS, Math.max(1, input.limit ?? 5))
@@ -573,12 +641,12 @@ export const memoryModule: ModuleDefinition<typeof settings> = defineModule({
           const device = yield* deviceOf
           if (items.length === 0) {
             const none = sentences([say(texts, l, "noNotes"), withheld])
-            yield* present.showList(device, undefined)
+            state.current = yield* present.showList(device, taken, undefined)
             return { spoken: none, data: { spoken: none, found: 0, ...(withheld !== undefined ? { withheld } : {}) } } satisfies Outcome
           }
           const owner = items.some((i) => i.mine === true) ? person : undefined
           const said = sentences([say(texts, l, "newestNotes", { items: listOf(items.map((i) => i.text), l, 3) }), more ? say(texts, l, "olderNotes") : undefined])
-          yield* present.showList(device, {
+          state.current = yield* present.showList(device, taken, {
             title: "listNotes",
             items: items.map((i) => i.text),
             more: 0,
