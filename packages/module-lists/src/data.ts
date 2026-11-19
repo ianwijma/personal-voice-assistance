@@ -168,6 +168,38 @@ export const undo = defineCollection({
 export const undoIdOf = (conversationId: string) => `u-${createHash("sha256").update(conversationId).digest("hex").slice(0, 32)}`
 
 // ---------------------------------------------------------------------------------------------------------------------
+// Checklists on screens
+
+/** Where a list is pinned as a checklist: a row per list and device (at most `MAX_PINS` at once). */
+export const MAX_PINS = 8
+
+/**
+ * One checklist pinned on one device's screen. It holds no person and no content (the content is read again from the
+ * lists every time it is shown): the list, the household's own device id, the key of the presentation and the time the
+ * host ends it by itself. The row is removed when the checklist is closed, when its list is deleted or once it ended.
+ */
+export const Pin = Schema.Struct({
+  list: ROW_ID,
+  device: StoredText(64).check(Schema.isPattern(/^[A-Za-z0-9_.:-]{1,64}$/)),
+  key: StoredText(64).check(Schema.isPattern(/^[A-Za-z0-9_.:@/-]{1,64}$/)),
+  until: EPOCH_MS
+})
+export type Pin = typeof Pin.Type
+
+export const pins = defineCollection({
+  name: "pins",
+  scope: "household",
+  schema: Pin,
+  // The worst legal pin is 393 characters of JSON (checkModule computes it).
+  maxChars: 400
+})
+
+const pinHash = (list: string, device: string) => createHash("sha256").update(`${list}\n${device}`).digest("hex")
+/** A pin's row id and its presentation key: hashes of the list and the device, so neither says what it names. */
+export const pinIdOf = (list: string, device: string) => `pin-${pinHash(list, device).slice(0, 32)}`
+export const pinKeyOf = (list: string, device: string) => `lists.${pinHash(list, device).slice(32, 56)}`
+
+// ---------------------------------------------------------------------------------------------------------------------
 // Matching
 
 const ARTICLES = new Set(["the", "a", "an", "some", "de", "het", "een", "wat", "my", "mijn"])

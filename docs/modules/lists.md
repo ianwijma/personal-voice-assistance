@@ -66,10 +66,11 @@ Everything is local: no outside service, no network.
 
 ## Tools
 
-Seven are typed actions with English and Dutch `examples`, so the intent path runs them without the language model;
+Nine are typed actions with English and Dutch `examples`, so the intent path runs them without the language model;
 the model is offered each as the tool `lists_<id>`. Three are tools for the model only. Every one that changes
-anything is `change`; the two reads are plain reads (`speculative`). All answer in one or two sentences, in the
-household's language.
+anything (the two that put a list on a screen and take it down included) is `change`; the two reads are plain reads
+(`speculative`). All answer in one or two sentences, in the household's language. Two of the actions are also said as
+phrase commands ("Phrase commands" below).
 
 | Tool | Kind | Parameters | Example | Answer |
 |---|---|---|---|---|
@@ -78,13 +79,16 @@ household's language.
 | `lists_complete` | action `lists.complete`, `change` | `item` (one or more, as said), `list?` | "I've got the bread" | "Ticked off bread on the shopping list." |
 | `lists_remove` | action `lists.remove`, `change` | `item`, `list?` | "take eggs off the shopping list" | "Took eggs off the shopping list." |
 | `lists_clear_done` | action `lists.clear_done`, `change` | `list?` | "clear the ticked-off items" | "Cleared 4 ticked-off things from the shopping list." |
+| `lists_show` | action `lists.show`, `change` | `list?` | "show the shopping list" | "Showing the shopping list on this screen." |
+| `lists_hide` | action `lists.hide`, `change` | `list?` | "close the shopping list" | "Closed the shopping list on this screen." |
 | `lists_undo` | action `lists.undo`, `change` | none | "undo that" | "Undone: the shopping list is as it was." |
 | `lists_overview` | action `lists.overview`, read | none | "which lists do we have" | "There are 3 lists: the shopping list with 9, the to-do list with 2 and the Camping list with 3." |
 | `lists_update` | tool, `change` | `item`, `list?`, `rename?`, `amount?`, `unit?`, `clearAmount?`, `note?`, `reopen?` | "make it two" | "Changed it: 2 milk on the shopping list." |
 | `lists_create` | tool, `change` | `name`, `kind?` (`shopping`, `todo`, `generic`), `items?` | "start a packing list for camping: tent, sleeping bags, torch" | "Made the camping list with tent, sleeping bags and torch." |
 | `lists_delete` | tool, `change` | `list` | "delete the camping list" | "Deleted the Camping list. Say undo to bring it back today." |
 
-Dutch: "zet melk op de boodschappenlijst" → "Melk op de boodschappenlijst gezet."; "wat staat er op de lijst" →
+Dutch: "zet melk op de boodschappenlijst" → "Melk op de boodschappenlijst gezet."; "toon de boodschappenlijst" →
+"De boodschappenlijst staat op dit scherm."; "wat staat er op de lijst" →
 "Op de boodschappenlijst staan 3 dingen: …"; "maak dat ongedaan" → "Ongedaan gemaakt: …".
 
 - **Which list.** No list named: the shopping list (and the answer names it, so a mistake is heard). The default lists
@@ -105,6 +109,71 @@ Dutch: "zet melk op de boodschappenlijst" → "Melk op de boodschappenlijst geze
   personal lists yet, and "my shopping list" is the household's, which `lists_add` says in its answer; one `lists_add`
   call per request; `lists_undo` reverses the last change.
 
+## Phrase commands
+
+Two actions can be said without the language model, after the wake phrase or in a follow-up window
+([docs/PHRASES.md](../PHRASES.md)). Both are for **the household's shopping list only**: the words name it, so the
+action's `list` is left out and it takes its own default. A phrase runs the existing action: the same parameters, the
+same refusals and sentences, the same risk class.
+
+| Action | English | Dutch |
+|---|---|---|
+| `lists.add` (`items` is a text slot of at most 8 words) | "add {items} to the shopping list", "put {items} on the shopping list", "add to the shopping list {items}", "put on the shopping list {items}" | "zet {items} op de boodschappenlijst", "doe {items} op de boodschappenlijst", "voeg {items} toe aan de boodschappenlijst", "zet op de boodschappenlijst {items}" |
+| `lists.read` (`show` and `from` take their defaults: the open items from the start) | "read the shopping list", "read me the shopping list", "what is on the shopping list", "what's on the shopping list", "what is on my shopping list" | "lees de boodschappenlijst voor", "lees de boodschappenlijst", "wat staat er op de boodschappenlijst", "wat staat er op mijn boodschappenlijst" |
+
+"Add milk, eggs and bread to the shopping list" is three items on the shopping list and answers "Added milk, eggs and
+bread to the shopping list."; "wat staat er op de boodschappenlijst" answers "Op de boodschappenlijst staan 3
+dingen: melk, eieren en brood." Matching is exact on words (no filler: "please add milk to the shopping list" is not a
+phrase, it goes on to the assistant as it did before), so more than eight words in the slot, another list ("to the
+to-do list"), "my shopping list" in an add (which says the household's clause) and everything else go to the
+assistant, whose tools take them as before.
+
+- **Once per invocation.** A phrase turn has its own turn id, and `lists.add` run as a phrase command keeps its outcome
+  by the invocation's identity (assistant, conversation, turn, device, the operation and what it was asked) in one
+  bounded record in `shared` (256 finished ones; one still running is never forgotten): the same invocation twice
+  (a replay) returns the first outcome and adds nothing more; the next phrase is a new invocation and acts as the
+  action does (an item said again is merged, with merging off a second item). Spoken and typed calls are not kept.
+- **A phrase that cannot be said by a device** (the slot would be longer than 8 words) is not taken; nothing is written.
+
+## Checklists
+
+"Show the shopping list" puts the list's **open items on the screen of the device that asked**, as a `list`
+presentation in the `checklist` style, one tickable line per item (the item's text with its amount, one line of at most
+80 characters; at most 12 items, the oldest first as read out; the title is the list's name, with "(+3 more)" when
+more are open than are shown, so what is not shown is counted and never hidden):
+
+- **When it is shown.** `lists_show` (or "show the shopping list", "toon de boodschappenlijst", "zet de takenlijst op
+  het scherm", and the model's tool). It is **pinned**: it stays until closed or until the host ends it, 24 hours (its
+  longest lifetime) after it was shown or last changed. Showing it again on the same device replaces it in place; one
+  device can hold several lists (the host's bounds: 8 of this module, 8 pinned on one device). It is shown only on the
+  device that asked; the answer says "Showing the shopping list on this screen."
+- **A device that cannot show it** (no screen, a page that cannot draw a list) changes nothing about the answer: it
+  says "This device can't show it." and then the read-out sentence of the list ("The shopping list has 3 things: …",
+  which is also the presentation's spoken fallback), and nothing is kept for that device. The model's tool says the same.
+- **Privacy.** A list is household data, read out on shared, private and public devices alike, so its presentation is
+  the household's (`sensitivity` is not personal) and is shown on every device that has a screen; the rule is the one
+  that lets the same list be read out there. Nothing about a person is put on it.
+- **It follows the list.** Every committed change of the module's lists (a voice add or tick, a tool, `lists_update`,
+  undo, the `Lists` service, the daily clean-up, deleting the list) wakes one fiber of the `shared` part, which makes each
+  pinned checklist equal to its list and shows it again where it changed (under the module's one permit, off the path of
+  the call that changed it). A change that leaves what a screen holds as it is sends nothing. Deleting a list takes its
+  checklists down; undoing the delete does not put them back. A checklist the host ended on its own (24 hours) is
+  forgotten with its pin at the next change.
+- **Closing.** `lists_hide` ("close the shopping list", "haal de lijst van het scherm") takes the list's checklist down
+  on this screen, or every one on it when no list is named; the list itself is not changed. After a restart of the
+  module (which forgets its handles, not what is pinned) the checklist is closed by showing it empty under the same key,
+  which the host ends three seconds later.
+- **A restart** keeps the pins (a row per list and device: the list, the device's id, the presentation's key and when
+  the host ends it; no person, no item) and the screens (the host keeps pinned presentations); the module brings every
+  checklist up to date when it starts, and again at every change.
+- **A tick** on an item is the press handler `lists` (registered in `shared`). It completes that item by its id through
+  the same engine call as `lists_complete` (so under the one-at-a-time rule), shows the checklist again and answers
+  "Ticked off eggs on the shopping list." It is idempotent by the item: an item that is already ticked off (by another
+  device, or a second press) is not ticked again and the answer says "Already ticked off: eggs."; an item that is gone
+  says so. A press records no undo entry (a press has no conversation). A tick can only tick off: the checklist shows
+  open items, and an untick answers "Here I can only tick things off." A device that does not hold the checklist, and a
+  module that is stopped, are refused by the host ("I can't do that right now.") before any of this runs.
+
 ## Settings
 
 | Field | Kind | Default | What it does |
@@ -119,9 +188,10 @@ No secrets, no addresses.
 
 ## What it stores
 
-Three household-scoped collections (`storage.version` 2: version 1 kept the hash alone in an item's `match`; the
-upgrade adds the status to it). **Nothing in them is about one person**: no person id, no
-device id, no conversation id (the undo row's id is a hash of the conversation id). Lists are shared household data
+Four household-scoped collections (`storage.version` 2: version 1 kept the hash alone in an item's `match`; the
+upgrade adds the status to it; the fourth, `pins`, is new and the other three are as they were). **Nothing in the first
+three is about one person**: no person id, no device id, no conversation id (the undo row's id is a hash of the
+conversation id). A pin holds a device's id (the household's own screen) and no person. Lists are shared household data
 by design, read out on shared, private and public devices alike; the store's own change record (`updatedBy`) is the
 store's, not read by the module.
 
@@ -129,6 +199,7 @@ store's, not read by the module.
 |---|---|---|---|---|
 | `lists`: one row per list (name, kind, open and ticked-off counts, `deletedAt`); the two default lists' rows made at the start | 200 (167) | none | all lists in one read (at most 50) | until deleted, then a day for undo |
 | `items`: one row per item (list, text, quantity, note, status `open`/`done`/`removed`, `place` = list and status, `since`, `match` = a hash of the list and normalised text with the status, `dedupeKey`) | 1,500 (1,466) | `[place, since]`, `[match, since]`, `dedupeKey` | 16 rows: every list read pages with `after` | open: until ticked off or removed; ticked off: by the settings; removed: a day for undo |
+| `pins`: where a list is shown as a checklist: one row per list and device (list, device id, the presentation's key, the time the host ends it; the id and the key are hashes) | 400 (393) | none | at most 17 in one read | until the checklist is closed, its list is deleted or it ended |
 | `undo`: the last change of each conversation (the items it changed with the rev it left them at and their status before, the amounts and notes a merge changed, an item's text before a change) | 16,000 (14,758) | `at` | 1 row (undo reads its row by id) | a day |
 
 - **Counts.** A list's open and ticked-off counts are on its row, changed in the same transaction as every item, so
@@ -165,12 +236,13 @@ an undo entry replaced since, stay. Every write it makes is the job's (`actor`),
 
 ## What was left out
 
-**Waits for wave B** (they need P7, P9 or P10, which do not exist yet):
+**Not now** (the checklist and the two phrase commands are described above):
 
-- The **checklist presentation** with direct ticks (research §8): `present.*`, a tick calling `lists_complete` as a
-  presentation action, the pinned list on a kitchen display, live updates on every copy.
-- **Phrase commands** for add and read (P7). The typed actions with examples are there and run without the model on
-  the intent path; the phrase commands come with P7.
+- **Live copies on every screen at once** beyond what pinning gives: a checklist is shown on the screens that asked for
+  it (a room or "everywhere" is not a target), up to the host's bounds.
+- **Phrase commands for other lists** (the to-do list, named lists, "my shopping list"), for ticking off, removing and
+  the other actions: they run through the model or the typed intent path as before.
+- Notifications (a list that changed, a reminder to shop); a checklist of ticked-off items; unticking.
 
 **Later, as the plan's row says** (not in this first version): chores, **person lists** ("my to-do list": until they
 exist, it is the household's to-do list, and the answer says that everyone here can see it), every outside

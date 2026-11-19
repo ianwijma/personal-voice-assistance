@@ -1,7 +1,7 @@
-import { type ModuleStore, type ParamOption, resolveOption, type Row, type StoreFailure, type StoreTx, type WriteOptions } from "@pva/core"
+import { ActionError, CurrentTurn, type ModuleStore, type ParamOption, resolveOption, type Row, type StoreFailure, type StoreTx, type WriteOptions } from "@pva/core"
 import { convertAmount, type UnitId } from "@pva/language"
 import { type Language, LISTS_LIMITS, say } from "@pva/module-contracts"
-import { Effect, Semaphore } from "effect"
+import { Deferred, Effect, Exit, Semaphore } from "effect"
 import {
   type Item,
   ITEM_PAGE,
@@ -33,6 +33,9 @@ import { texts } from "./texts.ts"
 
 /** The most rows a turn's scan of one list's items reads: every open item a list may have (32 indexed reads of 16). */
 export const SCAN_ROWS = MAX_OPEN
+
+/** Phrase commands kept for replay (the oldest finished one goes first). */
+export const RECORDS_KEPT = 256
 
 const DEFAULTS: ReadonlyArray<{ readonly id: string; readonly kind: "shopping" | "todo" }> = [{ id: SHOPPING, kind: "shopping" }, { id: TODO, kind: "todo" }]
 
@@ -99,7 +102,16 @@ export const isRefusal = (x: unknown): x is Refusal => x instanceof Refusal
  * The lists module's work on the store: shared by its tools, actions, service and job. One per module (`shared`),
  * with a cache of the list rows (at most `MAX_LISTS`, one read) for the synchronous list choices of the typed actions.
  */
-export const makeEngine = (store: ModuleStore) => {
+export const makeEngine = (rawStore: ModuleStore) => {
+  /** Called after every committed transaction of the module (what shows a list follows its data); set by `shared`. */
+  let onChange: () => void = () => {}
+  /** The module's store: every transaction of the lists and items (tools, actions, service, clean-up, undo) tells `onChange`. */
+  const store: ModuleStore = {
+    moduleId: rawStore.moduleId,
+    readOnly: rawStore.readOnly,
+    collection: (c) => rawStore.collection(c),
+    transaction: (f) => Effect.tap(rawStore.transaction(f), () => Effect.sync(() => onChange()))
+  }
   const listStore = store.collection(lists)
   const itemStore = store.collection(items)
   const undoStore = store.collection(undo)
@@ -111,6 +123,49 @@ export const makeEngine = (store: ModuleStore) => {
    */
   const lock = Semaphore.makeUnsafe(1)
   const serial = <A, E, R>(effect: Effect.Effect<A, E, R>): Effect.Effect<A, E, R> => lock.withPermits(1)(effect)
+
+  /** The outcome of a phrase command, kept by the invocation's identity: what was said, or the sentence it failed with. */
+  type Replied = { readonly say: string } | { readonly fail: string }
+  const records = new Map<string, { readonly deferred: Deferred.Deferred<Replied>; finished: boolean }>()
+  /**
+   * Runs a phrase command once for its invocation's identity (assistant, conversation, turn, device, the operation and
+   * what it was asked): a repeat, a concurrent one too, gets the first outcome and changes nothing; a new invocation
+   * has a new turn and acts again. Only phrase turns are kept (a model's or a typed call is the caller's own business);
+   * outside a turn there is no identity. One bounded record: finished operations are forgotten oldest first, and an
+   * operation still running is never forgotten.
+   */
+  const once = (operation: string, asked: string, run: Effect.Effect<{ readonly say: string }, ActionError>, aborted: string): Effect.Effect<{ readonly say: string }, ActionError> =>
+    Effect.gen(function*() {
+      const turn = yield* CurrentTurn
+      if (turn === undefined || turn.source !== "phrase") return yield* run
+      const key = [operation, turn.assistantId, turn.conversationId, turn.turnId, turn.deviceId, asked].join("\u0000")
+      const kept = records.get(key)
+      if (kept !== undefined) {
+        const first = yield* Deferred.await(kept.deferred)
+        return "say" in first ? { say: first.say } : yield* Effect.fail(new ActionError({ message: first.fail }))
+      }
+      const mine = { deferred: Deferred.makeUnsafe<Replied>(), finished: false }
+      records.set(key, mine)
+      if (records.size > RECORDS_KEPT) {
+        for (const [k, r] of records) {
+          if (records.size <= RECORDS_KEPT) break
+          if (r.finished) records.delete(k)
+        }
+      }
+      const finish = (outcome: Replied) => Effect.suspend(() => {
+        mine.finished = true
+        return Deferred.succeed(mine.deferred, outcome)
+      })
+      return yield* run.pipe(
+        Effect.onExit((exit) => {
+          if (Exit.isSuccess(exit)) return finish({ say: exit.value.say })
+          const failure = exit.cause.reasons.find((r) => r._tag === "Fail")
+          if (failure !== undefined && exit.cause.reasons.length === 1) return finish({ fail: (failure.error as ActionError).message })
+          // Cut short (interrupted, a defect): nothing was decided, so a retry runs; whoever waited is told it did not finish.
+          return Effect.sync(() => void (records.get(key) === mine && records.delete(key))).pipe(Effect.andThen(finish({ fail: aborted })))
+        })
+      )
+    })
 
   /** Read every list (one read: the at most `MAX_LISTS` rows fit one page) and keep them for the choices. */
   const loadLists = Effect.map(listStore.list({ limit: MAX_LISTS + 1 }), (rows) => {
@@ -652,6 +707,12 @@ export const makeEngine = (store: ModuleStore) => {
 
   return {
     store,
+    /** The store without the change signal (the module's own bookkeeping that must not wake what follows the lists). */
+    rawStore,
+    setOnChange: (f: () => void) => {
+      onChange = f
+    },
+    once,
     serial,
     ensureDefaults,
     /** A transaction whose function may `refuse` before it writes: the refusal is its value. */

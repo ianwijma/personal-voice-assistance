@@ -1,8 +1,9 @@
 import { ActionError, CurrentJob, CurrentTurn, defineAction, defineModule, makeTool, Param, type Row, Setting, type StoreFailure, ToolError } from "@pva/core"
 import { homeLanguage, isLine, type Language, Lists, LISTS_LIMITS, say, StoredText } from "@pva/module-contracts"
 import { speakList } from "@pva/language"
-import { Clock, Effect, Schema } from "effect"
-import { type Item, items, listPhrase, lists, MAX_CLEAR, MAX_LIVE_LISTS, MAX_OPEN, MAX_PER_REQUEST, NAME_CHARS, normalise, type Quantity, SHOPPING, TODO, undo, undoIdOf } from "./data.ts"
+import { Clock, Effect, Queue, Schema } from "effect"
+import { type Item, items, listPhrase, lists, MAX_CLEAR, MAX_LIVE_LISTS, MAX_OPEN, MAX_PER_REQUEST, NAME_CHARS, normalise, type Quantity, SHOPPING, TODO, pins, undo, undoIdOf } from "./data.ts"
+import { type Checklists, HANDLER, makeChecklists } from "./checklist.ts"
 import { type Engine, isRefusal, listChoice, makeEngine, speak } from "./engine.ts"
 import { type SaidItem, sayItem, type SplitMode, splitItems, takeListSuffix } from "./parse.ts"
 import { makeListsService } from "./service.ts"
@@ -75,6 +76,9 @@ const listOf = (things: ReadonlyArray<string>, lang: Language, max = 5) => speak
 const LIST_MARKERS = ["to", "on", "onto", "in", "into", "op", "aan", "in", "bij"]
 const OFF_MARKERS = ["off", "from", "on", "van", "op", "af", "uit"]
 
+/** What `shared` returns: the engine, and the checklists on screens that follow it. */
+type Shared = Engine & { readonly checklists: Checklists }
+
 // ---------------------------------------------------------------------------------------------------------------------
 // The module
 
@@ -86,7 +90,8 @@ export const listsModule = defineModule({
   enabledByDefault: false,
   settings,
   // Version 2: an item's `match` holds its status too (indexed with `since`), so a name finds the open item first.
-  storage: { version: 2, collections: [lists, items, undo] },
+  // The pins (where a list is shown as a checklist) are a new collection: the existing ones are as they were.
+  storage: { version: 2, collections: [lists, items, undo, pins] },
   shared: (ctx) =>
     Effect.gen(function*() {
       const engine = makeEngine(ctx.store)
@@ -111,11 +116,33 @@ export const listsModule = defineModule({
       }).pipe(Effect.orDie)
       // A system job at a quarter past four, the household's time zone.
       yield* ctx.scheduler.schedule({ handler: "tidy", key: "tidy", cron: "15 4 * * *" }).pipe(Effect.orDie)
-      return { value: engine, services: [Lists.of(makeListsService(engine))] }
+      // The checklists: a list's open items on a screen. Every committed change of the module's lists wakes one fiber
+      // that makes each pinned checklist equal to its list (off the call's path, one at a time with the module's work).
+      const checklists = makeChecklists(ctx, engine)
+      const wake = yield* Queue.sliding<void>(1)
+      engine.setOnChange(() => void Queue.offerUnsafe(wake, undefined))
+      yield* ctx.present.handle(HANDLER, {
+        // A tick: the same change as `lists_complete`, by the item's id. A busy store is said, not failed.
+        run: (press) => checklists.press(press).pipe(Effect.catch((e: StoreFailure) => Effect.succeed({ say: storeSentence(homeLanguage(ctx.host.view()), e, false) })))
+      }).pipe(Effect.orDie)
+      yield* Effect.forkScoped(Effect.forever(Effect.gen(function*() {
+        yield* Queue.take(wake)
+        const done = yield* Effect.exit(checklists.refresh)
+        // One that could not be brought up to date (the host was busy) is tried again in half a minute.
+        if (done._tag === "Failure" || done.value === false) {
+          yield* Effect.sleep("30 seconds")
+          Queue.offerUnsafe(wake, undefined)
+        }
+      })))
+      // What changed while the module was stopped (or before a restart forgot what it had shown) is brought up to date now.
+      Queue.offerUnsafe(wake, undefined)
+      const shared: Shared = Object.assign(engine, { checklists })
+      return { value: shared, services: [Lists.of(makeListsService(engine))] }
     }),
   start: (ctx) =>
     Effect.sync(() => {
-      const engine: Engine = ctx.shared
+      const engine: Shared = ctx.shared
+      const checklists = engine.checklists
       const lang = () => homeLanguage(ctx.host.view())
       const mode = ctx.settings.splitItems as SplitMode
       const merge = ctx.settings.mergeDuplicates
@@ -162,10 +189,16 @@ export const listsModule = defineModule({
           items: Param.text({ label: "What to add", after: ["add", "put", "zet", "doe", "voeg"], maxWords: 40 }),
           list: listParam
         },
+        // The household's shopping list only: these words name it, so `list` is left out (the action's own default).
+        phrases: {
+          en: ["add {items} to the shopping list", "put {items} on the shopping list", "add to the shopping list {items}", "put on the shopping list {items}"],
+          nl: ["zet {items} op de boodschappenlijst", "doe {items} op de boodschappenlijst", "voeg {items} toe aan de boodschappenlijst", "zet op de boodschappenlijst {items}"]
+        },
         risk: "change",
         latency: "instant",
+        // A phrase command runs once per invocation: a repeat of the same one gets its first outcome (`engine.once`).
         run: ({ items: text, list: value }) =>
-          serial(Effect.gen(function*() {
+          engine.once("add", JSON.stringify([text, value ?? null]), serial(Effect.gen(function*() {
             const l = lang()
             yield* engine.loadLists.pipe(Effect.mapError((e) => actionError(storeSentence(l, e, true))))
             const picked = chosen(value)
@@ -189,7 +222,7 @@ export const listsModule = defineModule({
             if (result.added.length === 0) return { say: speak(l, shared ? "alreadyShared" : "already", { list: phrase, items: listOf(result.already, l) }) }
             if (result.already.length === 0) return { say: speak(l, shared ? "addedShared" : "added", { list: phrase, items: listOf(result.added, l) }) }
             return { say: speak(l, shared ? "addedAndAlreadyShared" : "addedAndAlready", { list: phrase, items: listOf(result.added, l), already: listOf(result.already, l) }) }
-          }))
+          })), speak(lang(), "unsaved"))
       })
 
       // -- read --------------------------------------------------------------------------------------------------------
@@ -203,6 +236,11 @@ export const listsModule = defineModule({
           list: listParam,
           show: Param.choice({ label: "Which items", options: [{ value: "open", label: "still to get or do" }, { value: "done", label: "ticked off" }], default: "open", optional: true }),
           from: Param.number({ label: "From item number", min: 1, max: MAX_OPEN, integer: true, optional: true })
+        },
+        // The household's shopping list only; `show` and `from` take what every other path gives them (the open items from the start).
+        phrases: {
+          en: ["read the shopping list", "read me the shopping list", "what is on the shopping list", "what's on the shopping list", "what is on my shopping list"],
+          nl: ["lees de boodschappenlijst voor", "lees de boodschappenlijst", "wat staat er op de boodschappenlijst", "wat staat er op mijn boodschappenlijst"]
         },
         speculative: true,
         latency: "instant",
@@ -335,6 +373,69 @@ export const listsModule = defineModule({
             if (r.count === 0) return { say: speak(l, "noneDone", { list: phrase }) }
             return { say: speak(l, r.more ? "clearedSome" : "cleared", { list: phrase, count: r.count }) }
           }))
+      })
+
+      // -- show and hide: the checklist on this device's screen --------------------------------------------------------
+      const show = defineAction({
+        id: "show",
+        label: "Show a list on the screen",
+        description:
+          "Put a household list (the shopping list unless another is named) on this device's screen as a checklist of what is still open, with ticks. It stays there and follows the list (an item added, ticked off or removed anywhere) until it is closed with lists_hide, and is taken down when the list is deleted. Not for reading the list out (lists_read).",
+        examples: ["show the shopping list", "put the to-do list on the screen", "show me the list on the screen", "toon de boodschappenlijst", "zet de takenlijst op het scherm"],
+        params: { list: listParam },
+        risk: "change",
+        latency: "instant",
+        run: ({ list }) =>
+          Effect.gen(function*() {
+            const l = lang()
+            yield* engine.loadLists.pipe(Effect.mapError((e) => actionError(storeSentence(l, e, true))))
+            const target = chosen(list).list ?? SHOPPING
+            const phrase = engine.phraseOf(target, l)
+            const r = yield* checklists.show(target, readItems).pipe(Effect.mapError((e) => actionError(storeSentence(l, e, true))))
+            switch (r.kind) {
+              case "no-device":
+                return yield* Effect.fail(actionError(speak(l, "noDevice")))
+              case "gone":
+                return yield* Effect.fail(actionError(speak(l, "unknownList", { name: phrase, items: listOf(engine.listNames(l), l, 8) })))
+              case "limit":
+                return yield* Effect.fail(actionError(speak(l, "tooManyPins")))
+              case "failed":
+                return yield* Effect.fail(actionError(speak(l, "showFailed", { list: phrase })))
+              case "not-shown":
+                // The answer is the one spoken: a device that cannot show it changes nothing about it.
+                return { say: speak(l, r.why === "no-display" || r.why === "cannot-show-kind" ? "noScreen" : "notShown", { spoken: r.spoken }) }
+              case "shown":
+                return { say: speak(l, "showing", { list: phrase }) }
+            }
+          })
+      })
+
+      const hide = defineAction({
+        id: "hide",
+        label: "Close a list on the screen",
+        description: "Take a checklist that lists_show put on this device's screen down again (one list, or every one on this screen when none is named). The list itself is not changed.",
+        examples: ["close the shopping list", "hide the list", "take the lists off the screen", "sluit de boodschappenlijst", "haal de lijst van het scherm"],
+        params: { list: listParam },
+        risk: "change",
+        latency: "instant",
+        run: ({ list }) =>
+          Effect.gen(function*() {
+            const l = lang()
+            yield* engine.loadLists.pipe(Effect.mapError((e) => actionError(storeSentence(l, e, true))))
+            const target = chosen(list).list
+            const phrase = target === undefined ? "" : engine.phraseOf(target, l)
+            const r = yield* checklists.hide(target).pipe(Effect.mapError((e) => actionError(storeSentence(l, e, false))))
+            switch (r.kind) {
+              case "no-device":
+                return yield* Effect.fail(actionError(speak(l, "noDevice")))
+              case "none":
+                return { say: target === undefined ? speak(l, "nothingOnScreen") : speak(l, "notOnScreen", { list: phrase }) }
+              case "failed":
+                return yield* Effect.fail(actionError(speak(l, "hideFailed")))
+              case "closed":
+                return { say: target === undefined ? speak(l, "hiddenAll") : speak(l, "hidden", { list: phrase }) }
+            }
+          })
       })
 
       // -- undo --------------------------------------------------------------------------------------------------------
@@ -505,10 +606,10 @@ export const listsModule = defineModule({
       })
 
       return {
-        actions: [add, read, complete, remove, clearDone, undoAction, overview],
+        actions: [add, read, complete, remove, clearDone, undoAction, overview, show, hide],
         tools: [updateTool, createTool, deleteTool],
         instructions:
-          "Lists are the household's: everyone sees them on every device. There are no personal lists yet: \"my shopping list\" is the household's, and lists_add says so in its answer. Put everything said in one lists_add call; lists_undo reverses the last list change of this conversation."
+          "Lists are the household's: everyone sees them on every device. There are no personal lists yet: \"my shopping list\" is the household's, and lists_add says so in its answer. Put everything said in one lists_add call; lists_undo reverses the last list change of this conversation. lists_show puts a list on this screen as a checklist (lists_hide takes it down); say it again in words as well when nothing could be shown."
       }
     })
 })
