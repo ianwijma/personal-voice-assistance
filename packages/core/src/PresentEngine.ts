@@ -111,8 +111,8 @@ export interface PresentOutlet {
   readonly connections: (deviceId: string) => ReadonlyArray<PresentConnection>
 }
 
-/** Why an image is not there: refused (its type, its size, too many fetches at once, the cache full) or the fetch failed. */
-export type MediaRefusal = "type" | "size" | "busy" | "full" | "fetch" | "unavailable"
+/** Why an image is not there: refused (its type, its size, too many fetches at once, the cache full, an address the server may not fetch) or the fetch failed. */
+export type MediaRefusal = "type" | "size" | "busy" | "full" | "fetch" | "blocked" | "unavailable"
 export type MediaOutcome = { readonly hash: string } | { readonly refused: MediaRefusal }
 
 /** The image cache (serve mode: `/media`): fetch an address once, check it and keep it; never fails. */

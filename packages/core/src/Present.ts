@@ -423,7 +423,7 @@ export const StoredContent = Schema.Union([
     credit: Text(MAX_IMAGE_CREDIT_CHARS),
     caption: Schema.optionalKey(Text(MAX_IMAGE_CAPTION_CHARS)),
     hash: Schema.optionalKey(Schema.String.check(Schema.isPattern(MEDIA_HASH))),
-    failed: Schema.optionalKey(Schema.Literals(["type", "size", "busy", "full", "fetch", "unavailable"]))
+    failed: Schema.optionalKey(Schema.Literals(["type", "size", "busy", "full", "fetch", "blocked", "unavailable"]))
   }),
   Schema.Struct({
     kind: Schema.Literal("weather"),

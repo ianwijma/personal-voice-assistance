@@ -212,6 +212,9 @@ importers:
       '@pva/modules-builtin':
         specifier: workspace:*
         version: link:../../packages/modules-builtin
+      '@pva/net':
+        specifier: workspace:*
+        version: link:../../packages/net
       '@pva/protocol':
         specifier: workspace:*
         version: link:../../packages/protocol

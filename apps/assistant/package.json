@@ -40,6 +40,7 @@
     "@pva/module-timers": "workspace:*",
     "@pva/module-web-search": "workspace:*",
     "@pva/modules-builtin": "workspace:*",
+    "@pva/net": "workspace:*",
     "@pva/protocol": "workspace:*",
     "@pva/store-sqlite": "workspace:*",
     "@pva/stt-deepgram": "workspace:*",

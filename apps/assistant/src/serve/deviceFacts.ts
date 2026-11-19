@@ -10,7 +10,7 @@ import {
   type TargetDevice,
   type TurnPerson
 } from "@pva/core"
-import { boundaryKey, type DeclaredCapabilities, type DeviceOutputs, deviceOutputsFrom, type DevicePlace, effectiveCapabilities, roomOf, speakerAllowedFrom } from "@pva/protocol"
+import { boundaryKey, type DeclaredCapabilities, type DeviceOutputs, deviceOutputsFrom, type DevicePresentOutputs, devicePresentFrom, type DevicePlace, effectiveCapabilities, roomOf, speakerAllowedFrom } from "@pva/protocol"
 import { Effect } from "effect"
 import { deviceSettingsFrom } from "./devices.ts"
 import { type EffectiveMembers, effectiveMembersOf } from "./people.ts"
@@ -120,6 +120,11 @@ export interface DeviceFacts {
    * and shows unless an override says not.
    */
   readonly outputsOf: (deviceId: string, kind?: string) => DeviceOutputs
+  /**
+   * P10: what a device can do with a presentation now, from one place (`devicePresentFrom`): its latest declaration
+   * minus the owner's overrides (its own, else its type's). A page that never declared anything shows none.
+   */
+  readonly presentOf: (deviceId: string, kind?: string) => DevicePresentOutputs
   /** Something live changed (a connection, a declaration, visibility): the next read rebuilds the list. */
   readonly changed: () => void
   readonly devices: DevicesService
@@ -238,6 +243,13 @@ export const makeDeviceFacts = (options: DeviceFactsOptions): DeviceFacts => {
       const settings = deviceSettingsFrom(file, known ? deviceId : undefined, kind)
       const declared = (options.latestOf ?? options.declaredOf)(deviceId) ?? file.devices[deviceId]?.declared
       return deviceOutputsFrom(settings, declared?.capabilities)
+    },
+    presentOf: (deviceId, kind) => {
+      const file = current().file
+      const known = file.devices[deviceId] !== undefined
+      const settings = deviceSettingsFrom(file, known ? deviceId : undefined, kind)
+      const declared = (options.latestOf ?? options.declaredOf)(deviceId) ?? file.devices[deviceId]?.declared
+      return devicePresentFrom(settings, declared?.capabilities)
     },
     changed: () => {
       version++
