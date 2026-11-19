@@ -79,6 +79,11 @@ export interface NowPlaying {
   readonly stale: boolean
 }
 
+/** Whether an invocation's call to Home Assistant has gone out. */
+interface Sent {
+  value: boolean
+}
+
 /** What an invocation came to, kept for its repeats. */
 type Outcome = { readonly ok: true; readonly say: string } | { readonly ok: false; readonly message: string }
 
@@ -103,41 +108,47 @@ const percent = (level: number): number => Math.round(level * 100)
 /**
  * Text the module refuses to send as a content id. Home Assistant's Music Assistant integration reads one content id
  * several ways (an address with "://", a number as a library id, a path its host can open as a file, anything else as
- * a name to search), so these forms are refused: "://" or a backslash anywhere; a leading "/", "." or "~" or a drive
- * prefix; a file extension at the end; only digits. A slash inside a name (AC/DC) is allowed. This narrows what can
- * reach the file branch; it does not prove it unreachable (a relative path without an extension that the host can
- * read is still possible): a name-only lookup is missing below (docs/modules/music.md).
+ * a name to search), so these forms are refused: "://" or a backslash anywhere, a leading "/", "." or "~" or a drive
+ * prefix (`address`: an address or a path); a file extension at the end (`form`: a name of that form, "will.i.am" or
+ * "Love.exe" too, cannot be looked up safely through this connection); only digits (`digits`). A slash inside a name
+ * (AC/DC) is allowed. This narrows what can reach the file branch; it does not prove it unreachable (a relative path
+ * without an extension that the host can read is still possible): a name-only lookup is missing below
+ * (docs/modules/music.md).
  */
-export const queryProblem = (query: string): "address" | "bad" | "digits" | undefined => {
+export const queryProblem = (query: string): "address" | "form" | "bad" | "digits" | undefined => {
   const q = query.trim()
   if (q === "" || !isLine(q, QUERY_CHARS)) return "bad"
-  if (q.includes("://") || q.includes("\\") || /^[/.~]/.test(q) || /^[A-Za-z]:/.test(q) || /\.[A-Za-z0-9]{2,5}$/.test(q)) return "address"
+  if (q.includes("://") || q.includes("\\") || /^[/.~]/.test(q) || /^[A-Za-z]:/.test(q)) return "address"
+  if (/\.[A-Za-z0-9]{2,5}$/.test(q)) return "form"
   if (/^\d+$/.test(q)) return "digits"
   return undefined
 }
 
 export const makeControl = (host: Pick<ModuleHostApi, "service" | "view">, settings: Settings) =>
   Effect.gen(function*() {
-    // -- one bounded record of invocations, by their identity -------------------------------------------------------------
+    // -- one bounded record of phrase invocations, by their identity ------------------------------------------------------
     const records = new Map<string, Deferred.Deferred<Outcome>>()
     /**
-     * Runs `run` once for an invocation's identity (assistant, conversation, turn, device, source, the operation and its
-     * input): a repeat, even a concurrent one, gets the first outcome and sends nothing. A run cut short (interrupted,
-     * a defect) decided nothing: its record goes, so a retry runs, and whoever waited is told it did not finish.
-     * Without a turn there is no identity, and it simply runs.
+     * A phrase command's invocation runs once for its identity (assistant, conversation, turn, device, the operation and
+     * its input): a repeat, even a concurrent one, gets the first outcome and sends nothing. A run cut short
+     * (interrupted, a defect) before its call was sent decided nothing: its record goes, so a replay runs. Cut short
+     * after the call was sent, it may have happened: the record stays as "I may already have done that", and a replay
+     * sends nothing. Only phrases: a tool or action call made by the model has no identity of its own (the gateway gives
+     * its handler no per-call id, and a turn plus an input is not one), so it always runs: "skip two songs" skips twice.
      */
-    const once = (operation: string, input: unknown, lang: Language, run: Effect.Effect<string, ActionError | Answer>): Effect.Effect<string, ActionError> =>
+    const once = (operation: string, input: unknown, lang: Language, run: (sent: Sent) => Effect.Effect<string, ActionError | Answer>): Effect.Effect<string, ActionError> =>
       Effect.gen(function*() {
-        const outcome: Effect.Effect<Outcome> = run.pipe(
+        const sent: Sent = { value: false }
+        const outcome: Effect.Effect<Outcome> = run(sent).pipe(
           Effect.map((s): Outcome => ({ ok: true, say: s })),
           Effect.catchTag("Answer", (a) => Effect.succeed<Outcome>({ ok: true, say: a.text })),
           Effect.catchTag("ActionError", (e) => Effect.succeed<Outcome>({ ok: false, message: e.message }))
         )
         const turn = yield* CurrentTurn
         let result: Outcome
-        if (turn === undefined) result = yield* outcome
+        if (turn === undefined || turn.source !== "phrase") result = yield* outcome
         else {
-          const key = [operation, turn.assistantId, turn.conversationId, turn.turnId, turn.deviceId, turn.source, JSON.stringify(input)].join("\u0000")
+          const key = [operation, turn.assistantId, turn.conversationId, turn.turnId, turn.deviceId, JSON.stringify(input)].join("\u0000")
           const kept = records.get(key)
           if (kept !== undefined) result = yield* Deferred.await(kept)
           else {
@@ -145,25 +156,32 @@ export const makeControl = (host: Pick<ModuleHostApi, "service" | "view">, setti
             records.set(key, mine)
             if (records.size > INVOCATIONS_KEPT) records.delete(records.keys().next().value!)
             result = yield* outcome.pipe(
-              Effect.onExit((exit) =>
-                Exit.isSuccess(exit)
-                  ? Deferred.succeed(mine, exit.value)
-                  : Effect.sync(() => void (records.get(key) === mine && records.delete(key))).pipe(
-                    Effect.andThen(Deferred.succeed(mine, { ok: false, message: say(texts, lang, "unfinished") }))
-                  )
-              )
+              Effect.onExit((exit) => {
+                if (Exit.isSuccess(exit)) return Deferred.succeed(mine, exit.value)
+                // Sent: it may have happened, so the record stays and a replay sends nothing.
+                if (sent.value) return Deferred.succeed(mine, { ok: false, message: say(texts, lang, "mayHaveHappened") })
+                return Effect.sync(() => void (records.get(key) === mine && records.delete(key))).pipe(
+                  Effect.andThen(Deferred.succeed(mine, { ok: false, message: say(texts, lang, "unfinished") }))
+                )
+              })
             )
           }
         }
         return result.ok ? result.say : yield* new ActionError({ message: result.message })
       })
 
-    /** One call to one player, with its own time limit; the provider stopping during it is `StoppedDuring`. */
-    const callPlayer = (ha: HomeAssistantService, entity: HaEntity, service: string, data?: JsonObject) =>
-      ha.callService({ domain: "media_player", service, target: { entityIds: [entity.entityId] }, ...(data !== undefined ? { data } : {}) }).pipe(
+    /**
+     * One call to one player, within `timeoutMs` (default `CALL_TIMEOUT_MS`); the provider stopping during it is
+     * `StoppedDuring`. `sent` is marked right before the call goes out.
+     */
+    const callPlayer = (ha: HomeAssistantService, entity: HaEntity, service: string, data: JsonObject | undefined, sent: Sent, timeoutMs: number = CALL_TIMEOUT_MS) =>
+      Effect.suspend(() => {
+        sent.value = true
+        return ha.callService({ domain: "media_player", service, target: { entityIds: [entity.entityId] }, ...(data !== undefined ? { data } : {}) })
+      }).pipe(
         Effect.timeoutOrElse({
-          duration: CALL_TIMEOUT_MS,
-          orElse: () => Effect.fail(new HomeAssistantError({ reason: "timeout", detail: `no answer within ${CALL_TIMEOUT_MS} ms` }))
+          duration: timeoutMs,
+          orElse: () => Effect.fail(new HomeAssistantError({ reason: "timeout", detail: `no answer within ${timeoutMs} ms` }))
         }),
         Effect.catchCause((cause): Effect.Effect<never, HomeAssistantError | StoppedDuring> => {
           if (cause.reasons.some((r) => Cause.isDieReason(r) && isModuleStopped(r.defect))) return Effect.fail(new StoppedDuring())
@@ -218,11 +236,11 @@ export const makeControl = (host: Pick<ModuleHostApi, "service" | "view">, setti
       )
 
     const transport = (op: Transport, where: string | undefined, room: string | undefined, lang: Language) =>
-      once(op, { where: where ?? null }, lang, withHa(lang, (ha) =>
+      once(op, { where: where ?? null }, lang, (sent) => withHa(lang, (ha) =>
         Effect.gen(function*() {
           const entity = yield* target(ha, where, room, lang)
           const { service, asked } = TRANSPORT[op]
-          yield* callPlayer(ha, entity, service).pipe(Effect.mapError((e) => callFailure(lang, entity, e)))
+          yield* callPlayer(ha, entity, service, undefined, sent).pipe(Effect.mapError((e) => callFailure(lang, entity, e)))
           return say(texts, lang, asked, { player: playerName(entity) })
         })))
 
@@ -232,28 +250,34 @@ export const makeControl = (host: Pick<ModuleHostApi, "service" | "view">, setti
       room: string | undefined,
       lang: Language
     ) =>
-      once("play", { ...input, where: where ?? null }, lang, withHa(lang, (ha) =>
+      once("play", { ...input, where: where ?? null }, lang, (sent) => withHa(lang, (ha) =>
         Effect.gen(function*() {
           const title = input.query.trim()
           // An artist narrows a song or an album: "Artist - Title", the form Music Assistant's name search takes.
           const given = input.artist?.trim()
           const artist = (input.kind === "track" || input.kind === "album") && given !== undefined && given !== "" ? given : undefined
-          const refuse = (p: "address" | "bad") => new Answer({ text: say(texts, lang, p === "address" ? "address" : "badQuery") })
+          const refusal = (p: ReturnType<typeof queryProblem>): Answer | undefined =>
+            p === "address" ? new Answer({ text: say(texts, lang, "address") })
+            : p === "form" ? new Answer({ text: say(texts, lang, "nameForm") })
+            : p === "bad" ? new Answer({ text: say(texts, lang, "badQuery") })
+            : undefined
           const titleProblem = queryProblem(title)
-          if (titleProblem === "address" || titleProblem === "bad") return yield* refuse(titleProblem)
+          const titleRefused = refusal(titleProblem)
+          if (titleRefused !== undefined) return yield* titleRefused
           if (artist !== undefined) {
-            const artistProblem = queryProblem(artist)
-            if (artistProblem === "address" || artistProblem === "bad") return yield* refuse(artistProblem)
+            // The artist: the address, path, drive and name-form rules; an artist of digits only is a name ("311 - Amber").
+            const artistRefused = refusal(queryProblem(artist))
+            if (artistRefused !== undefined) return yield* artistRefused
           } else if (titleProblem === "digits") {
             return yield* new Answer({ text: say(texts, lang, input.kind === "track" || input.kind === "album" ? "digitsWhichArtist" : "digitsOnly", { query: title }) })
           }
           const contentId = artist === undefined ? title : `${artist} - ${title}`
-          const combined = queryProblem(contentId)
-          if (combined === "address" || combined === "bad") return yield* refuse(combined)
+          const combinedRefused = refusal(queryProblem(contentId))
+          if (combinedRefused !== undefined) return yield* combinedRefused
           const entity = yield* target(ha, where, room, lang)
           const queue = input.queue ?? "now"
           const asked = say(texts, lang, KIND_TEXT[input.kind], { name: artist === undefined ? title : say(texts, lang, "titleBy", { title, artist }) })
-          yield* callPlayer(ha, entity, "play_media", { media_content_id: contentId, media_content_type: input.kind, enqueue: ENQUEUE[queue] }).pipe(
+          yield* callPlayer(ha, entity, "play_media", { media_content_id: contentId, media_content_type: input.kind, enqueue: ENQUEUE[queue] }, sent).pipe(
             Effect.mapError((e) => callFailure(lang, entity, e, "playFailed", { query: asked }))
           )
           return say(texts, lang, queue === "next" ? "nextQueued" : queue === "add" ? "addQueued" : "playAsked", { player: playerName(entity), query: asked })
@@ -266,16 +290,16 @@ export const makeControl = (host: Pick<ModuleHostApi, "service" | "view">, setti
       room: string | undefined,
       lang: Language
     ) =>
-      once("volume", { ...input, where: where ?? null }, lang, withHa(lang, (ha) =>
+      once("volume", { ...input, where: where ?? null }, lang, (sent) => withHa(lang, (ha) =>
         Effect.gen(function*() {
           if (input.level === undefined && input.change === undefined) return yield* new Answer({ text: say(texts, lang, "volumeWhich") })
           const entity = yield* target(ha, where, room, lang)
           const player = playerName(entity)
           if (input.level !== undefined) {
-            yield* callPlayer(ha, entity, "volume_set", { volume_level: input.level / 100 }).pipe(Effect.mapError((e) => callFailure(lang, entity, e)))
+            yield* callPlayer(ha, entity, "volume_set", { volume_level: input.level / 100 }, sent).pipe(Effect.mapError((e) => callFailure(lang, entity, e)))
             return say(texts, lang, "volumeSet", { player, percent: input.level })
           }
-          yield* callPlayer(ha, entity, input.change === "up" ? "volume_up" : "volume_down").pipe(Effect.mapError((e) => callFailure(lang, entity, e)))
+          yield* callPlayer(ha, entity, input.change === "up" ? "volume_up" : "volume_down", undefined, sent).pipe(Effect.mapError((e) => callFailure(lang, entity, e)))
           return say(texts, lang, input.change === "up" ? "volumeUp" : "volumeDown", { player })
         })))
 
@@ -326,10 +350,22 @@ export const makeControl = (host: Pick<ModuleHostApi, "service" | "view">, setti
         detail: e._tag === "StoppedDuring" ? "the home-assistant module stopped during the call" : `Home Assistant: ${e.reason}`
       })
 
+    /**
+     * `Playback`'s one deadline: `PLAYBACK_LIMITS.callTimeoutMs` (3 s) from entry. Resolving the room spends from it
+     * (measured in real time: it is work on this thread and yields between its steps), and the call gets only what is
+     * left. Resolving that used it all up is `timeout` with nothing sent.
+     */
+    const deadline = () => {
+      const began = performance.now()
+      return () => PLAYBACK_LIMITS.callTimeoutMs - (performance.now() - began)
+    }
+    const outOfTime = () => new PlaybackError({ reason: "timeout", detail: "resolving the room used the whole budget; nothing was sent" })
+
     /** `Playback` (packages/core/src/Playback.ts): exactly its two operations, for the host's "stop" and volume. */
     const playback: PlaybackService = {
       pause: (room) =>
         Effect.gen(function*() {
+          const left = deadline()
           const bad = roomProblem(room)
           if (bad !== undefined) return yield* bad
           return yield* useService(host, HomeAssistant, (ha) =>
@@ -338,8 +374,10 @@ export const makeControl = (host: Pick<ModuleHostApi, "service" | "view">, setti
               if (r.kind === "not-yet") return false // the state is not known yet: nothing is done
               if (r.kind !== "player") return yield* new PlaybackError({ reason: "no_player", detail: r.kind === "ambiguous" ? "several players, none chosen" : r.kind })
               if (!PLAYING.has(r.entity.state)) return false
+              const remaining = left()
+              if (remaining <= 0) return yield* outOfTime()
               // Sent: from here a failure, the provider stopping included, is a failure, never "nothing was playing".
-              yield* callPlayer(ha, r.entity, "media_pause").pipe(Effect.mapError(playbackError))
+              yield* callPlayer(ha, r.entity, "media_pause", undefined, { value: false }, remaining).pipe(Effect.mapError(playbackError))
               return true
             })).pipe(
               // The smart-home module off before anything was sent: the player's state is not known, so nothing is done.
@@ -348,6 +386,7 @@ export const makeControl = (host: Pick<ModuleHostApi, "service" | "view">, setti
         }),
       changeVolume: (room, change) =>
         Effect.gen(function*() {
+          const left = deadline()
           const bad = roomProblem(room)
           if (bad !== undefined) return yield* bad
           if (!("to" in change)) {
@@ -364,7 +403,9 @@ export const makeControl = (host: Pick<ModuleHostApi, "service" | "view">, setti
               const r = yield* resolvePlayer(ha, settings.players, settings.useAreas, room)
               if (r.kind === "not-yet") return yield* new PlaybackError({ reason: "failed", detail: "no state from Home Assistant yet" })
               if (r.kind !== "player") return yield* new PlaybackError({ reason: "no_player", detail: r.kind === "ambiguous" ? "several players, none chosen" : r.kind })
-              yield* callPlayer(ha, r.entity, "volume_set", { volume_level: to }).pipe(Effect.mapError(playbackError))
+              const remaining = left()
+              if (remaining <= 0) return yield* outOfTime()
+              yield* callPlayer(ha, r.entity, "volume_set", { volume_level: to }, { value: false }, remaining).pipe(Effect.mapError(playbackError))
               return to
             })).pipe(Effect.catchTag("ProviderOff", () => Effect.fail(new PlaybackError({ reason: "failed", detail: "the home-assistant module is off" }))))
         })

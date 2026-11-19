@@ -12,7 +12,8 @@ import { Effect } from "effect"
  * 3. with `useAreas` on, a Home Assistant area whose name or an alias is the name, and the media players in it: one is
  *    the room's player; of several, the one Music Assistant serves (an entity with the `mass_player_type` attribute) when
  *    exactly one is; otherwise the person is asked which (never the first);
- * 4. every exposed media player whose name or an alias is the name: one is it; several, a question.
+ * 4. every exposed media player whose name or an alias is the name: one is it; several, a question counting all of them
+ *    (the Music Assistant preference is only among an area's players: a name said is never narrowed).
  *
  * A question names at most `NAMED` players and says how many there are.
  *
@@ -99,14 +100,19 @@ const matching = <T extends HaArea | HaEntity>(items: ReadonlyArray<T>, key: str
     return found
   })
 
-/** Of the candidates: one, the one Music Assistant serves, or a question naming at most `NAMED` with the count. */
-const choose = (where: string, candidates: ReadonlyArray<HaEntity>): Resolved => {
+const ask = (where: string, pool: ReadonlyArray<HaEntity>): Resolved => ({ kind: "ambiguous", where, count: pool.length, names: pool.slice(0, NAMED).map(playerName) })
+
+/** Of an area's players: one, the one Music Assistant serves, or a question naming at most `NAMED` with the count. */
+const chooseInArea = (where: string, candidates: ReadonlyArray<HaEntity>): Resolved => {
   if (candidates.length === 1) return { kind: "player", entity: candidates[0]! }
   const served = candidates.filter(isMusicAssistant)
   if (served.length === 1) return { kind: "player", entity: served[0]! }
-  const pool = served.length > 1 ? served : candidates
-  return { kind: "ambiguous", where, count: pool.length, names: pool.slice(0, NAMED).map(playerName) }
+  return ask(where, served.length > 1 ? served : candidates)
 }
+
+/** Of the players a name matches: one, or a question counting every match (no preference: the name was said). */
+const chooseByName = (where: string, candidates: ReadonlyArray<HaEntity>): Resolved =>
+  candidates.length === 1 ? { kind: "player", entity: candidates[0]! } : ask(where, candidates)
 
 /**
  * Resolve `text` (a room or a player, as said or as the device's room) to one player. `text` is at most `ROOM_CHARS`
@@ -144,13 +150,13 @@ export const resolvePlayer = (
         const areaIds = new Set(areas.map((a) => a.id))
         const areaName = oneLine(areas[0]!.name, ROOM_CHARS)
         const inArea = players.filter((p) => p.areaId !== undefined && areaIds.has(p.areaId))
-        if (inArea.length > 0) return choose(areaName, inArea)
+        if (inArea.length > 0) return chooseInArea(areaName, inArea)
         // An area of that name without a player: a player may still carry the name (step 4); otherwise it is empty.
         const byName = yield* matching(players, key)
-        return byName.length > 0 ? choose(where, byName) : { kind: "empty", where: areaName }
+        return byName.length > 0 ? chooseByName(where, byName) : { kind: "empty", where: areaName }
       }
     }
     // 4. Every player's own names, in steps.
     const byName = yield* matching(players, key)
-    return byName.length > 0 ? choose(where, byName) : { kind: "unknown", where }
+    return byName.length > 0 ? chooseByName(where, byName) : { kind: "unknown", where }
   })
