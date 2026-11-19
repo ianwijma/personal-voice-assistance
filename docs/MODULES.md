@@ -353,8 +353,9 @@ Claude Code bridge, a generated action tool, the intent agent, a phrase command,
 `host.actions.run`, a job, a press on a presentation or a notification, core's confirmed path, the CLI modes): checks the principal (§3), that the
 assistant has the module on and the tool is not switched off, runs the risk function on the validated input, then
 decides with **one function**, `decideRisk(policy, declared classes, class of this input)` (`@pva/protocol`), on the
-policy **as saved at that moment**: a save applies to the next call, without a restart. An action declared `confirm:
-true` is refused on every path before that (confirmation is off). A module route and a field action (a Test button)
+policy **as saved at that moment in serve mode**: a save applies to the next serve call, without a restart. The CLI
+modes capture the policy and refusal language at startup; a saved change applies when the CLI restarts. An action
+declared `confirm: true` is refused on every path before that (confirmation is off). A module route and a field action (a Test button)
 run with no principal: a call they make is refused before any decision.
 
 - A tool or action **every** declared class of which is refused is **not offered**: it is left out of the model's tool

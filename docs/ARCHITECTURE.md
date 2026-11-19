@@ -384,7 +384,9 @@ CurrentPrincipal: Context.Reference<Principal | undefined>       // the admitted
 - **Risk policy (P8, first version; docs/MODULES.md §4).** A household setting (Shared settings › Risk policy: flat
   keys `RISK_READ`, `RISK_CHANGE`, `RISK_MESSAGE`; `RISK_MONEY` and `RISK_SECURITY` shown fixed), one level: no
   narrowing by assistant or device. The pure functions live in `@pva/protocol` (`risk.ts`), so the server, the CLI
-  modes, the test kit and the web mock share them; `@pva/core` re-exports them (`RiskPolicy.ts`):
+  modes, the test kit and the web mock share them. `@pva/core` re-exports the decision, decoder, offer and sentence
+  helpers (`RiskPolicy.ts`), except `riskRefusalPrefix`; the save validators `riskPolicyValueProblem` and
+  `riskPolicyPatchProblems` and `riskRefusalPrefix` are exported only by `@pva/protocol`:
 
   ```ts
   type RiskOutcome = "allow" | "confirm" | "deny"
@@ -399,7 +401,7 @@ CurrentPrincipal: Context.Reference<Principal | undefined>       // the admitted
   decodeRiskPolicy(value: (key) => unknown): RiskPolicy    // flat keys; a bad value is its default; money/security deny
   riskPolicyOf(partial): RiskPolicy                        // the same decoder over an object (the kit)
   riskPolicyValueProblem(key, value): string | undefined   // one value's save check
-  riskPolicyPatchProblems(values): ReadonlyArray<{ key, message }>  // THE save check: the real section (checkPatch) and the mock
+  riskPolicyPatchProblems(values, secrets?): ReadonlyArray<{ key, message }>  // THE save check: the real section (checkPatch) and the mock
   riskReason / riskSpoken(language, decision), riskRefusalPrefix(language), riskWithheld(language), riskLanguageOf(HOME_LANGUAGE)
   ```
 
@@ -427,8 +429,9 @@ CurrentPrincipal: Context.Reference<Principal | undefined>       // the admitted
   (`effectiveRiskLanguage`, the Home section's `HOME_LANGUAGE` field alone; `serveLanguageReader`); the gateway hook
   (`servePolicyReader`) reads that record as a field: no section definitions are built and no file is touched on a
   call. The settings `ConfigProvider` serves the policy's keys as the reader resolves them, and the CLI start runs the
-  same function over what it reads. **What is checked when:** the policy at every decision (each call, each held
-  action's second admission) and each tool-list read; `sensitivity` once, when a tool finishes (its result, or its
+  same function over what it reads. Its refusal language is resolved from the original typed settings and environment
+  through Home's field before provider string encoding, once at startup. **What is checked when:** the policy at every
+  decision (each call, each held action's second admission) and each tool-list read; `sensitivity` once, when a tool finishes (its result, or its
   failure: H3, corrected after review 2: a fixed personal failure or defect where its result could be shown; with
   per-result sensitivity a typed failure goes back as the module's own sentence and a defect is withheld), before it is
   formatted or presented (H2). A completed result that waits for sibling tools is not checked

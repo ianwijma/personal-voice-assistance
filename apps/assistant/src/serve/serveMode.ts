@@ -1082,6 +1082,8 @@ export const startServe = (options: ServeOptions): Effect.Effect<ServeHandle, Ht
           instructions: ReadonlyArray<string>
           /** The turn's configuration snapshot (`TraceConfig` without the hearing, which is the device's). */
           config: AssistantTraceConfig | undefined
+          /** The live registry's offered count when this configuration was captured. */
+          offeredTools: number
         }
         | undefined
       const llmNow = () => {
@@ -1148,7 +1150,8 @@ export const startServe = (options: ServeOptions): Effect.Effect<ServeHandle, Ht
               ...(assistant !== undefined ? { maxToolRounds: assistant.toolRounds } : {})
             },
             instructions,
-            config: assistant === undefined ? undefined : traceConfigOf(assistant, mine.registry.specs.length, mine.modules, deviceId)
+            config: assistant === undefined ? undefined : traceConfigOf(assistant, mine.registry.specs.length, mine.modules, deviceId),
+            offeredTools: mine.registry.specs.length
           }
         }
         return cached
@@ -1158,15 +1161,22 @@ export const startServe = (options: ServeOptions): Effect.Effect<ServeHandle, Ht
       const setup = Effect.sync((): TurnSetup => current().setup)
       /**
        * The turn's configuration snapshot, read when its trace begins: the values `current()` resolved for the setup,
-       * made again only when the module snapshot, the assistant, its bindings or the device's voice setting changed (no
-       * prompt or registry work). The object is never changed afterwards: a trace keeps the one its turn began with.
+       * made again when the module snapshot, the assistant, its bindings, the device's voice setting or the registry's
+       * offered count changed (no prompt or registry rebuild). The object is never changed afterwards: a trace keeps
+       * the one its turn began with.
        */
       const config = (): AssistantTraceConfig | undefined => {
-        const c = cached
-        if (c !== undefined && c.snapshot === host.snapshot() && c.assistant === assistantsNow().get(assistantId) &&
-          c.llm === resources.llmFor(assistantId) && c.voiceUser === voiceUserNow() && c.tts === resources.ttsFor(c.voiceUser) &&
-          c.voiceSource === voiceSourceNow()) return c.config
-        return current().config
+        const c = cached !== undefined && cached.snapshot === host.snapshot() && cached.assistant === assistantsNow().get(assistantId) &&
+          cached.llm === resources.llmFor(assistantId) && cached.voiceUser === voiceUserNow() && cached.tts === resources.ttsFor(cached.voiceUser) &&
+          cached.voiceSource === voiceSourceNow() ? cached : current()
+        const tools = c.setup.registry.specs.length
+        if (tools !== c.offeredTools) {
+          c.offeredTools = tools
+          // Replace the snapshot: earlier traces keep their configuration. traceConfigOf also preserves zero for
+          // a subscription assistant whose tools are disabled.
+          if (c.assistant !== undefined && c.config !== undefined) c.config = traceConfigOf(c.assistant, tools, c.config.modules, deviceId)
+        }
+        return c.config
       }
       // WP-13a: a Claude subscription assistant's options for its conversations (the same object while unchanged).
       let subscriptionOf: { readonly assistant: Assistant; readonly limit: number; readonly value: SubscriptionAssistant } | undefined
