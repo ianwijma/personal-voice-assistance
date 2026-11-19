@@ -1,4 +1,4 @@
-import type { MediaOutcome, MediaPort, MediaRefusal } from "@pva/core"
+import type { IssueRegistry, MediaOutcome, MediaPort, MediaRefusal } from "@pva/core"
 import { type ContentTypePolicy, NetRefused, NetTooLarge, safeFetch, type SafeFetchError, type SafeFetchOptions, type SafeResponse } from "@pva/net"
 import { MEDIA_HASH, MEDIA_TOKEN } from "@pva/protocol"
 import { Deferred, Effect, Exit, type Scope } from "effect"
@@ -18,11 +18,13 @@ import { join } from "node:path"
  *
  * What it promises, exactly (review round 1, b8, b9): an address is not fetched again while it is in this run's bounded
  * in-memory index of addresses (at most 1,024, the oldest forgotten first; not kept across a restart); a file is never
- * served after its day, and is removed by the next hourly sweep (or before a write that needs its room). A file whose
- * removal fails stays counted against the bounds and is tried again.
+ * served after its day, and is removed by the next hourly sweep (or before a write that needs its room).
  *
- * The files survive a restart: the directory is read at start (what has expired, or is not one of its files, is
- * removed) and every file is written through a temporary file and one `rename`.
+ * The directory is the truth (review round 2, R6): its inventory (at start, and after any failed file operation, every
+ * minute until it succeeds) removes temporary files, foreign files and what is past its age, and rebuilds the counts and
+ * bytes from what is there. Any file operation that fails makes the cache "not sure": nothing new is admitted until an
+ * inventory has read every entry and what remains is inside the bounds; what is kept is still served while its file can
+ * be read. Every file is written through a temporary file and one `rename`.
  */
 
 /** How long an image is kept (and may be served) after it was fetched. */
@@ -66,6 +68,25 @@ interface Kept {
   readonly at: number
 }
 
+/** The file operations the cache uses (tests inject failures). */
+export interface MediaFs {
+  readonly mkdirSync: typeof mkdirSync
+  readonly chmodSync: typeof chmodSync
+  readonly readdirSync: (path: string) => ReadonlyArray<string>
+  readonly statSync: (path: string) => { readonly size: number; readonly mtimeMs: number; isFile(): boolean }
+  readonly readFileSync: (path: string) => Buffer
+  readonly writeFileSync: typeof writeFileSync
+  readonly utimesSync: typeof utimesSync
+  readonly renameSync: typeof renameSync
+  readonly unlinkSync: typeof unlinkSync
+}
+const NODE_FS: MediaFs = { mkdirSync, chmodSync, readdirSync: (p) => readdirSync(p), statSync: (p) => statSync(p), readFileSync: (p) => readFileSync(p), writeFileSync, utimesSync, renameSync, unlinkSync }
+
+/** Entries one inventory looks at, at most (what it removes makes the next one shorter). */
+const MAX_INVENTORY_ENTRIES = 4_096
+/** How often the cache checks whether an inventory is needed (after a fault) or the hourly removal is due. */
+const CHECK_EVERY_MS = 60_000
+
 export interface MediaCacheOptions {
   /** Its own directory (`data/media`): made `0700`, files `0600`. */
   readonly dir: string
@@ -75,101 +96,170 @@ export interface MediaCacheOptions {
   readonly fetchOptions?: Pick<SafeFetchOptions, "resolver" | "connector">
   readonly now?: () => number
   readonly log?: (line: string) => void
+  /** Where its Health issue goes (source `media`): the cache could not be read or cleaned, so nothing new is admitted. */
+  readonly issues?: IssueRegistry
   /** Smaller bounds (tests of the full cache). Default `MAX_MEDIA_FILES`, `MAX_MEDIA_BYTES`. */
   readonly limits?: { readonly files?: number; readonly bytes?: number }
+  /** The file operations (tests inject failures). Default node:fs. */
+  readonly fs?: Partial<MediaFs>
 }
 
 export interface MediaCache extends MediaPort {
   /** Answer `GET /media/<token>`: the image `resolve(token)` names (a page's own address, `PresentEngine.mediaFor`) while it is kept; else 404. */
   readonly serve: (req: http.IncomingMessage, res: http.ServerResponse, resolve: (token: string) => string | undefined) => void
-  /** What is kept and under way (tests, Health). */
-  readonly stats: () => { readonly files: number; readonly bytes: number; readonly inFlight: number; readonly stale: number }
-  /** Remove what has expired now (an hourly fiber does it by itself). */
+  /**
+   * What is kept and under way (tests, Health). `sure`: the last inventory of the directory was complete and nothing has
+   * failed since; while it is not, nothing new is admitted.
+   */
+  readonly stats: () => { readonly files: number; readonly bytes: number; readonly inFlight: number; readonly sure: boolean }
+  /** Remove what has expired now, or, while the cache is not sure, take an inventory (a fiber does both by itself). */
   readonly sweep: () => void
 }
 
 export const MEDIA_PREFIX = "/media/"
+export const MEDIA_ISSUE_SOURCE = "media"
 
 export const makeMediaCache = (options: MediaCacheOptions): Effect.Effect<MediaCache, never, Scope.Scope> =>
   Effect.gen(function*() {
     const now = options.now ?? Date.now
     const log = options.log ?? (() => undefined)
     const fetch = options.fetch ?? safeFetch
+    const fs: MediaFs = { ...NODE_FS, ...options.fs }
     const maxFiles = Math.min(MAX_MEDIA_FILES, options.limits?.files ?? MAX_MEDIA_FILES)
     const maxBytes = Math.min(MAX_MEDIA_BYTES, options.limits?.bytes ?? MAX_MEDIA_BYTES)
-    const kept = new Map<string, Kept>()
+    let kept = new Map<string, Kept>()
     const urls = new Map<string, string>()
     const inFlight = new Map<string, Deferred.Deferred<MediaOutcome>>()
     let bytes = 0
     /**
-     * Files whose removal failed (other than "not there"): never served, still counted against the bounds until their
-     * removal succeeds, tried again at every sweep and before every write (review round 1, b4).
+     * Review round 2 (R6): the directory is the truth. `sure` only after a complete inventory of it, with what remains
+     * inside the bounds, and nothing has failed since. Any failed file operation makes the cache not sure: nothing new is
+     * admitted (a fetch is refused `unavailable`) until an inventory succeeds; what is kept is still served while its file
+     * can be read. There is no list of paths to remove later: an inventory removes what it sees expired at that moment.
      */
-    const stale = new Map<string, number>()
-    let staleBytes = 0
+    let sure = false
+    let lastSweep = now()
+    const code = (e: unknown) => String((e as { code?: unknown }).code ?? e)
+    let issued = false
+    const setSure = (value: boolean) => {
+      sure = value
+      if (issued === !value) return
+      issued = !value
+      options.issues?.set(MEDIA_ISSUE_SOURCE, value ? [] : [{
+        id: "media.cache",
+        severity: "warning",
+        title: "The image cache could not be read or cleaned",
+        detail: "New images are not fetched until its directory (data/media) has been read completely; images already kept are still shown. It is tried again every minute."
+      }])
+    }
+    const fault = (why: string) => {
+      log(`Media: ${why}; no new image is kept until the image directory has been read completely`)
+      setSure(false)
+    }
     const fileOf = (k: Pick<Kept, "hash" | "type">) => join(options.dir, `${k.hash}.${MEDIA_TYPES[k.type]}`)
-    /** Remove a file; true when it is gone (removed, or not there). */
+    /** Remove a file; true when it is gone (removed, or not there). A failure is a fault. */
     const unlink = (path: string): boolean => {
       try {
-        unlinkSync(path)
+        fs.unlinkSync(path)
         return true
       } catch (e) {
         if ((e as { code?: unknown }).code === "ENOENT") return true
-        log(`Media: ${path} could not be removed (${String((e as { code?: unknown }).code ?? e)}); tried again`)
+        fault(`${path} could not be removed (${code(e)})`)
         return false
       }
     }
-    const removeLater = (path: string, size: number) => {
-      if (stale.has(path)) return
-      stale.set(path, size)
-      staleBytes += size
-    }
-    const retryStale = () => {
-      for (const [path, size] of [...stale]) {
-        if (!unlink(path)) continue
-        stale.delete(path)
-        staleBytes -= size
+
+    /**
+     * Read the directory as it is: remove temporary files, what is not one of its files, and what is past its age; then,
+     * oldest first, what is over the bounds. Counts and bytes are rebuilt from what is really there. Sure only when every
+     * entry could be read and removed where it had to be, and what remains is inside the bounds. An unreadable entry is
+     * never taken as absent: the inventory is then incomplete.
+     */
+    const inventory = () => {
+      let complete = true
+      let names: ReadonlyArray<string>
+      try {
+        fs.mkdirSync(options.dir, { recursive: true, mode: 0o700 })
+        fs.chmodSync(options.dir, 0o700)
+        names = fs.readdirSync(options.dir)
+      } catch (e) {
+        fault(`the image directory ${options.dir} could not be read (${code(e)})`)
+        return
       }
-    }
-    const remove = (k: Kept) => {
-      // Not served from now on; its place in the bounds is given back only once the file is gone.
-      kept.delete(k.hash)
-      bytes -= k.bytes
-      const path = fileOf(k)
-      if (!unlink(path)) removeLater(path, k.bytes)
-    }
-    const sweep = () => {
+      if (names.length > MAX_INVENTORY_ENTRIES) {
+        complete = false
+        names = names.slice(0, MAX_INVENTORY_ENTRIES)
+      }
       const t = now()
-      retryStale()
-      for (const k of [...kept.values()]) if (k.at + MEDIA_KEEP_MS <= t) remove(k)
+      const found: Array<Kept> = []
+      for (const name of names) {
+        const path = join(options.dir, name)
+        const m = /^([0-9a-f]{64})\.([a-z]+)$/.exec(name)
+        const type = m === null ? undefined : EXTENSIONS[m[2]!]
+        if (m === null || type === undefined) {
+          // A temporary file (an interrupted write) or a foreign one.
+          if (!unlink(path)) complete = false
+          continue
+        }
+        let st: ReturnType<MediaFs["statSync"]>
+        try {
+          st = fs.statSync(path)
+        } catch (e) {
+          if ((e as { code?: unknown }).code === "ENOENT") continue
+          fault(`${path} could not be read (${code(e)})`)
+          complete = false
+          continue
+        }
+        if (!st.isFile() || st.size > MAX_IMAGE_BYTES || st.mtimeMs + MEDIA_KEEP_MS <= t) {
+          if (!unlink(path)) complete = false
+          continue
+        }
+        found.push({ hash: m[1]!, type, bytes: st.size, at: st.mtimeMs })
+      }
+      // Over the bounds (smaller bounds than the files were kept under): the oldest go first.
+      found.sort((a, b) => a.at - b.at)
+      let total = found.reduce((n, k) => n + k.bytes, 0)
+      while (found.length > maxFiles || total > maxBytes) {
+        const oldest = found[0]!
+        if (!unlink(fileOf(oldest))) {
+          complete = false
+          break
+        }
+        found.shift()
+        total -= oldest.bytes
+      }
+      if (complete) {
+        kept = new Map(found.map((k) => [k.hash, k]))
+        bytes = total
+        lastSweep = t
+        setSure(true)
+        return
+      }
+      // Incomplete: what could be read is still served; nothing new is admitted.
+      for (const k of found) kept.set(k.hash, k)
+      setSure(false)
+    }
+
+    /** While sure: remove what has expired (a failure makes the cache not sure). While not sure: an inventory. */
+    const sweep = () => {
+      if (!sure) {
+        inventory()
+      } else {
+        const t = now()
+        lastSweep = t
+        for (const k of [...kept.values()]) {
+          if (k.at + MEDIA_KEEP_MS > t) continue
+          // Not served from now on; if its file cannot be removed the cache is not sure until an inventory removes it.
+          kept.delete(k.hash)
+          bytes -= k.bytes
+          unlink(fileOf(k))
+        }
+      }
       for (const [url, hash] of urls) if (!kept.has(hash)) urls.delete(url)
     }
 
     // The directory: its own, private; what is there is read back (the cache survives a restart).
-    try {
-      mkdirSync(options.dir, { recursive: true, mode: 0o700 })
-      chmodSync(options.dir, 0o700)
-      for (const name of readdirSync(options.dir)) {
-        const path = join(options.dir, name)
-        const m = /^([0-9a-f]{64})\.([a-z]+)$/.exec(name)
-        const type = m === null ? undefined : EXTENSIONS[m[2]!]
-        try {
-          const st = statSync(path)
-          if (m === null || type === undefined || !st.isFile() || st.size > MAX_IMAGE_BYTES || st.mtimeMs + MEDIA_KEEP_MS <= now() || kept.size >= maxFiles || bytes + st.size > maxBytes) {
-            // Debris (an interrupted write, a foreign file), an expired or an over-bound file: removed; if that fails,
-            // counted against the bounds and tried again.
-            if (!unlink(path)) removeLater(path, st.isFile() ? st.size : 0)
-            continue
-          }
-          kept.set(m[1]!, { hash: m[1]!, type, bytes: st.size, at: st.mtimeMs })
-          bytes += st.size
-        } catch {
-          // Unreadable: left alone, not served.
-        }
-      }
-    } catch (e) {
-      log(`Media: the image directory ${options.dir} could not be read (${String(e)}); images are fetched again`)
-    }
+    inventory()
 
     const refusalOf = (e: SafeFetchError): MediaRefusal =>
       e instanceof NetTooLarge ? "size" : e instanceof NetRefused ? (e.rule === "content-type" ? "type" : "blocked") : "fetch"
@@ -190,25 +280,29 @@ export const makeMediaCache = (options: MediaCacheOptions): Effect.Effect<MediaC
         if (MEDIA_TYPES[said] === undefined || is !== said) return { refused: "type" } satisfies MediaOutcome
         const hash = createHash("sha256").update(r.body).digest("hex")
         const t = now()
-        // What has expired is dealt with before the same bytes are matched against it (b5): an expired copy is a new admission.
+        // What has expired is dealt with before the same bytes are matched against it (b5): an expired copy is a new
+        // admission. While the cache is not sure (R6), this is an inventory; nothing new is admitted until one succeeds.
         sweep()
+        if (!sure) return { refused: "unavailable" } satisfies MediaOutcome
         const already = kept.get(hash)
         if (already === undefined) {
-          if (kept.size + stale.size >= maxFiles || bytes + staleBytes + r.body.length > maxBytes) return { refused: "full" } satisfies MediaOutcome
+          if (kept.size >= maxFiles || bytes + r.body.length > maxBytes) return { refused: "full" } satisfies MediaOutcome
           const k: Kept = { hash, type: said, bytes: r.body.length, at: t }
           const tmp = join(options.dir, `.tmp-${randomBytes(8).toString("hex")}`)
           try {
-            writeFileSync(tmp, r.body, { mode: 0o600 })
+            fs.writeFileSync(tmp, r.body, { mode: 0o600 })
             // The file's time is when it was fetched: what a restart reads back to keep it for the rest of its day.
-            utimesSync(tmp, t / 1000, t / 1000)
-            renameSync(tmp, fileOf(k))
+            fs.utimesSync(tmp, t / 1000, t / 1000)
+            fs.renameSync(tmp, fileOf(k))
           } catch (e) {
+            // Not kept. Whatever is left on disk is not counted here: the cache is not sure, and the inventory that makes
+            // it sure again removes the temporary file (or finds the file the rename made) and counts what is there.
+            fault(`an image could not be kept (${code(e)})`)
             try {
-              unlinkSync(tmp)
+              fs.unlinkSync(tmp)
             } catch {
-              // Not written.
+              // The inventory removes it.
             }
-            log(`Media: an image could not be kept (${String(e)})`)
             return { refused: "fetch" } satisfies MediaOutcome
           }
           kept.set(hash, k)
@@ -258,9 +352,12 @@ export const makeMediaCache = (options: MediaCacheOptions): Effect.Effect<MediaC
       if (k === undefined || k.at + MEDIA_KEEP_MS <= now()) return notFound(res)
       let body: Buffer
       try {
-        body = readFileSync(fileOf(k))
-      } catch {
-        remove(k)
+        body = fs.readFileSync(fileOf(k))
+      } catch (e) {
+        // Not served; what is on disk is decided by the next inventory.
+        kept.delete(k.hash)
+        bytes -= k.bytes
+        fault(`${fileOf(k)} could not be read (${code(e)})`)
         return notFound(res)
       }
       res.writeHead(200, {
@@ -279,13 +376,16 @@ export const makeMediaCache = (options: MediaCacheOptions): Effect.Effect<MediaC
       res.end(req.method === "HEAD" ? undefined : body)
     }
 
-    // What has expired goes every hour too, not only when something is fetched.
-    yield* Effect.forkScoped(Effect.forever(Effect.andThen(Effect.sleep(SWEEP_EVERY_MS), Effect.sync(sweep))))
+    // Every minute: an inventory while the cache is not sure; what has expired goes every hour, not only when something
+    // is fetched.
+    yield* Effect.forkScoped(Effect.forever(Effect.andThen(Effect.sleep(CHECK_EVERY_MS), Effect.sync(() => {
+      if (!sure || now() - lastSweep >= SWEEP_EVERY_MS) sweep()
+    }))))
 
     return {
       fetch: cacheFetch,
       serve,
-      stats: () => ({ files: kept.size, bytes, inFlight: inFlight.size, stale: stale.size }),
+      stats: () => ({ files: kept.size, bytes, inFlight: inFlight.size, sure }),
       sweep
     } satisfies MediaCache
   })
