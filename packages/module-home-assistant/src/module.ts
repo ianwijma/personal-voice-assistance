@@ -13,12 +13,13 @@ import {
   ModuleStartError,
   normalizePhrase,
   Param,
+  type PresentHandle,
   Setting,
   type SettingsOf,
   type SharedContext,
   ToolError
 } from "@pva/core"
-import { Clock, Effect, Schema } from "effect"
+import { Clock, Effect, Queue, Schema } from "effect"
 import { type HaServiceCall, HomeAssistant, homeLanguage, type JsonObject, type Language, say } from "@pva/module-contracts"
 import { checkAddressSetting, type HomeAssistantClient, type HomeAssistantConfig, HomeAssistantError, makeHomeAssistantClient, type NetDeps, normalizeBaseUrl } from "./client.ts"
 import {
@@ -31,6 +32,7 @@ import {
   type ChoiceKind,
   CHOICE_KINDS,
   COVER_SET_POSITION,
+  type Area,
   type Entity,
   HERE,
   type House,
@@ -53,6 +55,7 @@ import { addressSecrets, clip, fromUpstream, sanitize, type Secrets, secretList 
 import { holdsForm, secretForms } from "./secrets.ts"
 import { type CallProblem, makeTransport } from "./service.ts"
 import { listOf, numberOf, sentence, type TextKey, texts } from "./texts.ts"
+import { type Listing, listing, roomNow } from "./whatsOn.ts"
 
 export interface HomeAssistantDeps {
   /** `@pva/net`'s resolver and connector: in tests the kit's offline network (no test reaches the network). Default: the real ones. */
@@ -700,6 +703,31 @@ const defineHomeAssistant = (deps: HomeAssistantDeps) =>
         /** The house now, for a question (at most 3 s). */
         const live = Effect.suspend(() => shared.load(Math.min(shared.timeoutMs, TURN_CALL_MS))).pipe(Effect.mapError((e) => new ActionError(sanitize(secrets, { message: failureText(lang(), e) }))))
 
+        /**
+         * The "what is on" lists this part has shown, by device (one transient list a device shows at a time), so each
+         * follows the house: replaced when what is on changes, taken down when nothing is on any more, when a command
+         * changed something, when the last read failed or the room is gone. At most `MAX_SHOWN_LISTS`; kept in memory
+         * with their handles, which die with this part: after a restart the lists are gone (a transient list ends with
+         * the part that made it) and the next question shows a new one.
+         */
+        interface ShownList {
+          readonly handle: PresentHandle
+          readonly areaId: string
+          /** What it shows now (its presentation as JSON), to tell a change from a read that changed nothing. */
+          readonly content: string
+        }
+        const shownLists = new Map<string, ShownList>()
+        const MAX_SHOWN_LISTS = 8
+        const takeDown = (deviceId: string) =>
+          Effect.suspend(() => {
+            const shown = shownLists.get(deviceId)
+            shownLists.delete(deviceId)
+            return shown === undefined ? Effect.void : Effect.catchCause(Effect.asVoid(shown.handle.dismiss), () => Effect.void)
+          })
+        const takeDownAll = Effect.suspend(() => Effect.forEach([...shownLists.keys()], takeDown, { discard: true }))
+        /** What "what is on" is about: the lights and switches the assistant uses. */
+        const onKinds: ReadonlySet<string> = new Set(["light", "switch"].filter((k) => chosen.has(k)))
+
         /** A temperature of the installation (or a sensor's own unit) in the household's unit; `undefined`: not known. */
         const toHousehold = (house: House) => (v: number, from: TemperatureUnit | undefined): number | undefined => {
           const unit = from ?? house.temperatureUnit
@@ -713,6 +741,8 @@ const defineHomeAssistant = (deps: HomeAssistantDeps) =>
         const callAll = (calls: ReadonlyArray<HaServiceCall>) =>
           Effect.gen(function*() {
             const results = yield* Effect.all(calls.map((c) => Effect.result(shared.call(c, Math.min(shared.timeoutMs, TURN_CALL_MS)))), { concurrency: "unbounded" })
+            // Whatever came of it, a list of what is on may no longer be true: it comes down.
+            yield* takeDownAll
             const problems = results.flatMap((r) => (r._tag === "Failure" ? [r.failure] : []))
             if (problems.length === 0) return
             const l = lang()
@@ -737,13 +767,15 @@ const defineHomeAssistant = (deps: HomeAssistantDeps) =>
           input: string,
           vocabulary: ReadonlySet<string>,
           plan: (things: ReadonlyArray<Entity>, l: Language, house: House) => Plan,
-          done: (what: string, things: ReadonlyArray<Entity>, house: House) => string
+          done: (what: string, things: ReadonlyArray<Entity>, house: House) => string,
+          /** A phrase's room slot is the room's name as said, or a whole request: read as a request in any house. */
+          asRequest = false
         ) =>
           Effect.gen(function*() {
             const l = lang()
             const turn = yield* CurrentTurn
             const view = yield* cached
-            const r = resolveTarget(view.house, kind, view.names[kind], input, turn?.room, resolverOf(kind, vocabulary))
+            const r = resolveTarget(view.house, kind, view.names[kind], input, turn?.room, asRequest ? (index, text) => resolveInSentence(index, text, vocabulary) : resolverOf(kind, vocabulary))
             if (r._tag !== "things") {
               const said = unresolvedText(l, kind, r, view.house.incomplete.has(kind))
               if ("ask" in said) return { say: said.ask }
@@ -783,6 +815,9 @@ const defineHomeAssistant = (deps: HomeAssistantDeps) =>
         const LIGHTS_ON = ["turn on the kitchen lights", "lights on", "living room lights on", "doe het licht aan in de woonkamer", "licht aan"]
         const LIGHTS_OFF = ["turn off the bedroom light", "lights off", "lights off in the office", "doe het licht uit in de keuken", "licht uit"]
         const BRIGHTNESS = ["dim the living room to 30 percent", "set the desk lamp to half", "zet de woonkamer op veertig procent"]
+        // The one run of each command: the action, its phrase form and the phrase form with a room's name all call it.
+        const lightsOn = (t: string | undefined, asRequest = false) => command("light", t ?? HERE, vocab(LIGHTS_ON, "light"), turnCalls("turn_on"), (what) => sentence(lang(), "turnedOn", { what }), asRequest)
+        const lightsOff = (t: string | undefined, asRequest = false) => command("light", t ?? HERE, vocab(LIGHTS_OFF, "light"), turnCalls("turn_off"), (what) => sentence(lang(), "turnedOff", { what }), asRequest)
         const lightActions: ReadonlyArray<ActionDefinition<any>> = [
           defineAction({
             id: "lights_on",
@@ -790,8 +825,10 @@ const defineHomeAssistant = (deps: HomeAssistantDeps) =>
             description: "Switch on the lights here (the asking device's room), in a room, one light, or every light. Not for dimming to a level: that is set_brightness.",
             examples: LIGHTS_ON,
             params: { target: lightTarget },
+            // Said without a room: the device's own room (the target is left out, so it is here, as for every other path).
+            phrases: { en: ["lights on", "turn on the lights", "turn the lights on"], nl: ["licht aan", "lampen aan", "doe het licht aan", "zet het licht aan"] },
             risk: "change",
-            run: ({ target: t }) => command("light", (t as string | undefined) ?? HERE, vocab(LIGHTS_ON, "light"), turnCalls("turn_on"), (what) => sentence(lang(), "turnedOn", { what }))
+            run: ({ target: t }) => lightsOn(t as string | undefined)
           }),
           defineAction({
             id: "lights_off",
@@ -799,8 +836,9 @@ const defineHomeAssistant = (deps: HomeAssistantDeps) =>
             description: "Switch off the lights here, in a room, one light, or every light.",
             examples: LIGHTS_OFF,
             params: { target: lightTarget },
+            phrases: { en: ["lights off", "turn off the lights", "turn the lights off"], nl: ["licht uit", "lampen uit", "doe het licht uit", "zet het licht uit"] },
             risk: "change",
-            run: ({ target: t }) => command("light", (t as string | undefined) ?? HERE, vocab(LIGHTS_OFF, "light"), turnCalls("turn_off"), (what) => sentence(lang(), "turnedOff", { what }))
+            run: ({ target: t }) => lightsOff(t as string | undefined)
           }),
           defineAction({
             id: "set_brightness",
@@ -899,6 +937,19 @@ const defineHomeAssistant = (deps: HomeAssistantDeps) =>
         /** Temperatures here (or in a room); the whole house only when the device has no room that is an area. */
         const roomTarget = nameParam("room", "Room", { optional: true, question: "Which room does the question refer to? \"Here\" when it names none." })
 
+        /**
+         * What a room parameter's text names: the value of its option ("here", "area:<id>", an "ask:" for a name two
+         * rooms share), or the sentence to say (not known, or more than one).
+         */
+        const roomNamed = (view: HouseView, room: string | undefined, resolve: (index: NameIndex, text: string) => string | { readonly ask: ReadonlyArray<string> } | undefined): { readonly say: string } | { readonly value: string } => {
+          const l = lang()
+          const value = resolve(view.names.room, room ?? HERE)
+          if (value === undefined) return { say: say(texts, l, "roomUnknown", { room: String(room ?? "") }) }
+          if (typeof value !== "string") return { say: say(texts, l, "whichOne", { name: String(room ?? ""), options: listOf(l, value.ask, 4) }) }
+          if (value.startsWith("ask:")) return { say: say(texts, l, "whichOne", { name: view.names.room.options.find((o) => o.value === value)?.label ?? String(room ?? ""), options: listOf(l, view.names.room.asks.get(value) ?? [], 4) }) }
+          return { value }
+        }
+
         const CLIMATE_SET = ["make it 21 degrees in here", "set the living room to twenty", "zet de verwarming op 20 graden"]
         const CLIMATE_MODE = ["turn the heating off", "set the bedroom to heat", "zet de verwarming uit"]
         const climateActions: ReadonlyArray<ActionDefinition<any>> = [
@@ -973,10 +1024,9 @@ const defineHomeAssistant = (deps: HomeAssistantDeps) =>
               const house = view.house
               const isTemp = (e: Entity) => (e.kind === "climate" && chosen.has("climate")) || (e.kind === "sensor" && chosen.has("sensor") && e.deviceClass === "temperature")
               const resolve = resolverOf("room", vocabularyOf(["how warm is it in here", "what's the temperature", "hoe warm is het hier", "temperature", "warm", "is", "it", "what", "how", "hoe", "het", "hier", "here"], []))
-              const value = resolve(view.names.room, (room as string | undefined) ?? HERE)
-              if (value === undefined) return { say: say(texts, l, "roomUnknown", { room: String(room ?? "") }) }
-              if (typeof value !== "string") return { say: say(texts, l, "whichOne", { name: String(room ?? ""), options: listOf(l, value.ask, 4) }) }
-              if (value.startsWith("ask:")) return { say: say(texts, l, "whichOne", { name: view.names.room.options.find((o) => o.value === value)?.label ?? String(room ?? ""), options: listOf(l, view.names.room.asks.get(value) ?? [], 4) }) }
+              const named = roomNamed(view, room as string | undefined, resolve)
+              if ("say" in named) return { say: named.say }
+              const value = named.value
               let area: { readonly id: string; readonly name: string } | undefined
               if (value === HERE) {
                 const a = areaOfRoom(house, turn?.room)
@@ -1019,6 +1069,8 @@ const defineHomeAssistant = (deps: HomeAssistantDeps) =>
         const COVERS_STOP = ["stop the blinds", "stop de rolluiken"]
         const COVER_POSITION = ["set the blinds to half", "open the kitchen blinds to 30 percent", "zet de rolluiken op de helft"]
         const NOT_MOVED = "Only blinds, curtains, shades, shutters and awnings: a garage door, a gate, a door or a cover without such a class is never moved."
+        const coversOpen = (t: string | undefined, asRequest = false) => command("cover", t ?? HERE, vocab(COVERS_OPEN, "cover"), turnCalls("open_cover"), (what) => sentence(lang(), "opening", { what }), asRequest)
+        const coversClose = (t: string | undefined, asRequest = false) => command("cover", t ?? HERE, vocab(COVERS_CLOSE, "cover"), turnCalls("close_cover"), (what) => sentence(lang(), "closing", { what }), asRequest)
         const coverActions: ReadonlyArray<ActionDefinition<any>> = [
           defineAction({
             id: "covers_open",
@@ -1026,8 +1078,9 @@ const defineHomeAssistant = (deps: HomeAssistantDeps) =>
             description: `Open a blind or shade, or every one here or in a room. ${NOT_MOVED}`,
             examples: COVERS_OPEN,
             params: { target: coverTarget },
+            phrases: { en: ["open the blinds"], nl: ["doe de rolluiken open", "doe de zonwering open"] },
             risk: "change",
-            run: ({ target: t }) => command("cover", (t as string | undefined) ?? HERE, vocab(COVERS_OPEN, "cover"), turnCalls("open_cover"), (what) => sentence(lang(), "opening", { what }))
+            run: ({ target: t }) => coversOpen(t as string | undefined)
           }),
           defineAction({
             id: "covers_close",
@@ -1035,8 +1088,9 @@ const defineHomeAssistant = (deps: HomeAssistantDeps) =>
             description: `Close a blind or shade, or every one here or in a room. ${NOT_MOVED}`,
             examples: COVERS_CLOSE,
             params: { target: coverTarget },
+            phrases: { en: ["close the blinds"], nl: ["doe de rolluiken dicht", "doe de zonwering dicht"] },
             risk: "change",
-            run: ({ target: t }) => command("cover", (t as string | undefined) ?? HERE, vocab(COVERS_CLOSE, "cover"), turnCalls("close_cover"), (what) => sentence(lang(), "closing", { what }))
+            run: ({ target: t }) => coversClose(t as string | undefined)
           }),
           defineAction({
             id: "covers_stop",
@@ -1179,12 +1233,141 @@ const defineHomeAssistant = (deps: HomeAssistantDeps) =>
             })
         })
 
+        // -----------------------------------------------------------------------------------------------------------------
+        // Phrase commands with a room's name. A phrase slot cannot be a list the module fills while it runs (the target of
+        // the actions above is one in most houses), so a room's name is taken as text here and resolved by the same
+        // lookup, then run by the very same `command` as the action it is the phrase form of: the same refusals, the same
+        // sentences, the same risk class. Not offered to the model as tools; one example each.
+        const roomSlot = Param.text({ label: "Room or device", after: [], maxWords: 6, ask: "Which room?" })
+        const phraseForm = (id: string, label: string, formOf: string, phrases: { readonly en: ReadonlyArray<string>; readonly nl: ReadonlyArray<string> }, run: (room: string) => ReturnType<typeof lightsOn>) =>
+          defineAction({
+            id,
+            label,
+            description: `The phrase form of ${formOf} with a room or a device named in the sentence ("${phrases.en[0]!.replace("{room}", "the kitchen")}"); prefer ${formOf}.`,
+            examples: [phrases.en[0]!.replace("{room}", "the kitchen"), phrases.nl[0]!.replace("{room}", "de keuken")],
+            params: { room: roomSlot },
+            phrases,
+            offerAsTool: false,
+            risk: "change",
+            run: ({ room }) => run(String(room))
+          })
+        const lightPhrases: ReadonlyArray<ActionDefinition<any>> = [
+          phraseForm("lights_on_in", "Turn lights on in a room", "lights_on", {
+            en: ["lights on in {room}", "turn on the lights in {room}", "turn the lights on in {room}", "turn on the {room} lights", "turn the {room} lights on"],
+            nl: ["licht aan in {room}", "doe het licht aan in {room}", "zet het licht aan in {room}"]
+          }, (room) => lightsOn(room, true)),
+          phraseForm("lights_off_in", "Turn lights off in a room", "lights_off", {
+            en: ["lights off in {room}", "turn off the lights in {room}", "turn the lights off in {room}", "turn off the {room} lights", "turn the {room} lights off"],
+            nl: ["licht uit in {room}", "doe het licht uit in {room}", "zet het licht uit in {room}"]
+          }, (room) => lightsOff(room, true))
+        ]
+        const coverPhrases: ReadonlyArray<ActionDefinition<any>> = [
+          phraseForm("covers_open_in", "Open the blinds in a room", "covers_open", {
+            en: ["open the blinds in {room}", "open the {room} blinds"],
+            nl: ["doe de rolluiken open in {room}", "doe de zonwering open in {room}"]
+          }, (room) => coversOpen(room, true)),
+          phraseForm("covers_close_in", "Close the blinds in a room", "covers_close", {
+            en: ["close the blinds in {room}", "close the {room} blinds"],
+            nl: ["doe de rolluiken dicht in {room}", "doe de zonwering dicht in {room}"]
+          }, (room) => coversClose(room, true))
+        ]
+
+        // -----------------------------------------------------------------------------------------------------------------
+        // What is on in a room: the answer, and the same as a transient list on the screen of the device that asked.
+        const WHATS_ON = ["what is on in the kitchen", "what is on here", "wat staat er aan in de keuken"]
+        const whatsOnVocabulary = vocabularyOf([...WHATS_ON, "what's on in the living room", "wat staat er hier aan"], ["what", "whats", "is", "on", "here", "wat", "staat", "er", "aan", "hier", "which", "lights", "switches"])
+
+        /**
+         * Show the list on the device that asked (the Presenter decides whether its screen takes it: no display, offline,
+         * a kind its page cannot draw: nothing changes about the answer) and keep its handle, so it follows the data.
+         * Showing a list for a device replaces its older one; an empty answer shows none and takes the older one down.
+         */
+        const showListing = (deviceId: string | undefined, area: Area, out: Listing) =>
+          Effect.gen(function*() {
+            if (deviceId === undefined) return
+            yield* takeDown(deviceId)
+            if (out.present === undefined) return
+            const handle = yield* Effect.catchCause(ctx.present.show("origin", out.present), () => Effect.succeed(undefined))
+            if (handle === undefined) return
+            // Shown nowhere (no screen, not connected): nothing to keep, and nothing left waiting for a screen to appear.
+            if (!handle.outcome.devices.some((d) => d.shown)) return yield* Effect.catchCause(handle.dismiss, () => Effect.succeed(false))
+            shownLists.set(deviceId, { handle, areaId: area.id, content: JSON.stringify(out.present) })
+            if (shownLists.size > MAX_SHOWN_LISTS) yield* takeDown(shownLists.keys().next().value!)
+          })
+
+        /** After every kept read of the house: each list shown follows what is on now, or comes down. */
+        const followLists = Effect.gen(function*() {
+          for (const [deviceId, shown] of [...shownLists]) {
+            const view = shared.view()
+            const area = view?.house.areas.find((a) => a.id === shown.areaId)
+            // The last read failed (what is on is no longer known) or the room is gone: it comes down.
+            if (view === undefined || shared.problem() !== undefined || area === undefined) {
+              yield* takeDown(deviceId)
+              continue
+            }
+            const out = listing(lang(), area, roomNow(view.house, area, onKinds))
+            if (out.present === undefined) {
+              yield* takeDown(deviceId)
+              continue
+            }
+            const content = JSON.stringify(out.present)
+            if (content === shown.content) continue
+            const updated = yield* Effect.catchCause(shown.handle.update(out.present), () => Effect.succeed(undefined))
+            // It had ended or was replaced (by another module's list, a newer one): nothing left to follow.
+            if (updated === undefined) shownLists.delete(deviceId)
+            else shownLists.set(deviceId, { ...shown, content })
+          }
+        })
+        const wake = yield* Queue.sliding<void>(1)
+        yield* Effect.acquireRelease(
+          Effect.sync(() => shared.onChange(() => void Queue.offerUnsafe(wake, undefined))),
+          (off) => Effect.sync(off)
+        )
+        yield* Effect.forkScoped(Effect.forever(Effect.andThen(Queue.take(wake), Effect.catchCause(followLists, () => Effect.void))))
+
+        const whatsOn = defineAction({
+          id: "whats_on",
+          label: "What is on in a room",
+          description: "Say which lights and switches are on in a room (here by default), and show them as a list on the screen of the device that asked. A question, not a command.",
+          examples: WHATS_ON,
+          params: { room: Param.text({ label: "Room", after: [], maxWords: 6, optional: true, ask: "Which room?", question: "Which room does the question refer to? \"Here\" when it names none." }) },
+          phrases: {
+            en: ["what is on in {room}", "what's on in {room}", "what is on here"],
+            nl: ["wat staat er aan in {room}", "wat staat er hier aan"]
+          },
+          offerAsTool: false,
+          risk: "read",
+          run: ({ room }) =>
+            Effect.gen(function*() {
+              const l = lang()
+              const turn = yield* CurrentTurn
+              const view = yield* live
+              const house = view.house
+              const named = roomNamed(view, room as string | undefined, (index, text) => resolveInSentence(index, text, whatsOnVocabulary))
+              if ("say" in named) return { say: named.say }
+              let area: Area | undefined
+              if (named.value === HERE) {
+                const a = areaOfRoom(house, turn?.room)
+                if (a._tag === "ambiguous") return { say: say(texts, l, "whichOne", { name: turn?.room ?? "", options: listOf(l, a.labels, 4) }) }
+                if (a._tag === "none") return { say: turn?.room === undefined || turn.room.trim() === "" ? say(texts, l, "whichRoom") : say(texts, l, "roomUnknown", { room: turn.room }) }
+                area = a.area
+              } else {
+                area = house.areas.find((a) => `area:${a.id}` === named.value)
+              }
+              if (area === undefined) return { say: say(texts, l, "roomUnknown", { room: String(room ?? "") }) }
+              const out = listing(l, area, roomNow(house, area, onKinds))
+              yield* showListing(turn?.deviceId, area, out)
+              return { say: out.say }
+            })
+        })
+
         const actions: Array<ActionDefinition<any>> = []
-        if (offers("light")) actions.push(...lightActions)
+        if (offers("light")) actions.push(...lightActions, ...lightPhrases)
+        if (offers("light") || offers("switch")) actions.push(whatsOn)
         if (offers("switch")) actions.push(...switchActions)
         if (offers("climate")) actions.push(...climateActions)
         if (offers("climate") || offers("sensor")) actions.push(climateStatus)
-        if (offers("cover")) actions.push(...coverActions)
+        if (offers("cover")) actions.push(...coverActions, ...coverPhrases)
         if (offers("scene")) actions.push(sceneAction)
         if (offers("lock") || (chosen.has("cover") && present?.has("lock") === true)) actions.push(locksStatus)
 

@@ -95,6 +95,27 @@ describe("home-assistant: the main thread, in the largest supported house", () =
       assert.isBelow(tool.worst, bound(10))
     }), 60_000)
 
+  it.effect("a phrase's answer with its list, in the largest supported house: what is on in a room holds the main thread less than 10 ms at a time", () =>
+    Effect.gen(function*() {
+      // 2,000 lights, all on, 50 to a room: the answer reads the house again, builds the list (twelve rows) and shows it.
+      const ha = makeFakeHa({ areas: areas40(), entities: lights(HOUSE_LIMITS.supported, "on") })
+      const kit = yield* startTestModule(homeAssistantModule({ net: ha.net }), configured())
+      // Warm: the first call compiles what every later one runs.
+      yield* kit.phrases.say("what is on in the kitchen", { device: "kitchen-display" })
+      const first = yield* longestStop(kit.phrases.say("what is on in the kitchen", { device: "kitchen-display" }))
+      assert.isTrue(first.value.taken)
+      yield* kit.present.settle
+      const shown = kit.present.shown("kitchen-display")
+      assert.strictEqual(shown.length, 1)
+      assert.strictEqual(shown[0]!.content.kind === "list" ? shown[0]!.content.items.length : 0, 12)
+      // And the plain commands by phrase, as the device's own room.
+      const off = yield* longestStop(kit.phrases.say("lights off", { device: "kitchen-display" }))
+      assert.isTrue(off.value.taken)
+      console.log(`"what is on in the kitchen" with its list among ${HOUSE_LIMITS.supported} lights: longest stop ${first.worst.toFixed(1)} ms; "lights off": ${off.worst.toFixed(1)} ms`)
+      assert.isBelow(first.worst, bound(10))
+      assert.isBelow(off.worst, bound(10))
+    }), 60_000)
+
   it.effect("the lookup itself is a few map reads: a five-word request in the largest supported house", () =>
     Effect.gen(function*() {
       const areas = areas40()
