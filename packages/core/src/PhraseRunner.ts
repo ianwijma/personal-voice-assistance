@@ -1,6 +1,6 @@
 import { Cause, Clock, Data, Effect, Exit } from "effect"
 import { ACTION_TIMEOUT_MS, ActionError, type ActionOutcome, actionToolName, type RegisteredAction } from "./Actions.ts"
-import { type ExecutionGateway, isGatewayRefusal } from "./Gateway.ts"
+import { type ExecutionGateway, isGatewayRefusal, spokenRefusal } from "./Gateway.ts"
 import type { ToolRisk } from "./Module.ts"
 import type { NotifyEngine } from "./NotifyEngine.ts"
 import type { Taken } from "./PhraseDecision.ts"
@@ -127,6 +127,11 @@ export interface PhraseTrace {
   /** The class the gateway judged the call as, and its refusal, if any. */
   readonly risk?: ToolRisk
   readonly refused?: string
+  /**
+   * P8: the household risk policy's decision for the command's action (the same as for the model's call of that action),
+   * when the gateway took one: its outcome and the class it was decided by.
+   */
+  readonly decision?: { readonly outcome: "allow" | "confirm" | "deny"; readonly by: string }
   /** How long the module's action ran. */
   readonly actionMs?: number
   /** P10: the action's outcome carried a presentation, handed to the Presenter. */
@@ -243,6 +248,7 @@ interface TraceRecord {
   readonly tool?: string
   risk?: ToolRisk
   refused?: string
+  decision?: { readonly outcome: "allow" | "confirm" | "deny"; readonly by: string }
   actionStarted?: bigint
   actionMs?: number
   presented?: boolean
@@ -280,6 +286,7 @@ export const runTaken = (taken: Taken, ports: PhrasePorts): Effect.Effect<Phrase
             ...(rec.tool !== undefined ? { tool: rec.tool } : {}),
             ...(rec.risk !== undefined ? { risk: rec.risk } : {}),
             ...(rec.refused !== undefined ? { refused: rec.refused } : {}),
+            ...(rec.decision !== undefined ? { decision: rec.decision } : {}),
             ...(rec.actionMs !== undefined ? { actionMs: rec.actionMs } : {}),
             ...(rec.presented === true ? { presented: true } : {}),
             totalMs: Number(now - started) / 1e6,
@@ -412,6 +419,7 @@ const operate = (taken: Taken, ports: PhrasePorts, rec: TraceRecord): Effect.Eff
           onDecision: (d) => {
             if (d.risk !== undefined) rec.risk = d.risk
             if (d.refused !== undefined) rec.refused = d.refused
+            if (d.outcome !== undefined && d.by !== undefined) rec.decision = { outcome: d.outcome, by: d.by }
             if (d.presented === true) rec.presented = true
           }
         }).pipe(Effect.timeoutOrElse({ duration: ACTION_TIMEOUT_MS, orElse: () => Effect.fail(new PhraseTimeout()) }))
@@ -432,7 +440,10 @@ const operate = (taken: Taken, ports: PhrasePorts, rec: TraceRecord): Effect.Eff
       if (Cause.hasInterruptsOnly(exit.cause)) return yield* Effect.failCause(exit.cause as Cause.Cause<never>)
       const error = Cause.squash(exit.cause)
       if (error instanceof ActionError && isGatewayRefusal(error)) {
-        return { did: "refused", why: error.message, settlement: { answer: host("notAllowed", assistant), resume } }
+        // P8: a refusal of the risk policy is said in the policy's own sentence (as for the same action asked of the
+        // intent agent); the host's other refusals keep "I'm not allowed to do that."
+        const spoken = spokenRefusal(error)
+        return { did: "refused", why: error.message, settlement: { answer: spoken !== undefined ? { assistant, text: spoken } : host("notAllowed", assistant), resume } }
       }
       // Withdrawn as it was called (the module stopped): nothing ran.
       if (!ports.isPublished(assistant, action)) return { did: "not-running", why: "withdrawn", settlement: { answer: host("cantNow", assistant), resume } }

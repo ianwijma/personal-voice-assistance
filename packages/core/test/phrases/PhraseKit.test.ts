@@ -66,7 +66,8 @@ describe("a module's phrase commands", () => {
       const kit = yield* startTestModule(egg.definition)
       assert.strictEqual(did(yield* kit.phrases.say("tell the house about the egg")), "ran")
       const refused = yield* kit.phrases.say("tell my sister about the egg")
-      assert.deepStrictEqual([did(refused), said(refused)], ["refused", "I'm not allowed to do that."])
+      // P8: the risk policy's own sentence, the same as for the same action asked of the intent agent.
+      assert.deepStrictEqual([did(refused), said(refused)], ["refused", "I can't send that: messages need the owner's confirmation, and I can't ask for that yet."])
       assert.deepStrictEqual(egg.parts.runs, ["tell"])
       const failed = yield* kit.phrases.say("crack the egg")
       assert.deepStrictEqual([did(failed), said(failed)], ["failed", "The egg cracked."])

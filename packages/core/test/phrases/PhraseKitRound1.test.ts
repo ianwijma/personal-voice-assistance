@@ -86,7 +86,7 @@ describe("one settlement for every outcome (E4)", () => {
     Effect.gen(function*() {
       const kit = yield* startTestModule(probe())
       assert.strictEqual(said(yield* kit.phrases.say("crack it", { interrupting })), `It cracked. ${interrupting}`)
-      assert.strictEqual(said(yield* kit.phrases.say("tell my sister", { interrupting })), `I'm not allowed to do that. ${interrupting}`)
+      assert.strictEqual(said(yield* kit.phrases.say("tell my sister", { interrupting })), `I can't send that: messages need the owner's confirmation, and I can't ask for that yet. ${interrupting}`)
       assert.strictEqual(said(yield* kit.phrases.say("hang on forever", { interrupting })), `That didn't work. ${interrupting}`)
       const taken = yield* kit.phrases.decide("fan on")
       yield* kit.stop

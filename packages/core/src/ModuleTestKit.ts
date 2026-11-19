@@ -998,7 +998,9 @@ export const startTestModule = (definition: ModuleDefinition<any>, options: Star
 
     // ---- P7: phrase commands, on the real decision, matcher, sets, runner and gateway (the helpers serve mode uses)
     let phraseTurns = 1000
-    const actionsOf = (assistant: string) => offeredActions(offeredParts(assistant), host.gateway)
+    // P8: every published action of the assistant's modules, whatever the risk policy says (as serve mode): a phrase is
+    // taken and its action decided by the gateway at execution, so a refusal says the policy's own sentence.
+    const actionsOf = (assistant: string) => offeredActions(offeredParts(assistant))
     const phraseSets = yield* makePhraseSets({
       language,
       assistants: () => assistants.map((a) => ({ id: a.id, name: a.id })),

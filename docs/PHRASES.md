@@ -73,7 +73,8 @@ defineAction({
   controls are matched. Typed text is never matched: it is a message to the assistant.
 - **For whom**: the assistants that use your instance and have the action on. A command is in an assistant's set when
   its action is in the registry that assistant's turns get: the modules it has on, without the tools and action tools it
-  switched off, and without what the risk policy refuses for every class. A module that is not published (stopped,
+  switched off. What the risk policy refuses does **not** leave a set (P8): the phrase is taken and its action is
+  decided when it runs (below), so a refused command says why instead of going on to the assistant. A module that is not published (stopped,
   restarting, down) has no phrases in any set: saying one goes on to the assistant as before.
 
 ### The bounds
@@ -107,12 +108,19 @@ defineAction({
 - It runs **through the execution gateway** like every other entry path, as a turn of the assistant on the device with
   `source: "phrase"` (`CurrentTurn`: the device, its room, its default person, the connection that owns its audio, a
   fresh turn id, the assistant's current conversation id): admission, the assistant's switches, your risk function and
-  the risk policy. A refusal is "I'm not allowed to do that." (in the household's language).
+  the household's risk policy (docs/MODULES.md §4), on the policy of that moment and with the same function as the
+  model's call of the same action: the same class, the same decision. A refusal by the risk policy says the policy's
+  own spoken sentence, the one the intent path says ("I can't do that: this household doesn't allow me to change
+  things in the house.", in the household's language); a refusal by the gateway's other checks says "I'm not allowed
+  to do that.". The host's own controls ("stop", "never mind", "repeat", "louder", "quieter") do not go through the
+  gateway and are never refused; a ringing card's button said aloud is a press on the card, decided as one
+  (docs/NOTIFICATIONS.md).
 - It returns at once (within 5 s) with `{ say }` (else its `announce`): spoken as a **canned reply** of the assistant it
   was addressed to, on that device (its voice, through the device's one output, recorded nowhere: nothing enters the
   conversation history), cut to 300 characters. Anything longer it starts in your shared part, or schedules (`inMs: 0`).
 - A failure says your `ActionError`'s message (cut to 300); a time-out, a defect or an `announce` that throws "That
-  didn't work."; a refusal by the gateway "I'm not allowed to do that."; one module action already running on the
+  didn't work."; a refusal by the risk policy its own sentence (above), by the gateway's other checks "I'm not allowed
+  to do that."; one module action already running on the
   device "One moment, I'm still doing the last one.".
 - **Not published when it runs** (the module stopped or restarted between the moment the utterance was decided and the
   run): "I can't do that right now.", and nothing ran.
@@ -245,7 +253,7 @@ words, and a control matches the same with or without the module set.
 Every taken utterance leaves an **execution trace**, published where turn traces are (admin's latency list, the `trace`
 message), and no conversation turn or history entry: `TraceInfo` with `phrase` (additive within protocol 11): what took
 it (`by`: ringing, control, command; `name`), the outcome (`did`, `why`), for a command the class the gateway judged it
-as and its refusal (`risk`, `refused`), the person it ran for, how long the action ran (`actionMs`, and the tool in
+as and its refusal (`risk`, `refused`), the risk policy's decision (`decision`: `outcome` and `by`, P8), the person it ran for, how long the action ran (`actionMs`, and the tool in
 `tools`), and the whole run (`totalMs`). Also for a silent action, and a failed, refused or timed-out one. Exactly one
 per taken utterance: its identity (the addressed assistant, else the device's answering one; the principal, the turn a
 command runs as, with its person; the control or command and its tool) is fixed before anything can return early, so a

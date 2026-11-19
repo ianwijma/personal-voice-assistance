@@ -109,7 +109,8 @@ export const registryWith = (
 /**
  * The actions a registry of `modules` offers (`ToolRegistry.actions`), without building one: those of its generated
  * action tools and its intent-only actions that the gateway offers (the risk policy allows a class), in module order.
- * P7's phrase sets read an assistant's actions with it, by the same rule as its turns.
+ * Without a gateway (the default gateway has no policy) it lists every action: P7's phrase sets read an assistant's
+ * actions that way (P8: a phrase's action is decided by the policy when it runs, not left out of the set).
  */
 export const offeredActions = (modules: ReadonlyArray<AssistantModule>, gateway: ExecutionGateway = defaultGateway): Array<RegisteredAction> => {
   const out: Array<RegisteredAction> = []
