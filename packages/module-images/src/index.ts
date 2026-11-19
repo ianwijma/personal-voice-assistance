@@ -193,7 +193,7 @@ const picturing = (lang: Wiki, outcome: Extract<Outcome, { kind: "found" }>, wor
 }
 
 /** The result for everything but a picture: a spoken line, marked as outside text wherever it carries a title from the sites. */
-const plain = (lang: Wiki, cfg: Cfg, outcome: Exclude<Outcome, { kind: "found" }>, word: string): Readonly<Record<string, unknown>> => {
+const plain = (lang: Wiki, cfg: Cfg, outcome: Exclude<Outcome, { kind: "found" }>, word: string, offer: (o: Candidate) => boolean = () => true): Readonly<Record<string, unknown>> => {
   const shown = cleanLine(word, 100).text
   switch (outcome.kind) {
     case "nothing":
@@ -201,14 +201,16 @@ const plain = (lang: Wiki, cfg: Cfg, outcome: Exclude<Outcome, { kind: "found" }
     case "noPicture":
       return { spoken: say(texts, lang, cfg.commonsFallback ? "noPicture" : "noPictureNoCommons", { title: outcome.page.label }), notice: UNTRUSTED_NOTICE }
     case "ambiguous": {
-      const labels = outcome.options.map((o) => o.label)
+      // Only names that can be offered are offered (the action offers only what its own follow-up accepts, whole).
+      const offered = outcome.options.filter(offer)
+      const labels = offered.map((o) => o.label)
       const list = speakList(labels, lang, { max: 3 })
       const key = list === undefined ? "whichUnnamed" : labels.length === 1 ? "whichOne" : "which"
       return {
         spoken: say(texts, lang, key, { word: shown, list: list ?? "" }),
         notice: UNTRUSTED_NOTICE,
         // `title` and `wiki` are what the follow-up call passes back as `page` and `wiki`: the chosen option is then that page.
-        options: outcome.options.map((o) => ({ title: o.title, wiki: o.wiki, ...(o.description !== "" ? { description: o.description } : {}) }))
+        options: offered.map((o) => ({ title: o.title, wiki: o.wiki, ...(o.description !== "" ? { description: o.description } : {}) }))
       }
     }
   }
@@ -219,8 +221,11 @@ const Query = StoredText(100).check(
   Schema.makeFilter((t: string) => isLine(t, 100) || "one line, without line breaks")
 )
 
-/** The leading article of a spoken "a picture of an okapi". */
+/** The text without a leading article ("an okapi" is "okapi"); the same text when it has none. Tried only after the exact text found nothing. */
 const withoutArticle = (thing: string): string => thing.trim().replace(/^(?:an?|the|de|het|een)\s+/i, "").replace(/\s+/g, " ")
+
+/** A name the action can be given back, whole: within its own bound, one line, within the phrase's eight words, and not cut when said. */
+const sayable = (o: Candidate): boolean => o.title.length <= 100 && o.title === o.label && isLine(o.title, 100) && o.title.split(/\s+/).length <= 8
 
 export const imagesModule = (deps: NetDeps = {}) =>
   defineModule({
@@ -287,13 +292,23 @@ export const imagesModule = (deps: NetDeps = {}) =>
             Effect.gen(function*() {
               const view = ctx.host.view()
               const lang = homeLanguage(view)
-              const word = withoutArticle(thing)
-              if (word === "" || word.length > 100 || !isLine(word, 100)) return yield* new ActionError({ message: say(texts, lang, "badWord") })
+              // The name as it was said, exactly, as the tool looks it up ("The Who", "De Dijk", "A Star Is Born"). Only when that finds
+              // nothing at all is the text without a leading article tried ("an okapi"), and what is said names what was found.
+              const said = thing.trim().replace(/\s+/g, " ")
+              if (said === "" || said.length > 100 || !isLine(said, 100)) return yield* new ActionError({ message: say(texts, lang, "badWord") })
               const timeoutMs = Math.min(cfg.timeoutMs, ACTION_REQUEST_MS)
-              const outcome = yield* withBudget(lookup(deps, cfg, lang, { word }, agentOf(view.home), timeoutMs), ACTION_BUDGET_MS).pipe(
-                Effect.mapError((e) => new ActionError({ message: failureText(lang, e) }))
-              )
-              if (outcome.kind !== "found") return { say: String(plain(lang, cfg, outcome, word).spoken) }
+              const bare = withoutArticle(said)
+              let word = said
+              const outcome = yield* withBudget(
+                Effect.gen(function*() {
+                  const first = yield* lookup(deps, cfg, lang, { word: said }, agentOf(view.home), timeoutMs)
+                  if (first.kind !== "nothing" || bare === "" || bare === said) return first
+                  word = bare
+                  return yield* lookup(deps, cfg, lang, { word: bare }, agentOf(view.home), timeoutMs)
+                }),
+                ACTION_BUDGET_MS
+              ).pipe(Effect.mapError((e) => new ActionError({ message: failureText(lang, e) })))
+              if (outcome.kind !== "found") return { say: String(plain(lang, cfg, outcome, said, sayable).spoken) }
               const p = picturing(lang, outcome, word)
               if (p === undefined) return { say: say(texts, lang, outcome.page === undefined ? "nothing" : "noPicture", { word: cleanLine(word, 100).text, title: outcome.page?.label ?? "" }) }
               // Shown by the module itself, so what is said follows what the Presenter did: a sentence that is true on a screen

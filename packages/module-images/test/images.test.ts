@@ -814,6 +814,119 @@ describe("@pva/module-images", () => {
       assert.isBelow(Date.now() - began, 4_000)
     }), 30_000)
 
+  // ------------------------------------------------------------------------------------------------------------------
+  // Review round 2
+
+  it.effect("[r2-1] the action looks the name up as it was said: The Who, De Dijk and A Star Is Born keep their article; 'an okapi' falls back to 'okapi' only when the exact text found nothing", () =>
+    Effect.gen(function*() {
+      const who: PageFixture = { title: "The Who", description: "English rock band", pageimage: "Okapi2.jpg" }
+      const other: PageFixture = { title: "Who", description: "A pronoun", pageimage: "Okapi2.jpg" }
+      const world: World = {
+        en: { ...standardWorld.en, "the who": [who], who: [other], "a star is born": [{ title: "A Star Is Born", description: "A film", pageimage: "Okapi2.jpg" }], star: [{ title: "Star", description: "A sun", pageimage: "Okapi2.jpg" }] },
+        nl: { ...standardWorld.nl, "de dijk": [{ title: "De Dijk", description: "Nederlandse band", pageimage: "Okapi2.jpg" }], dijk: [{ title: "Dijk", description: "Een waterkering", pageimage: "Okapi2.jpg" }], okapi: standardWorld.nl!.okapi! },
+        files: standardWorld.files!
+      }
+      const en = yield* start(world)
+      for (const [phrase, title] of [["show me a picture of The Who", "The Who"], ["show me a picture of A Star Is Born", "A Star Is Born"], ["show me a picture of an okapi", "Okapi"]] as const) {
+        const said = yield* en.kit.phrases.say(phrase, { device: "kitchen-display" })
+        assert.isTrue(said.taken, phrase)
+        assert.strictEqual(en.kit.phrases.spoken.at(-1)?.text, `Here is a picture of ${title}.`, phrase)
+      }
+      // The exact text was looked up first, and only that: "who" was never searched when "the who" found a page.
+      const searched = en.net.requests.filter((r) => r.url.includes("en.wikipedia")).map((r) => new URL(r.url).searchParams.get("gsrsearch"))
+      assert.deepStrictEqual(searched.filter((q) => q === "who" || q === "star"), [])
+      assert.deepStrictEqual(searched.filter((q) => q === "an okapi" || q === "okapi"), ["an okapi", "okapi"])
+      const nl = yield* start(world, NL)
+      assert.isTrue((yield* nl.kit.phrases.say("toon een foto van De Dijk", { device: "kitchen-display" })).taken)
+      assert.strictEqual(nl.kit.phrases.spoken.at(-1)?.text, "Hier is een plaatje van De Dijk.")
+      assert.isTrue((yield* nl.kit.phrases.say("toon een foto van de okapi", { device: "kitchen-display" })).taken)
+      assert.strictEqual(nl.kit.phrases.spoken.at(-1)?.text, "Hier is een plaatje van Okapi.")
+      // The action itself, and a name nothing finds even without its article: the sentence says what was asked.
+      const none = yield* en.kit.action("show", { thing: "the zzzz" }, { device: "kitchen-display" })
+      assert.deepStrictEqual(none, { ok: true, say: "I couldn't find a picture of the zzzz on Wikipedia or Wikimedia Commons." })
+    }))
+
+  it.effect("[r2-2] a completion marker that is not true, and consumed metadata of the wrong type, are failed reads, through the tool and the action", () =>
+    Effect.gen(function*() {
+      const json = { headers: { "content-type": "application/json" } }
+      const answering = (wikipedia: unknown, commons: unknown, settings: Record<string, unknown> = {}) =>
+        Effect.gen(function*() {
+          const net = makeOfflineNet({ "https://en.wikipedia.org/w/api.php": { body: wikipedia, ...json }, "https://commons.wikimedia.org/w/api.php": { body: commons, ...json } })
+          const kit = yield* startTestModule(imagesModule({ resolver: net.resolver, connector: net.connector }), { media: fakeMedia().media, settings })
+          return { tool: yield* kit.tool("image_find", { query: "okapi" }, { device: "kitchen-display" }), action: yield* kit.action("show", { thing: "okapi" }, { device: "kitchen-display" }) }
+        })
+      // Wikipedia: any completion marker but `true`.
+      for (const marker of [{ batchcomplete: false }, { batchcomplete: null }, { batchcomplete: "" }, { batchcomplete: "true" }, { batchcomplete: 1 }]) {
+        const r = yield* answering(marker, marker)
+        assert.isFalse(r.tool.ok, JSON.stringify(marker))
+        assert.include(r.tool.content, failure("en", "rubbish", "Wikipedia"))
+        assert.isFalse(r.action.ok, JSON.stringify(marker))
+        assert.include(JSON.stringify(r.action), failure("en", "rubbish", "Wikipedia"))
+      }
+      // Commons: a page that is fine and a file whose consumed metadata has the wrong type (fallback off, as the reviewer had it).
+      const file = (meta: Record<string, unknown>) => ({ batchcomplete: true, query: { pages: [{ title: "File:Okapi2.jpg", imageinfo: [{ thumburl: "https://upload.wikimedia.org/a/b.jpg", mime: "image/jpeg", extmetadata: meta }] }] } })
+      const ok = { LicenseShortName: { value: "CC0" } }
+      for (const meta of [
+        { LicenseShortName: { value: 42 } }, { LicenseShortName: 42 }, { LicenseShortName: {} }, { ...ok, NonFree: { value: [true] } }, { ...ok, NonFree: { value: 1 } }, { ...ok, Artist: { value: 5 } }, { ...ok, Artist: "x" }
+      ]) {
+        const r = yield* answering(pageAnswer([OKAPI]), file(meta), { commonsFallback: false })
+        assert.isFalse(r.tool.ok, JSON.stringify(meta))
+        assert.include(r.tool.content, failure("en", "rubbish", "Wikimedia Commons"))
+        assert.isFalse(r.action.ok, JSON.stringify(meta))
+        assert.include(JSON.stringify(r.action), failure("en", "rubbish", "Wikimedia Commons"))
+      }
+      // An image address of the wrong type, or none at all.
+      for (const info of [{ thumburl: 7, mime: "image/jpeg", extmetadata: ok }, { mime: "image/jpeg", extmetadata: ok }]) {
+        const r = yield* answering(pageAnswer([OKAPI]), { batchcomplete: true, query: { pages: [{ title: "File:Okapi2.jpg", imageinfo: [info] }] } }, { commonsFallback: false })
+        assert.include(r.tool.content, failure("en", "rubbish", "Wikimedia Commons"))
+      }
+      // What may legitimately be missing stays missing: no author, no NonFree entry; and a complete empty answer is still empty.
+      const fine = yield* answering(pageAnswer([OKAPI]), file(ok), { commonsFallback: false })
+      assert.include(fine.tool.value as string, "Author not stated, CC0, via Wikimedia Commons")
+      const empty = yield* answering({ batchcomplete: true }, { batchcomplete: true })
+      assert.strictEqual((empty.tool.value as { spoken: string }).spoken, "I couldn't find a picture of okapi on Wikipedia or Wikimedia Commons.")
+    }))
+
+  it.effect("[r2-3] the action offers only names it accepts back, whole; the repeated phrase finds the page; with none to offer it asks for more words", () =>
+    Effect.gen(function*() {
+      const longest = `Term ${"x".repeat(88)} (bird)`
+      assert.strictEqual(longest.length, 100)
+      const tooLong = `Term ${"x".repeat(97)} (bird)`
+      assert.strictEqual(tooLong.length, 109)
+      const world = (suffix: string): World => ({
+        en: {
+          term: [{ title: "Term", disambiguation: true }, { title: tooLong, description: "Too long to say back" }, { title: longest, description: "The long one", pageimage: "Okapi2.jpg" }, { title: "Term (other)", description: "Other", pageimage: "Okapi2.jpg" }],
+          [longest.toLowerCase()]: [{ title: "Term", disambiguation: true }, { title: longest, description: "The long one", pageimage: "Okapi2.jpg" }],
+          ...(suffix === "" ? { kiwi: [KIWI_DISAMBIGUATION, KIWI_BIRD, KIWIFRUIT], "kiwi (bird)": [KIWI_BIRD, KIWIFRUIT] } : {}),
+          onlylong: [{ title: "Onlylong", disambiguation: true }, { title: tooLong, description: "x" }]
+        },
+        nl: { term: [{ title: "Term", disambiguation: true }, { title: tooLong, description: "Te lang" }, { title: longest, description: "De lange", pageimage: "Okapi2.jpg" }], [longest.toLowerCase()]: [{ title: "Term", disambiguation: true }, { title: longest, pageimage: "Okapi2.jpg" }], onlylong: [{ title: "Onlylong", disambiguation: true }, { title: tooLong }] },
+        files: standardWorld.files!
+      })
+      for (const [lang, ask, again, options] of [["en", "show me a picture of term", `show me a picture of ${longest}`, {}], ["nl", "toon een foto van term", `toon een foto van ${longest}`, NL]] as const) {
+        const { kit } = yield* start(world(""), options)
+        assert.isTrue((yield* kit.phrases.say(ask, { device: "kitchen-display" })).taken)
+        const question = kit.phrases.spoken.at(-1)!.text
+        // The title that is too long to be given back is not offered; the one at the bound is, whole.
+        assert.notInclude(question, "x".repeat(89), lang)
+        assert.include(question, longest, lang)
+        assert.isTrue((yield* kit.phrases.say(again, { device: "kitchen-display" })).taken)
+        assert.strictEqual(kit.phrases.spoken.at(-1)?.text, lang === "en" ? `Here is a picture of ${longest}.` : `Hier is een plaatje van ${longest}.`, lang)
+        yield* kit.present.settle
+        assert.strictEqual(kit.present.shown("kitchen-display").length, 1, lang)
+        // Nothing that can be offered: no name is offered, the person is asked to say more.
+        const none = yield* kit.action("show", { thing: "onlylong" }, { device: "kitchen-display" })
+        assert.include(JSON.stringify(none), lang === "en" ? "I can't tell which. Can you say a bit more?" : "ik weet niet welke. Kun je iets meer zeggen?", lang)
+        assert.notInclude(JSON.stringify(none), "xxxxxxxx")
+      }
+      // The ordinary round trip, by phrase.
+      const { kit } = yield* start(world(""))
+      assert.isTrue((yield* kit.phrases.say("show me a picture of kiwi", { device: "kitchen-display" })).taken)
+      assert.include(kit.phrases.spoken.at(-1)!.text, "Kiwi (bird)")
+      assert.isTrue((yield* kit.phrases.say("show me a picture of Kiwi (bird)", { device: "kitchen-display" })).taken)
+      assert.strictEqual(kit.phrases.spoken.at(-1)?.text, "Here is a picture of Kiwi (bird).")
+    }))
+
   it.effect("the main thread is never held: the longest stop while the largest legal answers are read stays under 10 ms", () =>
     Effect.gen(function*() {
       const LIMIT = 96 * 1024

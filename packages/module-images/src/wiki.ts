@@ -84,14 +84,14 @@ const getJson = (deps: NetDeps, source: Source, url: string, agent: string, time
 
 /**
  * The pages of an answer: an array (possibly empty); `undefined` when the answer does not have the shape of a query answer. An
- * answer with no `query` at all is an empty result only when it says it is complete (`batchcomplete`), which is what the API
- * answers for a search with no hits.
+ * answer with no `query` at all is an empty result only when it says it is complete (`batchcomplete: true`), which is what the API
+ * answers for a search with no hits. In format version 2 the marker is the boolean `true`: any other value is not a completion.
  */
 const pagesOf = (json: Readonly<Record<string, unknown>>): ReadonlyArray<unknown> | undefined => {
-  if (!("query" in json)) return json.batchcomplete === undefined ? undefined : []
+  if (!("query" in json)) return json.batchcomplete === true ? [] : undefined
   const query = objectOf(json.query)
   if (query === undefined) return undefined
-  if (!("pages" in query)) return json.batchcomplete === undefined ? undefined : []
+  if (!("pages" in query)) return json.batchcomplete === true ? [] : undefined
   return Array.isArray(query.pages) ? query.pages : undefined
 }
 
@@ -241,10 +241,20 @@ export const fileOutcome = (page: unknown): FileOutcome | undefined => {
   if (info.thumburl !== undefined && typeof info.thumburl !== "string") return undefined
   if (info.url !== undefined && typeof info.url !== "string") return undefined
   if (info.extmetadata !== undefined && objectOf(info.extmetadata) === undefined) return undefined
+  const meta = objectOf(info.extmetadata)
+  // Every metadata entry that is used is checked before anything is decided: an entry, when there, is an object with a value of the
+  // type the API gives (text; `NonFree` text or a boolean). A wrong type is a malformed answer, not an absent field.
+  for (const key of ["LicenseShortName", "Artist", "NonFree"]) {
+    const entry = meta?.[key]
+    if (entry === undefined) continue
+    const value = objectOf(entry)?.value
+    if (typeof value !== "string" && !(key === "NonFree" && typeof value === "boolean")) return undefined
+  }
+  // An image information with no address at all is not an answer either.
+  if (info.thumburl === undefined && info.url === undefined) return undefined
   if (!info.mime.toLowerCase().startsWith("image/")) return { kind: "unusable" }
   const url = imageUrlOf(info.thumburl ?? info.url)
   if (url === undefined) return { kind: "unusable" }
-  const meta = objectOf(info.extmetadata)
   const nonFree = metaValue(meta, "NonFree")
   if (nonFree === true || (typeof nonFree === "string" && nonFree.toLowerCase() === "true")) return { kind: "unusable" }
   // A file with no licence line cannot be credited honestly, and a licence is never shortened: one too long is not used.

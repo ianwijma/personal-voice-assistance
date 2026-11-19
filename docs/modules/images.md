@@ -50,12 +50,13 @@ Example phrases: "show me an okapi", "can I see a picture of the Eiffeltoren", "
 **The action `images.show`** (one `thing`, a text; not offered to the model as a second tool) with one phrase set per language, said
 after the wake phrase with no model: "show me a picture of {thing}", "show me a photo of {thing}", "show a picture of {thing}",
 "show a photo of {thing}"; "toon een plaatje van {thing}", "toon een foto van {thing}", "laat een foto zien van {thing}", "laat een
-plaatje zien van {thing}". The thing is the slot at the end; a leading "a", "an", "the", "een", "de", "het" is dropped. The action
+plaatje zien van {thing}". The thing is the slot at the end; the name is looked up as it was said, exactly as the tool does ("The Who", "De Dijk", "A Star Is Born"); only when that finds nothing at all is the text without a leading "a", "an", "the", "een", "de", "het" tried ("an okapi" is "okapi"), and the sentence names what was found. The action
 shows the picture itself (`ctx.present.show("origin", …)`) and says what the Presenter did: "Here is a picture of Okapi." where it was
 shown, and where it was not (a speaker, a page that cannot draw it) "I found a picture of Okapi: …. I can't show it here." Its
 lookup has a budget of **4 s** in all and **1.5 s** a request (an action has 5 s), then a failure is said as one. An ambiguous word
 asks, as the tool does; a phrase turn is recorded nowhere, so the person answers with a new phrase naming the one they mean ("show me a
-picture of Kiwi (bird)"), which a title match finds exactly.
+picture of Kiwi (bird)"), which a title match finds exactly. The action offers only names it accepts back, whole: within its 100
+characters, one line, within the phrase's eight words and not cut when said; with no such name it asks the person to say a bit more.
 
 What the model gets from the tool (every string from the two sites is cleaned by one function: markup and control characters gone, one
 line, cut at a code-point boundary with an ellipsis, never inside a character; and **every result that carries one has the notice**
@@ -78,7 +79,9 @@ How a lookup goes (at most four requests, one lookup at most 9 s for the tool, e
 
 Every answer is checked for its shape: a complete empty search (`batchcomplete`, no pages) is an empty result, and anything else that is
 not a query answer (no `query`, `pages` not a list, an entry that is not an object, a field of the wrong type) is a failed read, said as one
-("sent an answer I couldn't read"), never "nothing found". A request goes to one host and stays on it: **a redirect to another host is
+("sent an answer I couldn't read"), never "nothing found". That holds for the completion marker (it must be `true`, the format-version-2
+boolean) and for every metadata entry that is used (licence, author, `NonFree`: an object whose value has the type the API gives) and
+the image address; metadata that is simply missing stays missing. A request goes to one host and stays on it: **a redirect to another host is
 refused before it is looked up or connected to** and is a failed read ("I can't reach …"); a redirect within the same host is followed.
 
 A picture is used only when its address is `https://upload.wikimedia.org/…` (printable ASCII, at most 2,000 characters), its type is an
@@ -92,8 +95,8 @@ Wikimedia Commons"; when they do not fit, the author is cut with an ellipsis, ne
 ("I found a picture of …" and the refusal "I can't show it here.") is reserved first, and the title and the description share what is
 left, so the refusal is never cut away by the longest legal title and description.
 
-**The image itself is never fetched by the module**: the server's media route fetches it once when the presentation is stored
-(PRESENTING.md, "Images"), through its own policy, type and size checks. The module sends only requests to the two sites' public APIs.
+**The image itself is never fetched by the module**: the server's media route fetches it once, when a page is to show it
+(PRESENTING.md, "Images"; nothing is fetched while no device would show it), through its own policy, type and size checks. The module sends only requests to the two sites' public APIs.
 
 ## Settings
 
@@ -131,8 +134,9 @@ a deeply nested one, asserted under 10 ms with the shared `bound()`).
 
 - **Answering a question by voice without the model**: a phrase turn is recorded nowhere, so the action's question cannot be answered with "the bird"; the person says the phrase again with the name.
 - **`gallery` with `pick`** and other kinds that are not in the Presenter (PRESENTING.md, "Not now"): an ambiguous word is a
-  spoken question with the candidates named. The module also does not split results into clusters; only a Wikipedia
-  disambiguation page (or a title match on one) makes a word ambiguous.
+  spoken question with the candidates named. The module also does not split results into clusters; a word is ambiguous
+  when the site marks it so (the best match, or the page of those words, is a disambiguation page) or when several qualified
+  titles ("Crane (bird)", "Crane (machine)") match words that have no page of their own; it is then asked, never guessed.
 - **Other sources** (Openverse, Pexels, Brave, Unsplash), **image generation**, **Immich and personal photos**, **a photo
   frame**, **cameras and snapshots**, and **images in a tool result to the model** (the research's later parts).
 - **Safe search and a children's policy** (plan §2 row 9, §7).
