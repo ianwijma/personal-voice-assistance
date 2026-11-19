@@ -1018,7 +1018,7 @@ decidePresentation({ kind, personal, mayReveal, device: { connected, display, ki
 selectPresentations(candidates): what a device shows (pinned ≤ 8 oldest first, the newest transient)
 devicePresentFrom(settings, declared): DevicePresentOutputs = { display, kinds, touch }   // declaration minus overrides
 // present.show / present.update { presentation: PresentationWire }, present.dismiss { id } (server → voice connection),
-// present.action { requestId, id, action, item?, done? } (page → server) answered by result { say? }: additive within protocol 11
+// present.action { requestId, id, revision, action, item?, done? } (page → server) answered by result { say? }: additive within protocol 11
 PresentHook (ModuleHostOptions.present) = { forPart(part, runner): ModulePresent; fromResult(moduleId, principal, value) }
 PresentEngine = PresentHook & { reconcile(deviceId); reconcileAll(); press(PresentPressRequest): Effect<PresentPressAnswer>;
                                 mediaFor(token): hash | undefined; busyAnswer(); live(); held(deviceId); maintainNow; planNow;
@@ -1070,7 +1070,9 @@ ActionCallOptions.onDecision({ risk?, refused?, presented? })      // P7's trace
 - **Parts**: `forPart` records the part as open and adds a finaliser to its scope; when it closes, its transient
   presentations leave the index at once (their rows removed by maintenance) and its accepted shows not written yet are
   dropped. A tool's `{ forModel, present }` belongs to the module's newest open part.
-- **Presses**: admitted only for a connection that holds the presentation and while the decision (with that page's
+- **Presses**: the displayed `revision` (show id and stored revision) is echoed by a press and must match both the
+  holder and the current entry; admitted only for a connection that holds the presentation and while the decision (with
+  that page's
   kinds) makes it interactive there; claimed in memory (one per presentation); the handler runs through
   `PartRunner.inFlight` with the presentation principal, admitted by `ExecutionGateway.principal` first, within 5 s. It
   is not a tool call: no risk class or trace of its own (the gateway has no call kind for registered handlers), the

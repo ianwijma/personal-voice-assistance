@@ -62,7 +62,7 @@ export function PresentationStage() {
         {ordered.length > 0
           ? (
             <section aria-label={ordered[0]!.texts.region} data-testid="presentations" className="flex w-full flex-col gap-2">
-              {ordered.map((p) => <PresentationCard key={p.id} p={p} />)}
+              {ordered.map((p) => <PresentationCard key={`${p.id}:${p.revision}`} p={p} />)}
             </section>
           )
           : null}
@@ -87,7 +87,7 @@ function PresentationCard({ p }: { readonly p: HeldPresentation }) {
   const press = (key: string, message: { readonly action: string; readonly item?: string; readonly done?: boolean }) => {
     if (!p.interactive || pending.has(key)) return
     setPending((x) => new Set(x).add(key))
-    const current = () => mounted.current && client.store.get().presentations.some((x) => x.id === p.id)
+    const current = () => mounted.current && client.store.get().presentations.some((x) => x.id === p.id && x.revision === p.revision)
     const done = () => {
       if (!mounted.current) return
       setPending((x) => {
@@ -97,7 +97,7 @@ function PresentationCard({ p }: { readonly p: HeldPresentation }) {
       })
     }
     // continuation(identity): shows this presentation's own answer, only while it is still held.
-    void client.request({ type: "present.action", id: p.id, ...message }).then((r) => {
+    void client.request({ type: "present.action", id: p.id, revision: p.revision, ...message }).then((r) => {
       done()
       if (current()) setSaid(r.say ?? (r.ok ? undefined : r.error?.message))
     }, done)

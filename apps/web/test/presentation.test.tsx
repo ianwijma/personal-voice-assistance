@@ -26,6 +26,7 @@ const NL = { region: "Op het scherm", loading: "De afbeelding wordt geladen…",
 
 const wire = (id: string, content: PresentationWire["content"], extra: Partial<PresentationWire> = {}): PresentationWire => ({
   id,
+  revision: `${id}:1`,
   lifetime: "pinned",
   shownAt: 1_000,
   serverNow: 1_000,
@@ -138,7 +139,7 @@ describe("ticks and buttons", () => {
     await act(async () => {
       fireEvent.click(screen.getAllByRole("checkbox")[0]!)
     })
-    expect(request).toHaveBeenCalledWith({ type: "present.action", id: "l", action: "tick", item: "milk", done: true })
+    expect(request).toHaveBeenCalledWith({ type: "present.action", id: "l", revision: "l:1", action: "tick", item: "milk", done: true })
     expect(screen.getByText("Ticked.")).toBeTruthy()
     await act(async () => {
       fireEvent.click(screen.getByText("Later"))
@@ -249,13 +250,32 @@ describe("long and many, and the notification cards in the same stage", () => {
 
   it("a transient presentation is drawn first, then the pinned ones oldest first; nothing at all draws nothing", () => {
     mount(run([
-      show(wire("p2", CARD, { shownAt: 20 })),
+      show(wire("p2", { ...CARD, title: "Newer" }, { shownAt: 20 })),
       show(wire("t", { ...CARD, title: "Now" }, { lifetime: "transient", shownAt: 30 })),
-      show(wire("p1", CARD, { shownAt: 10 }))
+      show(wire("p1", { ...CARD, title: "Older" }, { shownAt: 10 }))
     ]))
     expect(screen.getAllByTestId("presentation").map((e) => e.getAttribute("data-lifetime"))).toEqual(["transient", "pinned", "pinned"])
+    expect(screen.getAllByRole("heading").map((h) => h.textContent)).toEqual(["Now", "Older", "Newer"])
     cleanup()
     mount(initialState)
     expect(screen.queryByTestId("present-stage")).toBeNull()
   })
+})
+
+// b4: the stable key belongs to multiple showings; interactions belong to the displayed revision.
+it("a replacement clears a pending press and ignores its reply, and clears an answer already shown", async () => {
+  let finish: (v: unknown) => void = () => undefined
+  const request = vi.fn(() => new Promise((resolve) => { finish = resolve }))
+  const drink = (title: string, revision: string) => wire("drink", { ...CARD, title }, { revision, buttons: [{ id: "choose", label: "Choose" }] })
+  const { store } = mount(run([show(drink("Tea", "tea:1"))]), request)
+  await act(async () => fireEvent.click(screen.getByRole("button")))
+  await act(async () => store.dispatch(update(drink("Coffee", "coffee:2"))))
+  expect((screen.getByRole("button") as HTMLButtonElement).disabled).toBe(false)
+  await act(async () => finish({ ok: true, say: "Tea selected." }))
+  expect(screen.queryByText("Tea selected.")).toBeNull()
+  await act(async () => fireEvent.click(screen.getByRole("button")))
+  await act(async () => finish({ ok: true, say: "Coffee selected." }))
+  expect(screen.getByText("Coffee selected.")).toBeTruthy()
+  await act(async () => store.dispatch(update(drink("Water", "water:3"))))
+  expect(screen.queryByText("Coffee selected.")).toBeNull()
 })
