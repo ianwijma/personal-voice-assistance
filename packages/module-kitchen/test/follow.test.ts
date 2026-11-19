@@ -2,6 +2,7 @@
 // without the model) and the checklist of what is low or missing, shown on a screen with ticks. Through the kit, in
 // the real host, gateway, phrase matcher and Presenter, with a stateful stub of the shopping list.
 import { assert, describe, it, vi } from "@effect/vitest"
+import { CurrentTurnCommit, type TurnCommit } from "@pva/core"
 import { provide, startTestModule, stubService } from "@pva/core/testing"
 import { Lists, type ListItem, type ListsService } from "@pva/module-contracts"
 import { Effect } from "effect"
@@ -324,5 +325,45 @@ describe("kitchen: the list on the turn's path", () => {
       }
       console.log(`kitchen_stock_low with its list, 130 low products: longest event-loop stop ${worst.toFixed(2)} ms`)
       assert.isBelow(worst, bound(10))
+    }))
+})
+
+/** A turn that is not committed yet: what it asked to show waits for `promote`; a discarded turn never calls it. */
+const speculativeTurn = () => {
+  const waiting: Array<() => void> = []
+  const commit: TurnCommit = { committed: () => false, whenCommitted: (f) => void waiting.push(f) }
+  return { commit, promote: () => waiting.splice(0).forEach((f) => f()) }
+}
+
+describe("kitchen: a speculative turn and the screen (R8)", () => {
+  it.effect("stock_low in a turn that is discarded shows nothing and withdraws nothing; a promoted one shows once", () =>
+    Effect.gen(function*() {
+      const k = yield* start(statefulLists())
+      yield* lowProducts(k, 2, "first")
+      // What is on the screen before: a committed answer's list.
+      yield* k.tool("kitchen_stock_low", {}, { turnId: 1 })
+      yield* k.present.settle
+      const before = k.present.shown()
+      assert.strictEqual(before.length, 1)
+      yield* lowProducts(k, 1, "later")
+      // A speculative turn: the tool runs, answers, and its turn is discarded.
+      const discarded = speculativeTurn()
+      const r = yield* k.tool("kitchen_stock_low", {}, { turnId: 2 }).pipe(Effect.provideService(CurrentTurnCommit, discarded.commit))
+      assert.match(answerOf(r), /^Running low: first 000, first 001/u)
+      yield* k.present.settle
+      assert.deepStrictEqual(k.present.shown().map((p) => p.id), before.map((p) => p.id))
+      assert.strictEqual(k.present.messages.filter((m) => m.message.type === "present.show").length, 1)
+      // The same call in a turn that is promoted: shown once, and it replaces the earlier transient list.
+      const promoted = speculativeTurn()
+      yield* k.tool("kitchen_stock_low", {}, { turnId: 3 }).pipe(Effect.provideService(CurrentTurnCommit, promoted.commit))
+      yield* k.present.settle
+      assert.strictEqual(k.present.shown().length, 1)
+      assert.deepStrictEqual(k.present.shown().map((p) => p.id), before.map((p) => p.id))
+      promoted.promote()
+      yield* k.present.settle
+      assert.strictEqual(k.present.shown().length, 1)
+      assert.notStrictEqual(k.present.shown()[0]!.id, before[0]!.id)
+      assert.strictEqual(k.present.messages.filter((m) => m.message.type === "present.show").length, 2)
+      assert.deepStrictEqual(listOf(k).content?.items.map((i) => i.text), ["first 000", "first 001", "later 000"])
     }))
 })

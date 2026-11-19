@@ -112,7 +112,7 @@ every time, also twice in one turn.
 `stock_low` also puts **a list of what is low or missing on the screen of the device that asked**
 (`docs/PRESENTING.md`, a plain `list`, no ticks). It is returned with the answer (`{ say, present }`), never shown from
 inside the action: `stock_low` may run before the turn is committed, and the host shows what a speculative call returns
-only when the turn is promoted.
+only when the turn is promoted: a discarded turn shows nothing and withdraws nothing.
 
 - **It shows what the answer says, and nothing more**: the products the answer names, in its order (all of them up to
   six; else the first five), then the answer's own "and 25 more" ("and more" when the read was cut) and, for a cut read,
@@ -125,7 +125,8 @@ only when the turn is promoted.
   a device with no display shows nothing and nothing else changes. It shows no recipe, so the allergy rules have nothing
   to leave out. An empty answer shows nothing.
 - **Transient**: on the screen for the default 30 seconds, and a newer transient one of any module takes the screen.
-  Nothing else manages it: it is not updated when the stock changes (the answer was the stock at that moment) and the
+  An empty answer does not withdraw an earlier list, and a discarded turn withdraws nothing: a list ends by its
+  lifetime or is replaced by the next one on that device. Nothing else manages it: it is not updated when the stock changes (the answer was the stock at that moment) and the
   module holds no handle.
 
 ## Tools
