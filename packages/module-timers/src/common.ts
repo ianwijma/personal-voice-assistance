@@ -39,7 +39,8 @@ export const NAME_CHARS = 60
 /** A name as given: trimmed and single-spaced, one line of at most `NAME_CHARS`; `undefined` for none; `false` when it is not one. */
 export const cleanName = (raw: string | undefined): string | undefined | false => {
   if (raw === undefined) return undefined
-  const name = raw.replace(/\s+/gu, " ").trim()
+  // Spaces are tidied; any other white space (a tab, a line break, a line separator) is not one line, and is refused.
+  const name = raw.replace(/ +/g, " ").trim()
   if (name === "") return undefined
   return isLine(name, NAME_CHARS) ? name : false
 }

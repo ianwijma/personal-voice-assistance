@@ -3,7 +3,7 @@
 // against its contract, paging past one store page, the ambient line, invalid settings, the daily clean-up, and that
 // timers are household data on every kind of device.
 import { assert, describe, it } from "@effect/vitest"
-import { type ModuleStore, type NotifyActionHandler, type Row, StoreError, type StoreFailure } from "@pva/core"
+import { type JobRow, type ModuleStore, type NotifyActionHandler, type Row, StoreError, type StoreFailure } from "@pva/core"
 import { startTestModule } from "@pva/core/testing"
 import { Timers, TIMERS_LIMITS, type TimersService } from "@pva/module-contracts"
 import { Effect, Fiber } from "effect"
@@ -87,7 +87,7 @@ const hooked = (hooks: Hooks, notifyDelayMs = 0, handlers?: Handlers): typeof ti
 })
 
 const activeRows = (kit: { moduleStore: () => ModuleStore }) => kit.moduleStore().collection(timers).list({ where: { phase: "active" } })
-const liveRingJobs = (kit: { jobs: Effect.Effect<ReadonlyArray<{ readonly handler: string; readonly state: string }>> }) =>
+const liveRingJobs = (kit: { jobs: Effect.Effect<ReadonlyArray<JobRow>> }) =>
   Effect.map(kit.jobs, (jobs) => jobs.filter((j) => j.handler === "ring" && (j.state === "scheduled" || j.state === "running")))
 
 describe("restarts and outages", () => {
@@ -147,7 +147,7 @@ describe("one change at a time", () => {
     Effect.gen(function*() {
       const kit = yield* startTestModule(timersModule)
       yield* kit.action("start", { duration: "1 minute", name: "eggs" })
-      const job = (yield* liveRingJobs(kit))[0] as unknown as { readonly id: string }
+      const job = (yield* liveRingJobs(kit))[0]!
       yield* kit.action("pause", {})
       // Run the old job by hand: the row is paused and names no job, so nothing rings.
       yield* kit.runJob(job.id).pipe(Effect.ignore)
