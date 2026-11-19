@@ -86,6 +86,11 @@
  * pages; a page that does not know them ignores them), `notification.action` (a request a newer page sends; an older
  * page never sends it, and the server needs nothing from a page that does not) and `Result.say`. No closed set
  * gains a member: a press of an action whose handler is not running is answered with the existing `not_running`.
+ * P7, additive within 11 (docs/PHRASES.md): `TraceInfo.phrase` (an optional key: a taken utterance's execution trace),
+ * `output.volume` (server → the voice connections of one device: the reply
+ * output's gain; a page that does not know it ignores it and the server needs nothing from it) and the optional
+ * `DevicePlace.ringingWithoutWake` (absent means on; an older peer ignores the key, a newer one accepts its absence). No
+ * closed set gains a member, so the version stays 11.
  * P10, additive within 11 (docs/PRESENTING.md): `present.show`, `present.update` and `present.dismiss` (server → voice
  * pages; a page that does not know them ignores them, and it is sent none, because it declares no presentation kinds)
  * and `present.action` (a request only a newer page sends). No closed set the decoder checks gains a member: the kinds

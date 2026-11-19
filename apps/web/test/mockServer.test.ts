@@ -244,6 +244,32 @@ describe("the mock, through its handlers, as the server", { timeout: 30_000 }, (
     for (const p of [one, old, again]) p.ws.close()
   })
 
+  it("P7: the reply volume as the server keeps it: output.volume to the device's voice pages, again after a welcome, with the server's step and bounds", async () => {
+    const http = url.replace(/^ws/, "http").replace(/\/ws$/, "")
+    const post = (body: unknown) => fetch(`${http}/mock/volume`, { method: "POST", body: JSON.stringify(body) }).then(async (r) => ({ status: r.status, body: (await r.json()) as unknown }))
+    const one = await Peer.open({ device: { id: "d-mock-volume01", kind: "web-voice", name: "One" } })
+    const other = await Peer.open({ device: { id: "d-mock-volume02", kind: "web-voice", name: "Other" } })
+    // At the default nothing is sent at a welcome; louder at the top is the limit, nothing sent.
+    expect(one.messages.some((m) => m.type === "output.volume")).toBe(false)
+    expect((await post({ deviceId: "d-mock-volume01", direction: "louder" })).body).toEqual({ level: 1, atLimit: true })
+    expect((await post({ deviceId: "d-mock-volume01", direction: "quieter" })).body).toEqual({ level: 0.8, atLimit: false })
+    expect((await one.waitFor("output.volume")).volume).toBe(0.8)
+    // A second page of the device says hello: told the level after its welcome; the other device was told nothing.
+    const again = await Peer.open({ device: { id: "d-mock-volume01", kind: "web-voice", name: "One" } })
+    expect((await again.waitFor("output.volume")).volume).toBe(0.8)
+    expect(other.messages.some((m) => m.type === "output.volume")).toBe(false)
+    // A level is moved to the nearest step within the bounds.
+    expect((await post({ deviceId: "d-mock-volume01", to: 0.05 })).body).toMatchObject({ level: 0.2 })
+    expect((await post({ deviceId: "d-mock-volume01" })).status).toBe(400)
+    // b9: an absolute setting that is the level already changes nothing (as the server: atLimit).
+    expect((await post({ deviceId: "d-mock-volume01", to: 0.2 })).body).toEqual({ level: 0.2, atLimit: true })
+    // b9 + b8: past the cap the oldest level is dropped and its pages are set back to the default, as the server does.
+    for (let i = 0; i < 256; i++) await post({ deviceId: `d-cap-${String(i).padStart(4, "0")}`, direction: "quieter" })
+    expect((await one.waitFor("output.volume", (m) => m.volume === 1)).volume).toBe(1)
+    expect((await post({ deviceId: "d-mock-volume01", direction: "louder" })).body).toEqual({ level: 1, atLimit: true })
+    for (const p of [one, other, again]) p.ws.close()
+  })
+
   it("b13/b14: the mock decides delivery per device with the real decision function (also on hello), and never reuses an id", async () => {
     const http = url.replace(/^ws/, "http").replace(/\/ws$/, "")
     const post = (path: string, body: unknown) => fetch(`${http}${path}`, { method: "POST", body: JSON.stringify(body) })

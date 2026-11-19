@@ -121,6 +121,12 @@ export interface RouteGate {
    * usual; an open utterance keeps its target.
    */
   release(): void
+  /**
+   * P7 ("never mind", `SessionControl.cancelPending`): the reply playing was cancelled: it counts as playing no more,
+   * and the armed and follow-up windows close. The caller also keeps that reply's end from opening a window
+   * (`replyEnded` is not called for it); a later reply opens its own as before.
+   */
+  cancelReply(): void
   /** An utterance starting now would be accepted without a phrase. */
   awake(now: number): boolean
   /** The open window right now, if any (armed first, then follow-up). */
@@ -367,6 +373,11 @@ export const makeRouteGate = (initial: RouteConfig): RouteGate => {
       following = { assistant, from: now }
     },
     release: () => {
+      armed = undefined
+      following = undefined
+    },
+    cancelReply: () => {
+      replying = undefined
       armed = undefined
       following = undefined
     },
