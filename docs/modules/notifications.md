@@ -13,13 +13,12 @@ The spoken side of the notification service ([NOTIFICATIONS.md](../NOTIFICATIONS
 
 - **Read out what is open for this device**, dismiss one, send a test.
 - **Do not disturb by voice**: on, on for a length of time, on until a time, off, and "is it on". Do not disturb is the
-  service's, for the **whole house** (there is no per-device one in the first version); every answer says so.
+  service's, for the **whole house** (there is no per-device one in the first version); the confirmations and the status say so.
 - **One inbound hook** on a module route, so a script on the home network (Home Assistant, n8n) can show a card.
 
 **What "open for this device" covers, and why it is narrower than it sounds.** `ctx.notify.list` gives a module only its
 *own* open notifications (docs/NOTIFICATIONS.md "The calls"). So the list covers what was sent through this module (the
-hook and the test), not timers' or reminders' notifications. A successful list says so (`covers`), the empty answer says
-so, and the failed-read and unknown-name sentences speak of "this module's hook and test" / "from this module". Of those
+hook and the test), not timers' or reminders' notifications. The list answers (`covers`, and the empty one) say so, and the failed-read and unknown-name sentences speak of "this module's hook and test" / "from this module"; the short do-not-disturb sentences are about the house, not this scope. Of those
 it tells a device only what is for it (sent to every device, or to that device) and, for a personal one, only where
 `Privacy.mayReveal(owner, device)` says so *now*, asked after the last read and again right before a dismissal. When every
 open one is personal and withheld, it says so truthfully ("Nothing I can read out here; 1 personal notification is kept for
@@ -31,14 +30,18 @@ its owner's devices.", singular and plural, both languages) and never a title. N
 Actions are not offered to the model as tools; the tools below are the model's way in. All answers are in the household's
 language (English and Dutch). **Every change goes through one shared operation** (`src/operations.ts`, made in the
 module's shared part), so a tool and a phrase run the same code. Each keeps a bounded record (256) of finished operations
-by the invocation's identity (assistant, conversation, turn, device, the operation and what it was asked): a **repeat of the
-same invocation, sequential or concurrent, gets the first outcome and changes nothing** (do not disturb is not extended; a
+by the invocation's identity (assistant, conversation, turn, device, the operation and its *resolved* request: a duration is
+milliseconds, an "until" its instant, a dismissal its words, so a tool and a phrase asking the same thing are one request): a
+**repeat of the same invocation, sequential or concurrent, gets the first outcome and changes nothing**. Invocations in flight
+are kept until they settle and are bounded at 64 (a 65th mutation is refused as busy, nothing done); only finished ones are
+evicted (256, oldest first) (do not disturb is not extended; a
 dismissal stays bound to the notification chosen the first time). A new utterance has a new turn id and acts again.
 
 | Tool | Risk | Does | Example |
 |---|---|---|---|
 | `notifications_open` | read | the open ones for this device (at most 5 titles and "and N more", how many personal ones are kept back, and that the read was cut when it was); titles are marked as untrusted outside text | "which notifications are open?" |
-| `notifications_dismiss` `{ which? }` | change | one open notification of this module on this device. The name has its leading articles and trailing filler words dropped (the, a, an, de, het, een; one, notification, melding), then the exact title wins, else every remaining word must be a whole word of the title (no stemming); **several matches ask which**, none refuses with "I don't know a notification by that name from this module." (the name is never repeated); no name: the only open one | "dismiss the washing machine" |
+| `notifications_dismiss` `{ which? }` | change | one open notification of this module on this device. The name has its leading articles and trailing filler words dropped (the, a, an, de, het, een; one, notification, melding), a **full title that was said wins first** (before anything is dropped); else titles and reference are normalised the same
+way (two that become the same ask which), else every remaining word must be a whole word of the title (no stemming); **several matches ask which**, none refuses with "I don't know a notification by that name from this module." (the name is never repeated); no name: the only open one | "dismiss the washing machine" |
 | `notifications_dnd_on` `{ for?, until? }` | change | do not disturb for the house: until turned off, `for` a length in words, or `until` a time in words; at most 7 days; both is refused; an unclear or ambiguous time is a question. A "for" answer confirms the length ("for 2 hours"), an "until" answer the clock time; **never a time that is not the real end** | "do not disturb until eight" |
 | `notifications_dnd_off` | change | off; says so only when the service then reads off | "do not disturb off" |
 | `notifications_dnd_status` | read | on, with the time left (`speakDuration`) and the clock time only when the end is on a whole minute; a failed read says it could not read, never "off" | "is do not disturb on?" |
@@ -91,7 +94,7 @@ restart is a new invocation), no module data is read and written: dismissing res
 gone and says so), do not disturb is set or cleared as one service call, a test and a hook send dedupe by key.
 
 Bounds (nothing on a turn computes more than this): the list reads at most 5 pages of 12 and says when it was cut (this
-module has at most 10 open, so one page holds them); a time or duration said in words is at most 60 characters.
+module has at most 10 open, so one page holds them); a time or duration given to a tool is at most 60 characters; the phrase's "until" slot is text of at most five words (inside the phrase layer's 300-character utterance).
 
 ## What it needs
 

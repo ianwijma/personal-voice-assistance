@@ -42,7 +42,7 @@ export const texts = defineTexts({
     notBoth: "Say either for how long or until when, not both.",
     tooLong: "Do not disturb can be set for at most seven days.",
     tooShort: "That moment has already passed or is too close; say a time a little later.",
-    the: "the"
+    busy: "I'm busy with other things right now; try again in a moment."
   },
   nl: {
     covers: "Dat gaat alleen over meldingen via de hook of de test van deze module, niet over die van andere modules.",
@@ -84,6 +84,6 @@ export const texts = defineTexts({
     notBoth: "Zeg hoe lang of tot wanneer, niet allebei.",
     tooLong: "Niet storen kan hoogstens zeven dagen worden ingesteld.",
     tooShort: "Dat moment is al voorbij of te dichtbij; noem een tijd iets later.",
-    the: "de"
+    busy: "Ik ben even bezig met andere dingen; probeer het zo nog eens."
   }
 })

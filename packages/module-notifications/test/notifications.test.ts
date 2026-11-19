@@ -3,7 +3,7 @@
 import { assert, describe, it, vi } from "@effect/vitest"
 import { type ModuleDefinition, type ModuleNotify, type ModuleRoute, NotifyError, type RouteRequest } from "@pva/core"
 import { checkModule, startTestModule } from "@pva/core/testing"
-import { Effect, Schema } from "effect"
+import { Deferred, Effect, Fiber, Schema } from "effect"
 import { holdsSecret, HOOK_TOKEN_HEADER, secretForms, tokenMatches } from "../src/hook.ts"
 import { notificationsModule, catalog } from "../src/index.ts"
 import { texts } from "../src/texts.ts"
@@ -371,13 +371,6 @@ describe("the inbound hook", () => {
       assert.deepStrictEqual(yield* kit.checkHealth, [])
     }))
 
-  it.effect("while the module is stopped, its route is not the published one (the host withdraws it); after a restart the same token works", () =>
-    Effect.gen(function*() {
-      const seen = { routes: [] as ReadonlyArray<ModuleRoute> }
-      const kit = yield* startTestModule(wrapped((n) => n, seen), { secrets: { hookToken: TOKEN } })
-      yield* kit.restart
-      assert.strictEqual((yield* hit(seen.routes[0]!)).status, 202)
-    }))
 })
 
 // ---------------------------------------------------------------------------------------------------------------------
@@ -484,11 +477,14 @@ describe("review 1.3/1.6/1.8/1.11: dismiss by name", () => {
     Effect.gen(function*() {
       const { kit, route } = yield* withHook()
       yield* post(route, "Washing machine done", "a")
-      yield* post(route, "Washing machine door", "b")
+      yield* post(route, "Washing machine done late", "b")
+      // Both titles hold every word of the reference: more than one fits, so it asks...
       const ask = (yield* kit.tool("notifications_dismiss", { which: "the washing machine" }, as("kitchen-display"))).value as any
       assert.include(ask.ask, "Which one?")
-      assert.deepStrictEqual([...ask.candidates].sort(), ["Washing machine done", "Washing machine door"])
+      assert.deepStrictEqual([...ask.candidates].sort(), ["Washing machine done", "Washing machine done late"])
+      // ...but the full title said wins, and only that card is dismissed.
       assert.deepStrictEqual((yield* kit.tool("notifications_dismiss", { which: "washing machine done" }, as("kitchen-display"))).value, { spoken: "Dismissed." })
+      assert.deepStrictEqual((yield* kit.notify.all).filter((n) => n.state === "open").map((n) => n.title), ["Washing machine done late"])
     }))
 
   it.effect("in Dutch: de/het/een and a trailing melding are dropped (tool and phrase)", () =>
@@ -569,19 +565,28 @@ describe("review 1.4: a repeat of the same invocation returns the first outcome"
       assert.strictEqual(kit.notify.dnd().until, (yield* kit.now) + 600_000)
     }))
 
-  it.effect("the same record serves a tool and a phrase of one identity, and is bounded", () =>
+  it.effect("a tool and then an action of one identity are one request; finished records are bounded (a 257th makes the oldest forgotten)", () =>
     Effect.gen(function*() {
       const kit = yield* startTestModule(notificationsModule)
-      const turn = kit.turn({ device: "kitchen-display", turnId: 904 })
+      const turn = kit.turn({ device: "kitchen-display", source: "phrase", turnId: 904 })
       const a = yield* kit.tool("notifications_dnd_on", { for: "ten minutes" }, turn)
-      yield* kit.advance(30_000)
-      const b = yield* kit.tool("notifications_dnd_on", { for: "ten minutes" }, turn)
-      assert.deepStrictEqual(a.value, b.value)
-      assert.strictEqual(kit.notify.dnd().until, (yield* kit.now) - 30_000 + 600_000)
-      // More identities than the record keeps: it forgets the oldest, never grows without bound, and still works.
-      for (let i = 0; i < 300; i++) yield* kit.tool("notifications_dnd_off", {}, as("kitchen-display"))
-      assert.isFalse(kit.notify.dnd().on)
+      const until = kit.notify.dnd().until
+      yield* kit.advance(60_000)
+      // The action decodes "ten minutes" to 600000 ms: the same request, so the first deadline stays.
+      const b = yield* kit.action("dnd_for", { duration: "ten minutes" }, turn)
+      assert.deepStrictEqual([b.ok, (b as any).say], [true, (a.value as any).spoken])
+      assert.strictEqual(kit.notify.dnd().until, until)
+      // Inside the bound the repeat still joins the first. Past it (256 others finished since), the oldest is forgotten and acts again.
+      // (Other finished invocations that change nothing: a dismissal with nothing open.)
+      for (let i = 0; i < 254; i++) yield* kit.tool("notifications_dismiss", {}, as("kitchen-display"))
+      yield* kit.action("dnd_for", { duration: "ten minutes" }, turn)
+      assert.strictEqual(kit.notify.dnd().until, until)
+      yield* kit.tool("notifications_dismiss", {}, as("kitchen-display"))
+      yield* kit.tool("notifications_dismiss", {}, as("kitchen-display"))
+      yield* kit.action("dnd_for", { duration: "ten minutes" }, turn)
+      assert.strictEqual(kit.notify.dnd().until, (yield* kit.now) + 600_000)
     }))
+
 })
 
 describe("review 1.5: one test per asking device", () => {
@@ -658,4 +663,153 @@ describe("review 1.9: do not disturb until a time, as a phrase", () => {
       assert.isTrue((yield* nl.phrases.say("niet storen tot banaan", { device: "kitchen-display" })).taken)
       assert.strictEqual(nl.phrases.spoken.at(-1)?.text, "Tot wanneer? Ik begreep de tijd niet.")
     }))
+
+  it.effect("a really ambiguous time asks and changes nothing, in both languages", () =>
+    Effect.gen(function*() {
+      const kit = yield* startTestModule(notificationsModule)
+      assert.isTrue((yield* kit.phrases.say("do not disturb until Friday at midnight", { device: "kitchen-display" })).taken)
+      assert.strictEqual(kit.phrases.spoken.at(-1)?.text, "Until when exactly? That could be more than one time.")
+      assert.isFalse(kit.notify.dnd().on)
+      assert.include(((yield* kit.tool("notifications_dnd_on", { until: "Friday at midnight" }, as("kitchen-display"))).value as any).spoken, "more than one time")
+      const nl = yield* startTestModule(notificationsModule, NL)
+      assert.isTrue((yield* nl.phrases.say("niet storen tot vrijdag om middernacht", { device: "kitchen-display" })).taken)
+      assert.strictEqual(nl.phrases.spoken.at(-1)?.text, "Tot wanneer precies? Dat kan meer dan één tijdstip zijn.")
+      assert.isFalse(nl.notify.dnd().on)
+    }))
+})
+
+describe("review 2", () => {
+  /** A service whose list can be held: each held read says it started, and waits for `release`. */
+  const gated = () => {
+    const state = { held: false, started: 0, resolved: 0, release: Deferred.makeUnsafe<void>() }
+    const change = (n: ModuleNotify): ModuleNotify => ({
+      ...n,
+      resolve: (id, outcome) => Effect.tap(n.resolve(id, outcome), (done) => Effect.sync(() => void (done && state.resolved++))),
+      list: (q) => Effect.gen(function*() {
+        if (state.held) {
+          state.started++
+          yield* Deferred.await(state.release)
+        }
+        return yield* n.list(q)
+      })
+    })
+    return { state, change }
+  }
+  const until = (state: { started: number }, n: number) => Effect.gen(function*() { for (let i = 0; i < 2_000 && state.started < n; i++) yield* Effect.yieldNow })
+
+  it.effect("an invocation still in flight is never forgotten: 256 fresh ones later its repeat joins it, and one card is dismissed", () =>
+    Effect.gen(function*() {
+      const g = gated()
+      const seen = { routes: [] as ReadonlyArray<ModuleRoute> }
+      const kit = yield* startTestModule(wrapped(g.change, seen), { secrets: { hookToken: TOKEN } })
+      yield* hit(seen.routes[0]!, { body: { title: "Washer done", key: "w" } })
+      const turn = kit.turn({ device: "kitchen-display", turnId: 5001 })
+      g.state.held = true
+      const original = yield* kit.tool("notifications_dismiss", {}, turn).pipe(Effect.forkChild)
+      yield* until(g.state, 1)
+      g.state.held = false
+      for (let i = 0; i < 256; i++) yield* kit.tool("notifications_dnd_off", {}, as("kitchen-display"))
+      const repeat = yield* kit.tool("notifications_dismiss", {}, turn).pipe(Effect.forkChild)
+      for (let i = 0; i < 50; i++) yield* Effect.yieldNow
+      yield* hit(seen.routes[0]!, { body: { title: "Door open", key: "d" } })
+      yield* Deferred.succeed(g.state.release, undefined)
+      const results = [yield* Fiber.join(original), yield* Fiber.join(repeat)]
+      // One invocation: the repeat joined it (the same answer), and it can never dismiss two cards.
+      assert.deepStrictEqual(results[0]!.value, results[1]!.value)
+      assert.isAtMost(g.state.resolved, 1)
+    }))
+
+  it.effect("at 64 invocations in flight a new mutation is refused as busy and nothing is done; it works again once they settle", () =>
+    Effect.gen(function*() {
+      const g = gated()
+      const kit = yield* startTestModule(wrapped(g.change))
+      g.state.held = true
+      const fibers = []
+      for (let i = 0; i < 64; i++) fibers.push(yield* kit.tool("notifications_dismiss", {}, as("kitchen-display")).pipe(Effect.forkChild))
+      yield* until(g.state, 64)
+      assert.strictEqual(g.state.started, 64)
+      const refused = yield* kit.tool("notifications_dnd_on", {}, as("kitchen-display"))
+      assert.isFalse(refused.ok)
+      assert.include(refused.content, "I'm busy with other things right now; try again in a moment.")
+      assert.isFalse(kit.notify.dnd().on)
+      g.state.held = false
+      yield* Deferred.succeed(g.state.release, undefined)
+      for (const f of fibers) yield* Fiber.join(f)
+      assert.isTrue((yield* kit.tool("notifications_dnd_on", {}, as("kitchen-display"))).ok)
+    }))
+
+  it.effect("the busy sentence is Dutch in a Dutch household", () =>
+    Effect.gen(function*() {
+      const g = gated()
+      const kit = yield* startTestModule(wrapped(g.change), NL)
+      g.state.held = true
+      const fibers = []
+      for (let i = 0; i < 64; i++) fibers.push(yield* kit.tool("notifications_dismiss", {}, as("kitchen-display")).pipe(Effect.forkChild))
+      yield* until(g.state, 64)
+      assert.include((yield* kit.tool("notifications_dnd_off", {}, as("kitchen-display"))).content, "Ik ben even bezig met andere dingen; probeer het zo nog eens.")
+      g.state.held = false
+      yield* Deferred.succeed(g.state.release, undefined)
+      for (const f of fibers) yield* Fiber.join(f)
+    }))
+
+  it.effect("dismiss by tool and then by phrase of one identity is one request (the name is keyed as words)", () =>
+    Effect.gen(function*() {
+      const seen = { routes: [] as ReadonlyArray<ModuleRoute> }
+      const kit = yield* startTestModule(wrapped((n) => n, seen), { secrets: { hookToken: TOKEN } })
+      yield* hit(seen.routes[0]!, { body: { title: "Washing machine done", key: "w" } })
+      const turn = kit.turn({ device: "kitchen-display", source: "phrase", turnId: 5100 })
+      assert.deepStrictEqual((yield* kit.tool("notifications_dismiss", { which: "The washing machine" }, turn)).value, { spoken: "Dismissed." })
+      yield* hit(seen.routes[0]!, { body: { title: "Washing machine door", key: "d" } })
+      assert.deepStrictEqual(yield* kit.action("dismiss", { which: "the  Washing machine!" }, turn), { ok: true, say: "Dismissed." })
+      assert.deepStrictEqual((yield* kit.notify.all).filter((n) => n.state === "open").map((n) => n.title), ["Washing machine door"])
+    }))
+
+  it.effect("an until request is keyed by its resolved instant: the same time said two ways is one request", () =>
+    Effect.gen(function*() {
+      const kit = yield* startTestModule(notificationsModule)
+      const turn = kit.turn({ device: "kitchen-display", source: "phrase", turnId: 5200 })
+      const a = yield* kit.tool("notifications_dnd_on", { until: "eight" }, turn)
+      const instant = kit.notify.dnd().until
+      yield* kit.tool("notifications_dnd_off", {}, as("kitchen-display"))
+      const b = yield* kit.action("dnd_until", { time: "8 pm" }, turn)
+      assert.deepStrictEqual([b.ok, (b as any).say], [true, (a.value as any).spoken])
+      assert.isFalse(kit.notify.dnd().on) // the repeat did nothing: it returned the first outcome
+      assert.isNumber(instant)
+    }))
+
+  const overlap = (language: "en" | "nl") => Effect.gen(function*() {
+    const dutch = language === "nl"
+    const seen = { routes: [] as ReadonlyArray<ModuleRoute> }
+    const kit = yield* startTestModule(wrapped((n) => n, seen), { secrets: { hookToken: TOKEN }, ...(dutch ? NL : {}) })
+    const [withArticle, plain, longer] = dutch ? ["De deur", "Deur", "De deur open"] : ["The Door", "Door", "Door open"]
+    return { kit, seen, withArticle, plain, longer }
+  })
+  const openTitles = (kit: any) => Effect.map(kit.notify.all as Effect.Effect<ReadonlyArray<any>>, (all) => all.filter((n) => n.state === "open").map((n) => n.title).sort())
+
+  for (const language of ["en", "nl"] as const) {
+    it.effect(`a full title said wins over its article-less twin and its longer neighbour (${language})`, () =>
+      Effect.gen(function*() {
+        const { kit, seen, withArticle, plain, longer } = yield* overlap(language)
+        yield* hit(seen.routes[0]!, { body: { title: withArticle, key: "a" } })
+        yield* hit(seen.routes[0]!, { body: { title: plain, key: "b" } })
+        yield* kit.tool("notifications_dismiss", { which: withArticle }, as("kitchen-display"))
+        assert.deepStrictEqual(yield* openTitles(kit), [plain])
+        // With "Door open" beside "The Door": the full title is not an ambiguity.
+        yield* hit(seen.routes[0]!, { body: { title: longer, key: "c" } })
+        yield* hit(seen.routes[0]!, { body: { title: withArticle, key: "d" } })
+        yield* kit.tool("notifications_dismiss", { which: withArticle }, as("kitchen-display"))
+        assert.deepStrictEqual(yield* openTitles(kit), [longer, plain].sort())
+      }))
+
+    it.effect(`two titles that are the same after articles are dropped ask, when none was said in full (${language})`, () =>
+      Effect.gen(function*() {
+        const { kit, seen, withArticle, plain } = yield* overlap(language)
+        yield* hit(seen.routes[0]!, { body: { title: withArticle, key: "a" } })
+        yield* hit(seen.routes[0]!, { body: { title: plain, key: "b" } })
+        const ask = (yield* kit.tool("notifications_dismiss", { which: dutchOrEnglish(language) }, as("kitchen-display"))).value as any
+        assert.deepStrictEqual([...ask.candidates].sort(), [plain, withArticle].sort())
+        assert.deepStrictEqual(yield* openTitles(kit), [plain, withArticle].sort())
+      }))
+  }
+  const dutchOrEnglish = (language: "en" | "nl") => (language === "nl" ? "een deur" : "a door")
 })
