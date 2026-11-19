@@ -154,7 +154,7 @@ describe("@pva/module-music", () => {
       Effect.gen(function*() {
         const ha = makeHa({ areas: [], entities: [] }, "unknown")
         const kit = yield* start(ha)
-        const notYet = { ok: false, code: "failed", message: "Home Assistant hasn't reported its players yet; try again in a minute." }
+        const notYet = { ok: false, code: "failed", message: "Home Assistant hasn't reported its players yet; try again in a minute." } as const
         assert.deepStrictEqual(yield* kit.action("pause", {}, KITCHEN), notYet)
         assert.deepStrictEqual(yield* kit.action("now_playing", {}, KITCHEN), notYet)
         const tool = yield* kit.tool("music_now_playing", {}, KITCHEN)
@@ -168,7 +168,7 @@ describe("@pva/module-music", () => {
     it.effect("the smart-home module off, or stopping during the call: every tool says so", () =>
       Effect.gen(function*() {
         const off = yield* startTestModule(musicModule)
-        const said = { ok: false, code: "failed", message: "The Home Assistant module is off." }
+        const said = { ok: false, code: "failed", message: "The Home Assistant module is off." } as const
         for (const id of ["pause", "resume", "next", "previous", "now_playing"]) assert.deepStrictEqual(yield* off.action(id, {}, KITCHEN), said, id)
         assert.deepStrictEqual(yield* off.action("play", { query: "Nina Simone", kind: "artist" }, KITCHEN), said)
         assert.deepStrictEqual(yield* off.action("volume", { level: 20 }, KITCHEN), said)
@@ -525,14 +525,25 @@ describe("@pva/module-music", () => {
         assert.strictEqual((yield* Effect.flip(playback.pause("Bedroom").pipe(Effect.andThen(playback.pause("Kitchen"))))).reason, "failed")
       }))
 
-    it.effect("with the smart-home module off, Playback fails as failed (the host's stop then does nothing)", () =>
+    it.effect("with the smart-home module off, pause knows no state and does nothing (false); changeVolume fails", () =>
       Effect.gen(function*() {
         const kit = yield* startTestModule(musicModule)
-        const e = yield* Effect.flip(kit.service(Playback)!.pause("Kitchen"))
+        assert.isFalse(yield* kit.service(Playback)!.pause("Kitchen"))
+        const e = yield* Effect.flip(kit.service(Playback)!.changeVolume("Kitchen", { to: 0.5 }))
         assert.instanceOf(e, PlaybackError)
         assert.strictEqual(e.reason, "failed")
         const stop = yield* kit.phrases.say("stop", KITCHEN)
         assert.isTrue(stop.taken && stop.outcome.did === "nothing")
+      }))
+
+    it.effect("a pause that fails is a failure, and the host's stop says it couldn't stop it", () =>
+      Effect.gen(function*() {
+        const ha = makeHa()
+        const kit = yield* start(ha)
+        ha.answer(() => Effect.fail(new HomeAssistantError({ reason: "not_connected", detail: "test" })))
+        assert.strictEqual((yield* Effect.flip(kit.service(Playback)!.pause("Kitchen"))).reason, "failed")
+        const stop = yield* kit.phrases.say("stop", KITCHEN)
+        assert.isTrue(stop.taken && stop.outcome.did === "failed")
       }))
   })
 

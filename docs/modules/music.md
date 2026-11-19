@@ -118,11 +118,12 @@ announcement and a reply). "Louder" and "quieter" are the host's too and change 
 - `pause(room)`: resolves the room as above; pauses the player and answers `true` when its cached state is `playing` or
   `buffering`; `false` when it is anything else, and when no state has arrived yet (nothing is done). A room no player
   serves, or one with several players and none chosen, is `no_player`; a room that is empty, longer than 60 characters
-  or not one line is `invalid`. A failed call is `failed`, one without an answer in 3 s `timeout`; the smart-home
-  module off is `failed`.
+  or not one line is `invalid`. A failed call is `failed`, one without an answer in 3 s `timeout` (the host's "stop"
+  then says "I couldn't stop that."). With the smart-home module off the player's state is not known: `false`, nothing
+  done.
 - `changeVolume(room, { to } | { by })`: `to` from 0 to 1, `by` from −1 to 1 (otherwise `invalid`), clamped, through
   the same one-at-a-time path as `music_volume`; `unknown_level` for a step without a present level (nothing changed);
-  answers the level set.
+  answers the level set; the smart-home module off is `failed`.
 
 What plays is household data (the contract says so): the module stores nothing personal and answers the same on every
 device.
@@ -190,6 +191,8 @@ allow-list, `packages/module-home-assistant/src/services.ts` on its branch, and 
   "resume". The module implements exactly the interface as it is; those are its own tools until a consumer needs them.
 - **A room with several players** in `Playback`: the contract does not say; the module pauses none and answers
   `no_player` ("never pick the first").
+- **`pause` with the smart-home module off** (or stopping during the call): the contract's "the provider does not know
+  the player's state", so `false` and nothing done, rather than a failure the host would word as "I couldn't stop that".
 - **`pause` while Home Assistant does not answer** (`reconnecting`): the cache may still say `playing`; the call then
   fails `not_connected`, which is `failed`.
 - **Rooms** are compared with `nameKey` as the contract says, and also without a leading article, as for every other

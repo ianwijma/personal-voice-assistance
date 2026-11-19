@@ -293,7 +293,10 @@ export const makeControl = (host: Pick<ModuleHostApi, "service" | "view">, setti
               if (!PLAYING.has(r.entity.state)) return false
               yield* callPlayer(ha, r.entity, "media_pause").pipe(Effect.mapError(playbackError))
               return true
-            })).pipe(Effect.catchTag("ProviderOff", () => Effect.fail(new PlaybackError({ reason: "failed", detail: "the home-assistant module is off" }))))
+            })).pipe(
+              // The smart-home module off: the player's state is not known, so (as the contract says) nothing is done.
+              Effect.catchTag("ProviderOff", () => Effect.succeed(false))
+            )
         }),
       changeVolume: (room, change) =>
         Effect.gen(function*() {
