@@ -251,7 +251,7 @@ speaker and no display gets the cue and no card.
 
 ## What P7 and P10 build on
 
-- P7 (`ringing` window, the spoken "stop"): `engine.ringingOn(deviceId)` (what rings there, with its actions),
+- P7 (`ringing` window, the spoken "stop"; built: [PHRASES.md](PHRASES.md)): `engine.ringingOn(deviceId)` (what rings there, with its actions),
   `engine.onRingingChanged(listener)` (open and close the window: called whenever what rings on a device differs from
   what it last told: at the end of every step of a pass that can change what a page holds, also a step that failed
   part-way (the clean-up at a page's bound and the held-but-unseen tail included), and when a closed page's cards are

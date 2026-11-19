@@ -162,6 +162,28 @@ describe("connection", () => {
     expect(store.get().connection.attempt).toBe(0)
   })
 
+  it("P7: output.volume reaches the audio port's reply volume on every tab; every welcome sets it back to the default first", async () => {
+    const { url, peers } = await startServer()
+    const volumes: Array<number> = []
+    const port = { ...fakeAudio(false).audio, replyVolume: (v: number) => void volumes.push(v) }
+    const { store } = connect(url, port)
+    await until(() => store.get().connection.status === "open")
+    expect(volumes).toEqual([1])
+    peers[0]!.ws.send(encodeServerMessage({ type: "output.volume", volume: 0.6 }))
+    await until(() => volumes.length === 2)
+    expect(volumes).toEqual([1, 0.6])
+    // A reconnect (a server that may have restarted and forgotten the level): the default again at the welcome.
+    peers[0]!.ws.terminate()
+    await until(() => peers.length === 2 && store.get().connection.status === "open")
+    expect(volumes.at(-1)).toBe(1)
+    // An audio port without it (an older page's) is never called and nothing breaks.
+    const plain = connect(url, fakeAudio(false).audio)
+    await until(() => plain.store.get().connection.status === "open")
+    peers.at(-1)!.ws.send(encodeServerMessage({ type: "output.volume", volume: 0.4 }))
+    await new Promise((r) => setTimeout(r, 50))
+    expect(plain.store.get().connection.status).toBe("open")
+  })
+
   it("says hello, dispatches the welcome and answers liveness pings", async () => {
     const { url, peers } = await startServer()
     const { store, conn } = connect(url, fakeAudio().audio)
