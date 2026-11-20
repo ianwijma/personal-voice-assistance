@@ -1,7 +1,7 @@
 # Modules: where the work stands
 
 Status of the work planned in [MODULES-PLAN.md](MODULES-PLAN.md), kept here so it does not depend on any one working
-session. Updated 2026-11-19, 19:11. Nothing below is merged into `main`; the owner merges.
+session. Updated 2026-11-20, 16:53. Nothing below is merged into `main`; the owner merges.
 
 **State: the work is done and waits for the owner.** Every preparation part, every module that was not deferred and
 every follow-up has an open pull request, has had at least one complete Sol review, and has its findings fixed. On
@@ -14,7 +14,8 @@ under "Known gaps kept on purpose".
 
 **The whole, on one branch: `t3/modules-13-all`, pull request #130 (code as of `08b3c65c`; later commits on it are merges that change no code: this page, and branch heads that
 moved by a test-only fix: the bin-day test and the reminders tests' time limit).** Every branch below merged
-together, merges only, plus one commit of its own (a 20 second test limit for the `node` project on CI). On it:
+together, merges only, plus two commits of its own (a 20 second test limit on CI for the `node` test project and, since 2026-11-20, for
+the `latency` project too: a slow CI run passed the default 5 seconds in two latency-project tests). On it:
 `pnpm check` passes; `pnpm test`: 10,094 passed and one failed, a measurement (the music module's latency test
 "resolving a room at the largest cache": 10.2 ms on the main thread against its 10 ms bound in the full run; alone it
 passed three times out of three; the run before the last two merges had 10,085 passed, none failed); the browser
@@ -23,6 +24,66 @@ the branch to try out. Putting the parts together found three faults, fixed on t
 withheld every refusal and failure sentence of a module with per-answer privacy (#115, corrected: a module's own
 failure sentence goes back as it is, a crash stays withheld); reminders tagged an already reduced confirmation with
 its owner (#114); a browser test did not know the new Risk policy page (#115).
+
+**CI is green on all 44 open pull requests of this work (#87 to #130) at the heads named on this page** (seen
+2026-11-19, 19:28). On the final head of the branch with everything, locally: `pnpm check` passes, `pnpm test` 10,095
+passed and none failed, the latency tests the way CI runs them pass (37 files, 420 tests), the browser tests pass
+(218 cases).
+
+**The GPT review cycle on six pull requests is finished** (owner's instruction, 2026-11-19 evening; ran through the
+night to 2026-11-20 morning). The last fix rounds of #108, #114, #115, #117, #122 and #129 had not been reviewed. Each
+was reviewed by GPT Astra; what it found was fixed by GPT Sol on a separate branch `<branch>-gpt-review` with its own
+pull request "[GPT Review] …" into the reviewed branch; then Astra looked again, at most ten rounds.
+
+| Reviewed pull request | Fix pull request | Head | Blocking findings per round | Result |
+|---|---|---|---|---|
+| #115 risk policy (P8) | #135 | `22032ab6` | 7, 4, 2, 3, 2, 3 (outside this pull request) | approved in round 7 |
+| #129 routines | #132 | `f85752da` | 13, 5, 3, 8, 2 | approved in round 6 |
+| #122 lists follow-up | #131 | `89beb5a8` | 12, 5, 3, 3, 3, 3, 1 | approved in round 8 |
+| #114 reminders | #133 | `93e86c27` | 16, 9, 8, 4, 4, 2, 1 | approved in round 8 |
+| #108 presentation (P10) | #136 | `47602005` | 26, 14, 7, 3, 4, 2, 2, 1, 1 | core approved in round 6, the voice page in round 10 |
+| #117 timers and alarms | #134 | `61bdf42d` | 16, 10, 4, 2, 3, 2, 7, 6, 2, 2, then 2, 1, 1, 1, 2, 2 | **not approved after sixteen rounds; ended by the owner.** Rounds 9 to 13 found only further words the module's lists missed (the owner: feedback about word lists is ignored, that mechanism will be redone). Rounds 14 to 16 were about the same unnamed alarm set twice: it is no longer created twice, and a group of identical alarms is cancelled or skipped in one transaction. **Two cases from the last review are open:** two such alarms that were snoozed for different lengths are still treated as identical, so cancelling "the 10:01 alarm" removes both; and after one failed send or write the "already set" answer can name a ring that is already past. No tests were written for the last fixes, by the owner's decision |
+
+**All six together: `t3/modules-13-all-gpt-review`, pull request #137 "[GPT Review] …" into `t3/modules-13-all`
+(`8b5738fb`).** The six do not simply add up: the presentation fixes (#136) and the risk policy on top of it changed
+the same places, so combining them needed four conflict resolutions and four further fixes that exist only on this
+branch (two risk-policy test fixtures without the revision a press must now carry; showings admitted in the same
+millisecond were ordered by their random ids; the compact stage's height with the fixed notification strip). On it,
+locally: `pnpm check` passes; `pnpm test` 10,700 passed and none failed before the last, layout-only commit, and on
+the final code 10,698 passed with 2 failing under load that pass alone (the SQLite presentation contract's case a5; a
+store latency bound at 10.98 ms against 10 ms); the browser tests pass (253 of 253). Checked again by the lead on the
+head `8bf553fb`; the final head `9c9e47dd` adds one more timers fix, on which `pnpm check` and the timers tests (461) pass: `pnpm check` passes, the full suite passes (10,839 tests, none
+failed), the latency tests the way CI runs them pass (449), the browser tests pass (253 of 253). **CI, seen 2026-11-20, 16:20: green on all 51 open pull requests (#87 to #137).** It is not reliably green:
+at its newest head `104358ab` the branch with everything, #130, failed three runs in a row before it passed, on tests
+that pass on every local run, a different one each time (the bin-day refresh test, the bin-day reminder test "a copy
+too old to trust", a SQLite latency step, the timers test "the repeating series moves on", which is fixed only on
+the timers fix branch and so in #137); and #87 needs a second run now and then for a timing test of code already on
+`main`. By the owner's instruction these tests are not being rewritten: they will be replaced.
+
+**To take the fixes: merge #130, then #137** (the six fix pull requests can then be closed). The fix pull requests
+are not part of #130. Taking single ones into their own branches instead means resolving the four conflicts between
+#136 and #135 again. The review reports and the fixer's account of every round (what was fixed, what was stated
+as a limit, what was decided and not changed) are in the working notes under `reports/gpt/`.
+
+The owner stopped the cycle on 2026-11-20 with these words: feedback about word lists can be ignored, this will be
+improved; and the corrected tests are not to be made any more, because they will be replaced by different tests.
+
+What the cycle found that matters beyond its six pull requests:
+
+- **The direct path hands an action only its declared parameter values**, never the person's words or the words no
+  parameter consumed. An action therefore cannot tell "cancel the eggs timer" with "eggs" dropped by the host's
+  extraction from "cancel the timer", and can act on the only timer. Timers and alarms now ask back wherever a
+  parameter they did receive holds something they do not understand; the rest needs the host to give an action the
+  utterance or what was not consumed. Seven rounds of the timers review were spent on phrasings, and it never ran
+  out of them: lists of words in a module cannot close this; other modules were not looked at for it.
+- **The rule that nothing a speculative turn asks for reaches a screen did not hold on the real voice path** through
+  the Claude Code agent adapter (the tool's callback did not see the turn's commit state). Fixed in #136.
+- **"Move to settings"** (moving a value from a `.env` file into the settings): three findings outside #115, not
+  fixed: the module host reports a module setting's save as done when writing it failed; a Home save from another page
+  at the same moment can undo part of "Move all"; moving an unchanged Home Assistant token restarts that part. And one
+  stated limit: the `.env` files must not be edited by hand while a move runs.
+- Limits that the fix rounds stated on the pages instead of fixing (sequences that need two faults at once, or a
+  changed system clock) are listed in each fixer's account under "stated as a limit".
 
 **Two ways to merge.** Either #130 alone (it contains every commit of #87 to #129; the others can then be
 closed), or the stack one by one in the order of the tables below.
@@ -136,9 +197,9 @@ Found by the last checks and written down instead of fixed:
 - **Timers and alarms, reminders:** delivery is at least once (a ring that was already stopped can sound again after a
   crash between sending and recording); Stop pressed in the same instant as "five more minutes" or a snooze can lose.
 - **Routines:** not all-or-nothing; the host's "stop" ends a routine only while it is speaking its own line.
-- **No review after the last fix round** of: reminders, timers and alarms, routines, the lists follow-up, the web
-  search follow-up (its list was rebuilt after its review), P8's correction, P10's third round. Each has its tests,
-  `pnpm check` and the full run on the whole.
+- **No review after the last fix round** of: the web search follow-up (its list was rebuilt after its review) and
+  the last fix round of timers and alarms (#134). The other pull requests named here before had the GPT review
+  cycle described at the top of this page.
 
 ## Open points
 
@@ -148,7 +209,8 @@ Found by the last checks and written down instead of fixed:
   right after a job (on the local-info module branch and its follow-up), and a 20 second limit on CI in the branch
   with everything. Still
   seen once each: `ModuleHostP3Round5` "forty modules" (core, 5 s limit), the SQLite scheduler contract's
-  daylight-saving test (30 s limit), the calendar privacy test "finding 22" (the kit gave up waiting for the module
+  daylight-saving test (30 s limit), a test of code already on `main` (the vault's "unlock time … stays under a
+  second" measured 1.4 s), the calendar privacy test "finding 22" (the kit gave up waiting for the module
   to stop), the bin-day reminder test "a copy too old to trust"; and in local full runs under load the SQLite
   `logStart` test ("database is locked"), the calendar latency test and one timers test ("the repeating series moves
   on although its ring is refused": the alarm's row was not there yet when the test looked; it passes alone 5 times
