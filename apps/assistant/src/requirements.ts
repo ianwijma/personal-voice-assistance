@@ -184,7 +184,7 @@ export interface RequirementCheckerOptions {
   readonly distro?: Distro
 }
 
-/** How the owner updates the assistant (README "Getting started": a git checkout with pnpm), run in its directory. */
+/** How the owner updates the assistant (README "Quick start": a git checkout with pnpm), run in its directory. */
 export const UPDATE_FIX = { kind: "command" as const, label: "Update the assistant, then restart it", value: "git pull && pnpm install" }
 
 export const makeRequirementChecker = (options: RequirementCheckerOptions): RequirementChecker => {

@@ -881,7 +881,7 @@ export const sectionDefinitions = (dirs: ModelDirs = defaultModelDirs): Readonly
           label: "Save what the assistant hears",
           description:
             "Saves the audio the server receives for each of your turns as a WAV file in the data directory (recordings/), with its level, " +
-            "loudness and band, and logs them with the transcript (see the README: `pnpm start compare-models`). Keeps the newest files only.",
+            "loudness and band, and logs them with the transcript (see docs/RUNNING.md: `pnpm start compare-models`). Keeps the newest files only.",
           env: "RECORD_HEARD_AUDIO",
           default: false
         }),

@@ -9,7 +9,7 @@ import { formatLevelStats, levelStats, type LevelStats, wavBytes } from "../leve
  * recogniser's own gain control) is saved as `<dataDir>/recordings/<time>-<device>-<n>.wav`
  * with a `.json` beside it (transcript, model, level statistics, transport
  * counters), and one line is logged per turn. `pnpm start compare-models
- * <file>` then runs every installed model on it (README, "Is it the audio or
+ * <file>` then runs every installed model on it (docs/RUNNING.md, "Is it the audio or
  * the model?").
  *
  * A recording starts at `SpeechStarted` with the 1.5 s before it and ends at

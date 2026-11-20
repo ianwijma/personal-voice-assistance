@@ -2027,7 +2027,7 @@ export const ServeConfig = Config.all({
   ),
   // A reverse proxy in front (docs/UI-AND-MODULES.md §1.11): then no module route caller counts as on the home network.
   behindProxy: Config.Boolean("SERVE_BEHIND_PROXY").pipe(Config.withDefault(false)),
-  // Off only to rule it out when the page fails to load on some browser (see the README).
+  // Off only to rule it out when the page fails to load on some browser (see docs/RUNNING.md).
   crossOriginIsolation: Config.Boolean("SERVE_CROSS_ORIGIN_ISOLATION").pipe(Config.withDefault(true)),
   tlsCert: Config.option(Config.String("SERVE_TLS_CERT")),
   tlsKey: Config.option(Config.String("SERVE_TLS_KEY")),
@@ -2085,7 +2085,7 @@ export const serveMode = Effect.scoped(Effect.gen(function*() {
     )
   }
   if (tls === undefined && !isLoopback(config.host)) {
-    yield* Effect.logWarning("Browsers only allow the microphone on https:// or localhost; use an SSH tunnel or SERVE_TLS_CERT/SERVE_TLS_KEY (see the README).")
+    yield* Effect.logWarning("Browsers only allow the microphone on https:// or localhost; use an SSH tunnel or SERVE_TLS_CERT/SERVE_TLS_KEY (see docs/CONFIGURATION.md, Keys & access).")
   }
   yield* handle.ready
   const status = handle.engine.status()
