@@ -151,6 +151,8 @@ export const timerTexts = defineTexts({
 export const alarmTexts = defineTexts({
   en: {
     set: "Alarm set for {moment}.",
+    alreadySet: "That alarm is already set; it next rings {moment}.",
+    duplicateResult: "For all {count} identical alarms: {result}",
     setNamed: "{Name} alarm set for {moment}.",
     setRepeat: "Alarm set {rule}; the first one is {moment}.",
     setRepeatNamed: "{Name} alarm set {rule}; the first one is {moment}.",
@@ -217,6 +219,8 @@ export const alarmTexts = defineTexts({
   },
   nl: {
     set: "Wekker gezet voor {moment}.",
+    alreadySet: "Die wekker staat al; hij gaat weer af {moment}.",
+    duplicateResult: "Voor alle {count} identieke wekkers: {result}",
     setNamed: "Wekker {Name} gezet voor {moment}.",
     setRepeat: "Wekker gezet {rule}; de eerste keer is {moment}.",
     setRepeatNamed: "Wekker {Name} gezet {rule}; de eerste keer is {moment}.",

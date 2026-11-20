@@ -15,6 +15,10 @@ This page belongs to the module's pull request, which touches its package and th
 Alarms that ring on the device they were set on, either once ("wake me at seven", "tomorrow at 6:30") or repeating
 ("every weekday at quarter to seven", "elke werkdag om half zeven"). Up to 50 at once.
 
+Setting an identical alarm again keeps the existing row and job and says it is already set, with its next occurrence.
+An identical alarm has the same device, zone, next occurrence, repetition and name (or both are unnamed). This check
+runs in the same transaction as insertion, so repeating the request also after a restart does not create duplicates.
+
 **An alarm is not changed.** To move one, it is cancelled and set again (`alarms_cancel`, then `alarms_set`). The module
 instructions tell the model to cancel and set again.
 
@@ -184,6 +188,9 @@ the owed ring forgotten.
   ringing occurrence was set for), even if a local alarm has that name;
 - a name request matches names on its own device;
 - or the only one there is;
+- when every candidate is identical in time, repetition, name and device, including its ringing or snooze state,
+  cancellation applies to all of those indistinguishable alarms and reports how many. This handles duplicates saved
+  before duplicate creation was prevented; “next” and “all” still keep their meaning for a repeating alarm;
 - otherwise a question that lists them. Never the first of several.
 
 ### One change at a time

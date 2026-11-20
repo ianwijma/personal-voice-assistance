@@ -68,7 +68,8 @@ describe("setting alarms", () => {
     Effect.gen(function*() {
       const kit = yield* startTestModule(alarmsModule)
       for (let i = 0; i < MAX_ALARMS; i++) yield* kit.action("set", { when: `${String(5 + Math.floor(i / 12)).padStart(2, "0")}:${String((i % 12) * 5).padStart(2, "0")}` })
-      assert.strictEqual(said(yield* kit.action("set", { when: "9:00" })), "There are already 50 alarms, the most I keep. Cancel one first.")
+      assert.include(said(yield* kit.action("set", { when: "9:00" }))!, "already set")
+      assert.strictEqual(said(yield* kit.action("set", { when: "9:10" })), "There are already 50 alarms, the most I keep. Cancel one first.")
       assert.strictEqual(said(yield* kit.action("list", {})), "50 alarms: tomorrow at five o'clock at night, tomorrow at five past five at night, tomorrow at ten past five at night and 47 more.")
       // The last one, by its time, past the first pages.
       assert.strictEqual(said(yield* kit.action("cancel", { which: "9:05" })), "The alarm for tomorrow at five past nine in the morning is cancelled.")
