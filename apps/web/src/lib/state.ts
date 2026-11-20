@@ -217,6 +217,11 @@ export interface ClientState {
   /** Admin (protocol 7): the assistants with where they are used, and the device types with their defaults. */
   readonly assistants: ReadonlyArray<AssistantInfo>
   readonly deviceTypes: ReadonlyArray<DeviceTypeInfo>
+  /**
+   * Admin, protocol 12: the pairing codes redeemed while this page was open (`node.paired`), newest last, so the Add
+   * voice node dialog that shows a code learns that its box is paired.
+   */
+  readonly pairedNodes: ReadonlyArray<PairedNode>
   /** The audio owner said the wake phrase alone (`wake` with `armed`): "Listening…" until the next state change. */
   readonly woke: { readonly phrase: string; readonly assistantId?: string } | undefined
   /**
@@ -312,6 +317,14 @@ export interface ClientState {
   }
 }
 
+/** A `node.paired`: the code that was redeemed, and the node it made. */
+export interface PairedNode {
+  readonly code: string
+  readonly deviceId: string
+  readonly name: string
+}
+export const MAX_PAIRED_NODES = 8
+
 /** A presentation as the page holds it: the server's form and the clock offset taken when it arrived. */
 export type HeldPresentation = PresentationWire & { readonly receivedMono: number }
 
@@ -341,6 +354,7 @@ export const initialState: ClientState = {
   devices: [],
   assistants: [],
   deviceTypes: [],
+  pairedNodes: [],
   woke: undefined,
   setup: undefined,
   holder: undefined,
@@ -384,6 +398,7 @@ const adminPart = {
   devices: initialState.devices,
   assistants: initialState.assistants,
   deviceTypes: initialState.deviceTypes,
+  pairedNodes: initialState.pairedNodes,
   sessions: initialState.sessions,
   health: initialState.health,
   heard: initialState.heard,
@@ -729,7 +744,13 @@ const server: ServerHandlers = {
   // P10: a presentation held (or replaced in place), and one taken down. Never cut: the server bounds what a page holds.
   "present.show": (s, m) => withPresentation(s, m.presentation),
   "present.update": (s, m) => withPresentation(s, m.presentation),
-  "present.dismiss": (s, m) => (s.presentations.some((p) => p.id === m.id) ? { ...s, presentations: s.presentations.filter((p) => p.id !== m.id) } : s)
+  "present.dismiss": (s, m) => (s.presentations.some((p) => p.id === m.id) ? { ...s, presentations: s.presentations.filter((p) => p.id !== m.id) } : s),
+  // Protocol 12 (docs/VOICE-NODES.md §7.4): `node.command` goes to a node, never to a page.
+  "node.command": (s) => s,
+  // A code was redeemed: the Add voice node dialog showing it moves on to "paired".
+  "node.paired": (s, m) => ({ ...s, pairedNodes: [...s.pairedNodes.filter((p) => p.code !== m.code), { code: m.code, deviceId: m.deviceId, name: m.name }].slice(-MAX_PAIRED_NODES) }),
+  // N8: the Test microphone meter reads these.
+  "node.meter": (s) => s
 }
 
 const withPresentation = (s: ClientState, p: PresentationWire): ClientState => {
@@ -860,6 +881,7 @@ function pickAdmin(s: ClientState): Partial<ClientState> {
     health: s.health,
     assistants: s.assistants,
     deviceTypes: s.deviceTypes,
+    pairedNodes: s.pairedNodes,
     sessions: s.sessions,
     heard: s.heard,
     adminReady: s.adminReady

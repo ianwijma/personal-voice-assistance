@@ -45,6 +45,7 @@ import {
   type Assistant,
   type ConversationInfo,
   type DeviceSettings,
+  type DeviceTypeDefinition,
   MAX_DEVICE_NAME_CHARS,
   routeConfigFrom,
   type ServerMessage,
@@ -136,6 +137,11 @@ export interface VoiceSessionOptions {
   readonly engine: Engine
   /** The device's effective settings now (docs/ASSISTANTS.md §2.6). */
   readonly deviceSettings: () => DeviceSettings
+  /**
+   * The device's type now (docs/VOICE-NODES.md §4.1): its `followUpUnset` is the follow-up of an assignment without
+   * its own (a voice node: 0, one answer per phrase). Absent: the assistant's own follow-up.
+   */
+  readonly deviceType?: () => Pick<DeviceTypeDefinition, "followUpUnset"> | undefined
   /**
    * P5: the room and person every turn here has (`CurrentTurn.room`, `.person`), read at each turn's start (a cache
    * read). Absent: neither.
@@ -464,7 +470,7 @@ export const makeVoiceSession = (options: VoiceSessionOptions): Effect.Effect<Vo
 
     const gate = makeEchoGate("instant")
     // After the echo gate, before the dispatcher; configured from this device's settings and the assistants.
-    const routeConfigNow = (): RouteConfig => routeConfigFrom(options.deviceSettings(), options.assistants())
+    const routeConfigNow = (): RouteConfig => routeConfigFrom(options.deviceSettings(), options.assistants(), options.deviceType?.())
     const routeKeyOf = (config: RouteConfig) => JSON.stringify({ ...config, off: [...config.off].sort() })
     const route = makeRouteGate(routeConfigNow())
     let routeKey = routeKeyOf(route.config())

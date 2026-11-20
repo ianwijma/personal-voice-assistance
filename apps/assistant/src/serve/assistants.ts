@@ -16,6 +16,7 @@ import {
   type DeviceSetup,
   deviceSetupFrom,
   type DeviceTarget,
+  type DeviceTypeDefinition,
   deviceTypeOf,
   type EngineState,
   type ErrorInfo,
@@ -25,6 +26,7 @@ import {
   MAX_ASSISTANTS,
   type ModuleInfo,
   type ModuleOffer,
+  type NodeInfo,
   effectiveDeviceSettings,
   TYPESAFE_GIVE_UP_MS,
   validateAssistant,
@@ -35,7 +37,7 @@ import {
 } from "@pva/protocol"
 import { Effect, Schema, Semaphore } from "effect"
 import { deviceListInfos, deviceSettingsFrom, deviceTypeInfos, typeSettingsFrom } from "./devices.ts"
-import { EntitySaveError, type SettingsStore, SettingsStoreError } from "./SettingsStore.ts"
+import { EntitySaveError, type SettingsStore, SettingsStoreError, type StoredNode } from "./SettingsStore.ts"
 import type { VoiceSessions } from "./VoiceSessions.ts"
 import type { MembersGate } from "./people.ts"
 
@@ -104,8 +106,8 @@ export interface Assistants {
   readonly infos: () => ReadonlyArray<AssistantInfo>
   /** `device.types`. */
   readonly deviceTypes: () => ReadonlyArray<DeviceTypeInfo>
-  /** `devices`: the protocol 5 entries with the protocol 7 fields added. */
-  readonly devices: (base: ReadonlyArray<DeviceInfo>) => ReadonlyArray<DeviceListInfo>
+  /** `devices`: the protocol 5 entries with the protocol 7 fields added (and protocol 12's `node`, from `nodeInfo`). */
+  readonly devices: (base: ReadonlyArray<DeviceInfo>, nodeInfo?: (id: string, node: StoredNode) => NodeInfo) => ReadonlyArray<DeviceListInfo>
   /** A voice connection's setup (`device.setup`, `snapshot.setup`). `kind`: the kind its hello named. */
   readonly setupFor: (deviceId: string | undefined, kind?: string) => DeviceSetup
   readonly create: (message: ClientMessageOf<"assistant.create">) => Effect.Effect<AssistantResult>
@@ -201,16 +203,21 @@ export const makeAssistants = (options: AssistantsOptions): Assistants => {
     return issues
   }
 
-  const setupFor: Assistants["setupFor"] = (deviceId, kind) =>
-    deviceSetupFrom(
-      deviceSettingsFrom(store.settings(), deviceId, kind),
+  const setupFor: Assistants["setupFor"] = (deviceId, kind) => {
+    const file = store.settings()
+    // The record's kind wins (a node's setup carries `sound` and `soundDevices`, a browser's does not).
+    const type = deviceTypeOf((deviceId === undefined ? undefined : file.devices[deviceId]?.kind) ?? kind ?? "")
+    return deviceSetupFrom(
+      deviceSettingsFrom(file, deviceId, kind),
       new Map(inEffect().map((a) => [a.id, a])),
       {
         ...(deviceId !== undefined ? { deviceId } : {}),
         canAuto: options.canAuto(),
-        ...(options.speakerAllowed !== undefined ? { speakerAllowed: options.speakerAllowed(deviceId, kind) } : {})
+        ...(options.speakerAllowed !== undefined ? { speakerAllowed: options.speakerAllowed(deviceId, kind) } : {}),
+        keys: type?.keys
       }
     )
+  }
 
   // ---- The assistants push
 
@@ -244,10 +251,12 @@ export const makeAssistants = (options: AssistantsOptions): Assistants => {
   const settingsRefusal = (
     next: DeviceSettings,
     before: DeviceSettings,
-    saveAnyway: boolean
+    saveAnyway: boolean,
+    type?: DeviceTypeDefinition
   ): AssistantResult | undefined => {
     const ids = knownIds()
-    const records = { assistants: new Map(inEffect().map((a) => [a.id, a])) }
+    // With the type: a voice node that answers without a phrase warns (`answers_everything`, docs/VOICE-NODES.md §4.2).
+    const records = { assistants: new Map(inEffect().map((a) => [a.id, a])), ...(type !== undefined ? { type } : {}) }
     const checked = validateDeviceSettings(next, ids, records)
     if (checked.errors.length > 0) return refusal(checked.errors)
     if (saveAnyway) return undefined
@@ -354,7 +363,7 @@ export const makeAssistants = (options: AssistantsOptions): Assistants => {
         if (voiceRefused !== undefined) return Effect.succeed(voiceRefused)
         const before = typeSettingsFrom(file, target.type)
         const next = { ...before, ...Object.fromEntries(Object.entries(patch).filter(([, v]) => v !== undefined)) } as DeviceSettings
-        const refused = settingsRefusal(next, before, saveAnyway) ?? memoryRefusal({ place: { place: `type:${target.type}`, settings: next } }, saveAnyway, "assistants")
+        const refused = settingsRefusal(next, before, saveAnyway, type) ?? memoryRefusal({ place: { place: `type:${target.type}`, settings: next } }, saveAnyway, "assistants")
         if (refused !== undefined) return Effect.succeed(refused)
         const inherited = inheritorsRefusal(target.type, next)
         if (inherited !== undefined) return Effect.succeed(inherited)
@@ -373,7 +382,7 @@ export const makeAssistants = (options: AssistantsOptions): Assistants => {
       const kindDefaults = file.deviceTypes[record.kind]
       const effective = (o: DeviceOwn) =>
         effectiveDeviceSettings((type ?? deviceTypeOf(record.kind)!).builtIn, kindDefaults, type === undefined ? undefined : applicableOwn(type, o))
-      const refused = settingsRefusal(effective(own), effective(record.own), saveAnyway) ??
+      const refused = settingsRefusal(effective(own), effective(record.own), saveAnyway, type) ??
         memoryRefusal({ place: { place: `device:${target.id}`, settings: effective(own) } }, saveAnyway, "assistants")
       if (refused !== undefined) return Effect.succeed(refused)
       return store.saveDevice(target.id, message.rev, { ...(message.name !== undefined ? { name: message.name } : {}), own }).pipe(
@@ -564,7 +573,7 @@ export const makeAssistants = (options: AssistantsOptions): Assistants => {
 
   return {
     deviceTypes: () => deviceTypeInfos(store.settings()),
-    devices: (base) => deviceListInfos(store.settings(), base),
+    devices: (base, nodeInfo) => deviceListInfos(store.settings(), base, nodeInfo),
     infos,
     setupFor, create: one(create),
     save: one(save),

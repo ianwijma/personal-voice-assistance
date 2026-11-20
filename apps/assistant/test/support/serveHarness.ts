@@ -194,6 +194,8 @@ export const startTestServer = async (
     port: 0,
     allowedOrigins: ["http://localhost:3000"],
     webDir: join(dataDir, "no-web"),
+    // Not the checkout's apps/node/dist: whether `pnpm serve` built it here must not change what the tests see.
+    nodeDir: join(dataDir, "no-node"),
     catalog: [greeterModule],
     // Never the owner's real vault; a cheap scrypt so tests stay fast (a vault opens with its own stored parameters).
     vaultPath: join(dataDir, "vault", "vault.enc"),

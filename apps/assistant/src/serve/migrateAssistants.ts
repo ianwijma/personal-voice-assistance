@@ -10,6 +10,7 @@ import {
   DEFAULT_DEVICE_PROFILE,
   type DeviceOwn,
   type DeviceProfile,
+  type DeviceCapabilities,
   type DeviceRecord,
   type DeviceSettings,
   deviceTypeOf,
@@ -30,6 +31,7 @@ import { defaultSystemPrompt } from "../config.ts"
 import { isTtsProvider } from "../providers.ts"
 import { DEFAULT_ASSISTANT_VOICE, resolveAssistantVoice } from "../voiceSelection.ts"
 import { sectionDefinitions } from "./sectionDefinitions.ts"
+import type { StoredNode } from "./SettingsStore.ts"
 
 /**
  * Settings version 3 → 4: first-class assistants and merged devices (docs/ASSISTANTS.md §2.5, §6, §1.2).
@@ -84,8 +86,15 @@ export interface SettingsFileV3 extends V3FrontendData {
 
 /** A device type's defaults: complete settings, and the entity's save counter. */
 export type StoredDeviceType = DeviceSettings & { readonly rev: number }
-/** A remembered device with the entity's save counter. */
-export type StoredDevice = DeviceRecord & { readonly rev: number }
+/**
+ * A remembered device with the entity's save counter; a paired voice node carries `node` (its credential digest),
+ * and a device that declared its capabilities `capabilities` (docs/VOICE-NODES.md §3.3).
+ */
+export type StoredDevice = DeviceRecord & {
+  readonly rev: number
+  readonly node?: StoredNode
+  readonly capabilities?: DeviceCapabilities
+}
 
 export interface AssistantList {
   /** The admin's order; every id is in `byId`. */
@@ -480,7 +489,9 @@ const settingsFromProfile = (p: DeviceProfile, assistantId: string): DeviceSetti
   look: FOLLOW_ASSISTANT,
   voice: FOLLOW_ASSISTANT,
   place: BUILT_IN_PLACE,
-  capabilities: NO_OVERRIDES
+  capabilities: NO_OVERRIDES,
+  sound: BUILT_IN_WEB_VOICE_SETTINGS.sound,
+  soundDevices: BUILT_IN_WEB_VOICE_SETTINGS.soundDevices
 })
 
 /** The fields present in `overrides`. */

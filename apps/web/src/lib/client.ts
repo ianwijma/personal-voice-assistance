@@ -1,4 +1,4 @@
-import type { Assistant, AssistantBody, AssistantId, ClientMessage, DeviceProfile, DeviceSettingsPatch, DeviceTarget, FrontendRole, SettingsPatch, ToolId } from "@pva/protocol"
+import type { Assistant, AssistantBody, AssistantId, ClientMessage, DeviceProfile, DeviceSettingsPatch, DeviceTarget, FrontendRole, NodeCommandName, SettingsPatch, ToolId } from "@pva/protocol"
 import { type Outcome, outcomeOf } from "./assistants.ts"
 import { createDiagnosticsStore, type DiagnosticsStore, type MicProcessing } from "./audio/diagnostics.ts"
 import { CUE_RATE, wakeCue } from "./audio/cue.ts"
@@ -106,6 +106,13 @@ export interface AssistantClient {
    * without one, the most recently active session.
    */
   readonly wakeTest: (on: boolean, deviceId?: string) => Promise<ResultMessage>
+  /**
+   * Admin, protocol 12 (docs/VOICE-NODES.md §5.3): a one-time pairing code for a new voice node (`result.pairing`;
+   * `node.paired` follows when the box redeems it), its cancel, and a command to a connected node.
+   */
+  readonly nodePairCreate: (options?: { readonly name?: string; readonly replace?: string }) => Promise<ResultMessage>
+  readonly nodePairCancel: (code: string) => Promise<ResultMessage>
+  readonly nodeCommand: (id: string, command: NodeCommandName, durationMs?: number) => Promise<ResultMessage>
   /** Voice: start a new conversation on this device (`conversation.new`); the chat empties on the server's answer. */
   readonly newConversation: (assistantId?: string) => Promise<ResultMessage>
   /**
@@ -722,6 +729,14 @@ export const createAssistantClient = (options: { readonly frontend?: FrontendRol
         options.label ?? "The device"
       ),
     wakeTest: (on, deviceId) => connection.request(deviceId === undefined ? { type: "wake.test", on } : { type: "wake.test", on, deviceId }),
+    nodePairCreate: (options = {}) =>
+      connection.request({
+        type: "node.pair.create",
+        ...(options.name !== undefined && options.name.trim() !== "" ? { name: options.name.trim() } : {}),
+        ...(options.replace !== undefined ? { replace: options.replace } : {})
+      }),
+    nodePairCancel: (code) => connection.request({ type: "node.pair.cancel", code }),
+    nodeCommand: (id, command, durationMs) => connection.request(durationMs === undefined ? { type: "node.command.send", id, command } : { type: "node.command.send", id, command, durationMs }),
     newConversation: (assistantId) => connection.request(assistantId === undefined ? { type: "conversation.new" } : { type: "conversation.new", assistantId }),
     // Who has the turn afterwards is the server's to say: an accepted pick closes its windows and the `state` that follows names the holder.
     pickAssistant: (withoutPhrase) => connection.request({ type: "device.pick", withoutPhrase }),

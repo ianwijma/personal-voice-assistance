@@ -10,10 +10,12 @@ import {
   DeviceSettings,
   deviceTypeOf,
   FrontendKindId,
+  Hex64,
   makeAssistantId,
   MAX_ASSISTANTS,
   NonNegativeFinite,
   NonNegativeInt,
+  NodePlatform,
   ProfileOverrides,
   removeAssistantFromSettings,
   type SettingValue
@@ -131,7 +133,31 @@ const V3DeviceRecord = Schema.Struct({
 })
 
 const StoredDeviceTypeSchema = Schema.Struct({ ...DeviceSettings.fields, rev: NonNegativeInt })
-const StoredDeviceSchema = Schema.Struct({ ...DeviceRecordSchema.fields, rev: NonNegativeInt })
+/**
+ * A paired voice node (docs/VOICE-NODES.md §3.3), on its device record. Server only: the credential's digest never
+ * enters `@pva/protocol` or a push. The settings file stays version 4 (an optional key).
+ */
+export const StoredNode = Schema.Struct({
+  /** SHA-256 of the node's credential, 64 hex. The credential itself is never stored. */
+  credentialSha256: Hex64,
+  /** Epoch ms. */
+  pairedAt: NonNegativeFinite,
+  /** The last `hello.node.version` (written when it changes). */
+  version: Schema.optionalKey(Schema.String.check(Schema.isMaxLength(64))),
+  /** The last `hello.node.platform` (written when it changes). */
+  platform: Schema.optionalKey(NodePlatform)
+})
+export type StoredNode = typeof StoredNode.Type
+
+const StoredDeviceSchema = Schema.Struct({
+  ...DeviceRecordSchema.fields,
+  rev: NonNegativeInt,
+  /**
+   * A paired voice node's pairing (protocol 12). Its declaration is `declared`, as every device's: a `capabilities`
+   * key that a pre-merge voice-node build wrote next to it is ignored when read (the node declares again at each hello).
+   */
+  node: Schema.optionalKey(StoredNode)
+})
 
 /**
  * The settings file's format. 5 (P5): device types and devices have the `place` and `capabilities` sections and a
@@ -260,17 +286,18 @@ const readFrontendData = (u: Record<string, unknown>, problems: Array<string>): 
   return { frontends, devices }
 }
 
+/** Section keys added after version 4 was first written: a stored type entry without one takes the built-in's. */
+const LATER_KEYS = ["look", "voice", "place", "capabilities", "sound", "soundDevices"] as const
+
 /**
  * A stored type entry is a complete `DeviceSettings`: one written before a section key existed (`look`, `voice`,
- * docs/LOOKS-AND-VOICES.md; `place`, `capabilities`, protocol 11) lacks it and takes the built-in's, so it loads whole
- * and behaves as before.
+ * docs/LOOKS-AND-VOICES.md; `place`, `capabilities`, protocol 11; `sound`, `soundDevices`, docs/VOICE-NODES.md §3.1)
+ * lacks it and takes the built-in's, so it loads whole and behaves as before.
  */
 const withNewKeys = (value: unknown, kind: string): unknown => {
   if (!isRecord(value)) return value
   const builtIn: DeviceSettings = deviceTypeOf(kind)?.builtIn ?? BUILT_IN_WEB_VOICE_SETTINGS
-  const missing: Record<string, unknown> = {}
-  for (const key of ["look", "voice", "place", "capabilities"] as const) if (value[key] === undefined) missing[key] = builtIn[key]
-  return { ...missing, ...value }
+  return { ...Object.fromEntries(LATER_KEYS.flatMap((k) => (value[k] === undefined ? [[k, builtIn[k]]] : []))), ...value }
 }
 
 /** The entities of a version-4 file; entries that do not decode are dropped, each with a problem. */

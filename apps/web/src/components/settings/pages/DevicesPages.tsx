@@ -21,6 +21,7 @@ import {
   settingsOf,
   wakesAssistant
 } from "@/lib/devices.ts"
+import { isNodeKind, nodeOnlineText, reportedSoundDevices, unencrypted, updatePending } from "@/lib/nodes.ts"
 import { INTERRUPT_CHOICES, lastSeenText } from "@/lib/profileForm.ts"
 import { agoText, stateWord, turnsText } from "@/lib/sessions.ts"
 import { formatSettingsHash, isTypePageId, typePageId } from "@/lib/settingsTree.ts"
@@ -29,14 +30,16 @@ import { useClient, useClientState } from "../../context.tsx"
 import { inputClass } from "../../fields/types.ts"
 import { Icon, Spinner } from "../../ui/Icon.tsx"
 import { useDialog } from "../../ui/Panel.tsx"
-import { Button, cx, Segmented, Switch } from "../../ui/controls.tsx"
+import { Button, cx, Segmented } from "../../ui/controls.tsx"
 import { FormFooter } from "../FormFooter.tsx"
 import { PhraseTester } from "../PhraseTester.tsx"
 import { Dialog, DialogButtons } from "./assistants/parts.tsx"
 import { AssignSection, MarksFor, type SectionContext } from "./devices/AssignSection.tsx"
+import { AddNodeDialog } from "./devices/AddNodeDialog.tsx"
 import { LookSection, LookVoiceLine, VoiceSection } from "./devices/LookVoiceSections.tsx"
+import { NodeActions, NodeStatusSection, SoundDevicesSection, SoundSection } from "./devices/NodeSections.tsx"
 import { CapabilitiesSection, PlaceSection } from "./devices/PlaceSections.tsx"
-import { Chip, DField, Pill } from "./devices/parts.tsx"
+import { Chip, DField, Pill, Toggle } from "./devices/parts.tsx"
 
 /** The time, ticking every 30 s, for "Seen 5 min ago". */
 const useNow = () => {
@@ -57,7 +60,7 @@ const talkingOf = (d: DeviceListInfo, session: SessionInfo | undefined): boolean
 /** How many sections a device has its own value for (the list and "who answers without a phrase" are one section). */
 const ownSections = (d: Pick<DeviceListInfo, "own">): number => {
   const own = d.own as Record<string, unknown>
-  return ["assistants|withoutPhrase", "matching", "voicePage", "look", "voice", "place", "capabilities", "interruptMode", "audio", "captions"].filter((s) => s.split("|").some((k) => own[k] !== undefined)).length
+  return ["assistants|withoutPhrase", "matching", "voicePage", "look", "voice", "place", "capabilities", "interruptMode", "audio", "captions", "sound", "soundDevices"].filter((s) => s.split("|").some((k) => own[k] !== undefined)).length
 }
 
 /**
@@ -94,13 +97,17 @@ function Row({ d, type, defaults, assistants, session, now }: {
   })
   const members = devices.filter((x) => x.kind === type.kind)
   const own = d.own === undefined ? 0 : ownSections({ own: d.own })
+  const listed = defaults ? undefined : devices.find((x) => x.id === d.id)
+  const node = isNodeKind(type.kind)
+  const seen = (x: Pick<DeviceListInfo, "lastSeen" | "connections">) => (node ? nodeOnlineText(x, now) : lastSeenText(x, now))
   const meta = defaults
     ? [`Applies to ${members.length} ${members.length === 1 ? type.one : type.many}`, "Each follows it unless it has its own value"]
-    : [own > 0 ? `${own} own setting${own === 1 ? "" : "s"}` : "Follows the defaults", ...(d.id !== undefined ? [lastSeenText(devices.find((x) => x.id === d.id) ?? { lastSeen: 0, connections: 0 }, now)] : [])]
+    : [own > 0 ? `${own} own setting${own === 1 ? "" : "s"}` : "Follows the defaults", ...(d.id !== undefined ? [seen(listed ?? { lastSeen: 0, connections: 0 })] : [])]
   if (settings.withoutPhrase.mode === "typesafe") meta.unshift("Without a phrase: TypeSafe decides")
   // Protocol 11: the room it is in, when one is set.
   if (!defaults && settings.place.room.trim() !== "") meta.unshift(settings.place.room.trim())
-  const connected = !defaults && (devices.find((x) => x.id === d.id)?.connections ?? 0) > 0
+  const connected = !defaults && (listed?.connections ?? 0) > 0
+  const lastError = listed?.node?.status?.lastError
   const speaker = talking && session?.state === "speaking" ? assistants.find((a) => a.id === session.answering)?.name : undefined
   return (
     <li>
@@ -111,13 +118,15 @@ function Row({ d, type, defaults, assistants, session, now }: {
         data-device={defaults ? `type:${type.kind}` : d.id}
       >
         <span className={cx("inline-flex size-9 shrink-0 items-center justify-center rounded-full border", connected ? "border-ok/50 text-ok" : "border-line text-ink-faint")} aria-hidden="true">
-          <Icon name="device" size={18} />
+          <Icon name={node ? "speaker" : "device"} size={18} />
         </span>
         <span className="min-w-0 flex-1">
           <span className="flex flex-wrap items-center gap-x-2 gap-y-0.5">
             <span className="truncate text-[14px] text-ink">{d.name}</span>
             {defaults && <Chip testId="defaults-chip">Defaults</Chip>}
             {talking && <Chip tone="you" testId="talking-now">Talking now</Chip>}
+            {updatePending(listed?.node) && <Chip tone="warn" testId="update-pending">Update pending</Chip>}
+            {unencrypted(listed?.node) && <Chip tone="warn" testId="unencrypted">Unencrypted</Chip>}
             {talking && session !== undefined && <span className="text-[12px] text-ink-muted" data-testid="session-state">{speaker !== undefined ? `${speaker} speaking` : stateWord(session.state)}</span>}
           </span>
           <span className="my-1 flex flex-wrap gap-1.5" data-testid="device-chips">
@@ -127,7 +136,8 @@ function Row({ d, type, defaults, assistants, session, now }: {
             ))}
           </span>
           <span className="block text-[12px] text-ink-faint" data-testid="device-meta">{meta.join(" · ")}</span>
-          <LookVoiceLine settings={settings} own={d.own} defaults={defaults} />
+          {lastError !== undefined && <span className="mt-0.5 block text-[12px] text-warn [overflow-wrap:anywhere]" data-testid="device-last-error">Last error {agoText(lastError.at, now)}: {lastError.message}</span>}
+          <LookVoiceLine settings={settings} own={d.own} defaults={defaults} keys={type.keys} />
         </span>
         <Icon name="chevron" size={16} className="mt-2 shrink-0 text-ink-faint" />
       </button>
@@ -150,33 +160,52 @@ export function DevicesPage() {
   const sessions = useClientState((s) => s.sessions)
   const assistants = useClientState((s) => s.assistants)
   const now = useNow()
+  const [adding, setAdding] = useState(false)
   return (
     <div className="flex flex-col gap-8" data-testid="device-list">
       {types.map((t) => {
         const members = devices.filter((d) => d.kind === t.kind)
+        const node = isNodeKind(t.kind)
         return (
           <section key={t.kind} data-testid={`device-type-${t.kind}`}>
-            <div className="mb-1 flex items-baseline justify-between gap-3">
+            <div className="mb-1 flex flex-wrap items-center justify-between gap-x-3 gap-y-1">
               <h4 className="label text-ink-faint">{t.title}</h4>
-              <span className="font-mono text-[12px] text-ink-faint" data-testid="type-count">{members.length} {members.length === 1 ? t.one : t.many}</span>
+              <span className="ml-auto inline-flex items-center gap-3">
+                <span className="font-mono text-[12px] text-ink-faint" data-testid="type-count">{members.length} {members.length === 1 ? t.one : t.many}</span>
+                {node && members.length > 0 && (
+                  <Button size="sm" onClick={() => setAdding(true)} data-testid="add-node-button">
+                    <Icon name="plus" size={14} />
+                    Add voice node
+                  </Button>
+                )}
+              </span>
             </div>
             <p className="mb-3 text-[13px] text-ink-muted">{t.description}</p>
             <ul className="flex flex-col divide-y divide-line/60 rounded-md border border-line">
               <Row d={{ name: `Every ${t.one}`, settings: t.settings }} type={t} defaults assistants={assistants} session={undefined} now={now} />
               {members.map((d) => <Row key={d.id} d={d} type={t} defaults={false} assistants={assistants} session={sessions.find((x) => x.deviceId === d.id)} now={now} />)}
             </ul>
-            {members.length === 0 && (
+            {members.length === 0 && (node ? (
+              <div className="mt-3 flex flex-col items-start gap-3 rounded-md border border-dashed border-line px-4 py-4" data-testid="no-devices">
+                <p className="text-[14px] text-ink">No voice nodes yet. Add one: you get a command to run on the box.</p>
+                <Button variant="primary" onClick={() => setAdding(true)} data-testid="add-node-button">
+                  <Icon name="plus" size={16} />
+                  Add voice node
+                </Button>
+              </div>
+            ) : (
               <div className="mt-3 flex flex-col items-start gap-1 rounded-md border border-dashed border-line px-4 py-4" data-testid="no-devices">
                 <p className="text-[14px] text-ink">No devices yet.</p>
                 <p className="text-[13px] text-ink-muted">Open the voice assistant on a phone, tablet or computer: it appears here the first time it connects.</p>
               </div>
-            )}
+            ))}
           </section>
         )
       })}
       <p className="text-[13px] text-ink-muted">
         Assistants are made under <a href={formatSettingsHash(["assistants"])} className="text-voice underline-offset-4 hover:underline">Assistants</a>. Here you only choose which ones answer on each device.
       </p>
+      {adding && <AddNodeDialog onClose={() => setAdding(false)} />}
     </div>
   )
 }
@@ -216,6 +245,7 @@ function DeviceEditor({ type, device }: { readonly type: DeviceTypeInfo; readonl
   const canAuto = useCanAuto()
   const hasRouting = useHasRouting()
   const memberCount = useClientState((s) => s.devices.filter((d) => d.kind === type.kind).length)
+  const typeMembers = devices.filter((d) => d.kind === type.kind)
   const now = useNow()
   const isType = device === undefined
   const base: DeviceBase = device === undefined ? baseOfType(type) : baseOfDevice(device, type)
@@ -313,10 +343,11 @@ function DeviceEditor({ type, device }: { readonly type: DeviceTypeInfo; readonl
   const defaultsName = `Every ${type.one}`
   const thisWord = isType ? `these ${type.many}` : `this ${type.one}`
   const name = edit.name ?? device?.name ?? defaultsName
+  const node = isNodeKind(type.kind)
   const ctx: SectionContext = { base, edit, update, settings, isType, thisWord, defaultsName, deviceName: name, setBlocked: setBlockedId, generation, epoch, renew: () => {
     setGeneration((g) => g + 1)
     setEpoch((g) => g + 1)
-  } }
+  }, followUpUnset: type.followUpUnset, typeMany: type.many, node }
   const sections = sectionsOf(type)
   const has = (s: ReturnType<typeof sectionsOf>[number]) => sections.includes(s)
 
@@ -398,9 +429,15 @@ function DeviceEditor({ type, device }: { readonly type: DeviceTypeInfo; readonl
           ? `Applies to ${memberCount} ${memberCount === 1 ? type.one : type.many} except where one has its own value. A change reaches running devices at once.`
           : `A ${type.one}. Each section follows ${defaultsName} until you change it here.`}
       </p>
+      {device !== undefined && node && (
+        <>
+          <NodeStatusSection device={device} now={now} conversations={convText} />
+          <NodeActions device={device} />
+        </>
+      )}
       {device !== undefined && (
         <>
-          <dl className="grid grid-cols-[auto_1fr] gap-x-6 gap-y-1.5 text-[13px]" data-testid="device-facts">
+          {!node && <dl className="grid grid-cols-[auto_1fr] gap-x-6 gap-y-1.5 text-[13px]" data-testid="device-facts">
             <dt className="text-ink-muted">Type</dt>
             <dd className="text-ink">{type.one.charAt(0).toUpperCase() + type.one.slice(1)}</dd>
             <dt className="text-ink-muted">Status</dt>
@@ -413,8 +450,8 @@ function DeviceEditor({ type, device }: { readonly type: DeviceTypeInfo; readonl
             <dd className="text-ink" data-testid="device-conversation">{convText}</dd>
             <dt className="text-ink-muted">First seen</dt>
             <dd className="text-ink">{new Date(device.firstSeen).toLocaleDateString(undefined, { day: "numeric", month: "long", year: "numeric" })}</dd>
-          </dl>
-          <DField testId="name" label="Name" htmlFor="device-name" help="Shown here, in Diagnostics and in the header while this device has the audio." {...(nameProblem(edit.name) !== undefined ? { error: nameProblem(edit.name)! } : {})} markers={edit.name !== undefined && edit.name.trim() !== device.name ? <span className="label ml-auto text-[11px] text-voice" data-testid="unsaved-marker">Unsaved</span> : undefined}>
+          </dl>}
+          <DField testId="name" label="Name" htmlFor="device-name" help={node ? "Shown here and in Diagnostics." : "Shown here, in Diagnostics and in the header while this device has the audio."} {...(nameProblem(edit.name) !== undefined ? { error: nameProblem(edit.name)! } : {})} markers={edit.name !== undefined && edit.name.trim() !== device.name ? <span className="label ml-auto text-[11px] text-voice" data-testid="unsaved-marker">Unsaved</span> : undefined}>
             <input
               id="device-name"
               value={edit.name ?? device.name}
@@ -461,6 +498,8 @@ function DeviceEditor({ type, device }: { readonly type: DeviceTypeInfo; readonl
       {has("voice") && <VoiceSection ctx={ctx} assistants={assistants} />}
       {has("place") && <PlaceSection ctx={ctx} />}
       {has("capabilities") && <CapabilitiesSection ctx={ctx} device={device} now={now} {...(isType ? { typeKind: type.kind } : {})} />}
+      {has("sound") && <SoundSection ctx={ctx} device={device} />}
+      {has("soundDevices") && <SoundDevicesSection ctx={ctx} inputs={reportedSoundDevices(device !== undefined ? [device] : typeMembers, "inputs")} outputs={reportedSoundDevices(device !== undefined ? [device] : typeMembers, "outputs")} />}
       <section className="flex flex-col gap-3" aria-labelledby="h-other" data-testid="section-other">
         <h3 id="h-other" className="label text-ink-faint">Other device settings</h3>
         {has("interrupting") && (
@@ -518,7 +557,7 @@ function DeviceEditor({ type, device }: { readonly type: DeviceTypeInfo; readonl
           </Group>
         )}
       </section>
-      {device !== undefined && <Forget device={device} />}
+      {device !== undefined && <Forget device={device} node={node} />}
       <FormFooter
         dirty={dirty}
         saving={saving}
@@ -542,15 +581,6 @@ function DeviceEditor({ type, device }: { readonly type: DeviceTypeInfo; readonl
           onConfirm={() => void save(true)}
         />
       )}
-    </div>
-  )
-}
-
-function Toggle({ label, checked, onChange }: { readonly label: string; readonly checked: boolean; readonly onChange: (v: boolean) => void }) {
-  return (
-    <div className="flex items-center gap-3">
-      <Switch checked={checked} onChange={onChange} label={label} />
-      <span className="text-[14px] text-ink">{checked ? "On" : "Off"}</span>
     </div>
   )
 }
@@ -591,27 +621,31 @@ function SaveAnywayDialog({ warnings, busy, onBack, onConfirm }: {
   )
 }
 
-function Forget({ device }: { readonly device: DeviceListInfo }) {
+/** Forget a browser, or remove a voice node (`device.forget` both: a node's credential goes with its record). */
+function Forget({ device, node }: { readonly device: DeviceListInfo; readonly node: boolean }) {
   const client = useClient()
   const [asking, setAsking] = useState(false)
   return (
     <section className="flex flex-col items-start gap-2 border-t border-line/60 pt-6" aria-labelledby="forget-title">
-      <h4 id="forget-title" className="label text-ink-faint">Forget</h4>
+      <h4 id="forget-title" className="label text-ink-faint">{node ? "Remove" : "Forget"}</h4>
       <p className="text-[13px] text-ink-muted">
-        Removes this device, its own settings and its conversations.{device.connections > 0 ? " It is connected now, so it comes back at once as a new device with the defaults." : " If it connects again, it comes back with the defaults."}
+        {node
+          ? "Removes this voice node, its own settings and its conversations. The node disconnects and must be paired again to come back."
+          : <>Removes this device, its own settings and its conversations.{device.connections > 0 ? " It is connected now, so it comes back at once as a new device with the defaults." : " If it connects again, it comes back with the defaults."}</>}
       </p>
-      <Button variant="danger" className="max-sm:h-11" onClick={() => setAsking(true)} data-testid="forget">Forget this device…</Button>
+      <Button variant="danger" className="max-sm:h-11" onClick={() => setAsking(true)} data-testid="forget">{node ? "Remove voice node…" : "Forget this device…"}</Button>
       {asking && (
         <ConfirmForget
           name={device.name}
+          node={node}
           onCancel={() => setAsking(false)}
           onConfirm={async () => {
             const result = await client.forgetDevice(device.id) // continuation(none): navigates away or shows the error
             if (result.ok) {
-              client.store.dispatch({ type: "local/toast", message: `Forgot ${device.name}.`, tone: "info" })
+              client.store.dispatch({ type: "local/toast", message: `${node ? "Removed" : "Forgot"} ${device.name}.`, tone: "info" })
               client.settings(["devices"], { discard: true })
             }
-            return result.ok ? undefined : result.error?.message ?? "Not forgotten."
+            return result.ok ? undefined : result.error?.message ?? (node ? "Not removed." : "Not forgotten.")
           }}
         />
       )}
@@ -619,7 +653,7 @@ function Forget({ device }: { readonly device: DeviceListInfo }) {
   )
 }
 
-function ConfirmForget({ name, onCancel, onConfirm }: { readonly name: string; readonly onCancel: () => void; readonly onConfirm: () => Promise<string | undefined> }) {
+function ConfirmForget({ name, node, onCancel, onConfirm }: { readonly name: string; readonly node: boolean; readonly onCancel: () => void; readonly onConfirm: () => Promise<string | undefined> }) {
   const ref = useRef<HTMLDivElement>(null)
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState<string | undefined>()
@@ -627,8 +661,10 @@ function ConfirmForget({ name, onCancel, onConfirm }: { readonly name: string; r
   return (
     <div className="fixed inset-0 z-[60] flex items-end justify-center bg-bg/70 p-4 pb-[max(16px,env(safe-area-inset-bottom))] sm:items-center" data-testid="forget-dialog">
       <div ref={ref} role="alertdialog" aria-modal="true" aria-labelledby="forget-dialog-title" aria-describedby="forget-dialog-text" className="w-full max-w-[400px] rounded-lg border border-line bg-surface p-5 shadow-panel">
-        <h2 id="forget-dialog-title" className="text-[16px] font-medium text-ink">Forget {name}?</h2>
-        <p id="forget-dialog-text" className="mt-1 text-[14px] text-ink-muted">Its name, own settings and conversations are removed. This cannot be undone.</p>
+        <h2 id="forget-dialog-title" className="text-[16px] font-medium text-ink">{node ? "Remove" : "Forget"} {name}?</h2>
+        <p id="forget-dialog-text" className="mt-1 text-[14px] text-ink-muted">
+          {node ? "The node disconnects and must be paired again to come back. Its own settings and conversations are removed." : "Its name, own settings and conversations are removed. This cannot be undone."}
+        </p>
         {error !== undefined && <p role="alert" className="mt-2 text-[13px] text-danger">{error}</p>}
         <div className="mt-4 flex flex-wrap justify-end gap-2">
           <Button size="md" variant="quiet" className="max-sm:h-11" onClick={onCancel} data-cancel="" disabled={busy}>Keep it</Button>
@@ -647,7 +683,7 @@ function ConfirmForget({ name, onCancel, onConfirm }: { readonly name: string; r
             }}
           >
             {busy && <Spinner size={12} />}
-            Forget
+            {node ? "Remove" : "Forget"}
           </Button>
         </div>
       </div>

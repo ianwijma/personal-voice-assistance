@@ -25,7 +25,7 @@ import { Button, cx } from "../../../ui/controls.tsx"
 import { NumberControl, PresetControl } from "../assistants/parts.tsx"
 import { Callout, Chip, DField, Pill, SectionMarks, useValueDraft } from "./parts.tsx"
 
-const SELECT_STYLE = { backgroundImage: "url(\"data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 20 20' fill='none' stroke='%23888' stroke-width='1.5'%3E%3Cpath d='M5 7.5l5 5 5-5'/%3E%3C/svg%3E\")" } as const
+export const SELECT_STYLE = { backgroundImage: "url(\"data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 20 20' fill='none' stroke='%23888' stroke-width='1.5'%3E%3Cpath d='M5 7.5l5 5 5-5'/%3E%3C/svg%3E\")" } as const
 export const selectClass = "appearance-none bg-[length:16px] bg-[right_10px_center] bg-no-repeat pr-9"
 
 const FOLLOW_UP = [[0, "Off: one answer per phrase"], [5, "5 seconds"], [8, "8 seconds"], [15, "15 seconds"], [30, "30 seconds"]] as const
@@ -52,6 +52,12 @@ export interface SectionContext {
   readonly epoch: number
   /** A reset of part of the draft: the number fields drop what was typed and its error. */
   readonly renew: () => void
+  /** The type's follow-up for an assignment without its own (voice nodes: 0); undefined: the assistant's own. */
+  readonly followUpUnset: number | undefined
+  /** "voice nodes": the type, in the words of what such an assignment follows. */
+  readonly typeMany: string
+  /** A voice node or Every voice node: one answer per phrase, so answering without one is a warning. */
+  readonly node: boolean
 }
 
 /** Section marks for `id`, wired to the draft. */
@@ -130,6 +136,8 @@ export function AssignSection({ ctx, assistants, canAuto, hasRouting, serverErro
     ? "For a sentence without a phrase, TypeSafe chooses the assistant whose “Handles” fits it best. A wake phrase always wins, and during an assistant’s follow-up time the next sentence stays with it."
     : wp.mode === "assistant"
     ? `${nameOf(wp.assistant)} answers whatever is said, without a phrase. The others wait for their phrase; after a reply and the follow-up time, ${ctx.thisWord} go${ctx.isType ? "" : "es"} back to ${nameOf(wp.assistant)}.`
+    : ctx.followUpUnset === 0
+    ? `Every assistant here waits for its phrase. Each phrase gets one answer; then ${ctx.thisWord} sleep${ctx.isType ? "" : "s"} again.`
     : `Every assistant here waits for its phrase. After a reply and the follow-up time, ${ctx.thisWord} sleep${ctx.isType ? "" : "s"} again.`
 
   const notices = list.filter((e) => hearerAssistant !== undefined && e.assistant !== hearer && byId.get(e.assistant) !== undefined && !sameRecogniser(byId.get(e.assistant)!, hearerAssistant))
@@ -173,6 +181,11 @@ export function AssignSection({ ctx, assistants, canAuto, hasRouting, serverErro
           <option value="typesafe" disabled={!canAuto && !typesafe}>The one that fits: TypeSafe decides{!canAuto ? " (not set up)" : ""}</option>
         </select>
       </DField>
+      {ctx.node && wp.mode !== "nobody" && (
+        <Callout tone="warn" testId="answers-everything-note">
+          <p>A voice node would answer everything it hears, not one question per wake phrase. Saving asks you to confirm this.</p>
+        </Callout>
+      )}
       {typesafe && !canAuto && (
         <Callout tone="warn" testId="typesafe-callout">
           <p>
@@ -292,8 +305,13 @@ function AssignmentRow({ ctx, index, assignment: e, info, hearsWith, recogniser 
     ev.preventDefault()
     addPhrase()
   }
-  const fu = useValueDraft(`fu-${e.assistant}`, e.followUpSeconds ?? info?.followUpSeconds ?? 0, (v) => patch({ ...e, followUpSeconds: v as number }), ctx.setBlocked)
+  // What an assignment without its own value follows: the device type's rule (voice nodes: off), else the assistant's.
+  const inherited = ctx.followUpUnset ?? info?.followUpSeconds ?? 0
+  const fu = useValueDraft(`fu-${e.assistant}`, e.followUpSeconds ?? inherited, (v) => patch({ ...e, followUpSeconds: v as number }), ctx.setBlocked)
   const fuOwn = e.followUpSeconds !== undefined
+  const followsText = ctx.followUpUnset !== undefined
+    ? `${ctx.followUpUnset === 0 ? "Off: one answer per phrase" : followUpLabel(ctx.followUpUnset)} (${ctx.typeMany})`
+    : `Follows ${name}: ${followUpLabel(info?.followUpSeconds ?? 0)}`
   return (
     <li className="flex flex-col gap-3 px-3 py-3" data-assignment={e.assistant} data-index={index}>
       <div className="flex flex-wrap items-center gap-x-2 gap-y-1">
@@ -372,6 +390,7 @@ function AssignmentRow({ ctx, index, assignment: e, info, hearsWith, recogniser 
           label="Keep listening after a reply"
           htmlFor={`a-fu-${e.assistant}`}
           error={fu.localErrors[`fu-${e.assistant}`]}
+          {...(ctx.followUpUnset === 0 && !fuOwn ? { help: `One answer per phrase on ${ctx.typeMany}, unless you choose a time here.` } : {})}
           markers={
             <span className="ml-auto inline-flex items-center gap-2" data-testid="fu-marks">
               {fuOwn ? (
@@ -380,7 +399,7 @@ function AssignmentRow({ ctx, index, assignment: e, info, hearsWith, recogniser 
                   <button
                     type="button"
                     className="text-[12px] text-voice underline-offset-4 hover:underline"
-                    title={`Back to ${name}’s own setting: ${followUpLabel(info?.followUpSeconds ?? 0)}`}
+                    title={ctx.followUpUnset !== undefined ? `Back to the rule of ${ctx.typeMany}: ${followUpLabel(ctx.followUpUnset)}` : `Back to ${name}’s own setting: ${followUpLabel(info?.followUpSeconds ?? 0)}`}
                     aria-label={`Reset the follow-up of ${name}`}
                     onClick={() => {
                       const { followUpSeconds: _gone, ...rest } = e
@@ -393,7 +412,7 @@ function AssignmentRow({ ctx, index, assignment: e, info, hearsWith, recogniser 
                   </button>
                 </>
               ) : (
-                <span className="text-[12px] text-ink-faint">Follows {name}: {followUpLabel(info?.followUpSeconds ?? 0)}</span>
+                <span className="text-[12px] text-ink-faint" data-testid="fu-follows">{followsText}</span>
               )}
             </span>
           }

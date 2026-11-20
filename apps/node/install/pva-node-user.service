@@ -1,0 +1,17 @@
+# The voice node as a user service of @USER@, for PipeWire (which runs per user; docs/VOICE-NODES.md §7.2).
+# Written by install.sh to ~@USER@/.config/systemd/user/pva-node.service; lingering keeps it running without a login.
+[Unit]
+Description=Personal voice assistant node
+After=pipewire.service pipewire-pulse.service wireplumber.service
+Wants=pipewire.service
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+ExecStart=/opt/pva-node/runtime/current/bin/node /opt/pva-node/pva-node-boot.mjs run --config /etc/pva-node/node.json --audio @AUDIO@
+Restart=always
+RestartSec=2
+NoNewPrivileges=yes
+
+[Install]
+WantedBy=default.target

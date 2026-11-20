@@ -132,7 +132,7 @@ describe("DeviceCapabilities", () => {
 
 describe("the place and capabilities sections (protocol 11)", () => {
   it("are new section keys, required in complete settings, so the protocol is 11", () => {
-    expect(PROTOCOL_VERSION).toBe(11)
+    expect(PROTOCOL_VERSION).toBe(12)
     expect(DEVICE_SETTINGS_KEYS).toContain("place")
     expect(DEVICE_SETTINGS_KEYS).toContain("capabilities")
     expect(BUILT_IN_WEB_VOICE_SETTINGS.place).toEqual(BUILT_IN_PLACE)

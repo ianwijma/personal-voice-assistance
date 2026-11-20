@@ -2,7 +2,7 @@
 import { type ReactNode, useEffect, useMemo, useState } from "react"
 import type { Assistant } from "@pva/protocol"
 import type { AssistantDraft } from "../assistants/useAssistantDraft.ts"
-import { cx } from "../../../ui/controls.tsx"
+import { cx, Switch } from "../../../ui/controls.tsx"
 
 /** The building blocks of the device and defaults pages: sections with their Own value · Reset marks, fields, callouts. */
 
@@ -138,4 +138,14 @@ export function Chip({ children, tone = "plain", testId }: { readonly children: 
 /** A pill: a phrase, or "Jeff · without a phrase". */
 export function Pill({ children, className }: { readonly children: ReactNode; readonly className?: string }) {
   return <span className={cx("inline-flex items-center rounded-full border border-line bg-surface-2/50 px-2 py-0.5 text-[12px] text-ink-muted", className)}>{children}</span>
+}
+
+/** A switch with "On" / "Off" beside it. */
+export function Toggle({ label, checked, onChange, disabled = false }: { readonly label: string; readonly checked: boolean; readonly onChange: (v: boolean) => void; readonly disabled?: boolean }) {
+  return (
+    <div className="flex items-center gap-3">
+      <Switch checked={checked} onChange={onChange} label={label} disabled={disabled} />
+      <span className="text-[14px] text-ink">{checked ? "On" : "Off"}</span>
+    </div>
+  )
 }

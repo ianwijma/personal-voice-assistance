@@ -156,12 +156,14 @@ export function VoiceSection({ ctx, assistants }: { readonly ctx: SectionContext
  * "Own look: Flame · Own voice: Amy": a device (or a type's defaults) that fixes the look or voice for every assistant
  * (docs/LOOKS-AND-VOICES.md §4); "(defaults)" when a device follows its type's defaults for it.
  */
-export function LookVoiceLine({ settings, own, defaults }: {
+export function LookVoiceLine({ settings, own, defaults, keys }: {
   readonly settings: DeviceListInfo["settings"]
   readonly own: DeviceListInfo["own"] | undefined
   readonly defaults: boolean
+  /** The type's keys: a type without `look` (a voice node: no screen) shows only the voice. */
+  readonly keys?: ReadonlyArray<string> | undefined
 }) {
-  const look = settings.look.from === "device" ? settings.look.look : undefined
+  const look = settings.look.from === "device" && (keys === undefined || keys.includes("look")) ? settings.look.look : undefined
   const voice = settings.voice.from === "device" ? settings.voice.voice : undefined
   if (look === undefined && voice === undefined) return null
   const word = (k: "look" | "voice") => (defaults ? (k === "look" ? "Look" : "Voice") : own?.[k] !== undefined ? (k === "look" ? "Own look" : "Own voice") : (k === "look" ? "Look (defaults)" : "Voice (defaults)"))
