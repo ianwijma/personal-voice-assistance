@@ -1,7 +1,7 @@
 # Modules: where the work stands
 
 Status of the work planned in [MODULES-PLAN.md](MODULES-PLAN.md), kept here so it does not depend on any one working
-session. Updated 2026-11-20, 15:01. Nothing below is merged into `main`; the owner merges.
+session. Updated 2026-11-20, 15:59. Nothing below is merged into `main`; the owner merges.
 
 **State: the work is done and waits for the owner.** Every preparation part, every module that was not deferred and
 every follow-up has an open pull request, has had at least one complete Sol review, and has its findings fixed. On
@@ -53,8 +53,12 @@ locally: `pnpm check` passes; `pnpm test` 10,700 passed and none failed before t
 the final code 10,698 passed with 2 failing under load that pass alone (the SQLite presentation contract's case a5; a
 store latency bound at 10.98 ms against 10 ms); the browser tests pass (253 of 253). Checked again by the lead on the
 head `8bf553fb`; the final head `9c9e47dd` adds one more timers fix, on which `pnpm check` and the timers tests (461) pass: `pnpm check` passes, the full suite passes (10,839 tests, none
-failed), the latency tests the way CI runs them pass (449), the browser tests pass (253 of 253). **CI is green on
-all 51 open pull requests of this work (#87 to #137)**, seen 2026-11-20, 11:25.
+failed), the latency tests the way CI runs them pass (449), the browser tests pass (253 of 253). **CI, seen 2026-11-20, 15:59:** green on every pull request (#87 to #137) except the
+branch with everything, #130, at its newest head `104358ab` (the commit that extends the CI test limit): three runs
+in a row failed there on tests that pass on every local run and on #137, a different one each time (the bin-day
+refresh test, the bin-day reminder test "a copy too old to trust", a SQLite latency step, the timers test "the
+repeating series moves on", which is fixed on the timers fix branch and so in #137). #130 was green at its head
+before that commit. By the owner's instruction these tests are not being rewritten: they will be replaced.
 
 **To take the fixes: merge #130, then #137** (the six fix pull requests can then be closed). The fix pull requests
 are not part of #130. Taking single ones into their own branches instead means resolving the four conflicts between
