@@ -75,3 +75,24 @@ for (const [nl, name] of [[false, "Faith"], [true, "Jade"]] as const) it.effect(
   yield* kit.action("cancel", { which: name })
   assert.deepStrictEqual(yield* alarmRows(kit), [])
 }))
+
+for (const [nl, words] of [
+  [false, ["final", "middle", "penultimate", "upcoming", "following", "coming", "remaining", "only", "sole"]],
+  [true, ["eerstkomende", "eerstvolgende", "volgende", "vorige", "laatste", "voorlaatste", "middelste", "komende", "resterende", "enige"]]
+] as const) it.effect(`13: position-word requests preserve all alarms until explicitly named (${nl ? "Dutch" : "English"})`, () => Effect.gen(function*() {
+  const kit = yield* startTestModule(alarmsModule, nl ? dutch : {})
+  yield* kit.action("set", { when: "11:30", name: "Breakfast" })
+  yield* kit.action("set", { when: "16:30", name: "Lunch" })
+  for (const word of words) {
+    const name = `${word[0]!.toUpperCase()}${word.slice(1)} ${nl ? "Wekker" : "Alarm"}`
+    yield* kit.action("set", { when: "13:15", name })
+    const before = yield* alarmRows(kit)
+    assert.strictEqual(before.length, 3)
+    const reply = yield* spokenCancel(kit, nl ? `annuleer de ${word} wekker` : `cancel the ${word} alarm`)
+    assert.include(reply!.say!, "?")
+    assert.include(reply!.say!, name)
+    assert.deepStrictEqual(yield* alarmRows(kit), before)
+    yield* spokenCancel(kit, nl ? `annuleer de wekker genaamd ${name}` : `cancel the alarm named ${name}`)
+    assert.deepStrictEqual((yield* alarmRows(kit)).map((r) => r.value.name).sort(), ["Breakfast", "Lunch"])
+  }
+}))

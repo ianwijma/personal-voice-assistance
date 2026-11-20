@@ -128,7 +128,7 @@ const hasTemporalWord = (text: string, lang: Language, options: DateOptions): bo
   (text.match(/[\p{L}\p{N}]+(?:['’][\p{L}]+)*/gu) ?? []).some((word) =>
     /\p{N}/u.test(word)
     || /^(?:before|after|until|by|from|between|this|next|coming|at|on|in|past|to|of|and|half|quarter|oh|o'clock|oclock|voor|na|tot|tegen|vanaf|van|tussen|deze|dit|volgende|komende|aanstaande|op|om|over|en|kwart)$/iu.test(word)
-    || /^(?:last|next|previous|earliest|latest|soonest|newest|oldest|other|laatste|volgende|vorige|vroegste|spoedigste|snelste|nieuwste|oudste|ander|andere|eerstvolgende)$/iu.test(word)
+    || /^(?:last|next|previous|earliest|latest|soonest|newest|oldest|other|final|middle|penultimate|upcoming|following|coming|remaining|only|sole|laatste|volgende|vorige|vroegste|spoedigste|snelste|nieuwste|oudste|ander|andere|eerstvolgende|eerstkomende|voorlaatste|middelste|komende|resterende|enige)$/iu.test(word)
     || [word, lang === "nl" ? word.replace(/(?:ste|de)$/iu, "") : word.replace(/ieth$/iu, "y").replace(/th$/iu, "")]
       .some((part) => parseNumber(part, lang).kind !== "not-understood" || parseNumber(`${lang === "nl" ? "een" : "one"} ${part}`, lang).kind !== "not-understood")
     || [word, `${lang === "nl" ? "de" : "the"} ${word}`, `1 ${word}`, `7 ${word}`, `${lang === "nl" ? "morgen" : "tomorrow"} ${word}`, `${lang === "nl" ? "over" : "in"} 1 ${word}`, ...(lang === "nl" ? [`7 's ${word}`] : [])]
