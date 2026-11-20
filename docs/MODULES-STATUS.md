@@ -1,7 +1,7 @@
 # Modules: where the work stands
 
 Status of the work planned in [MODULES-PLAN.md](MODULES-PLAN.md), kept here so it does not depend on any one working
-session. Updated 2026-11-20, 14:37. Nothing below is merged into `main`; the owner merges.
+session. Updated 2026-11-20, 15:01. Nothing below is merged into `main`; the owner merges.
 
 **State: the work is done and waits for the owner.** Every preparation part, every module that was not deferred and
 every follow-up has an open pull request, has had at least one complete Sol review, and has its findings fixed. On
@@ -14,7 +14,8 @@ under "Known gaps kept on purpose".
 
 **The whole, on one branch: `t3/modules-13-all`, pull request #130 (code as of `08b3c65c`; later commits on it are merges that change no code: this page, and branch heads that
 moved by a test-only fix: the bin-day test and the reminders tests' time limit).** Every branch below merged
-together, merges only, plus one commit of its own (a 20 second test limit for the `node` project on CI). On it:
+together, merges only, plus two commits of its own (a 20 second test limit on CI for the `node` test project and, since 2026-11-20, for
+the `latency` project too: a slow CI run passed the default 5 seconds in two latency-project tests). On it:
 `pnpm check` passes; `pnpm test`: 10,094 passed and one failed, a measurement (the music module's latency test
 "resolving a room at the largest cache": 10.2 ms on the main thread against its 10 ms bound in the full run; alone it
 passed three times out of three; the run before the last two merges had 10,085 passed, none failed); the browser
@@ -44,7 +45,7 @@ pull request "[GPT Review] …" into the reviewed branch; then Astra looked agai
 | #117 timers and alarms | #134 | `85b4a62b` | 16, 10, 4, 2, 3, 2, 7, 6, 2, 2, then 2, 1, 1, 1, 2 | **not approved; stopped by the owner after fifteen rounds.** Rounds 9 to 13 found only further words the module's lists missed (the owner: feedback about word lists is ignored, that mechanism will be redone). Rounds 14 and 15 found one real case (the same unnamed alarm set twice could not be cancelled: fixed) and two small ones in that fix, which are **not fixed**: a cancel or skip of a group of identical alarms is not one transaction, so one failed write can leave half of it done; and the "already set" answer gives the next regular time, not a pending snooze's |
 
 **All six together: `t3/modules-13-all-gpt-review`, pull request #137 "[GPT Review] …" into `t3/modules-13-all`
-(`9c9e47dd`).** The six do not simply add up: the presentation fixes (#136) and the risk policy on top of it changed
+(`9c4b6bf4`).** The six do not simply add up: the presentation fixes (#136) and the risk policy on top of it changed
 the same places, so combining them needed four conflict resolutions and four further fixes that exist only on this
 branch (two risk-policy test fixtures without the revision a press must now carry; showings admitted in the same
 millisecond were ordered by their random ids; the compact stage's height with the fixed notification strip). On it,
