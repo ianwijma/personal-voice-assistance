@@ -1,7 +1,7 @@
 # Modules: where the work stands
 
 Status of the work planned in [MODULES-PLAN.md](MODULES-PLAN.md), kept here so it does not depend on any one working
-session. Updated 2026-11-20, 08:24. Nothing below is merged into `main`; the owner merges.
+session. Updated 2026-11-20, 11:08. Nothing below is merged into `main`; the owner merges.
 
 **State: the work is done and waits for the owner.** Every preparation part, every module that was not deferred and
 every follow-up has an open pull request, has had at least one complete Sol review, and has its findings fixed. On
@@ -41,10 +41,10 @@ pull request "[GPT Review] …" into the reviewed branch; then Astra looked agai
 | #122 lists follow-up | #131 | `89beb5a8` | 12, 5, 3, 3, 3, 3, 1 | approved in round 8 |
 | #114 reminders | #133 | `93e86c27` | 16, 9, 8, 4, 4, 2, 1 | approved in round 8 |
 | #108 presentation (P10) | #136 | `47602005` | 26, 14, 7, 3, 4, 2, 2, 1, 1 | core approved in round 6, the voice page in round 10 |
-| #117 timers and alarms | #134 | `7cfb9de1` | 16, 10, 4, 2, 3, 2, 7, 6, 2, 2 | **not approved**: the round limit was reached. The two findings of the last review were fixed in a last round that was not reviewed again |
+| #117 timers and alarms | #134 | `900fd91c` | 16, 10, 4, 2, 3, 2, 7, 6, 2, 2, then (three more rounds the owner allowed) 2, 1, 1 | **not approved** after thirteen rounds. From round 9 on every finding was another word of the same two kinds (a text that is an alarm's name and can also be read as a time or an order; a word for repeating in a timer's name); each was fixed, the last one in a round that was not reviewed again |
 
 **All six together: `t3/modules-13-all-gpt-review`, pull request #137 "[GPT Review] …" into `t3/modules-13-all`
-(`c489b0a9`).** The six do not simply add up: the presentation fixes (#136) and the risk policy on top of it changed
+(`8bf553fb`).** The six do not simply add up: the presentation fixes (#136) and the risk policy on top of it changed
 the same places, so combining them needed four conflict resolutions and four further fixes that exist only on this
 branch (two risk-policy test fixtures without the revision a press must now carry; showings admitted in the same
 millisecond were ordered by their random ids; the compact stage's height with the fixed notification strip). On it,
@@ -66,8 +66,8 @@ What the cycle found that matters beyond its six pull requests:
   parameter consumed. An action therefore cannot tell "cancel the eggs timer" with "eggs" dropped by the host's
   extraction from "cancel the timer", and can act on the only timer. Timers and alarms now ask back wherever a
   parameter they did receive holds something they do not understand; the rest needs the host to give an action the
-  utterance or what was not consumed. Two rounds of the timers review were spent on phrasings; other modules were not
-  looked at for this.
+  utterance or what was not consumed. Seven rounds of the timers review were spent on phrasings, and it never ran
+  out of them: lists of words in a module cannot close this; other modules were not looked at for it.
 - **The rule that nothing a speculative turn asks for reaches a screen did not hold on the real voice path** through
   the Claude Code agent adapter (the tool's callback did not see the turn's commit state). Fixed in #136.
 - **"Move to settings"** (moving a value from a `.env` file into the settings): three findings outside #115, not
