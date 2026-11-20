@@ -280,7 +280,8 @@ export const makeIntentAgent = (options: IntentAgentOptions = {}): AgentImplemen
         return out
       }
       const callId = `action-${input.turnId}-${++calls}`
-      const now = input.now === undefined ? Clock.currentTimeMillis : Effect.sync(input.now)
+      // The trace clock, else the monotonic one (as `ModelAgent` and the Claude agent): the entry sits among the trace's times.
+      const now = Effect.sync(input.now ?? (() => performance.now()))
       const speculative = def.speculative === true
       const admitted = Deferred.makeUnsafe<boolean>()
       const dropped = Deferred.makeUnsafe<void>()
