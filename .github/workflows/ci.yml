@@ -12,10 +12,17 @@ concurrency:
 permissions:
   contents: read
 
+# Three kinds of job, all at the same time, each on its own runner:
+#   check     the typecheck (`pnpm check`)
+#   test      everything but the latency tests, split by file over SHARDS runners (`vitest --shard`)
+#   latency   the latency tests (files that import latencyBound.ts: vitest.latency.ts), one file at a time. Their own
+#             runner, so no other test keeps its cores busy while they measure how long the main thread stops.
+# A failure in one job does not stop the others, so every result is seen.
+
 jobs:
-  check-and-test:
+  check:
     runs-on: ubuntu-latest
-    timeout-minutes: 40
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v7
       - uses: pnpm/action-setup@v6
@@ -25,16 +32,46 @@ jobs:
           cache: pnpm
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
-      # `pnpm check` also builds the audio worklets the web tests need,
-      # so it must run before `pnpm test`.
       - name: Typecheck
-        id: check
         run: pnpm check
-      # Everything but the latency tests (files that import latencyBound.ts: vitest.latency.ts), files in parallel.
+
+  test:
+    name: test (${{ matrix.shard }}/4)
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        # Keep the 4 in `name` and in `--shard` the same as the length of this list.
+        shard: [1, 2, 3, 4]
+    steps:
+      - uses: actions/checkout@v7
+      - uses: pnpm/action-setup@v6
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+          cache: pnpm
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+      # The audio worklets and characters the web tests import (`pnpm check` builds them too).
+      - name: Build worklets and characters
+        run: pnpm --filter @pva/web worklets && pnpm --filter @pva/web characters
       - name: Test
-        run: pnpm test --project node --project web
-      # The latency tests after the rest, one file at a time: nothing else keeps the two cores busy while they measure
-      # how long the main thread stops. Also when the step before failed, so both results are seen.
+        run: pnpm test --project node --project web --shard=${{ matrix.shard }}/4
+
+  latency:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+      - uses: pnpm/action-setup@v6
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+          cache: pnpm
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+      - name: Build worklets and characters
+        run: pnpm --filter @pva/web worklets && pnpm --filter @pva/web characters
       - name: Latency tests
-        if: ${{ !cancelled() && steps.check.outcome == 'success' }}
         run: pnpm test --project latency --no-file-parallelism
