@@ -16,6 +16,10 @@ unless it says otherwise.
 There is no `latest` tag. Pull requests from forks never build. A labelled PR gets a LAN-only preview deployment in the
 homelab cluster at `https://pva-pr-<n>.k3s.lab.wijma.cloud`, started from a copy of production's data volume.
 
+A preview expires after 7 days: the daily `Preview expiry` workflow removes the `preview` label from a PR when nothing was
+pushed to it and the label was not re-added for that long, and the cluster then deletes the preview and its copy of the
+data. Closing or merging the PR deletes it too. A push, or adding the label again, gives it another 7 days.
+
 The base is `node:22.23.5-bookworm-slim` (pinned by digest; Debian, not Alpine, because the speech library ships
 prebuilt glibc binaries). It adds `util-linux` (`flock`), `tar`, `bzip2` and `ca-certificates`, and pnpm 10.34.9 (the
 `packageManager` version). The image is about 1.6 GB on disk (380 MB compressed); the speech models are not in it.
