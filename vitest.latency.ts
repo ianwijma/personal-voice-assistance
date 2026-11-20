@@ -6,7 +6,7 @@ import { join } from "node:path"
  * (docs/MODULES.md §15 "Latency tests"). **A test file is one when it imports `latencyBound.ts`** (for `bound()`,
  * packages/store-sqlite/test/latencyBound.ts, or with a bare `import` when it times real work without it).
  *
- * `pnpm test` runs them with everything else. CI runs them in a step of their own, one file at a time, after the rest
+ * `pnpm test` runs them with everything else. CI runs them in a job of its own, on its own runner, one file at a time
  * (`--project latency --no-file-parallelism`): on its two cores, tests that keep other threads busy on purpose
  * (workers spinning, megabytes parsed in workers) made the main thread's longest stops in them several times longer.
  */

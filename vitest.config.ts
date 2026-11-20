@@ -9,7 +9,7 @@ export const latency = latencyTestFiles(import.meta.dirname)
 export default defineConfig({
   test: {
     // `pnpm test` runs every project: `node` and `web` together, then `latency` (group 1) one file at a time. CI runs
-    // the same as two steps (.github/workflows/ci.yml), so the latency results are seen also when the others fail.
+    // `node` and `web` split over several jobs (`--shard`) and `latency` in a job of its own (.github/workflows/ci.yml).
     projects: [
       {
         test: {
