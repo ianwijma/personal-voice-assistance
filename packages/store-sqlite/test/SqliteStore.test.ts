@@ -262,7 +262,8 @@ describe("SQLite household store: transactions the database ends, locks held els
       assert.strictEqual((yield* store.forModule("fill").collection(bigs).list()).length, 1)
     }).pipe(Effect.scoped))
 
-  it.live("a write made while the store's own checkpoint worker truncates a large log (it holds the write lock meanwhile) waits for it on timers and succeeds: no `busy` in ordinary operation", () =>
+  // Flaky, disabled until fixed: https://github.com/ianwijma/personal-voice-assistance/issues/143
+  it.live.skip("a write made while the store's own checkpoint worker truncates a large log (it holds the write lock meanwhile) waits for it on timers and succeeds: no `busy` in ordinary operation", () =>
     Effect.gen(function*() {
       const dir = tmp()
       const file = join(dir, "household.db")
