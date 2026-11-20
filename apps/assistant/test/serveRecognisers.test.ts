@@ -3,11 +3,13 @@
 // without a phrase, else the first in its list) and stream options; a hearer change builds the new recogniser
 // first and switches at the next silence; a device without assistants runs none; a model that fails is that
 // recogniser's problem only.
-import type { SttEvent } from "@pva/core"
+import { makeTurnTrace, type SttEvent, type TurnTrace } from "@pva/core"
 import { sttContractKeeper } from "@pva/core/testing"
 import type { Assistant, AssistantHearing, DeviceOwn, ServerMessageOf } from "@pva/protocol"
 import { Deferred, Effect, Exit, Queue, Stream } from "effect"
 import { mkdtempSync, readFileSync, writeFileSync } from "node:fs"
+import * as Http from "node:http"
+import type { AddressInfo } from "node:net"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { afterEach, describe, expect, it, vi } from "vitest"
@@ -85,7 +87,7 @@ const baseHearing = (model: string, extra: Partial<AssistantHearing> = {}): Assi
 })
 
 /** Alpha (hears with model-a) and Bravo (model-b) on the browser defaults: Alpha first, nobody without a phrase. */
-const twoHearers = async (): Promise<string> => {
+const twoHearers = async (withoutPhrase: Record<string, unknown> = { mode: "nobody" }): Promise<string> => {
   const dataDir = mkdtempSync(join(tmpdir(), "pva-recognisers-"))
   const first = await startTestServer({ build: fakeBuild({ stt: controlledStt().stt, llm: scriptedLlm(() => "").llm }), dataDir })
   await first.close()
@@ -97,21 +99,109 @@ const twoHearers = async (): Promise<string> => {
   file.deviceTypes["web-voice"] = {
     ...file.deviceTypes["web-voice"],
     assistants: [{ assistant: "alpha", phrases: ["hey alpha"] }, { assistant: "bravo", phrases: ["hey bravo"] }],
-    withoutPhrase: { mode: "nobody" }
+    withoutPhrase
   }
   writeFileSync(path, `${JSON.stringify(file, null, 2)}\n`)
   return dataDir
 }
 
-const start = async (fake: ReturnType<typeof fakeRecognisers>, extra: { hearerSwitchWaitMs?: number; freeMemoryBytes?: () => number } = {}) => {
+const start = async (
+  fake: ReturnType<typeof fakeRecognisers>,
+  { withoutPhrase, ...extra }: {
+    hearerSwitchWaitMs?: number
+    freeMemoryBytes?: () => number
+    env?: Record<string, string>
+    withoutPhrase?: Record<string, unknown>
+    turnTrace?: TurnTrace["Service"]
+  } = {}
+) => {
   server = await startTestServer({
     build: fakeBuild({ stt: controlledStt().stt, llm: scriptedLlm((t) => `Heard ${t}`).llm }),
     buildStt: fake.build,
     resourceGraceMs: 100,
-    dataDir: await twoHearers(),
+    dataDir: await twoHearers(withoutPhrase),
     ...extra
   })
 }
+
+/**
+ * A trace clock that stands still until the test moves it: every time the server records (stamps, marks, the time
+ * line) is the value set last, so a turn's times can be asserted exactly, whatever the scheduling.
+ */
+const manualClock = () => {
+  let t = 0
+  let reads = 0
+  return {
+    turnTrace: makeTurnTrace({
+      now: () => {
+        reads++
+        return t
+      }
+    }),
+    set: (to: number) => void (t = to),
+    /** How often the server read the clock (a stamp reads it once): a barrier for "stamped". */
+    reads: () => reads
+  }
+}
+/** Far from 0: a time line entry stamped before the jump is −`JUMP` relative to a turn after it. */
+const JUMP = 50_000
+
+/**
+ * A fake TypeSafe (`/v1/systemone`) that picks Alpha, and the `start` options that route by it. The first request is
+ * held until `release()` (a routing call the test keeps pending for as long as it needs); later ones are answered at
+ * once. `close` releases it and stops the server.
+ */
+const heldTypeSafe = async () => {
+  let requests = 0
+  /** When its caller gave up on the held request (closed it unanswered); `performance.now()`. */
+  let abandonedAt: number | undefined
+  let release = () => {}
+  const held = new Promise<void>((resolve) => (release = resolve))
+  const jev = Http.createServer((req, res) => {
+    req.resume()
+    req.on("end", () => {
+      const first = ++requests === 1
+      if (first) {
+        res.on("close", () => {
+          if (!res.writableEnded) abandonedAt = performance.now()
+        })
+      }
+      void (first ? held : Promise.resolve()).then(() => {
+        if (res.destroyed) return
+        res.writeHead(200, { "content-type": "application/json" })
+        res.end(JSON.stringify({ model: "jev-1", answers: { assistant: { type: "choice", choice: "alpha", confidence: 0.9, probabilities: { alpha: 0.9, bravo: 0.1 } }, fits: { type: "noul", noul: 0.9 } }, usage: { input_tokens: 1, output_tokens: 1 } }))
+      })
+    })
+  })
+  await new Promise<void>((resolve) => jev.listen(0, "127.0.0.1", resolve))
+  return {
+    options: {
+      env: { TYPESAFE_ROUTING: "true", TYPESAFE_API_KEY: "ts-test-key", TYPESAFE_BASE_URL: `http://127.0.0.1:${(jev.address() as AddressInfo).port}` },
+      withoutPhrase: { mode: "typesafe", fallback: "alpha", giveUpMs: 2_000 }
+    },
+    requests: () => requests,
+    /**
+     * When the held request was abandoned unanswered (`performance.now()`; `undefined`: not yet). Measure it from a time
+     * taken before the utterance was emitted: TypeSafe's give-up starts when the session sends, before this server
+     * receives, so a bound from receipt could be met by a real give-up.
+     */
+    abandonedAt: () => abandonedAt,
+    release: () => release(),
+    close: () => {
+      release()
+      jev.closeAllConnections()
+      jev.close()
+    }
+  }
+}
+
+/**
+ * The precondition of the "while routing is pending" tests: the held call was still pending when the stream or loop
+ * stopped. Had TypeSafe given up first (2 s), the old final would have been answered (by the fallback) and closed
+ * normally, and the test would prove nothing: then it fails here.
+ */
+const neverAnswered = (client: ScriptedClient, text: string) =>
+  expect(client.messages.filter((m) => m.type === "turn.start" && (m as { userText?: string }).userText === text)).toEqual([])
 
 const connect = async (deviceId?: string) => {
   const client = await ScriptedClient.connect({ url: server!.url, ...(deviceId !== undefined ? { deviceId } : {}) })
@@ -231,6 +321,132 @@ describe("serve: one recogniser per device, from its hearer (WP-11)", () => {
     expect(old.closed).toBe(false)
     await until("switched to model-c", () => streamOf(fake, "device-a")?.model === "model-c", 3_000)
     expect(old.closed).toBe(true)
+  })
+
+  it("an utterance closed by the switch takes its times with it: the next utterance's time line starts when it was heard", async () => {
+    const fake = fakeRecognisers()
+    const clock = manualClock()
+    await start(fake, { hearerSwitchWaitMs: 300, turnTrace: clock.turnTrace })
+    const admin = await connect()
+    await admin.admin(TEST_ADMIN_PASSWORD)
+    const client = await device("device-a")
+    await until("device-a hearing", () => streamOf(fake, "device-a") !== undefined)
+    const old = streamOf(fake, "device-a")!
+    // The old stream's utterance is stamped at 0 (a barrier: both stamps read the clock); it is closed by the switch.
+    const read = clock.reads()
+    fake.emit(old, { _tag: "SpeechStarted" }, { _tag: "Interim", text: "hey alpha what" })
+    await until("the old utterance stamped", () => clock.reads() >= read + 2)
+    await saveHearing("alpha", { model: "model-c" })
+    await until("switched to model-c", () => streamOf(fake, "device-a")?.model === "model-c" && old.closed, 3_000)
+    // Everything of the new utterance is recorded at JUMP.
+    clock.set(JUMP)
+    const from = client.messages.length
+    const adminFrom = admin.messages.length
+    fake.emit(streamOf(fake, "device-a")!, { _tag: "SpeechStarted" }, { _tag: "Interim", text: "hey alpha what time" }, { _tag: "EndOfTurn", text: "hey alpha what time is it" })
+    const begun = await client.waitFor("turn.start", () => true, { from, timeoutMs: 10_000 })
+    const trace = (await admin.waitFor("trace", (m) => m.trace.turnId === begun.turnId, { from: adminFrom, timeoutMs: 10_000 })).trace
+    const line = trace.timeline!
+    const startedAt = line.find((x) => x.name === "speechStarted")!.at
+    const firstInterimAt = line.find((x) => x.name === "firstInterim")!.at
+    // Its own start and first words (at JUMP, as its end of turn: 0), not the closed utterance's (−JUMP).
+    expect(startedAt).toBe(0)
+    expect(firstInterimAt).toBe(0)
+  })
+
+  it("a start the old stream stamped but never delivered (dispatch busy with a routing call) gives the next stream's utterance no times", async () => {
+    // TypeSafe's answer is held: the final below keeps the session's dispatch busy while the next start comes in.
+    const jev = await heldTypeSafe()
+    try {
+      const fake = fakeRecognisers()
+      const clock = manualClock()
+      await start(fake, { hearerSwitchWaitMs: 300, ...jev.options, turnTrace: clock.turnTrace })
+      const admin = await connect()
+      await admin.admin(TEST_ADMIN_PASSWORD)
+      const client = await device("device-a")
+      await until("device-a hearing", () => streamOf(fake, "device-a") !== undefined)
+      const old = streamOf(fake, "device-a")!
+      // The origin for the give-up bound below: before the routing call (and its 2 s give-up) can have started.
+      const emittedAt = performance.now()
+      fake.emit(old, { _tag: "SpeechStarted" }, { _tag: "EndOfTurn", text: "what is the weather" })
+      await until("the routing call", () => jev.requests() === 1)
+      // Stamped on arrival (a barrier: both stamps read the clock), still queued behind the routing call; then the
+      // switch replaces the stream while that call is pending.
+      const read = clock.reads()
+      fake.emit(old, { _tag: "SpeechStarted" }, { _tag: "Interim", text: "and tomorrow" })
+      await until("the next start stamped", () => clock.reads() >= read + 2)
+      await saveHearing("alpha", { model: "model-c" })
+      await until("switched to model-c", () => streamOf(fake, "device-a")?.model === "model-c" && old.closed, 3_000)
+      // The precondition, observed: the switch cut the routing call (interrupting the old stream's dispatch abandoned
+      // the held request) before TypeSafe's 2 s give-up could. Given up first, the Alpha fallback would have answered the
+      // old final (`neverAnswered` fails then too) and closed the utterance normally.
+      await until("the routing call abandoned", () => jev.abandonedAt() !== undefined)
+      expect(jev.abandonedAt()! - emittedAt).toBeLessThan(1_900)
+      neverAnswered(client, "what is the weather")
+      // Everything of the new utterance (and its routing call) is recorded at JUMP; the dropped start was at 0.
+      clock.set(JUMP)
+      const from = client.messages.length
+      const adminFrom = admin.messages.length
+      fake.emit(streamOf(fake, "device-a")!, { _tag: "SpeechStarted" }, { _tag: "Interim", text: "what time" }, { _tag: "EndOfTurn", text: "what time is it" })
+      const begun = await client.waitFor("turn.start", () => true, { from, timeoutMs: 10_000 })
+      const trace = (await admin.waitFor("trace", (m) => m.trace.turnId === begun.turnId, { from: adminFrom, timeoutMs: 10_000 })).trace
+      const line = trace.timeline!
+      const startedAt = line.find((x) => x.name === "speechStarted")!.at
+      const firstInterimAt = line.find((x) => x.name === "firstInterim")!.at
+      // Its own start and first words (JUMP, as its end of turn), not the dropped ones (−JUMP).
+      expect(startedAt).toBe(0)
+      expect(firstInterimAt).toBe(0)
+      neverAnswered(client, "what is the weather")
+    } finally {
+      jev.close()
+    }
+  })
+
+  it("an engine reload while a final awaits TypeSafe closes that utterance: the next one (by its phrase) gets its own start", async () => {
+    const jev = await heldTypeSafe()
+    try {
+      const fake = fakeRecognisers()
+      const clock = manualClock()
+      await start(fake, { ...jev.options, turnTrace: clock.turnTrace })
+      const admin = await connect()
+      await admin.admin(TEST_ADMIN_PASSWORD)
+      const client = await device("device-a")
+      await until("device-a hearing", () => streamOf(fake, "device-a") !== undefined)
+      const old = streamOf(fake, "device-a")!
+      // The origin for the give-up bound below: before the routing call (and its 2 s give-up) can have started.
+      const emittedAt = performance.now()
+      fake.emit(old, { _tag: "SpeechStarted" }, { _tag: "EndOfTurn", text: "what is the weather" })
+      await until("the routing call", () => jev.requests() === 1)
+      // While the routing call is pending (held): nobody answers without a phrase now, and the engines reload.
+      // "nobody" before the reload: the reload's route-gate flush is then dropped (the gate had closed the utterance at
+      // its final), which is what leaves the dispatcher's utterance open. In "decide" mode the flush would close it.
+      await saveOwn("device-a", { withoutPhrase: { mode: "nobody" } })
+      expect((await Effect.runPromise(server!.handle.engine.reload)).ok).toBe(true)
+      await until("a new stream", () => streamOf(fake, "device-a") !== undefined && streamOf(fake, "device-a") !== old && old.closed, 5_000)
+      // The precondition, observed: the reload cut the routing call (the old loop's interruption abandoned the held
+      // request) before TypeSafe's 2 s give-up could. Given up first, the answer would be nobody now ("nobody" mode),
+      // the dispatcher would close the utterance itself, and the test would prove nothing: it fails here instead.
+      await until("the routing call abandoned", () => jev.abandonedAt() !== undefined)
+      expect(jev.abandonedAt()! - emittedAt).toBeLessThan(1_900)
+      neverAnswered(client, "what is the weather")
+      // Everything of the new utterance is recorded at JUMP; the reloaded-away one at 0.
+      clock.set(JUMP)
+      const from = client.messages.length
+      const adminFrom = admin.messages.length
+      const now = streamOf(fake, "device-a")!
+      fake.emit(now, { _tag: "SpeechStarted" }, { _tag: "Interim", text: "hey alpha what time" }, { _tag: "EndOfTurn", text: "hey alpha what time is it" })
+      const begun = await client.waitFor("turn.start", () => true, { from, timeoutMs: 10_000 })
+      expect(begun).toMatchObject({ assistantId: "alpha" })
+      const trace = (await admin.waitFor("trace", (m) => m.trace.turnId === begun.turnId, { from: adminFrom, timeoutMs: 10_000 })).trace
+      expect(trace.route).toMatchObject({ by: "phrase" })
+      const line = trace.timeline!
+      const startedAt = line.find((x) => x.name === "speechStarted")!.at
+      // Its own start and first words (JUMP, as its end of turn), not the reloaded-away utterance's (−JUMP).
+      expect(startedAt).toBe(0)
+      expect(line.find((x) => x.name === "firstInterim")!.at).toBe(0)
+      neverAnswered(client, "what is the weather")
+    } finally {
+      jev.close()
+    }
   })
 
   it("an utterance closed by the switch holds the turn no longer: its assistant is not reported while the hearing tail lasts", async () => {

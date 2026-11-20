@@ -290,10 +290,71 @@ export const TraceConfig = Schema.Struct({
   voiceFrom: Schema.optionalKey(Schema.Literals(["assistant", "device"])),
   modules: NonNegativeInt,
   tools: NonNegativeInt,
+  /** The modules the turn had (those counted in `modules`), in the server's order. Absent: an older server, or not known. */
+  moduleList: Schema.optionalKey(Schema.Array(Schema.Struct({ id: Schema.String, name: Schema.String }))),
+  /** The tools the turn could call (those counted in `tools`), each with the id of the module it belongs to. Absent: as `moduleList`. */
+  toolList: Schema.optionalKey(Schema.Array(Schema.Struct({ name: Schema.String, module: Schema.optionalKey(Schema.String) }))),
   replyEarly: Schema.Boolean,
   toolRounds: NonNegativeInt
 })
 export type TraceConfig = typeof TraceConfig.Type
+
+/**
+ * One entry of a turn's time line: something that happened at a moment (`at`), or took a while (`at` its start, `ms`
+ * how long). `at` is milliseconds relative to end of turn, like `TraceInfo.marks` (negative: before the user had
+ * finished, e.g. `speechStarted`, or work a promoted speculative turn did early). `name` is a stable camelCase machine
+ * name (`TRACE_EVENT_NAMES` lists the ones this protocol version knows; a client shows an unknown name as it is).
+ */
+export const TraceEvent = Schema.Struct({
+  name: Schema.String.check(Schema.isMaxLength(64)),
+  at: Schema.Finite,
+  ms: Schema.optionalKey(NonNegativeFinite),
+  /** What it was about, short: the tool's name, the clause's number, the transcript's length, "round 2". */
+  detail: Schema.optionalKey(Schema.String.check(Schema.isMaxLength(200)))
+})
+export type TraceEvent = typeof TraceEvent.Type
+
+/**
+ * The time-line entry names this protocol version knows, in the order a turn usually passes them. Entries with `ms`
+ * (spans): `routing`, `tool`, `action`. A name may occur more than once (`llmRequestSent` per tool round, `tool` per call).
+ */
+export const TRACE_EVENT_NAMES = [
+  /** Hearing: the recogniser heard speech begin / sent its first partial transcript / sent an early transcript (a speculative turn starts) / said the user went on / sent the final transcript (always at 0). */
+  "speechStarted",
+  "firstInterim",
+  "eagerEndOfTurn",
+  "turnResumed",
+  "endOfTurn",
+  /** The turn's trace began (before 0 for a speculative turn). */
+  "turnStarted",
+  /** Choosing the assistant: a wake phrase was heard / the TypeSafe routing request (span) / the assistant was decided. */
+  "wakePhrase",
+  "routing",
+  "assistantChosen",
+  /** Language model, per round (`detail`: "round 2"): request sent, first token, last token. */
+  "llmRequestSent",
+  "llmFirstToken",
+  "llmDone",
+  /** Intent agents: decision request sent / answered; the action's run (span, `detail`: its name). */
+  "decisionSent",
+  "decisionReceived",
+  "action",
+  /** A tool call (span, `detail`: the tool's name). */
+  "tool",
+  /** Voice: the first clause was ready to speak / synthesis was asked for / its first audio came / all audio was made. */
+  "firstClause",
+  "ttsRequestSent",
+  "ttsFirstAudio",
+  "ttsDone",
+  /** Playing: the first audio left for the device / the device reported playback started / the sound was audible (plus its output latency) / playback ended. */
+  "audioSent",
+  "playbackStart",
+  "audible",
+  "playbackEnd",
+  /** The turn ended (`detail`: its outcome). */
+  "turnEnded"
+] as const
+export type TraceEventName = typeof TRACE_EVENT_NAMES[number]
 
 /**
  * One turn's latency trace. Marks are milliseconds relative to end of turn
@@ -362,6 +423,11 @@ export const TraceInfo = Schema.Struct({
   route: Schema.optionalKey(TraceRoute),
   /** Protocol 7: a snapshot of the latency-relevant configuration at that turn. */
   config: Schema.optionalKey(TraceConfig),
+  /**
+   * Everything measured in the turn, ordered by `at` (at most 200 entries): from the user starting to speak to the
+   * reply's end. It repeats the `marks` (same names) and adds the rest. Absent: an older server.
+   */
+  timeline: Schema.optionalKey(Schema.Array(TraceEvent)),
   /**
    * P7, additive within 11 (docs/PHRASES.md "Traces"): present on the execution trace of a taken utterance (a phrase
    * command, a host control, the ringing window), which is no conversation turn; an older page ignores the key.

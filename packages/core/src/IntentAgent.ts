@@ -17,6 +17,7 @@ import {
 import { defaultIntentWords, type IntentWords } from "./IntentWords.ts"
 import type { AgentImplementation } from "./ModuleContributions.ts"
 import { makePendingIntents, needsConfirmation, type PendingIntents } from "./PendingIntents.ts"
+import { beginTraceSpan } from "./TurnTrace.ts"
 import { parseValues } from "./ValueParsing.ts"
 
 /**
@@ -279,17 +280,22 @@ export const makeIntentAgent = (options: IntentAgentOptions = {}): AgentImplemen
         return out
       }
       const callId = `action-${input.turnId}-${++calls}`
-      const now = input.now === undefined ? Clock.currentTimeMillis : Effect.sync(input.now)
+      // The trace clock, else the monotonic one (as `ModelAgent` and the Claude agent): the entry sits among the trace's times.
+      const now = Effect.sync(input.now ?? (() => performance.now()))
       const speculative = def.speculative === true
       const admitted = Deferred.makeUnsafe<boolean>()
       const dropped = Deferred.makeUnsafe<void>()
       const started = Deferred.makeUnsafe<void>()
       // `actionStarted` and the action's time are from the moment it runs (after promotion for one that was held).
       let start = yield* now
+      const name = actionToolName(action.moduleId, def.id)
+      // Recorded when it starts running: an action still running when the turn ends (Stop) is on the time line, without a duration.
+      let span: ReturnType<typeof beginTraceSpan> | undefined
       const starting = Effect.flatMap(now, (at) =>
         Effect.sync(() => {
           start = at
           input.mark("actionStarted")
+          span = beginTraceSpan(input.trace, "action", at, name)
           Deferred.doneUnsafe(started, Effect.void)
         }))
       // Waiting for promotion and running are bounded separately: at most `pendingMs` for the first, and
@@ -315,7 +321,8 @@ export const makeIntentAgent = (options: IntentAgentOptions = {}): AgentImplemen
         const exit = yield* Fiber.await(fiber)
         const ms = (yield* now) - start
         input.mark("actionFinished")
-        input.trace.tools.push({ name: actionToolName(action.moduleId, def.id), ms })
+        input.trace.tools.push({ name, ms })
+        span?.end(start + ms)
         return { exit, ms }
       })
       return Stream.fromIterable<AgentEvent>([decided]).pipe(

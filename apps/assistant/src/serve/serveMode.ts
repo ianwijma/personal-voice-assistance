@@ -717,17 +717,27 @@ export const startServe = (options: ServeOptions): Effect.Effect<ServeHandle, Ht
         if (choice.offTools.length === 0) return [part]
         return [{ ...part, module: withoutOffTools(part.module, choice.offTools) }]
       })
+    /** The offered tools by name, each with the module it comes from, for the turn's trace. */
+    const toolListOf = (specs: ReadonlyArray<{ readonly name: string }>, snapshot: ModuleSnapshot) =>
+      specs.map((spec) => {
+        const module = snapshot.toolModules.get(spec.name)
+        return module === undefined ? { name: spec.name } : { name: spec.name, module }
+      })
     const modulesFor = (snapshot: ModuleSnapshot, assistant: Assistant) => {
       const parts = partsFor(snapshot, assistant)
       /** The modules it has on that run (capabilities; for the turn's configuration snapshot). */
-      const modules = parts.reduce((n, p) => (isCapability(p.moduleId) && p.unavailable !== true ? n + 1 : n), 0)
-      const same = parts.length === snapshot.parts.length && parts.every((p, i) => p === snapshot.parts[i])
-      if (same) return { registry: snapshot.registry, instructions: snapshot.instructions, modules }
+      const running = parts.filter((p) => isCapability(p.moduleId) && p.unavailable !== true)
+      const modules = running.length
+      /** The same modules by id and display name, for the turn's trace (the names the time line shows). */
+      const moduleList = running.map((p) => ({ id: p.moduleId, name: catalog.find((d) => d.id === p.moduleId)?.name ?? p.moduleId }))
+      // Every call still goes through the host's gateway, which checks the assistant's choices again at execution.
+      const registry = makeToolRegistry(parts.map((p) => p.module), { gateway: host.gateway })
       return {
-        // Every call still goes through the host's gateway, which checks the assistant's choices again at execution.
-        registry: makeToolRegistry(parts.map((p) => p.module), { gateway: host.gateway }),
+        registry,
         instructions: parts.flatMap((p) => (p.instructions.length > 0 ? [p.instructions] : [])),
-        modules
+        modules,
+        moduleList,
+        toolList: toolListOf(registry.specs, snapshot)
       }
     }
 
@@ -1052,7 +1062,14 @@ export const startServe = (options: ServeOptions): Effect.Effect<ServeHandle, Ht
      * a binding on the Claude subscription: the options its agent is passed, from the assistant's own fields), the
      * voice it is bound to, the modules and tools it has, and its reply-early and tool-round settings.
      */
-    const traceConfigOf = (assistant: Assistant, tools: number, modules: number, deviceId: string | undefined): AssistantTraceConfig => {
+    const traceConfigOf = (
+      assistant: Assistant,
+      tools: number,
+      modules: number,
+      deviceId: string | undefined,
+      lists: { readonly moduleList?: TraceConfig["moduleList"]; readonly toolList?: TraceConfig["toolList"] } = {}
+    ): AssistantTraceConfig => {
+      const { moduleList, toolList } = lists
       const deviceVoice = deviceSettingsOf(deviceId).voice
       const key = resources.keyFor(assistant.id)
       // The account of the binding in use, as `agentSetup` reads it (during a change the old binding answers, the old
@@ -1070,6 +1087,9 @@ export const startServe = (options: ServeOptions): Effect.Effect<ServeHandle, Ht
         voiceFrom: deviceVoice.from,
         modules,
         tools: passed !== undefined && !passed.tools ? 0 : tools,
+        // As the counts: a subscription assistant that is not passed tools has none (the lists are shared, never changed).
+        ...(moduleList !== undefined ? { moduleList } : {}),
+        ...(toolList !== undefined ? { toolList: passed !== undefined && !passed.tools ? [] : toolList } : {}),
         replyEarly: assistant.replyEarly,
         toolRounds: assistant.toolRounds
       }
@@ -1139,7 +1159,7 @@ export const startServe = (options: ServeOptions): Effect.Effect<ServeHandle, Ht
           cached.voiceUser !== voiceUser || cached.voiceSource !== voiceSource
         ) {
           // An assistant that does not exist (any more) is never routed; should a turn still start, it gets no tools.
-          const mine = assistant === undefined ? { registry: makeToolRegistry([], { gateway: host.gateway }), instructions: [], modules: 0 } : modulesFor(snapshot, assistant)
+          const mine = assistant === undefined ? { registry: makeToolRegistry([], { gateway: host.gateway }), instructions: [], modules: 0, moduleList: [], toolList: [] } : modulesFor(snapshot, assistant)
           const base = assistant?.prompt ?? defaultSystemPrompt
           const instructions = home === undefined ? mine.instructions : [home, ...mine.instructions]
           // `TurnSetup.ttsReady`: completes once this `tts` (the instance bound now, not a later one) is built.
@@ -1164,7 +1184,7 @@ export const startServe = (options: ServeOptions): Effect.Effect<ServeHandle, Ht
               ...(assistant !== undefined ? { maxToolRounds: assistant.toolRounds } : {})
             },
             instructions,
-            config: assistant === undefined ? undefined : traceConfigOf(assistant, mine.registry.specs.length, mine.modules, deviceId),
+            config: assistant === undefined ? undefined : traceConfigOf(assistant, mine.registry.specs.length, mine.modules, deviceId, mine),
             offeredTools: mine.registry.specs.length
           }
         }
@@ -1188,7 +1208,10 @@ export const startServe = (options: ServeOptions): Effect.Effect<ServeHandle, Ht
           c.offeredTools = tools
           // Replace the snapshot: earlier traces keep their configuration. traceConfigOf also preserves zero for
           // a subscription assistant whose tools are disabled.
-          if (c.assistant !== undefined && c.config !== undefined) c.config = traceConfigOf(c.assistant, tools, c.config.modules, deviceId)
+          if (c.assistant !== undefined && c.config !== undefined) c.config = traceConfigOf(c.assistant, tools, c.config.modules, deviceId, {
+            ...(c.config.moduleList !== undefined ? { moduleList: c.config.moduleList } : {}),
+            toolList: toolListOf(c.setup.registry.specs, host.snapshot())
+          })
         }
         return c.config
       }

@@ -4,6 +4,8 @@ import {
   CurrentTurnTrace,
   type Agent,
   type AgentEvent,
+  addTraceEvent,
+  beginTraceSpan,
   AgentError,
   type AgentImplementation,
   type AgentTurnInput,
@@ -433,7 +435,11 @@ export const makeClaudeAgent = async (options: ClaudeAgentOptions): Promise<Clau
           slot.syncedThrough = start + input.history.length
           const text = composeMessage({ instructions: acquired.instructions, earlier, context: input.context, text: input.text })
 
+          /** The trace clock (`input.now`), the scale of every mark and time-line entry of the turn. */
+          const clock = input.now ?? (() => performance.now())
           let textSinceTool = false
+          /** This call's first text was recorded on the time line. */
+          let firstToken = false
           let toolCalls = 0
           let callIds = 0
           const tooMany = input.maxToolRounds
@@ -450,23 +456,30 @@ export const makeClaudeAgent = async (options: ClaudeAgentOptions): Promise<Clau
             }
             const call: ToolCall = { id: `claude-${input.turnId}-${++callIds}`, name, input: args }
             emit({ _tag: "ToolStarted", call })
-            const started = performance.now()
+            let started = clock()
+            let span: ReturnType<typeof beginTraceSpan> | undefined
             // Cancelled while this call waited (the native yield, or promotion): it does not start. Checked inside the
             // effect, so even an effect that would finish synchronously never runs after cancellation.
             const live = <A>(effect: Effect.Effect<A>): Effect.Effect<A, SessionError> =>
               Effect.suspend(() => (controller.signal.aborted ? Effect.fail(new SessionError("the turn was interrupted", "failed")) : effect))
             try {
               if (!input.tools.isSpeculative(name)) await Effect.runPromise(live(input.promoted), { signal: controller.signal })
+              // The tool's own time: after the wait for the turn to be confirmed (a speculative turn's tool span must not begin before 0).
+              started = clock()
+              // Recorded at its start: a tool still running when the turn is interrupted is on the time line too.
+              span = beginTraceSpan(input.trace, "tool", started, name)
               const ran = await Effect.runPromise(live(runTool(call)), { signal: controller.signal })
               // A failed tool returns its error as a result (it does not throw): a diagnostic, redacted like the
               // catch path's (after the final review). A successful result is content and passes untouched.
               const result = ran.isError ? { ...ran, content: redact(ran.content, secrets) } : ran
-              const ms = Math.round(performance.now() - started)
+              const ms = Math.round(clock() - started)
               input.trace.tools.push({ name, ms })
+              span?.end(started + ms)
               emit({ _tag: "ToolFinished", result, ms })
               return { content: result.content, isError: result.isError }
             } catch (e) {
-              const ms = Math.round(performance.now() - started)
+              const ms = Math.round(clock() - started)
+              span?.end(started + ms)
               const result = { id: call.id, name, content: `Tool did not finish: ${fromUpstream(e, secrets)}`, isError: true }
               emit({ _tag: "ToolFinished", result, ms })
               return { content: result.content, isError: true }
@@ -490,6 +503,10 @@ export const makeClaudeAgent = async (options: ClaudeAgentOptions): Promise<Clau
                   const event = m.event
                   if (event.type === "content_block_delta" && event.delta.type === "text_delta" && event.delta.text.length > 0) {
                     input.mark("llmFirstToken")
+                    if (!firstToken) {
+                      firstToken = true
+                      addTraceEvent(input.trace, "llmFirstToken", clock())
+                    }
                     textSinceTool = true
                     emit({ _tag: "TextDelta", text: event.delta.text })
                   }
@@ -521,7 +538,10 @@ export const makeClaudeAgent = async (options: ClaudeAgentOptions): Promise<Clau
                   return
                 }
                 case "result": {
-                  if (m.subtype === "success" && !m.is_error) return finish()
+                  if (m.subtype === "success" && !m.is_error) {
+                    addTraceEvent(input.trace, "llmDone", clock())
+                    return finish()
+                  }
                   if (m.subtype === "error_max_turns") return finish()
                   // Redacted whole, then shortened (`clip`): a cut first could leave part of a secret unrecognisable.
                   const detail = m.subtype === "success" ? clip(m.result, secrets, 200) : redact(String(m.subtype), secrets)
@@ -537,6 +557,11 @@ export const makeClaudeAgent = async (options: ClaudeAgentOptions): Promise<Clau
               reject(new SessionError(`${AGENT_NAME} stopped: ${reason}`, "unavailable"))
             }
             input.mark("llmRequestSent")
+            // Its own entry too: after a failed agent's request in the same turn (a fallback) the first-only mark is
+            // that agent's, and the time line pairs this call's `llmDone` with the latest request. With an entry the
+            // published time line leaves the mark out (no duplicate).
+            addTraceEvent(input.trace, "llmRequestSent", clock())
+            firstToken = false
             try {
               session!.send(text, { message: onMessage, died }, toolHandler)
             } finally {

@@ -1,7 +1,8 @@
-import { Clock, Effect, Stream } from "effect"
+import { Effect, Stream } from "effect"
 import { type Agent, type AgentEvent, AgentError, type AgentTurnInput } from "./Agent.ts"
 import type { Message, ToolCall, ToolResult } from "./Domain.ts"
 import type { Llm } from "./Services.ts"
+import { addTraceEvent, beginTraceSpan } from "./TurnTrace.ts"
 
 /**
  * A `model` agent over any `Llm` (docs/AGENTS-AND-INTENTS.md §1.7): the
@@ -44,7 +45,9 @@ export const makeModelAgent = (options: { readonly llm: Llm["Service"] }): Pick<
       const request = input.context === undefined ? { system: input.system } : { system: input.system, context: input.context }
       const base: ReadonlyArray<Message> = [...input.history, { role: "user", content: input.text }]
       const rounds: Array<Round> = []
-      const now = input.now === undefined ? Clock.currentTimeMillis : Effect.sync(input.now)
+      // One clock for the tool spans and the model events: the trace's (`input.now`), else the monotonic one.
+      const clock = input.now ?? (() => performance.now())
+      const now = Effect.sync(clock)
 
       const runTools = (round: Round): Stream.Stream<AgentEvent> => {
         const results: Array<ToolResult | undefined> = round.toolCalls.map(() => undefined)
@@ -55,10 +58,13 @@ export const makeModelAgent = (options: { readonly llm: Llm["Service"] }): Pick<
           Stream.make({ _tag: "ToolStarted", call } as AgentEvent).pipe(
             Stream.concat(Stream.fromEffect(Effect.gen(function*() {
               const start = yield* now
+              // Recorded at its start: a tool still running when the turn is interrupted is on the time line too.
+              const span = beginTraceSpan(input.trace, "tool", start, call.name)
               const result = yield* tools.run(call)
               const ms = (yield* now) - start
               results[index] = result
               input.trace.tools.push({ name: call.name, ms })
+              span.end(start + ms)
               return { _tag: "ToolFinished", result, ms } satisfies AgentEvent
             })))
           )
@@ -76,19 +82,27 @@ export const makeModelAgent = (options: { readonly llm: Llm["Service"] }): Pick<
           const current: Round = { text: "", toolCalls: [] }
           const messages = [...base, ...roundMessages(rounds)]
           rounds.push(current)
+          const detail = `round ${n + 1}`
           input.mark("llmRequestSent")
+          addTraceEvent(input.trace, "llmRequestSent", clock(), undefined, detail)
+          let first = false
           return llm.stream({ ...request, messages, tools: tools.specs }).pipe(
             Stream.mapError((error) => new AgentError({ message: error.message, reason: "failed", cause: error })),
             Stream.map((event): AgentEvent | undefined => {
               switch (event._tag) {
                 case "TextDelta":
                   input.mark("llmFirstToken")
+                  if (!first) {
+                    first = true
+                    addTraceEvent(input.trace, "llmFirstToken", clock(), undefined, detail)
+                  }
                   current.text += event.text
                   return event.text.length > 0 ? event : undefined
                 case "ToolCall":
                   current.toolCalls.push({ id: event.id, name: event.name, input: event.input })
                   return undefined
                 case "Done":
+                  addTraceEvent(input.trace, "llmDone", clock(), undefined, detail)
                   return undefined
               }
             }),

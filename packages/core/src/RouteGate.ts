@@ -171,7 +171,7 @@ const none: RouteResult = { events: [] }
 
 const withText = (event: SttEvent, text: string): SttEvent =>
   event._tag === "Interim" || event._tag === "EagerEndOfTurn" || event._tag === "EndOfTurn"
-    ? (event.text === text ? event : { _tag: event._tag, text })
+    ? (event.text === text ? event : { ...event, text })
     : event
 
 const blank = (text: string) => text.trim().length === 0

@@ -1,3 +1,4 @@
+import { MAX_TIMELINE_ENTRIES, traceTimeline } from "@pva/core"
 import type { ConversationEvent, Message, Trace } from "@pva/core"
 import type { HistoryItem, ServerMessage, TraceConfig, TraceInfo } from "@pva/protocol"
 
@@ -62,6 +63,18 @@ export const traceInfo = (trace: Trace): TraceInfo => {
     const t = trace.marks[key]
     if (t !== undefined) marks[key] = Math.round((t - origin) * 10) / 10
   }
+  const round = (n: number) => Math.round((n - origin) * 10) / 10
+  // The whole time line (docs/ARCHITECTURE.md, Latency tracing): relative to the same origin as the marks, sorted, capped.
+  const timeline = traceTimeline(trace)
+    // A time that is not a number (a bad clock) would make the whole message invalid: the entry is left out.
+    .filter((e) => Number.isFinite(e.at - origin))
+    .slice(0, MAX_TIMELINE_ENTRIES)
+    .map((e) => ({
+      name: e.name.slice(0, 64),
+      at: round(e.at),
+      ...(e.ms !== undefined && Number.isFinite(e.ms) ? { ms: Math.max(0, Math.round(e.ms * 10) / 10) } : {}),
+      ...(e.detail !== undefined ? { detail: e.detail.slice(0, 200) } : {})
+    }))
   return {
     turnId: trace.id,
     mode: trace.mode,
@@ -80,7 +93,8 @@ export const traceInfo = (trace: Trace): TraceInfo => {
     ...(trace.route !== undefined ? { route: { ...trace.route } } : {}),
     // The configuration the turn began with (docs/ASSISTANTS.md §3.7): an object made at its start and never changed,
     // shared by the traces of every turn that began with the same one.
-    ...(trace.config !== undefined ? { config: trace.config as TraceConfig } : {})
+    ...(trace.config !== undefined ? { config: trace.config as TraceConfig } : {}),
+    timeline
   }
 }
 

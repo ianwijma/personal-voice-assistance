@@ -7,9 +7,11 @@ import { firstSoundMs } from "@/lib/state.ts"
 import { parseKey } from "@/lib/voicePicker.ts"
 import { Icon } from "../ui/Icon.tsx"
 import { cx } from "../ui/controls.tsx"
+import { latencyTone } from "@/lib/traceTimeline.ts"
+import type { AxisMode } from "@/lib/traceTimeline.ts"
+import { TraceDetail, type TraceTab } from "./TraceDetail.tsx"
 
-/** Latency colour: muted below the 800 ms target, warn from 800, danger from 1500. */
-export const latencyTone = (ms: number) => (ms >= 1500 ? "text-danger" : ms >= 800 ? "text-warn" : "text-ink-muted")
+export { latencyTone }
 
 const fmt = (n: number | undefined) => (n === undefined ? "—" : `${Math.round(n)}`)
 
@@ -240,7 +242,11 @@ function RoutingCell({ t }: { readonly t: TraceInfo }) {
   )
 }
 
-export function TraceRow({ view, open, onToggle, onPop }: {
+export function TraceRow({ view, open, onToggle, onPop, tab, onTab, mode, onMode }: {
+  readonly tab: TraceTab
+  readonly onTab: (t: TraceTab) => void
+  readonly mode: AxisMode
+  readonly onMode: (m: AxisMode) => void
   readonly view: TraceView
   readonly open: boolean
   readonly onToggle: () => void
@@ -304,13 +310,7 @@ export function TraceRow({ view, open, onToggle, onPop }: {
       {open && (
         <tr className="bg-surface-2/40" data-testid="trace-detail-row">
           <td colSpan={TRACE_COLUMNS.length} id={detail} className="pb-4 pt-1 font-sans">
-            <div className="sticky left-0 flex w-[min(100%,calc(100vw-40px))] max-w-[640px] flex-col gap-2.5 text-[13px]">
-              <Facts facts={view.facts} columns="120px" />
-              {view.changed.length > 0 && <p className="text-warn" data-testid="changed-since">Changed since this turn: {changedText(view.changed)}</p>}
-              {t.assistant !== undefined && (
-                <div><a className="text-voice underline-offset-4 hover:underline" href={formatSettingsHash(["assistants", t.assistant.id])}>Open {t.assistant.name}</a></div>
-              )}
-            </div>
+            <TraceDetail t={t} id={detail} facts={view.facts} changed={view.changed} tab={tab} onTab={onTab} mode={mode} onMode={onMode} />
           </td>
         </tr>
       )}

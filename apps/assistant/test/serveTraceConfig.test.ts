@@ -2,7 +2,7 @@
 // says what that turn used (its assistant's language model and voice, the recogniser the device heard with, the
 // modules and tools, reply early, tool rounds), captured at the turn's start, so a later change leaves it as it was.
 import { Llm, type LlmEvent, voiceKey } from "@pva/core"
-import { endOfTurn, speechStarted } from "@pva/core/testing"
+import { endOfTurn, interim, speechStarted } from "@pva/core/testing"
 import { type Assistant, type ServerMessage, type ServerMessageOf, TraceInfo } from "@pva/protocol"
 import { Effect, Schema, Stream } from "effect"
 import { mkdtempSync, readFileSync, writeFileSync } from "node:fs"
@@ -112,7 +112,12 @@ describe("the per-turn configuration snapshot (TraceInfo.config)", () => {
 
     const spoken = async (text: string) => {
       const from = page.messages.length
-      stt.emit(speechStarted, endOfTurn(text))
+      // Spoken over ~200 ms (a first partial after 100 ms) so the time line's order can be asserted.
+      stt.emit(speechStarted)
+      await sleep(100)
+      stt.emit(interim(text.split(" ").slice(0, 3).join(" ")))
+      await sleep(100)
+      stt.emit(endOfTurn(text))
       const begun = await page.waitFor("turn.start", () => true, { from, timeoutMs: 10_000 })
       return page.waitFor("turn.end", (m) => m.turnId === begun.turnId, { from, timeoutMs: 10_000 })
     }
@@ -140,6 +145,9 @@ describe("the per-turn configuration snapshot (TraceInfo.config)", () => {
       voiceFrom: "assistant",
       modules: 1,
       tools: 1,
+      // The names behind the counts: the modules and tools the turn had, each tool with its module.
+      moduleList: [{ id: "greeter", name: "Greeter" }],
+      toolList: [{ name: "greet", module: "greeter" }],
       replyEarly: true,
       toolRounds: 3
     }
@@ -150,12 +158,28 @@ describe("the per-turn configuration snapshot (TraceInfo.config)", () => {
       voiceFrom: "assistant",
       modules: 0,
       tools: 0,
+      moduleList: [],
+      toolList: [],
       replyEarly: false,
       toolRounds: 1
     }
     const first = traces(admin)
     expect(first.map((t) => [t.mode, t.assistant?.id])).toEqual([["voice", "alpha"], ["text", "alpha"], ["voice", "bravo"], ["text", "bravo"]])
     expect(first.map((t) => t.config)).toEqual([alphaConfig, alphaConfig, bravoConfig, bravoConfig])
+    // The time line of the voice turn: the utterance began, the phrase was heard, the assistant chosen, then the end of turn.
+    const spokenLine = first[0]!.timeline!
+    const lineNames = spokenLine.map((e) => e.name)
+    expect(lineNames).toEqual(expect.arrayContaining(["speechStarted", "firstInterim", "wakePhrase", "assistantChosen", "endOfTurn", "llmRequestSent", "turnEnded"]))
+    expect(spokenLine.find((e) => e.name === "wakePhrase")!.detail).toBe("hey alpha")
+    expect(spokenLine.find((e) => e.name === "assistantChosen")!.detail).toBe("alpha")
+    const when = (name: string) => spokenLine.find((e) => e.name === name)!.at
+    // In the order it happened (non-strict orderings only, which causality guarantees whatever the scheduling; the exact
+    // times are serveTimelineOrder.test.ts's, on a hand-run clock).
+    expect(when("endOfTurn")).toBe(0)
+    expect(when("speechStarted")).toBeLessThanOrEqual(when("firstInterim"))
+    expect(when("firstInterim")).toBeLessThanOrEqual(when("wakePhrase"))
+    expect(when("wakePhrase")).toBeLessThanOrEqual(when("assistantChosen"))
+    expect(when("assistantChosen")).toBeLessThanOrEqual(0)
     // As the protocol's schema reads it.
     for (const t of first) expect(Schema.decodeUnknownSync(TraceInfo)(t).config).toEqual(t.config)
     // The device's own `turn.end` does not carry it (a voice connection never learns a model, §5.3).

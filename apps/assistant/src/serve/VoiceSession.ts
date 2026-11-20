@@ -1,5 +1,6 @@
 import { makeWebAudio, type WebAudio } from "@pva/audio-web"
 import {
+  addTraceEvent,
   announcementChime,
   AudioError,
   chunkClauses,
@@ -17,6 +18,7 @@ import {
   type RouteResult,
   type Stt,
   type SttEvent,
+  type UtteranceTimes,
   type Trace,
   type ConnectionRef,
   type CommandSet,
@@ -364,6 +366,8 @@ export const assistantTurnTrace = (
     readonly route?: () => TraceRoute | undefined
     /** The routing call's times (trace clock) of the route, when TypeSafe was asked. */
     readonly routeTimes?: () => Pick<RouteDecision, "sentAt" | "receivedAt"> | undefined
+    /** When the route was decided and its wake phrase heard (trace clock; the time line's `assistantChosen`, `wakePhrase`). */
+    readonly routedAt?: () => { readonly chosenAt: number; readonly phraseAt?: number; readonly phrase?: string } | undefined
     /** The configuration snapshot of the turn (docs/ASSISTANTS.md §3.7), read once at its start; never changed after. */
     readonly config?: () => TraceConfig | undefined
   }
@@ -373,6 +377,13 @@ export const assistantTurnTrace = (
     const times = fields.routeTimes?.()
     delete trace.marks.routeSent
     delete trace.marks.routeReceived
+    // The route may be decided again at the final: its entries are replaced.
+    if (trace.events !== undefined) trace.events = trace.events.filter((e) => e.name !== "wakePhrase" && e.name !== "assistantChosen")
+    const at = fields.routedAt?.()
+    if (at !== undefined) {
+      if (at.phraseAt !== undefined) addTraceEvent(trace, "wakePhrase", at.phraseAt, undefined, at.phrase)
+      addTraceEvent(trace, "assistantChosen", at.chosenAt, undefined, trace.assistant?.id)
+    }
     if (times === undefined) return
     trace.marks.routeSent = times.sentAt
     if (times.receivedAt !== undefined) trace.marks.routeReceived = times.receivedAt
@@ -411,6 +422,7 @@ export const assistantTurnTrace = (
         }
       }
     },
+    event: shared.event,
     finish: shared.finish,
     recent: shared.recent
   })
@@ -820,6 +832,7 @@ export const makeVoiceSession = (options: VoiceSessionOptions): Effect.Effect<Vo
 
     const dispatcher = makeSessionDispatcher<Target>({
       replyEarly: (assistant) => assistantOf(assistant)?.replyEarly ?? true,
+      now: options.turnTrace.now,
       decide,
       // The device may have changed while TypeSafe was asked: the answer goes only to an assistant it still has, and
       // to nobody once the device no longer routes by TypeSafe.
@@ -883,6 +896,12 @@ export const makeVoiceSession = (options: VoiceSessionOptions): Effect.Effect<Vo
                 return { id: assistant, name: a?.name ?? assistant }
               },
               route: () => traceRouteOf(assistant),
+              routedAt: () => {
+                const t = dispatcherRef?.routedAtOf(assistant)
+                if (t === undefined) return undefined
+                const r = dispatcherRef?.routeOf(assistant)
+                return r?.by === "phrase" ? { ...t, phrase: r.phrase } : t
+              },
               routeTimes: () => {
                 const r = dispatcherRef?.routeOf(assistant)
                 return r?.by === "decide" ? r.decision : undefined
@@ -971,6 +990,40 @@ export const makeVoiceSession = (options: VoiceSessionOptions): Effect.Effect<Vo
      * (`decideUtterance`, docs/PHRASES.md), which runs the gates on it once; a taken utterance's final reaches them, or
      * the dispatcher, with no words, and what took it runs after it is dispatched.
      */
+    /**
+     * Stamp the recogniser's events where they enter the session: as they arrive, ahead of the buffer that `onStt`'s
+     * serial dispatch drains, before any gate or a pending routing call can hold them back. `onStt` awaits dispatch (a
+     * TypeSafe call may take a while), so the stamp runs on the producer side of an unbounded buffer, in its own fiber
+     * in the stream's scope: same order (one FIFO), a failure or end after the events before it, interrupted with the
+     * stream. The recognisers already push into an unbounded queue (`Stream.callback`), so the buffer takes no
+     * backpressure away from them. The open utterance's times (`UtteranceTimes`, shared by its events) belong to that
+     * one stream: the producer touches nothing else of the session, and a replacement stream (a switch, a failure, a
+     * new build) starts with none, whatever the old one had stamped but not yet delivered.
+     */
+    const stamped = <E>(events: Stream.Stream<SttEvent, E>): Stream.Stream<SttEvent, E> =>
+      Stream.suspend(() => {
+        let utterance: UtteranceTimes | undefined
+        const stamp = (event: SttEvent): SttEvent => {
+          switch (event._tag) {
+            case "SpeechStarted":
+              if (utterance === undefined) utterance = { startedAt: options.turnTrace.now() }
+              return event.heard === utterance ? event : { ...event, heard: utterance }
+            case "Interim":
+              if (utterance !== undefined && utterance.firstInterimAt === undefined && event.text.trim() !== "") {
+                utterance.firstInterimAt = options.turnTrace.now()
+              }
+              return event
+            case "EagerEndOfTurn":
+            case "TurnResumed":
+              // On the event itself (an utterance may have several): the dispatcher may hold it for the routing call.
+              return event.heardAt !== undefined ? event : { ...event, heardAt: options.turnTrace.now() }
+            case "EndOfTurn":
+              utterance = undefined
+              return event
+          }
+        }
+        return events.pipe(Stream.map(stamp), Stream.buffer({ capacity: "unbounded" }))
+      })
     const onStt = (event: SttEvent): Effect.Effect<void> =>
       Effect.suspend(() => {
         const t = now()
@@ -1232,13 +1285,27 @@ export const makeVoiceSession = (options: VoiceSessionOptions): Effect.Effect<Vo
       holderCheck()
     }
 
+    /**
+     * After the route gate was flushed: an utterance the dispatcher still has open is closed there directly (it starts
+     * nothing). That happens when the stream or loop was stopped while a final was still being dispatched (a TypeSafe
+     * call): the route gate had closed that utterance already, so its flush forwards nothing, and the dispatcher would
+     * treat the next `SpeechStarted` as a repeat and hand the next utterance this one's start and times. Only called
+     * once the recogniser loop that delivered the utterance has ended (no turn of it is being delivered); with nothing
+     * open it does nothing.
+     */
+    const closeDispatcherUtterance = Effect.suspend(() => {
+      if (!dispatcher.hasOpen()) return Effect.void
+      utteranceDropped()
+      return dispatcher.dispatch({ events: [{ _tag: "EndOfTurn", text: "" }] })
+    })
+
     /** Closes an utterance the previous stream left open (it starts nothing). */
     const closeOpenUtterance = Effect.suspend(() => {
-      if (!utteranceOpen) return Effect.void
+      if (!utteranceOpen) return closeDispatcherUtterance
       utteranceOpen = false
       utteranceDropped()
       heard.discard()
-      return dispatcher.dispatch(route.filter({ _tag: "EndOfTurn", text: "" }, now()))
+      return Effect.andThen(dispatcher.dispatch(route.filter({ _tag: "EndOfTurn", text: "" }, now())), closeDispatcherUtterance)
     })
 
     const sameHearing = (a: Hearing, b: Hearing) => a.kind === b.kind && (a.kind !== "ready" || (b.kind === "ready" && a.id === b.id))
@@ -1252,7 +1319,7 @@ export const makeVoiceSession = (options: VoiceSessionOptions): Effect.Effect<Vo
       Effect.gen(function*() {
         streamKey = hearing.key
         streamHearing = hearing
-        const fiber = yield* Effect.forkChild(Effect.exit(Stream.runForEach(hearing.stt.transcribe(input), (event) =>
+        const fiber = yield* Effect.forkChild(Effect.exit(Stream.runForEach(stamped(hearing.stt.transcribe(input)), (event) =>
           Effect.suspend(() => {
             if (event._tag === "SpeechStarted") utteranceOpen = true
             else if (event._tag === "EndOfTurn") utteranceOpen = false
@@ -1307,6 +1374,8 @@ export const makeVoiceSession = (options: VoiceSessionOptions): Effect.Effect<Vo
             utteranceOpen = false
             utteranceDropped()
             yield* dispatcher.dispatch(route.filter({ _tag: "EndOfTurn", text: "" }, now()))
+            // The previous run was interrupted (the engine stops every loop before a new build starts them).
+            yield* closeDispatcherUtterance
           }
           failedId = undefined
           const builtStt = built.providers.stt

@@ -528,6 +528,7 @@ Nothing else is sent: only the sentence and the Handles lines. TypeSafe option o
   is taken from the resource keys and assistant fields that conversation actually uses for that turn, not from the
   saved settings.
 - **Built:** every finished turn's trace carries `config`, taken once at the turn's start (the keys and fields that conversation uses for that turn), for voice and typed turns, and shown to admin connections only.
+- **Built (time line):** `TraceInfo.timeline` lists everything measured in the turn, sorted, relative to end of turn (docs/ARCHITECTURE.md, Latency tracing: names, where each is recorded). Routing adds `wakePhrase` (phrase heard, detail the phrase), `routing` (the TypeSafe call, a span) and `assistantChosen`; the dispatcher stamps the time of each route when it sets it (`routedAtOf`). `config` gains `moduleList` (`{id, name}`) and `toolList` (`{name, module?}`): the modules and tools behind `modules` and `tools` (empty tool list for a Claude subscription assistant that is not passed tools, as `tools: 0`). All optional keys: `PROTOCOL_VERSION` is not bumped for them.
 - `Publisher.traceInfo` (Publisher.ts:56-75) maps them into `TraceInfo` (§5.4). Today it drops `Trace.agent`; that
   field is dropped from `TraceInfo` for good, replaced by `assistant` and `route`.
 
@@ -822,6 +823,20 @@ modes read them), and the Claude subscription module's per-assistant fields are 
 | Shared › Speech recognition models, Voice providers | `models`, jobs, `/api/voice-providers` | `job.*`, `model.delete`, `settings.update` | Models page and Voice providers page reused; "used by" added |
 | Keys & vault, Recordings, Problems, Settings from outside, About | unchanged | unchanged | unchanged (Problems lists resource problems) |
 | Diagnostics › Latency (assistant filter, device filter, median per assistant, Routing column, snapshot popover and detail, "changed since") | `trace`, `admin.snapshot.traces`, `assistants` | – | `latency.tsx` extended; columns grow from 7 to 10 |
+
+**The open latency row** (`TraceDetail.tsx`, `TraceTimeline.tsx`, pure model in `lib/traceTimeline.ts`) has two tabs. **Timeline**
+(the default) is built from `TraceInfo.timeline`. On a desktop it is a full-width chart with one lane per phase (speaking,
+choosing the assistant, language model, tools, voice, playback; empty lanes left out), lines at 0 and at the audible moment,
+hollow bars between paired moments (request to done per round, first clause to last audio, playback start to end), and the
+entry table under it, which is the chart's text alternative. Hovering, focusing or tapping a mark shows a tooltip and links
+its table row; the marks are one tab stop with arrow, Home/End and PageUp/PageDown keys. The axis is "Reply" by default: long
+speaking before the work and long playback after the sound are shortened to a fixed share with a `//` break and a caption
+each, so labels exist only where the scale is linear; "Entire turn" draws one linear scale. On a phone there is no chart:
+a vertical list on a rail with a summary of first token, first audio and audible, long runs folded. **Information** has the
+configuration (language model, hearing, voice, chosen by), "Modules and tools" (each module with its tools, the ones the
+turn called marked) from `config.moduleList` and `config.toolList`, what changed since, and the link to the assistant. A
+trace from an older server says what was not recorded (counts instead of lists; the time line rebuilt from `marks`, `route`,
+`client` and `totalMs`, or none). The hover popover keeps counts.
 
 Removed from the admin web: the Front ends category, `ProfileForm`'s activation and voice groups, the Language model,
 Speech recognition and Voices top-level categories (their shared parts move to Shared settings), and the module

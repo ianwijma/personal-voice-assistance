@@ -279,6 +279,7 @@ test.describe("Diagnostics › Latency", () => {
     expect(medians.map((m) => m.replace(/^·\s*/, ""))).toEqual(["Jeff median 245 ms", "T3 median 612 ms", "Keuken median 931 ms"])
     // A turn with no snapshot says so.
     await row(page, 36).getByTestId("trace-toggle").click()
+    await page.getByTestId("trace-tab-information").click()
     await expect(page.getByTestId("trace-facts")).toContainText("not recorded")
   })
 
@@ -338,6 +339,7 @@ test.describe("Diagnostics › Latency", () => {
     await expect(pop).toBeHidden()
     // The turn with no assistant name to hover: no popover; a turn without a snapshot says so in its open row.
     await row(page, 41).getByTestId("trace-toggle").click()
+    await page.getByTestId("trace-tab-information").click()
     const detail = page.getByTestId("trace-detail-row")
     await expect(detail).toContainText("Chosen by")
     await expect(detail).toContainText("Typed text")
@@ -346,10 +348,240 @@ test.describe("Diagnostics › Latency", () => {
     await expect(detail).toHaveCount(0)
   })
 
+  test("the open row opens on the Timeline tab: lanes, a shortened axis with a switch, the table, hover and keyboard on the marks", async ({ page, baseURL }) => {
+    await loginAdmin(page, baseURL, "#settings/diagnostics/latency")
+    await row(page, 43).getByTestId("trace-toggle").click()
+    const detail = page.getByTestId("trace-detail-row")
+    // Tabs: Timeline is the default, Information is the other; arrow keys move and activate.
+    await expect(detail.getByRole("tablist", { name: "Turn 43" })).toBeVisible()
+    await expect(detail.getByTestId("trace-tab-timeline")).toHaveAttribute("aria-selected", "true")
+    await expect(detail.getByTestId("trace-tab-information")).toHaveAttribute("aria-selected", "false")
+    const graphic = detail.getByTestId("trace-timeline")
+    await expect(graphic).toHaveAttribute("role", "group")
+    await expect(graphic).toHaveAttribute("data-mode", "reply")
+    for (const lane of ["hearing", "choosing", "model", "tools", "voice", "playback"]) await expect(graphic.locator(`[data-lane=${lane}]`)).toBeVisible()
+    await expect(graphic.locator("[data-lane=tools] [data-event=tool]")).toHaveCount(2)
+    await expect(graphic.getByTestId("timeline-zero").first()).toBeVisible()
+    await expect(graphic.getByTestId("timeline-audible").first()).toBeVisible()
+    await expect(graphic.getByText("you stopped talking").first()).toBeVisible()
+    // The long speaking and the long playback are shortened and captioned; the switch shows the whole turn on one scale.
+    await expect(graphic.getByText("2.3 s, shortened")).toBeVisible()
+    const mode = detail.getByTestId("timeline-axis-mode")
+    await mode.getByRole("radio", { name: "Entire turn" }).click()
+    await expect(graphic).toHaveAttribute("data-mode", "entire")
+    await expect(graphic.getByText(/shortened/)).toHaveCount(0)
+    await mode.getByRole("radio", { name: "Reply" }).click()
+    await expect(graphic).toHaveAttribute("data-mode", "reply")
+    // The switch by keyboard: an arrow selects the other option and moves the focus to it, without a page error.
+    const pageErrors: Array<Error> = []
+    page.on("pageerror", (err) => pageErrors.push(err))
+    await mode.getByRole("radio", { name: "Reply" }).focus()
+    await page.keyboard.press("ArrowRight")
+    await expect(graphic).toHaveAttribute("data-mode", "entire")
+    await expect(mode.getByRole("radio", { name: "Entire turn" })).toHaveAttribute("aria-checked", "true")
+    await expect(mode.getByRole("radio", { name: "Entire turn" })).toBeFocused()
+    await page.keyboard.press("ArrowLeft")
+    await expect(graphic).toHaveAttribute("data-mode", "reply")
+    await expect(mode.getByRole("radio", { name: "Reply" })).toBeFocused()
+    expect(pageErrors.map((err) => err.message)).toEqual([])
+    // The table lists every entry: "started talking" before 0, the rounds in the labels, a tool's duration, the derived playback time.
+    const events = detail.getByTestId("trace-events")
+    const started = events.locator("tr[data-event=speechStarted]")
+    await expect(started).toContainText("Started talking")
+    await expect(started.locator("td").nth(1)).toHaveText(/^−[\d,]+$/)
+    await expect(events.locator("tr[data-event=endOfTurn] td").nth(1)).toHaveText("0")
+    const order = await events.locator("tbody tr").evaluateAll((trs) => trs.map((r) => r.getAttribute("data-event")))
+    expect(order.indexOf("speechStarted")).toBeLessThan(order.indexOf("endOfTurn"))
+    expect(order.indexOf("endOfTurn")).toBeLessThan(order.indexOf("audible"))
+    await expect(events).toContainText("Language model: request sent · round 2")
+    await expect(events.locator("tr[data-event=tool]").first()).toContainText("add_note")
+    await expect(events.locator("tr[data-event=tool]").first().locator("td").nth(3)).toHaveText("2")
+    await expect(events.locator("tr[data-event=wakePhrase]")).toContainText("hey keuken")
+    await expect(events.locator("tr[data-event=playbackEnd] td").nth(3)).toHaveText("3,074")
+    await expect(events.locator("tr[data-event=audible]")).toContainText("playback start +1,490 + output latency 54 ms")
+    // Hover a mark: a tooltip says what it is, its table row is linked; leaving hides it.
+    const tool = graphic.locator("[data-testid=trace-mark][data-event=tool]").first()
+    const tip = page.getByTestId("trace-tooltip")
+    await tool.hover()
+    await expect(tip).toBeVisible()
+    await expect(tip).toContainText("Tool call")
+    await expect(tip).toContainText("took 2 ms")
+    await expect(tip).toContainText("add_note")
+    await expect(events.locator("tr[data-event=tool]").first()).toHaveAttribute("data-linked", "true")
+    await page.mouse.move(0, 0)
+    await expect(tip).toBeHidden()
+    await expect(events.locator("tr[data-linked=true]")).toHaveCount(0)
+    // Hover a row: its mark is linked, no tooltip.
+    await started.hover()
+    await expect(graphic.locator("[data-testid=trace-mark][data-event=speechStarted]")).toHaveAttribute("data-linked", "true")
+    await expect(tip).toHaveCount(0)
+    await page.mouse.move(0, 0)
+    // Keyboard: one tab stop; focus shows the tooltip; arrows, Home/End, Enter pins, Escape unpins.
+    const marks = graphic.getByTestId("trace-mark")
+    await expect(marks.and(page.locator("[tabindex='0']"))).toHaveCount(1)
+    await graphic.locator("[data-testid=trace-mark][data-event=endOfTurn]").focus()
+    await expect(tip).toContainText("Finished talking")
+    const focused = page.locator("[data-testid=trace-mark]:focus")
+    await page.keyboard.press("ArrowRight")
+    await expect(focused).toHaveAttribute("data-event", "assistantChosen")
+    await expect(tip).toContainText("Assistant chosen")
+    await page.keyboard.press("ArrowDown")
+    await expect(focused).toHaveAttribute("data-event", /llm|decision|action/)
+    await page.keyboard.press("Home")
+    await expect(focused).toHaveAttribute("data-event", "speechStarted")
+    await page.keyboard.press("End")
+    await expect(focused).toHaveAttribute("data-event", "playbackEnd")
+    await page.keyboard.press("Enter")
+    await expect(focused).toHaveAttribute("data-pinned", "true")
+    await expect(events.locator("tr[data-event=playbackEnd]")).toHaveAttribute("data-linked", "true")
+    await page.keyboard.press("Escape")
+    await expect(focused).not.toHaveAttribute("data-pinned", "true")
+    await expect(tip).toBeHidden()
+    // Tabs by keyboard.
+    await detail.getByTestId("trace-tab-timeline").focus()
+    await page.keyboard.press("ArrowRight")
+    await expect(detail.getByTestId("trace-tab-information")).toHaveAttribute("aria-selected", "true")
+    // Information: the configuration, then modules with their tools as one entry, called ones marked.
+    const facts = detail.getByTestId("trace-facts")
+    for (const k of ["Language model", "Hearing", "Voice", "Chosen by"]) await expect(facts).toContainText(k)
+    await expect(facts).not.toContainText("Modules")
+    const mt = detail.getByTestId("trace-modules-tools")
+    await expect(mt).not.toHaveAttribute("data-recorded", "false")
+    await expect(mt.locator("[data-module=notes]")).toContainText("Notes")
+    await expect(mt.locator("[data-module=notes]")).toContainText("2 of 2 called")
+    await expect(mt.locator("[data-module=notes] [data-called=true]")).toHaveCount(2)
+    await expect(mt.locator("[data-module=notes]")).toContainText("add_note · 2 ms")
+    await expect(mt.locator("[data-module=home]")).toContainText("none called")
+    for (const name of ["home_state", "set_light"]) await expect(mt.locator("[data-module=home]")).toContainText(name)
+    await expect(mt.locator("[data-module=home] [data-called=true]")).toHaveCount(0)
+    await expect(detail.getByRole("link", { name: "Open Keuken" })).toBeVisible()
+    await row(page, 43).getByTestId("trace-toggle").click()
+  })
+
+  test("the open row for an early turn, TypeSafe's routing, an interrupted turn, and traces from an older server", async ({ page, baseURL }) => {
+    await loginAdmin(page, baseURL, "#settings/diagnostics/latency")
+    const detail = page.getByTestId("trace-detail-row")
+    // Turn 48: early; the early transcript is before 0.
+    await row(page, 48).getByTestId("trace-toggle").click()
+    await expect(detail.locator("tr[data-event=eagerEndOfTurn]")).toContainText("Early transcript (reply started early)")
+    await expect(detail.locator("tr[data-event=eagerEndOfTurn] td").nth(1)).toHaveText("−330")
+    await expect(detail.getByTestId("timeline-end")).toHaveCount(0)
+    await row(page, 48).getByTestId("trace-toggle").click()
+    // Turn 45: TypeSafe's routing is a span, with its duration.
+    await row(page, 45).getByTestId("trace-toggle").click()
+    await expect(detail.getByTestId("trace-timeline").locator("[data-lane=choosing] [data-event=routing]")).toBeVisible()
+    await expect(detail.locator("tr[data-event=routing] td").nth(3)).toHaveText("138")
+    await row(page, 45).getByTestId("trace-toggle").click()
+    // Turn 40 was interrupted: a note and an end line, nothing drawn after it.
+    await row(page, 40).getByTestId("trace-toggle").click()
+    await expect(detail.getByTestId("timeline-end-note")).toContainText("This turn was interrupted at")
+    await expect(detail.getByTestId("timeline-end").first()).toBeVisible()
+    await row(page, 40).getByTestId("trace-toggle").click()
+    // Turn 37 (an older server: a snapshot without lists or a time line): counts, and a time line rebuilt from the marks.
+    await row(page, 37).getByTestId("trace-toggle").click()
+    await expect(detail.getByTestId("timeline-rebuilt")).toContainText("did not record a full time line")
+    await expect(detail.locator("tr[data-event=llmFirstToken]")).toBeVisible()
+    await expect(detail.getByTestId("trace-timeline").locator("[data-lane=tools]")).toHaveCount(0)
+    await detail.getByTestId("trace-tab-information").click()
+    await expect(detail.getByTestId("trace-modules-tools")).toHaveAttribute("data-recorded", "false")
+    await expect(detail.getByTestId("trace-modules-tools")).toContainText("Modules and tools not recorded for this turn · 3 modules · 4 tools")
+    await row(page, 37).getByTestId("trace-toggle").click()
+    // Turn 36 has no snapshot at all.
+    await row(page, 36).getByTestId("trace-toggle").click()
+    await expect(detail.getByTestId("trace-modules-tools")).toHaveText("Modules and tools not recorded for this turn.")
+    await detail.getByTestId("trace-tab-timeline").click()
+    await expect(detail.getByTestId("timeline-rebuilt")).toBeVisible()
+    await row(page, 36).getByTestId("trace-toggle").click()
+  })
+
+  test("a pinned tooltip follows its mark when the page scrolls", async ({ page, baseURL }) => {
+    await page.setViewportSize({ width: 1280, height: 600 })
+    await loginAdmin(page, baseURL, "#settings/diagnostics/latency")
+    await row(page, 43).getByTestId("trace-toggle").click()
+    const graphic = page.getByTestId("trace-detail-row").getByTestId("trace-timeline")
+    const tool = graphic.locator("[data-testid=trace-mark][data-event=tool]").first()
+    const tip = page.getByTestId("trace-tooltip")
+    await tool.click()
+    await expect(tool).toHaveAttribute("data-pinned", "true")
+    await page.mouse.move(0, 0)
+    await expect(tip).toBeVisible()
+    // Scroll whatever scrolls the mark (the page or a panel around it), then, two frames later (well before any other
+    // re-render), how far the mark moved and whether the tooltip is still just above or below it and over it.
+    const after = await tool.evaluate(async (mark) => {
+      const tipEl = document.querySelector("[data-testid=trace-tooltip]")!
+      const adjacent = () => {
+        const m = mark.getBoundingClientRect()
+        const t = tipEl.getBoundingClientRect()
+        const gap = Math.min(Math.abs(m.top - t.bottom), Math.abs(t.top - m.bottom))
+        return gap <= 12 && t.left <= m.right && t.right >= m.left
+      }
+      const top = mark.getBoundingClientRect().top
+      const before = adjacent()
+      let s: HTMLElement | null = mark.parentElement
+      while (s !== null && !(s.scrollHeight > s.clientHeight && /(auto|scroll)/.test(getComputedStyle(s).overflowY))) s = s.parentElement
+      if (s === null) window.scrollBy(0, 150)
+      else s.scrollTop += 150
+      await new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve)))
+      return { before, moved: top - mark.getBoundingClientRect().top, adjacent: adjacent() }
+    })
+    expect(after.before).toBe(true)
+    expect(after.moved).toBeGreaterThan(50)
+    expect(after.adjacent).toBe(true)
+  })
+
+  test("a pinned tooltip goes when the chart is hidden (the viewport narrows below the chart's breakpoint) and does not come back", async ({ page, baseURL }) => {
+    // 900 → 700 px: the admin shell stays the narrow one (it changes at 1024 px, remounting the page), the chart
+    // (768 px and up) is hidden and the phone list shown in the same open row.
+    await page.setViewportSize({ width: 900, height: 800 })
+    await loginAdmin(page, baseURL, "#settings/diagnostics/latency")
+    await row(page, 43).getByTestId("trace-toggle").click()
+    const detail = page.getByTestId("trace-detail-row")
+    const tool = detail.getByTestId("trace-timeline").locator("[data-testid=trace-mark][data-event=tool]").first()
+    const tip = page.getByTestId("trace-tooltip")
+    await tool.click()
+    await expect(tool).toHaveAttribute("data-pinned", "true")
+    await page.mouse.move(0, 0)
+    await expect(tip).toBeVisible()
+    await page.setViewportSize({ width: 700, height: 800 })
+    await expect(detail.getByTestId("trace-spine")).toBeVisible()
+    // Gone at once, and stays gone (a stale one lingers until some later render).
+    for (let i = 0; i < 10; i++) {
+      expect(await tip.count()).toBe(0)
+      await page.waitForTimeout(50)
+    }
+    // Wide again: the pin went with the hidden chart.
+    await page.setViewportSize({ width: 900, height: 800 })
+    await expect(tool).toBeVisible()
+    await expect(tool).not.toHaveAttribute("data-pinned", "true")
+    await expect(tip).toHaveCount(0)
+  })
+
+  test("two open rows: no id repeats, and each chart is described by its own shortened-axis note", async ({ page, baseURL }) => {
+    await loginAdmin(page, baseURL, "#settings/diagnostics/latency")
+    await row(page, 43).getByTestId("trace-toggle").click()
+    await row(page, 45).getByTestId("trace-toggle").click()
+    const details = page.getByTestId("trace-detail-row")
+    await expect(details).toHaveCount(2)
+    const ids = await details.evaluateAll((rows) => rows.flatMap((r) => [...r.querySelectorAll("[id]")].map((el) => el.id)))
+    expect(ids.length).toBeGreaterThan(0)
+    expect(ids.filter((id, i) => ids.indexOf(id) !== i)).toEqual([])
+    const charts = details.getByTestId("trace-timeline")
+    await expect(charts).toHaveCount(2)
+    for (const chart of await charts.all()) {
+      // The description it names is the note inside this chart (whose ranges are this turn's).
+      const own = await chart.evaluate((el) => {
+        const note = el.querySelector("[data-testid=timeline-short-note]")
+        return note !== null && el.getAttribute("aria-describedby") === note.id && document.getElementById(note.id) === note
+      })
+      expect(own).toBe(true)
+    }
+  })
+
   test("changed since: the snapshot differs from the assistant now; changing the assistant adds it live", async ({ page, baseURL }) => {
     await loginAdmin(page, baseURL, "#settings/diagnostics/latency")
     // Turn 41 (T3): the voice was Lessac then, it is Heart now. Turn 42 (Jeff): a bigger model then. Turn 39: Keuken heard it then.
     await row(page, 41).getByTestId("trace-toggle").click()
+    await page.getByTestId("trace-tab-information").click()
     await expect(page.getByTestId("changed-since")).toHaveText("Changed since this turn: voice Lessac → Heart")
     await row(page, 41).getByTestId("trace-toggle").click()
     await row(page, 42).getByTestId("trace-assistant").hover()
@@ -381,9 +613,56 @@ test.describe("Diagnostics › Latency", () => {
     await expect(rows(page)).toHaveCount(1, { timeout: 15_000 })
     await expect(rows(page).first().getByTestId("trace-assistant")).toHaveText("Jeff")
     await rows(page).first().getByTestId("trace-toggle").click()
+    await page.getByTestId("trace-tab-information").click()
     await expect(page.getByTestId("trace-facts")).toContainText("Anthropic API · claude-haiku-5-5 · effort low")
     await expect(page.getByTestId("trace-facts")).toContainText("Typed text")
     await expect(page.getByTestId("changed-since")).toHaveCount(0)
     await ctx.close()
   })
 })
+
+test.describe("Diagnostics › Latency, phone at 360 px", () => {
+  test.use({ viewport: { width: 360, height: 800 }, hasTouch: true, isMobile: true })
+  test.beforeEach(async () => {
+    await mock.scenario("latency")
+  })
+
+  test("the open row is a vertical list with a summary: no lane chart, nothing wider than the panel", async ({ page, baseURL }) => {
+    await loginAdmin(page, baseURL, "#settings/diagnostics/latency")
+    await page.locator("[data-testid=trace-row][data-turn='43']").getByTestId("trace-toggle").click()
+    const detail = page.getByTestId("trace-detail")
+    const spine = detail.getByTestId("trace-spine")
+    await expect(spine).toBeVisible()
+    await expect(detail.getByTestId("trace-timeline")).toBeHidden()
+    await expect(detail.getByTestId("trace-events")).toBeHidden()
+    await expect(detail.getByTestId("timeline-axis-mode")).toBeHidden()
+    await expect(detail.getByTestId("trace-summary")).toContainText("First token")
+    await expect(detail.getByTestId("trace-summary")).toContainText("+1,544")
+    await expect(spine.locator("li[data-event=speechStarted]")).toContainText("−2,339")
+    await expect(spine.locator("li[data-event=audible]")).toContainText("playback start +1,490 + output latency 54 ms")
+    await expect(spine.locator("li[data-event=tool]").first()).toContainText("add_note")
+    // Nothing in the panel is wider than the panel, and nothing scrolls sideways inside it.
+    const fits = await detail.evaluate((el) => {
+      const box = el.getBoundingClientRect()
+      const over = [...el.querySelectorAll("*")].filter((n) => !n.closest("[hidden]") && (n as HTMLElement).offsetParent !== null && n.getBoundingClientRect().right > box.right + 1)
+      const scrolls = [...el.querySelectorAll("*")].filter((n) => (n as HTMLElement).offsetParent !== null && n.scrollWidth > n.clientWidth + 1 && getComputedStyle(n).overflowX !== "visible")
+      return { scrollW: el.scrollWidth - el.clientWidth, over: over.length, scrolls: scrolls.length }
+    })
+    expect(fits).toEqual({ scrollW: 0, over: 0, scrolls: 0 })
+    await detail.getByTestId("trace-tab-information").click()
+    await expect(detail.getByTestId("trace-modules-tools")).toBeVisible()
+    await expect(detail.getByRole("link", { name: "Open Keuken" })).toBeVisible()
+    const info = await detail.evaluate((el) => el.scrollWidth - el.clientWidth)
+    expect(info).toBe(0)
+  })
+
+  test("a trace without a recorded time line shows the rebuilt list and the summary", async ({ page, baseURL }) => {
+    await loginAdmin(page, baseURL, "#settings/diagnostics/latency")
+    await page.locator("[data-testid=trace-row][data-turn='36']").getByTestId("trace-toggle").click()
+    const detail = page.getByTestId("trace-detail")
+    await expect(detail.getByTestId("timeline-rebuilt")).toBeVisible()
+    await expect(detail.getByTestId("trace-spine").locator("li[data-event=audible]")).toBeVisible()
+    await expect(detail.getByTestId("trace-summary")).toContainText("+150")
+  })
+})
+
