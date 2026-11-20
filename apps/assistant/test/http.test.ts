@@ -41,7 +41,8 @@ const rejectingHub = (): SessionHub & { rejected: number } => {
     endSessions: () => 0,
     audioOwnerOf: () => undefined,
     deviceOfConnection: () => undefined,
-    deviceConnected: () => false
+    deviceConnected: () => false,
+    nodeBundleChanged: () => {}
   }
   return hub
 }

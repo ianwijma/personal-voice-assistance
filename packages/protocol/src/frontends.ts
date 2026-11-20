@@ -267,7 +267,8 @@ export const DeviceHello = Schema.Struct({
   name: DeviceName,
   /**
    * Protocol 11 (P5): what this device can do, measured by the page (absent = cannot; `capabilities.ts`). Changes are
-   * sent with `device.caps`. The server keeps the last declaration in the device's record.
+   * sent with `device.caps`. The server keeps the last declaration in the device's record. A voice node (protocol 12)
+   * declares `{ v: 1, speaker, microphone }`.
    */
   capabilities: Schema.optionalKey(DeviceCapabilities)
 })

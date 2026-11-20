@@ -31,6 +31,12 @@
  *                   "hey go …" is ignored (a tester line), then "hey jeff" alone wakes it (`wake`, armed) and the voice
  *                   turn follows; after the reply the follow-up window, then asleep again. Devices are seeded.
  *   devices         like typed, with two remembered devices (the Kitchen iPad has its own assistant list) besides the ones that connect.
+ *   nodes           like devices, and the voice-node device type (protocol 12) with three voice nodes: Kitchen speaker
+ *                   (online, up to date, wss), Living room (online, "Update pending", plain ws, a microphone that is
+ *                   not connected), Garage (offline for 3 h, arecord missing, a last error). Every voice node has Jeff
+ *                   "Hey Jeff" and T3 "Hey T3".
+ *   nodes-empty     like typed, with the voice-node type listed and never saved: no node yet; the first
+ *                   node.pair.create seeds Every voice node from Every browser (docs/VOICE-NODES.md §3.4).
  *   long-phrase     like typed, with a six-word wake phrase ("hello my personal voice assistant please") as the
  *                   web-voice default (asleep after a claim) and a third device that has it among three phrases.
  *   admin-disabled  no admin password: `admin.state.enabled` is false and every login is refused.
@@ -100,6 +106,19 @@
  *
  * The model pickers' API (docs/MODEL-PICKERS.md §4) is under /api/models/ (mock/modelPickers.ts: every provider state,
  * recogniser downloads as the Models page's jobs); POST /mock/models/state {"provider", "state"} forces a state.
+ *
+ * Protocol 12, voice nodes (docs/VOICE-NODES.md §5, mock/nodes.ts; the node scenarios only, as only they list the
+ * voice-node type): `node.pair.create` answers `result.pairing` (codes of 8 Crockford characters, 10 minutes, at most
+ * 3 outstanding, the oldest cancelled by a fourth; the first one seeds Every voice node), and the "box" redeems the code
+ * by itself after 2 s: a node record (`vn-…`, the admin's name or the box's host name, made unique), `node.paired` to
+ * admin connections, then `devices`. With `replace` the record keeps its settings. `node.pair.cancel` drops a code.
+ * `node.command.send` answers `unknown_device` unless the id is a node that is online; Restart takes the node away for
+ * 3 s, Update now brings it up to date after 2 s. `device.forget` of a node removes it for good (no coming back). A
+ * browser hello naming a node's id is closed with 4403. Sample nodes are online without a socket. Control: POST
+ * /mock/nodes {"tls"?, "tlsPin"? (string | null), "loopbackOnly"?, "built"?, "redeemAfterMs"?, "ttlMs"?, "hostname"?,
+ * "transport"?} (how the server and the next box behave; reset by a scenario), POST /mock/node/redeem {"code"?} (the
+ * box redeems that code, default the newest), POST /mock/node {"deviceId", "online"?, "upToDate"?, "transport"?,
+ * "lastError"? (string | null), "status"? (null: never reported)}.
  */
 import { randomBytes } from "node:crypto"
 import { Schema } from "effect"
@@ -121,6 +140,8 @@ import {
   WAKE_ARMED_MS,
   WAKE_TEST_MAX_MS,
   WEB_VOICE_KIND,
+  VOICE_NODE_KIND,
+  type NodeInfo,
   decodeClientMessage,
   deviceTypeOf,
   decodeMicFrame,
@@ -160,6 +181,7 @@ import { fieldValueError } from "./fieldChecks.ts"
 import { seedTraces } from "./traces.ts"
 import { createVoiceAssistants, scenarioSettings, scriptedTurn } from "./voiceAssistants.ts"
 import { encodeWav, MOCK_PROVIDERS } from "./voices.ts"
+import { defaultPairingConfig, newNodeId, newPairCode, type NodeRecord, pairedNodeInfo, pairingOf, BUNDLE, seedNodeOwn, seedNodes, seedNodeType, uniqueName } from "./nodes.ts"
 import { createModelPickersMock } from "./modelPickers.ts"
 import { createModuleRoutesMock, DEMO_DEFINITION_ACTIONS, demoHomeAction, demoHomeModule, TokenRefusal } from "./demoHome.ts"
 import { createScheduledJobsMock, MockSchedulerError } from "./scheduledJobs.ts"
@@ -184,7 +206,9 @@ const SCENARIOS = [
   "latency",
   "admin-disabled",
   "admin-backoff",
-  "health"
+  "health",
+  "nodes",
+  "nodes-empty"
 ] as const
 /** The admin password of the mock (`PVA_ADMIN_PASSWORD` on the real server). */
 const ADMIN_PASSWORD = "admin password"
@@ -1040,6 +1064,8 @@ const assistantsMock = createAssistantsMock({
   toolNames: (id) => runningTools(id).map((t) => t.name),
   checkOwn: (id, own) => checkOwn(id, own),
   accountProblem: (account) => accountProblem(account),
+  kindOf: (id) => devices.get(id)?.kind,
+  nodeTypeListed: () => nodeScenario(),
   // Read when a device is saved: `sections` is set before any request arrives.
   isPerson: (id) => memberIds().has(id)
 })
@@ -1128,7 +1154,13 @@ interface DeviceRecord {
   lastSeen: number
   /** Protocol 11: what it declared last (hello, `device.caps`). */
   declared?: DeclaredCapabilities
+  /** Protocol 12: a voice node's info (mock/nodes.ts). */
+  node?: NodeInfo
+  /** A sample node that is online without a socket. */
+  virtual?: boolean
 }
+/** The scenarios with the voice-node device type (protocol 12). */
+const nodeScenario = () => scenario === "nodes" || scenario === "nodes-empty"
 const HOUR = 3_600_000
 /** The people of Members now (their ids). */
 const memberIds = (): ReadonlySet<string> => {
@@ -1169,9 +1201,10 @@ const withPersonIds = (patch: SettingsPatch) => {
   }) as unknown as SettingValue
 }
 const seededDevices = (): Map<string, DeviceRecord> => {
-  if (!seededDeviceScenario()) return new Map()
+  if (!seededDeviceScenario() && scenario !== "nodes") return new Map()
   const now = Date.now()
   return new Map([
+    ...(scenario === "nodes" ? seedNodes(now).map((n): [string, DeviceRecord] => [n.id, n]) : []),
     ...(scenario === "long-phrase"
       ? [["d-living-room-0003", { id: "d-living-room-0003", kind: WEB_VOICE_KIND, name: "Living room tablet", firstSeen: now - 20 * 24 * HOUR, lastSeen: now - 5 * 60_000 }] as [string, DeviceRecord]]
       : []),
@@ -1204,14 +1237,57 @@ const LONG_PHRASE = "hello my personal voice assistant please"
 let devices = seededDevices()
 seedVoiceScenario()
 
+// ---- Voice nodes (protocol 12, mock/nodes.ts)
+
+let pairingConfig = defaultPairingConfig()
+/** Outstanding pairing codes, oldest first. */
+const pairCodes = new Map<string, { expiresAt: number; name: string | undefined; replace: string | undefined }>()
+const isNode = (d: DeviceRecord | undefined): d is DeviceRecord & { node: NodeInfo } => d !== undefined && d.kind === VOICE_NODE_KIND && d.node !== undefined
+const connectionsOf = (d: DeviceRecord) => [...conns].filter((c) => c.welcomed && c.deviceId === d.id).length + (d.virtual === true ? 1 : 0)
+/** The `nodes` scenario: Every voice node as the owner left it, and the living room's own sound settings. */
+const seedNodeScenario = () => {
+  if (scenario !== "nodes") return
+  assistantsMock.setTypeSettings(VOICE_NODE_KIND, seedNodeType)
+  for (const o of seedNodeOwn()) assistantsMock.saveDevice({ target: { kind: "device", id: o.id }, rev: 0, settings: o.settings, saveAnyway: true })
+}
+seedNodeScenario()
+/** The box redeemed `code` (POST /node/pair on the real server): a node record, `node.paired`, then the lists. */
+const redeemCode = (code: string): boolean => {
+  const entry = pairCodes.get(code)
+  if (entry === undefined || entry.expiresAt <= Date.now()) return false
+  pairCodes.delete(code)
+  const now = Date.now()
+  const old = entry.replace === undefined ? undefined : devices.get(entry.replace)
+  let record: DeviceRecord
+  if (old !== undefined && isNode(old)) {
+    record = { ...old, lastSeen: now, virtual: true, node: { ...old.node, pairedAt: now } }
+  } else {
+    const name = uniqueName(entry.name ?? pairingConfig.hostname, [...devices.values()].map((d) => d.name))
+    record = { id: newNodeId(), kind: VOICE_NODE_KIND, name, firstSeen: now, lastSeen: now, node: pairedNodeInfo(pairingConfig, now), declared: { capabilities: { v: 1, speaker: { media: ["speech"] }, microphone: { farField: false } }, seenAt: now }, virtual: true }
+  }
+  devices.set(record.id, record)
+  broadcast({ type: "node.paired", code, deviceId: record.id, name: record.name })
+  assistantsChanged()
+  return true
+}
+
 const deviceInfos = (): Array<DeviceListInfo> => {
   const now = Date.now()
   return [...devices.values()]
     .map((d) => {
+      const { virtual: _virtual, node, ...rest } = d
       const open = [...conns].filter((c) => c.welcomed && c.deviceId === d.id)
-      const connections = open.length
-      const live = connections === 0 ? undefined : { visible: open.some((c) => c.visible !== false), ...(open.some((c) => c.lastInteractionAt !== undefined) ? { lastInteractionAt: Math.max(...open.map((c) => c.lastInteractionAt ?? 0)) } : {}) }
-      return { ...d, lastSeen: connections > 0 ? now : d.lastSeen, connections, audioOwner: voiceSessions.get(d.id)?.owner !== undefined, ...assistantsMock.deviceFields(d.id), ...(live !== undefined ? { live } : {}) }
+      const connections = connectionsOf(d)
+      const live = open.length === 0 ? undefined : { visible: open.some((c) => c.visible !== false), ...(open.some((c) => c.lastInteractionAt !== undefined) ? { lastInteractionAt: Math.max(...open.map((c) => c.lastInteractionAt ?? 0)) } : {}) }
+      return {
+        ...rest,
+        lastSeen: connections > 0 ? now : d.lastSeen,
+        connections,
+        audioOwner: voiceSessions.get(d.id)?.owner !== undefined,
+        ...assistantsMock.deviceFields(d.id),
+        ...(node !== undefined ? { node: structuredClone(node) } : {}),
+        ...(live !== undefined ? { live } : {})
+      }
     })
     .sort((a, b) => b.lastSeen - a.lastSeen)
 }
@@ -1551,6 +1627,9 @@ const resetState = () => {
   devices = seededDevices()
   retiredMemberIds = new Set()
   assistantsMock.reset(scenario === "long-phrase")
+  pairingConfig = defaultPairingConfig()
+  pairCodes.clear()
+  seedNodeScenario()
   syncCapabilities()
   voice.reset()
   seedVoiceScenario()
@@ -1767,7 +1846,7 @@ const serveMockMedia = (path: string, res: ServerResponse) => {
 }
 
 /** Messages that carry admin data: only admin connections get them (protocol 5). */
-const ADMIN_ONLY: ReadonlySet<ServerMessage["type"]> = new Set(["engine", "module.changed", "section.changed", "vault", "env", "job", "models", "devices", "assistants", "device.types", "sessions", "trace", "wake.heard", "admin.snapshot", "health"])
+const ADMIN_ONLY: ReadonlySet<ServerMessage["type"]> = new Set(["engine", "module.changed", "section.changed", "vault", "env", "job", "models", "devices", "assistants", "device.types", "sessions", "trace", "wake.heard", "admin.snapshot", "health", "node.paired", "node.meter"])
 let lastSummary = ""
 const broadcast = (m: ServerMessage) => {
   const adminOnly = ADMIN_ONLY.has(m.type)
@@ -2828,6 +2907,11 @@ const onClientMessage = (c: Conn, m: ClientMessage) => {
       const before = boundaries()
       devices.delete(m.id)
       assistantsMock.forgetDevice(m.id)
+      // A voice node is not recorded again (its credential went with it: the real server closes it with 4403, and it
+      // must be paired again).
+      if (record.kind === VOICE_NODE_KIND) {
+        for (const x of conns) if (x.deviceId === m.id) x.ws.close(CloseCode.unauthorized)
+      }
       // As the server: a connected device's session ends (known → not known); its pages say hello again as a new device.
       endChangedSessions(before)
       pushSetups()
@@ -2934,6 +3018,56 @@ const onClientMessage = (c: Conn, m: ClientMessage) => {
       sendTo(c, { type: "conversation.history", requestId: m.requestId, assistantId: m.assistantId, id: conv.conversation.id, history: clone(conv.history.slice(-200)), ...(lastTurnId !== undefined ? { lastTurnId } : {}) })
       return
     }
+    case "node.pair.create": {
+      if (requireAdmin(c, m.requestId)) return
+      if (m.replace !== undefined && !isNode(devices.get(m.replace))) return result(c, m.requestId, false, { code: "unknown_device", message: "That voice node is not known (any more)." })
+      // §3.4: the first pairing seeds Every voice node from Every browser.
+      if (assistantsMock.seedNodeType()) assistantsChanged()
+      // At most 3 outstanding: a fourth cancels the oldest.
+      while (pairCodes.size >= 3) pairCodes.delete(pairCodes.keys().next().value!)
+      const code = newPairCode()
+      const expiresAt = Date.now() + pairingConfig.ttlMs
+      pairCodes.set(code, { expiresAt, name: m.name, replace: m.replace })
+      sendTo(c, { type: "result", requestId: m.requestId, ok: true, pairing: pairingOf(pairingConfig, code, expiresAt, m.replace) })
+      after(pairingConfig.ttlMs, () => {
+        if (pairCodes.get(code)?.expiresAt === expiresAt) pairCodes.delete(code)
+      })
+      if (pairingConfig.redeemAfterMs > 0 && pairingConfig.built && !pairingConfig.loopbackOnly) after(pairingConfig.redeemAfterMs, () => void redeemCode(code))
+      return
+    }
+    case "node.pair.cancel": {
+      if (requireAdmin(c, m.requestId)) return
+      pairCodes.delete(m.code)
+      result(c, m.requestId, true)
+      return
+    }
+    case "node.command.send": {
+      if (requireAdmin(c, m.requestId)) return
+      const record = devices.get(m.id)
+      if (!isNode(record) || connectionsOf(record) === 0) return result(c, m.requestId, false, { code: "unknown_device", message: isNode(record) ? `${record.name} is not connected.` : "That is not a voice node." })
+      for (const x of conns) if (x.welcomed && x.deviceId === m.id) sendTo(x, { type: "node.command", command: m.command, ...(m.durationMs !== undefined ? { durationMs: m.durationMs } : {}) })
+      result(c, m.requestId, true)
+      // The stand-in box: a restart is away for 3 s; an update restarts on the server's release.
+      if (record.virtual === true && (m.command === "restart" || m.command === "update")) {
+        after(m.command === "update" ? 2000 : 300, () => {
+          record.virtual = false
+          record.lastSeen = Date.now()
+          devicesChanged()
+          after(3000, () => {
+            if (devices.get(record.id) !== record) return
+            record.virtual = true
+            if (m.command === "update") record.node = { ...record.node, version: BUNDLE.version, bundleSha256: BUNDLE.sha256, upToDate: true }
+            devicesChanged()
+          })
+        })
+      }
+      return
+    }
+    case "node.status":
+    case "node.level":
+      // Only an authenticated node sends these; the mock has no node connections.
+      sendTo(c, { type: "error", error: { code: "bad_message", message: `${m.type} comes from a voice node only.` } })
+      return
     case "ping":
       sendTo(c, { type: "pong", id: m.id })
       return
@@ -3057,6 +3191,11 @@ wss.on("connection", (ws: WebSocket) => {
       c.frontend = m.frontend
       const tokenSent = m.frontend === "admin" ? m.adminToken : undefined
       if (tokenSent !== undefined && sessions.has(tokenSent)) c.session = tokenSent
+      if (m.frontend === "voice" && m.device !== undefined && (m.device.kind === VOICE_NODE_KIND || devices.get(m.device.id)?.kind === VOICE_NODE_KIND)) {
+        // Protocol 12: a node exists only by pairing, and the mock checks no credentials: a page naming a node's id, or
+        // an unpaired node, is refused as the real server refuses a hello without a valid credential.
+        return ws.close(CloseCode.unauthorized)
+      }
       if (m.frontend === "voice" && m.device !== undefined && deviceTypeOf(m.device.kind) !== undefined) {
         const now = Date.now()
         const known = devices.get(m.device.id)
@@ -3577,6 +3716,48 @@ const http = createServer((req, res) => {
         const r = voice.saveSettings(typeof payload.deviceId === "string" ? payload.deviceId : undefined, (payload.settings ?? {}) as Parameters<typeof voice.saveSettings>[1])
         if (r.ok) assistantsChanged()
         return json(res, r.ok ? 200 : 400, r.ok ? { ok: true } : { ok: false, error: r.error })
+      }
+      case "/mock/nodes": {
+        // Protocol 12: how the server reports itself in `result.pairing`, and how the next box behaves.
+        const p = payload
+        if (typeof p.tls === "boolean") pairingConfig.tls = p.tls
+        if (typeof p.tlsPin === "string") pairingConfig.tlsPin = p.tlsPin
+        if (p.tlsPin === null) pairingConfig.tlsPin = undefined
+        if (typeof p.loopbackOnly === "boolean") pairingConfig.loopbackOnly = p.loopbackOnly
+        if (typeof p.built === "boolean") pairingConfig.built = p.built
+        if (typeof p.redeemAfterMs === "number") pairingConfig.redeemAfterMs = p.redeemAfterMs
+        if (typeof p.ttlMs === "number") pairingConfig.ttlMs = p.ttlMs
+        if (typeof p.hostname === "string") pairingConfig.hostname = p.hostname
+        if (p.transport === "ws" || p.transport === "wss") pairingConfig.transport = p.transport
+        return json(res, 200, { ok: true, config: pairingConfig })
+      }
+      case "/mock/node/redeem": {
+        const code = typeof payload.code === "string" ? payload.code : [...pairCodes.keys()].at(-1)
+        const ok = code !== undefined && redeemCode(code)
+        return json(res, ok ? 200 : 400, ok ? { ok: true } : { ok: false, error: "no such code (or it expired)" })
+      }
+      case "/mock/node": {
+        // A sample node's state changes (online, release, transport, last error, status) as the box would report it.
+        const record = typeof payload.deviceId === "string" ? devices.get(payload.deviceId) : undefined
+        if (!isNode(record)) return json(res, 400, { error: "not a voice node" })
+        if (typeof payload.online === "boolean") {
+          record.virtual = payload.online
+          if (!payload.online) record.lastSeen = Date.now()
+        }
+        let node: NodeInfo = record.node
+        if (typeof payload.upToDate === "boolean") node = { ...node, upToDate: payload.upToDate }
+        if (payload.transport === "ws" || payload.transport === "wss") node = { ...node, transport: payload.transport }
+        if (payload.status === null) {
+          const { status: _gone, ...rest } = node
+          node = rest
+        }
+        if (node.status !== undefined && (typeof payload.lastError === "string" || payload.lastError === null)) {
+          const { lastError: _old, ...status } = node.status
+          node = { ...node, status: typeof payload.lastError === "string" ? { ...status, lastError: { message: payload.lastError, at: Date.now() } } : status }
+        }
+        record.node = node
+        devicesChanged()
+        return json(res, 200, { ok: true })
       }
       case "/mock/idle": {
         // Protocol 6: the device's conversation has been quiet for longer than its conversationIdleMinutes: the next

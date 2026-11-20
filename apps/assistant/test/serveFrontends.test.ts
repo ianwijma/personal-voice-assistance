@@ -117,7 +117,8 @@ describe("admin password and sessions", () => {
     // together, and an unadmitted page gets none). The snapshot carries the registry, so the order is not asserted.
     expect(withoutHealth(page.types(from))).toEqual(["result", "admin.state", "admin.snapshot"])
     expect(page.messages[from + 1]).toEqual({ type: "admin.state", admin: { enabled: true, loggedIn: true, expiresAt: result.admin!.expiresAt } })
-    expect(snapshot?.deviceTypes?.map((t) => t.kind)).toEqual([WEB_VOICE_KIND])
+    // Protocol 12: browsers and voice nodes.
+    expect(snapshot?.deviceTypes?.map((t) => t.kind)).toEqual([WEB_VOICE_KIND, "voice-node"])
     expect(snapshot?.vault.admin).toBe(true)
 
     const voice = await voicePage(server)

@@ -375,7 +375,7 @@ describe("device.save", () => {
     expect(await save({ withoutPhrase: { mode: "assistant", assistant: "ghost" } })).toMatchObject({ ok: false, error: { code: "unknown_assistant" } })
     expect(await save({ captions: null })).toMatchObject({ ok: false, error: { code: "invalid_settings", fieldErrors: [{ key: "captions" }] } })
     expect(typeOf(a).settings.interruptMode).toBe("manual")
-    expect(await request(a, { type: "device.save", target: { kind: "type", type: "voice-node" }, rev: 0, settings: {} })).toMatchObject({ ok: false, error: { code: "unknown_device" } })
+    expect(await request(a, { type: "device.save", target: { kind: "type", type: "no-such-type" }, rev: 0, settings: {} })).toMatchObject({ ok: false, error: { code: "unknown_device" } })
   })
 
   it("an assistant that cannot be reached asks for 'save anyway'; a device is unknown, renamed, reset with null", async () => {

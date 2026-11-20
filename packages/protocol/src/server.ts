@@ -15,6 +15,7 @@ import { AssistantId } from "./assistants.ts"
 import { AssistantInfo, DeviceListInfo, DeviceSetup, DeviceTypeInfo } from "./devices.ts"
 import { DeviceId, WakePhrase } from "./frontends.ts"
 import { AdminSnapshot, EngineStatus, EngineSummary, HistoryItem, ModuleInfo, SettingsSection, Snapshot, TraceInfo } from "./snapshot.ts"
+import { NodeCommand, NodeMeter, NodePaired, NodePairing } from "./nodes.ts"
 import { EnvInfo } from "./env.ts"
 import { JobInfo, ModelSet } from "./jobs.ts"
 import { VaultInfo } from "./vault.ts"
@@ -236,7 +237,9 @@ export const Result = Schema.Struct({
    * Additive within protocol 11 (P9): on the result of `notification.action`, the sentence to show for the press (the
    * module's answer, or "I can't do that right now"), in the household's language.
    */
-  say: Schema.optionalKey(Schema.String.check(Schema.isMaxLength(300)))
+  say: Schema.optionalKey(Schema.String.check(Schema.isMaxLength(300))),
+  /** Protocol 12: present only on the successful result of `node.pair.create`. */
+  pairing: Schema.optionalKey(NodePairing)
 })
 
 /**
@@ -409,7 +412,13 @@ export const HealthMessage = Schema.Struct({
   health: HealthInfo
 })
 
-export const ServerMessage = Schema.Union([
+/**
+ * Every server message. `Schema.toTaggedUnion`'s type-level utilities recurse once per member and exceed the compiler's
+ * instantiation depth beyond 47 members (protocol 12 has 49), so the utilities are added at run time as before but typed
+ * by hand: the union, its `tag`, `discriminants` and `cases` (`match`, `guards` and `isAnyOf` exist but are untyped;
+ * nothing uses them on this union).
+ */
+const ServerMessageUnion = Schema.Union([
   Welcome,
   Session,
   State,
@@ -455,9 +464,19 @@ export const ServerMessage = Schema.Union([
   OutputVolumeMessage,
   PresentShowMessage,
   PresentUpdateMessage,
-  PresentDismissMessage
-]).pipe(Schema.toTaggedUnion("type"))
-export type ServerMessage = typeof ServerMessage.Type
+  PresentDismissMessage,
+  NodeCommand,
+  NodePaired,
+  NodeMeter
+])
+export type ServerMessage = typeof ServerMessageUnion.Type
+const untypedToTaggedUnion = Schema.toTaggedUnion as unknown as (tag: "type") => (union: typeof ServerMessageUnion) => unknown
+export const ServerMessage = untypedToTaggedUnion("type")(ServerMessageUnion) as typeof ServerMessageUnion & {
+  readonly tag: "type"
+  readonly discriminants: ReadonlyArray<ServerMessage["type"]>
+  /** Member schema by discriminant (the codec asks only whether a type is one). */
+  readonly cases: Readonly<Record<ServerMessage["type"], Schema.Top>>
+}
 export type ServerMessageType = ServerMessage["type"]
 export type ServerMessageOf<T extends ServerMessageType> = Extract<ServerMessage, { readonly type: T }>
 

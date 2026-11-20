@@ -161,7 +161,10 @@ describe("migration fixtures", () => {
       voice: { from: "assistant" },
       // Protocol 11: the built-in place and no overrides.
       place: { room: "", privacy: "shared", alwaysOn: false, acceptsFromOthers: true, quietRoom: false, defaultPerson: null },
-      capabilities: { noDisplay: false, excludeKinds: [], noSpeaker: false }
+      capabilities: { noDisplay: false, excludeKinds: [], noSpeaker: false },
+      // Protocol 12: complete settings carry the node sections too (not in the browsers' keys, so ignored there).
+      sound: { volume: 80, cues: true },
+      soundDevices: { input: "", output: "" }
     })
     expect(isDeviceSettings(web)).toBe(true)
     expect(existsSync(join(dir, "settings.json"))).toBe(false)

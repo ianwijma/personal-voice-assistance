@@ -43,7 +43,9 @@ it.skipIf(missing !== undefined)(
     server = await startTestServer({
       build: defaultProviderBuilder,
       catalog: moduleCatalog,
-      env: { ...process.env, LLM_PROVIDER: "fake", STT_PROVIDER: "sherpa", STT_SHERPA_MODEL: "zipformer-en", TTS_PROVIDER: "sherpa", VOICES: "standard" },
+      // The real voice directory: without it the harness points TTS_SHERPA_MODEL_DIR at a stand-in where every voice
+      // "is installed" but none can load, and Piper fails the turn.
+      env: { ...process.env, LLM_PROVIDER: "fake", STT_PROVIDER: "sherpa", STT_SHERPA_MODEL: "zipformer-en", TTS_PROVIDER: "sherpa", VOICES: "standard", TTS_SHERPA_MODEL_DIR: SherpaTts.defaultModelDir },
       dataDir: join(dir, "data")
     })
     expect(server.handle.engine.status()).toMatchObject({ state: "ready" })

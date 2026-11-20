@@ -1,0 +1,254 @@
+[
+  {
+    "id": 40,
+    "type": "PipeWire:Interface:Node",
+    "version": 3,
+    "permissions": [
+      "r",
+      "w",
+      "x",
+      "m"
+    ],
+    "info": {
+      "state": "suspended",
+      "props": {
+        "media.class": "Audio/Sink",
+        "node.name": "alsa_output.pci-0000_00_1f.3.analog-stereo",
+        "node.description": "Built-in Audio Analog Stereo",
+        "object.id": 40,
+        "object.serial": 1040,
+        "device.api": "alsa",
+        "node.nick": "HDA Intel PCH"
+      }
+    }
+  },
+  {
+    "id": 41,
+    "type": "PipeWire:Interface:Node",
+    "version": 3,
+    "permissions": [
+      "r",
+      "w",
+      "x",
+      "m"
+    ],
+    "info": {
+      "state": "suspended",
+      "props": {
+        "media.class": "Audio/Source",
+        "node.name": "alsa_input.pci-0000_00_1f.3.analog-stereo",
+        "node.description": "Built-in Audio Analog Stereo",
+        "object.id": 41,
+        "object.serial": 1041,
+        "device.api": "alsa"
+      }
+    }
+  },
+  {
+    "id": 55,
+    "type": "PipeWire:Interface:Node",
+    "version": 3,
+    "permissions": [
+      "r",
+      "w",
+      "x",
+      "m"
+    ],
+    "info": {
+      "state": "suspended",
+      "props": {
+        "media.class": "Audio/Sink",
+        "node.name": "alsa_output.usb-Jabra_SPEAK_410_USB-00.analog-stereo",
+        "node.description": "Jabra SPEAK 410 USB Analog Stereo",
+        "object.id": 55,
+        "object.serial": 1055,
+        "device.api": "alsa"
+      }
+    }
+  },
+  {
+    "id": 56,
+    "type": "PipeWire:Interface:Node",
+    "version": 3,
+    "permissions": [
+      "r",
+      "w",
+      "x",
+      "m"
+    ],
+    "info": {
+      "state": "suspended",
+      "props": {
+        "media.class": "Audio/Source",
+        "node.name": "alsa_input.usb-Jabra_SPEAK_410_USB-00.mono-fallback",
+        "node.description": "Jabra SPEAK 410 USB Mono",
+        "object.id": 56,
+        "object.serial": 1056,
+        "device.api": "alsa"
+      }
+    }
+  },
+  {
+    "id": 70,
+    "type": "PipeWire:Interface:Node",
+    "version": 3,
+    "permissions": [
+      "r",
+      "w",
+      "x",
+      "m"
+    ],
+    "info": {
+      "state": "suspended",
+      "props": {
+        "media.class": "Audio/Source/Virtual",
+        "node.name": "pva-echo-cancel-source",
+        "node.description": "PVA echo-cancelled mic",
+        "object.id": 70,
+        "object.serial": 1070,
+        "node.virtual": true
+      }
+    }
+  },
+  {
+    "id": 71,
+    "type": "PipeWire:Interface:Node",
+    "version": 3,
+    "permissions": [
+      "r",
+      "w",
+      "x",
+      "m"
+    ],
+    "info": {
+      "state": "suspended",
+      "props": {
+        "media.class": "Audio/Sink",
+        "node.name": "pva-echo-cancel-sink",
+        "node.description": "PVA echo-cancel speaker",
+        "object.id": 71,
+        "object.serial": 1071,
+        "node.virtual": true
+      }
+    }
+  },
+  {
+    "id": 72,
+    "type": "PipeWire:Interface:Node",
+    "version": 3,
+    "permissions": [
+      "r",
+      "w",
+      "x",
+      "m"
+    ],
+    "info": {
+      "state": "suspended",
+      "props": {
+        "media.class": "Stream/Output/Audio",
+        "node.name": "playback.pva-echo-cancel",
+        "node.description": "pva-echo-cancel playback",
+        "object.id": 72,
+        "object.serial": 1072
+      }
+    }
+  },
+  {
+    "id": 80,
+    "type": "PipeWire:Interface:Node",
+    "version": 3,
+    "permissions": [
+      "r",
+      "w",
+      "x",
+      "m"
+    ],
+    "info": {
+      "state": "suspended",
+      "props": {
+        "media.class": "Stream/Input/Audio",
+        "node.name": "Firefox",
+        "node.description": "Firefox",
+        "object.id": 80,
+        "object.serial": 1080
+      }
+    }
+  },
+  {
+    "id": 81,
+    "type": "PipeWire:Interface:Node",
+    "version": 3,
+    "permissions": [
+      "r",
+      "w",
+      "x",
+      "m"
+    ],
+    "info": {
+      "state": "suspended",
+      "props": {
+        "media.class": "Video/Source",
+        "node.name": "v4l2_input.pci-0000_00_14.0-usb-0_5_1.0",
+        "node.description": "Webcam",
+        "object.id": 81,
+        "object.serial": 1081,
+        "device.api": "v4l2"
+      }
+    }
+  },
+  {
+    "id": 82,
+    "type": "PipeWire:Interface:Node",
+    "version": 3,
+    "permissions": [
+      "r",
+      "w",
+      "x",
+      "m"
+    ],
+    "info": {
+      "state": "suspended",
+      "props": {
+        "media.class": "Midi/Bridge",
+        "node.name": "Midi-Bridge",
+        "node.description": "",
+        "object.id": 82,
+        "object.serial": 1082
+      }
+    }
+  },
+  {
+    "id": 90,
+    "type": "PipeWire:Interface:Metadata",
+    "version": 3,
+    "props": {
+      "metadata.name": "default"
+    },
+    "metadata": [
+      {
+        "subject": 0,
+        "key": "default.audio.sink",
+        "type": "Spa:String:JSON",
+        "value": {
+          "name": "alsa_output.usb-Jabra_SPEAK_410_USB-00.analog-stereo"
+        }
+      },
+      {
+        "subject": 0,
+        "key": "default.audio.source",
+        "type": "Spa:String:JSON",
+        "value": {
+          "name": "alsa_input.usb-Jabra_SPEAK_410_USB-00.mono-fallback"
+        }
+      },
+      {
+        "subject": 0,
+        "key": "default.configured.audio.sink",
+        "type": "Spa:String:JSON",
+        "value": {
+          "name": "alsa_output.usb-Jabra_SPEAK_410_USB-00.analog-stereo"
+        }
+      }
+    ]
+  }
+]

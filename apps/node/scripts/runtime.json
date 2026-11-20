@@ -1,0 +1,12 @@
+{
+  "comment": "The Node runtime install.sh puts on a node (docs/VOICE-NODES.md §7.1, §7.3). A bump is a code change: run `node apps/node/scripts/pin-runtime.mjs <version>` and commit. Hashes are the .tar.gz lines of https://nodejs.org/dist/v<version>/SHASUMS256.txt.",
+  "version": "22.23.5",
+  "linux-arm64": {
+    "url": "https://nodejs.org/dist/v22.23.5/node-v22.23.5-linux-arm64.tar.gz",
+    "sha256": "8bd3dc69eee8f3f226315a80d7d1d4faccf217a4c8fae500168ac2e38f3bdba3"
+  },
+  "linux-x64": {
+    "url": "https://nodejs.org/dist/v22.23.5/node-v22.23.5-linux-x64.tar.gz",
+    "sha256": "c54118104acc524633b5abe106bbf44a53126ec8b4e5fa105cb92b5d7de8a1a1"
+  }
+}

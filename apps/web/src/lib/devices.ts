@@ -20,7 +20,7 @@ import { deepEqual } from "./assistants.ts"
  */
 
 /** A section of the page. `assign` is two keys of the settings: the list and who answers without a phrase. */
-export type SectionId = "assign" | "phrases" | "voicePage" | "look" | "voice" | "place" | "capabilities" | "interrupting" | "audio" | "captions"
+export type SectionId = "assign" | "phrases" | "voicePage" | "look" | "voice" | "place" | "capabilities" | "interrupting" | "audio" | "captions" | "sound" | "soundDevices"
 
 export const SECTION_KEYS: Readonly<Record<SectionId, ReadonlyArray<DeviceSettingsKey>>> = {
   assign: ["assistants", "withoutPhrase"],
@@ -32,7 +32,10 @@ export const SECTION_KEYS: Readonly<Record<SectionId, ReadonlyArray<DeviceSettin
   capabilities: ["capabilities"],
   interrupting: ["interruptMode"],
   audio: ["audio"],
-  captions: ["captions"]
+  captions: ["captions"],
+  // Protocol 12: voice nodes only (docs/VOICE-NODES.md §3.2).
+  sound: ["sound"],
+  soundDevices: ["soundDevices"]
 }
 
 /** The sections a device type has (its `keys`). */
@@ -79,7 +82,9 @@ export const settingsOf = (base: DeviceBase, edit: DeviceEdit): DeviceSettings =
   look: valueOf(base, edit, "look"),
   voice: valueOf(base, edit, "voice"),
   place: valueOf(base, edit, "place"),
-  capabilities: valueOf(base, edit, "capabilities")
+  capabilities: valueOf(base, edit, "capabilities"),
+  sound: valueOf(base, edit, "sound"),
+  soundDevices: valueOf(base, edit, "soundDevices")
 })
 
 const keyOwn = (base: DeviceBase, edit: DeviceEdit, k: DeviceSettingsKey): boolean =>

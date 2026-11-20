@@ -10,6 +10,7 @@ import type { Assistant } from "./assistants.ts"
 import { BUILT_IN_WEB_VOICE_SETTINGS, type AssistantInfo, type DeviceListInfo, type DeviceRecordInfo, type DeviceSettings, type DeviceTypeInfo, deviceSetupFrom } from "./devices.ts"
 import type { EnvInfo } from "./env.ts"
 import type { JobInfo, ModelSet } from "./jobs.ts"
+import { VOICE_NODE_KIND } from "./nodes.ts"
 import { WEB_VOICE_KIND } from "./frontends.ts"
 import type { DeviceCapabilities } from "./capabilities.ts"
 import {
@@ -21,6 +22,7 @@ import {
   type Snapshot,
   type TraceInfo
 } from "./snapshot.ts"
+import type { NodeHello, NodePairing } from "./nodes.ts"
 import type { ConversationInfo, SessionInfo } from "./sessions.ts"
 import type { HealthInfo } from "./health.ts"
 
@@ -583,6 +585,69 @@ export const assistantsServerExamples: { readonly [T in AssistantsServerMessageT
   "device.types": { type: "device.types", types: [exampleDeviceType] },
 }
 
+// -- Protocol 12 (docs/VOICE-NODES.md §5)
+
+export const exampleNodeCapabilities: DeviceCapabilities = { v: 1, speaker: { media: ["speech"] }, microphone: { farField: false } }
+
+export const exampleNodeHello: NodeHello = {
+  credential: "q2Vx8m0rJ3cW5yT1bN7dK9fH4gL6pZ2aS8eU0iO3wQk",
+  version: "0.1.0+a1b2c3d4e5",
+  bundleSha256: "3b1f0c9e5a7d4b8e2c6f1a0d9e8b7c6a5f4e3d2c1b0a9f8e7d6c5b4a39281706",
+  platform: { os: "linux", arch: "arm64", hostname: "kitchen-pi", model: "Raspberry Pi 4 Model B" }
+}
+
+/** A voice node's `hello` (§5.2). */
+export const exampleNodeHelloMessage: Extract<ClientMessage, { readonly type: "hello" }> = {
+  type: "hello",
+  protocol: PROTOCOL_VERSION,
+  clientId: "node-6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b",
+  resumeOwner: true,
+  frontend: "voice",
+  device: { id: "n-8e2a41c7d0", kind: VOICE_NODE_KIND, name: "kitchen-pi", capabilities: exampleNodeCapabilities },
+  node: exampleNodeHello
+}
+
+export const exampleNodePairing: NodePairing = {
+  code: "K7QM2XHP",
+  expiresAt: 1_763_100_600_000,
+  tls: true,
+  tlsPin: "sha256:3b1f0c9e5a7d4b8e2c6f1a0d9e8b7c6a5f4e3d2c1b0a9f8e7d6c5b4a39281706",
+  loopbackOnly: false,
+  bundle: { version: "0.1.0+a1b2c3d4e5", sha256: "3b1f0c9e5a7d4b8e2c6f1a0d9e8b7c6a5f4e3d2c1b0a9f8e7d6c5b4a39281706" }
+}
+
+/** The successful result of `node.pair.create`. */
+export const exampleNodePairResult: Extract<ServerMessage, { readonly type: "result" }> = {
+  type: "result",
+  requestId: "n3",
+  ok: true,
+  pairing: exampleNodePairing
+}
+
+export const exampleNodeStatus = {
+  backend: "alsa",
+  inputs: [{ id: "plughw:CARD=Speaker,DEV=0", name: "USB Speakerphone", isDefault: true }],
+  outputs: [{ id: "plughw:CARD=Speaker,DEV=0", name: "USB Speakerphone", isDefault: true }],
+  input: { opened: "plughw:CARD=Speaker,DEV=0", sampleRate: 16_000 },
+  output: { opened: "plughw:CARD=Speaker,DEV=0" },
+  missingTools: ["pw-record"],
+  lastError: { message: "Could not open plughw:CARD=Gone,DEV=0; using the default device.", at: 1_763_100_000_000 }
+} as const
+
+export const nodeClientExamples = {
+  "node.status": { type: "node.status", ...exampleNodeStatus, missingTools: [...exampleNodeStatus.missingTools], inputs: [...exampleNodeStatus.inputs], outputs: [...exampleNodeStatus.outputs] },
+  "node.level": { type: "node.level", rmsDbfs: -32.5, peakDbfs: -12.1 },
+  "node.command.send": { type: "node.command.send", requestId: "n1", id: "n-8e2a41c7d0", command: "test-mic", durationMs: 5000 },
+  "node.pair.create": { type: "node.pair.create", requestId: "n3", name: "Kitchen", replace: "n-8e2a41c7d0" },
+  "node.pair.cancel": { type: "node.pair.cancel", requestId: "n4", code: "K7QM2XHP" }
+} as const satisfies Record<string, ClientMessage>
+
+export const nodeServerExamples = {
+  "node.command": { type: "node.command", command: "test-mic", durationMs: 5000 },
+  "node.paired": { type: "node.paired", code: "K7QM2XHP", deviceId: "n-8e2a41c7d0", name: "Kitchen" },
+  "node.meter": { type: "node.meter", deviceId: "n-8e2a41c7d0", rmsDbfs: -32.5, peakDbfs: -12.1 }
+} as const satisfies Record<string, ServerMessage>
+
 /** A refused `device.save` (protocol 7 error codes ride on the one `result`). */
 export const exampleDuplicatePhraseResult: Extract<ServerMessage, { readonly type: "result" }> = {
   type: "result",
@@ -659,7 +724,8 @@ export const clientExamples: { readonly [T in ClientMessageType]: Extract<Client
   "notification.action": { type: "notification.action", requestId: "n1", id: "n-4f2a", actionId: "stop" },
   // P10 (additive within 11): a tick on a checklist item.
   "present.action": { type: "present.action", requestId: "p1", id: "p-7c1d", revision: "show-1:1", action: "tick", item: "milk", done: true },
-  ...assistantsClientExamples
+  ...assistantsClientExamples,
+  ...nodeClientExamples
 }
 
 /** The `result` of a `notification.action` whose handler is not running (P9, additive within 11). */
@@ -843,6 +909,7 @@ export const serverExamples: { readonly [T in ServerMessageType]: Extract<Server
     }
   },
   "present.dismiss": { type: "present.dismiss", id: "p-7c1d" },
-  ...assistantsServerExamples
+  ...assistantsServerExamples,
+  ...nodeServerExamples
 }
 

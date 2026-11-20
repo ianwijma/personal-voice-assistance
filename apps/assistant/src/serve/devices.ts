@@ -15,11 +15,14 @@ import {
   type ErrorInfo,
   hearerOf,
   MAX_DEVICES,
+  type NodeInfo,
+  type NodePlatform,
+  VOICE_NODE_KIND,
   WEB_VOICE_DEVICE_TYPE,
   WEB_VOICE_KIND
 } from "@pva/protocol"
 import { Duration, Effect } from "effect"
-import type { SettingsFile, SettingsStore, StoredDevice } from "./SettingsStore.ts"
+import type { SettingsFile, SettingsStore, SettingsStoreError, StoredDevice, StoredNode } from "./SettingsStore.ts"
 
 /**
  * Device types and devices as version 4 stores them (docs/ASSISTANTS.md §2.3, §2.6), computed for the server and the
@@ -51,15 +54,38 @@ export const deviceTypeInfos = (file: SettingsFile): ReadonlyArray<DeviceTypeInf
     description: t.description,
     keys: [...t.keys],
     settings: typeSettingsFrom(file, t.kind),
-    rev: file.deviceTypes[t.kind]?.rev ?? 0
+    rev: file.deviceTypes[t.kind]?.rev ?? 0,
+    ...(t.followUpUnset !== undefined ? { followUpUnset: t.followUpUnset } : {})
   }))
 
-/** `devices`: the registry's entries (`DeviceRegistry.devices`) with `own`, `settings`, `hearer` and `rev` added. */
-export const deviceListInfos = (file: SettingsFile, base: ReadonlyArray<DeviceInfo>): ReadonlyArray<DeviceListInfo> =>
+/**
+ * `devices`: the registry's entries (`DeviceRegistry.devices`) with `own`, `settings`, `hearer` and `rev` added, and
+ * for a paired voice node `nodeInfo`'s `node` (docs/VOICE-NODES.md §3.3).
+ */
+export const deviceListInfos = (
+  file: SettingsFile,
+  base: ReadonlyArray<DeviceInfo>,
+  nodeInfo?: (id: string, node: StoredNode) => NodeInfo
+): ReadonlyArray<DeviceListInfo> =>
   base.map((d) => {
     const settings = deviceSettingsFrom(file, d.id, d.kind)
-    return { ...d, own: file.devices[d.id]?.own ?? {}, settings, hearer: hearerOf(settings), rev: file.devices[d.id]?.rev ?? 0 }
+    const record = file.devices[d.id]
+    return {
+      ...d,
+      own: record?.own ?? {},
+      settings,
+      hearer: hearerOf(settings),
+      rev: record?.rev ?? 0,
+      ...(record?.node !== undefined ? { node: nodeInfo?.(d.id, record.node) ?? nodeInfoFrom(record.node) } : {})
+    }
   })
+
+/** What the record alone says about a node (no memory: offline since the server started). */
+export const nodeInfoFrom = (node: StoredNode): NodeInfo => ({
+  pairedAt: node.pairedAt,
+  ...(node.version !== undefined ? { version: node.version } : {}),
+  ...(node.platform !== undefined ? { platform: node.platform } : {})
+})
 
 // -- The registry of remembered devices ------------------------------------------------------------------------------
 
@@ -79,10 +105,16 @@ export interface DeviceRegistry {
   /**
    * A device said hello (or picked an assistant): remember it (first time: with its suggested name, cleaned to one
    * line, and its declaration so far; the 64-device cap drops the least recently seen, devices with own settings
-   * last, connected devices never) and update `lastSeen`. `connected`: ids of devices with an open connection now.
-   * It never declares capabilities (only `declare` does).
+   * last, connected devices and paired nodes never) and update `lastSeen`. `connected`: ids of devices with an open
+   * connection now. It never declares capabilities (only `declare` does). A `voice-node` record is never created here
+   * (pairing does, `addNode`); for one that exists, `node`'s version and platform are written at once when they
+   * changed.
    */
-  readonly seen: (device: DeviceHello, connected: ReadonlySet<string>) => Effect.Effect<void>
+  readonly seen: (
+    device: DeviceHello,
+    connected: ReadonlySet<string>,
+    node?: { readonly version: string; readonly platform: NodePlatform }
+  ) => Effect.Effect<void>
   /**
    * A device's connection closed: `lastSeen` = now (memory; written with the next save). `last`: it was the device's
    * last connection; a declaration of a device whose record was never written is then dropped.
@@ -132,6 +164,22 @@ export interface DeviceRegistry {
    * at the commit and say hello again as a new device, declaring what they can do then).
    */
   readonly forget: (id: string) => Effect.Effect<DeviceResult>
+  /** The pairing of a remembered voice node (`undefined`: not a node, or not remembered). */
+  readonly nodeOf: (id: string) => StoredNode | undefined
+  /**
+   * Pairing (docs/VOICE-NODES.md §6.1): a new voice node record (`firstSeen = lastSeen = now`, no own settings), made
+   * room for like a new device. `connected` as for `seen`. Fails as the store's save does (`blocked()`).
+   */
+  readonly addNode: (
+    id: string,
+    record: { readonly name: string; readonly node: StoredNode },
+    connected: ReadonlySet<string>
+  ) => Effect.Effect<void, SettingsStoreError>
+  /**
+   * Pair again (`replace`): the node record keeps everything but gets `node`. `false` when there is no such node
+   * record any more (nothing is written).
+   */
+  readonly renewNode: (id: string, node: StoredNode) => Effect.Effect<boolean, SettingsStoreError>
 }
 
 export interface DeviceRegistryOptions {
@@ -188,6 +236,7 @@ export const makeDeviceRegistry = (options: DeviceRegistryOptions): DeviceRegist
     Object.fromEntries(Object.entries(devices).map(([id, r]) => [id, withLastSeen(id, r)]))
 
   const hasOwn = (r: StoredDevice) => Object.keys(r.own).length > 0
+  const sameJson = (a: unknown, b: unknown) => JSON.stringify(a) === JSON.stringify(b)
 
   /** Make room for one more: drop the least recently seen not connected (without own settings first). */
   const capped = (devices: Record<string, StoredDevice>, connected: ReadonlySet<string>): Record<string, StoredDevice> => {
@@ -196,7 +245,8 @@ export const makeDeviceRegistry = (options: DeviceRegistryOptions): DeviceRegist
     let excess = ids.length - (MAX_DEVICES - 1)
     if (excess <= 0) return out
     const candidates = ids
-      .filter((id) => !connected.has(id))
+      // A paired node is never dropped to make room: it would lose its credential and could not connect again.
+      .filter((id) => !connected.has(id) && out[id]!.node === undefined)
       .sort((a, b) => Number(hasOwn(out[a]!)) - Number(hasOwn(out[b]!)) || out[a]!.lastSeen - out[b]!.lastSeen)
     for (const id of candidates) {
       if (excess <= 0) break
@@ -287,12 +337,18 @@ export const makeDeviceRegistry = (options: DeviceRegistryOptions): DeviceRegist
         })
         .sort((a, b) => b.lastSeen - a.lastSeen)
     },
-    seen: (device, connected) =>
+    seen: (device, connected, node) =>
       Effect.suspend(() => {
         const t = now()
         const before0 = stored()[device.id]
+        // A node exists only by pairing (the hub refuses a node hello without a record before this).
+        if (before0 === undefined && device.kind === VOICE_NODE_KIND) return Effect.void
         lastSeen.set(device.id, t)
-        const write = before0 === undefined || t - before0.lastSeen >= LAST_SEEN_WRITE_MS
+        /** The node's facts as this hello gives them (only for a record that is a node). */
+        const facts = (r: StoredDevice): StoredDevice =>
+          r.node !== undefined && node !== undefined ? { ...r, node: { ...r.node, version: node.version, platform: node.platform } } : r
+        const changed = before0 !== undefined && !sameJson(facts(before0), before0)
+        const write = before0 === undefined || changed || t - before0.lastSeen >= LAST_SEEN_WRITE_MS
         if (!write) return persist
         const taken = new Map<string, number | undefined>()
         const saved = store.saveDeviceRecords(before0 === undefined ? `device ${device.id}` : `the last visit of device ${device.id}`, (committed) => {
@@ -300,11 +356,12 @@ export const makeDeviceRegistry = (options: DeviceRegistryOptions): DeviceRegist
           taken.set(device.id, declared.get(device.id)?.seq)
           const devices = withAllLastSeen(committed)
           const before = devices[device.id]
+          if (before === undefined && device.kind === VOICE_NODE_KIND) return devices
           // The latest declaration at the moment of writing: one that came while this write waited is in it too.
           const caps = declared.get(device.id)?.value
           const record: StoredDevice = before === undefined
             ? { kind: device.kind, name: cleanDeviceName(device.name), firstSeen: t, lastSeen: t, own: {}, rev: 0, ...(caps !== undefined ? { declared: caps } : {}) }
-            : { ...before, lastSeen: Math.max(before.lastSeen, t) }
+            : facts({ ...before, lastSeen: Math.max(before.lastSeen, t) })
           const room = before === undefined ? capped(devices, connected) : devices
           return { ...room, [device.id]: record }
         }).pipe(
@@ -366,6 +423,28 @@ export const makeDeviceRegistry = (options: DeviceRegistryOptions): DeviceRegist
           Effect.as<DeviceResult>({ ok: true }),
           Effect.catch((e) => Effect.succeed(failure("internal", e.message)))
         )
+      }),
+    nodeOf: (id) => stored()[id]?.node,
+    addNode: (id, record, connected) =>
+      Effect.suspend(() => {
+        const t = now()
+        return store.saveDeviceRecords(`voice node ${id}`, (committed) => {
+          const devices = withAllLastSeen(committed)
+          const room = capped(devices, connected)
+          return { ...room, [id]: { kind: VOICE_NODE_KIND, name: record.name, firstSeen: t, lastSeen: t, own: {}, rev: 0, node: record.node } }
+        }).pipe(Effect.tap(() => Effect.sync(() => lastSeen.set(id, t))))
+      }),
+    renewNode: (id, node) =>
+      Effect.suspend(() => {
+        if (stored()[id]?.node === undefined) return Effect.succeed(false)
+        let renewed = false
+        return store.saveDeviceRecords(`the pairing of voice node ${id}`, (committed) => {
+          const devices = withAllLastSeen(committed)
+          const before = devices[id]
+          if (before?.node === undefined) return devices
+          renewed = true
+          return { ...devices, [id]: { ...before, node } }
+        }).pipe(Effect.map(() => renewed))
       })
   }
 }

@@ -19,6 +19,7 @@ import { MAX_MOVE_KEYS } from "./env.ts"
 import { DeviceSettingsPatch, DeviceTarget } from "./devices.ts"
 import { DeviceHello, DeviceId, FrontendRole, SavedDeviceName, WakePhrase } from "./frontends.ts"
 import { DeviceCapabilities, DeviceLiveState } from "./capabilities.ts"
+import { NodeCommandSend, NodeHello, NodeLevel, NodePairCancel, NodePairCreate, NodeStatus } from "./nodes.ts"
 import { JobAction, ToolId } from "./jobs.ts"
 import { SettingsPatch, SettingValue } from "./settings.ts"
 import { Password } from "./vault.ts"
@@ -56,7 +57,9 @@ export const Hello = Schema.Struct({
    * reload or reconnect stays logged in. Valid: `admin.snapshot` follows `welcome`. Not valid: `snapshot.admin` says
    * `loggedIn: false` (no error).
    */
-  adminToken: Schema.optionalKey(AdminToken)
+  adminToken: Schema.optionalKey(AdminToken),
+  /** Protocol 12: required when the device is a voice node (kind `voice-node`, or a paired id); the credential proves it. */
+  node: Schema.optionalKey(NodeHello)
 })
 
 /** Facts about the browser's audio setup, for logs and the latency trace. */
@@ -494,7 +497,12 @@ export const ClientMessage = Schema.Union([
   ModuleAction,
   DeviceCaps,
   NotificationAction,
-  PresentAction
+  PresentAction,
+  NodeStatus,
+  NodeLevel,
+  NodeCommandSend,
+  NodePairCreate,
+  NodePairCancel
 ]).pipe(Schema.toTaggedUnion("type"))
 export type ClientMessage = typeof ClientMessage.Type
 export type ClientMessageType = ClientMessage["type"]

@@ -1,0 +1,24 @@
+null
+    Discard all samples (playback) or generate zero samples (capture)
+default
+    Default Audio Device
+sysdefault
+    Default Audio Device
+sysdefault:CARD=Speaker
+    Jabra SPEAK 410 USB, USB Audio
+    Default Audio Device
+front:CARD=Speaker,DEV=0
+    Jabra SPEAK 410 USB, USB Audio
+    Front output / input
+iec958:CARD=Speaker,DEV=0
+    Jabra SPEAK 410 USB, USB Audio
+    IEC958 (S/PDIF) Digital Audio Output
+hw:CARD=Speaker,DEV=0
+    Jabra SPEAK 410 USB, USB Audio
+    Direct hardware device without any conversions
+plughw:CARD=Speaker,DEV=0
+    Jabra SPEAK 410 USB, USB Audio
+    Hardware device with all software conversions
+usbstream:CARD=Speaker
+    Jabra SPEAK 410 USB
+    USB Stream Output
