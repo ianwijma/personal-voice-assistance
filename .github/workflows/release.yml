@@ -1,0 +1,320 @@
+name: Release
+
+# The run's title in the Actions list, e.g. "Release minor prerelease (rc) · dry run".
+# GitHub sets it at dispatch, before any job runs, so it can only use the inputs: the
+# exact versions are in the job names and the plan summary.
+run-name: Release ${{ inputs.version_bump }} ${{ inputs.release_type }}${{ inputs.release_type == 'prerelease' && format(' ({0})', inputs.prerelease_identifier) || '' }}${{ inputs.dry_run && ' · dry run' || '' }}
+
+# Run from the GitHub UI: Actions → Release → "Run workflow", pick a version bump
+# and a release type. See docs/RELEASING.md.
+#
+# 1. `plan` typechecks, tests and builds the image (without pushing it), works out the
+#    new version, and writes a summary of what is released now and what this run will
+#    release. It fails on blockers (e.g. the tag already exists). Nothing is changed yet.
+# 2. `version` waits for approval on the `release` environment. Read the summary,
+#    then approve or reject under "Review deployments". Once approved, it commits
+#    the new version to the default branch and pushes the `vX.Y.Z` tag.
+# 3. `image` checks out that tag, builds the container image and pushes it as
+#    ghcr.io/ianwijma/personal-voice-assistant:X.Y.Z (linux/amd64, docs/DEPLOYMENT.md).
+# 4. `release` creates the GitHub Release, with the image reference and its digest
+#    at the top of the notes.
+#
+# A dry run does everything except push and release: the image is built from the
+# commit with the new version applied, but not pushed.
+#
+# If `image` or `release` fails, use "Re-run failed jobs": it builds the tag that
+# was already pushed and does not bump the version again.
+
+on:
+  workflow_dispatch:
+    inputs:
+      version_bump:
+        description: Version bump
+        type: choice
+        required: true
+        default: patch
+        # Examples from 1.2.3 (see scripts/next-version.ts):
+        options:
+          - patch # 1.2.4 (bug fixes)
+          - minor # 1.3.0 (new features, backwards compatible)
+          - major # 2.0.0 (breaking changes)
+      release_type:
+        description: Release type (prerelease = release candidate, marked as a GitHub prerelease; release = stable, marked as latest)
+        type: choice
+        required: true
+        default: prerelease
+        # prerelease: 1.2.3 + minor → 1.3.0-rc.0; run it again → 1.3.0-rc.1, ...
+        # release:    1.2.3 + minor → 1.3.0; on a candidate, 1.3.0-rc.1 + minor → 1.3.0
+        options:
+          - prerelease
+          - release
+      dry_run:
+        description: Dry run (no push, no image in the registry, no GitHub Release)
+        type: boolean
+        required: false
+        default: true
+      prerelease_identifier:
+        description: Prerelease identifier, for prereleases only (rc → 1.3.0-rc.0)
+        type: string
+        required: false
+        default: rc
+
+permissions:
+  contents: read
+
+# One release at a time, and never cancel one halfway through. GitHub keeps one
+# waiting run per group: starting a third while one runs replaces the second.
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+env:
+  NODE_VERSION: "22"
+  # The same repository as .github/workflows/image.yml.
+  IMAGE: ghcr.io/ianwijma/personal-voice-assistant
+
+jobs:
+  plan:
+    name: Plan release (${{ inputs.version_bump }} ${{ inputs.release_type }})
+    runs-on: ubuntu-latest
+    # The same checks as .github/workflows/ci.yml (about 15 minutes), then the image build.
+    timeout-minutes: 50
+    outputs:
+      version: ${{ steps.next.outputs.version }}
+      tag: ${{ steps.next.outputs.tag }}
+      prerelease: ${{ steps.next.outputs.prerelease }}
+    steps:
+      # Running a workflow already needs write access to the repository. This also
+      # limits releases to the logins in the RELEASE_ACTORS repository variable
+      # (space- or comma-separated), or to the repository owner when it is unset.
+      - name: Require an allowed releaser
+        env:
+          ACTOR: ${{ github.actor }}
+          ALLOWED: ${{ vars.RELEASE_ACTORS || github.repository_owner }}
+        run: |
+          set -f # no file name expansion of the list
+          for login in ${ALLOWED//,/ }; do
+            if [[ "${login,,}" == "${ACTOR,,}" ]]; then exit 0; fi
+          done
+          echo "::error::${ACTOR} may not run releases (allowed: ${ALLOWED})."
+          exit 1
+
+      - name: Require the default branch
+        if: github.ref_name != github.event.repository.default_branch
+        env:
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          BRANCH: ${{ github.ref_name }}
+        run: |
+          echo "::error::Releases run from '${DEFAULT_BRANCH}' only (got '${BRANCH}')."
+          exit 1
+
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0 # all tags, for the changes since the last release
+          persist-credentials: false
+
+      - uses: pnpm/action-setup@v6
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      # The version and the blockers first: a wrong input or an existing tag fails
+      # within a minute, not after the tests.
+      - name: Work out the new version
+        id: next
+        env:
+          BUMP: ${{ inputs.version_bump }}
+          RELEASE_TYPE: ${{ inputs.release_type }}
+          PRERELEASE_IDENTIFIER: ${{ inputs.prerelease_identifier }}
+        run: |
+          # Works out the next version from package.json (tested in scripts/next-version.test.ts).
+          version="$(node --import tsx scripts/next-version.ts "$BUMP" "$RELEASE_TYPE" "$PRERELEASE_IDENTIFIER")"
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
+          echo "tag=v${version}" >> "$GITHUB_OUTPUT"
+          echo "prerelease=$([[ "$version" == *-* ]] && echo true || echo false)" >> "$GITHUB_OUTPUT"
+
+      - name: Summarize the release and check for blockers
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BUMP: ${{ inputs.version_bump }}
+          RELEASE_TYPE: ${{ inputs.release_type }}
+          DRY_RUN: ${{ inputs.dry_run }}
+          VERSION: ${{ steps.next.outputs.version }}
+          TAG: ${{ steps.next.outputs.tag }}
+          PRERELEASE: ${{ steps.next.outputs.prerelease }}
+        run: scripts/release/plan.sh
+
+      # The same three steps as .github/workflows/ci.yml. `pnpm check` also builds the
+      # audio worklets the web tests need, so it runs before the tests.
+      - name: Typecheck
+        run: pnpm check
+
+      - name: Test
+        run: pnpm test --project node --project web
+
+      - name: Latency tests
+        run: pnpm test --project latency --no-file-parallelism
+
+      # Not pushed: this shows before the approval that the image builds. No `context`:
+      # the action then builds the commit straight from git, not this directory with
+      # node_modules and the test output in it. The `image` job still installs and builds
+      # again (its package.json has the new version), only the base layers are reused.
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      - name: Build the image (not pushed)
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          platforms: linux/amd64
+          push: false
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  version:
+    name: Commit and tag ${{ needs.plan.outputs.tag }}
+    needs: plan
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    # The approval gate: give this environment required reviewers so the run waits
+    # here until someone has checked the plan summary and approved it.
+    environment: release
+    permissions:
+      contents: write
+    steps:
+      # With credentials: the push below needs them.
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Bump version
+        env:
+          VERSION: ${{ needs.plan.outputs.version }}
+          TAG: ${{ needs.plan.outputs.tag }}
+        run: |
+          # GitHub's documented identity for the github-actions[bot] account
+          # (41898282 is its user id), so the commit shows up as made by the bot.
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          # Sets the approved version in the root package.json (the only place it is
+          # kept: nothing is published to npm, and pnpm-lock.yaml does not record it),
+          # commits it, and creates the annotated tag.
+          npm pkg set "version=${VERSION}"
+          git commit -m "chore(release): ${TAG}" -- package.json
+          git tag -a "$TAG" -m "$TAG"
+
+      - name: Push release commit and tag
+        if: ${{ !inputs.dry_run }}
+        env:
+          TAG: ${{ needs.plan.outputs.tag }}
+          BRANCH: ${{ github.ref_name }}
+        # Atomic: either both land or neither does. It also fails if the branch moved
+        # since the run started, so only the commit that was reviewed gets released.
+        run: git push --atomic origin "HEAD:refs/heads/${BRANCH}" "refs/tags/${TAG}"
+
+  image:
+    name: Build image ${{ needs.plan.outputs.version }}
+    needs: [plan, version]
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      digest: ${{ steps.build.outputs.digest }}
+    steps:
+      - name: Check out ${{ needs.plan.outputs.tag }}
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # In a dry run the tag was never pushed; use the commit being released.
+          ref: ${{ inputs.dry_run && github.sha || needs.plan.outputs.tag }}
+          persist-credentials: false
+
+      - name: Apply the bumped version (dry run only)
+        if: ${{ inputs.dry_run }}
+        env:
+          VERSION: ${{ needs.plan.outputs.version }}
+        run: npm pkg set "version=${VERSION}"
+
+      - name: Describe the image
+        id: meta
+        run: |
+          echo "revision=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          echo "created=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_OUTPUT"
+
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      - uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
+        if: ${{ !inputs.dry_run }}
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # One tag, the version without the "v". No "latest" and no "main": those rules
+      # are in .github/workflows/image.yml and docs/DEPLOYMENT.md.
+      - name: Build${{ !inputs.dry_run && ' and push' || '' }} the image
+        id: build
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          platforms: linux/amd64
+          push: ${{ !inputs.dry_run }}
+          tags: ${{ env.IMAGE }}:${{ needs.plan.outputs.version }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.revision=${{ steps.meta.outputs.revision }}
+            org.opencontainers.image.version=${{ needs.plan.outputs.version }}
+            org.opencontainers.image.created=${{ steps.meta.outputs.created }}
+            org.opencontainers.image.title=personal-voice-assistant
+            org.opencontainers.image.description=Personal voice assistant, serve mode (web UI and WebSocket on one port)
+
+      - name: Summarize the image
+        env:
+          VERSION: ${{ needs.plan.outputs.version }}
+          DIGEST: ${{ steps.build.outputs.digest }}
+          DRY_RUN: ${{ inputs.dry_run }}
+        run: |
+          {
+            if [[ "$DRY_RUN" == "true" ]]; then
+              echo "## Image ${VERSION} built (dry run, not pushed)"
+            else
+              echo "## Image pushed"
+              echo
+              echo "\`${IMAGE}:${VERSION}\`"
+              echo
+              echo "Digest: \`${DIGEST}\`"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  release:
+    name: Release ${{ needs.plan.outputs.tag }}
+    needs: [plan, image]
+    # A dry run ends with the image build: there is no tag to release.
+    if: ${{ !inputs.dry_run }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write # create the GitHub Release
+    steps:
+      - name: Check out ${{ needs.plan.outputs.tag }}
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.plan.outputs.tag }}
+          persist-credentials: false
+
+      # On a re-run, keeps the existing release.
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.plan.outputs.tag }}
+          VERSION: ${{ needs.plan.outputs.version }}
+          PRERELEASE: ${{ needs.plan.outputs.prerelease }}
+          DIGEST: ${{ needs.image.outputs.digest }}
+        run: scripts/release/publish.sh

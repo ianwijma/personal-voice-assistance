@@ -5,6 +5,7 @@
     "packages/*/test",
     "apps/*/src",
     "apps/*/test",
+    "scripts",
     "vitest.config.ts",
     "vitest.latency.ts"
   ],

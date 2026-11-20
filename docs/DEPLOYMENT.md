@@ -6,12 +6,14 @@ unless it says otherwise.
 
 ## Image
 
-`ghcr.io/ianwijma/personal-voice-assistant` (linux/amd64 only), built by `.github/workflows/image.yml`:
+`ghcr.io/ianwijma/personal-voice-assistant` (linux/amd64 only), built by `.github/workflows/image.yml` and, for a
+release, by `.github/workflows/release.yml` ([RELEASING.md](RELEASING.md)):
 
 | Trigger | Tags |
 |---|---|
 | push to `main`, or `workflow_dispatch` on `main` | `sha-<7 characters of the commit>`, `main` |
 | pull request from this repository with the label `preview` | `pr-<number>-<full head commit sha>` (the head commit, not the merge commit) |
+| a release (the Release workflow, after approval) | `X.Y.Z`, the version without the `v` of its `vX.Y.Z` git tag; a release candidate is `X.Y.Z-rc.N` |
 
 There is no `latest` tag. Pull requests from forks never build. A labelled PR gets a LAN-only preview deployment in the
 homelab cluster at `https://pva-pr-<n>.k3s.lab.wijma.cloud`, started from a copy of production's data volume.
