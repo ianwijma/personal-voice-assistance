@@ -171,7 +171,7 @@ describe("status words", () => {
 
 describe("sections by type keys", () => {
   it("a voice node has no Look, voice page, Captions or browser Audio, and has Sound and Sound devices", () => {
-    expect(sectionsOf(nodeType)).toEqual(["assign", "phrases", "voice", "interrupting", "sound", "soundDevices"])
+    expect(sectionsOf(nodeType)).toEqual(["assign", "phrases", "voice", "place", "interrupting", "sound", "soundDevices"])
     expect(sectionsOf({ keys: [...WEB_VOICE_DEVICE_TYPE.keys] })).not.toContain("sound")
     expect(sectionsOf({ keys: [...WEB_VOICE_DEVICE_TYPE.keys] })).not.toContain("soundDevices")
   })

@@ -220,7 +220,10 @@ describe("a node's hello", () => {
     expect(record.node).toMatchObject({ version: "0.2.0+0123456789", platform: { os: "linux", arch: "arm64", hostname: "kitchen-pi", model: "Raspberry Pi 5" } })
     // Declared as every device declares (protocol 11's `declared`).
     expect(record.declared?.capabilities).toEqual({ v: 1, speaker: { media: ["speech"] }, microphone: { farField: false } })
-    const entry = lastDevices(admin).find((d) => d.id === paired.deviceId)!
+    // The devices list follows the write over the socket: wait for the one that has the hello's facts.
+    const listed = () => lastDevices(admin).find((d) => d.id === paired.deviceId)
+    for (let i = 0; i < 100 && (listed()?.node?.version !== "0.2.0+0123456789" || listed()?.declared === undefined); i++) await sleep(10)
+    const entry = listed()!
     expect(entry).toMatchObject({
       kind: VOICE_NODE_KIND,
       name: "kitchen-pi",

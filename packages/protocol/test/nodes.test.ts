@@ -102,7 +102,7 @@ describe("protocol 12: voice nodes", () => {
   it("the voice-node type is registered and the browser type ignores the node sections", () => {
     expect(DEVICE_TYPES.map((t) => t.kind)).toEqual(["web-voice", "voice-node"])
     expect(deviceTypeOf("voice-node")).toBe(VOICE_NODE_DEVICE_TYPE)
-    expect(VOICE_NODE_DEVICE_TYPE.keys).toEqual(["assistants", "withoutPhrase", "matching", "voice", "interruptMode", "sound", "soundDevices"])
+    expect(VOICE_NODE_DEVICE_TYPE.keys).toEqual(["assistants", "withoutPhrase", "matching", "voice", "interruptMode", "place", "sound", "soundDevices"])
     expect(WEB_VOICE_DEVICE_TYPE.keys).not.toContain("sound")
     expect(WEB_VOICE_DEVICE_TYPE.keys).not.toContain("soundDevices")
     expect(BUILT_IN_WEB_VOICE_SETTINGS.sound).toEqual({ volume: 80, cues: true })
