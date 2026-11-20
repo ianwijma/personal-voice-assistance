@@ -4,8 +4,13 @@ import {
   Llm,
   LlmError,
   makeModuleHost,
+  makeNotifyEngine,
+  makePresentEngine,
+  type NotDelivered,
+  notifyLanguageOf,
   makeToolRegistry,
   type ModuleDemand,
+  type Principal,
   makeTurnTrace,
   type ModuleDefinition,
   type ModuleHost,
@@ -17,7 +22,9 @@ import {
   type TurnSetup,
   type TurnTrace,
   type VoiceRef,
-  voiceKey
+  voiceKey,
+  withinModuleFrame,
+  withoutOffTools
 } from "@pva/core"
 import {
   type Assistant,
@@ -35,6 +42,7 @@ import {
   hearerOf,
   homeLineOf,
   linkedModuleDefaults,
+  homeValuesOf,
   engineSummary,
   type VoiceInfo,
   type ServerMessage,
@@ -55,7 +63,9 @@ import { fileURLToPath } from "node:url"
 import { defaultSystemPrompt } from "../config.ts"
 import { envView as processEnvView, userCwd } from "../env.ts"
 import { type EnvView, makeEnvView } from "../envView.ts"
-import { moduleCatalog, withModuleInstructions } from "../modules.ts"
+import { moduleCatalog, moduleDemandOf, withModuleInstructions } from "../modules.ts"
+import { makeRequirementChecker } from "../requirements.ts"
+import { makeHealthService } from "./health.ts"
 import {
   makeSubscriptionAgents,
   SUBSCRIPTION_AGENT_ID,
@@ -105,16 +115,19 @@ import { DEFAULT_ASSISTANT_VOICE, voiceEngineName, voiceLabel } from "../voiceSe
 import { type EnvMover, makeEnvMover } from "./envSettings.ts"
 import { type HttpError, type HttpServer, startHttp, webDirExists } from "./http.ts"
 import { makeNodeDist } from "./nodeDist.ts"
-import { deviceSettingsFrom, makeDeviceRegistry } from "./devices.ts"
+import { type DeviceRegistry, deviceSettingsFrom, makeDeviceRegistry } from "./devices.ts"
 import { type Jobs, makeJobs } from "./jobs.ts"
 import { makeModels, type Models, type PresetDownloader, presetsInUse } from "./models.ts"
 import { type Keys, makeKeys } from "./Keys.ts"
 import { makeSections } from "./sections.ts"
+import { serveLanguageReader, servePolicyReader } from "./riskPolicy.ts"
 import { makeAssistants } from "./assistants.ts"
 import { makeSessionHub, type SessionHub } from "./SessionHub.ts"
 import { makeNodes, type Nodes, type RedeemAnswer, spkiPin } from "./nodes.ts"
-import { DataDirConfig, KEYS_LOCKED_MESSAGE, loadSettingsStore, type SettingsStore, SettingsStoreError } from "./SettingsStore.ts"
+import { DataDirConfig, KEYS_LOCKED_MESSAGE, loadSettingsStore, type SaveStep, type SettingsStore, SettingsStoreError } from "./SettingsStore.ts"
 import { makeApi } from "./api.ts"
+import { isModuleRoutePath, makeModuleRouter } from "./moduleRoutes.ts"
+import { makeRouteTokens } from "./RouteTokens.ts"
 import { makeAssistantVoice } from "./AssistantVoice.ts"
 import { type Favourites, makeFavourites } from "./Favourites.ts"
 import { makeVoiceCatalog, type VoiceCatalog, type VoiceCatalogOptions } from "./VoiceCatalog.ts"
@@ -123,10 +136,21 @@ import { makeModelFavourites } from "./ModelFavourites.ts"
 import { type AssistantTraceConfig, type Hearing, makeVoiceSession } from "./VoiceSession.ts"
 import { makeVoiceSessions, type VoiceSessions } from "./VoiceSessions.ts"
 import { makeRoutingService, ROUTING_KEYS } from "./routing.ts"
+import { openServeHousehold } from "./household.ts"
+import { makeHouseholdPush } from "./HouseholdPush.ts"
+import { DeviceControl, Devices, hostEvent, makeIssueRegistry, oneLine, People, phraseLanguageOf, Privacy, SessionControl, withContextProvider } from "@pva/core"
+import { ringingWithoutWake } from "@pva/protocol"
+import { makeReplyVolumes, makeServePhrases } from "./phraseCommands.ts"
+import { openServeScheduler } from "./scheduler.ts"
+import { boundaryChanged, makeDeviceFacts, membersRemoved } from "./deviceFacts.ts"
+import { makeMediaCache } from "./media.ts"
+import type { SafeFetchOptions } from "@pva/net"
+import { effectiveMembersOf, makeMembersGate, makePeopleService, MEMBERS_ENV_REFUSED, MEMBERS_KEY, MEMBERS_SECTION_ID } from "./people.ts"
+import { householdBackupIssues, runMaintenance } from "@pva/store-sqlite"
 import { type KdfParams, openVault, type Vault, VaultPathConfig } from "./Vault.ts"
 import * as SherpaStt from "@pva/stt-sherpa"
 import * as SherpaTts from "@pva/tts-sherpa"
-import type { ToolId } from "@pva/protocol"
+import type { SettingValue, ToolId } from "@pva/protocol"
 
 /**
  * `serve` mode (docs/UI-AND-MODULES.md §4): one process, one port. The browser
@@ -151,6 +175,12 @@ export interface ServeOptions {
   readonly allowedOrigins: ReadonlyArray<string>
   /** Host names the server answers to besides IP literals and `localhost` (`SERVE_ALLOWED_HOSTS`). */
   readonly allowedHosts?: ReadonlyArray<string>
+  /**
+   * A reverse proxy is in front of the server (`SERVE_BEHIND_PROXY`, default false). The server cannot tell a proxied
+   * request from a local one, so then no caller counts as on the home network: module routes with the `lan` guard
+   * refuse every request (docs/UI-AND-MODULES.md §1.11).
+   */
+  readonly behindProxy?: boolean
   readonly tls?: { readonly certFile: string; readonly keyFile: string } | undefined
   /** Cross-origin isolation headers on the page and its files (`SERVE_CROSS_ORIGIN_ISOLATION`). Default on. */
   readonly crossOriginIsolation?: boolean
@@ -238,11 +268,17 @@ export interface ServeOptions {
   readonly nodesNow?: () => number
   /** How often the served node bundle is checked for a rebuild (default 5 s; tests shorten it). */
   readonly nodeBundlePollMs?: number
+  /** P10, tests: where the image cache's fetches go (a resolver and a connector standing in for the network). */
+  readonly mediaFetch?: Pick<SafeFetchOptions, "resolver" | "connector">
+  /** Tests: called before each file step of a settings save (to hold one save while another request comes in). */
+  readonly settingsBeforeStep?: (step: SaveStep) => void | Promise<void>
 }
 
 export interface ServeHandle {
   readonly http: HttpServer
   readonly hub: SessionHub
+  /** The registry of devices (tests: whether declarations are still being written). */
+  readonly devices: DeviceRegistry
   readonly engine: Engine
   /** The voice sessions (one per device). */
   readonly sessions: VoiceSessions
@@ -284,7 +320,7 @@ export const startServe = (options: ServeOptions): Effect.Effect<ServeHandle, Ht
     // Every save may change which language models are wanted (assistants, devices, shared keys): the pool reconciles.
     let resourcesChanged = () => {}
     const store = notifyAfterSaves(
-      yield* loadSettingsStore(options.dataDir, { lock, vault, assistants: { env, catalog } }),
+      yield* loadSettingsStore(options.dataDir, { lock, vault, assistants: { env, catalog }, ...(options.settingsBeforeStep !== undefined ? { beforeStep: options.settingsBeforeStep } : {}) }),
       () => resourcesChanged()
     )
     for (const problem of store.problems) yield* Effect.logError(problem)
@@ -309,25 +345,260 @@ export const startServe = (options: ServeOptions): Effect.Effect<ServeHandle, Ht
     // Where environment values came from (.env with its line, or the process), for the fields' source and lock.
     const envOrigin = options.envOrigin ?? envView.sourceOf
     const envLocation = envView.locationOf
-    const sections = makeSections(store, env, { envOrigin, envLocation })
+    // P5: one serialized operation owns people and every reference to them (`people.ts`, `MembersGate`): a Members
+    // save and the clean-up of the devices whose default person it removed, and every device or device type save.
+    const membersGate = makeMembersGate()
+    /** After a Members save, inside the gate: no device or device type keeps a removed person as its default. */
+    let afterMembersSave: Effect.Effect<void> = Effect.void
+    const sections = makeSections(store, env, {
+      envOrigin,
+      envLocation,
+      around: (id, save) =>
+        id !== MEMBERS_SECTION_ID ? save : membersGate.run(Effect.tap(save, (u) => (u.result.ok ? Effect.suspend(() => afterMembersSave) : Effect.void)))
+    })
+    if (env[MEMBERS_KEY] !== undefined && env[MEMBERS_KEY] !== "") yield* Effect.logWarning(`${MEMBERS_KEY} is set in the environment. ${MEMBERS_ENV_REFUSED}`)
     /** The Home values the modules' linked defaults come from (docs/ASSISTANTS.md §2.6). */
-    const homeDefaults = (moduleId: string) =>
-      linkedModuleDefaults({
-        location: String(sections.value("HOME_LOCATION") ?? ""),
-        units: sections.value("HOME_UNITS") === "imperial" ? "imperial" : "metric",
-        timeZone: String(sections.value("HOME_TIME_ZONE") ?? ""),
-        dateFormat: String(sections.value("HOME_DATE_FORMAT") ?? "en-GB")
-      })[moduleId]
+    const homeDefaults = (moduleId: string) => linkedModuleDefaults(homeValuesOf((key) => sections.value(key)))[moduleId]
+    // Module API v2: what the modules need is probed before any starts (concurrently, 5 s at most; never on a turn).
+    const checker = makeRequirementChecker({ dataDir: options.dataDir })
+    yield* checker.probeCatalog(catalog)
+    // P3: module route tokens, with the module secrets (in the vault once there is one).
+    // Stored token records that are not valid are ignored, with one Health issue (its registry is the host's, below).
+    let tokenIssues: ((ignored: number) => void) | undefined
+    const routeTokens = makeRouteTokens({ store, locked: () => vault.state() === "locked", report: (ignored) => tokenIssues?.(ignored) })
+
+    // The household store (docs/STORING-DATA.md): opened after the writer lock, and every module's data judged and
+    // upgraded before any module is made. A database from a newer assistant stops the start here.
+    const logContext = yield* Effect.context<never>()
+    const logInfo = (line: string) => void Effect.runForkWith(logContext)(Effect.logInfo(line))
+    // P5: the household's people (shared settings › Members); a diet a module records is saved like an admin edit.
+    // Review round 4: `effectiveMembersOf` of the committed settings is the one answer to "who is a member" (People,
+    // device facts and Privacy, the feed and ambient facts, the gateway, default-person saves and clean-up, the
+    // boundary). Nothing reads the saved Members list any other way.
+    const members = () => effectiveMembersOf(store.settings().assistant)
+    const people = makePeopleService({
+      value: (key) => sections.value(key),
+      members,
+      edit: (build) => {
+        let code: "unknown_person" | undefined
+        return Effect.map(
+          sections.edit(MEMBERS_SECTION_ID, (value) => {
+            const built = build(value)
+            if ("refused" in built) code = built.code
+            return built
+          }),
+          (u) => (u.result.ok ? { ok: true as const } : { ok: false as const, message: u.result.error.message, ...(code !== undefined ? { code } : {}) })
+        )
+      }
+    })
+    /** Projections that failed for pages, per module (a Health issue each; `host` exists once the store is open). */
+    const feedProblems = new Map<string, { what: string; message: string }>()
+    let reportFeed: (() => void) | undefined
+    const household = yield* openServeHousehold({
+      dataDir: options.dataDir,
+      catalog,
+      backupCopyDir: env.HOUSEHOLD_BACKUP_COPY_DIR,
+      log: logInfo,
+      people: () => [...members().referenceable],
+      guard: lock.guard,
+      report: (problem) => {
+        feedProblems.set(problem.module, { what: problem.what, message: problem.message })
+        reportFeed?.()
+      }
+    }).pipe(Effect.mapError((e) => new SettingsStoreError({ message: e.message, cause: e })))
+    // P5: what each device is and can do (its place, its declaration, connected or not), from cached values.
+    const devices = makeDeviceRegistry({ store })
+    const deviceFacts = makeDeviceFacts({
+      file: () => store.settings(),
+      declaredOf: (id) => devices.declaredOf(id),
+      latestOf: (id) => devices.latestOf(id),
+      lastSeenOf: (id) => devices.lastSeenOf(id),
+      live: (id) => hub?.deviceLive(id) ?? { connected: false, visible: false }
+    })
+    // P6: the scheduler (docs/SCHEDULING.md) on the household store, made before the module host it gives
+    // `ctx.scheduler` to; its Health issues go to the registry the host keeps. The gateway that admits a job's
+    // principal and the page boundary are the host's (bound once it exists; nothing runs before modules start).
+    const issues = makeIssueRegistry()
+    let hostRef: Pick<ModuleHost, "gateway" | "pageText"> | undefined
+    const scheduler = yield* openServeScheduler({
+      store: household.store,
+      catalog,
+      issues,
+      timeZone: () => String(sections.value("HOME_TIME_ZONE") ?? ""),
+      gateway: () => hostRef?.gateway,
+      pageText: (moduleId, text, max) => hostRef?.pageText(moduleId, text, max) ?? oneLine(text, max),
+      log: logInfo
+    })
+    // P9: the notification service (docs/NOTIFICATIONS.md) on the same store and scheduler, made before the module host
+    // it gives `ctx.notify` and `ctx.speech` to. Pages (the hub), voices (the sessions), the gateway and the page
+    // boundary are bound once they exist; nothing is delivered before a page says hello.
+    /** Late-bound: the voice sessions (announcements; every session is told when what it hears with may have changed). */
+    let sessionsRef: VoiceSessions | undefined
+    const notify = yield* makeNotifyEngine({
+      store: household.store,
+      scheduler,
+      devices: () => deviceFacts.devices.list(),
+      // One place for a device's effective outputs: its overrides first, then its declaration (`deviceOutputsFrom`).
+      outputs: (d) => deviceFacts.outputsOf(d.id, d.kind),
+      privacy: deviceFacts.privacy,
+      // The voice connections of the device that said hello (each its own bookkeeping in the service).
+      outlet: () =>
+        hub === undefined ? undefined : {
+          connections: (deviceId) => hub!.voiceConnections().filter((c) => c.deviceId === deviceId).map((c) => ({ id: c.id, send: c.send }))
+        },
+      // The device's voice session speaks (its `announce`); a device whose audio nobody started cannot.
+      speech: () =>
+        sessionsRef === undefined ? undefined : {
+          speak: (deviceId, text, o) =>
+            Effect.suspend(() => {
+              const session = sessionsRef?.get(deviceId)
+              // The gate answers only "go", "wait" or a `NotDelivered` reason, so what comes back as skipped is one.
+              return session === undefined
+                ? Effect.fail(new Error("nobody has started audio on that device"))
+                : Effect.map(session.announce.speak(text, o), (r) => (r === "spoken" ? r : { skipped: r.skipped as NotDelivered }))
+            })
+        },
+      issues,
+      gateway: () => hostRef?.gateway,
+      pageText: (moduleId, text, max) => hostRef?.pageText(moduleId, text, max) ?? oneLine(text, max),
+      language: () => notifyLanguageOf(sections.value("HOME_LANGUAGE")),
+      log: logInfo
+    })
+    // P7: each device's reply volume (`DeviceControl`, `output.volume` to its voice connections; memory only).
+    const replyVolumes = makeReplyVolumes((deviceId, message) => {
+      for (const c of hub?.voiceConnections() ?? []) if (c.deviceId === deviceId) c.send(message)
+    })
+    // P10: the Presenter (docs/PRESENTING.md) on the same store, made before the module host it gives `ctx.present` and the
+    // gateway's split to. Pages (the hub), the image cache, the gateway and the page boundary are bound once they exist;
+    // nothing is shown before a page says hello.
+    const media = yield* makeMediaCache({ dir: join(options.dataDir, "media"), log: logInfo, issues, ...(options.mediaFetch !== undefined ? { fetchOptions: options.mediaFetch } : {}) })
+    const present = yield* makePresentEngine({
+      store: household.store,
+      scheduler,
+      devices: () => deviceFacts.devices.list(),
+      // One place for what a device can show: its declaration minus its overrides (`devicePresentFrom`).
+      outputs: (d, declared) => deviceFacts.presentOf(d.id, d.kind, declared),
+      privacy: deviceFacts.privacy,
+      outlet: () =>
+        hub === undefined ? undefined : {
+          // Each connection is sent only the kinds its own page declared (an older tab beside a newer one gets none).
+          connections: (deviceId) => hub!.voiceConnections().filter((c) => c.deviceId === deviceId).map((c) => ({ id: c.id, send: c.send, kinds: () => c.declared?.()?.present?.kinds }))
+        },
+      media: () => media,
+      issues,
+      gateway: () => hostRef?.gateway,
+      pageText: (moduleId, text, max) => hostRef?.pageText(moduleId, text, max) ?? oneLine(text, max),
+      language: () => notifyLanguageOf(sections.value("HOME_LANGUAGE")),
+      log: logInfo
+    })
     // Capabilities run for the assistants that switch them on (`moduleDemand`, below; read from startEnabled on).
     const host = yield* makeModuleHost({
+      // P5: the core's own services for modules (`host.service`).
+      // P7: session and device control (docs/PHRASES.md), late-bound to the voice sessions and the hub.
+      coreServices: [
+        People.of(people),
+        Privacy.of(deviceFacts.privacy),
+        Devices.of(deviceFacts.devices),
+        SessionControl.of({
+          stopReply: (deviceId) => Effect.suspend(() => sessionsRef?.get(deviceId)?.control.stopReply ?? Effect.succeed(false)),
+          cancelPending: (deviceId) => Effect.suspend(() => sessionsRef?.get(deviceId)?.control.cancelPending ?? Effect.succeed(false)),
+          repeatLast: (deviceId) => Effect.suspend(() => sessionsRef?.get(deviceId)?.control.repeatLast ?? Effect.succeed(false)),
+          newConversation: (deviceId) =>
+            Effect.suspend(() => {
+              const session = sessionsRef?.get(deviceId)
+              return session === undefined ? Effect.succeed(undefined) : Effect.map(session.conversation.newConversation(), (info) => info.id)
+            })
+        }),
+        DeviceControl.of(replyVolumes.service)
+      ],
+      routeTokens,
+      issues,
+      scheduler,
+      notify,
+      present,
       catalog,
       persistence: store.modulePersistence,
       env,
       envOrigin,
       envLocation,
       defaults: homeDefaults,
-      demand: () => moduleDemand()
+      demand: () => moduleDemand(),
+      platform: { os: process.platform, arch: process.arch },
+      requirements: checker.check,
+      household: { store: household.store, events: household.bus },
+      // A program a module requires failed to run (ENOENT, EACCES): missing from now on; the host judges again.
+      programMissing: (tool) => checker.markMissing(tool),
+      // Serve mode: a call with no turn and no job is refused (a missing context never means "allowed").
+      localPrincipal: false,
+      // P8: the household's risk policy (Shared settings › Risk policy), read at every decision and every tool list from
+      // the record the sections publish with every committed save (a field read; review round 1, H1): a save applies to
+      // the next call. Its refusals in
+      // the household's language; a tool's `personal` result asked of the privacy rule for the call's device; a
+      // refusal outside a turn logged (a turn's decisions are in its trace line).
+      gatewayHooks: {
+        policy: servePolicyReader(sections),
+        language: serveLanguageReader(sections),
+        mayReveal: (owner, deviceId) => deviceFacts.privacy.mayReveal(owner, deviceId),
+        onDecision: (record) => {
+          if (record.turnId === undefined && record.outcome !== "allow") {
+            logInfo(`Risk policy: ${record.name} refused (${record.outcome}, ${record.by}) for a ${record.principal} call`)
+          }
+        }
+      },
+      // The execution gateway's first checks, on every call (and the turn's action catalogue): the assistant has the
+      // module on, and the tool is not one it switched off. Agents and decision providers are not per assistant.
+      access: {
+        moduleOn: (assistantId, moduleId) => !isCapability(moduleId) || assistantsNow().get(assistantId)?.modules[moduleId]?.on === true,
+        toolOff: (assistantId, moduleId, toolName) =>
+          isCapability(moduleId) && (assistantsNow().get(assistantId)?.modules[moduleId]?.offTools.includes(toolName) ?? false),
+        // The parts of a principal must belong together (or the call is refused): the assistant exists, the device
+        // is known and has that assistant, the connection is that device's, the person (P5) is in Members and the
+        // device's default person.
+        principalProblem: (principal) => principalProblem(principal)
+      },
+      // What modules may read about the assistant (`host.view()`): every read is a reference read or a small copy.
+      view: {
+        vaultLocked: () => vault.state() === "locked",
+        engine: () => (engine === undefined ? undefined : engineSummary(engine.status())),
+        devices: () => hub?.deviceViews() ?? [],
+        // Every key of the Home section, read generically (other PRs add keys to it).
+        home: () => sections.list().find((x) => x.id === "home")?.form.values ?? {}
+      }
     })
+    hostRef = host
+    /** Serve mode's check that a principal's parts belong together (`GatewayAccess.principalProblem`). */
+    const principalProblem = (principal: Principal): string | undefined => {
+      const parts = principal._tag === "turn"
+        ? { assistantId: principal.turn.assistantId, deviceId: principal.turn.deviceId, connection: principal.turn.connection, person: principal.turn.person }
+        : principal._tag === "job"
+        ? { assistantId: principal.job.assistantId, deviceId: principal.job.deviceId, connection: undefined, person: principal.job.person }
+        : principal._tag === "notification"
+        ? { assistantId: undefined, deviceId: principal.notification.deviceId, connection: principal.notification.connection, person: principal.notification.person }
+        : principal._tag === "presentation"
+        ? { assistantId: undefined, deviceId: principal.presentation.deviceId, connection: principal.presentation.connection, person: principal.presentation.person }
+        : undefined
+      if (parts === undefined) return undefined
+      const { assistantId, connection, deviceId, person } = parts
+      if (assistantId !== undefined && !assistantsNow().has(assistantId)) return `the assistant "${assistantId}" does not exist.`
+      // A person is checked whether or not the call names a device (a job may name a person and no device): P5, someone
+      // in Members (`effectiveMembersOf`, through `members()`). The person's id is not quoted: it may come from module code.
+      if (person !== undefined && !members().referenceable.has(person.id)) return "the person is not in Members."
+      if (deviceId === undefined) return undefined
+      if (!devices.known(deviceId) && hub?.deviceConnected(deviceId) !== true) return `the device "${deviceId}" is not known.`
+      if (assistantId !== undefined) {
+        const settings = deviceSettingsOf(deviceId)
+        const assigned = settings.assistants.some((a) => a.assistant === assistantId) ||
+          (settings.withoutPhrase.mode === "assistant" && settings.withoutPhrase.assistant === assistantId)
+        if (!assigned) return `the assistant "${assistantId}" is not on the device "${deviceId}".`
+      }
+      if (connection !== undefined && hub?.deviceOfConnection(connection) !== deviceId) return `the request did not come from the device "${deviceId}".`
+      // P5, turns only: a turn happens at a device, so its person can only be that device's default person (there is no
+      // voice identification). A job or a notification is deferred: its origin was captured when it was scheduled and the
+      // device may have been given to someone else since, so nothing ties its person to the device's default person; what
+      // may be shown or spoken where is decided at delivery (`Privacy.mayReveal`).
+      if (principal._tag === "turn" && person !== undefined && deviceFacts.placeOf(deviceId)?.defaultPerson !== person.id) return `the person is not the default person of the device "${deviceId}".`
+      return undefined
+    }
     const keys = makeKeys({ vault, store, host })
     const access = makeAccessPolicy({ catalog, sections: sections.list, vaultState: keys.state })
 
@@ -412,16 +683,7 @@ export const startServe = (options: ServeOptions): Effect.Effect<ServeHandle, Ht
      * values. Each capability has an entry (an empty list: nobody, so it does not run); agents and decision providers
      * have none and follow their own switch.
      */
-    const moduleDemand = (): ReadonlyMap<string, ReadonlyArray<ModuleDemand>> => {
-      const demand = new Map<string, Array<ModuleDemand>>(catalog.filter((d) => isCapability(d.id)).map((d) => [d.id, []]))
-      for (const assistant of assistantsNow().values()) {
-        if (!assistant.on) continue
-        for (const [moduleId, choice] of Object.entries(assistant.modules)) {
-          if (choice.on) demand.get(moduleId)?.push({ assistantId: assistant.id, ...(choice.own !== undefined ? { own: choice.own } : {}) })
-        }
-      }
-      return demand
-    }
+    const moduleDemand = (): ReadonlyMap<string, ReadonlyArray<ModuleDemand>> => moduleDemandOf(catalog, assistantsNow().values())
     /** Bring the module instances in line with the assistants and Home (after every save; not while blocked). */
     const syncModules = (): Effect.Effect<void> => Effect.suspend(() => (store.blocked() !== undefined ? Effect.void : host.refresh))
     /**
@@ -446,26 +708,57 @@ export const startServe = (options: ServeOptions): Effect.Effect<ServeHandle, Ht
      * effective settings; the others always pass), the tools it has not switched off, and their instructions. The
      * whole snapshot when nothing is left out.
      */
-    const modulesFor = (snapshot: ModuleSnapshot, assistant: Assistant) => {
-      const own = snapshot.assistantParts.get(assistant.id) ?? snapshot.parts
-      const parts = own.flatMap((part) => {
+    /** The parts an assistant's turns get: the modules it has on (capabilities), without the tools it switched off. */
+    const partsFor = (snapshot: ModuleSnapshot, assistant: Assistant) =>
+      (snapshot.assistantParts.get(assistant.id) ?? snapshot.parts).flatMap((part) => {
         if (!isCapability(part.moduleId)) return [part]
         const choice = assistant.modules[part.moduleId]
         if (choice === undefined || !choice.on) return []
         if (choice.offTools.length === 0) return [part]
-        const off = new Set(choice.offTools)
-        return [{ ...part, module: { ...part.module, tools: (part.module.tools ?? []).filter((t) => !off.has(t.name)) } }]
+        return [{ ...part, module: withoutOffTools(part.module, choice.offTools) }]
       })
+    const modulesFor = (snapshot: ModuleSnapshot, assistant: Assistant) => {
+      const parts = partsFor(snapshot, assistant)
       /** The modules it has on that run (capabilities; for the turn's configuration snapshot). */
-      const modules = parts.reduce((n, p) => (isCapability(p.moduleId) ? n + 1 : n), 0)
+      const modules = parts.reduce((n, p) => (isCapability(p.moduleId) && p.unavailable !== true ? n + 1 : n), 0)
       const same = parts.length === snapshot.parts.length && parts.every((p, i) => p === snapshot.parts[i])
       if (same) return { registry: snapshot.registry, instructions: snapshot.instructions, modules }
       return {
-        registry: makeToolRegistry(parts.map((p) => p.module)),
+        // Every call still goes through the host's gateway, which checks the assistant's choices again at execution.
+        registry: makeToolRegistry(parts.map((p) => p.module), { gateway: host.gateway }),
         instructions: parts.flatMap((p) => (p.instructions.length > 0 ? [p.instructions] : [])),
         modules
       }
     }
+
+    // P7: phrase commands (docs/PHRASES.md): each switched-on assistant's set, prepared ahead of use whenever the modules,
+    // an assistant's choices or the language change (a final only reads a ready set); the Health page names what a set
+    // leaves out (after each preparation, and at every check).
+    const servePhrases = yield* makeServePhrases({
+      host,
+      assistants: assistantsNow,
+      partsOf: partsFor,
+      language: () => phraseLanguageOf(sections.value("HOME_LANGUAGE")),
+      notify,
+      ringingAllowed: (deviceId) => ringingWithoutWake(deviceSettingsOf(deviceId).place),
+      room: (deviceId) => deviceFacts.originOf(deviceId).room,
+      volume: replyVolumes.service,
+      log: (line) => runFork(Effect.logInfo(line))
+    })
+    // A settings save may change an assistant's choices or the household's language: prepare again (cheap when nothing changed).
+    const stopPhraseWatch = store.onCommitted(() => servePhrases.changed())
+    yield* Effect.addFinalizer(() => Effect.sync(stopPhraseWatch))
+
+    /** The household's ambient facts in every turn's context (`HOME_AMBIENT_FACTS`, read at each turn). */
+    const ambientFacts = household.ambient({
+      mode: () => {
+        const v = sections.value("HOME_AMBIENT_FACTS")
+        return v === "all" || v === "module-on" ? v : "off"
+      },
+      moduleOn: (assistantId, moduleId) => assistantsNow().get(assistantId)?.modules[moduleId]?.on === true,
+      // P5: a person's ambient lines only where the privacy rule lets the turn's device hear them.
+      mayRevealPerson: (owner, turn) => deviceFacts.privacy.mayReveal(owner, turn)
+    })
 
     // ---- The resource pool: one language-model instance per distinct configuration (docs/ASSISTANTS.md §3.2, WP-9)
 
@@ -701,8 +994,8 @@ export const startServe = (options: ServeOptions): Effect.Effect<ServeHandle, Ht
             })
         })
       })
-    /** Late-bound: every voice session is told when what it hears with may have changed. */
-    let sessionsRef: VoiceSessions | undefined
+    // (`sessionsRef`, made above for the notification service, is the late-bound list of voice sessions: every
+    // voice session is also told when what it hears with may have changed.)
     /** The real providers (no injected build, or the real builder passed explicitly): the pool builds them all. */
     const realBuild = options.build === undefined || options.build === defaultProviderBuilder
     const resources = yield* makeResourcePool({
@@ -803,6 +1096,8 @@ export const startServe = (options: ServeOptions): Effect.Effect<ServeHandle, Ht
           instructions: ReadonlyArray<string>
           /** The turn's configuration snapshot (`TraceConfig` without the hearing, which is the device's). */
           config: AssistantTraceConfig | undefined
+          /** The live registry's offered count when this configuration was captured. */
+          offeredTools: number
         }
         | undefined
       const llmNow = () => {
@@ -844,7 +1139,7 @@ export const startServe = (options: ServeOptions): Effect.Effect<ServeHandle, Ht
           cached.voiceUser !== voiceUser || cached.voiceSource !== voiceSource
         ) {
           // An assistant that does not exist (any more) is never routed; should a turn still start, it gets no tools.
-          const mine = assistant === undefined ? { registry: makeToolRegistry([]), instructions: [], modules: 0 } : modulesFor(snapshot, assistant)
+          const mine = assistant === undefined ? { registry: makeToolRegistry([], { gateway: host.gateway }), instructions: [], modules: 0 } : modulesFor(snapshot, assistant)
           const base = assistant?.prompt ?? defaultSystemPrompt
           const instructions = home === undefined ? mine.instructions : [home, ...mine.instructions]
           // `TurnSetup.ttsReady`: completes once this `tts` (the instance bound now, not a later one) is built.
@@ -859,7 +1154,9 @@ export const startServe = (options: ServeOptions): Effect.Effect<ServeHandle, Ht
             voiceSource,
             setup: {
               system: systemFor(base, instructions),
-              registry: mine.registry,
+              // The household's ambient facts (docs/STORING-DATA.md), after the modules' context.
+              // P5: the line about the turn's device and the other screens comes first (cached, no I/O).
+              registry: withContextProvider(withContextProvider(mine.registry, deviceFacts.contextProvider), ambientFacts),
               llm: llm ?? notInUse,
               tts: tts ?? noVoice,
               ...(tts !== undefined ? { ttsReady } : {}),
@@ -867,7 +1164,8 @@ export const startServe = (options: ServeOptions): Effect.Effect<ServeHandle, Ht
               ...(assistant !== undefined ? { maxToolRounds: assistant.toolRounds } : {})
             },
             instructions,
-            config: assistant === undefined ? undefined : traceConfigOf(assistant, mine.registry.specs.length, mine.modules, deviceId)
+            config: assistant === undefined ? undefined : traceConfigOf(assistant, mine.registry.specs.length, mine.modules, deviceId),
+            offeredTools: mine.registry.specs.length
           }
         }
         return cached
@@ -877,15 +1175,22 @@ export const startServe = (options: ServeOptions): Effect.Effect<ServeHandle, Ht
       const setup = Effect.sync((): TurnSetup => current().setup)
       /**
        * The turn's configuration snapshot, read when its trace begins: the values `current()` resolved for the setup,
-       * made again only when the module snapshot, the assistant, its bindings or the device's voice setting changed (no
-       * prompt or registry work). The object is never changed afterwards: a trace keeps the one its turn began with.
+       * made again when the module snapshot, the assistant, its bindings, the device's voice setting or the registry's
+       * offered count changed (no prompt or registry rebuild). The object is never changed afterwards: a trace keeps
+       * the one its turn began with.
        */
       const config = (): AssistantTraceConfig | undefined => {
-        const c = cached
-        if (c !== undefined && c.snapshot === host.snapshot() && c.assistant === assistantsNow().get(assistantId) &&
-          c.llm === resources.llmFor(assistantId) && c.voiceUser === voiceUserNow() && c.tts === resources.ttsFor(c.voiceUser) &&
-          c.voiceSource === voiceSourceNow()) return c.config
-        return current().config
+        const c = cached !== undefined && cached.snapshot === host.snapshot() && cached.assistant === assistantsNow().get(assistantId) &&
+          cached.llm === resources.llmFor(assistantId) && cached.voiceUser === voiceUserNow() && cached.tts === resources.ttsFor(cached.voiceUser) &&
+          cached.voiceSource === voiceSourceNow() ? cached : current()
+        const tools = c.setup.registry.specs.length
+        if (tools !== c.offeredTools) {
+          c.offeredTools = tools
+          // Replace the snapshot: earlier traces keep their configuration. traceConfigOf also preserves zero for
+          // a subscription assistant whose tools are disabled.
+          if (c.assistant !== undefined && c.config !== undefined) c.config = traceConfigOf(c.assistant, tools, c.config.modules, deviceId)
+        }
+        return c.config
       }
       // WP-13a: a Claude subscription assistant's options for its conversations (the same object while unchanged).
       let subscriptionOf: { readonly assistant: Assistant; readonly limit: number; readonly value: SubscriptionAssistant } | undefined
@@ -1173,7 +1478,6 @@ export const startServe = (options: ServeOptions): Effect.Effect<ServeHandle, Ht
       ...(options.adminNow !== undefined ? { now: options.adminNow } : {})
     })
     yield* Effect.addFinalizer(() => Effect.sync(() => admin.dispose()))
-    const devices = makeDeviceRegistry({ store })
 
     // Voice nodes (docs/VOICE-NODES.md §6): the served bundle, the certificate's pin, pairing and credentials.
     const nodeDist = makeNodeDist(options.nodeDir ?? join(repoRoot, "apps", "node", "dist"))
@@ -1208,7 +1512,7 @@ export const startServe = (options: ServeOptions): Effect.Effect<ServeHandle, Ht
     // One voice session per device (docs/VOICE-SESSIONS.md §2), on the shared engines.
     const recordings = join(options.dataDir, "recordings")
     const sessions: VoiceSessions = makeVoiceSessions({
-      make: (key, device, reserved) =>
+      make: (key, device, reserved, ended) =>
         makeVoiceSession({
           key,
           ...(device !== undefined ? { deviceId: device.id } : {}),
@@ -1217,26 +1521,49 @@ export const startServe = (options: ServeOptions): Effect.Effect<ServeHandle, Ht
           deviceSettings: () => deviceSettingsOf(device?.id),
           // A voice node's assignments without a follow-up of their own get none (docs/VOICE-NODES.md §4.1).
           deviceType: () => deviceTypeOf((device === undefined ? undefined : devices.kindOfDevice(device.id)) ?? WEB_VOICE_KIND),
+          // P5: `CurrentTurn.room` and `.person` (the device's default person).
+          place: () => deviceFacts.originOf(device?.id),
+          // P5: "Don't use its speaker", or a declaration without one: nothing is sent to be played.
+          speakerAllowed: () => deviceFacts.speakerAllowed(device?.id, device === undefined ? undefined : devices.kindOfDevice(device.id)),
           hearing: hearingOf(device?.id),
           ...(options.hearerSwitchWaitMs !== undefined ? { hearerSwitchWaitMs: options.hearerSwitchWaitMs } : {}),
           assistants: assistantsNow,
           conversationSetup,
+          audioConnection: () => hub?.audioOwnerOf(key),
           voiceOf: (assistant, deviceId) => resources.ttsKeyFor(voiceUserFor(assistant, deviceId)),
           moduleOfTool: (name) => host.snapshot().toolModules.get(name) ?? null,
           routing: () => routing,
           turnTrace,
-          send: (message) => hub?.toSession(key, message),
+          // P5: an ended session (discarded, or its device's boundary changed) sends nothing to the device's next one.
+          send: (message) => {
+            if (!ended()) hub?.toSession(key, message)
+          },
           wakeHeard: (text, phrase, accepted, assistant) =>
-            hub?.wakeHeard(key, text, phrase, accepted, { ...(device !== undefined ? { deviceId: device.id } : {}), ...(assistant !== undefined ? { assistantId: assistant } : {}) }),
+            ended() ? undefined : hub?.wakeHeard(key, text, phrase, accepted, { ...(device !== undefined ? { deviceId: device.id } : {}), ...(assistant !== undefined ? { assistantId: assistant } : {}) }),
           onChange: (minor) => hub?.sessionsChanged(minor),
           onTrace: (trace) => {
             sessions.addTrace(trace)
+            household.bus.publish(hostEvent("turn.ended", {
+              turnId: trace.turnId,
+              outcome: trace.outcome,
+              ...(device !== undefined ? { deviceId: device.id } : {}),
+              ...(trace.assistant !== undefined ? { assistantId: trace.assistant.id } : {})
+            }, device !== undefined ? { kind: "device", id: device.id } : { kind: "household" }))
             // Admin's Diagnostics › Latency grows live (admin connections get no `turn.*`; ADMIN_ONLY).
             hub?.broadcast({ type: "trace", key, ...(device !== undefined ? { deviceId: device.id } : {}), trace })
           },
+          // P7 (E7): a taken utterance's execution trace, in admin's latency list (no turn, no history, no turn.ended event).
+          onPhraseTrace: (trace) => {
+            sessions.addTrace(trace)
+            hub?.broadcast({ type: "trace", key, ...(device !== undefined ? { deviceId: device.id } : {}), trace })
+          },
           minuteMs,
+          conversationEnded: (conversationId) =>
+            run(household.store.endConversation(conversationId).pipe(Effect.asVoid, Effect.catch((e) => Effect.logWarning(`Conversation data not deleted: ${e.message}`)))),
           ...(reserved !== undefined ? { reservedConversations: reserved } : {}),
           ...(options.stallMs !== undefined ? { stallMs: options.stallMs } : {}),
+          // P7: phrase commands, the host's essential controls and the ringing window.
+          phrases: servePhrases.forDevice(device?.id),
           heard: {
             dir: recordings,
             enabled: () => sections.value("RECORD_HEARD_AUDIO") === true,
@@ -1273,11 +1600,52 @@ export const startServe = (options: ServeOptions): Effect.Effect<ServeHandle, Ht
       llmProblems,
       speechMemoryWarning,
       voiceProblem,
+      isPerson: (id) => members().referenceable.has(id),
+      // P5: device and device type saves check their default person against the committed Members, inside the gate.
+      membersGate,
+      // P5: the setup's speaking flags follow what is sent (the override and the declaration).
+      speakerAllowed: (deviceId, kind) => deviceFacts.speakerAllowed(deviceId, kind),
       // TypeSafe is set up: the routing section is switched on, with a key and a valid address (WP-14).
       canAuto: routing.ready
     })
+    // Diagnostics › Health (§C.5): the issue registry, checked once the modules have started and on "Check again".
+    const health = makeHealthService({
+      host,
+      checker,
+      catalog,
+      fork: run,
+      // The household's cheap checks (backup age, directories, the log's size); its quick check is `pnpm start doctor`'s.
+      checks: {
+        // P7: what each assistant's phrase set leaves out (duplicates, modules past the bound).
+        phrases: Effect.sync(() => servePhrases.sets.issues()),
+        ...(household.sqlite !== undefined ? { "household-checks": householdBackupIssues(household.sqlite) } : {})
+      }
+    })
+    const push = makeHouseholdPush({
+      feed: household.feed,
+      bus: household.bus,
+      store: household.store,
+      // Projections see the server's record of a device (its saved name; P5: its room, privacy and default person,
+      // `DeviceFacts.targetOf`), never what a page said in its hello. A device not recorded: its id only, so no
+      // person-scoped data.
+      device: (id) => {
+        if (id === undefined) return {}
+        const name = devices.nameOf(id)
+        return name === undefined ? { id } : deviceFacts.targetOf({ id, name })
+      },
+      run,
+      log: (line) => runFork(Effect.logWarning(line))
+    })
     hub = makeSessionHub({
+      household: push.hooks,
+      notify,
+      // P7: a voice page of a device whose reply volume is not the default is told it after its welcome.
+      replyVolume: replyVolumes.levelOf,
+      present,
+      onDeviceChange: deviceFacts.changed,
+      speakerAllowed: deviceFacts.speakerAllowed,
       admin,
+      health,
       devices,
       nodes,
       assistants,
@@ -1313,11 +1681,117 @@ export const startServe = (options: ServeOptions): Effect.Effect<ServeHandle, Ht
     }, options.nodeBundlePollMs ?? 5_000)
     bundlePoll.unref()
     yield* Effect.addFinalizer(() => Effect.sync(() => clearInterval(bundlePoll)))
+    yield* push.forward
+    // A projection for pages that failed: one Health issue per module (it affects only that collection or event type).
+    reportFeed = () =>
+      host.issues.set("household-pages", [...feedProblems].map(([moduleId, p]) => ({
+        id: `core.household.projection.${moduleId}`,
+        severity: "warning" as const,
+        title: `Module ${moduleId}: what it shows on voice pages failed`,
+        // The projection's error is the module's own text: through the page boundary (P3), like its other words.
+        detail: host.pageText(moduleId, `${p.what}: ${p.message}`, 1900)
+      })))
+    reportFeed()
+    // Daily backups and their retention (never on a turn's path); a failing backup shows on the Health page.
+    if (household.sqlite !== undefined) {
+      const sqlite = household.sqlite
+      yield* Effect.forkScoped(runMaintenance(sqlite, {
+        log: logInfo,
+        onBackup: (problem) =>
+          host.issues.set("household", problem === undefined ? [] : [{
+            id: "core.household.backup",
+            severity: "warning",
+            title: "The household backup failed",
+            detail: problem.slice(0, 1900),
+            fix: { kind: "link", label: "About backups", value: "docs/STORING-DATA.md#backups" }
+          }])
+      }))
+    }
+    health.subscribe((info) => hubNow.broadcast({ type: "health", health: info }))
     host.subscribe((module) => {
-      hubNow.broadcast({ type: "module.changed", module: access.module(module) })
+      // One module's projection, within one frame (`withinModuleFrame`, the guard the snapshot's entries pass too).
+      hubNow.broadcast({ type: "module.changed", module: withinModuleFrame(access.module(module)) })
       if (module.id === SUBSCRIPTION_AGENT_ID && theEngine.status().engines.some((e) => e.provider === SUBSCRIPTION_PROVIDER)) theEngine.refreshStatus()
     })
     sections.subscribe((section) => hubNow.broadcast({ type: "section.changed", section: access.section(section) }))
+    // P5: the device boundary (`deviceFacts.ts`), in the step that commits a settings change: a device whose privacy,
+    // default person or output overrides changed (its own or its type's), or every device when a person left Members,
+    // has its session ended with its connections before anything else runs for it. The pages reconnect afresh.
+    // Follow-up to review round 4: a Members value that does not pass its checks as a whole (a typo in a hand-edited
+    // file) makes everyone nobody in memory (`effectiveMembersOf`), and nothing is written because of it; the owner is
+    // told here, and correcting the list keeps every identity (`withPersonIds`).
+    const membersInvalidIssue = () => {
+      const now = members()
+      host.issues.set("members-invalid", now.valid ? [] : [{
+        id: "core.members.invalid",
+        severity: "warning" as const,
+        title: "Members cannot be read",
+        detail: `Shared settings › Members does not pass its checks (${now.problem ?? "not valid"}). Until it is corrected, nobody counts as a member: personal content is shown and told nowhere, and no turn has a person. Nothing was changed or removed: devices keep their default person, and correcting the list keeps everyone's id and data.`.slice(0, 1900)
+      }])
+    }
+    membersInvalidIssue()
+    const stopBoundary = store.onCommitted((before, after) => {
+      if (effectiveMembersOf(before.assistant) !== effectiveMembersOf(after.assistant)) membersInvalidIssue()
+      const everyone = membersRemoved(before, after)
+      const ended = hubNow.endSessions((deviceId, kind) => everyone || boundaryChanged(before, after, deviceId, kind))
+      if (ended > 0) runFork(Effect.logInfo(`Settings that decide what ${ended === 1 ? "a device" : `${ended} connections`} may be sent changed: the session started again`))
+      // Review round 3: then, in the same step, every page whose device record changed (a room alone, a name) drops
+      // the snapshot it was sending and starts one of the new record, so no later part is built with the old one.
+      push.hooks.devicesChanged()
+      // P10: what may be shown where may have changed (a room, a place): every device is decided again.
+      present.reconcileAll()
+    })
+    yield* Effect.addFinalizer(() => Effect.sync(stopBoundary))
+    // P5: a person removed from Members is no device's default person any more (also at start, after a crash between
+    // the two saves); devices and voice pages then follow the new places. Not while Members cannot be read as a whole:
+    // then nobody is a member in memory only, and no stored reference is cleared because of it.
+    const clearDangling = Effect.suspend(() => (members().valid ? store.clearDefaultPeople(members().referenceable) : Effect.succeed(0))).pipe(
+      Effect.flatMap((n) => (n === 0 ? Effect.void : Effect.sync(() => hubNow.entitiesChanged())))
+    )
+    const clearRemovedPeople = clearDangling.pipe(
+      Effect.catch((e) => Effect.logWarning(`A removed person is still some device's default person: ${e.message}`))
+    )
+    afterMembersSave = clearRemovedPeople
+    /** Who was in Members at the last look: a change of it gives every page a fresh snapshot (a removed person's rows go). */
+    let memberIds = [...members().referenceable].sort().join(",")
+    sections.subscribe((section) => {
+      if (section.id !== MEMBERS_SECTION_ID) return
+      hubNow.refreshDevices()
+      const ids = [...members().referenceable].sort().join(",")
+      if (ids !== memberIds) {
+        memberIds = ids
+        push.resync()
+      }
+    })
+    // At start: a hand-edited Members value is already read repaired (`effectiveMembersOf`: every reader sees unique,
+    // unretired ids, and a reference to an id two records shared counts as none; a value that is not valid as a whole
+    // is no members in memory, and nothing is written for it: `membersInvalidIssue`). Writing that back is ordinary persistence: first
+    // the references to such an id are cleared, then the repaired list is saved through the section (so its ids are
+    // the committed ones). If either fails, a Health issue says so and the server goes on with the repaired list.
+    const repairIssue = (message: string | undefined) =>
+      host.issues.set("members", message === undefined ? [] : [{
+        id: "core.members.repair",
+        severity: "warning" as const,
+        title: "Members could not be written back with their ids",
+        detail: `The settings file gives a person no id, an id another person has, or the id of someone removed. The assistant uses repaired ids, but could not save them: ${message}`.slice(0, 1900)
+      }])
+    if (store.blocked() === undefined) {
+      run(
+        membersGate.run(clearDangling).pipe(
+          Effect.flatMap(() => {
+            if (!members().repaired) return Effect.void
+            return Effect.flatMap(
+              sections.edit(MEMBERS_SECTION_ID, (value) => ({ values: { [MEMBERS_KEY]: value(MEMBERS_KEY) ?? [] }, secrets: {} })),
+              (u) => (u.result.ok ? Effect.void : Effect.fail(new Error(u.result.error.message)))
+            )
+          }),
+          Effect.matchEffect({
+            onFailure: (e) => Effect.andThen(Effect.sync(() => repairIssue(e.message)), Effect.logWarning(`Members could not be written back with their ids: ${e.message}`)),
+            onSuccess: () => Effect.sync(() => repairIssue(undefined))
+          })
+        )
+      )
+    }
     keys.subscribe((state) => {
       hubNow.vaultChanged()
       sections.announceAll()
@@ -1375,7 +1849,28 @@ export const startServe = (options: ServeOptions): Effect.Effect<ServeHandle, Ht
       ...(options.modelListTimeoutMs !== undefined ? { listTimeoutMs: options.modelListTimeoutMs } : {}),
       ...(options.modelCatalogNow !== undefined ? { now: options.modelCatalogNow } : {})
     })
+    tokenIssues = (ignored) =>
+      host.issues.set("route-tokens", ignored === 0 ? [] : [{
+        id: "route-tokens.ignored",
+        severity: "warning",
+        title: `${ignored} stored route token${ignored === 1 ? " is" : "s are"} ignored`,
+        detail: "They are not valid (a changed id or details, or more than a module may hold), so they do not let anyone in and are not listed. Mint new tokens for the callers that need them.",
+        fix: { kind: "link", label: "Open Modules", value: "#settings/shared/modules" }
+      }])
+    routeTokens.audit()
+    // P3: module HTTP routes under /api/modules/ (docs/UI-AND-MODULES.md §1.11), and their admin view in the API.
+    const moduleRouter = makeModuleRouter({
+      host,
+      issues: host.issues,
+      admin,
+      tokens: routeTokens,
+      services,
+      scheme: options.tls === undefined ? "http" : "https",
+      behindProxy: options.behindProxy === true
+    })
     const api = makeApi({
+      moduleRoutes: moduleRouter,
+      scheduler,
       admin,
       catalog: voiceCatalog,
       favourites,
@@ -1398,7 +1893,9 @@ export const startServe = (options: ServeOptions): Effect.Effect<ServeHandle, Ht
       tls: options.tls,
       crossOriginIsolation: options.crossOriginIsolation ?? true,
       hub: hubNow,
-      api,
+      api: (req, res) => (isModuleRoutePath(req.url) ? moduleRouter.handle(req, res) : api(req, res)),
+      // P10: `/media/<token>`, a page's own address of an image it holds now.
+      media: (req, res) => media.serve(req, res, present.mediaFor),
       node: (req, res) => nodeDist.handle(req, res, nodes.redeem),
       ...(options.pingIntervalMs !== undefined ? { pingIntervalMs: options.pingIntervalMs } : {})
     })
@@ -1441,6 +1938,8 @@ export const startServe = (options: ServeOptions): Effect.Effect<ServeHandle, Ht
     // `startEnabled` skips a module another operation holds (a request from a page that connected first); the
     // reconcile after it starts that one once the operation has finished.
     const modulesStarted = yield* Effect.forkScoped(blockedAtStart ? Effect.void : Effect.andThen(host.startEnabled, reconcileModules))
+    // The first health check, once the modules have started (in the background; a page sees `checking` meanwhile).
+    yield* Effect.forkScoped(Effect.andThen(Fiber.await(modulesStarted), health.check))
     const engineStarted = yield* Effect.forkScoped(theEngine.start)
     // Every wanted language model is built (and warmed) alongside the engines, before the first turn (§3.2).
     const resourcesStarted = yield* Effect.forkScoped(syncResources())
@@ -1463,7 +1962,8 @@ export const startServe = (options: ServeOptions): Effect.Effect<ServeHandle, Ht
             // `startIfStopped`: after waiting out a `busy` (a reload the owner sent meanwhile), the engines
             // that reload brought up must not be rebuilt.
             whenIdle("the engines", () => true, theEngine.startIfStopped),
-            Effect.andThen(syncModules(), reconcileModules),
+            // The host starts nothing before `startEnabled`, which is the first start of the modules here.
+            Effect.andThen(host.startEnabled, reconcileModules),
             syncResources()
           ], { concurrency: 3, discard: true })
         }))
@@ -1471,7 +1971,7 @@ export const startServe = (options: ServeOptions): Effect.Effect<ServeHandle, Ht
     }
     const ready = Effect.asVoid(Effect.all([Fiber.await(modulesStarted), Fiber.await(engineStarted), Fiber.await(resourcesStarted)]))
 
-    return { http, hub: hubNow, engine: theEngine, sessions, host, keys, vault, envView, envMover, jobs, models, favourites, resources, store, nodes, ready }
+    return { http, hub: hubNow, devices, engine: theEngine, sessions, host, keys, vault, envView, envMover, jobs, models, favourites, resources, store, nodes, ready }
   })
 
 /**
@@ -1502,6 +2002,8 @@ export const ServeConfig = Config.all({
     Config.withDefault(""),
     Config.map((s) => s.split(",").map((h) => h.trim()).filter((h) => h.length > 0))
   ),
+  // A reverse proxy in front (docs/UI-AND-MODULES.md §1.11): then no module route caller counts as on the home network.
+  behindProxy: Config.Boolean("SERVE_BEHIND_PROXY").pipe(Config.withDefault(false)),
   // Off only to rule it out when the page fails to load on some browser (see the README).
   crossOriginIsolation: Config.Boolean("SERVE_CROSS_ORIGIN_ISOLATION").pipe(Config.withDefault(true)),
   tlsCert: Config.option(Config.String("SERVE_TLS_CERT")),

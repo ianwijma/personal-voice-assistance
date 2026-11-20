@@ -106,7 +106,7 @@ const nodeHello = (
     clientId: client.clientId,
     resumeOwner: true,
     frontend: "voice",
-    device: { id, kind: options.kind ?? VOICE_NODE_KIND, name: "whatever the box says", capabilities: { v: 1, speaker: { media: ["speech"] }, microphone: {} } },
+    device: { id, kind: options.kind ?? VOICE_NODE_KIND, name: "whatever the box says", capabilities: { v: 1, speaker: { media: ["speech"] }, microphone: { farField: false } } },
     ...(credential !== undefined
       ? {
         node: {
@@ -210,16 +210,21 @@ describe("a node's hello", () => {
     nodeHello(node, paired.deviceId, paired.credential, { bundleSha256: "a".repeat(64) })
     await node.waitFor("welcome")
     await admin.waitFor("devices", (m) => m.devices.some((d) => d.id === paired.deviceId && d.connections === 1))
-    for (let i = 0; i < 100 && server!.handle.store.settings().devices[paired.deviceId]?.node?.version !== "0.2.0+0123456789"; i++) await sleep(10)
+    const written = () => {
+      const r = server!.handle.store.settings().devices[paired.deviceId]
+      return r?.node?.version === "0.2.0+0123456789" && r.declared !== undefined
+    }
+    for (let i = 0; i < 100 && !written(); i++) await sleep(10)
     const record = server!.handle.store.settings().devices[paired.deviceId]!
     expect(record.name).toBe("kitchen-pi")
     expect(record.node).toMatchObject({ version: "0.2.0+0123456789", platform: { os: "linux", arch: "arm64", hostname: "kitchen-pi", model: "Raspberry Pi 5" } })
-    expect(record.capabilities).toEqual({ v: 1, speaker: { media: ["speech"] }, microphone: {} })
+    // Declared as every device declares (protocol 11's `declared`).
+    expect(record.declared?.capabilities).toEqual({ v: 1, speaker: { media: ["speech"] }, microphone: { farField: false } })
     const entry = lastDevices(admin).find((d) => d.id === paired.deviceId)!
     expect(entry).toMatchObject({
       kind: VOICE_NODE_KIND,
       name: "kitchen-pi",
-      capabilities: { v: 1, speaker: { media: ["speech"] }, microphone: {} },
+      declared: { capabilities: { v: 1, speaker: { media: ["speech"] }, microphone: { farField: false } } },
       node: { version: "0.2.0+0123456789", bundleSha256: "a".repeat(64), transport: "ws", platform: { model: "Raspberry Pi 5" } }
     })
     // No bundle is built here, so whether it is up to date is unknown.
@@ -337,7 +342,7 @@ describe("node messages", () => {
       writeFileSync(join(dist, "pva-node.mjs"), bundle)
       writeFileSync(join(dist, "pva-node-boot.mjs"), boot)
       writeFileSync(join(dist, "manifest.json"), JSON.stringify({
-        format: 1, protocol: 9, version: `0.0.0+${sha(bundle).slice(0, 10)}`,
+        format: 1, protocol: 12, version: `0.0.0+${sha(bundle).slice(0, 10)}`,
         bundle: { path: "pva-node.mjs", sha256: sha(bundle), bytes: bundle.length },
         boot: { path: "pva-node-boot.mjs", sha256: sha(boot), bytes: boot.length },
         runtime: { version: "22.23.5", "linux-arm64": pin, "linux-x64": pin }

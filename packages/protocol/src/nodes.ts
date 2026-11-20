@@ -3,7 +3,7 @@ import { RequestId } from "./common.ts"
 import { DeviceId, DeviceName } from "./frontends.ts"
 
 /**
- * Voice nodes (docs/VOICE-NODES.md §3, §5; protocol 9): headless speaker-and-microphone boxes, paired once with a
+ * Voice nodes (docs/VOICE-NODES.md §3, §5; protocol 12): headless speaker-and-microphone boxes, paired once with a
  * code and then connecting with a credential. Schemas for the node's `hello`, its status and level messages, the
  * admin's pairing and command messages, the `/node/*` HTTP bodies and the release manifest. Browser-safe.
  */

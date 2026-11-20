@@ -2,17 +2,19 @@ import type { Assistant, AssistantBody, AssistantId, ClientMessage, DeviceProfil
 import { type Outcome, outcomeOf } from "./assistants.ts"
 import { createDiagnosticsStore, type DiagnosticsStore, type MicProcessing } from "./audio/diagnostics.ts"
 import { CUE_RATE, wakeCue } from "./audio/cue.ts"
+import { makeRingLoop, ringCue } from "./audio/ringLoop.ts"
 import { levels, markInterrupted } from "./audio/levels.ts"
 import { type Guard, guardOf } from "./audio/lifecycle.ts"
 import { describeMicError, MicFallbackError, type PlayerEvent, VoiceAudio } from "./audio/VoiceAudio.ts"
 import { type Connection, makeConnection, type RequestInput, type ResultMessage, resolveWsUrl } from "./connection.ts"
 import { EchoTestCancelled, runEchoTest } from "./echoTest.ts"
 import { deviceHello } from "./device.ts"
+import { type CapabilityWatch, watchCapabilities } from "./capabilities.ts"
 import { ADMIN_TOKEN_KEY } from "./adminToken.ts"
 import { createPrefsStore, type Prefs, type PrefsStore } from "./prefs.ts"
 import { sessionsFullText } from "./sessions.ts"
 import { navigateSettings, type SettingsPath } from "./settingsTree.ts"
-import { type ClientState, profileOf } from "./state.ts"
+import { type ClientState, profileOf, ringingCard } from "./state.ts"
 import { type ClientStore, createClientStore } from "./store.ts"
 
 /**
@@ -56,6 +58,8 @@ export interface AssistantClient {
    */
   readonly settings: (to: SettingsPath | "close", options?: { readonly discard?: boolean }) => void
   readonly reloadEngines: () => Promise<ResultMessage>
+  /** Admin (protocol 9): "Check again" on the Health page; the new issues arrive as `health`. */
+  readonly checkHealth: () => Promise<ResultMessage>
   /** Key vault (see `lib/vault.ts`): passwords go to the server only and are never kept here. */
   readonly setupVault: (password: string) => Promise<ResultMessage>
   readonly unlockVault: (password: string) => Promise<ResultMessage>
@@ -103,7 +107,7 @@ export interface AssistantClient {
    */
   readonly wakeTest: (on: boolean, deviceId?: string) => Promise<ResultMessage>
   /**
-   * Admin, protocol 9 (docs/VOICE-NODES.md §5.3): a one-time pairing code for a new voice node (`result.pairing`;
+   * Admin, protocol 12 (docs/VOICE-NODES.md §5.3): a one-time pairing code for a new voice node (`result.pairing`;
    * `node.paired` follows when the box redeems it), its cancel, and a command to a connected node.
    */
   readonly nodePairCreate: (options?: { readonly name?: string; readonly replace?: string }) => Promise<ResultMessage>
@@ -162,6 +166,8 @@ const makeClientId = (): string => {
 const LOCAL_REPLY_ID = 0xffff_fff0
 /** The wake cue: another local id. */
 const CUE_REPLY_ID = LOCAL_REPLY_ID + 1
+/** P9: the ring cue of a notification card: another local id. */
+const RING_REPLY_ID = LOCAL_REPLY_ID + 2
 
 /**
  * THE place a player event becomes a playback report to the server (or none).
@@ -329,11 +335,13 @@ export const createAssistantClient = (options: { readonly frontend?: FrontendRol
       replyEnd: (turnId) => audio.replyEnd(turnId),
       replyStop: (turnId) => audio.replyStop(turnId, true),
       socketLost: () => audio.replyStop(undefined, false),
-      running: () => audio.running
+      running: () => audio.running,
+      replyVolume: (volume) => audio.setReplyVolume(volume)
     },
     // continuation(none): the connection's hooks run synchronously on each message, on the present state.
     hooks: {
       afterWelcome: (resumed) => {
+        capsWatch?.resync()
         if (resumed) {
           // The server assumes a live microphone on resume: tell it the truth.
           const s = store.get()
@@ -550,6 +558,33 @@ export const createAssistantClient = (options: { readonly frontend?: FrontendRol
     audio.playLocal(CUE_REPLY_ID, CUE_RATE, wakeCue())
   }
 
+  /**
+   * P9: the ring cue while a card that rings is shown (`audio/ringLoop.ts`, `ringingCard` over every card). Its life is
+   * the page's and the connection's: it is made once, followed while connected (`connect` subscribes and its clean-up
+   * stops it), stops when the connection is lost or the page is left, and plays only on the tab that owns the device's
+   * audio, while connected and while the audio runs (the Start gesture gave the page its permission), never over a
+   * reply or the echo test. Before that a ringing card shows without sound, with the server's note.
+   */
+  /** The page was left (`pagehide`; back from the back-forward cache, `pageshow`, clears it): no cue meanwhile. */
+  let pageLeft = false
+  const ringLoop = makeRingLoop({
+    wanted: () => {
+      const s = store.get()
+      return !pageLeft && s.connection.status === "open" && s.notifications.some(ringingCard)
+    },
+    canPlay: () => {
+      const s = store.get()
+      if (frontend !== "voice" || s.connection.status !== "open" || !owner() || !audio.running || audio.contextState !== "running") return false
+      if (s.audio.playing !== undefined || echoRun !== undefined) return false
+      const open = audio.openReply()
+      return open === undefined || open >= LOCAL_REPLY_ID
+    },
+    play: () => audio.playLocal(RING_REPLY_ID, CUE_RATE, ringCue()),
+    silence: () => {
+      if (audio.running && audio.openReply() === RING_REPLY_ID) audio.replyStop(RING_REPLY_ID, false)
+    }
+  })
+
   // ---- Screen wake lock while this tab owns the audio ----
   let wakeLock: { release: () => Promise<void> } | undefined
   const requestWakeLock = () => {
@@ -572,9 +607,14 @@ export const createAssistantClient = (options: { readonly frontend?: FrontendRol
     wakeLock = undefined
   }
 
+  /** Protocol 11: the voice page's declaration and live state (`device.caps`), while connected. */
+  let capsWatch: CapabilityWatch | undefined
   const connect = () => {
     prefs.load()
     const stop = connection.start()
+    if (frontend === "voice" && typeof window !== "undefined") capsWatch = watchCapabilities({ send: (m) => connection.send(m) })
+    // continuation(state): the ring loop reads the present state on every change while connected.
+    const stopRinging = store.subscribe(() => ringLoop.update())
     // continuation(none): acts on the present state when the page becomes visible.
     const onVisible = () => {
       if (document.visibilityState !== "visible" || !audio.running) return
@@ -587,12 +627,25 @@ export const createAssistantClient = (options: { readonly frontend?: FrontendRol
     // sent now with the best count the page has (it cannot wait for the worklet).
     // continuation(none): acts on the present state, synchronously.
     const onPageHide = () => {
+      pageLeft = true
+      ringLoop.stop()
       if (audio.running && owner()) audio.unload()
     }
     window.addEventListener("pagehide", onPageHide) // continuation(none): see `onPageHide`
+    // continuation(none): back from the back-forward cache: the cue may sound again (the present state decides).
+    const onPageShow = () => {
+      pageLeft = false
+      ringLoop.update()
+    }
+    window.addEventListener("pageshow", onPageShow) // continuation(none): see `onPageShow`
     return () => {
       document.removeEventListener("visibilitychange", onVisible)
       window.removeEventListener("pagehide", onPageHide)
+      window.removeEventListener("pageshow", onPageShow)
+      capsWatch?.stop()
+      capsWatch = undefined
+      stopRinging()
+      ringLoop.stop()
       stop()
     }
   }
@@ -636,6 +689,7 @@ export const createAssistantClient = (options: { readonly frontend?: FrontendRol
       connection.request({ type: "settings.update", sectionId, patch, ...(confirmWarnings === true ? { confirmWarnings: true } : {}) }),
     settings: (to, options = {}) => dispatch({ type: "local/ui", patch: navigateSettings(store.get().ui, to, options.discard === true) }),
     reloadEngines: () => connection.request({ type: "engine.reload" }),
+    checkHealth: () => connection.request({ type: "health.check" }),
     setupVault: (password) => connection.request({ type: "vault.setup", password }),
     unlockVault: (password) => connection.request({ type: "vault.unlock", password }),
     lockVault: () => connection.request({ type: "vault.lock" }),

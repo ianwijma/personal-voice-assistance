@@ -11,7 +11,7 @@
  * ALSA otherwise (headless boxes, and the system service, which has no user session) — `chooseBackend`. Device
  * lists come from `pw-dump` and `arecord -L` / `aplay -L` (`listDevices`).
  *
- * The pushed `soundDevices` (protocol 9) arrive as `inputDevice` / `outputDevice`; `buildAudio` makes the services
+ * The pushed `soundDevices` (protocol 12) arrive as `inputDevice` / `outputDevice`; `buildAudio` makes the services
  * for one choice again, so `runNode` can reopen the capture and use another output from the next play.
  */
 import { accessSync, constants, existsSync, readdirSync, statSync } from "node:fs"

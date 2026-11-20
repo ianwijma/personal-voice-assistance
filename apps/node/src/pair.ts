@@ -1,7 +1,7 @@
 /**
  * Pairing (docs/VOICE-NODES.md §5.5, §6.1, §8): `pva-node pair --server <url> --code <code>` redeems an admin-issued
  * code with `POST <server>/node/pair` (`NodePairRequest` / `NodePairAnswer` of `@pva/protocol`) and writes
- * `node.json` with the device id and credential it gets back. install.sh runs it. A protocol 9 server refuses a node
+ * `node.json` with the device id and credential it gets back. install.sh runs it. A protocol 12 server refuses a node
  * that was not paired, so this is the only way to a working config.
  *
  * The code is a secret for ten minutes: with a `tlsPin`, the server's key is checked before the body is sent.

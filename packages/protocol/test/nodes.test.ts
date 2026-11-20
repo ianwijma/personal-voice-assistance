@@ -40,9 +40,9 @@ const sha = "3b1f0c9e5a7d4b8e2c6f1a0d9e8b7c6a5f4e3d2c1b0a9f8e7d6c5b4a39281706"
 const assistants = new Map([exampleAssistant, exampleAssistantT3].map((a) => [a.id, a]))
 const decodes = (schema: Schema.Top, value: unknown) => Schema.decodeUnknownResult(schema as Schema.Codec<unknown, unknown>)(value)._tag === "Success"
 
-describe("protocol 9: voice nodes", () => {
-  it("is version 9 and CloseCode.unauthorized is 4403", () => {
-    expect(PROTOCOL_VERSION).toBe(9)
+describe("protocol 12: voice nodes", () => {
+  it("is version 12 and CloseCode.unauthorized is 4403", () => {
+    expect(PROTOCOL_VERSION).toBe(12)
     expect(CloseCode.unauthorized).toBe(4403)
   })
 

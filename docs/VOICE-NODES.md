@@ -29,7 +29,9 @@ device), docs/LOOKS-AND-VOICES.md (per-device look and voice), docs/ARCHITECTURE
 | Answer window for confirmation questions | Dropped | `Assistant.confirmActions` is the literal `"off"`; there are no confirmation questions |
 | "Front ends" renamed "Device defaults"; node pages beside it | Nothing renamed. The Devices section lists types already; nodes appear in it as a second type | Main's Devices section is that page |
 | `micStreaming: continuous \| on-keyword` | No field; nodes stream continuously | WP-5 was a no-go (Status) |
-| Protocol 7 | Protocol **9** (8 is looks and voices) | ASSISTANTS.md §5.1 reserved 9 for nodes |
+| Protocol 7 | Protocol **12** (8 is looks and voices; 9–11 went to main's modules while this branch waited) | ASSISTANTS.md §5.1 reserved 9 for nodes; renumbered at the merge with main (2026-11-21) |
+| Own `capabilities.ts` (a v1 subset), `DeviceListInfo.capabilities`, `StoredDevice.capabilities` | Main's P5 declaration: `DeviceCapabilities` from main's `capabilities.ts`, kept as `DeviceRecord.declared` and shown as `DeviceListInfo.declared`, through the hub's `declare` like a browser's. A node declares `{ v: 1, speaker: { media: ["speech"] }, microphone: { farField: false } }` (main's `farField` is required) | Main implemented the capability declaration in full (docs/ARCHITECTURE.md, "People, rooms and device capabilities"); one declaration path for every device |
+| Settings file version 4 | Version 5 (main's P5); the voice-node type also has main's `place` section key, and both built-ins carry `place` and `capabilities` | Merged with main |
 | Per-device `agent` (reserved) | Not needed | The assistant list on the device is that choice |
 
 ## 1. Goals and non-goals
@@ -94,12 +96,12 @@ Extended (existing structures, all in `packages/protocol/src/devices.ts` unless 
 | `effectiveFollowUpSeconds(assignment, assistant, type?)`, `followUpMsFor(…, type?)`, `routeConfigFrom(settings, assistants, type?)` | `assignment.followUpSeconds ?? type?.followUpUnset ?? assistant.followUpSeconds`. |
 | `validateDeviceSettings(settings, known, { assistants, type? })` | Warning `answers_everything` when `type.kind === "voice-node"` and `withoutPhrase.mode !== "nobody"` (§4.3). |
 | `DeviceSetup`, `deviceSetupFrom(…, { keys? })` | `+ sound?`, `+ soundDevices?`: present when the device's type has those keys. |
-| `DeviceListInfo` | `+ node?: NodeInfo`, `+ capabilities?: DeviceCapabilities` (§5.3). |
-| `DeviceHello` (`frontends.ts`) | `+ capabilities?: DeviceCapabilities`. |
+| `DeviceListInfo` | `+ node?: NodeInfo` (§5.3); what it declared is main's `declared`. |
+| `DeviceHello` (`frontends.ts`) | `capabilities?: DeviceCapabilities` (main's, protocol 11). |
 | `Hello` (`client.ts`) | `+ node?: NodeHello`. |
 | `Result` (`server.ts`) | `+ pairing?: NodePairing`. |
 | `CloseCode` (`constants.ts`) | `+ unauthorized: 4403`. |
-| Server `StoredDevice` (`apps/assistant/src/serve/SettingsStore.ts`) | `+ node?: StoredNode`, `+ capabilities?: DeviceCapabilities`. Server-only: the credential digest never enters `@pva/protocol` or a push. |
+| Server `StoredDevice` (`apps/assistant/src/serve/SettingsStore.ts`) | `+ node?: StoredNode`; its declaration is main's `declared`. Server-only: the credential digest never enters `@pva/protocol` or a push. |
 
 Added:
 
@@ -107,12 +109,12 @@ Added:
   `NodeHello`, `AudioDeviceInfo`, `NodeStatus`, `NodeLevel`, `NodeCommandName`, `NodeCommand`, `NodeCommandSend`,
   `NodePairCreate`, `NodePairCancel`, `NodePaired`, `NodeMeter`, `NodePairing`, `NodeInfo`, `NodePairRequest`,
   `NodePairAnswer`, `NodeManifest` (moved from `apps/node/src/update.ts`, unchanged, so the server can read it).
-- `packages/protocol/src/capabilities.ts`: `DeviceCapabilities` (the v1 subset of §13).
+- (`packages/protocol/src/capabilities.ts` is main's since the merge: the full P5 declaration.)
 - `VOICE_NODE_DEVICE_TYPE` and `BUILT_IN_VOICE_NODE_SETTINGS` in `devices.ts`.
 - Server: `serve/nodes.ts` (pairing, credentials, node info, commands), `serve/nodeDist.ts` (the files and the pair route).
 - Web: `devices/AddNodeDialog.tsx`, `devices/NodeSections.tsx`.
 
-The settings file stays **version 4**: `node` and `capabilities` on a device record are optional keys. A downgrade to a
+The settings file is main's **version 5**: `node` on a device record is an optional key (a `capabilities` key written by a pre-merge build of this branch is ignored when read). A downgrade to a
 server without them drops them on the next save (nodes must then be paired again); recorded as a risk.
 
 ### 3.2 The type
@@ -161,7 +163,7 @@ StoredNode = {
   version?: string                  // last hello.node.version, written when it changes
   platform?: NodePlatform           // last hello.node.platform, written when it changes
 }
-StoredDevice += { node?: StoredNode, capabilities?: DeviceCapabilities }
+StoredDevice += { node?: StoredNode }   // the declaration is main's `declared`
 ```
 
 | Admin shows | From |
@@ -173,12 +175,12 @@ StoredDevice += { node?: StoredNode, capabilities?: DeviceCapabilities }
 | Platform, model | `NodeInfo.platform` |
 | Backend, device lists, opened devices, missing tools, last error | `NodeInfo.status` (memory, last `node.status`, kept after disconnect until restart) |
 | Transport | `NodeInfo.transport`: `ws` / `wss` as the server sees it |
-| What it can do | `DeviceListInfo.capabilities` |
+| What it can do | `DeviceListInfo.declared.capabilities` (main's declaration) |
 
 The registry (`apps/assistant/src/serve/devices.ts`) changes in three places: `seen` never **creates** a `voice-node`
-record (pairing does) and writes `node.version` / `platform` / `capabilities` with the `lastSeen` save when they
-changed; `capped` never evicts a record that has `node`; `forget` of a node is followed by closing its connections with
-4403 (the hub), not by registering it again.
+record (pairing does) and writes `node.version` / `platform` with the `lastSeen` save when they changed (the
+declaration goes through `declare`, as every device's); `capped` never evicts a record that has `node`; `forget` of a node is followed by closing its connections with
+4403 (the hub, in the commit step's `endSessions`), not by registering it again.
 
 ### 3.4 Seeding "Every voice node"
 
@@ -242,15 +244,18 @@ dropped (it needs the phrase). On a browser the follow-up window hides this; on 
 argued. If it is common, the fix is the node's assistant's hearing (`finalSilenceMs` per assistant exists), or a
 short follow-up on that assignment.
 
-## 5. Protocol 9
+## 5. Protocol 12
+
+(Designed and first built as protocol 9; renumbered to 12 when main, which had used 9–11 for modules, was merged
+in on 2026-11-21. The build-plan history below keeps the old number.)
 
 ### 5.1 Version paragraph (`constants.ts`)
 
-> 9: voice nodes (docs/VOICE-NODES.md §5). Device type `voice-node`; `DeviceSettingsKey` gains `sound` and
+> 12: voice nodes (docs/VOICE-NODES.md §5). Device type `voice-node`; `DeviceSettingsKey` gains `sound` and
 > `soundDevices` (a closed set; required in `DeviceSettings`), `DeviceTypeDefinition`/`DeviceTypeInfo.followUpUnset`;
-> `hello.node` (required for a node), `hello.device.capabilities`; client `node.status`, `node.level` (node only),
+> `hello.node` (required for a node; a node declares speaker and microphone in `hello.device.capabilities`); client `node.status`, `node.level` (node only),
 > `node.command.send`, `node.pair.create`, `node.pair.cancel` (admin); server `node.command` (to the node),
-> `node.paired`, `node.meter` (admin only); `result.pairing`; `devices` entries carry `node` and `capabilities`;
+> `node.paired`, `node.meter` (admin only); `result.pairing`; `devices` entries carry `node`;
 > `device.setup` carries `sound` and `soundDevices` for a node; close code 4403 (`unauthorized`). HTTP: `/node/*`
 > (not part of the WebSocket protocol, but its schemas are here).
 
@@ -265,12 +270,12 @@ NodeHello = {
   platform: NodePlatform
 }
 NodePlatform = { os: "linux", arch: "arm64" | "x64" | "arm", hostname: String ≤ 64, model?: String ≤ 120 }
-DeviceHello.capabilities?: DeviceCapabilities
+DeviceHello.capabilities?: DeviceCapabilities   // main's (protocol 11)
 ```
 
-A node's hello: `{ type: "hello", protocol: 9, clientId: "node-<uuid per process>", resumeOwner: true, frontend:
+A node's hello: `{ type: "hello", protocol: 12, clientId: "node-<uuid per process>", resumeOwner: true, frontend:
 "voice", device: { id, kind: "voice-node", name: <hostname>, capabilities: { v: 1, speaker: { media: ["speech"] },
-microphone: {} } }, node: { … } }`. The name in `hello` is ignored for a node (the record's name wins).
+microphone: { farField: false } } }, node: { … } }`. The name in `hello` is ignored for a node (the record's name wins).
 
 After `welcome` the node sends `audio.claim { audio: { contextSampleRate: 16000, outputPath: "direct" } }` and
 `mic.state { live: true }`, then mic frames (as built). It gets `snapshot.setup` in `welcome` and `device.setup` on
@@ -307,7 +312,7 @@ NodeInfo = {
   status?: Omit<NodeStatus, "type">
   transport?: "ws" | "wss"
 }
-DeviceListInfo += { node?: NodeInfo, capabilities?: DeviceCapabilities }
+DeviceListInfo += { node?: NodeInfo }   // `declared` and `live` are main's
 DeviceTypeInfo += { followUpUnset?: Int }
 DeviceSetup    += { sound?: NodeSound, soundDevices?: NodeSoundDevices }
 Result         += { pairing?: NodePairing }

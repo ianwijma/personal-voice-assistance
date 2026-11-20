@@ -1,4 +1,5 @@
-import { Cause, Clock, Effect, Exit, Fiber, Stream } from "effect"
+import { defaultGateway, spokenRefusal } from "./Gateway.ts"
+import { Cause, Clock, Deferred, Effect, Exit, Fiber, Stream } from "effect"
 import { ACTION_TIMEOUT_MS, ActionError, type ActionOutcome, actionToolName, type RegisteredAction } from "./Actions.ts"
 import type { AgentEvent, AgentTurnInput, IntentDecisionInfo } from "./Agent.ts"
 import {
@@ -25,10 +26,13 @@ import { parseValues } from "./ValueParsing.ts"
  * confirmation. No conversational model.
  *
  * Speculation: the decision runs during a speculative turn and an `announce`
- * text is spoken at once (synthesised early, played at promotion); the action
- * itself waits for `promoted` unless it is `speculative` (read-only). An action
- * that has started runs to completion even when the owner barges in (it is
- * detached from the turn, with the 5 s limit). A pending parameter question is
+ * text is spoken once the gateway's first admission has passed (synthesised
+ * early, played at promotion); the action itself waits for `promoted` unless
+ * it is `speculative` (read-only), and is admitted again just before it runs.
+ * An action that has started runs to completion even when the owner barges in
+ * (it is detached from the turn):
+ * waiting for promotion is bounded by `pendingMs`, the action itself by the
+ * 5 s limit from the moment it starts. A pending parameter question is
  * stored only when the turn is committed. An action declared `confirm: true` is
  * never run here: the agent emits `ConfirmAction` and core asks and conducts the
  * confirmation (review round 6).
@@ -83,7 +87,8 @@ export const makeIntentAgent = (options: IntentAgentOptions = {}): AgentImplemen
   const lists = options.words ?? defaultIntentWords
   // The conversation's shared pending entry when it gives one (`AgentTurnInput.pendingIntents`), else this agent's own.
   const own = makePendingIntents()
-  let store: PendingIntents = own
+  // For the status line only: the store of the latest turn. Every turn uses its own (`input.pendingIntents`).
+  let lastStore: PendingIntents = own
   let storeNow = 0
   let lastDecider: string | undefined = "(none yet)"
   let calls = 0
@@ -105,7 +110,9 @@ export const makeIntentAgent = (options: IntentAgentOptions = {}): AgentImplemen
     Stream.unwrap(Effect.gen(function*() {
       const now = input.now === undefined ? Clock.currentTimeMillis : Effect.sync(input.now)
       const startedAt = yield* now
-      store = input.pendingIntents ?? own
+      // This turn's store, captured before anything can overlap another turn of this agent.
+      const store = input.pendingIntents ?? own
+      lastStore = store
       storeNow = startedAt
       // Only this agent's own parameter questions: a pending confirmation is core's (review round 6),
       // answered before routing, never by an agent.
@@ -125,7 +132,7 @@ export const makeIntentAgent = (options: IntentAgentOptions = {}): AgentImplemen
       })
       if (decider === undefined) {
         // Before the Handoff: Conversation stops reading this stream at a Handoff, so nothing after it would run.
-        yield* dropOnPromotion(input, pending)
+        yield* dropOnPromotion(input, store, pending)
         return emit(decision({ outcome: "error", ms: 0, reason: "No decision provider is running" }), { _tag: "Handoff", reason: "no decider" })
       }
 
@@ -133,7 +140,7 @@ export const makeIntentAgent = (options: IntentAgentOptions = {}): AgentImplemen
       for (const failed of plan.unavailable) yield* Effect.logWarning(`Intent agent: ${failed.message}`)
       // Every action's module failed to list its values and nothing is pending: a plain hand-off, no request.
       if (plan.actions.length === 0 && plan.pending === undefined) {
-        yield* dropOnPromotion(input, pending)
+        yield* dropOnPromotion(input, store, pending)
         return emit(decision({ outcome: "fallback", ms: 0, reason: "no actions available" }), { _tag: "Handoff", reason: "no actions" })
       }
       input.mark("decisionSent")
@@ -147,7 +154,7 @@ export const makeIntentAgent = (options: IntentAgentOptions = {}): AgentImplemen
       input.mark("decisionReceived")
       const ms = (yield* now) - startedAt
       if (Exit.isFailure(exit)) {
-        yield* dropOnPromotion(input, pending)
+        yield* dropOnPromotion(input, store, pending)
         const error = Cause.findErrorOption(exit.cause)
         const reason = error._tag === "Some" ? error.value.message : `${decider.name} failed`
         if (error._tag === "None") yield* Effect.logWarning(`Decision provider ${decider.id} crashed`, exit.cause)
@@ -155,7 +162,7 @@ export const makeIntentAgent = (options: IntentAgentOptions = {}): AgentImplemen
       }
 
       const outcome = interpretDecision(plan, exit.value, thresholds, lists)
-      return outcomeEvents(input, outcome, decision, ms, startedAt, pending)
+      return outcomeEvents(input, store, outcome, decision, ms, startedAt, pending)
     }))
 
   /**
@@ -166,17 +173,15 @@ export const makeIntentAgent = (options: IntentAgentOptions = {}): AgentImplemen
    * `pendingMs` (a discarded turn is never promoted; the question would have
    * expired by then anyway), and clears only the question this turn saw.
    */
-  const dropOnPromotion = (input: AgentTurnInput, seen: PendingIntent | undefined): Effect.Effect<void> => {
+  const dropOnPromotion = (input: AgentTurnInput, shared: PendingIntents, seen: PendingIntent | undefined): Effect.Effect<void> => {
     if (seen === undefined) return Effect.void
-    const shared = store
     const clear = Effect.sync(() => shared.clearIf(seen))
     if (!input.speculative) return clear
     return Effect.asVoid(Effect.forkDetach(input.promoted.pipe(Effect.andThen(clear), Effect.timeoutOption(pendingMs))))
   }
 
   /** Store (or clear) the pending intent once the turn is committed. */
-  const commitPending = (input: AgentTurnInput, next: PendingIntent | undefined, at: number) => {
-    const shared = store
+  const commitPending = (input: AgentTurnInput, shared: PendingIntents, next: PendingIntent | undefined, at: number) => {
     return Stream.fromEffectDrain(Effect.andThen(input.promoted, Effect.sync(() => {
       shared.set(next === undefined ? undefined : { intent: next, at, until: at + pendingMs, turnId: input.turnId })
     })))
@@ -186,6 +191,7 @@ export const makeIntentAgent = (options: IntentAgentOptions = {}): AgentImplemen
 
   const outcomeEvents = (
     input: AgentTurnInput,
+    store: PendingIntents,
     outcome: IntentOutcome,
     decision: (info: Omit<IntentDecisionInfo, "decider" | "params"> & { readonly params?: ReadonlyArray<ParamDetail> }) => AgentEvent,
     ms: number,
@@ -196,20 +202,20 @@ export const makeIntentAgent = (options: IntentAgentOptions = {}): AgentImplemen
       case "Fallback": {
         const info = decision({ outcome: "fallback", ms, reason: outcome.reason, ...(outcome.probability !== undefined ? { probability: outcome.probability } : {}) })
         if (outcome.reason === "no_match" && options.onNoMatch === "say") {
-          return emit(info, text(options.noMatchText ?? "I can't do that."), FLUSH).pipe(Stream.concat(commitPending(input, undefined, at)))
+          return emit(info, text(options.noMatchText ?? "I can't do that."), FLUSH).pipe(Stream.concat(commitPending(input, store, undefined, at)))
         }
         // The conversational agent takes the turn; a pending question is not asked twice (once this turn is committed).
         // The drop is set up before the Handoff: Conversation reads nothing after it.
-        return Stream.fromEffectDrain(dropOnPromotion(input, pending)).pipe(Stream.concat(emit(info, { _tag: "Handoff", reason: outcome.reason })))
+        return Stream.fromEffectDrain(dropOnPromotion(input, store, pending)).pipe(Stream.concat(emit(info, { _tag: "Handoff", reason: outcome.reason })))
       }
       case "Cancelled":
         return emit(decision({ outcome: "cancelled", ms, action: actionRef(outcome.action) }), text(CANCELLED_TEXT), FLUSH).pipe(
-          Stream.concat(commitPending(input, undefined, at))
+          Stream.concat(commitPending(input, store, undefined, at))
         )
       case "Confirm":
         // Core asks and conducts the confirmation (review round 6): this agent proposes and stops.
         // A parameter question this turn answered is not asked again (dropped once committed).
-        return Stream.fromEffectDrain(dropOnPromotion(input, pending)).pipe(Stream.concat(emit(
+        return Stream.fromEffectDrain(dropOnPromotion(input, store, pending)).pipe(Stream.concat(emit(
           decision({ outcome: "confirm", ms, action: actionRef(outcome.pending.action), params: outcome.details, probability: outcome.pending.probability }),
           { _tag: "ConfirmAction", action: outcome.pending.action, params: outcome.pending.params }
         )))
@@ -225,23 +231,36 @@ export const makeIntentAgent = (options: IntentAgentOptions = {}): AgentImplemen
           text(outcome.question),
           FLUSH
         ).pipe(
-          Stream.concat(commitPending(input, outcome.pending, at)),
+          Stream.concat(commitPending(input, store, outcome.pending, at)),
           Stream.concat(emit({ _tag: "ExpectReply" }))
         )
       case "Act":
         // Never runs an action declared `confirm: true` (only core's consumption does): propose it instead.
         if (needsConfirmation(outcome.action)) {
-          return Stream.fromEffectDrain(dropOnPromotion(input, pending)).pipe(Stream.concat(emit(
+          return Stream.fromEffectDrain(dropOnPromotion(input, store, pending)).pipe(Stream.concat(emit(
             decision({ outcome: "confirm", ms, action: actionRef(outcome.action), params: outcome.details, probability: outcome.probability }),
             { _tag: "ConfirmAction", action: outcome.action, params: outcome.params }
           )))
         }
-        return act(input, outcome, decision({ outcome: "act", ms, action: actionRef(outcome.action), params: outcome.details, probability: outcome.probability }), at)
+        return act(input, store, outcome, decision({ outcome: "act", ms, action: actionRef(outcome.action), params: outcome.details, probability: outcome.probability }), at)
     }
   }
 
-  const act = (input: AgentTurnInput, outcome: Extract<IntentOutcome, { _tag: "Act" }>, decided: AgentEvent, at: number): Stream.Stream<AgentEvent> =>
-    Stream.suspend(() => {
+  /**
+   * Run the action through the execution gateway, and say its announcement once the gateway has admitted it: an
+   * action refused at once is never announced. A speculative (read) action runs at once; any other is admitted at once
+   * (so its announcement can be spoken, and synthesised, while the turn is still speculative), then held until the
+   * turn is committed (at most `pendingMs`) and admitted again just before it runs. A turn that is discarded first
+   * never runs it. The action gets `ACTION_TIMEOUT_MS` from the moment it starts.
+   *
+   * Known limit (review round 4, kept for latency): if access to the action is withdrawn between the eager end of
+   * turn and promotion, the second admission refuses it and it does not run, but the person may hear the start of
+   * the success sentence followed by the refusal. Releasing the sentence only after the second admission cost one
+   * first-clause synthesis on every held intent turn; a playback gate in `Conversation` that holds pre-synthesised
+   * audio until the final admission would close it without that cost (a possible later change).
+   */
+  const act = (input: AgentTurnInput, store: PendingIntents, outcome: Extract<IntentOutcome, { _tag: "Act" }>, decided: AgentEvent, at: number): Stream.Stream<AgentEvent> =>
+    Stream.unwrap(Effect.gen(function*() {
       const { action, params } = outcome
       const def = action.definition
       const announce = ((): string | undefined => {
@@ -261,30 +280,50 @@ export const makeIntentAgent = (options: IntentAgentOptions = {}): AgentImplemen
       }
       const callId = `action-${input.turnId}-${++calls}`
       const now = input.now === undefined ? Clock.currentTimeMillis : Effect.sync(input.now)
-
-      const run = Effect.gen(function*() {
-        input.mark("actionStarted")
-        const start = yield* now
-        // Detached: once started, an action finishes even if the turn is interrupted (half a light switch is worse).
-        // Suspended: a `run` that throws while building its effect fails the action, not the turn.
-        const fiber = yield* Effect.forkDetach(Effect.suspend(() => def.run(params as never)).pipe(
-          Effect.timeoutOrElse({
-            duration: ACTION_TIMEOUT_MS,
-            orElse: () => Effect.fail(new ActionError({ message: `${def.label} did not finish within ${ACTION_TIMEOUT_MS / 1000} seconds.` }))
-          })
-        ))
+      const speculative = def.speculative === true
+      const admitted = Deferred.makeUnsafe<boolean>()
+      const dropped = Deferred.makeUnsafe<void>()
+      const started = Deferred.makeUnsafe<void>()
+      // `actionStarted` and the action's time are from the moment it runs (after promotion for one that was held).
+      let start = yield* now
+      const starting = Effect.flatMap(now, (at) =>
+        Effect.sync(() => {
+          start = at
+          input.mark("actionStarted")
+          Deferred.doneUnsafe(started, Effect.void)
+        }))
+      // Waiting for promotion and running are bounded separately: at most `pendingMs` for the first, and
+      // `ACTION_TIMEOUT_MS` for the action from the moment it starts.
+      const holdUntil = speculative ? undefined : Effect.raceFirst(
+        input.promoted,
+        Effect.flatMap(Deferred.await(dropped), () => Effect.fail(new ActionError({ message: "Not run: the turn was not committed." })))
+      ).pipe(
+        Effect.timeoutOrElse({ duration: pendingMs, orElse: () => Effect.fail(new ActionError({ message: "Not run: the turn was not committed in time." })) }),
+        Effect.andThen(starting)
+      )
+      const onAdmitted = Effect.andThen(Deferred.succeed(admitted, true), speculative ? starting : Effect.void)
+      const limit = Effect.andThen(Deferred.await(started), Effect.sleep(ACTION_TIMEOUT_MS)).pipe(
+        Effect.andThen(Effect.fail(new ActionError({ message: `${def.label} did not finish within ${ACTION_TIMEOUT_MS / 1000} seconds.` })))
+      )
+      const runAction = input.tools.runAction ?? defaultGateway.action
+      // Detached: once it runs, an action finishes even if the turn is interrupted (half a light switch is worse).
+      // Through the execution gateway (the module and the action must be on for the turn's assistant).
+      const fiber = yield* Effect.forkDetach(Effect.raceFirst(runAction(action, params, { onAdmitted, ...(holdUntil !== undefined ? { holdUntil } : {}) }), limit).pipe(
+        Effect.ensuring(Deferred.succeed(admitted, false))
+      ))
+      const finished = Effect.gen(function*() {
         const exit = yield* Fiber.await(fiber)
         const ms = (yield* now) - start
         input.mark("actionFinished")
         input.trace.tools.push({ name: actionToolName(action.moduleId, def.id), ms })
         return { exit, ms }
       })
-
-      const head: ReadonlyArray<AgentEvent> = [decided, ...(early ? sentence(announce) : [])]
-      return Stream.fromIterable(head).pipe(
-        Stream.concat(def.speculative === true ? Stream.empty : commitPending(input, undefined, at)),
+      return Stream.fromIterable<AgentEvent>([decided]).pipe(
+        // The announcement waits for the first admission (and is left out if the gateway refuses there).
+        Stream.concat(Stream.unwrap(Effect.map(Deferred.await(admitted), (ok) => Stream.fromIterable(ok && early ? sentence(announce!) : [])))),
+        Stream.concat(speculative ? Stream.empty : commitPending(input, store, undefined, at)),
         Stream.concat(emit({ _tag: "ActionStarted", callId, actionId: action.id, label: def.label, params })),
-        Stream.concat(Stream.unwrap(Effect.map(run, ({ exit, ms }): Stream.Stream<AgentEvent> => {
+        Stream.concat(Stream.unwrap(Effect.map(finished, ({ exit, ms }): Stream.Stream<AgentEvent> => {
           if (Exit.isSuccess(exit)) {
             const say = (exit.value as ActionOutcome | undefined)?.say
             return Stream.fromIterable<AgentEvent>([
@@ -295,14 +334,18 @@ export const makeIntentAgent = (options: IntentAgentOptions = {}): AgentImplemen
           }
           const error = Cause.findErrorOption(exit.cause)
           const message = error._tag === "Some" ? error.value.message : "Something went wrong."
+          // P8: a refusal of the risk policy is said in its own spoken sentence, in the household's language.
+          const spoken = error._tag === "Some" ? spokenRefusal(error.value) : undefined
           return Stream.fromIterable<AgentEvent>([
             { _tag: "ActionFinished", callId, ok: false, ms, error: message },
-            ...sentence(`Sorry, ${message.length > 0 ? message : "that failed."}`)
+            ...sentence(spoken ?? `Sorry, ${message.length > 0 ? message : "that failed."}`)
           ])
         }))),
-        Stream.concat(def.speculative === true ? commitPending(input, undefined, at) : Stream.empty)
+        Stream.concat(speculative ? commitPending(input, store, undefined, at) : Stream.empty),
+        // A turn whose stream ends before it was committed (discarded, interrupted) never runs a held action.
+        Stream.ensuring(Effect.sync(() => void Deferred.doneUnsafe(dropped, Effect.void)))
       )
-    })
+    }))
 
-  return { speculate: true, turn, pending: () => store.current(storeNow)?.intent }
+  return { speculate: true, turn, pending: () => lastStore.current(storeNow)?.intent }
 }

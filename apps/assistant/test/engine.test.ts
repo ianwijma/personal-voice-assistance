@@ -50,12 +50,15 @@ describe("Engine: reload guard", () => {
   it.live("a refused reload does not release the running reload's guard; the running reload completes", () =>
     Effect.gen(function*() {
       const gate = yield* Deferred.make<void>()
-      const { build, builds } = scriptedBuild([undefined, Deferred.await(gate)])
+      const building = yield* Deferred.make<void>()
+      const { build, builds } = scriptedBuild([undefined, Effect.andThen(Deferred.succeed(building, undefined), Deferred.await(gate))])
       const engine = yield* engineWith(build)
       assert.isTrue((yield* engine.start).ok)
 
       const a = yield* Effect.forkChild(engine.reload)
-      yield* Effect.sleep(20) // A is building
+      // A is building (it holds the guard and its build has begun): awaited, not assumed after a sleep, since A
+      // first stops the running build, which on a busy machine takes longer than any fixed wait.
+      yield* Deferred.await(building).pipe(Effect.timeout(2_000))
       const b = yield* engine.reload
       const c = yield* engine.reload
       assert.isTrue(busy(b), "B is refused")
@@ -100,11 +103,12 @@ describe("Engine: startIfStopped (seventh review)", () => {
   it.live("after a busy answer, the retry does not rebuild engines that the running reload brought up", () =>
     Effect.gen(function*() {
       const gate = yield* Deferred.make<void>()
-      const { build, builds } = scriptedBuild([undefined, Deferred.await(gate)])
+      const building = yield* Deferred.make<void>()
+      const { build, builds } = scriptedBuild([undefined, Effect.andThen(Deferred.succeed(building, undefined), Deferred.await(gate))])
       const engine = yield* engineWith(build)
       assert.isTrue((yield* engine.start).ok)
       const reload = yield* Effect.forkChild(engine.reload)
-      yield* Effect.sleep(20) // the reload is building
+      yield* Deferred.await(building).pipe(Effect.timeout(2_000)) // the reload is building
       assert.isTrue(busy(yield* engine.startIfStopped), "busy while the reload holds the guard")
       yield* Deferred.succeed(gate, undefined)
       assert.isTrue((yield* Fiber.join(reload).pipe(Effect.timeout(2_000))).ok)

@@ -19,10 +19,10 @@ import { assistantsClientExamples, clientExamples, exampleDevice, serverExamples
 const decodes = (schema: Schema.Top, value: unknown) => Schema.decodeUnknownResult(schema as Schema.Codec<unknown, unknown>)(value)._tag === "Success"
 
 describe("protocol 8", () => {
-  it("is protocol version 8, and the examples speak it", () => {
-    expect(PROTOCOL_VERSION).toBe(9)
-    expect(serverExamples.welcome.protocol).toBe(9)
-    expect(clientExamples.hello.protocol).toBe(9)
+  it("is protocol version 8 or later (9 added module API v2), and the examples speak it", () => {
+    expect(PROTOCOL_VERSION).toBeGreaterThanOrEqual(8)
+    expect(serverExamples.welcome.protocol).toBe(PROTOCOL_VERSION)
+    expect(clientExamples.hello.protocol).toBe(PROTOCOL_VERSION)
   })
 
   it("a version 7 hello still decodes, so the server can answer it with the mismatch close", () => {

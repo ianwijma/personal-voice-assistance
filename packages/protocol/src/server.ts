@@ -20,6 +20,12 @@ import { EnvInfo } from "./env.ts"
 import { JobInfo, ModelSet } from "./jobs.ts"
 import { VaultInfo } from "./vault.ts"
 import { ConversationId, ConversationReason, SessionInfo, SessionKey } from "./sessions.ts"
+import { HealthInfo } from "./health.ts"
+import { HouseholdEventMessage, HouseholdGapMessage, HouseholdSnapshotMessage } from "./household.ts"
+import { NotificationResolvedMessage, NotificationRingMessage } from "./notifications.ts"
+import { PresentDismissMessage, PresentShowMessage, PresentUpdateMessage } from "./presentation.ts"
+import { OutputVolumeMessage } from "./volume.ts"
+import { FieldActionResult } from "./settings.ts"
 
 /**
  * Text frames from the assistant to the browser. Binary frames from the
@@ -225,7 +231,14 @@ export const Result = Schema.Struct({
    * have now, so the page can wait until that revision has reached it (the lists are pushed after the result).
    */
   rev: Schema.optionalKey(NonNegativeInt),
-  /** Protocol 9: present only on the successful result of `node.pair.create`. */
+  /** Protocol 10: present only on the result of `module.action` that ran: what the handler said, shown by the button. */
+  action: Schema.optionalKey(FieldActionResult),
+  /**
+   * Additive within protocol 11 (P9): on the result of `notification.action`, the sentence to show for the press (the
+   * module's answer, or "I can't do that right now"), in the household's language.
+   */
+  say: Schema.optionalKey(Schema.String.check(Schema.isMaxLength(300))),
+  /** Protocol 12: present only on the successful result of `node.pair.create`. */
   pairing: Schema.optionalKey(NodePairing)
 })
 
@@ -390,7 +403,22 @@ export const DeviceTypesMessage = Schema.Struct({
   types: Schema.Array(DeviceTypeInfo)
 })
 
-export const ServerMessage = Schema.Union([
+/**
+ * Protocol 9, admin connections only: the issue registry changed (a check started or finished, a module became
+ * unavailable or available again, a module's start failed). Always the whole registry.
+ */
+export const HealthMessage = Schema.Struct({
+  type: Schema.Literal("health"),
+  health: HealthInfo
+})
+
+/**
+ * Every server message. `Schema.toTaggedUnion`'s type-level utilities recurse once per member and exceed the compiler's
+ * instantiation depth beyond 47 members (protocol 12 has 49), so the utilities are added at run time as before but typed
+ * by hand: the union, its `tag`, `discriminants` and `cases` (`match`, `guards` and `isAnyOf` exist but are untyped;
+ * nothing uses them on this union).
+ */
+const ServerMessageUnion = Schema.Union([
   Welcome,
   Session,
   State,
@@ -427,11 +455,28 @@ export const ServerMessage = Schema.Union([
   ConversationHistory,
   AssistantsMessage,
   DeviceTypesMessage,
+  HealthMessage,
+  HouseholdSnapshotMessage,
+  HouseholdEventMessage,
+  HouseholdGapMessage,
+  NotificationRingMessage,
+  NotificationResolvedMessage,
+  OutputVolumeMessage,
+  PresentShowMessage,
+  PresentUpdateMessage,
+  PresentDismissMessage,
   NodeCommand,
   NodePaired,
   NodeMeter
-]).pipe(Schema.toTaggedUnion("type"))
-export type ServerMessage = typeof ServerMessage.Type
+])
+export type ServerMessage = typeof ServerMessageUnion.Type
+const untypedToTaggedUnion = Schema.toTaggedUnion as unknown as (tag: "type") => (union: typeof ServerMessageUnion) => unknown
+export const ServerMessage = untypedToTaggedUnion("type")(ServerMessageUnion) as typeof ServerMessageUnion & {
+  readonly tag: "type"
+  readonly discriminants: ReadonlyArray<ServerMessage["type"]>
+  /** Member schema by discriminant (the codec asks only whether a type is one). */
+  readonly cases: Readonly<Record<ServerMessage["type"], Schema.Top>>
+}
 export type ServerMessageType = ServerMessage["type"]
 export type ServerMessageOf<T extends ServerMessageType> = Extract<ServerMessage, { readonly type: T }>
 

@@ -37,7 +37,7 @@ const typeBase = baseOfType(type)
 
 describe("sections of a device type", () => {
   it("a type with every key has every section; a section needs all of its keys", () => {
-    expect(sectionsOf(type)).toEqual(["assign", "phrases", "voicePage", "look", "voice", "interrupting", "audio", "captions"])
+    expect(sectionsOf(type)).toEqual(["assign", "phrases", "voicePage", "look", "voice", "place", "capabilities", "interrupting", "audio", "captions"])
     expect(sectionsOf({ keys: ["assistants", "withoutPhrase", "interruptMode"] })).toEqual(["assign", "interrupting"])
     // `assign` is two keys: one of them alone is not the section.
     expect(sectionsOf({ keys: ["assistants"] })).toEqual([])
@@ -45,8 +45,8 @@ describe("sections of a device type", () => {
   })
 
   it("an unknown type shows every section", () => {
-    // Protocol 9 added Sound and Sound devices (voice nodes).
-    expect(sectionsOf(undefined)).toHaveLength(10)
+    // Protocol 11 added Place and Capabilities, protocol 12 Sound and Sound devices (voice nodes).
+    expect(sectionsOf(undefined)).toHaveLength(12)
   })
 })
 
@@ -340,7 +340,7 @@ describe("the Look and Voice sections (docs/LOOKS-AND-VOICES.md §2, §4)", () =
   const amy = { provider: "piper", voiceId: "en_US-amy-medium" }
 
   it("are sections of a type that has their keys, and not of one that does not (an older server)", () => {
-    expect(sectionsOf(allKeys)).toEqual(["assign", "phrases", "voicePage", "look", "voice", "interrupting", "audio", "captions"])
+    expect(sectionsOf(allKeys)).toEqual(["assign", "phrases", "voicePage", "look", "voice", "place", "capabilities", "interrupting", "audio", "captions"])
     expect(sectionsOf(older)).not.toContain("look")
     expect(sectionsOf(older)).not.toContain("voice")
   })

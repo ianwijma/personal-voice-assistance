@@ -135,6 +135,57 @@ export const ChoiceOption = Schema.Struct({
 })
 export type ChoiceOption = typeof ChoiceOption.Type
 
+// ---------------------------------------------------------------------------------------------------------------------
+// Bounds of the protocol 10 field types (docs/SETTINGS-UI.md §3.2). Every string, list and record they add has a
+// maximum, checked here on the wire (both directions) and by the core's constructors and decoders, so one module form
+// stays far below the frame limit (1 MB) however a module fills it.
+
+/** A label, button text or note. */
+export const MAX_FIELD_LABEL = 200
+/** A description or confirmation text. */
+export const MAX_FIELD_DESCRIPTION = 1000
+/** Items of a `textList` (value, default and `maxItems`). */
+export const MAX_TEXT_LIST_ITEMS = 200
+/** Characters of one `textList` item (and `itemMaxLength`). */
+export const MAX_TEXT_LIST_ITEM = 500
+/** Records of a `records` value (and `maxItems`). */
+export const MAX_RECORDS = 200
+/** Item fields of a `records` field (keys of one record). */
+export const MAX_RECORD_FIELDS = 32
+/** Characters of one text value inside a record, of a `combo` value (and `maxLength`). */
+export const MAX_RECORD_TEXT = 2000
+/** A whole `records` or `textList` value as JSON, characters. */
+export const MAX_LIST_JSON = 32_768
+/** Options of a `combo` field (static and the running instance's together), or of a record's choice. */
+export const MAX_COMBO_OPTIONS = 200
+/** A whole options list as JSON, characters (the host drops the last options of a longer one). */
+export const MAX_OPTIONS_JSON = 32_768
+
+const Text = (max: number) => Schema.String.check(Schema.isMaxLength(max))
+/** At most `max` characters as JSON (the list's whole size on the wire). */
+const jsonAtMost = <T>(max: number, what: string) =>
+  Schema.makeFilter((v: T) => JSON.stringify(v).length <= max || `${what} must be at most ${max} characters as JSON`)
+/** A declared limit: a whole number from 1 to `max`. */
+const Limit = (max: number) => Schema.Int.check(Schema.isBetween({ minimum: 1, maximum: max }))
+
+/** An option of a protocol 10 field (a `combo`, a record's choice), bounded. */
+export const BoundedChoiceOption = Schema.Struct({
+  value: Schema.String.check(Schema.isMinLength(1), Schema.isMaxLength(200)),
+  label: Text(MAX_FIELD_LABEL),
+  description: Schema.optionalKey(Text(500)),
+  tags: Schema.optionalKey(Schema.Array(OptionTag).check(Schema.isMaxLength(6))),
+  implication: Schema.optionalKey(Text(500))
+})
+const BoundedOptions = Schema.Array(BoundedChoiceOption).check(Schema.isMaxLength(MAX_COMBO_OPTIONS), jsonAtMost(MAX_OPTIONS_JSON, "The options"))
+
+/** A `textList` value: bounded items and size. */
+export const TextListValue = Schema.Array(Text(MAX_TEXT_LIST_ITEM)).check(Schema.isMaxLength(MAX_TEXT_LIST_ITEMS), jsonAtMost(MAX_LIST_JSON, "A list"))
+
+const fieldText = {
+  label: Text(MAX_FIELD_LABEL),
+  description: Schema.optionalKey(Text(MAX_FIELD_DESCRIPTION))
+}
+
 export const TextField = Schema.Struct({
   type: Schema.Literal("text"),
   ...common,
@@ -188,13 +239,170 @@ export const MultiChoiceField = Schema.Struct({
   options: Schema.Array(ChoiceOption)
 })
 
-export const SettingField = Schema.Union([TextField, SecretField, NumberField, BooleanField, ChoiceField, MultiChoiceField])
-  .pipe(Schema.toTaggedUnion("type"))
+// ---------------------------------------------------------------------------------------------------------------------
+// Protocol 10: the extended field types (docs/AGENTS-AND-INTENTS.md §4.3, docs/MODULES-PLAN.md §4 P3). They were
+// defined in `agents.ts` for agent forms and joined `SettingField` here, so module forms, settings sections and
+// agent forms share one wire form.
+
+/** A list of short strings (aliases, greeting words, rooms): chips with an "add" input. Value: `string[]`. */
+export const TextListField = Schema.Struct({
+  type: Schema.Literal("textList"),
+  ...common,
+  ...fieldText,
+  default: TextListValue,
+  maxItems: Schema.optionalKey(Limit(MAX_TEXT_LIST_ITEMS)),
+  itemMaxLength: Schema.optionalKey(Limit(MAX_TEXT_LIST_ITEM)),
+  placeholder: Schema.optionalKey(Text(MAX_FIELD_LABEL))
+})
+
+const itemCommon = {
+  key: FieldKey,
+  ...fieldText,
+  /** Protocol 11: kept in every record but not drawn (an id the server makes, such as a person's). */
+  hidden: Schema.optionalKey(Schema.Boolean)
+}
+
+/** The field types allowed inside a record: flat, no secrets, no nesting, no actions (docs/MODULES-PLAN.md §3.3). */
+export const RecordItemField = Schema.Union([
+  Schema.Struct({
+    type: Schema.Literal("text"),
+    ...itemCommon,
+    default: Text(MAX_RECORD_TEXT),
+    placeholder: Schema.optionalKey(Text(MAX_FIELD_LABEL)),
+    maxLength: Schema.optionalKey(Limit(MAX_RECORD_TEXT)),
+    multiline: Schema.optionalKey(Schema.Boolean)
+  }),
+  Schema.Struct({
+    type: Schema.Literal("number"),
+    ...itemCommon,
+    default: Schema.Finite,
+    integer: Schema.Boolean,
+    min: Schema.optionalKey(Schema.Finite),
+    max: Schema.optionalKey(Schema.Finite),
+    step: Schema.optionalKey(Schema.Finite),
+    unit: Schema.optionalKey(Text(40))
+  }),
+  Schema.Struct({ type: Schema.Literal("boolean"), ...itemCommon, default: Schema.Boolean }),
+  Schema.Struct({ type: Schema.Literal("choice"), ...itemCommon, default: Text(200), options: BoundedOptions }),
+  Schema.Struct({
+    type: Schema.Literal("multichoice"),
+    ...itemCommon,
+    default: Schema.Array(Text(200)).check(Schema.isMaxLength(MAX_COMBO_OPTIONS)),
+    options: BoundedOptions
+  }),
+  Schema.Struct({
+    type: Schema.Literal("textList"),
+    ...itemCommon,
+    default: TextListValue,
+    maxItems: Schema.optionalKey(Limit(MAX_TEXT_LIST_ITEMS)),
+    itemMaxLength: Schema.optionalKey(Limit(MAX_TEXT_LIST_ITEM)),
+    placeholder: Schema.optionalKey(Text(MAX_FIELD_LABEL))
+  })
+]).pipe(Schema.toTaggedUnion("type"))
+export type RecordItemField = typeof RecordItemField.Type
+
+/** One record: item field key → value (at most `MAX_RECORD_FIELDS` keys, bounded values). */
+export const RecordValue = Schema.Record(
+  FieldKey,
+  Schema.Union([Text(MAX_RECORD_TEXT), Schema.Finite, Schema.Boolean, Schema.Array(Text(MAX_TEXT_LIST_ITEM)).check(Schema.isMaxLength(MAX_TEXT_LIST_ITEMS))])
+).check(Schema.isMaxProperties(MAX_RECORD_FIELDS))
+export type RecordValue = typeof RecordValue.Type
+
+/** A `records` value: at most `MAX_RECORDS` records and `MAX_LIST_JSON` characters as JSON. */
+export const RecordsValue = Schema.Array(RecordValue).check(Schema.isMaxLength(MAX_RECORDS), jsonAtMost(MAX_LIST_JSON, "A list of records"))
+
+/**
+ * An ordered list of records with the same flat fields (rooms with aliases, lamps, members). Rendered as a list of
+ * compact rows, each expanding into a small form built from `itemFields`; add, remove and (if `orderable`) move
+ * up/down. Value: `RecordValue[]`. Nested configuration is JSON in a validated text field instead.
+ */
+export const RecordsField = Schema.Struct({
+  type: Schema.Literal("records"),
+  ...common,
+  ...fieldText,
+  default: RecordsValue,
+  itemFields: Schema.Array(RecordItemField).check(Schema.isMinLength(1), Schema.isMaxLength(MAX_RECORD_FIELDS)),
+  /** Singular noun for buttons: "Add room". */
+  itemLabel: Text(60),
+  /** Item field whose value titles a collapsed row. */
+  titleKey: FieldKey,
+  maxItems: Schema.optionalKey(Limit(MAX_RECORDS)),
+  /** Order matters (first match wins); show move controls. */
+  orderable: Schema.Boolean
+})
+
+/**
+ * Free text with suggestions (a combobox): a model name picked from the backend's own list, with any other name
+ * allowed when `allowCustom`. The server adds the running instance's options (`settingOptions`) to the static ones;
+ * `optionsNote` says where they came from ("From the server's model list", "Not running: type a name").
+ * Value: `string`.
+ */
+export const ComboField = Schema.Struct({
+  type: Schema.Literal("combo"),
+  ...common,
+  ...fieldText,
+  default: Text(MAX_RECORD_TEXT),
+  options: BoundedOptions,
+  allowCustom: Schema.Boolean,
+  maxLength: Schema.optionalKey(Limit(MAX_RECORD_TEXT)),
+  placeholder: Schema.optionalKey(Text(MAX_FIELD_LABEL)),
+  optionsNote: Schema.optionalKey(Text(MAX_FIELD_LABEL))
+})
+
+/**
+ * A button that runs something on the server ("Test", "Refresh the list"). It has no value: it is never in
+ * `values` and never in a patch. Pressing it sends `module.action`; the result (`Result.action`) is shown next to
+ * the button until the form is closed. `requiresSaved`: the handler uses the saved settings, so the button is
+ * disabled while the form has unsaved edits; without it the page sends its draft values with the press.
+ */
+export const ActionField = Schema.Struct({
+  type: Schema.Literal("action"),
+  ...common,
+  ...fieldText,
+  buttonLabel: Text(60),
+  /** Ask "Are you sure?" with this text first. */
+  confirm: Schema.optionalKey(Text(MAX_FIELD_DESCRIPTION)),
+  requiresSaved: Schema.Boolean
+})
+
+/** What an `action` field's handler said: shown next to its button (`Result.action` of `module.action`). */
+export const FieldActionResult = Schema.Struct({
+  ok: Schema.Boolean,
+  /** One or two sentences for the owner. At most 500 characters. */
+  text: Schema.String.check(Schema.isMaxLength(500)),
+  tone: Schema.optionalKey(Schema.Literals(["neutral", "ok", "warning", "error"]))
+})
+export type FieldActionResult = typeof FieldActionResult.Type
+
+/** Read-only text computed by the server ("Logged in with a Max plan", "Last test: 912 ms"). Value: `string` ("" when not known). */
+export const InfoField = Schema.Struct({
+  type: Schema.Literal("info"),
+  ...common,
+  ...fieldText,
+  tone: Schema.optionalKey(Schema.Literals(["neutral", "ok", "warning", "error"]))
+})
+
+export const SettingField = Schema.Union([
+  TextField,
+  SecretField,
+  NumberField,
+  BooleanField,
+  ChoiceField,
+  MultiChoiceField,
+  TextListField,
+  RecordsField,
+  ComboField,
+  ActionField,
+  InfoField
+]).pipe(Schema.toTaggedUnion("type"))
 export type SettingField = typeof SettingField.Type
 export type SettingFieldType = SettingField["type"]
 
-/** A non-secret value. The field's `type` says which member applies. */
-export const SettingValue = Schema.Union([Schema.String, Schema.Finite, Schema.Boolean, Schema.Array(Schema.String)])
+/**
+ * A non-secret value. The field's `type` says which member applies; protocol 10 adds a list of records. `action`
+ * fields have no value; `info` fields have a string.
+ */
+export const SettingValue = Schema.Union([Schema.String, Schema.Finite, Schema.Boolean, Schema.Array(Schema.String), RecordsValue])
 export type SettingValue = typeof SettingValue.Type
 
 /** What the client may know about a secret. */

@@ -142,7 +142,7 @@ describe("migration fixtures", () => {
     const dir = tmp()
     const store = await run(openStore(dir, withCatalog()))
     const file = store.settings()
-    expect(file.version).toBe(4)
+    expect(file.version).toBe(5)
     expect(file.migration).toBeUndefined()
     expect(file.assistants.order).toEqual(["assistant"])
     expect(file.assistants.byId.assistant).toEqual(defaultAssistant)
@@ -159,7 +159,10 @@ describe("migration fixtures", () => {
       captions: { captions: true, speakTyped: true },
       look: { from: "assistant" },
       voice: { from: "assistant" },
-      // Protocol 9: complete settings carry the node sections too (not in the browsers' keys, so ignored there).
+      // Protocol 11: the built-in place and no overrides.
+      place: { room: "", privacy: "shared", alwaysOn: false, acceptsFromOthers: true, quietRoom: false, defaultPerson: null },
+      capabilities: { noDisplay: false, excludeKinds: [], noSpeaker: false },
+      // Protocol 12: complete settings carry the node sections too (not in the browsers' keys, so ignored there).
       sound: { volume: 80, cues: true },
       soundDevices: { input: "", output: "" }
     })
@@ -172,7 +175,7 @@ describe("migration fixtures", () => {
     expect(profileOfSettings(deviceSettingsFrom(file, undefined), file.assistants.byId.assistant!)).toEqual(DEFAULT_DEVICE_PROFILE)
     // The first save writes it.
     await run(saveSection(store, "recordings", { RECORD_HEARD_AUDIO: true }, {}))
-    expect(onDisk(dir)).toMatchObject({ version: 4, assistants: { order: ["assistant"] }, deviceTypes: { [WEB_VOICE_KIND]: { rev: 0 } } })
+    expect(onDisk(dir)).toMatchObject({ version: 5, assistants: { order: ["assistant"] }, deviceTypes: { [WEB_VOICE_KIND]: { rev: 0 } } })
   })
 
   it("activation always: withoutPhrase is the assistant; wake-phrase: nobody, with the kind's phrases, matching, follow-up and reset time", async () => {
@@ -328,10 +331,10 @@ describe("the version-4 file", () => {
     expect(steps).toEqual(["migrate-assistants"])
     expect(readFileSync(join(dir, "settings.json.v3-backup"), "utf8")).toBe(v3Text(v))
     const written = onDisk(dir)
-    expect(written).toMatchObject({ version: 4, revision: 7, assistant: { SYSTEM_PROMPT: "x" }, migration: { from: 3, at: 1_794_931_200_000 } })
+    expect(written).toMatchObject({ version: 5, revision: 7, assistant: { SYSTEM_PROMPT: "x" }, migration: { from: 3, at: 1_794_931_200_000 } })
     expect(written).toEqual(JSON.parse(JSON.stringify(store.settings())))
     expect(store.blocked()).toBeUndefined()
-    expect(store.problems.join(" ")).toContain("was migrated to version 4")
+    expect(store.problems.join(" ")).toContain("was migrated to version 5")
     // The next start reads version 4 as it is: no second migration, no new notes.
     const again: Array<StartupStep> = []
     const restarted = await run(openStore(dir, { ...withCatalog(), beforeStartupStep: (s) => void again.push(s) }))
@@ -353,7 +356,7 @@ describe("the version-4 file", () => {
     const v: V3 = { revision: 3, assistant: { ANTHROPIC_MODEL: "claude-opus-5-5", LLM_PROVIDER: "anthropic" } }
     const dir = v3Dir(v)
     const reader = await run(loadSettingsStore(dir, { readOnly: true, assistants: { catalog: moduleCatalog } }))
-    expect(reader.settings()).toMatchObject({ version: 4, revision: 3, assistants: { byId: { assistant: { llm: { model: "claude-opus-5-5" } } } } })
+    expect(reader.settings()).toMatchObject({ version: 5, revision: 3, assistants: { byId: { assistant: { llm: { model: "claude-opus-5-5" } } } } })
     expect(readFileSync(join(dir, "settings.json"), "utf8")).toBe(v3Text(v))
     expect(existsSync(join(dir, "settings.json.v3-backup"))).toBe(false)
     // A reader during the server's migration (paused before its write) and after it: the same assistant, from one save.
@@ -369,7 +372,7 @@ describe("the version-4 file", () => {
     release()
     await writer
     const after = await run(loadSettingsStore(dir, { readOnly: true, assistants: { catalog: moduleCatalog } }))
-    expect(onDisk(dir).version).toBe(4)
+    expect(onDisk(dir).version).toBe(5)
     for (const r of [during, after]) {
       expect(r.blocked()).toBeUndefined()
       expect(r.settings().revision).toBe(3)
@@ -512,7 +515,7 @@ describe("serve: a version-3 install starts on version 4", () => {
 
     // The version-4 file: the assistant holds exactly what the engines were built from.
     const file = onDisk(dataDir)
-    expect(file).toMatchObject({ version: 4, migration: { from: 3 } })
+    expect(file).toMatchObject({ version: 5, migration: { from: 3 } })
     expect(file.revision).toBeGreaterThanOrEqual(4) // the device's hello saved since
     expect(file.assistants.byId.assistant).toMatchObject({
       prompt: "Answer like a butler.",

@@ -2,7 +2,7 @@
 // WP-12a/12b/12c): the Home line reaches the prompt the model receives, Weather and Clock follow Home unless set, an
 // assistant's own module values run its own instance (and are checked at `assistant.save`), and Home Assistant
 // (against the fake Home Assistant server) gives its tools to the assistant that has it on.
-import { type ModuleDefinition, Llm, type LlmEvent } from "@pva/core"
+import { defineModule, type JobOrigin, LOCAL_PRINCIPAL, Llm, type LlmEvent, makeConnectionRef, type ModuleDefinition, type Principal, Setting, type TurnContext } from "@pva/core"
 import { homeAssistantModule } from "@pva/module-home-assistant"
 import { clockModule, weatherModule } from "@pva/modules-builtin"
 import type { ClientMessage, ModuleInfo } from "@pva/protocol"
@@ -12,6 +12,7 @@ import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { afterEach, describe, expect, it, vi } from "vitest"
 import { startFakeHomeAssistant } from "../../../packages/module-home-assistant/test/fakeHomeAssistant.ts"
+import { openVault } from "../src/serve/Vault.ts"
 import { ScriptedClient, sleep } from "./support/scriptedClient.ts"
 import { controlledStt, fakeBuild, greeterModule, scriptedLlm, startTestServer, TEST_ADMIN_PASSWORD, type TestServer } from "./support/serveHarness.ts"
 
@@ -122,9 +123,16 @@ const until = async (what: () => boolean) => {
   expect(what()).toBe(true)
 }
 
-/** An assistant's tool in the running host (its instance). */
-const toolOf = (assistantId: string, name: string) =>
-  (server!.handle.host.snapshot().assistantParts.get(assistantId) ?? []).flatMap((p) => p.module.tools ?? []).find((t) => t.name === name)
+/** An assistant's tool in the running host (its instance), run through the gateway as a job for that assistant. */
+const toolOf = (assistantId: string, name: string) => {
+  const part = (server!.handle.host.snapshot().assistantParts.get(assistantId) ?? []).find((p) => (p.module.tools ?? []).some((t) => t.name === name))
+  const tool = part?.module.tools?.find((t) => t.name === name)
+  if (part === undefined || tool === undefined) return undefined
+  return {
+    execute: (input: unknown) =>
+      server!.handle.host.gateway.tool(part.moduleId, tool, input, { principal: { _tag: "job", job: { jobId: "test", moduleId: part.moduleId, assistantId } } })
+  }
+}
 
 describe("Home and module instances (WP-12a/12b)", () => {
   it("the Home line is in the prompt the model receives; Weather and Clock follow Home; an own date format answers that assistant in it", async () => {
@@ -164,6 +172,8 @@ describe("Home and module instances (WP-12a/12b)", () => {
     expect(moduleOf(admin, "clock")!.instances!.map((i) => [i.assistants, i.own])).toEqual([[["alpha"], []], [["bravo"], ["locale"]]])
     expect(moduleOf(admin, "clock")!.settings.fields.map((f) => [f.key, f.overridable === true])).toEqual([["timeZone", true], ["locale", true]])
 
+    // Weather restarts with Home as well (it has a shared part now): wait for it too, or Alpha's tools are not yet published.
+    await until(() => moduleOf(admin, "weather")?.state === "running")
     await typed(page, "second", "alpha")
     await typed(page, "third", "bravo")
     const home = "Home: Utrecht, Netherlands; time zone Asia/Tokyo; language nl-NL."
@@ -174,7 +184,7 @@ describe("Home and module instances (WP-12a/12b)", () => {
     // The clock's context: Alpha in Home's date format (en-US), Bravo in its own (nl-NL); both in Home's zone.
     expect(llm.requests[1]!.context).toMatch(/It is [A-Z][a-z]+day, [A-Z][a-z]+ \d{1,2}, \d{4}, .* local time \(Asia\/Tokyo\)\./)
     expect(llm.requests[2]!.context).toMatch(/It is [a-z]+dag \d{1,2} [a-z]+ \d{4}, .* local time \(Asia\/Tokyo\)\./)
-    expect(llm.requests[1]!.tools).toEqual(["current_time", "clock_time_now", "weather"])
+    expect(llm.requests[1]!.tools).toEqual(["current_time", "clock_time_now", "weather", "weather_rain_soon", "weather_forecast"])
     expect(llm.requests[2]!.tools).toEqual(["current_time", "clock_time_now"])
 
     // The weather tool without a place looks up Home, in Home's units.
@@ -256,7 +266,10 @@ describe("Home Assistant in the app (WP-12c)", () => {
       ["token", false],
       ["domains", true],
       ["aliases", false],
-      ["timeoutMs", false]
+      ["timeoutMs", false],
+      ["server", false],
+      ["lists", false],
+      ["test", false]
     ])
     const configured = await request(admin, { type: "module.configure", moduleId: "home-assistant", patch: { values: { baseUrl: ha.url }, secrets: { token: ha.token } } })
     expect(configured.ok).toBe(true)
@@ -276,5 +289,85 @@ describe("Home Assistant in the app (WP-12c)", () => {
     // The tool works against the server.
     const state = String(await Effect.runPromise(toolOf("alpha", "home_state")!.execute({}).pipe(Effect.map((v) => JSON.stringify(v)))))
     expect(state).toContain("Living room")
+  })
+})
+
+// P1 review round 3: the gateway refuses a principal whose parts do not belong together (gateway finding 6), and the
+// modules start only once serve mode has built what they depend on, also when the vault unlocks by itself at boot
+// (requirements/health finding 1).
+describe("module API v2 in serve mode (review round 3)", () => {
+  it("a principal must hang together: unknown device, assistant not on the device, another connection, a person, a local claim are refused", async () => {
+    const dataDir = await dataDirWith({ alpha: { greeter: { on: true, offTools: [] } }, bravo: { greeter: { on: true, offTools: [] } } }, [greeterModule])
+    const path = join(dataDir, "settings.json")
+    const file = JSON.parse(readFileSync(path, "utf8")) as Json
+    file.deviceTypes["web-voice"].assistants = [{ assistant: "alpha", phrases: ["hey alpha"] }]
+    writeFileSync(path, `${JSON.stringify(file, null, 2)}\n`)
+    server = await startTestServer({ build: fakeBuild({ stt: controlledStt().stt, llm: scriptedLlm(() => "").llm }), dataDir, catalog: [greeterModule] })
+    const voice = await connect()
+    await voice.hello()
+    const deviceId = voice.device.id
+    const host = server.handle.host
+    const part = (host.snapshot().assistantParts.get("alpha") ?? []).find((p) => p.moduleId === "greeter")!
+    const tool = part.module.tools!.find((t) => t.name === "greet")!
+    const as = async (principal: Principal) => {
+      const exit = await Effect.runPromise(Effect.exit(host.gateway.tool("greeter", tool, {}, { principal })))
+      return exit._tag === "Success" ? `ran: ${String(exit.value)}` : String((exit.cause as { readonly reasons?: ReadonlyArray<{ readonly error?: { readonly message?: string } }> }).reasons?.[0]?.error?.message ?? "failed")
+    }
+    const turn = (parts: Partial<TurnContext>): Principal => ({ _tag: "turn", turn: { turnId: 1, conversationId: "c", source: "voice", assistantId: "alpha", deviceId, ...parts } })
+    expect(await as(turn({}))).toBe("ran: hello")
+    expect(await as(turn({ deviceId: "d-nobody-knows" }))).toBe('Not run: the device "d-nobody-knows" is not known.')
+    expect(await as(turn({ assistantId: "bravo" }))).toBe(`Not run: the assistant "bravo" is not on the device "${deviceId}".`)
+    expect(await as(turn({ assistantId: "ghost" }))).toBe('Not run: the assistant "ghost" does not exist.')
+    expect(await as(turn({ connection: makeConnectionRef("another-tab") }))).toBe(`Not run: the request did not come from the device "${deviceId}".`)
+    // P5 filled in P1's placeholder ("this server knows no people yet"): a person must be in Members and the device's
+    // default person (servePeopleRooms.test.ts has the cases with people).
+    expect(await as(turn({ person: { id: "p1", how: "chosen" } }))).toBe("Not run: the person is not in Members.")
+    expect(await as(LOCAL_PRINCIPAL)).toBe("Not run: there is no local principal here.")
+    // Review round 4 (p1-r4b finding 5): a job's person is checked whether or not the job names a device. P5: the
+    // check is Members (this server has none here), with or without a device.
+    const job = (parts: Partial<JobOrigin>): Principal => ({ _tag: "job", job: { jobId: "j", moduleId: "greeter", ...parts } })
+    expect(await as(job({}))).toBe("ran: hello")
+    expect(await as(job({ person: { id: "nobody", how: "chosen" } }))).toBe("Not run: the person is not in Members.")
+    expect(await as(job({ assistantId: "alpha", person: { id: "nobody", how: "chosen" } }))).toBe("Not run: the person is not in Members.")
+    expect(await as(job({ assistantId: "alpha", deviceId, person: { id: "nobody", how: "chosen" } }))).toBe("Not run: the person is not in Members.")
+  })
+
+  it("with the vault unlocked at boot, a module starts after serve mode is built, and one nobody has on never starts", async () => {
+    const started: Array<string> = []
+    const probe = (id: string): ModuleDefinition<any> =>
+      defineModule({
+        apiVersion: 2,
+        id,
+        name: id,
+        description: "",
+        settings: { token: Setting.secret({ label: "Token" }) },
+        start: ({ host }) =>
+          Effect.sync(() => {
+            // Every attempt is recorded, before anything that could throw (review round 4, p1-r4c finding 9); serve
+            // mode builds the engine before it opens the host, so an attempt that does not see it is premature.
+            let ready = false
+            try {
+              ready = host.view().engine !== undefined
+            } catch {
+              ready = false
+            }
+            started.push(`${id}: ${ready ? "built" : "early"}`)
+            return {}
+          })
+      })
+    const dataDir = await dataDirWith({ alpha: { used: { on: true, offTools: [] } }, bravo: {} }, [probe("used"), probe("unused")])
+    const vaultPath = join(dataDir, "vault", "vault.enc")
+    const vault = await openVault({ path: vaultPath, kdf: { N: 2 ** 12, r: 8, p: 1 } })
+    await vault.setup("correct horse", { modules: { used: { token: "t1" }, unused: { token: "t2" } }, assistant: {} })
+    started.length = 0
+    server = await startTestServer({
+      build: fakeBuild({ stt: controlledStt().stt, llm: scriptedLlm(() => "").llm }),
+      dataDir,
+      catalog: [probe("used"), probe("unused")],
+      vaultPassword: "correct horse"
+    })
+    await until(() => started.length > 0)
+    expect(started).toEqual(["used: built"])
+    expect(server.handle.host.modules().find((m) => m.id === "unused")!.state).toBe("disabled")
   })
 })

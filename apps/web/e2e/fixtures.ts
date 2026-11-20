@@ -25,6 +25,7 @@ export type Scenario =
   | "latency"
   | "admin-disabled"
   | "admin-backoff"
+  | "health"
   | "nodes"
   | "nodes-empty"
 
@@ -105,17 +106,17 @@ export const mock = {
   idle: async (deviceId?: string, now = false) => {
     await fetch(`${MOCK}/mock/idle`, { method: "POST", body: JSON.stringify({ ...(deviceId === undefined ? {} : { deviceId }), now }) })
   },
-  /** Protocol 9: how the server reports itself in `result.pairing` and how the next box behaves (mock/nodes.ts `PairingConfig`). */
+  /** Protocol 12: how the server reports itself in `result.pairing` and how the next box behaves (mock/nodes.ts `PairingConfig`). */
   nodes: async (config: { tls?: boolean; tlsPin?: string | null; loopbackOnly?: boolean; built?: boolean; redeemAfterMs?: number; ttlMs?: number; hostname?: string; transport?: "ws" | "wss" }) => {
     const r = await fetch(`${MOCK}/mock/nodes`, { method: "POST", body: JSON.stringify(config) })
     expect(r.ok).toBe(true)
   },
-  /** Protocol 9: the box redeems a code (default: the newest). */
+  /** Protocol 12: the box redeems a code (default: the newest). */
   redeem: async (code?: string) => {
     const r = await fetch(`${MOCK}/mock/node/redeem`, { method: "POST", body: JSON.stringify(code === undefined ? {} : { code }) })
     expect(r.ok).toBe(true)
   },
-  /** Protocol 9: a node's state as the box would report it. */
+  /** Protocol 12: a node's state as the box would report it. */
   node: async (deviceId: string, patch: { online?: boolean; upToDate?: boolean; transport?: "ws" | "wss"; lastError?: string | null; status?: null }) => {
     const r = await fetch(`${MOCK}/mock/node`, { method: "POST", body: JSON.stringify({ deviceId, ...patch }) })
     expect(r.ok).toBe(true)

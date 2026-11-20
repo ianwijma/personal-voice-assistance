@@ -1,0 +1,78 @@
+name: Preview expiry
+
+# Once a day, removes the `preview` label from open PRs whose preview is older than MAX_AGE_DAYS,
+# and says so in a PR comment. The homelab cluster then deletes the preview deployment and its copy
+# of the data (docs/DEPLOYMENT.md). Adding the label again brings it back, with a fresh copy.
+#
+# A preview's age counts from the later of two moments: its head commit (committer date) and the
+# last time the label was added. So a push or a re-label gives it another MAX_AGE_DAYS.
+#
+# Scheduled workflows run only from the default branch.
+
+on:
+  schedule:
+    - cron: "23 4 * * *"
+  workflow_dispatch:
+    inputs:
+      dry-run:
+        description: List what would expire, change nothing
+        type: boolean
+        default: true
+
+env:
+  MAX_AGE_DAYS: 7
+  LABEL: preview
+
+concurrency:
+  group: preview-expiry
+
+permissions: {}
+
+jobs:
+  expire:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      issues: write
+      pull-requests: write
+    steps:
+      - name: Expire old previews
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          # Empty on the schedule, which means a real run.
+          DRY_RUN: ${{ inputs.dry-run }}
+        run: |
+          cutoff=$(( $(date +%s) - MAX_AGE_DAYS * 86400 ))
+          if [ "$DRY_RUN" = true ]; then echo "Dry run: nothing will be changed"; fi
+          prs=$(gh pr list --repo "$REPO" --state open --label "$LABEL" --limit 500 \
+            --json number,headRefOid,isCrossRepository \
+            --jq '.[] | select(.isCrossRepository | not) | [.number, .headRefOid] | @tsv')
+          if [ -z "$prs" ]; then
+            echo "No open PRs with the $LABEL label"
+            exit 0
+          fi
+          while IFS=$'\t' read -r pr sha; do
+            committed=$(gh api "repos/$REPO/commits/$sha" --jq .commit.committer.date)
+            labelled=$(gh api --paginate "repos/$REPO/issues/$pr/events" \
+              --jq ".[] | select(.event == \"labeled\" and .label.name == \"$LABEL\") | .created_at" | tail -n1)
+            newest=$(date -d "$committed" +%s)
+            if [ -n "$labelled" ] && [ "$(date -d "$labelled" +%s)" -gt "$newest" ]; then
+              newest=$(date -d "$labelled" +%s)
+            fi
+            since=$(date -u -d "@$newest" +%Y-%m-%d)
+            if [ "$newest" -ge "$cutoff" ]; then
+              echo "#$pr: head ${sha::7}, last pushed or labelled $since, keeping"
+              continue
+            fi
+            if [ "$DRY_RUN" = true ]; then
+              echo "#$pr: head ${sha::7}, last pushed or labelled $since, would expire"
+              continue
+            fi
+            echo "#$pr: head ${sha::7}, last pushed or labelled $since, expiring"
+            gh api -X DELETE "repos/$REPO/issues/$pr/labels/$LABEL" > /dev/null
+            gh api "repos/$REPO/issues/$pr/comments" -f body="### Preview expired
+
+          The preview for this PR was removed: nothing was pushed and the \`$LABEL\` label was not re-added for more than $MAX_AGE_DAYS days (last on $since).
+          Add the \`$LABEL\` label again to bring it back, with a fresh copy of production's data." > /dev/null
+          done <<< "$prs"

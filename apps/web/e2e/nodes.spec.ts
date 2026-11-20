@@ -2,7 +2,7 @@ import { type Page } from "@playwright/test"
 import { exampleNodePairing } from "@pva/protocol/examples"
 import { expect, loginAdmin, mock, test } from "./fixtures.ts"
 
-// Admin › Devices › Voice nodes (docs/VOICE-NODES.md §7, protocol 9), on the mock's `nodes` scenarios: Add voice node
+// Admin › Devices › Voice nodes (docs/VOICE-NODES.md §7, protocol 12), on the mock's `nodes` scenarios: Add voice node
 // (address → one-time code and install command → paired → its page), the node page's Status, Actions, Sound and
 // Sound devices, the sections a display-less device does not have, the "answers everything" warning, Remove, and no
 // sideways scroll on a 320 px phone. Mock data (`nodes`): Kitchen speaker (online, up to date, wss), Living room (online,

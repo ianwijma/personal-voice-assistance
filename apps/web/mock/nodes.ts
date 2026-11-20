@@ -1,11 +1,11 @@
 /**
- * The mock's voice nodes (protocol 9, docs/VOICE-NODES.md §5, §6.1, §7.4): the pairing settings the server would
+ * The mock's voice nodes (protocol 12, docs/VOICE-NODES.md §5, §6.1, §7.4): the pairing settings the server would
  * report, one-time codes, the node records a redeemed code makes, and the three sample nodes of the `nodes` scenario
  * (online and up to date; online with "Update pending" on plain `ws`; offline with a last error). No socket here: the
  * server (`server.ts`) answers the messages and stands in for the boxes (a sample node is "online" without a socket).
  */
 import { randomBytes } from "node:crypto"
-import { type DeviceCapabilities, type NodeInfo, type NodePairing, type NodePlatform, type NodeStatusBody, VOICE_NODE_KIND } from "@pva/protocol"
+import { type DeclaredCapabilities, type NodeInfo, type NodePairing, type NodePlatform, type NodeStatusBody, VOICE_NODE_KIND } from "@pva/protocol"
 import { exampleNodeCapabilities, exampleNodeHello, exampleNodePairing, exampleNodeStatus } from "@pva/protocol/examples"
 
 /** What `node.pair.create` reports about the server, and how the mock plays the box (POST /mock/nodes changes it). */
@@ -48,7 +48,8 @@ export interface NodeRecord {
   firstSeen: number
   lastSeen: number
   node: NodeInfo
-  capabilities: DeviceCapabilities
+  /** Protocol 11's last declaration (a node declares speaker and microphone in its hello). */
+  declared: DeclaredCapabilities
   /** Online without a socket: the mock stands in for the box. */
   virtual: boolean
 }
@@ -116,7 +117,7 @@ export const seedNodes = (now: number): Array<NodeRecord> => {
       firstSeen: now - 6 * DAY,
       lastSeen: now,
       virtual: true,
-      capabilities: structuredClone(exampleNodeCapabilities),
+      declared: { capabilities: structuredClone(exampleNodeCapabilities), seenAt: now },
       node: {
         pairedAt: now - 6 * DAY,
         version: BUNDLE.version,
@@ -134,7 +135,7 @@ export const seedNodes = (now: number): Array<NodeRecord> => {
       firstSeen: now - 20 * DAY,
       lastSeen: now,
       virtual: true,
-      capabilities: structuredClone(exampleNodeCapabilities),
+      declared: { capabilities: structuredClone(exampleNodeCapabilities), seenAt: now },
       node: {
         pairedAt: now - 20 * DAY,
         version: "0.0.9+0f9e8d7c6b",
@@ -165,7 +166,7 @@ export const seedNodes = (now: number): Array<NodeRecord> => {
       firstSeen: now - 3 * DAY,
       lastSeen: now - 3 * HOUR,
       virtual: false,
-      capabilities: structuredClone(exampleNodeCapabilities),
+      declared: { capabilities: structuredClone(exampleNodeCapabilities), seenAt: now },
       node: {
         pairedAt: now - 3 * DAY,
         version: BUNDLE.version,

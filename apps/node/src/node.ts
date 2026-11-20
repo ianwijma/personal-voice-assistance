@@ -3,7 +3,7 @@
  * connection to the assistant that is re-made for ever (docs/VOICE-NODES.md §8). Each connection gets a fresh
  * `Session`; the capture feeds whichever session is current and owns the audio.
  *
- * Protocol 9: `hello` carries the node's credential (`helloFor`); the pushed `sound` (volume, cues) and
+ * Protocol 12: `hello` carries the node's credential (`helloFor`); the pushed `sound` (volume, cues) and
  * `soundDevices` (input reopened, output used from the next play, a device that fails falls back to the default and
  * is reported as `lastError`) come with `snapshot.setup` / `device.setup`; `node.status` (`status.ts`) and
  * `node.level` go to the server; `node.command` is `identify`, `test-speaker`, `test-mic`, `restart` or `update`.
@@ -52,7 +52,7 @@ export interface NodeSettings {
 export const DEFAULT_VOLUME = 80
 
 /** What this node declares it can do (§5.2). */
-export const NODE_CAPABILITIES: DeviceCapabilities = { v: 1, speaker: { media: ["speech"] }, microphone: {} }
+export const NODE_CAPABILITIES: DeviceCapabilities = { v: 1, speaker: { media: ["speech"] }, microphone: { farField: false } }
 
 /** `hello.node` without the credential: the running version and bundle, and the box. */
 export type NodeIdentity = Omit<NodeHello, "credential">

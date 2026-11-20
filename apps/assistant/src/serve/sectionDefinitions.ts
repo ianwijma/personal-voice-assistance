@@ -1,13 +1,19 @@
 import { Setting, type SettingsCheck, type SettingsProblem, type SettingsSpec } from "@pva/core"
 import {
   type Condition,
+  DEFAULT_RISK_POLICY,
+  FIXED_REASON,
+  RISK_POLICY_KEYS,
+  riskPageTexts,
+  riskPolicyPatchProblems,
   CONVERSATION_IDLE_MINUTES_LIMITS,
   DEFAULT_CONVERSATION_IDLE_MINUTES,
   DEFAULT_MAX_VOICE_SESSIONS,
   DEFAULT_SESSION_DISCARD_MINUTES,
   type OptionTag,
   type SettingsGroup,
-  type SettingsPage
+  type SettingsPage,
+  type SettingValue
 } from "@pva/protocol"
 import * as SherpaStt from "@pva/stt-sherpa"
 import * as SherpaTts from "@pva/tts-sherpa"
@@ -18,6 +24,7 @@ import { isTtsProvider, ttsProviderInfo } from "../providers.ts"
 import { checkUrl, defaults as jevDefaults } from "@pva/decide-typesafe"
 import { checkAccountAddress } from "@pva/llm-openai-compatible"
 import { ASSISTANT_VOICE, DEFAULT_ASSISTANT_VOICE } from "../voiceSelection.ts"
+import { membersSection } from "./people.ts"
 
 /**
  * The assistant settings as the settings screen shows them (docs/SETTINGS-UI.md
@@ -45,6 +52,40 @@ export interface SectionDefinition {
   readonly protected?: boolean
   readonly spec: SettingsSpec
   readonly checks?: ReadonlyArray<SettingsCheck>
+  /**
+   * P5: the section's stored values after a valid save, before it is written (Members gives a new person an id), with
+   * `committed`, every saved value before this save (as `load` gives them). Must keep valid values valid. It may set
+   * the section's `storedKeys` too.
+   */
+  readonly normalize?: (
+    values: Readonly<Record<string, SettingValue>>,
+    committed: Readonly<Record<string, unknown>>
+  ) => Readonly<Record<string, SettingValue>>
+  /**
+   * P5 round 3: keys the server keeps for the section beside its fields (not shown, not editable, never from the
+   * environment), written by `normalize` with the section's values.
+   */
+  readonly storedKeys?: ReadonlyArray<string>
+  /**
+   * P5 round 3: the saved values as every reader sees them, made synchronously from the saved ones (Members repairs
+   * ids a hand-edited file left missing or twice). Must return the same object while nothing changed.
+   */
+  readonly load?: (stored: Readonly<Record<string, unknown>>) => Readonly<Record<string, unknown>>
+  /**
+   * P8: fields whose value is fixed (key → the value and why): shown locked with the reason, never written (a saved
+   * value of a hand-edited file is ignored: every reader sees the fixed value), and a save that sets one to anything
+   * else is refused with the reason.
+   */
+  readonly fixed?: Readonly<Record<string, { readonly value: string; readonly reason: string }>>
+  /**
+   * P8 (review round 1, H5): the section's own check of a patch's values, run first (before the fixed-field and generic
+   * form checks): any problem refuses the save with the first problem's message and all of them as field errors, and
+   * nothing is written. The web mock runs the same function.
+   */
+  readonly checkPatch?: (
+    values: Readonly<Record<string, unknown>>,
+    secrets: Readonly<Record<string, unknown>>
+  ) => ReadonlyArray<{ readonly key: string; readonly message: string }>
 }
 
 const reload = "reload" as const
@@ -121,16 +162,35 @@ const checkVoiceKey = (value: string): string | undefined => {
   return isTtsProvider(ref.provider) ? undefined : `There is no voice provider "${ref.provider}"`
 }
 
-/** An IANA time zone this machine knows (empty = this machine's own). */
+/** An IANA name, not a fixed offset such as "+01:00": recurrences store the zone as an iCalendar TZID (modules P2, review round 2). */
+const ianaZoneName = /^[A-Za-z][A-Za-z0-9_+\-]*(?:\/[A-Za-z0-9_+\-]+)*$/
+
+/** An IANA time zone this machine knows (empty = this machine's own). Fixed offsets ("+01:00", "+0100") are refused. */
 const checkTimeZone = (zone: string): string | undefined => {
-  if (zone.trim() === "") return undefined
+  const trimmed = zone.trim()
+  if (trimmed === "") return undefined
+  const refusal = "Unknown time zone (use an IANA name such as Europe/Amsterdam, not an offset)"
+  if (!ianaZoneName.test(trimmed)) return refusal
   try {
-    new Intl.DateTimeFormat("en", { timeZone: zone.trim() })
-    return undefined
+    const resolved = new Intl.DateTimeFormat("en", { timeZone: trimmed }).resolvedOptions().timeZone
+    return ianaZoneName.test(resolved) ? undefined : refusal
   } catch {
-    return "Unknown time zone (use an IANA name such as Europe/Amsterdam)"
+    return refusal
   }
 }
+
+/** Three capital letters. Any such code is accepted, also one ISO 4217 does not list (review round 2, finding 25). */
+const checkCurrency = (code: string): string | undefined =>
+  /^[A-Z]{3}$/.test(code) ? undefined : "Use a three-letter currency code in capitals, e.g. EUR"
+
+/**
+ * The API contact goes in a `User-Agent` header, which holds printable ASCII only: an address with accents or another script
+ * (an internationalised domain or mailbox) is refused with a hint rather than sent mangled.
+ */
+const checkApiContact = (contact: string): string | undefined =>
+  /^[\x20-\x7e]*$/.test(contact)
+    ? undefined
+    : "Use plain ASCII letters, digits and punctuation only: this goes in an HTTP header. Write an internationalised address in its ASCII form (xn--…, or %-encoded)"
 
 /**
  * The shared `home` section (docs/ASSISTANTS.md §2.4, §7.3): every assistant's prompt gets a Home line from it, and
@@ -152,7 +212,7 @@ export const homeSection: SectionDefinition = {
     }),
     HOME_TIME_ZONE: Setting.text({
       label: "Time zone",
-      description: "IANA name, e.g. Europe/Amsterdam. Empty: this machine's zone.",
+      description: "IANA name, e.g. Europe/Amsterdam (not an offset such as +01:00). Empty: this machine's zone.",
       env: "HOME_TIME_ZONE",
       placeholder: Intl.DateTimeFormat().resolvedOptions().timeZone,
       maxLength: 64,
@@ -187,8 +247,100 @@ export const homeSection: SectionDefinition = {
         { value: "en-US", label: "November 13, 2026" },
         { value: "nl-NL", label: "13 november 2026" }
       ]
+    }),
+    HOME_CURRENCY: Setting.text({
+      label: "Currency",
+      description: "Three-letter code of the household's money, e.g. EUR, USD, GBP (any three capital letters are accepted; use the ISO 4217 code). The default of modules that handle prices.",
+      env: "HOME_CURRENCY",
+      default: "EUR",
+      placeholder: "EUR",
+      maxLength: 3,
+      check: checkCurrency
+    }),
+    HOME_CUP_SIZE: Setting.choice({
+      label: "Cup size",
+      description: "How big \"a cup\" is in recipes and shopping lists.",
+      env: "HOME_CUP_SIZE",
+      default: "metric",
+      options: [{ value: "metric", label: "Metric cup (250 ml)" }, { value: "us", label: "US cup (236.6 ml)" }]
+    }),
+    HOME_API_CONTACT: Setting.text({
+      label: "API contact",
+      description: "An email address or web address put in the User-Agent of requests to public web services that ask who is calling. Empty: none is sent.",
+      env: "HOME_API_CONTACT",
+      placeholder: "you@example.com",
+      maxLength: 200,
+      check: checkApiContact
+    }),
+    HOME_AMBIENT_FACTS: Setting.choice({
+      label: "Household facts in every reply",
+      description: "Running timers, the next alarm and other short facts modules keep, told to the assistant with each turn (at most 600 characters), so any assistant can answer \"how long is left on the pasta?\". Off until its effect on the time to the first word is measured on your model (docs/STORING-DATA.md, \"Ambient facts\").",
+      env: "HOME_AMBIENT_FACTS",
+      default: "off",
+      options: [
+        { value: "all", label: "For every assistant" },
+        { value: "module-on", label: "Only for assistants that have the module on" },
+        { value: "off", label: "Off" }
+      ]
     })
   }
+}
+
+const riskWords = riskPageTexts("en")
+const outcomeOptions = [
+  { value: "allow", label: riskWords.outcomes.allow, description: "The assistant does it." },
+  { value: "confirm", label: riskWords.outcomes.confirm, description: "Refused, saying it needs your confirmation: the assistant cannot ask for it yet." },
+  { value: "deny", label: riskWords.outcomes.deny, description: "Refused, saying this household does not allow it." }
+] as const
+const refuseOnly = [{ value: "deny", label: riskWords.outcomes.deny }] as const
+
+/**
+ * P8: the household's risk policy (docs/MODULES.md §4, docs/MODULES-PLAN.md §4 P8 "First version"): what the
+ * assistant does with each kind of thing a tool or action would do, for every assistant on every device (one level:
+ * no assistant or device narrows it). Read at every call and every tool list (`decodeRiskPolicy` over these keys);
+ * a save applies to the next call. `money` and `security` are fixed at Refuse. Admin only.
+ */
+export const riskSection: SectionDefinition = {
+  id: "risk",
+  title: "Risk policy",
+  group: "modules",
+  page: {
+    id: "risk",
+    title: "Risk policy",
+    description: "What the assistant may do on its own, for every assistant on every device. A refused call is not run; the assistant says why."
+  },
+  order: 7,
+  protected: true,
+  spec: {
+    [RISK_POLICY_KEYS.read]: Setting.choice({
+      label: riskWords.classes.read,
+      description: "Lookups that change nothing: the weather, what is on a list, the time.",
+      env: RISK_POLICY_KEYS.read,
+      default: DEFAULT_RISK_POLICY.read,
+      options: outcomeOptions
+    }),
+    [RISK_POLICY_KEYS.change]: Setting.choice({
+      label: riskWords.classes.change,
+      description: "Lights, timers, lists, reminders, speaking or ringing on the house's own devices.",
+      env: RISK_POLICY_KEYS.change,
+      default: DEFAULT_RISK_POLICY.change,
+      options: outcomeOptions
+    }),
+    [RISK_POLICY_KEYS.message]: Setting.choice({
+      label: riskWords.classes.message,
+      description: "Mail, chat or a call to people outside the house, or anything in your name on an outside channel. No module sends one yet.",
+      env: RISK_POLICY_KEYS.message,
+      default: DEFAULT_RISK_POLICY.message,
+      options: outcomeOptions
+    }),
+    [RISK_POLICY_KEYS.money]: Setting.choice({ label: riskWords.classes.money, description: "Purchases and payments.", default: "deny", options: refuseOnly }),
+    [RISK_POLICY_KEYS.security]: Setting.choice({ label: riskWords.classes.security, description: "Unlocking, disarming, opening a garage door or a gate.", default: "deny", options: refuseOnly })
+  },
+  fixed: {
+    [RISK_POLICY_KEYS.money]: { value: "deny", reason: FIXED_REASON },
+    [RISK_POLICY_KEYS.security]: { value: "deny", reason: FIXED_REASON }
+  },
+  checkPatch: riskPolicyPatchProblems
 }
 
 /**
@@ -296,6 +448,8 @@ const openAiAccountsSection: SectionDefinition = {
 export const sectionDefinitions = (dirs: ModelDirs = defaultModelDirs): ReadonlyArray<SectionDefinition> => {
   return [
     homeSection,
+    membersSection,
+    riskSection,
     openAiAccountsSection,
     // ---- Language model
     {

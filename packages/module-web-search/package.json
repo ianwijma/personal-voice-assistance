@@ -1,0 +1,31 @@
+{
+  "name": "@pva/module-web-search",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "scripts": {
+    "check": "tsc -p tsconfig.json",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "@mozilla/readability": "catalog:",
+    "@pva/core": "workspace:*",
+    "@pva/language": "workspace:*",
+    "@pva/module-contracts": "workspace:*",
+    "@pva/net": "workspace:*",
+    "effect": "catalog:",
+    "linkedom": "catalog:",
+    "pdfjs-dist": "catalog:",
+    "turndown": "catalog:"
+  },
+  "devDependencies": {
+    "@effect/vitest": "catalog:",
+    "@types/node": "catalog:",
+    "@types/turndown": "catalog:",
+    "typescript": "catalog:",
+    "vitest": "catalog:"
+  }
+}

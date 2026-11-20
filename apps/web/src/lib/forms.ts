@@ -37,8 +37,8 @@ export const setDraftValue = (draft: Draft, key: string, value: SettingValue): D
 
 /** "Reset to default": the draft shows the default, and the save removes the saved value. */
 export const resetDraftValue = (draft: Draft, field: SettingField): Draft => {
-  if (field.type === "secret") return draft
-  return { ...draft, values: { ...draft.values, [field.key]: field.default }, reset: [...(draft.reset ?? []).filter((k) => k !== field.key), field.key] }
+  if (field.type === "secret" || field.type === "action" || field.type === "info") return draft
+  return { ...draft, values: { ...draft.values, [field.key]: field.default as SettingValue }, reset: [...(draft.reset ?? []).filter((k) => k !== field.key), field.key] }
 }
 
 /**
@@ -52,10 +52,29 @@ export const fieldVisible = (field: SettingField, lookup: (key: string) => unkno
 export const draftLookup = (draft: Draft, fallback: (key: string) => unknown) => (key: string): unknown =>
   Object.hasOwn(draft.values, key) ? draft.values[key] : fallback(key)
 
+/** Equal values; lists (of text or, protocol 10, of records) are compared deeply. */
 export const valueEqual = (a: SettingValue | undefined, b: SettingValue | undefined): boolean => {
-  if (Array.isArray(a) && Array.isArray(b)) return a.length === b.length && a.every((x, i) => x === b[i])
+  if (Array.isArray(a) && Array.isArray(b)) return a.length === b.length && a.every((x, i) => deepEqual(x, b[i]))
   return a === b
 }
+
+const deepEqual = (a: unknown, b: unknown): boolean => {
+  if (a === b) return true
+  if (Array.isArray(a) && Array.isArray(b)) return a.length === b.length && a.every((x, i) => deepEqual(x, b[i]))
+  if (typeof a !== "object" || typeof b !== "object" || a === null || b === null || Array.isArray(a) || Array.isArray(b)) return false
+  const ka = Object.keys(a)
+  const kb = Object.keys(b)
+  return ka.length === kb.length && ka.every((k) => Object.hasOwn(b, k) && deepEqual((a as Record<string, unknown>)[k], (b as Record<string, unknown>)[k]))
+}
+
+/** `record[key]` when `key` is the record's own (a field named `constructor` is not `Object`), else `undefined`. */
+export const ownValue = <V>(record: Readonly<Record<string, V>>, key: string): V | undefined => (Object.hasOwn(record, key) ? record[key] : undefined)
+
+/** Fields whose value the owner sets (protocol 10: an `action` has none, an `info` value is the server's). */
+export const hasOwnerValue = (field: SettingField): boolean => field.type !== "action" && field.type !== "info"
+
+/** A field's default (secrets, actions and info values have none). */
+export const fieldDefault = (field: SettingField): SettingValue | undefined => ("default" in field ? field.default : undefined)
 
 /**
  * The patch for the fields the user edited (changed from the draft's base). Locked fields are never sent, nor
@@ -65,13 +84,13 @@ export const computePatch = (form: SettingsForm, draft: Draft, shown: (field: Se
   const values: Record<string, SettingValue | null> = {}
   const secrets: Record<string, string | null> = {}
   for (const field of form.fields) {
-    if (field.locked !== undefined || !shown(field)) continue
+    if (field.locked !== undefined || !shown(field) || !hasOwnerValue(field)) continue
     if (field.type === "secret") {
       if (field.key in draft.secrets) secrets[field.key] = draft.secrets[field.key]!
       continue
     }
-    const next = draft.values[field.key]
-    if (draft.reset?.includes(field.key) === true && field.source === "saved" && valueEqual(next, field.default)) {
+    const next = ownValue(draft.values, field.key)
+    if (draft.reset?.includes(field.key) === true && field.source === "saved" && valueEqual(next, fieldDefault(field))) {
       values[field.key] = null
       continue
     }
@@ -119,13 +138,17 @@ export interface FormSync {
  * every other field takes the new server value, the new values become the base
  * (so a save sends only the edits), and the form is marked stale ("Changed in
  * another tab"). A field changed on both sides keeps the user's edit.
+ *
+ * `invalid`: the fields that show a local error (text a renderer could not take yet). The same rule as Save and Test:
+ * such a field is edited, so it keeps its draft value (and its renderer, with the text being typed) and the form is
+ * marked stale, never silently replaced under its error.
  */
-export const reconcile = (sync: FormSync, previous: SettingsForm, next: SettingsForm, revision: number): FormSync => {
+export const reconcile = (sync: FormSync, previous: SettingsForm, next: SettingsForm, revision: number, invalid: ReadonlyArray<string> = []): FormSync => {
   if (revision <= sync.baseRevision) return sync
-  if (!isDirty(previous, sync.draft)) return { draft: initialDraft(next), baseRevision: revision, stale: false }
+  if (!isDirty(previous, sync.draft) && invalid.length === 0) return { draft: initialDraft(next), baseRevision: revision, stale: false }
   const values: Record<string, SettingValue> = { ...next.values }
   for (const key of Object.keys(sync.draft.values)) {
-    if (edited(sync.draft, key)) values[key] = sync.draft.values[key]!
+    if (edited(sync.draft, key) || invalid.includes(key)) values[key] = sync.draft.values[key]!
   }
   return {
     draft: {

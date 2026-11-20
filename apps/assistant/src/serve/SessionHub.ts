@@ -1,11 +1,13 @@
 import type { AudioClientLink } from "@pva/audio-web"
-import type { HostResult, ModuleHost } from "@pva/core"
+import { adminModules, type ConnectionRef, type HostDeviceView, type HostResult, makeConnectionRef, type ModuleHost, type NotifyEngine, type PresentEngine, STOP_ACTION, withinModuleFrame } from "@pva/core"
 import {
   type AdminSnapshot,
   type AdminState,
   type ClientMessage,
   CloseCode,
+  type DeviceCapabilities,
   type DeviceHello,
+  type DeviceLiveState,
   deviceTypeOf,
   engineSummary,
   decodeClientMessage,
@@ -16,6 +18,7 @@ import {
   MAX_PASSWORD_CHARS,
   type NodePairing,
   micSequenceGap,
+  type ModuleInfo,
   PROTOCOL_VERSION,
   type RequestId,
   type ServerMessage,
@@ -28,7 +31,9 @@ import { Effect } from "effect"
 import type { AccessPolicy } from "./access.ts"
 import type { AdminSessions, SessionEndReason } from "./AdminSessions.ts"
 import type { AssistantResult, Assistants } from "./assistants.ts"
+import { type ActionOutcome, moduleActionOutcome } from "./moduleAction.ts"
 import type { Engine } from "./Engine.ts"
+import type { HealthService } from "./health.ts"
 import type { EnvMover } from "./envSettings.ts"
 import type { DeviceRegistry, DeviceResult } from "./devices.ts"
 import type { Jobs } from "./jobs.ts"
@@ -64,7 +69,13 @@ import type { VoiceSessions } from "./VoiceSessions.ts"
  * turns, replies, wake, conversation) go to its device's connections only (`toSession`); shared ones (engine
  * summary, jobs, …) are broadcast. The device's profile configures its session (`VoiceSession.syncProfile`).
  *
- * Protocol 9 (docs/VOICE-NODES.md §6.1): a hello that is a voice node's (its device names a paired node's id, its kind
+ * P5 (docs/ARCHITECTURE.md, "People, rooms and device capabilities"): a change of what a device may be told or sent
+ * ends its session and closes its connections in the commit's own step (`endSessions`, `CloseCode.settingsChanged`);
+ * reply audio is checked at every frame against the committed settings (`speakerAllowed`); a device the server has no
+ * record of is welcomed once its first registration is written; every text message is numbered on arrival, so
+ * declarations keep the order they arrived in whatever is coalesced or queued.
+ *
+ * Protocol 12 (docs/VOICE-NODES.md §6.1): a hello that is a voice node's (its device names a paired node's id, its kind
  * is `voice-node`, it carries `hello.node`, or, without a device, its client id is a paired node's id) must carry the
  * credential of that node's record (`Nodes.checkHello`), else the connection is closed with 4403 before any
  * `welcome`. A browser therefore can neither take a node's id nor create a node. `node.status` and `node.level` come
@@ -118,6 +129,11 @@ export interface SessionHub {
    */
   readonly nodeBundleChanged: () => void
   /**
+   * P5: device types or devices were saved outside a `device.save` (a removed person cleared from them): as after a
+   * save, sessions and voice pages apply them and admin gets the lists again.
+   */
+  readonly entitiesChanged: () => void
+  /**
    * One final transcript of a session, for admin connections with the phrase tester on that follow it (`wake.heard`;
    * `wake.test.deviceId`, else the most recently active session): the phrase it matched, and whether its wake gate
    * accepted it. `source`: the session's device and the matched phrase's assistant there, sent as they are, so the
@@ -130,6 +146,54 @@ export interface SessionHub {
     accepted: boolean,
     source: { readonly deviceId?: string; readonly assistantId?: string }
   ) => void
+  /** The known devices with their open connections now, most recently seen first (`ModuleHostApi.view().devices`). */
+  readonly deviceViews: () => ReadonlyArray<HostDeviceView>
+  /** The connection that owns a session's audio now (a voice turn's `CurrentTurn.connection`). */
+  readonly audioOwnerOf: (sessionKey: string) => ConnectionRef | undefined
+  /** The device a connection said hello as (its id), while it is open; `undefined` otherwise. */
+  readonly deviceOfConnection: (ref: ConnectionRef) => string | undefined
+  /** A connection of this device is open now (it said hello; its record may not be saved yet). */
+  readonly deviceConnected: (deviceId: string) => boolean
+  /** The open voice connections, for household pushes (`HouseholdPush.ts`). */
+  readonly voiceConnections: () => ReadonlyArray<VoiceConnection>
+  /** P5: whether a device is connected now, whether one of its tabs is visible, and when it was last used. */
+  readonly deviceLive: (id: string) => { readonly connected: boolean; readonly visible: boolean; readonly lastInteractionAt?: number | undefined }
+  /**
+   * P5: the boundary of some devices changed (`deviceFacts.ts`; called in the step that commits the change). For every
+   * voice session and voice connection whose device `affected` names (`undefined`: a page without a device),
+   * synchronously and before anything else can run for it: its session is ended (`VoiceSessions.endDevice`: it sends
+   * nothing more, its conversations and agents' sessions end, its conversation-scoped rows go) and its connections are
+   * closed with `CloseCode.settingsChanged`, so nothing more is sent on them. Their pages reconnect and start afresh.
+   * Returns how many connections were closed.
+   */
+  readonly endSessions: (affected: (deviceId: string | undefined, kind: string | undefined) => boolean) => number
+}
+
+/**
+ * A voice connection as the household push sees it: the device id it claimed in `hello` (not authenticated: §2 rows 5
+ * and 7 of docs/MODULES-PLAN.md) and a send that checks it is still open. What the device is called is the server's
+ * record of it, looked up by the push (`makeHouseholdPush({ device })`), never what the page said; P5: so are its
+ * room, privacy and default person (`DeviceFacts.targetOf`).
+ */
+export interface VoiceConnection {
+  readonly id: string
+  readonly deviceId: string | undefined
+  readonly send: (message: ServerMessage) => void
+  /** What this connection's own page declared last (its hello, then `device.caps`); P10 sends it only the kinds in it. */
+  readonly declared?: () => DeviceCapabilities | undefined
+}
+
+/** What the hub tells the household push (docs/STORING-DATA.md "Pages"). */
+export interface HouseholdHooks {
+  /** A voice connection finished its hello: send it a fresh snapshot, then the changes after it. */
+  readonly connected: (connection: VoiceConnection) => void
+  /** That connection closed: stop sending to it. */
+  readonly closed: (connection: VoiceConnection) => void
+  /** A device's record may have changed (a save, a newly recorded device): pages whose device record changed get a fresh snapshot. */
+  readonly devicesChanged: () => void
+  /** A device's first connection opened / its last one closed (`host.device.connected` / `.disconnected`). */
+  readonly deviceConnected: (deviceId: string) => void
+  readonly deviceDisconnected: (deviceId: string) => void
 }
 
 export interface HubOptions {
@@ -158,6 +222,36 @@ export interface HubOptions {
   readonly nodes?: Nodes
   /** Settings from outside the UI and "Move to settings". Absent: no `env` in the snapshot, moves refused. */
   readonly env?: EnvMover
+  /** Household data for voice pages and device events (P4). Absent: none sent. */
+  readonly household?: HouseholdHooks
+  /**
+   * P9: the notification service (docs/NOTIFICATIONS.md). The device is reconciled (`reconcile`: what each of its
+   * voice connections holds made equal to what is open and allowed now) when a connection of it says hello (once its
+   * record is written), when one closes and when its declaration changes; a card's button is `notification.action`
+   * (a module action through the bounded admission, `stop` outside it), answered with `result` (`say`); the page's
+   * Stop reaches the announcement being spoken (`stopSpeech`). Absent: none of it.
+   */
+  readonly notify?: Pick<NotifyEngine, "reconcile" | "press" | "stopSpeech" | "busyAnswer">
+  /**
+   * P7: a device's reply volume when it is not the default (`DeviceControl`), sent as `output.volume` to each of its
+   * voice connections right after its `welcome`. Absent, or `undefined` for the device: nothing is sent.
+   */
+  readonly replyVolume?: (deviceId: string) => number | undefined
+  /**
+   * P10: the Presenter (docs/PRESENTING.md). The device is reconciled at the same moments as for notifications (a hello
+   * once its record is written, a close, a changed declaration); a tick or a button is `present.action`, through the
+   * bounded admission, answered with `result` (`say`). Absent: none of it.
+   */
+  readonly present?: Pick<PresentEngine, "reconcile" | "press" | "busyAnswer">
+  /** P5: a device's connections, declaration or live state changed (the device facts rebuild their list). */
+  readonly onDeviceChange?: () => void
+  /**
+   * P5: whether reply audio may be sent to a device now (its effective speaker, from the committed settings and its
+   * latest declaration). Read for every audio frame where it leaves, and for typed `speak`. Absent: always.
+   */
+  readonly speakerAllowed?: (deviceId: string | undefined, kind?: string) => boolean
+  /** Diagnostics › Health (`health`, `health.check`). Absent: no `health` in the admin snapshot, checks refused. */
+  readonly health?: HealthService
   /** Model downloads (jobs). Absent: none offered. */
   readonly models?: Models
   readonly jobs?: Jobs
@@ -189,12 +283,15 @@ export const ADMIN_ONLY: ReadonlySet<ServerMessageType> = new Set<ServerMessageT
   "sessions",
   "trace",
   "wake.heard",
+  "health",
   "node.paired",
   "node.meter"
 ])
 
 interface Client {
   readonly connection: HubConnection
+  /** This connection as a turn names it (`CurrentTurn.connection`, module API v2): opaque, one per connection. */
+  readonly ref: ConnectionRef
   helloed: boolean
   closed: boolean
   clientId: string | undefined
@@ -222,7 +319,43 @@ interface Client {
   nodeId: string | undefined
   /** The device whose session the phrase tester follows (`undefined`: the most recently active one). */
   wakeTestDevice: string | undefined
+  /** This connection for household pushes (voice connections, after hello). */
+  voice?: VoiceConnection
+  /**
+   * P5: the household feed follows this connection. A device the server has not recorded yet starts once its first
+   * registration is written, so its first snapshot is of the place it has (not one of an unknown device, at once
+   * replaced).
+   */
+  householdStarted?: boolean
+  /** P9: this connection was given what is open for its device (once its device is known). */
+  notifyStarted?: boolean
+  /** P5: this tab is visible (until it says otherwise) and when it was last used (`device.caps.live`). */
+  visible: boolean
+  lastInteractionAt: number | undefined
+  /**
+   * P5: the latest `device.caps` not handled yet (coalesced: at most one handled per `CAPS_MIN_GAP_MS`). A
+   * declaration keeps the number it got when it arrived (`DeviceRegistry.arrival`), so one held back here never
+   * replaces one that arrived later on another tab.
+   */
+  capsPending: { capabilities?: { readonly value: DeviceCapabilities; readonly seq: number }; live?: DeviceLiveState } | undefined
+  /** P10: what this connection's own page declared last (its hello, then each `device.caps` as it arrives). */
+  ownCaps?: DeviceCapabilities | undefined
+  capsTimer: ReturnType<typeof setTimeout> | undefined
+  capsHandledAt: number
+  /**
+   * P5: the hello of a device the server has no record of yet is answered once its first registration is written
+   * (decided against committed state from its first turn on). Messages in between are kept (at most
+   * `MAX_QUEUED_BEFORE_WELCOME`) and handled after the welcome.
+   */
+  registering: boolean
+  queued: Array<{ readonly text: string; readonly arrival: number }>
 }
+
+/** Text messages kept while a new device's hello waits for its registration (a page sends none before its welcome). */
+const MAX_QUEUED_BEFORE_WELCOME = 32
+
+/** P5: a connection's `device.caps` are handled at most this often; later ones in between are coalesced to the latest. */
+export const CAPS_MIN_GAP_MS = 500
 
 /** Who owns a session's audio (per device), and what the hub remembers about it. */
 interface Ownership {
@@ -237,7 +370,7 @@ const MIC_GAP_ERROR_INTERVAL_MS = 10_000
 
 /** `node.pair.create`'s answer: `result.pairing`. */
 type PairResult = { readonly ok: true; readonly pairing: NodePairing } | { readonly ok: false; readonly error: ErrorInfo }
-type Outcome = HostResult | DeviceResult | AssistantResult | PairResult
+type Outcome = HostResult | DeviceResult | AssistantResult | ActionOutcome | PairResult
 
 const ADMIN_REQUIRED_MESSAGE = "This needs the admin page: log in there with the admin password"
 
@@ -372,9 +505,11 @@ export const makeSessionHub = (options: HubOptions): SessionHub => {
           ok: true,
           ...("assistantId" in outcome && outcome.assistantId !== undefined ? { assistantId: outcome.assistantId } : {}),
           ...("rev" in outcome && outcome.rev !== undefined ? { rev: outcome.rev } : {}),
+          ...("action" in outcome ? { action: outcome.action } : {}),
+          ...("say" in outcome && typeof outcome.say === "string" ? { say: outcome.say } : {}),
           ...("pairing" in outcome && outcome.pairing !== undefined ? { pairing: outcome.pairing } : {})
         }
-        : { type: "result", requestId, ok: false, error: outcome.error }
+        : { type: "result", requestId, ok: false, error: outcome.error, ...("say" in outcome && typeof outcome.say === "string" ? { say: outcome.say } : {}) }
     )
 
   const failure = (code: ErrorInfo["code"], message: string): HostResult => ({ ok: false, error: { code, message } })
@@ -387,10 +522,12 @@ export const makeSessionHub = (options: HubOptions): SessionHub => {
     client: Client,
     requestId: RequestId,
     work: Effect.Effect<Outcome, never>,
-    after?: (r: Outcome) => void
+    after?: (r: Outcome) => void,
+    /** The answer when the bound refuses it (default: the hub's own). */
+    refused?: () => HostResult
   ) => {
     if (client.pending >= maxPendingPerConnection || pendingTotal >= maxPendingTotal) {
-      return result(client, requestId, failure("busy", "Too many changes at once; try again in a moment"))
+      return result(client, requestId, refused?.() ?? failure("busy", "Too many changes at once; try again in a moment"))
     }
     client.pending++
     pendingTotal++
@@ -424,9 +561,33 @@ export const makeSessionHub = (options: HubOptions): SessionHub => {
     for (const c of clients) if (!c.closed && c.helloed && c.sessionKey === key) n++
     return n
   }
+  /** P5: a device is connected, one of its tabs is visible, and its last interaction over all tabs. */
+  const deviceLive = (id: string) => {
+    let connected = false
+    let visible = false
+    let lastInteractionAt: number | undefined
+    for (const c of clients) {
+      if (c.closed || !c.helloed || c.device?.id !== id) continue
+      connected = true
+      if (c.visible) visible = true
+      if (c.lastInteractionAt !== undefined && (lastInteractionAt === undefined || c.lastInteractionAt > lastInteractionAt)) lastInteractionAt = c.lastInteractionAt
+    }
+    return { connected, visible, lastInteractionAt }
+  }
+  /** Admin's list of devices: protocol 7's with what each declared last and, while connected, its live state. */
+  const deviceList = () =>
+    assistants.devices(registry.devices(live), options.nodes?.info).map((d) => {
+      const declared = registry.declaredOf(d.id)
+      const l = deviceLive(d.id)
+      return {
+        ...d,
+        ...(declared !== undefined ? { declared } : {}),
+        ...(l.connected ? { live: { visible: l.visible, ...(l.lastInteractionAt !== undefined ? { lastInteractionAt: l.lastInteractionAt } : {}) } } : {})
+      }
+    })
+  const deviceChanged = () => options.onDeviceChange?.()
+  const speakerAllowed = (client: Client) => options.speakerAllowed?.(client.device?.id, client.device?.kind) ?? true
   const connectedDevices = () => new Set([...clients].flatMap((c) => (c.device !== undefined && !c.closed ? [c.device.id] : [])))
-
-  const deviceList = () => [...assistants.devices(registry.devices(live), options.nodes?.info)]
 
   let devicesTimer: ReturnType<typeof setTimeout> | undefined
   let devicesSentAt = -Infinity
@@ -467,8 +628,13 @@ export const makeSessionHub = (options: HubOptions): SessionHub => {
   }
 
   const refreshDevices = () => {
+    deviceChanged()
     for (const session of sessions.all()) session.syncProfile()
     refreshSetups()
+    // Pages whose device record changed (its name; P5: its room, or a person added to Members) get a fresh snapshot. A
+    // change of privacy or default person never needs one: it ends the device's session with its connections
+    // (`endSessions`), and the successor starts from its own snapshot.
+    options.household?.devicesChanged()
   }
 
   /** Send `device.setup` to every voice connection whose setup changed (never to admin connections: it is the voice page's). */
@@ -502,11 +668,34 @@ export const makeSessionHub = (options: HubOptions): SessionHub => {
     devicesChanged(false)
     sessionsChanged(false)
   }
+  /** P5: the household feed starts following a voice connection (its first snapshot). */
+  const startHousehold = (client: Client) => {
+    if (client.voice === undefined || client.householdStarted === true || client.closed || options.household === undefined) return
+    client.householdStarted = true
+    options.household.connected(client.voice)
+  }
+
+  /** P9: a voice connection of a known device gets the cards of what is open for its device (that connection only). */
+  const startNotify = (client: Client) => {
+    if (client.role !== "voice" || client.device === undefined || client.notifyStarted === true || client.closed || options.notify === undefined) return
+    client.notifyStarted = true
+    options.notify.reconcile(client.device.id)
+    // P10: and the presentations shown there (its pinned ones again after a reconnect).
+    options.present?.reconcile(client.device.id)
+  }
+
   /** Remember the device of this connection (background save), then push what changed. `node`: an authenticated node's facts. */
   const registerDevice = (device: DeviceHello, node?: Parameters<DeviceRegistry["seen"]>[2]) =>
     options.run(Effect.andThen(registry.seen(device, connectedDevices(), node), Effect.sync(() => {
       refreshDevices()
       devicesChanged(false)
+      // Written (or refused): the device's connections that waited for it start their feed now.
+      for (const c of clients) {
+        if (c.device?.id === device.id && c.helloed) {
+          startHousehold(c)
+          startNotify(c)
+        }
+      }
     })))
 
   /** Close every connection of a device with 4403 (a node removed or paired again elsewhere). */
@@ -523,6 +712,96 @@ export const makeSessionHub = (options: HubOptions): SessionHub => {
     devicesChanged(false)
   })
 
+  /**
+   * P5: a declaration of a connection's device (`hello`, `device.caps`) with its number of arrival: known at once
+   * (unless one that arrived later was applied already), written in the background.
+   */
+  const declare = (deviceId: string, capabilities: DeviceCapabilities, seq: number, kind?: string) => {
+    const spoke = options.speakerAllowed?.(deviceId, kind) ?? true
+    if (!registry.declare(deviceId, capabilities, seq)) return false
+    options.run(registry.persist)
+    // Review round 3: a declaration that takes speech away stops the reply in flight at once, by the same path as the
+    // page's Stop (the page is told to stop and flush what it holds), also while synthesis is paused; the send-time
+    // gate (`linkFor`) stays.
+    deviceChanged()
+    // P9: what the device's pages hold follows its new outputs (a ring silenced, a card withdrawn or given back).
+    options.notify?.reconcile(deviceId)
+    // P10: and what it shows (a display taken away withdraws it; a kind it now draws is sent).
+    options.present?.reconcile(deviceId)
+    if (spoke && !(options.speakerAllowed?.(deviceId, kind) ?? true)) {
+      const session = sessions.get(deviceId)
+      if (session !== undefined && session.publisher.committedTurn() !== undefined) session.conversation.stop()
+      // P9: an announcement being spoken stops too, through the service (its play is interrupted, which tells the page
+      // to stop and flush what it holds, as for a reply). An output override is a boundary change: it ends the session,
+      // and the announcement with it (`VoiceSession.announce`).
+      if (session?.announce.playing() !== undefined) options.run(Effect.asVoid(options.notify?.stopSpeech(deviceId) ?? Effect.void))
+    }
+    return true
+  }
+
+  /** P5: one connection's latest `device.caps`, handled at most once per `CAPS_MIN_GAP_MS`. */
+  const handleCaps = (client: Client) => {
+    client.capsTimer = undefined
+    const pending = client.capsPending
+    client.capsPending = undefined
+    const device = client.device
+    if (pending === undefined || device === undefined || client.closed) return
+    client.capsHandledAt = performance.now()
+    let changed = false
+    if (pending.live !== undefined) {
+      const at = pending.live.lastInteractionAt === undefined ? client.lastInteractionAt : Math.min(pending.live.lastInteractionAt, Date.now())
+      if (client.visible !== pending.live.visible || at !== client.lastInteractionAt) {
+        client.visible = pending.live.visible
+        client.lastInteractionAt = at
+        changed = true
+      }
+    }
+    const declared = pending.capabilities !== undefined && declare(device.id, pending.capabilities.value, pending.capabilities.seq, device.kind)
+    if (!changed && !declared) return
+    deviceChanged()
+    devicesChanged(true)
+    // What it declared decides whether its setup says replies are spoken here.
+    if (declared) refreshSetups()
+  }
+
+  /** See `SessionHub.endSessions`. Synchronous: nothing else runs between the commit that called it and its end. */
+  const endSessions = (affected: (deviceId: string | undefined, kind: string | undefined) => boolean): number => {
+    const keys = new Set<string>()
+    const judge = (deviceId: string | undefined, kind: string | undefined) => {
+      try {
+        return affected(deviceId, kind)
+      } catch {
+        return true
+      }
+    }
+    for (const session of sessions.all()) {
+      const deviceId = session.deviceId
+      if (judge(deviceId, deviceId === undefined ? undefined : registry.kindOfDevice(deviceId))) keys.add(session.key)
+    }
+    for (const client of clients) {
+      if (client.closed || client.role !== "voice" || client.sessionKey === undefined) continue
+      if (judge(client.device?.id, client.device?.kind)) keys.add(client.sessionKey)
+    }
+    let closed = 0
+    for (const key of keys) {
+      // The session first (marked ended, removed, its ownership forgotten), then every connection of its device.
+      sessions.endDevice(key)
+      owners.delete(key)
+      for (const client of [...clients]) {
+        if (client.closed || client.sessionKey !== key || client.role !== "voice") continue
+        // A voice node whose record is gone (removed in this commit) has no credential any more: 4403, not a reconnect.
+        if (client.nodeId !== undefined && registry.nodeOf(client.nodeId) === undefined) drop(client, CloseCode.unauthorized, "this voice node was removed")
+        else drop(client, CloseCode.settingsChanged, "settings changed")
+        closed++
+      }
+    }
+    if (keys.size > 0) {
+      sessionsChanged(false)
+      devicesChanged(true)
+    }
+    return closed
+  }
+
   // ---- Ownership
 
   const linkFor = (client: Client): AudioClientLink =>
@@ -530,6 +809,8 @@ export const makeSessionHub = (options: HubOptions): SessionHub => {
       sendMessage: (message) => send(client, message),
       sendBinary: (data) => {
         if (client.closed || overLimit(client)) return
+        // P5: where audio leaves, against the committed settings and the latest declaration (every frame).
+        if (!speakerAllowed(client)) return
         client.connection.sendBinary(data)
       }
     }
@@ -583,9 +864,27 @@ export const makeSessionHub = (options: HubOptions): SessionHub => {
   const lost = (client: Client) => {
     if (client.helloTimer !== undefined) clearTimeout(client.helloTimer)
     if (!clients.delete(client)) return
+    if (client.voice !== undefined) options.household?.closed(client.voice)
+    if (client.capsTimer !== undefined) clearTimeout(client.capsTimer)
+    client.capsTimer = undefined
+    // A declaration this tab still held back (its coalescing) is the device's, not the tab's: applied now, with its
+    // number of arrival (a later one from another tab still wins).
+    const held = client.capsPending?.capabilities
+    client.capsPending = undefined
+    if (held !== undefined && client.device !== undefined && declare(client.device.id, held.value, held.seq, client.device.kind)) {
+      deviceChanged()
+      refreshSetups()
+    }
     if (client.device !== undefined) {
-      registry.left(client.device.id)
+      const id = client.device.id
+      const last = ![...clients].some((c) => c.helloed && c.device?.id === id)
+      registry.left(id, last)
+      deviceChanged()
       devicesChanged(true)
+      if (last) options.household?.deviceDisconnected(id)
+      // P9: what this connection held is dropped, and the device's other pages are reconciled.
+      options.notify?.reconcile(id)
+      options.present?.reconcile(id)
     }
     const key = client.sessionKey
     if (key === undefined) return
@@ -638,9 +937,9 @@ export const makeSessionHub = (options: HubOptions): SessionHub => {
     }
   }
 
-  const adminSnapshot = (): AdminSnapshot => ({
+  const adminSnapshot = (modules: ReadonlyArray<ModuleInfo>): AdminSnapshot => ({
     engine: options.engine.status(),
-    modules: options.host.modules().map(access.module),
+    modules: [...modules],
     sections: options.sections.list().map(access.section),
     traces: [...sessions.traces()],
     vault: keys.info(true),
@@ -650,10 +949,27 @@ export const makeSessionHub = (options: HubOptions): SessionHub => {
     devices: deviceList(),
     sessions: [...sessions.list()],
     assistants: [...assistants.infos()],
-    deviceTypes: [...assistants.deviceTypes()]
+    deviceTypes: [...assistants.deviceTypes()],
+    ...(options.health !== undefined ? { health: options.health.info() } : {})
   })
 
-  const hello = (client: Client, message: ClientMessage) => {
+  /**
+   * `admin.snapshot`, then at once, in the same send, a `module.changed` for every module the snapshot carries only
+   * as a light entry (`adminModules`: the modules' complete projections together within `ADMIN_MODULES_SHARE_BYTES`,
+   * each within `MODULE_FRAME_MAX_BYTES`). The send limit is judged before the snapshot, not between its frames: they
+   * are one answer, and a page that falls behind afterwards is dropped as before.
+   */
+  const sendAdminSnapshot = (client: Client) => {
+    const { modules, follow } = adminModules(options.host.modules().map((m) => withinModuleFrame(access.module(m))))
+    if (client.closed || overLimit(client)) return
+    client.connection.sendText(encodeServerMessage({ type: "admin.snapshot", snapshot: adminSnapshot(modules) }))
+    for (const module of follow) {
+      if (client.closed) return
+      client.connection.sendText(encodeServerMessage({ type: "module.changed", module }))
+    }
+  }
+
+  const hello = (client: Client, message: ClientMessage, arrival: number) => {
     if (message.type !== "hello") return drop(client, CloseCode.helloTimeout, "the first message must be hello")
     if (client.helloTimer !== undefined) clearTimeout(client.helloTimer)
     if (message.protocol !== PROTOCOL_VERSION) {
@@ -681,12 +997,38 @@ export const makeSessionHub = (options: HubOptions): SessionHub => {
         name: check.name,
         ...(message.device?.capabilities !== undefined ? { capabilities: message.device.capabilities } : {})
       }
+      client.ownCaps = message.device?.capabilities
       options.nodes?.connected(check.id, nodeHello)
     } else if (message.frontend === "voice" && message.device !== undefined && deviceTypeOf(message.device.kind) !== undefined) {
       // A device of a kind this server does not know is treated like no device (the browser defaults).
       client.device = message.device
+      client.ownCaps = message.device.capabilities
     }
     if (message.frontend === "voice") client.sessionKey = client.device?.id ?? message.clientId
+    // P5: only `hello` and `device.caps` declare, each with its number of arrival, taken now; the record is written in
+    // the background (a declaration that comes while it is written goes into it).
+    // Known at once, also to the welcome below (its setup says whether replies are spoken here).
+    if (client.device?.capabilities !== undefined && declare(client.device.id, client.device.capabilities, arrival, client.device.kind)) deviceChanged()
+    const device = client.device
+    if (device === undefined || registry.known(device.id)) return welcome(client, message)
+    // A device the server has no record of: answered once its first registration is written (or refused), so every
+    // decision about it from its first turn on is made against its committed record.
+    client.registering = true
+    options.run(Effect.andThen(registry.seen(device, connectedDevices()), Effect.sync(() => {
+      client.registering = false
+      if (client.closed) return
+      refreshDevices()
+      devicesChanged(false)
+      welcome(client, message)
+      for (const queued of client.queued.splice(0)) {
+        if (client.closed) break
+        onText(client, queued.text, queued.arrival)
+      }
+    })))
+  }
+
+  /** The rest of a hello: the welcome, ownership resumed, the feed started. */
+  const welcome = (client: Client, message: ClientMessage & { readonly type: "hello" }) => {
     let tokenRefused = false
     if (message.frontend === "admin" && message.adminToken !== undefined) {
       if (admin.check(message.adminToken) !== undefined) client.adminToken = message.adminToken
@@ -712,9 +1054,31 @@ export const makeSessionHub = (options: HubOptions): SessionHub => {
       connectionId: client.connection.id,
       snapshot: first
     })
-    if (client.adminToken !== undefined) send(client, { type: "admin.snapshot", snapshot: adminSnapshot() })
+    if (client.adminToken !== undefined) sendAdminSnapshot(client)
+    // P7: the device's reply volume when it is not the default (the page set its gain back to the default at welcome).
+    if (client.role === "voice" && client.device !== undefined) {
+      const volume = options.replyVolume?.(client.device.id)
+      if (volume !== undefined) send(client, { type: "output.volume", volume })
+    }
+    const firstOfDevice = client.device !== undefined && ![...clients].some((c) => c !== client && c.helloed && !c.closed && c.device?.id === client.device!.id)
     client.helloed = true
+    if (client.device !== undefined) deviceChanged()
+    if (client.role === "voice" && options.household !== undefined) {
+      const device = client.device
+      client.voice = {
+        id: client.connection.id,
+        deviceId: device?.id,
+        send: (m) => send(client, m),
+        declared: () => client.ownCaps
+      }
+      if (firstOfDevice) options.household.deviceConnected(device!.id)
+      // A device the server already knows starts at once; a new one when its registration is written.
+      if (device === undefined || registry.known(device.id)) startHousehold(client)
+      // P9: the cards of what is open for its device (ringing again where it rang); a new device once it is recorded.
+      if (device !== undefined && registry.known(device.id)) startNotify(client)
+    }
     if (client.device !== undefined) {
+      const nodeHello = message.node
       registerDevice(client.device, client.nodeId !== undefined && nodeHello !== undefined ? { version: nodeHello.version, platform: nodeHello.platform } : undefined)
     }
     if (key !== undefined) sessions.connections(key, connectionsOf(key))
@@ -753,10 +1117,11 @@ export const makeSessionHub = (options: HubOptions): SessionHub => {
     if (previous !== undefined && previous !== outcome.session.token) admin.logout(previous)
     send(client, { type: "result", requestId, ok: true, admin: outcome.session })
     send(client, { type: "admin.state", admin: adminState(client) })
-    send(client, { type: "admin.snapshot", snapshot: adminSnapshot() })
+    sendAdminSnapshot(client)
   }
 
-  const handle = (client: Client, message: ClientMessage) => {
+  /** `arrival`: the message's number in the order the hub received messages (`DeviceRegistry.arrival`). */
+  const handle = (client: Client, message: ClientMessage, arrival: number) => {
     switch (message.type) {
       case "hello":
         return warnOnce(client, "bad_message", "hello was already received")
@@ -808,6 +1173,13 @@ export const makeSessionHub = (options: HubOptions): SessionHub => {
         const session = sessionOf(client)
         if (session === undefined) return
         const running = session.publisher.committedTurn()
+        // P9: the page's Stop while an announcement plays (it names the announcement's reply id, or none): the
+        // announcement stops at once; the next reply and the next announcement are left as they are.
+        const announcing = session.announce.playing()
+        if (announcing !== undefined && client.device !== undefined && (message.turnId === undefined || message.turnId === announcing)) {
+          options.run(Effect.asVoid(options.notify?.stopSpeech(client.device.id) ?? Effect.void))
+          if (message.turnId !== undefined) return
+        }
         if (message.turnId !== undefined && message.turnId !== running) return
         session.conversation.stop()
         return
@@ -827,7 +1199,8 @@ export const makeSessionHub = (options: HubOptions): SessionHub => {
         // the follow-up holder, else who answers without a phrase, … Its conversation is made on first use.
         const requestId = message.requestId
         return options.run(Effect.map(
-          session.conversation.sendText(message.text, message.speak && isOwner(client), message.assistantId),
+          // P5: never spoken on a device that may not speak ("Don't use its speaker", or a declaration without one).
+          session.conversation.sendText(message.text, message.speak && isOwner(client) && speakerAllowed(client), message.assistantId, client.ref),
           (outcome) =>
             result(
               client,
@@ -867,18 +1240,14 @@ export const makeSessionHub = (options: HubOptions): SessionHub => {
         const id = message.id
         // Decided before the record (and with it the node's credential digest) is deleted.
         const wasNode = registry.nodeOf(id) !== undefined
+        // A connected device's session ends at the commit (its boundary: known → not known) with its connections; its
+        // pages say hello again and are recorded as a new device, with what they declare then. A voice node's are
+        // closed with 4403 there (`endSessions`): its credential is gone with the record, and it is never registered again.
         return limited(client, message.requestId, registry.forget(id), (r) => {
           if (!r.ok) return
-          if (wasNode || [...clients].some((c) => c.nodeId === id)) {
-            // A voice node: its credential is gone with the record; it is closed and never registered again.
-            revoke(id, "this voice node was removed")
-            options.nodes?.forget(id)
-          } else {
-            options.nodes?.forget(id)
-            // A device that is connected now is recorded again as new (the type defaults).
-            const again = [...clients].find((c) => c.device?.id === id && !c.closed)?.device
-            if (again !== undefined) registerDevice(again)
-          }
+          // Whatever of a node is still open (an admin-less connection of it, a race with its hello) is closed too.
+          if (wasNode || [...clients].some((c) => c.nodeId === id)) revoke(id, "this voice node was removed")
+          options.nodes?.forget(id)
           refreshDevices()
           pushAssistants()
           devicesChanged(false)
@@ -949,7 +1318,7 @@ export const makeSessionHub = (options: HubOptions): SessionHub => {
         // An accepted pick decides who answers next: the device's open armed and follow-up windows close.
         const picked = (r: Parameters<typeof afterAssistantsChange>[0]) => {
           afterAssistantsChange(r)
-          if (r.ok) sessionOf(client)?.pickAccepted()
+          if (r.ok && !client.closed) sessionOf(client)?.pickAccepted()
         }
         // The device record is saved in the background at hello: make sure it exists before the pick writes to it.
         return limited(
@@ -1002,6 +1371,10 @@ export const makeSessionHub = (options: HubOptions): SessionHub => {
       case "module.configure":
         if (!allowed(client, message.requestId)) return
         return limited(client, message.requestId, options.host.configure(message.moduleId, message.patch))
+      case "module.action":
+        // P3: a button of a module's form ("Test"); its own 8 s limit and double-press guard are the host's.
+        if (!allowed(client, message.requestId)) return
+        return limited(client, message.requestId, moduleActionOutcome(options.host, message))
       case "settings.update": {
         if (!allowed(client, message.requestId)) return
         let saved: { reload: boolean; path: string } = { reload: false, path: "" }
@@ -1021,6 +1394,16 @@ export const makeSessionHub = (options: HubOptions): SessionHub => {
       case "engine.reload":
         if (!allowed(client, message.requestId)) return
         return limited(client, message.requestId, options.engine.reload)
+      case "health.check": {
+        if (!allowed(client, message.requestId)) return
+        const health = options.health
+        if (health === undefined) return result(client, message.requestId, failure("internal", "Health checks are not available here"))
+        // Answered as soon as it has started (a check can outlast the page's request timeout): this page gets
+        // `health` with `checking` first, then every admin page gets the outcome as `health` (the subscription).
+        health.begin()
+        send(client, { type: "health", health: health.info() })
+        return result(client, message.requestId, { ok: true })
+      }
       case "vault.setup":
         if (!allowed(client, message.requestId)) return
         return vaultRequest(client, message.requestId, keys.setup(message.password))
@@ -1063,6 +1446,118 @@ export const makeSessionHub = (options: HubOptions): SessionHub => {
       }
       case "ping":
         return send(client, { type: "pong", id: message.id })
+      case "notification.action": {
+        // P9: a press on a card's button, from a voice page of the device it was shown on (the service checks that the
+        // notification is for this device; `stop` always works). Not an admin request: the house's own devices.
+        if (client.role !== "voice" || client.device === undefined || options.notify === undefined) {
+          return result(client, message.requestId, failure("bad_message", "A notification is answered from a voice page of its device"))
+        }
+        const notify = options.notify
+        const deviceId = client.device.id
+        const pressed = Effect.map(
+          notify.press({ notificationId: message.id, actionId: message.actionId, deviceId, connection: client.ref }),
+          (answer): HostResult & { readonly say: string } =>
+            answer.ok
+              ? { ok: true, say: answer.say }
+              : { ok: false, error: { code: answer.code === "not_running" ? "not_running" : answer.code === "busy" ? "busy" : "bad_message", message: answer.say }, say: answer.say }
+        )
+        // `stop` is always admitted; a module action goes through the hub's bounded admission (per connection and in all).
+        // Refused by that bound: the service's sentence, in the household's language, as every other answer on the card.
+        if (message.actionId !== STOP_ACTION) {
+          return limited(client, message.requestId, pressed, undefined, () => {
+            const busy = notify.busyAnswer()
+            return { ok: false, error: { code: "busy", message: busy.say }, say: busy.say } as HostResult
+          })
+        }
+        const requestId = message.requestId
+        return options.run(Effect.map(pressed, (r) => {
+          if (!client.closed) result(client, requestId, r)
+        }))
+      }
+      case "present.action": {
+        // P10: a tick or a button on a presentation, from a voice page of the device it was shown on (the Presenter
+        // checks that this connection holds it and may press it). Always through the bounded admission.
+        if (client.role !== "voice" || client.device === undefined || options.present === undefined) {
+          return result(client, message.requestId, failure("bad_message", "A presentation is answered from a voice page of its device"))
+        }
+        const present = options.present
+        const deviceId = client.device.id
+        const pressed = Effect.map(
+          present.press({
+            presentationId: message.id,
+            revision: message.revision,
+            action: message.action,
+            ...(message.item !== undefined ? { item: message.item } : {}),
+            ...(message.done !== undefined ? { done: message.done } : {}),
+            deviceId,
+            connection: client.ref
+          }),
+          (answer): HostResult & { readonly say: string } =>
+            answer.ok
+              ? { ok: true, say: answer.say }
+              : { ok: false, error: { code: answer.code === "not_running" ? "not_running" : answer.code === "busy" ? "busy" : "bad_message", message: answer.say }, say: answer.say }
+        )
+        return limited(client, message.requestId, pressed, undefined, () => {
+          const busy = present.busyAnswer()
+          return { ok: false, error: { code: "busy", message: busy.say }, say: busy.say } as HostResult
+        })
+      }
+      case "device.caps": {
+        // P5: only a voice connection with a device declares (admin pages and pages without a device are ignored).
+        // Bounded here, whatever the page does: an empty message is ignored, the latest one wins, at most one is
+        // handled per CAPS_MIN_GAP_MS per connection, an unchanged one changes nothing, and writes are the
+        // registry's (one at a time for all devices).
+        if (client.role !== "voice" || client.device === undefined) return
+        if (message.capabilities === undefined && message.live === undefined) return
+        const pending = client.capsPending ?? {}
+        // Numbered on arrival: coalescing below keeps the number (a later declaration on another tab wins).
+        if (message.capabilities !== undefined) {
+          pending.capabilities = { value: message.capabilities, seq: arrival }
+          // P10: this page's own kinds, at once (the device's declaration follows, coalesced).
+          client.ownCaps = message.capabilities
+          options.present?.reconcile(client.device.id)
+        }
+        if (message.live !== undefined) pending.live = message.live
+        client.capsPending = pending
+        if (client.capsTimer !== undefined) return
+        const wait = client.capsHandledAt + CAPS_MIN_GAP_MS - performance.now()
+        if (wait <= 0) return handleCaps(client)
+        client.capsTimer = setTimeout(() => handleCaps(client), wait)
+        return
+      }
+    }
+  }
+
+  /**
+   * A text message from a connection. It is numbered the moment it is received (`arrival`, before any queueing or
+   * coalescing), so declarations keep the order they arrived in.
+   */
+  const onText = (client: Client, text: string, arrival: number = registry.arrival()) => {
+    if (client.closed) return
+    if (client.registering) {
+      // Kept for after the welcome (a page sends nothing before it; a flood is refused), with its number.
+      if (client.queued.length >= MAX_QUEUED_BEFORE_WELCOME) return drop(client, CloseCode.badMessage, "too many messages before welcome")
+      client.queued.push({ text, arrival })
+      return
+    }
+    const decoded = decodeClientMessage(text)
+    if (!client.helloed) {
+      if (decoded._tag !== "Ok") return drop(client, CloseCode.helloTimeout, "the first message must be hello")
+      return hello(client, decoded.message, arrival)
+    }
+    if (decoded._tag === "Unknown") return
+    if (decoded._tag === "Invalid") {
+      // A schema error quotes the offending value: never echo a password back.
+      const reason = decoded.messageType?.startsWith("vault.") === true || decoded.messageType === "admin.login"
+        ? `${decoded.messageType}: a password is missing or longer than ${MAX_PASSWORD_CHARS} characters`
+        : decoded.reason
+      return warnOnce(client, "bad_message", `Message not understood: ${reason}`)
+    }
+    try {
+      handle(client, decoded.message, arrival)
+    } catch (error) {
+      console.error("serve: error while handling a message", error)
+      send(client, { type: "error", error: { code: "internal", message: "The assistant could not handle that message" } })
     }
   }
 
@@ -1074,6 +1569,7 @@ export const makeSessionHub = (options: HubOptions): SessionHub => {
       }
       const client: Client = {
         connection,
+        ref: makeConnectionRef(connection.id),
         helloed: false,
         closed: false,
         clientId: undefined,
@@ -1090,7 +1586,14 @@ export const makeSessionHub = (options: HubOptions): SessionHub => {
         lastSetup: undefined,
         wakeTestUntil: 0,
         wakeTestDevice: undefined,
-        nodeId: undefined
+        nodeId: undefined,
+        visible: true,
+        lastInteractionAt: undefined,
+        capsPending: undefined,
+        capsTimer: undefined,
+        capsHandledAt: -Infinity,
+        registering: false,
+        queued: []
       }
       client.helloTimer = setTimeout(() => {
         if (!client.helloed) drop(client, CloseCode.helloTimeout, "no hello")
@@ -1098,30 +1601,9 @@ export const makeSessionHub = (options: HubOptions): SessionHub => {
       client.helloTimer.unref?.()
       clients.add(client)
       return {
-        onText: (text) => {
-          if (client.closed) return
-          const decoded = decodeClientMessage(text)
-          if (!client.helloed) {
-            if (decoded._tag !== "Ok") return drop(client, CloseCode.helloTimeout, "the first message must be hello")
-            return hello(client, decoded.message)
-          }
-          if (decoded._tag === "Unknown") return
-          if (decoded._tag === "Invalid") {
-            // A schema error quotes the offending value: never echo a password back.
-            const reason = decoded.messageType?.startsWith("vault.") === true || decoded.messageType === "admin.login"
-              ? `${decoded.messageType}: a password is missing or longer than ${MAX_PASSWORD_CHARS} characters`
-              : decoded.reason
-            return warnOnce(client, "bad_message", `Message not understood: ${reason}`)
-          }
-          try {
-            handle(client, decoded.message)
-          } catch (error) {
-            console.error("serve: error while handling a message", error)
-            send(client, { type: "error", error: { code: "internal", message: "The assistant could not handle that message" } })
-          }
-        },
+        onText: (text) => onText(client, text),
         onBinary: (data) => {
-          if (client.closed) return
+          if (client.closed || client.registering) return
           if (!client.helloed) return drop(client, CloseCode.badMessage, "binary data before hello")
           const frame = decodeMicFrame(data)
           if (!frame.ok) return warnOnce(client, "bad_message", `Audio frame not understood: ${frame.error}`)
@@ -1165,6 +1647,21 @@ export const makeSessionHub = (options: HubOptions): SessionHub => {
     },
     refreshDevices,
     nodeBundleChanged: () => devicesChanged(false),
+    endSessions,
+    entitiesChanged: () => afterAssistantsChange({ ok: true }),
+    deviceLive,
+    voiceConnections: () => [...clients].flatMap((c) => (c.voice !== undefined && c.helloed && !c.closed ? [c.voice] : [])),
+    audioOwnerOf: (key) => owners.get(key)?.owner?.ref,
+    deviceConnected: (deviceId) => {
+      for (const client of clients) if (!client.closed && client.device?.id === deviceId) return true
+      return false
+    },
+    deviceOfConnection: (ref) => {
+      for (const client of clients) if (client.ref === ref) return client.closed ? undefined : client.device?.id
+      return undefined
+    },
+    deviceViews: () =>
+      [...registry.devices(live)].sort((a, b) => b.lastSeen - a.lastSeen).map((d) => ({ id: d.id, name: d.name, kind: d.kind, connections: d.connections })),
     wakeHeard: (key, text, phrase, accepted, source) => {
       const at = Date.now()
       const message = encodeServerMessage({ type: "wake.heard", text, ...(phrase !== undefined ? { matched: phrase } : {}), accepted, source, at })

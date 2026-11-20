@@ -7,6 +7,7 @@ import {
   ASSISTANT_TABS,
   copyName,
   hearingModelNames,
+  identityOnStart,
   isAssistantTab,
   listJoin,
   modelAfterAccountChange,
@@ -214,5 +215,25 @@ describe("samePage", () => {
     expect(samePage(["assistants", "jeff"], ["assistants", "keuken"])).toBe(false)
     expect(samePage(["assistants", "jeff"], ["devices", "jeff"])).toBe(false)
     expect(samePage([], [])).toBe(true)
+  })
+})
+
+// Review round 1 of the modules P1, finding 22: switching templates in the new-assistant wizard.
+describe("identityOnStart", () => {
+  const dj = { name: "DJ", purpose: "Plays music", handles: "music, radio" }
+  const chef = { name: "Chef", purpose: "Cooks", handles: "recipes" }
+  const empty = { name: "", purpose: "", handles: "" }
+
+  it("fills an empty draft from the template, and replaces what the previous template filled in", () => {
+    const first = identityOnStart(empty, undefined, dj)
+    expect(first).toEqual(dj)
+    expect(identityOnStart(first, dj, chef)).toEqual(chef)
+  })
+
+  it("keeps what the owner typed, also over a template's value, and clears the template's values on a blank start", () => {
+    const typed = { ...dj, name: "Disco" }
+    expect(identityOnStart(typed, dj, chef)).toEqual({ ...chef, name: "Disco" })
+    expect(identityOnStart(typed, dj, undefined)).toEqual({ name: "Disco", purpose: "", handles: "" })
+    expect(identityOnStart({ name: "Mine", purpose: "", handles: "" }, undefined, chef)).toEqual({ ...chef, name: "Mine" })
   })
 })

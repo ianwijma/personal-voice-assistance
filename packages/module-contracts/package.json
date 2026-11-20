@@ -1,0 +1,26 @@
+{
+  "name": "@pva/module-contracts",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "scripts": {
+    "check": "tsc -p tsconfig.json",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "@pva/core": "workspace:*",
+    "effect": "catalog:"
+  },
+  "devDependencies": {
+    "@effect/vitest": "catalog:",
+    "@pva/language": "workspace:*",
+    "@pva/net": "workspace:*",
+    "@types/node": "catalog:",
+    "linkedom": "catalog:",
+    "typescript": "catalog:",
+    "vitest": "catalog:"
+  }
+}

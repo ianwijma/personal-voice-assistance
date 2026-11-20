@@ -33,8 +33,16 @@ const rejectingHub = (): SessionHub & { rejected: number } => {
     micFramesLost: () => 0,
     vaultChanged: () => {},
     refreshDevices: () => {},
-    nodeBundleChanged: () => {},
-    wakeHeard: () => {}
+    wakeHeard: () => {},
+    deviceViews: () => [],
+    voiceConnections: () => [],
+    deviceLive: () => ({ connected: false, visible: false }),
+    entitiesChanged: () => undefined,
+    endSessions: () => 0,
+    audioOwnerOf: () => undefined,
+    deviceOfConnection: () => undefined,
+    deviceConnected: () => false,
+    nodeBundleChanged: () => {}
   }
   return hub
 }

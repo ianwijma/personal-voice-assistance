@@ -12,6 +12,16 @@ import { AudioInput, AudioOutput, Llm, Stt, Tts, type TtsAudio } from "./Service
 import { makeTurnTrace, TurnTrace } from "./TurnTrace.ts"
 import { defaultRoutingConfig, makeTriggerRouter, type RoutingConfig } from "./TriggerRouter.ts"
 import { makeToolRegistry, type ToolRegistry } from "./ToolRegistry.ts"
+import { connectStoreToBus, type EventBusOptions, type HouseholdEvent, makeEventBus } from "./EventBus.ts"
+import type { ModuleStorage } from "./HouseholdStore.ts"
+import { makeMemoryHouseholdStore, type MemoryStoreOptions } from "./MemoryHouseholdStore.ts"
+import type { HouseholdStore } from "./HouseholdStore.ts"
+import { type IssueRegistry, makeIssueRegistry } from "./Issues.ts"
+import { makeSchedulerEngine, type SchedulerEngineOptions } from "./SchedulerEngine.ts"
+import { TestClock } from "effect/testing"
+import { schedulerStorage } from "./SchedulerJobs.ts"
+import { notifyStorage } from "./Notify.ts"
+import { presentStorage } from "./Present.ts"
 
 export interface Sleep {
   readonly _tag: "Sleep"
@@ -427,3 +437,91 @@ export const testTurnTraceLayer = Layer.effect(
 
 // The trigger-phrase router, as a fixture for agent tests (see TriggerRouter.ts).
 export * from "./TriggerRouter.ts"
+
+// ---------------------------------------------------------------------------------------------------------------------
+// Household store and event bus (docs/STORING-DATA.md "Testing a module")
+
+export { makeMemoryHouseholdStore, type MemoryStoreOptions }
+
+/** An event bus that also records every event published on it (by the store, the host or modules), in order. */
+export const makeRecordingEventBus = (options: EventBusOptions = {}) => {
+  const events: Array<HouseholdEvent> = []
+  const bus = makeEventBus({
+    ...options,
+    observe: (event) => {
+      events.push(event)
+      options.observe?.(event)
+    }
+  })
+  return { bus, events }
+}
+
+/**
+ * A household for a module test: an in-memory store prepared for `modules` (their `storage`), a recording bus fed
+ * from the store's commits, and what to give the module host (`ModuleHostOptions.household`).
+ */
+export const makeTestHousehold = (
+  modules: ReadonlyArray<{ readonly id: string; readonly storage?: ModuleStorage }>,
+  options: MemoryStoreOptions = {}
+) =>
+  Effect.gen(function*() {
+    const store = makeMemoryHouseholdStore(options)
+    // P6: the scheduler's collections (core.scheduler) are prepared with the modules', as in serve mode.
+    yield* store.prepare(modules.map((m) => ({ id: m.id, storage: m.storage })), [schedulerStorage, notifyStorage, presentStorage])
+    const recording = makeRecordingEventBus()
+    connectStoreToBus(store, recording.bus)
+    return { store, bus: recording.bus, events: recording.events, household: { store, events: recording.bus } }
+  })
+
+// ---------------------------------------------------------------------------------------------------------------------
+// Scheduler (docs/SCHEDULING.md "Testing a module")
+
+/** An in-memory household store (`makeMemoryHouseholdStore`). */
+export type MemoryHouseholdStore = ReturnType<typeof makeMemoryHouseholdStore>
+
+/**
+ * A scheduler for tests: the real engine (`makeSchedulerEngine`) on a household store prepared for `modules` and the
+ * scheduler (`makeTestHousehold`; or the `store` given, which must have been prepared with `schedulerStorage`). It runs
+ * on the Effect clock: in `it.effect` that is the test clock; `advance(ms)` moves it and lets the engine run. Give
+ * `scheduler` to the module host as `ModuleHostOptions.scheduler`, and `household` as its household.
+ *
+ * A restart is a second scheduler on the same store after the first one's scope has closed: rows it left `running`
+ * are recovered by the rule in docs/SCHEDULING.md once their handler is published again.
+ */
+export const makeTestScheduler = (
+  options: {
+    /** The modules whose collections the store is prepared for (and whose names the admin list shows). */
+    readonly modules?: ReadonlyArray<{ readonly id: string; readonly name?: string; readonly storage?: ModuleStorage }>
+    readonly store?: HouseholdStore
+    /** `HOME_TIME_ZONE` (default: the server's). */
+    readonly timeZone?: string | (() => string | undefined)
+    readonly issues?: IssueRegistry
+  } & Omit<SchedulerEngineOptions, "store" | "timeZone" | "issues" | "modules"> = {}
+) =>
+  Effect.gen(function*() {
+    const { issues: given, modules, store: givenStore, timeZone, ...rest } = options
+    const names = (modules ?? []).map((m) => ({ id: m.id, name: m.name ?? m.id }))
+    const made = givenStore === undefined ? yield* makeTestHousehold(modules ?? []) : undefined
+    const store = givenStore ?? made!.store
+    const issues = given ?? makeIssueRegistry()
+    const scheduler = yield* makeSchedulerEngine({
+      ...rest,
+      store,
+      issues,
+      modules: () => names,
+      timeZone: typeof timeZone === "function" ? timeZone : () => timeZone
+    })
+    /** Move the test clock by `ms` and let the engine run until it waits again. */
+    const advance = (ms: number) => Effect.andThen(Effect.andThen(scheduler.settled, TestClock.adjust(ms)), scheduler.settled)
+    return { scheduler, store, issues, advance, household: made?.household }
+  })
+
+// ---------------------------------------------------------------------------------------------------------------------
+// The module test kit (docs/MODULES.md "Testing"): a module in the real host, its conformance check, a network
+// without a network.
+
+export * from "./ModuleTestKit.ts"
+export * from "./ModuleCheck.ts"
+export * from "./OfflineNet.ts"
+export { offThreadWorkers } from "./OffThread.ts"
+export * from "./ModuleStubs.ts"

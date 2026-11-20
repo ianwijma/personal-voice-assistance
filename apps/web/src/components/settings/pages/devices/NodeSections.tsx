@@ -45,7 +45,7 @@ export function NodeStatusSection({ device, now, conversations }: { readonly dev
   const node = device.node
   const status = node?.status
   const online = device.connections > 0
-  const can = capabilitiesText(device.capabilities)
+  const can = capabilitiesText(device.declared?.capabilities)
   return (
     <section className="flex flex-col gap-3" aria-labelledby="h-node-status" data-testid="node-status">
       <h3 id="h-node-status" className="label text-ink-faint">Status</h3>

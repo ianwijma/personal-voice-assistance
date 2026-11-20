@@ -12,11 +12,17 @@
   },
   "dependencies": {
     "@pva/core": "workspace:*",
-    "effect": "catalog:"
+    "@pva/language": "workspace:*",
+    "@pva/module-contracts": "workspace:*",
+    "@pva/net": "workspace:*",
+    "date-holidays": "catalog:",
+    "effect": "catalog:",
+    "suncalc": "catalog:"
   },
   "devDependencies": {
     "@effect/vitest": "catalog:",
     "@types/node": "catalog:",
+    "@types/suncalc": "catalog:",
     "typescript": "catalog:",
     "vitest": "catalog:"
   }

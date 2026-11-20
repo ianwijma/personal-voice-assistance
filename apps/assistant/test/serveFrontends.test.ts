@@ -58,8 +58,11 @@ const request = async (client: ScriptedClient, message: RequestInput) => {
 }
 
 /** Wait until the admin page's device list has this device (its record was saved). */
-const deviceKnown = (admin: ScriptedClient, id: string) =>
-  admin.waitFor("devices", (m) => m.devices.some((d) => d.id === id), { from: 0 })
+/** The device in admin's list: in its snapshot already (a new device is recorded before its welcome, P5), or pushed later. */
+const deviceKnown = async (admin: ScriptedClient, id: string) => {
+  if (admin.messages.some((m) => m.type === "admin.snapshot" && m.snapshot.devices.some((d) => d.id === id))) return
+  await admin.waitFor("devices", (m) => m.devices.some((d) => d.id === id), { from: 0 })
+}
 
 const setupOf = (client: ScriptedClient, pred: (m: Extract<ServerMessage, { type: "device.setup" }>) => boolean) =>
   client.waitFor("device.setup", pred, { from: 0 })
@@ -75,6 +78,10 @@ const typeRev = (admin: ScriptedClient): number => {
 }
 
 // ---------------------------------------------------------------------------
+
+
+/** The message types without `health`, which reaches an admitted admin page whenever the issue registry changes. */
+const withoutHealth = (types: ReadonlyArray<string>) => types.filter((t) => t !== "health")
 
 describe("admin password and sessions", () => {
   it("unset or shorter than 8 characters: admin is disabled; login is refused and says how to enable it", async () => {
@@ -105,9 +112,12 @@ describe("admin password and sessions", () => {
     expect(result.ok).toBe(true)
     expect(result.admin?.token).toMatch(/^[A-Za-z0-9_-]{43}$/)
     expect(result.admin!.expiresAt).toBeGreaterThanOrEqual(before + 12 * 3_600_000 - 1_000)
-    expect(page.types(from)).toEqual(["result", "admin.state", "admin.snapshot"])
+    // `health` is pushed to admitted admin pages whenever the issue registry changes, and the server's first health
+    // check runs in the background after start: one may follow the snapshot (never precede it: the three are sent
+    // together, and an unadmitted page gets none). The snapshot carries the registry, so the order is not asserted.
+    expect(withoutHealth(page.types(from))).toEqual(["result", "admin.state", "admin.snapshot"])
     expect(page.messages[from + 1]).toEqual({ type: "admin.state", admin: { enabled: true, loggedIn: true, expiresAt: result.admin!.expiresAt } })
-    // Protocol 9: browsers and voice nodes.
+    // Protocol 12: browsers and voice nodes.
     expect(snapshot?.deviceTypes?.map((t) => t.kind)).toEqual([WEB_VOICE_KIND, "voice-node"])
     expect(snapshot?.vault.admin).toBe(true)
 
@@ -138,13 +148,14 @@ describe("admin password and sessions", () => {
     const again = await connect(server)
     const welcome = await again.hello({ frontend: "admin", adminToken: token })
     expect(welcome.snapshot.admin).toMatchObject({ enabled: true, loggedIn: true })
-    expect(again.types()).toEqual(["welcome", "admin.snapshot"])
+    expect(withoutHealth(again.types())).toEqual(["welcome", "admin.snapshot"])
     expect((await request(again, { type: "wake.test", on: false })).ok).toBe(true)
 
     const stranger = await connect(server)
     const refused = await stranger.hello({ frontend: "admin", adminToken: "A".repeat(43) })
     expect(refused.snapshot.admin).toEqual({ enabled: true, loggedIn: false, endReason: "token" })
     await sleep(50)
+    // No health either: it is not admitted.
     expect(stranger.types()).toEqual(["welcome"])
     // A voice page's token is ignored (admin pages only).
     const voice = await connect(server)
@@ -319,7 +330,7 @@ describe("devices", () => {
     await setupOf(tab1.client, (m) => m.interruptMode === "instant" && !m.captions.captions)
 
     const saved = JSON.parse(readFileSync(join(server.dataDir, "settings.json"), "utf8"))
-    expect(saved.version).toBe(4)
+    expect(saved.version).toBe(5)
     expect(saved.devices["phone-0001"]).toMatchObject({ kind: WEB_VOICE_KIND, name: "Test browser", own: { captions: { captions: false } } })
     expect(saved.devices["phone-0001"].own.interruptMode).toBeUndefined()
   })

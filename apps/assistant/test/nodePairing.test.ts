@@ -261,7 +261,7 @@ const nodeHello = (client: ScriptedClient, id: string, credential: string) =>
     clientId: client.clientId,
     resumeOwner: true,
     frontend: "voice",
-    device: { id, kind: VOICE_NODE_KIND, name: "kitchen-pi", capabilities: { v: 1, speaker: { media: ["speech"] }, microphone: {} } },
+    device: { id, kind: VOICE_NODE_KIND, name: "kitchen-pi", capabilities: { v: 1, speaker: { media: ["speech"] }, microphone: { farField: false } } },
     node: { credential, version: "0.1.0+abcdef0123", platform: { os: "linux", arch: "arm64", hostname: "kitchen-pi" } }
   })
 

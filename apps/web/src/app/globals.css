@@ -115,15 +115,19 @@ body {
 /* The voice stage scales with the height it has, so the line, its label and what is under them stay clear of the
    dock on small and landscape phones (320 × 568, 667 × 375); on taller screens the old fixed sizes are kept. */
 @layer components {
-  .stage-pad { padding-top: max(12px, min(36dvh - 100px, 50dvh - 200px)); }
-  .stage-vis { height: clamp(48px, 100dvh - 320px, 160px); }
+  .stage-pad { padding-top: max(12px, min(36dvh - 100px - var(--pva-notifications-space, 0px), 50dvh - 200px - var(--pva-notifications-space, 0px))); }
+  .stage-vis { height: clamp(16px, 100dvh - 320px - var(--pva-notifications-space, 0px), 160px); }
   @media (min-width: 640px) {
-    .stage-pad { padding-top: max(12px, min(38dvh - 141px, 60dvh - 280px)); }
-    .stage-vis { height: clamp(48px, 100dvh - 320px, 240px); }
+    .stage-pad { padding-top: max(12px, min(38dvh - 141px - var(--pva-notifications-space, 0px), 60dvh - 280px - var(--pva-notifications-space, 0px))); }
+    .stage-vis { height: clamp(16px, 100dvh - 320px - var(--pva-notifications-space, 0px), 240px); }
   }
   @media (max-height: 600px) {
-    .stage-pad { padding-top: max(8px, min(36dvh - 100px, 50dvh - 200px)); }
+    .stage-pad { padding-top: max(0px, min(36dvh - 100px - var(--pva-notifications-space, 0px), 50dvh - 200px - var(--pva-notifications-space, 0px))); }
   }
+}
+
+@media (max-height: 600px) {
+  .stage-pad > * { margin-top: 0; }
 }
 
 @keyframes pva-spin { to { transform: rotate(360deg); } }

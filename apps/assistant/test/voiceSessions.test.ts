@@ -93,3 +93,44 @@ describe("reserved conversation ids", () => {
     expect(open("device")).toEqual({ a, b: bNew })
   })
 })
+
+describe("P5 round 2: endDevice", () => {
+  it("synchronously marks the session ended (its sends are fenced), removes it with its reservations, and stops it in the background", async () => {
+    const fences: Array<() => boolean> = []
+    let stopped = 0
+    let discarded = 0
+    const sessions = makeVoiceSessions({
+      make: (_key, _device, _reserved, ended) => {
+        fences.push(ended)
+        return Effect.succeed({
+          key: "device",
+          conversation: { start: () => {}, end: Effect.sync(() => void stopped++) }
+        } as unknown as VoiceSession)
+      },
+      max: () => 4,
+      discardMs: () => 60_000,
+      runSync: (effect) => Effect.runSync(effect),
+      run: (effect) => void Effect.runFork(effect),
+      onChange: () => {},
+      onDiscard: () => void discarded++,
+      announce: () => {}
+    })
+    const first = sessions.open("device", undefined)
+    const reserved = sessions.conversation("other", "a", ["a"]).id
+    expect(fences[0]!()).toBe(false)
+    sessions.endDevice("device")
+    // In the same step: fenced, gone, its ownership forgotten.
+    expect(fences[0]!()).toBe(true)
+    expect(sessions.get("device")).toBeUndefined()
+    expect(discarded).toBe(1)
+    // A new session of the same device is a new one, with its own fence.
+    const second = sessions.open("device", undefined)
+    expect(second).not.toBe(first)
+    expect(fences[1]!()).toBe(false)
+    await new Promise((r) => setTimeout(r, 10))
+    expect(stopped).toBe(1)
+    // A device without a session: its reservations go (its next id is new).
+    sessions.endDevice("other")
+    expect(sessions.conversation("other", "a", ["a"]).id).not.toBe(reserved)
+  })
+})

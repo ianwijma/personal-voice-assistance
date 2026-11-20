@@ -51,14 +51,14 @@ const node: DeviceListInfo = {
   settings: VOICE_NODE_DEVICE_TYPE.builtIn,
   hearer: null,
   node: { pairedAt: 1_763_000_000_000, version: "0.1.0+a1b2c3d4e5", upToDate: false, transport: "ws", status, platform: { os: "linux", arch: "arm64", hostname: "kitchen-pi", model: "Raspberry Pi 4 Model B" } },
-  capabilities: exampleNodeCapabilities
+  declared: { capabilities: exampleNodeCapabilities, seenAt: 1_763_000_000_000 }
 }
 
 describe("reducer", () => {
   it("`devices` carries a node's info and capabilities through", () => {
     const s = run([{ type: "devices", devices: [node] }])
     expect(s.devices[0]?.node?.status?.backend).toBe("alsa")
-    expect(s.devices[0]?.capabilities).toEqual(exampleNodeCapabilities)
+    expect(s.devices[0]?.declared?.capabilities).toEqual(exampleNodeCapabilities)
   })
 
   it("`node.paired` is remembered by its code (newest last, one entry per code, at most a few) and goes at logout", () => {

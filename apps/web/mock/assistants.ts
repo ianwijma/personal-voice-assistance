@@ -155,6 +155,9 @@ const seedDeviceOwn = (longPhrase = false): Map<string, { own: DeviceOwn; rev: n
     ["d-kitchen-ipad-0001", { rev: 0, own: { assistants: [{ assistant: "jeff", phrases: ["Hey Jeff"] }, { assistant: "keuken", phrases: ["Hé keuken", "Hey keuken"], followUpSeconds: 15 }], captions: { captions: false, speakTyped: false } } }]
   ])
 
+/** The person the sample phone belongs to (mock/server.ts seeds Members with Sam and Robin). */
+export const SAM_ID = "p-sam00001"
+
 /** The device types the mock knows (the real server's `DEVICE_TYPES`); the voice-node one is listed only when the server says so. */
 const DEFS: ReadonlyArray<DeviceTypeDefinition> = [WEB_VOICE_DEVICE_TYPE, VOICE_NODE_DEVICE_TYPE]
 const defOf = (kind: string): DeviceTypeDefinition => DEFS.find((d) => d.kind === kind) ?? WEB_VOICE_DEVICE_TYPE
@@ -194,13 +197,15 @@ export interface AssistantsMock {
   /** A device was forgotten: its own settings go. */
   readonly forgetDevice: (id: string) => void
   /**
-   * Protocol 9, the first `node.pair.create` (docs/VOICE-NODES.md §3.4): while the voice-node type was never saved, its
+   * Protocol 12, the first `node.pair.create` (docs/VOICE-NODES.md §3.4): while the voice-node type was never saved, its
    * defaults become the browsers' assistants without their follow-up values, the browsers' matching, nobody without a
    * phrase. Nothing when the browsers have no assistant. True when it seeded.
    */
   readonly seedNodeType: () => boolean
   /** Set a type's defaults as if the owner had saved them (scenario data). */
   readonly setTypeSettings: (kind: string, settings: Partial<DeviceSettings>) => void
+  /** Protocol 11: people removed from Members are no device's default person any more. True when something changed. */
+  readonly clearDefaultPeople: (known: ReadonlySet<string>) => boolean
 }
 
 /** What the server knows about modules that the assistants' checks need (mock/server.ts gives it). */
@@ -216,6 +221,8 @@ export interface ModuleCatalog {
   readonly kindOf?: (deviceId: string) => string | undefined
   /** Whether the voice-node type is listed (the node scenarios). */
   readonly nodeTypeListed?: () => boolean
+  /** Protocol 11: whether a person id is in Members (a `place.defaultPerson` must be, as on the server). */
+  readonly isPerson?: (id: string) => boolean
 }
 
 export const createAssistantsMock = (catalog: ModuleCatalog): AssistantsMock => {
@@ -374,6 +381,11 @@ export const createAssistantsMock = (catalog: ModuleCatalog): AssistantsMock => 
     saveDevice: ({ target, rev, settings, saveAnyway }) => {
       const patch = Object.fromEntries(Object.entries(settings).filter(([, v]) => v !== undefined)) as Record<string, unknown>
       const known = new Set(assistants.map((a) => a.id))
+      // As the server: a default person must be in Members.
+      const person = settings.place?.defaultPerson
+      if (person !== undefined && person !== null && catalog.isPerson !== undefined && !catalog.isPerson(person)) {
+        return refusal([{ code: "invalid", path: "place.defaultPerson", message: "That person is not in Members (any more): pick another, or nobody." }])
+      }
       if (target.kind === "type") {
         if (!listed(target.type)) return fail("unknown_device", `No device type ${target.type}.`)
         const t = typeOf(target.type)
@@ -433,6 +445,22 @@ export const createAssistantsMock = (catalog: ModuleCatalog): AssistantsMock => 
     setTypeSettings: (kind, settings) => {
       const t = typeOf(kind)
       types.set(kind, { settings: { ...t.settings, ...clone(settings) }, rev: t.rev + 1, saved: true })
+    },
+    clearDefaultPeople: (known) => {
+      let changed = false
+      const gone = (p: string | null) => p !== null && !known.has(p)
+      for (const [kind, t] of types) {
+        if (!gone(t.settings.place.defaultPerson)) continue
+        types.set(kind, { ...t, settings: { ...t.settings, place: { ...t.settings.place, defaultPerson: null } }, rev: t.rev + 1 })
+        changed = true
+      }
+      for (const [id, record] of deviceOwn) {
+        const place = record.own.place
+        if (place === undefined || !gone(place.defaultPerson)) continue
+        deviceOwn.set(id, { own: { ...record.own, place: { ...place, defaultPerson: null } }, rev: record.rev + 1 })
+        changed = true
+      }
+      return changed
     }
   }
   return mock

@@ -12,6 +12,7 @@ import type { EnvInfo } from "./env.ts"
 import type { JobInfo, ModelSet } from "./jobs.ts"
 import { VOICE_NODE_KIND } from "./nodes.ts"
 import { WEB_VOICE_KIND } from "./frontends.ts"
+import type { DeviceCapabilities } from "./capabilities.ts"
 import {
   type AdminSnapshot,
   engineSummary,
@@ -21,9 +22,9 @@ import {
   type Snapshot,
   type TraceInfo
 } from "./snapshot.ts"
-import type { DeviceCapabilities } from "./capabilities.ts"
 import type { NodeHello, NodePairing } from "./nodes.ts"
 import type { ConversationInfo, SessionInfo } from "./sessions.ts"
+import type { HealthInfo } from "./health.ts"
 
 export const exampleWeatherModule: ModuleInfo = {
   id: "weather",
@@ -108,6 +109,56 @@ export const exampleHomeAssistantModule: ModuleInfo = {
   protected: true,
   kind: "capability",
   group: "modules"
+}
+
+/** Protocol 9: a module that cannot run here (a program it needs is missing), with its manifest fields. */
+export const exampleUnavailableModule: ModuleInfo = {
+  id: "music",
+  name: "Music",
+  description: "Plays music on the device you talk to.",
+  enabled: true,
+  state: "unavailable",
+  unavailable: { reason: "yt-dlp is missing", fix: { kind: "command", label: "Install yt-dlp", value: "sudo apt install yt-dlp" } },
+  tools: [],
+  settings: { fields: [], values: {}, secrets: {}, errors: [] },
+  revision: 2,
+  kind: "capability",
+  group: "modules",
+  version: "0.3.0",
+  apiVersion: 2,
+  templates: [{
+    id: "music.dj",
+    name: "DJ",
+    prompt: "You pick and play music. Keep spoken answers to one sentence.",
+    purpose: "Plays music",
+    modules: ["music"],
+    suggestedPhrases: ["hey dj"]
+  }]
+}
+
+/** Protocol 9: the issue registry after a check. */
+export const exampleHealth: HealthInfo = {
+  issues: [
+    {
+      id: "music.requires.yt-dlp",
+      module: "music",
+      severity: "error",
+      title: "yt-dlp is missing",
+      detail: "Music needs it: Resolves stream URLs.",
+      fix: { kind: "command", label: "Install yt-dlp", value: "sudo apt install yt-dlp" }
+    },
+    {
+      id: "music.speaker.kitchen",
+      module: "music",
+      device: "d-kitchen-0001",
+      severity: "warning",
+      title: "The speaker did not answer",
+      detail: "Music could not reach it at the last check.",
+      fix: { kind: "link", label: "Open Music", value: "#settings/shared/modules/music" }
+    }
+  ],
+  checkedAt: 1_763_100_000_000,
+  checking: false
 }
 
 /** A section with the settings-screen placement and field semantics (protocol 3). */
@@ -364,7 +415,7 @@ export const exampleDeviceType: DeviceTypeInfo = {
   one: "browser",
   many: "browsers",
   description: "The voice page on a phone, tablet or computer.",
-  keys: ["assistants", "withoutPhrase", "matching", "voicePage", "interruptMode", "audio", "captions", "look", "voice"],
+  keys: ["assistants", "withoutPhrase", "matching", "voicePage", "interruptMode", "audio", "captions", "look", "voice", "place", "capabilities"],
   settings: exampleDeviceSettings,
   rev: 2
 }
@@ -392,6 +443,15 @@ export const exampleDeviceSetup = deviceSetupFrom(
 const { id: _id, rev: _rev, ...exampleAssistantBody } = exampleAssistant
 
 
+/** What a tablet's voice page declares (protocol 11). */
+export const exampleCapabilities: DeviceCapabilities = {
+  v: 1,
+  display: { class: "standard", widthPx: 1024, heightPx: 768, dpr: 2, touch: "coarse", colour: true },
+  present: { kinds: {} },
+  speaker: { media: ["speech", "audio"] },
+  microphone: { farField: false }
+}
+
 export const exampleDevice: DeviceListInfo = {
   id: "d-5c1e0b7a42",
   kind: WEB_VOICE_KIND,
@@ -403,7 +463,9 @@ export const exampleDevice: DeviceListInfo = {
   hearer: "jeff",
   rev: 1,
   connections: 1,
-  audioOwner: true
+  audioOwner: true,
+  declared: { capabilities: exampleCapabilities, seenAt: 1_763_100_000_000 },
+  live: { visible: true }
 }
 
 export const exampleConversation: ConversationInfo = { id: "5b0f6a0e-3c1d-4c7e-9a52-1f0e8d2b7c44", startedAt: 1_763_099_400_000 }
@@ -451,7 +513,8 @@ export const exampleAdminSnapshot: AdminSnapshot = {
   sessions: [
     exampleSession,
     { key: "c-a0d1e2f3", name: "Browser without a device id", state: "idle", ownerPresent: false, conversationId: "9d4c2a71-0b5e-4f3a-8e61-7c2d9b0a5f13", turns: 0, lastTurnAt: null }
-  ]
+  ],
+  health: exampleHealth
 }
 
 const audio = { contextSampleRate: 48_000, baseLatencyMs: 10, outputLatencyMs: 21.3, echoCancellation: true, outputPath: "direct" } as const
@@ -495,9 +558,9 @@ export const assistantsServerExamples: { readonly [T in AssistantsServerMessageT
   "device.types": { type: "device.types", types: [exampleDeviceType] },
 }
 
-// -- Protocol 9 (docs/VOICE-NODES.md §5)
+// -- Protocol 12 (docs/VOICE-NODES.md §5)
 
-export const exampleNodeCapabilities: DeviceCapabilities = { v: 1, speaker: { media: ["speech"] }, microphone: {} }
+export const exampleNodeCapabilities: DeviceCapabilities = { v: 1, speaker: { media: ["speech"] }, microphone: { farField: false } }
 
 export const exampleNodeHello: NodeHello = {
   credential: "q2Vx8m0rJ3cW5yT1bN7dK9fH4gL6pZ2aS8eU0iO3wQk",
@@ -581,7 +644,7 @@ export const clientExamples: { readonly [T in ClientMessageType]: Extract<Client
     clientId: "c-7f3a9b21",
     resumeOwner: false,
     frontend: "voice",
-    device: { id: "d-5c1e0b7a42", kind: WEB_VOICE_KIND, name: "iPhone · Safari" }
+    device: { id: "d-5c1e0b7a42", kind: WEB_VOICE_KIND, name: "iPhone · Safari", capabilities: exampleCapabilities }
   },
   "audio.claim": { type: "audio.claim", audio },
   "audio.release": { type: "audio.release" },
@@ -623,8 +686,36 @@ export const clientExamples: { readonly [T in ClientMessageType]: Extract<Client
   "wake.test": { type: "wake.test", requestId: "r21", on: true, deviceId: "d-5c1e0b7a42" },
   "conversation.new": { type: "conversation.new", requestId: "r22" },
   "ping": { type: "ping", id: 41 },
+  "health.check": { type: "health.check", requestId: "h1" },
+  "module.action": { type: "module.action", requestId: "a1", moduleId: "home-assistant", key: "test", values: { baseUrl: "http://homeassistant.local:8123" } },
+  "device.caps": {
+    type: "device.caps",
+    capabilities: exampleCapabilities,
+    live: { visible: true, lastInteractionAt: 1_763_100_000_000 }
+  },
+  // P9 (additive within 11): a press on a ring card's button.
+  "notification.action": { type: "notification.action", requestId: "n1", id: "n-4f2a", actionId: "stop" },
+  // P10 (additive within 11): a tick on a checklist item.
+  "present.action": { type: "present.action", requestId: "p1", id: "p-7c1d", revision: "show-1:1", action: "tick", item: "milk", done: true },
   ...assistantsClientExamples,
   ...nodeClientExamples
+}
+
+/** The `result` of a `notification.action` whose handler is not running (P9, additive within 11). */
+export const exampleNotificationActionResult: Extract<ServerMessage, { readonly type: "result" }> = {
+  type: "result",
+  requestId: "n1",
+  ok: false,
+  error: { code: "not_running", message: "I can't do that right now." },
+  say: "I can't do that right now."
+}
+
+/** The `result` of a `module.action` that ran (protocol 10). */
+export const exampleActionResult: Extract<ServerMessage, { readonly type: "result" }> = {
+  type: "result",
+  requestId: "a1",
+  ok: true,
+  action: { ok: true, text: "Connected to Home in 84 ms: 4 areas, 9 lights.", tone: "ok" }
 }
 
 /** The `result` of a successful `admin.login`. */
@@ -644,6 +735,30 @@ export const exampleAdminHello: Extract<ClientMessage, { readonly type: "hello" 
   frontend: "admin",
   adminToken: "q2Vx8m0rJ3cW5yT1bN7dK9fH4gL6pZ2aS8eU0iO3wQk"
 }
+
+/** The final part after `serverExamples["household.snapshot"]`: no rows, the collections cut short named. */
+export const exampleHouseholdSnapshotFinal: Extract<ServerMessage, { readonly type: "household.snapshot" }> = {
+  type: "household.snapshot",
+  seq: 42,
+  part: 1,
+  final: true,
+  collections: [],
+  truncated: [{ module: "shopping", collection: "items" }]
+}
+
+/** P10: a pinned checklist as a voice connection holds it. */
+export const examplePresentation = {
+  id: "p-7c1d",
+  revision: "show-1:1",
+  lifetime: "pinned",
+  shownAt: 1_763_100_600_000,
+  serverNow: 1_763_100_600_000,
+  v: 1,
+  content: { kind: "list", title: "Shopping", style: "checklist", items: [{ id: "milk", text: "Milk", done: false }, { id: "eggs", text: "Eggs", done: false }] },
+  buttons: [{ id: "clear", label: "Clear ticked" }],
+  interactive: true,
+  texts: { region: "On screen", loading: "Loading the image…", imageMissing: "The image is not available.", failed: "That didn't work.", timerDone: "Done", credit: "Image:", high: "High", low: "Low" }
+} as const
 
 export const serverExamples: { readonly [T in ServerMessageType]: Extract<ServerMessage, { readonly type: T }> } = {
   "welcome": {
@@ -711,6 +826,62 @@ export const serverExamples: { readonly [T in ServerMessageType]: Extract<Server
   "sessions": { type: "sessions", sessions: [exampleSession] },
   "trace": { type: "trace", key: exampleDevice.id, deviceId: exampleDevice.id, trace: { ...exampleTrace, session: exampleDevice.name } },
   "pong": { type: "pong", id: 41 },
+  "health": { type: "health", health: exampleHealth },
+  // A snapshot's parts: rows in the parts before the last (this one), then the empty final part
+  // (`exampleHouseholdSnapshotFinal`), which names the collections whose rows were not all sent.
+  "household.snapshot": {
+    type: "household.snapshot",
+    seq: 42,
+    part: 0,
+    final: false,
+    collections: [{
+      module: "timers",
+      collection: "timers",
+      rows: [{ id: "t1", rev: 40, scope: { kind: "household" }, value: { label: "pasta", dueAt: 1_763_100_600_000 }, updatedAt: 1_763_100_000_000 }]
+    }],
+    truncated: []
+  },
+  "household.event": {
+    type: "household.event",
+    event: {
+      seq: 43,
+      at: 1_763_100_010_000,
+      module: "timers",
+      type: "timers.timers.changed",
+      scope: { kind: "household" },
+      data: { collection: "timers", id: "t1", op: "put", rev: 43, value: { label: "pasta", dueAt: 1_763_100_900_000 } }
+    }
+  },
+  "household.gap": { type: "household.gap", reason: "overflow" },
+  // P9 (additive within 11): a timer's ring card, and its end.
+  "notification.ring": {
+    type: "notification.ring",
+    notification: {
+      id: "n-4f2a",
+      title: "Pasta timer",
+      text: "Ten minutes are up.",
+      priority: "ring",
+      show: true,
+      sound: true,
+      actions: [{ id: "stop", label: "Stop" }, { id: "snooze", label: "Snooze" }],
+      sentAt: 1_763_100_600_000,
+      texts: { region: "Notifications", startAudio: "Start audio to hear it." }
+    }
+  },
+  "notification.resolved": { type: "notification.resolved", id: "n-4f2a", outcome: "stop" },
+  // P7 (additive within 11): the reply output's gain on one device.
+  "output.volume": { type: "output.volume", volume: 0.6 },
+  // P10 (additive within 11): a checklist on the stage, a tick taken in, and its end.
+  "present.show": { type: "present.show", presentation: examplePresentation },
+  "present.update": {
+    type: "present.update",
+    presentation: {
+      ...examplePresentation,
+      serverNow: 1_763_100_660_000,
+      content: { kind: "list", title: "Shopping", style: "checklist", items: [{ id: "milk", text: "Milk", done: true }, { id: "eggs", text: "Eggs", done: false }] }
+    }
+  },
+  "present.dismiss": { type: "present.dismiss", id: "p-7c1d" },
   ...assistantsServerExamples,
   ...nodeServerExamples
 }

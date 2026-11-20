@@ -4,7 +4,7 @@ import { type AddressInfo } from "node:net"
 import { type ClientMessage, CloseCode, decodeClientMessage, decodeMicFrame, encodeReplyFrame, encodeServerMessage, PROTOCOL_VERSION, type ServerMessage } from "@pva/protocol"
 import { serverExamples } from "@pva/protocol/examples"
 import { WebSocket as WsClient, WebSocketServer, type WebSocket as ServerSocket } from "ws"
-import { type AudioPort, backoffMs, makeConnection } from "@/lib/connection.ts"
+import { type AudioPort, backoffMs, makeConnection, SETTINGS_CHANGED_NOTICE } from "@/lib/connection.ts"
 import { createClientStore } from "@/lib/store.ts"
 
 const timing = { openTimeoutMs: 1000, welcomeTimeoutMs: 500, pingEveryMs: 60, pongTimeoutMs: 150, requestTimeoutMs: 300, backoffBaseMs: 20, backoffMaxMs: 80 }
@@ -94,6 +94,96 @@ const connect = (url: string, audio: AudioPort, hooks = {}) => {
 }
 
 describe("connection", () => {
+  it("P5: a close for changed settings reconnects at once, says hello again and shows a notice after the welcome (once)", async () => {
+    const { url, peers } = await startServer()
+    const { store } = connect(url, fakeAudio().audio)
+    await until(() => store.get().connection.status === "open")
+    expect(store.get().toasts).toEqual([])
+    peers[0]!.ws.close(CloseCode.settingsChanged, "settings changed")
+    await until(() => peers.length === 2 && store.get().connection.status === "open")
+    expect(peers[1]!.text[0]!.type).toBe("hello")
+    expect(store.get().toasts.map((t) => [t.message, t.tone])).toEqual([[SETTINGS_CHANGED_NOTICE, "info"]])
+    // An ordinary drop afterwards: no notice again.
+    peers[1]!.ws.terminate()
+    await until(() => peers.length === 3 && store.get().connection.status === "open")
+    expect(store.get().toasts.filter((t) => t.message === SETTINGS_CHANGED_NOTICE)).toHaveLength(1)
+  })
+
+  it("P5 round 3: a close for changed settings drops the old session's turns and conversations at once, while disconnected and after the new welcome", async () => {
+    let answer = true
+    const { url, peers } = await startServer((p) => {
+      if (answer) p.ws.send(encodeServerMessage(serverExamples.welcome))
+    })
+    const { store } = connect(url, fakeAudio().audio)
+    await until(() => store.get().connection.status === "open")
+    store.dispatch({ type: "turn.start", turnId: 41, source: "text", userText: "Sam's private question", spoken: false })
+    store.dispatch({ type: "local/ui", patch: { chatView: "alpha", unread: 2 } })
+    expect(store.get().turns.map((t) => t.userText)).toContain("Sam's private question")
+    const seq = store.get().sessionSeq
+    // The successor's welcome is withheld: the page stays disconnected.
+    answer = false
+    peers[0]!.ws.close(CloseCode.settingsChanged, "settings changed")
+    await until(() => peers.length === 2 && peers[1]!.text.some((m) => m.type === "hello"))
+    expect(store.get().connection.status).not.toBe("open")
+    expect(store.get().turns).toEqual([])
+    expect(store.get().conversations).toEqual({})
+    expect(store.get().pending).toEqual({})
+    expect(store.get().ui).toMatchObject({ chatView: undefined, unread: 0 })
+    expect(store.get().sessionSeq).toBe(seq + 1)
+    // Then the welcome: still nothing of the old session.
+    peers[1]!.ws.send(encodeServerMessage(serverExamples.welcome))
+    await until(() => store.get().connection.status === "open")
+    expect(store.get().turns.map((t) => t.userText)).not.toContain("Sam's private question")
+  })
+
+  it("P5 round 3: closes for changed settings before any welcome are failures: they back off, then the page recovers", async () => {
+    let refuse = 0
+    const { url, peers } = await startServer((p) => {
+      if (refuse > 0) {
+        refuse--
+        p.ws.close(CloseCode.settingsChanged, "settings changed")
+      } else p.ws.send(encodeServerMessage(serverExamples.welcome))
+    })
+    const { store } = connect(url, fakeAudio().audio)
+    await until(() => store.get().connection.status === "open")
+    const attempts: Array<number> = []
+    const off = store.subscribe(() => {
+      const c = store.get().connection
+      if (c.status === "reconnecting") attempts.push(c.attempt)
+    })
+    // One close after an established session, then four in a row before a welcome.
+    refuse = 4
+    peers[0]!.ws.close(CloseCode.settingsChanged, "settings changed")
+    await until(() => peers.length === 6 && store.get().connection.status === "open", 4000)
+    off()
+    // The first reconnect is at once (attempt 1); the closes before a welcome count up as failures.
+    expect(attempts[0]).toBe(1)
+    expect(Math.max(...attempts)).toBeGreaterThanOrEqual(4)
+    expect(store.get().connection.attempt).toBe(0)
+  })
+
+  it("P7: output.volume reaches the audio port's reply volume on every tab; every welcome sets it back to the default first", async () => {
+    const { url, peers } = await startServer()
+    const volumes: Array<number> = []
+    const port = { ...fakeAudio(false).audio, replyVolume: (v: number) => void volumes.push(v) }
+    const { store } = connect(url, port)
+    await until(() => store.get().connection.status === "open")
+    expect(volumes).toEqual([1])
+    peers[0]!.ws.send(encodeServerMessage({ type: "output.volume", volume: 0.6 }))
+    await until(() => volumes.length === 2)
+    expect(volumes).toEqual([1, 0.6])
+    // A reconnect (a server that may have restarted and forgotten the level): the default again at the welcome.
+    peers[0]!.ws.terminate()
+    await until(() => peers.length === 2 && store.get().connection.status === "open")
+    expect(volumes.at(-1)).toBe(1)
+    // An audio port without it (an older page's) is never called and nothing breaks.
+    const plain = connect(url, fakeAudio(false).audio)
+    await until(() => plain.store.get().connection.status === "open")
+    peers.at(-1)!.ws.send(encodeServerMessage({ type: "output.volume", volume: 0.4 }))
+    await new Promise((r) => setTimeout(r, 50))
+    expect(plain.store.get().connection.status).toBe("open")
+  })
+
   it("says hello, dispatches the welcome and answers liveness pings", async () => {
     const { url, peers } = await startServer()
     const { store, conn } = connect(url, fakeAudio().audio)

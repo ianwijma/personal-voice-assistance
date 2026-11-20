@@ -1,0 +1,228 @@
+import { type ClientMessage, type DeviceCapabilities, type DeviceLiveState, displayClassOf, PRESENT_KIND_VERSIONS } from "@pva/protocol"
+
+/**
+ * What this browser can do (protocol 11, docs/MODULES-PLAN.md §4 P5; presentation-and-device-capabilities.md §5.2),
+ * measured by the page itself: the viewport and pixel ratio, the pointer, colour, whether it can play and record
+ * audio, and whether it is a phone tab that can open links. Absent means "cannot". Sent in `hello.device.capabilities`
+ * and again with `device.caps` when it changes; the live state (visible, last interaction) at most once a second.
+ */
+
+/** Presentation renderers this page has, kind → highest version (P10: every kind of the first version). */
+export const PRESENT_KINDS: Readonly<Record<string, number>> = { ...PRESENT_KIND_VERSIONS }
+
+/** The parts of the browser the measurement reads (a fake in tests). */
+export interface CapabilityEnv {
+  readonly width: number
+  readonly height: number
+  readonly dpr: number
+  readonly matches: (query: string) => boolean
+  readonly userAgent: string
+  readonly audioOut: boolean
+  readonly microphone: boolean
+}
+
+export const browserEnv = (): CapabilityEnv | undefined => {
+  if (typeof window === "undefined") return undefined
+  return {
+    width: Math.round(window.innerWidth),
+    height: Math.round(window.innerHeight),
+    dpr: window.devicePixelRatio || 1,
+    matches: (q) => {
+      try {
+        return window.matchMedia?.(q).matches === true
+      } catch {
+        return false
+      }
+    },
+    userAgent: typeof navigator === "undefined" ? "" : navigator.userAgent,
+    audioOut: typeof AudioContext !== "undefined" || typeof (window as { webkitAudioContext?: unknown }).webkitAudioContext !== "undefined",
+    microphone: typeof navigator !== "undefined" && typeof navigator.mediaDevices?.getUserMedia === "function"
+  }
+}
+
+const clampDpr = (dpr: number) => Math.min(16, Math.max(0.1, Number.isFinite(dpr) ? dpr : 1))
+
+/** The declaration for an environment. */
+export const measureCapabilities = (env: CapabilityEnv): DeviceCapabilities => {
+  const width = Math.max(0, Math.min(100_000, env.width))
+  const height = Math.max(0, Math.min(100_000, env.height))
+  const touch = env.matches("(pointer: coarse)") ? "coarse" : env.matches("(pointer: fine)") ? "fine" : "none"
+  // `(monochrome)` matches e-ink and other grey-scale screens.
+  const colour = !env.matches("(monochrome)")
+  const phone = /iPhone|iPod|Android.*Mobile|Mobile.*Firefox/.test(env.userAgent)
+  return {
+    v: 1,
+    display: { class: displayClassOf(width, height), widthPx: width, heightPx: height, dpr: Math.round(clampDpr(env.dpr) * 100) / 100, touch, colour },
+    present: { kinds: { ...PRESENT_KINDS } },
+    ...(env.audioOut ? { speaker: { media: ["speech", "audio"] as const } } : {}),
+    ...(env.microphone ? { microphone: { farField: false } } : {}),
+    ...(phone ? { openUrl: true } : {})
+  }
+}
+
+/** This browser's declaration now, or `undefined` outside a browser. */
+export const currentCapabilities = (): DeviceCapabilities | undefined => {
+  const env = browserEnv()
+  return env === undefined ? undefined : measureCapabilities(env)
+}
+
+export const CAPS_MIN_INTERVAL_MS = 1000
+
+export interface CapabilityWatchOptions {
+  readonly send: (message: ClientMessage) => boolean
+  readonly measure?: () => DeviceCapabilities | undefined
+  readonly visible?: () => boolean
+  readonly now?: () => number
+  /** Where the events come from (default `window` and `document`). */
+  readonly target?: Pick<Window, "addEventListener" | "removeEventListener">
+  readonly doc?: Pick<Document, "addEventListener" | "removeEventListener">
+  readonly setTimer?: (f: () => void, ms: number) => unknown
+  readonly clearTimer?: (t: unknown) => void
+  /**
+   * Media queries to watch (default `window.matchMedia`; absent there: none, and the other events still count): the
+   * pointer and colour ones the measurement reads, and the current pixel ratio (re-armed for the new one on a change).
+   */
+  readonly matchMedia?: ((query: string) => MediaQueryWatch | undefined) | undefined
+  /** The pixel ratio now, for the resolution query (default `window.devicePixelRatio`). */
+  readonly dpr?: () => number
+}
+
+/** The part of a `MediaQueryList` the watch uses (older Safari has only `addListener`). */
+export interface MediaQueryWatch {
+  readonly addEventListener?: (type: "change", listener: () => void) => void
+  readonly removeEventListener?: (type: "change", listener: () => void) => void
+  readonly addListener?: (listener: () => void) => void
+  readonly removeListener?: (listener: () => void) => void
+}
+
+/** The media queries `measureCapabilities` reads: a change of any of them alone (no resize) is measured again. */
+export const WATCHED_MEDIA_QUERIES: ReadonlyArray<string> = ["(pointer: coarse)", "(pointer: fine)", "(monochrome)"]
+
+const listenTo = (mql: MediaQueryWatch | undefined, listener: () => void): (() => void) => {
+  if (mql === undefined) return () => {}
+  try {
+    if (typeof mql.addEventListener === "function") {
+      mql.addEventListener("change", listener)
+      return () => mql.removeEventListener?.("change", listener)
+    }
+    if (typeof mql.addListener === "function") {
+      mql.addListener(listener)
+      return () => mql.removeListener?.(listener)
+    }
+  } catch {
+    // A browser without change events on media queries: resize and interaction still count.
+  }
+  return () => {}
+}
+
+export interface CapabilityWatch {
+  /**
+   * After every `welcome`: send the current declaration and live state again. The page never assumes the one in
+   * `hello` is still right (it may have changed between `hello` and `welcome`, when nothing can be sent); the server
+   * ignores a declaration that did not change.
+   */
+  readonly resync: () => void
+  readonly stop: () => void
+}
+
+/**
+ * Watch the page: a resize or rotation that changes the declaration, a change of a media query it reads (the pointer,
+ * colour, the pixel ratio; no polling), a change of visibility, and touches and keys, sent as `device.caps` at most once
+ * a second (the last change wins; nothing is sent when nothing changed). `stop` removes every listener.
+ */
+export const watchCapabilities = (options: CapabilityWatchOptions): CapabilityWatch => {
+  const measure = options.measure ?? currentCapabilities
+  const visible = options.visible ?? (() => typeof document === "undefined" || document.visibilityState !== "hidden")
+  const now = options.now ?? Date.now
+  const setTimer = options.setTimer ?? ((f, ms) => setTimeout(f, ms))
+  const clearTimer = options.clearTimer ?? ((t) => clearTimeout(t as ReturnType<typeof setTimeout>))
+  const target = options.target ?? (typeof window === "undefined" ? undefined : window)
+  const doc = options.doc ?? (typeof document === "undefined" ? undefined : document)
+
+  let sentCaps: string | undefined = JSON.stringify(measure())
+  let sentVisible = true
+  let interaction: number | undefined
+  let sentInteraction: number | undefined
+  let lastSentAt = -Infinity
+  let timer: unknown
+
+  const flush = () => {
+    timer = undefined
+    const caps = measure()
+    const capsText = JSON.stringify(caps)
+    const vis = visible()
+    const message: { -readonly [K in keyof Extract<ClientMessage, { type: "device.caps" }>]: Extract<ClientMessage, { type: "device.caps" }>[K] } = { type: "device.caps" }
+    if (caps !== undefined && capsText !== sentCaps) message.capabilities = caps
+    if (vis !== sentVisible || interaction !== sentInteraction) {
+      const live: DeviceLiveState = { visible: vis, ...(interaction !== undefined ? { lastInteractionAt: interaction } : {}) }
+      message.live = live
+    }
+    if (message.capabilities === undefined && message.live === undefined) return
+    if (!options.send(message)) return // not connected: the next hello carries the declaration, `resync` the rest
+    lastSentAt = now()
+    if (message.capabilities !== undefined) sentCaps = capsText
+    sentVisible = vis
+    sentInteraction = interaction
+  }
+  const schedule = () => {
+    if (timer !== undefined) return
+    timer = setTimer(flush, Math.max(0, lastSentAt + CAPS_MIN_INTERVAL_MS - now()))
+  }
+  const onChange = () => schedule()
+  const onInteraction = () => {
+    interaction = now()
+    schedule()
+  }
+  target?.addEventListener("resize", onChange)
+  target?.addEventListener("orientationchange", onChange)
+  target?.addEventListener("pointerdown", onInteraction, { passive: true })
+  target?.addEventListener("keydown", onInteraction)
+  doc?.addEventListener("visibilitychange", onChange)
+  const matchMedia = "matchMedia" in options
+    ? options.matchMedia
+    : typeof window !== "undefined" && typeof window.matchMedia === "function"
+    ? (q: string) => window.matchMedia(q) as MediaQueryWatch
+    : undefined
+  const dpr = options.dpr ?? (() => (typeof window === "undefined" ? 1 : window.devicePixelRatio || 1))
+  const safeMatch = (q: string) => {
+    try {
+      return matchMedia?.(q)
+    } catch {
+      return undefined
+    }
+  }
+  const mediaOff = WATCHED_MEDIA_QUERIES.map((q) => listenTo(safeMatch(q), onChange))
+  // The resolution query matches the pixel ratio now; once it changes (another screen, a zoom) it is armed for the new one.
+  let resolutionOff: () => void = () => {}
+  let stopped = false
+  const armResolution = () => {
+    resolutionOff()
+    if (stopped) return
+    resolutionOff = listenTo(safeMatch(`(resolution: ${dpr()}dppx)`), () => {
+      armResolution()
+      onChange()
+    })
+  }
+  armResolution()
+  return {
+    resync: () => {
+      // Nothing counts as sent: the next flush sends what the page measures now.
+      sentCaps = undefined
+      sentVisible = !visible()
+      sentInteraction = undefined
+      schedule()
+    },
+    stop: () => {
+      if (timer !== undefined) clearTimer(timer)
+      timer = undefined
+      target?.removeEventListener("resize", onChange)
+      target?.removeEventListener("orientationchange", onChange)
+      target?.removeEventListener("pointerdown", onInteraction)
+      target?.removeEventListener("keydown", onInteraction)
+      doc?.removeEventListener("visibilitychange", onChange)
+      stopped = true
+      for (const off of mediaOff) off()
+      resolutionOff()
+    }
+  }
+}

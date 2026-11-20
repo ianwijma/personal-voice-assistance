@@ -18,8 +18,8 @@ import { clientExamples, exampleAdminSnapshot, exampleSnapshot, serverExamples }
 const valid = (schema: Schema.Codec<unknown, unknown>, value: unknown) => Schema.decodeUnknownResult(schema as never)(value)._tag === "Success"
 
 describe("protocol 6", () => {
-  it("is version 8 now (6 added these)", () => {
-    expect(PROTOCOL_VERSION).toBe(9)
+  it("is version 9 now (6 added these)", () => {
+    expect(PROTOCOL_VERSION).toBe(12)
   })
 
   it("conversation.new is a request with an id", () => {

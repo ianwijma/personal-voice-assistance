@@ -451,7 +451,11 @@ function ModuleRow({ draft, module: m, compact }: { readonly draft: AssistantDra
           {changed && <span className="label text-[11px] text-voice" data-testid="unsaved-marker">Unsaved</span>}
         </div>
         <span className="text-[13px] text-ink-muted">{m.description}</span>
-        {needsSetup ? (
+        {m.state === "unavailable" ? (
+          <p className="text-[13px] text-warn" data-testid="module-unavailable">
+            Not available on this server{m.unavailable !== undefined ? `: ${m.unavailable.reason.replace(/[.]$/, "")}` : ""}. See <SettingsLink path={["diagnostics", "health"]}>Health</SettingsLink>.
+          </p>
+        ) : needsSetup ? (
           <p className="text-[13px] text-warn">Set up {m.name} in <SettingsLink path={["shared", "modules"]}>its settings</SettingsLink> first.</p>
         ) : !compact && choice.on && total > 0 ? (
           <>

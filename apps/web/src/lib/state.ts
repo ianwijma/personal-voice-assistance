@@ -10,10 +10,14 @@ import {
   type EngineSummary,
   EnvInfo,
   type ErrorInfo,
+  type HealthInfo,
   type HistoryItem,
   type JobInfo,
   type ModelSet,
   type ModuleInfo,
+  MAX_NOTIFICATION_CARDS,
+  type NotificationCard,
+  type PresentationWire,
   type Role,
   type ServerMessage,
   type ServerMessageType,
@@ -214,7 +218,7 @@ export interface ClientState {
   readonly assistants: ReadonlyArray<AssistantInfo>
   readonly deviceTypes: ReadonlyArray<DeviceTypeInfo>
   /**
-   * Admin, protocol 9: the pairing codes redeemed while this page was open (`node.paired`), newest last, so the Add
+   * Admin, protocol 12: the pairing codes redeemed while this page was open (`node.paired`), newest last, so the Add
    * voice node dialog that shows a code learns that its box is paired.
    */
   readonly pairedNodes: ReadonlyArray<PairedNode>
@@ -256,6 +260,8 @@ export interface ClientState {
   readonly staleTurns: ReadonlyArray<number>
   /** Admin: the voice sessions, most recently active first (`admin.snapshot.sessions`, `sessions`). */
   readonly sessions: ReadonlyArray<SessionInfo>
+  /** Admin (protocol 9): the issue registry (Diagnostics › Health); undefined: the server keeps none. */
+  readonly health: HealthInfo | undefined
   readonly liveTranscript: string
   readonly traces: ReadonlyArray<TraceInfo>
   /**
@@ -266,6 +272,29 @@ export interface ClientState {
   /** The next trace id; never reused, also not after a logout or a new snapshot. */
   readonly traceSeq: number
   readonly pending: Readonly<Record<string, PendingRequest>>
+  /** Counts the sessions the server ended on this page (`local/session-ended`): views keyed by it start afresh. */
+  readonly sessionSeq: number
+  /**
+   * P9: the notification cards on this device (`notification.ring` until `notification.resolved`), oldest first: every
+   * one the server sent, never cut here (the server holds a page to `MAX_CARDS`, its total bound). Emptied at every welcome and when the
+   * session ends: the server sends what is open again after a welcome. `quiet`: a button was
+   * pressed here, so the page's ring cue stops for it at once (the server's `resolved` takes the card down).
+   */
+  readonly notifications: ReadonlyArray<NotificationCard & {
+    readonly quiet?: boolean
+    /** Local action state belongs to this holding, across stage/chat remounts; withdrawal takes it away. */
+    readonly pendingActions?: ReadonlyArray<{ readonly actionId: string }>
+    readonly said?: string | undefined
+  }>
+  /**
+   * P10: the presentations on this device (`present.show` / `present.update` until `present.dismiss`), in the order the
+   * server gave them; never cut here (the server sends a page at most `MAX_PRESENTATIONS_PER_PAGE`). Emptied at every
+   * welcome, when the session ends and when the connection is lost (review round 1, G10: a page without its server shows
+   * nothing from it): the server sends what applies again after a hello. `receivedMono`: this page's monotonic clock
+   * when the message arrived, so a countdown runs from the server's instant (`serverNow`) without reading the wall clock
+   * again; it is taken again at every update.
+   */
+  readonly presentations: ReadonlyArray<HeldPresentation>
   readonly toasts: ReadonlyArray<Toast>
   readonly ui: {
     readonly chatOpen: boolean
@@ -296,9 +325,17 @@ export interface PairedNode {
 }
 export const MAX_PAIRED_NODES = 8
 
+/** A presentation as the page holds it: the server's form and the clock offset taken when it arrived. */
+export type HeldPresentation = PresentationWire & { readonly receivedMono: number }
+
+/** The page's clocks: the wall clock (epoch ms) and a monotonic one (ms, `performance.now()`); tests move them. */
+export const pageClock = { now: (): number => Date.now(), mono: (): number => performance.now() }
+
 export const MAX_TURNS = 300
 export const MAX_TRACES = 50
 export const MAX_TOASTS = 3
+/** The most notification cards the server lets a page hold (`MAX_NOTIFICATION_CARDS`, 64); the page keeps all it is sent. */
+export const MAX_CARDS = MAX_NOTIFICATION_CARDS
 
 export const emptyEngine: EngineStatus = { state: "starting", problems: [], reloadPending: false, reloadPendingFor: [], engines: [], voices: [] }
 /** Before the admin snapshot: no vault known, and this page is not admin. */
@@ -334,11 +371,15 @@ export const initialState: ClientState = {
   turns: [],
   staleTurns: [],
   sessions: [],
+  health: undefined,
   liveTranscript: "",
   traces: [],
   traceIds: [],
   traceSeq: 0,
   pending: {},
+  sessionSeq: 0,
+  notifications: [],
+  presentations: [],
   toasts: [],
   ui: { chatOpen: false, chatView: undefined, sheetOpen: false, settingsOpen: false, settingsPath: [], settingsDirty: false, unread: 0, shortcutsOpen: false }
 }
@@ -359,6 +400,7 @@ const adminPart = {
   deviceTypes: initialState.deviceTypes,
   pairedNodes: initialState.pairedNodes,
   sessions: initialState.sessions,
+  health: initialState.health,
   heard: initialState.heard,
   adminReady: false
 } satisfies Partial<ClientState>
@@ -377,8 +419,20 @@ export type LocalAction =
   | { readonly type: "local/toast-dismiss"; readonly id: number }
   | { readonly type: "local/ui"; readonly patch: Partial<ClientState["ui"]> }
   | { readonly type: "local/socket-lost" }
+  /**
+   * P5 round 3: the server ended this device's session (`CloseCode.settingsChanged`): what the old session showed
+   * goes at once, before reconnecting (its turns, conversations, the requests in flight, the wake prompt, what was
+   * playing), and `sessionSeq` moves on so session-scoped views (the composer's draft) start afresh.
+   */
+  | { readonly type: "local/session-ended" }
+  /** P9: a button of a card was pressed here: its cue stops now (the card stays until the server resolves it). */
+  | { readonly type: "local/notification-pressed"; readonly id: string; readonly press?: { readonly actionId: string } }
+  | { readonly type: "local/notification-answered"; readonly id: string; readonly press: { readonly actionId: string }; readonly answer?: { readonly say?: string | undefined } }
 
 export type Action = ServerMessage | LocalAction
+
+/** P9: a card that wants the ring cue: a ring the server says to sound, not pressed here. Derived from every card. */
+export const ringingCard = (n: ClientState["notifications"][number]): boolean => n.priority === "ring" && n.sound && n.quiet !== true
 
 let toastSeq = 0
 
@@ -509,7 +563,15 @@ const server: ServerHandlers = {
   "admin.snapshot": (s, m) => ({
     ...s,
     engine: m.snapshot.engine,
-    modules: { order: m.snapshot.modules.map((x) => x.id), byId: Object.fromEntries(m.snapshot.modules.map((x) => [x.id, x])) },
+    modules: {
+      order: m.snapshot.modules.map((x) => x.id),
+      // A light entry (`details: "follow"`: its complete entry follows at once in `module.changed`) never replaces a
+      // complete one the page already has (a reconnect while a form is being edited keeps its fields).
+      byId: Object.fromEntries(m.snapshot.modules.map((x) => {
+        const known = s.modules.byId[x.id]
+        return [x.id, x.details === "follow" && known !== undefined && known.details === undefined ? known : x]
+      }))
+    },
     sections: m.snapshot.sections,
     vault: m.snapshot.vault,
     env: m.snapshot.env,
@@ -520,6 +582,7 @@ const server: ServerHandlers = {
     assistants: m.snapshot.assistants ?? [],
     deviceTypes: m.snapshot.deviceTypes ?? [],
     sessions: m.snapshot.sessions,
+    health: m.snapshot.health,
     adminReady: true,
     // The snapshot's traces replace the list: each gets a new id.
     ...newTraceIds(s, Math.min(m.snapshot.traces.length, MAX_TRACES))
@@ -656,7 +719,33 @@ const server: ServerHandlers = {
   "conversation.history": (s, m) => onHistory(s, m, historyToTurns),
   assistants: (s, m) => ({ ...s, assistants: m.assistants }),
   "device.types": (s, m) => ({ ...s, deviceTypes: m.types }),
-  // Protocol 9 (docs/VOICE-NODES.md §7.4): `node.command` goes to a node, never to a page.
+  health: (s, m) => ({ ...s, health: m.health }),
+  // Household data (docs/STORING-DATA.md "Pages"): no page shows it yet (P10 is the first).
+  "household.snapshot": (s) => s,
+  "household.event": (s) => s,
+  "household.gap": (s) => s,
+  // P9: a card shown (or shown again, silent or not), and one taken down.
+  "notification.ring": (s, m) => {
+    const before = s.notifications.find((n) => n.id === m.notification.id)
+    const card = {
+      ...m.notification,
+      ...(before?.quiet === true ? { quiet: true } : {}),
+      ...(before?.pendingActions !== undefined ? { pendingActions: before.pendingActions } : {}),
+      ...(before?.said !== undefined ? { said: before.said } : {})
+    }
+    const rest = s.notifications.filter((n) => n.id !== m.notification.id)
+    // Never cut: the server enforces the bound (it withdraws before it adds at the bound), and a card dropped here
+    // would be a live ring lost without a word.
+    return { ...s, notifications: [...rest, card].sort((a, b) => a.sentAt - b.sentAt) }
+  },
+  // P7: the reply volume reaches the audio graph (`connection.ts`); nothing on the page shows it.
+  "output.volume": (s) => s,
+  "notification.resolved": (s, m) => (s.notifications.some((n) => n.id === m.id) ? { ...s, notifications: s.notifications.filter((n) => n.id !== m.id) } : s),
+  // P10: a presentation held (or replaced in place), and one taken down. Never cut: the server bounds what a page holds.
+  "present.show": (s, m) => withPresentation(s, m.presentation),
+  "present.update": (s, m) => withPresentation(s, m.presentation),
+  "present.dismiss": (s, m) => (s.presentations.some((p) => p.id === m.id) ? { ...s, presentations: s.presentations.filter((p) => p.id !== m.id) } : s),
+  // Protocol 12 (docs/VOICE-NODES.md §7.4): `node.command` goes to a node, never to a page.
   "node.command": (s) => s,
   // A code was redeemed: the Add voice node dialog showing it moves on to "paired".
   "node.paired": (s, m) => ({ ...s, pairedNodes: [...s.pairedNodes.filter((p) => p.code !== m.code), { code: m.code, deviceId: m.deviceId, name: m.name }].slice(-MAX_PAIRED_NODES) }),
@@ -664,16 +753,53 @@ const server: ServerHandlers = {
   "node.meter": (s) => s
 }
 
+const withPresentation = (s: ClientState, p: PresentationWire): ClientState => {
+  const held: HeldPresentation = { ...p, receivedMono: pageClock.mono() }
+  const i = s.presentations.findIndex((x) => x.id === p.id)
+  if (i === -1) return { ...s, presentations: [...s.presentations, held] }
+  const presentations = s.presentations.slice()
+  presentations[i] = held
+  return { ...s, presentations }
+}
+
 const local = (s: ClientState, a: LocalAction): ClientState => {
   switch (a.type) {
     case "local/connection":
       // Outdated: the page shows its own notice with Reload, so the server's "out of date" error toast goes.
       return a.status === "outdated"
-        ? { ...s, toasts: [], connection: { ...s.connection, status: a.status, attempt: a.attempt } }
-        : { ...s, connection: { ...s.connection, status: a.status, attempt: a.attempt } }
+        ? { ...s, toasts: [], presentations: [], connection: { ...s.connection, status: a.status, attempt: a.attempt } }
+        : { ...s, ...(a.status !== "open" ? { presentations: [] } : {}), connection: { ...s.connection, status: a.status, attempt: a.attempt } }
     case "local/socket-lost":
-      // Requests in flight will never be answered on this socket; the player was flushed.
-      return { ...s, pending: {}, audio: withoutPlaying(s.audio), liveTranscript: "" }
+      // Requests in flight will never be answered on this socket; the player was flushed. P10: what the server showed
+      // goes too (it may have ended or been withdrawn meanwhile); after the next welcome the server sends what applies.
+      return { ...s, pending: {}, audio: withoutPlaying(s.audio), liveTranscript: "", presentations: [] }
+    case "local/notification-pressed":
+      return { ...s, notifications: s.notifications.map((n) => (n.id === a.id ? { ...n, quiet: true, ...(a.press !== undefined ? { pendingActions: [...(n.pendingActions ?? []), a.press] } : {}) } : n)) }
+    case "local/notification-answered":
+      return { ...s, notifications: s.notifications.map((n) => n.id === a.id && n.pendingActions?.includes(a.press)
+        ? { ...n, pendingActions: n.pendingActions.filter((p) => p !== a.press), ...(a.answer !== undefined ? { said: a.answer.say } : {}) }
+        : n) }
+    case "local/session-ended":
+      // Not a network drop: the old session is gone for good, and nothing of it stays on screen.
+      return {
+        ...s,
+        notifications: [],
+        presentations: [],
+        pending: {},
+        audio: withoutPlaying(s.audio),
+        liveTranscript: "",
+        turns: [],
+        staleTurns: [],
+        conversations: {},
+        woke: undefined,
+        holder: undefined,
+        holderTold: false,
+        // Review round 4: what the recogniser heard (the admin phrase tester) and the notices of the old session go too.
+        heard: [],
+        toasts: [],
+        sessionSeq: s.sessionSeq + 1,
+        ui: { ...s.ui, chatView: undefined, unread: 0 }
+      }
     case "local/audio": {
       const { error: _error, ...rest } = s.audio
       const base = a.phase === "off" || a.phase === "error" ? { ...withoutPlaying(rest), micLive: true } : rest
@@ -752,6 +878,7 @@ function pickAdmin(s: ClientState): Partial<ClientState> {
     traceIds: s.traceIds,
     traces: s.traces,
     devices: s.devices,
+    health: s.health,
     assistants: s.assistants,
     deviceTypes: s.deviceTypes,
     pairedNodes: s.pairedNodes,

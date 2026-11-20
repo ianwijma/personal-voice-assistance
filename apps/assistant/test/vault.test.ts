@@ -4,6 +4,7 @@ import { cpSync, existsSync, mkdtempSync, readFileSync, rmSync, statSync, writeF
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { describe, expect, it } from "vitest"
+import { bound } from "../../../packages/store-sqlite/test/latencyBound.ts"
 import { KEYS_LOCKED_MESSAGE, loadSettingsStore, type SaveStep } from "../src/serve/SettingsStore.ts"
 import { DEFAULT_KDF, defaultVaultPath, openVault, type VaultSecrets } from "../src/serve/Vault.ts"
 import { openStore } from "./support/store.ts"
@@ -192,7 +193,9 @@ describe("vault: file and crypto", () => {
     expect(await vault.unlock("correct horse")).toEqual({ ok: true })
     const ms = performance.now() - start
     console.log(`vault unlock (scrypt N=2^17, r=8, p=1): ${ms.toFixed(0)} ms`)
-    expect(ms).toBeLessThan(1_000)
+    // Shared CI runners are several times slower than a development machine (2.6 s there on 2026-11-18): three times the
+    // bound on CI, as the store's latency tests (this file is one of them, so CI runs it alone).
+    expect(ms).toBeLessThan(bound(1_000))
   })
 })
 
@@ -218,7 +221,7 @@ describe("vault: the settings store on top of it", () => {
     await Effect.runPromise(store.saveAssistant(["STT_PROVIDER", "DEEPGRAM_API_KEY"], { STT_PROVIDER: "deepgram" }, { DEEPGRAM_API_KEY: "dg" }))
     expect(existsSync(join(dir, "secrets.json"))).toBe(false)
     expect(vault.secrets()?.assistant).toEqual({ ANTHROPIC_API_KEY: "sk-json", DEEPGRAM_API_KEY: "dg" })
-    expect(JSON.parse(readFileSync(join(dir, "settings.json"), "utf8"))).toMatchObject({ version: 4, assistant: { STT_PROVIDER: "deepgram" } })
+    expect(JSON.parse(readFileSync(join(dir, "settings.json"), "utf8"))).toMatchObject({ version: 5, assistant: { STT_PROVIDER: "deepgram" } })
     expect(readFileSync(join(dir, "settings.json"), "utf8")).not.toContain("dg\"")
   })
 

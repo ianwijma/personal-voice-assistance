@@ -78,8 +78,8 @@ const byId = assistantsById([jeff, t3])
 const settings = (patch: Partial<DeviceSettings> = {}): DeviceSettings => ({ ...exampleDeviceSettings, ...patch })
 
 describe("protocol 7", () => {
-  it("is protocol version 8 now (7 added these)", () => {
-    expect(PROTOCOL_VERSION).toBe(9)
+  it("is protocol version 9 now (7 added these)", () => {
+    expect(PROTOCOL_VERSION).toBe(12)
   })
 })
 

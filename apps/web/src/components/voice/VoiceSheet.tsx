@@ -27,7 +27,7 @@ export function VoiceSheet() {
   const open = useClientState((s) => s.ui.sheetOpen)
   const ref = useRef<HTMLElement>(null)
   const close = () => client.store.dispatch({ type: "local/ui", patch: { sheetOpen: false } })
-  useDialog(ref, open, close)
+  useDialog(ref, open, close, undefined, { extraFocus: "#voice-notifications" })
   if (!open) return null
   return (
     <>
@@ -36,12 +36,13 @@ export function VoiceSheet() {
         ref={ref}
         role="dialog"
         aria-modal="true"
+        aria-owns="voice-notifications"
         aria-labelledby="sheet-title"
         data-testid="voice-sheet"
         className={cx(
           "fixed z-40 flex flex-col overflow-hidden border-line bg-surface shadow-panel",
-          "inset-x-0 bottom-0 max-h-[88dvh] rounded-t-lg border-t animate-[pva-sheet-up_320ms_var(--ease-out)]",
-          "sm:inset-x-auto sm:bottom-0 sm:right-0 sm:top-0 sm:max-h-none sm:w-[400px] sm:rounded-none sm:border-l sm:border-t-0 sm:animate-[pva-slide-in_320ms_var(--ease-out)]"
+          "inset-x-0 bottom-0 max-h-[min(88dvh,calc(100dvh-var(--pva-notifications-space,88px)))] rounded-t-lg border-t animate-[pva-sheet-up_320ms_var(--ease-out)]",
+          "sm:inset-x-auto sm:bottom-0 sm:right-0 sm:top-[var(--pva-notifications-space,88px)] sm:max-h-none sm:w-[400px] sm:rounded-none sm:border-l sm:border-t-0 sm:animate-[pva-slide-in_320ms_var(--ease-out)]"
         )}
       >
         <div className="mx-auto mt-2 h-1 w-10 shrink-0 rounded-full bg-line sm:hidden" aria-hidden="true" />

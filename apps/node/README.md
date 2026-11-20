@@ -5,9 +5,9 @@ connects to the assistant server as one more voice device over the existing WebS
 microphone as 16 kHz mono PCM and plays the replies, reporting playback like a browser does. The server keeps every
 engine. Design: [docs/VOICE-NODES.md](../../docs/VOICE-NODES.md).
 
-Status: protocol 9 (N3). The node is paired once (`pva-node pair`, run by the installer) and then says `hello` with
+Status: protocol 12 (N3; built as protocol 9, renumbered when main was merged in). The node is paired once (`pva-node pair`, run by the installer) and then says `hello` with
 its credential; it applies the `sound` and `soundDevices` the server pushes, reports `node.status` and obeys
-`node.command`. A protocol 9 server refuses a node that was not paired, so there is no unpaired mode.
+`node.command`. A protocol 12 server refuses a node that was not paired, so there is no unpaired mode.
 
 ## Run
 

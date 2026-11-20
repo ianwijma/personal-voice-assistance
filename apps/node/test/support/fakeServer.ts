@@ -4,7 +4,7 @@
  * binary frames through `decodeMicFrame` / `encodeReplyFrame`). It answers `hello` with `welcome` (protocol-version
  * checked, as the server does) and `ping` with `pong`; everything else is driven by the test.
  *
- * Protocol 9 (docs/VOICE-NODES.md §6.1): a `hello` without `node`, from a device that is not a `voice-node`, or with
+ * Protocol 12 (docs/VOICE-NODES.md §6.1): a `hello` without `node`, from a device that is not a `voice-node`, or with
  * a credential other than `credential` (when given) is closed with 4403 and no `welcome`. `setup` is sent in
  * `welcome.snapshot.setup`. With `tls` the server speaks wss on a self-signed certificate (for the pin tests).
  */

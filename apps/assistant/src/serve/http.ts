@@ -47,6 +47,8 @@ export interface HttpOptions {
   readonly crossOriginIsolation?: boolean
   /** Requests under `/api/` (docs/VOICE-PROVIDERS.md §5), after the host check. Absent: they get the static 404. */
   readonly api?: (req: http.IncomingMessage, res: http.ServerResponse) => void
+  /** P10: requests under `/media/` (docs/PRESENTING.md "Images"), after the host check. Absent: the static 404. */
+  readonly media?: (req: http.IncomingMessage, res: http.ServerResponse) => void
   /** Requests under `/node/` (docs/VOICE-NODES.md §6.3: `makeNodeDist(...).handle`), after the host check. Absent: static 404. */
   readonly node?: (req: http.IncomingMessage, res: http.ServerResponse) => void
 }
@@ -310,6 +312,10 @@ export const startHttp = (options: HttpOptions): Effect.Effect<HttpServer, HttpE
         }
         if (options.api !== undefined && (req.url ?? "").startsWith(API_PREFIX)) {
           options.api(req, res)
+          return
+        }
+        if (options.media !== undefined && (req.url ?? "").startsWith("/media/")) {
+          options.media(req, res)
           return
         }
         if (options.node !== undefined && (req.url ?? "").startsWith(NODE_PREFIX)) {

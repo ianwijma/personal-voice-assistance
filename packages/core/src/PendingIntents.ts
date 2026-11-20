@@ -3,7 +3,7 @@ import { actionToolName, checkedActionValues, type RegisteredAction } from "./Ac
 import { type PendingIntent, pendingStillValid } from "./Decision.ts"
 import type { ToolCall, ToolResult } from "./Domain.ts"
 import { defaultIntentWords, type IntentWords, isConfirmation, isRefusal } from "./IntentWords.ts"
-import type { ToolRegistry } from "./ToolRegistry.ts"
+import { registryWith, type ToolRegistry } from "./ToolRegistry.ts"
 import { readUtterance } from "./Utterance.ts"
 
 /**
@@ -209,5 +209,5 @@ export const proposingTools = (tools: ToolRegistry["Service"], ctx: ProposalCont
       }
       return Effect.succeed({ id: call.id, name: call.name, content: PROPOSED_RESULT, isError: false })
     })
-  return { ...tools, run }
+  return registryWith(tools, { run })
 }

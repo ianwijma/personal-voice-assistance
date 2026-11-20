@@ -23,7 +23,7 @@ const writeDist = (dir: string, bundle: Buffer = BUNDLE, claimedSha = sha(bundle
   writeFileSync(join(dir, "install.sh"), INSTALL)
   const manifest = {
     format: 1,
-    protocol: 9,
+    protocol: 12,
     version: "1.2.3",
     bundle: { path: "pva-node.mjs", sha256: claimedSha, bytes: bundle.length },
     boot: { path: "pva-node-boot.mjs", sha256: sha(BOOT), bytes: BOOT.length },
@@ -246,7 +246,15 @@ describe("http.ts node option", () => {
     vaultChanged: () => {},
     refreshDevices: () => {},
     nodeBundleChanged: () => {},
-    wakeHeard: () => {}
+    wakeHeard: () => {},
+    deviceViews: () => [],
+    voiceConnections: () => [],
+    deviceLive: () => ({ connected: false, visible: false }),
+    entitiesChanged: () => undefined,
+    endSessions: () => 0,
+    audioOwnerOf: () => undefined,
+    deviceOfConnection: () => undefined,
+    deviceConnected: () => false
   })
 
   it("hands /node/ to the option after the host check, and leaves other paths to the static handler", async () => {
