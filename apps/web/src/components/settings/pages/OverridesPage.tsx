@@ -33,16 +33,22 @@ export function OverridesPage() {
     })
   }
   const groups: ReadonlyArray<{ readonly id: string; readonly title: string; readonly note: string; readonly entries: ReadonlyArray<EnvEntry> }> = [
-    { id: "movable", title: "In .env, can move into the settings", note: "Move puts the value in the settings (a key goes into the vault) and comments the line out of .env.", entries: movable },
+    {
+      id: "refused",
+      title: "Not read",
+      note: "The assistant knows these and does not read them from the environment; each says why. Remove them.",
+      entries: env.entries.filter((e) => e.refused !== undefined)
+    },
+    { id: "movable", title: "In .env, can move into the settings", note: "Move puts the value in the settings (a key goes into the vault) and comments the line out of .env. A move rewrites the file it has just read. Do not edit the files by hand while a move runs: an edit made between that read and the rewrite can be lost.", entries: movable },
     {
       id: "process",
       title: "From the process environment",
       note: "Exported by the shell or the service that started the assistant. They win over the settings; unset them there to set them here.",
-      entries: env.entries.filter((e) => e.origin === "process" && e.kind !== "bootstrap")
+      entries: env.entries.filter((e) => e.origin === "process" && e.kind !== "bootstrap" && e.refused === undefined)
     },
     { id: "bootstrap", title: "Stay in .env", note: "Read before the settings exist (where they are, the address and port, the vault password).", entries: env.entries.filter((e) => e.kind === "bootstrap") },
     { id: "development", title: "For development", note: "Benchmarks, tests and the command-line audio.", entries: env.entries.filter((e) => e.kind === "development" && e.origin === "file") },
-    { id: "unknown", title: "Not used by anything", note: "Nothing reads these: often a typo of a setting's name. Remove them from .env.", entries: env.entries.filter((e) => e.kind === "unknown") }
+    { id: "unknown", title: "Not used by anything", note: "Nothing reads these: often a typo of a setting's name. Remove them from .env.", entries: env.entries.filter((e) => e.kind === "unknown" && e.refused === undefined) }
   ]
   const lockedVault = vault.state === "locked"
   return (
@@ -81,6 +87,7 @@ export function OverridesPage() {
                 <span className="min-w-0 break-all font-mono text-[11px] text-ink-faint">
                   {e.origin === "file" ? `${e.file ?? ".env"}${e.line !== undefined ? `:${e.line}` : ""}` : "process environment"}
                 </span>
+                {e.refused !== undefined && <span className="basis-full text-[12px] text-warn" data-testid="env-refused">{e.refused}</span>}
                 <span className="ml-auto flex items-center gap-3">
                   {e.page !== undefined && (
                     <button type="button" className="text-[12px] text-voice underline-offset-4 hover:underline" onClick={() => client.settings([e.page!.path[0]!, e.page!.path[1]!])}>

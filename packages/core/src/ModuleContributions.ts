@@ -27,6 +27,19 @@ export interface FieldActionResult {
   readonly tone?: "neutral" | "ok" | "warning" | "error"
 }
 
+/**
+ * What a field action's handler gets: the module's settings (environment > saved > linked default, with secrets; no
+ * assistant's own values), and, for an `action` field with `requiresSaved: false` pressed with unsaved edits, the
+ * page's draft values applied over them (`draft: true`; secrets are always the saved ones).
+ */
+export interface FieldActionInput<A = Readonly<Record<string, unknown>>> {
+  readonly settings: A
+  readonly draft: boolean
+}
+
+/** A field action's handler: has 8 s; a failure or defect is reported as a failed result. */
+export type FieldActionHandler<A = Readonly<Record<string, unknown>>> = (input: FieldActionInput<A>) => Effect.Effect<FieldActionResult, unknown>
+
 /** What a running module may contribute besides tools, context and instructions. */
 export interface ModuleContributions {
   /** Agents (a module of kind "agent" contributes exactly one). */
@@ -42,8 +55,11 @@ export interface ModuleContributions {
   readonly settingOptions?: () => Readonly<Record<string, ReadonlyArray<ChoiceOption>>>
   /** Values of `info` fields (read-only text). Read whenever the form is described. */
   readonly info?: () => Readonly<Record<string, string>>
-  /** Handlers of the module's `action` fields, by field key. */
-  readonly fieldActions?: Readonly<Record<string, () => Effect.Effect<FieldActionResult>>>
+  /**
+   * Handlers of the module's `action` fields, by field key, run on this instance (it must be running). A handler
+   * declared on the definition (`defineModule({ fieldActions })`) runs without an instance and wins.
+   */
+  readonly fieldActions?: Readonly<Record<string, FieldActionHandler>>
 }
 
 /** Kept for compatibility: `ModuleInstance` itself now carries the contributions. */

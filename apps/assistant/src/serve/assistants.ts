@@ -37,6 +37,7 @@ import { Effect, Schema, Semaphore } from "effect"
 import { deviceListInfos, deviceSettingsFrom, deviceTypeInfos, typeSettingsFrom } from "./devices.ts"
 import { EntitySaveError, type SettingsStore, SettingsStoreError } from "./SettingsStore.ts"
 import type { VoiceSessions } from "./VoiceSessions.ts"
+import type { MembersGate } from "./people.ts"
 
 /**
  * The server half of the assistants and devices messages (docs/ASSISTANTS.md §5.2 to §5.4): validation, the entity
@@ -80,6 +81,22 @@ export interface AssistantsOptions {
    * without a key (warning, "Save anyway"). Without it every voice is accepted.
    */
   readonly voiceProblem?: (voice: VoiceRefJson) => { readonly level: "error" | "warning"; readonly message: string } | undefined
+  /**
+   * P5: whether a person id is one of the household's Members a reference may name (`EffectiveMembers.referenceable`;
+   * a `place.defaultPerson` must be). Absent: none is (fails closed).
+   */
+  readonly isPerson?: (id: string) => boolean
+  /**
+   * P5: the one serialized operation over people and the references to them (`people.ts`): every save here (devices,
+   * device types, assistants and their placements, picks) runs inside it, so a default person is checked against
+   * committed Members and no write made from an older read can bring a removed one back. Absent: none (tests).
+   */
+  readonly membersGate?: MembersGate
+  /**
+   * P5: whether reply audio is sent to a device now (`DeviceFacts.speakerAllowed`): its setup's speaking flags follow
+   * it. Absent: the `capabilities` override alone.
+   */
+  readonly speakerAllowed?: (deviceId: string | undefined, kind?: string) => boolean
 }
 
 export interface Assistants {
@@ -188,7 +205,11 @@ export const makeAssistants = (options: AssistantsOptions): Assistants => {
     deviceSetupFrom(
       deviceSettingsFrom(store.settings(), deviceId, kind),
       new Map(inEffect().map((a) => [a.id, a])),
-      { ...(deviceId !== undefined ? { deviceId } : {}), canAuto: options.canAuto() }
+      {
+        ...(deviceId !== undefined ? { deviceId } : {}),
+        canAuto: options.canAuto(),
+        ...(options.speakerAllowed !== undefined ? { speakerAllowed: options.speakerAllowed(deviceId, kind) } : {})
+      }
     )
 
   // ---- The assistants push
@@ -276,6 +297,13 @@ export const makeAssistants = (options: AssistantsOptions): Assistants => {
     return fail("invalid_settings", `${problem.message} Save anyway to keep it.`, { warnings: [{ key: "voice", message: problem.message }] })
   }
 
+  /** P5: a `place` whose default person is not one of the Members is refused. */
+  const placeRefusal = (patch: DeviceSettingsPatch): AssistantResult | undefined => {
+    const person = patch.place?.defaultPerson
+    if (person === undefined || person === null || options.isPerson?.(person) === true) return undefined
+    return refusal([{ code: "invalid", path: "place.defaultPerson", message: "That person is not in Members (any more): pick another, or nobody." }])
+  }
+
   const ownWith = (own: DeviceOwn, patch: DeviceSettingsPatch, keys: ReadonlyArray<DeviceSettingsKey>): DeviceOwn => {
     const out: Record<string, unknown> = { ...own }
     for (const key of keys) {
@@ -322,7 +350,7 @@ export const makeAssistants = (options: AssistantsOptions): Assistants => {
           else if (patch[key] === null) issues.push({ code: "invalid", path: key, message: "Defaults cannot be reset; only a device can follow them." })
         }
         if (issues.length > 0) return Effect.succeed(refusal(issues))
-        const voiceRefused = voicePatchRefusal(patch, saveAnyway)
+        const voiceRefused = voicePatchRefusal(patch, saveAnyway) ?? placeRefusal(patch)
         if (voiceRefused !== undefined) return Effect.succeed(voiceRefused)
         const before = typeSettingsFrom(file, target.type)
         const next = { ...before, ...Object.fromEntries(Object.entries(patch).filter(([, v]) => v !== undefined)) } as DeviceSettings
@@ -337,7 +365,7 @@ export const makeAssistants = (options: AssistantsOptions): Assistants => {
       }
       const record = file.devices[target.id]
       if (record === undefined) return Effect.succeed(fail("unknown_device", "That device is not known (it may have been forgotten)."))
-      const voiceRefused = voicePatchRefusal(patch, saveAnyway)
+      const voiceRefused = voicePatchRefusal(patch, saveAnyway) ?? placeRefusal(patch)
       if (voiceRefused !== undefined) return Effect.succeed(voiceRefused)
       const type = deviceTypeOf(record.kind)
       const keys = type?.keys ?? []
@@ -529,7 +557,10 @@ export const makeAssistants = (options: AssistantsOptions): Assistants => {
    * would check the same state (two creates named "Desk" would both pass the unique-name check). One at a time.
    */
   const serial = Semaphore.makeUnsafe(1)
-  const one = <A extends ReadonlyArray<unknown>>(f: (...args: A) => Effect.Effect<AssistantResult>) => (...args: A) => serial.withPermit(f(...args))
+  // P5: inside the Members gate too, outermost: each of these may write a device's own sections (its place with its
+  // default person) from what it read, so none may run while Members changes.
+  const gate = <X>(effect: Effect.Effect<X>) => (options.membersGate === undefined ? effect : options.membersGate.run(effect))
+  const one = <A extends ReadonlyArray<unknown>>(f: (...args: A) => Effect.Effect<AssistantResult>) => (...args: A) => gate(serial.withPermit(f(...args)))
 
   return {
     deviceTypes: () => deviceTypeInfos(store.settings()),

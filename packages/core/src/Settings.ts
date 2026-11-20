@@ -11,6 +11,7 @@ import {
   SettingsPatch,
   SettingValue
 } from "@pva/protocol"
+import { SettingExtra } from "./SettingsExtra.ts"
 
 /**
  * Typed settings for modules and assistant settings sections.
@@ -20,7 +21,9 @@ import {
  * settings (`SettingsOf<typeof spec>`), validation of stored and submitted
  * values, environment-variable overrides, and the field descriptions the web UI
  * renders as a form (`SettingField` in `@pva/protocol`). The set of field types
- * is closed: each has exactly one widget in the UI.
+ * is closed: each has exactly one widget in the UI. Since protocol 10 it includes the extended types of
+ * `SettingsExtra.ts` (`textList`, `records`, `combo`, `action`, `info`); `action` and `info` have no value the
+ * owner sets (`Setting.value`).
  *
  * Precedence for every field: environment variable (when the field names one
  * and it is set to a non-empty value; the field is then locked in the UI) >
@@ -72,10 +75,21 @@ export interface Setting<A> {
   readonly visibleWhen?: Condition
   /** An assistant may have its own value (`ModuleChoice.own`); never a secret. */
   readonly overridable: boolean
+  /**
+   * Absent or `editable`: an ordinary value. `none`: an `action` (no value at all: never in `values`, never saved or
+   * patched). `readOnly`: an `info` value only the server sets ("" in the resolved form, never saved or patched).
+   */
+  readonly value?: "editable" | "none" | "readOnly"
 }
 
+/** Does the owner set this field's value (saved, patched, from the environment)? */
+export const isEditableSetting = (setting: Setting<unknown>): boolean => setting.value === undefined || setting.value === "editable"
+
 export type SettingsSpec = { readonly [key: string]: Setting<any> }
-export type SettingsOf<S extends SettingsSpec> = { readonly [K in keyof S]: S[K] extends Setting<infer A> ? A : never }
+/** The settings a module receives: every field with a value (an `action` or `info` field has none the module reads). */
+export type SettingsOf<S extends SettingsSpec> = {
+  readonly [K in keyof S as S[K] extends { readonly value: "none" | "readOnly" } ? never : K]: S[K] extends Setting<infer A> ? A : never
+}
 
 const ok = <A>(value: A): Decoded<A> => ({ ok: true, value })
 const fail = (error: string): Decoded<never> => ({ ok: false, error })
@@ -258,8 +272,8 @@ const multichoice = <const V extends string>(options: SettingCommon & {
   }
 }
 
-/** Constructors for settings fields. */
-export const Setting = { text, secret, number, boolean, choice, multichoice }
+/** Constructors for settings fields (the five extended ones from `SettingsExtra.ts`). */
+export const Setting = { text, secret, number, boolean, choice, multichoice, ...SettingExtra }
 
 /** Where setting values come from. Plain records and functions, so they are easy to fake in tests. */
 export interface SettingsSources {
@@ -286,12 +300,26 @@ export interface SettingsSources {
    * the environment, the saved value and the default. The form then shows the assistant's effective values.
    */
   readonly own?: Readonly<Record<string, unknown>>
+  /**
+   * How a field's decoder (module code: its checks, a record's item decoders) is called: the module host passes its
+   * containment (`moduleCode`), so one that throws is that field's error (`fallback`'s message) and not the caller's
+   * exception. Absent: called as it is.
+   */
+  readonly contain?: Contain
 }
 
+/** Run module-supplied settings code: `f`'s result, or `fallback` with a message if it throws (`SettingsSources.contain`). */
+export type Contain = <A>(f: () => A, fallback: (message: string) => A) => A
+
+/** A field's decoder or environment reader called through `contain` (when given): a throw is a field error. */
+const contained = (contain: Contain | undefined, f: () => Decoded<unknown>): Decoded<unknown> =>
+  contain === undefined ? f() : contain(f, (message) => fail(message))
+
 /** The default of a field: the linked default when there is a valid one, else its own. */
-const defaultOf = (setting: Setting<unknown>, key: string, sources: Pick<SettingsSources, "defaults">): unknown => {
+const defaultOf = (setting: Setting<unknown>, key: string, sources: Pick<SettingsSources, "defaults" | "contain">): unknown => {
   if (sources.defaults === undefined || !Object.hasOwn(sources.defaults, key) || setting.secret) return setting.defaultValue
-  const decoded = setting.decode(sources.defaults[key])
+  const defaults = sources.defaults
+  const decoded = contained(sources.contain, () => setting.decode(defaults[key]))
   return decoded.ok ? decoded.value : setting.defaultValue
 }
 
@@ -317,7 +345,7 @@ export const applicableOwnValues = (spec: SettingsSpec, own: Readonly<Record<str
  * Check an assistant's own values for a module (docs/ASSISTANTS.md §2.2): every key must be an `overridable` field
  * (never a secret), and every value one the field accepts. One error per bad key.
  */
-export const checkOwnValues = (spec: SettingsSpec, own: Readonly<Record<string, unknown>>): ReadonlyArray<FieldError> => {
+export const checkOwnValues = (spec: SettingsSpec, own: Readonly<Record<string, unknown>>, contain?: Contain): ReadonlyArray<FieldError> => {
   const errors: Array<FieldError> = []
   for (const [key, value] of Object.entries(own)) {
     const setting = Object.hasOwn(spec, key) ? spec[key] : undefined
@@ -325,7 +353,7 @@ export const checkOwnValues = (spec: SettingsSpec, own: Readonly<Record<string, 
     else if (setting.secret) errors.push({ key, message: "A secret is shared: it cannot be set per assistant" })
     else if (!setting.overridable) errors.push({ key, message: "This setting is shared: it cannot be set per assistant" })
     else {
-      const decoded = setting.decode(value)
+      const decoded = contained(contain, () => setting.decode(value))
       if (!decoded.ok) errors.push({ key, message: decoded.error })
     }
   }
@@ -349,7 +377,7 @@ export interface ResolvedSettings<A> {
 }
 
 const envValue = (setting: Setting<unknown>, env: SettingsSources["env"]): string | undefined => {
-  if (setting.env === undefined) return undefined
+  if (setting.env === undefined || !isEditableSetting(setting)) return undefined
   const text = env[setting.env]
   return text === undefined || text.length === 0 ? undefined : text
 }
@@ -368,6 +396,12 @@ export const resolveSettings = <S extends SettingsSpec>(spec: S, sources: Settin
   }
 
   for (const [key, setting] of Object.entries(spec)) {
+    if (!isEditableSetting(setting)) {
+      // An action has no value; an info value is the server's ("" here: the module host fills it from the instance).
+      fields.push({ ...setting.describe(key), source: "default" })
+      if (setting.value === "readOnly") values[key] = ""
+      continue
+    }
     const fromEnv = envValue(setting, sources.env)
     const fieldDefault = defaultOf(setting, key, sources)
     const described = fieldDefault === setting.defaultValue || setting.secret
@@ -391,15 +425,17 @@ export const resolveSettings = <S extends SettingsSpec>(spec: S, sources: Settin
     let source: FieldSource
     if (ownApplies(setting, key, sources.own)) {
       source = "saved"
-      decoded = setting.decode(sources.own[key])
+      const own = sources.own
+      decoded = contained(sources.contain, () => setting.decode(own[key]))
       if (!decoded.ok) decoded = fail(`The assistant's own value is not valid (${decoded.error})`)
     } else if (fromEnv !== undefined) {
       source = origin(setting.env!)
-      decoded = setting.fromEnv(fromEnv)
-      if (!decoded.ok) decoded = fail(`${setting.env}=${fromEnv} is not valid: ${decoded.error}`)
+      decoded = contained(sources.contain, () => setting.fromEnv(fromEnv))
+      // The environment's value is never quoted (whatever the field is): the variable's name says where to look.
+      if (!decoded.ok) decoded = fail(`${setting.env} in the environment is not valid: ${decoded.error}`)
     } else if (Object.hasOwn(sources.stored, key)) {
       source = "saved"
-      decoded = setting.decode(sources.stored[key])
+      decoded = contained(sources.contain, () => setting.decode(sources.stored[key]))
       if (!decoded.ok) decoded = fail(`The saved value is not valid (${decoded.error}); save a new one`)
     } else {
       source = "default"
@@ -446,12 +482,12 @@ export const applySettingsPatch = (
   spec: SettingsSpec,
   sources: SettingsSources,
   patch: SettingsPatch,
-  /** `includeHidden`: save fields whose `visibleWhen` does not hold too ("Move to settings" keeps every value). */
+  /** Internal "Move to settings": save hidden and environment-locked fields while their overrides stay effective. */
   options: { readonly includeHidden?: boolean } = {}
 ): PatchResult => {
   const stored: Record<string, SettingValue> = {}
   for (const [key, value] of Object.entries(sources.stored)) {
-    if (Object.hasOwn(spec, key)) stored[key] = value as SettingValue
+    if (Object.hasOwn(spec, key) && isEditableSetting(spec[key]!)) stored[key] = value as SettingValue
   }
   const secrets: Record<string, string> = {}
   for (const [key, value] of Object.entries(sources.secrets)) {
@@ -462,15 +498,15 @@ export const applySettingsPatch = (
   // Visibility is judged on the values after the patch (a patch that chooses Deepgram shows its fields).
   const after: Record<string, unknown> = {}
   for (const [key, setting] of Object.entries(spec)) {
-    if (setting.secret) continue
+    if (setting.secret || !isEditableSetting(setting)) continue
     const fromEnv = envValue(setting, sources.env)
     const raw = fromEnv !== undefined
-      ? setting.fromEnv(fromEnv)
+      ? contained(sources.contain, () => setting.fromEnv(fromEnv))
       : Object.hasOwn(patch.values, key) && patch.values[key] !== null
-      ? setting.decode(patch.values[key])
+      ? contained(sources.contain, () => setting.decode(patch.values[key]))
       : Object.hasOwn(patch.values, key) || !Object.hasOwn(sources.stored, key)
       ? ok(defaultOf(setting, key, sources))
-      : setting.decode(sources.stored[key])
+      : contained(sources.contain, () => setting.decode(sources.stored[key]))
     after[key] = raw.ok ? raw.value : defaultOf(setting, key, sources)
   }
   const hidden = (key: string) => {
@@ -485,11 +521,15 @@ export const applySettingsPatch = (
       errors.push({ key: null, message: `Unknown setting "${key}"` })
       return undefined
     }
+    if (!isEditableSetting(setting)) {
+      errors.push({ key, message: setting.value === "none" ? "An action has no value" : "Read-only: the server sets it" })
+      return undefined
+    }
     if (setting.secret !== wantSecret) {
       errors.push({ key, message: wantSecret ? "Not a secret" : "Secrets go in the secrets part of the patch" })
       return undefined
     }
-    if (envValue(setting, sources.env) !== undefined) {
+    if (envValue(setting, sources.env) !== undefined && options.includeHidden !== true) {
       errors.push({ key, message: `Set by ${setting.env} in the environment; change it there` })
       return undefined
     }
@@ -504,7 +544,7 @@ export const applySettingsPatch = (
       delete stored[key]
       continue
     }
-    const decoded = setting.decode(raw)
+    const decoded = contained(sources.contain, () => setting.decode(raw))
     if (decoded.ok) stored[key] = decoded.value as SettingValue
     else errors.push({ key, message: decoded.error })
   }
@@ -516,7 +556,7 @@ export const applySettingsPatch = (
       delete secrets[key]
       continue
     }
-    const decoded = setting.decode(raw)
+    const decoded = contained(sources.contain, () => setting.decode(raw))
     if (decoded.ok && decoded.value !== undefined) secrets[key] = decoded.value as string
     else errors.push({ key, message: decoded.ok ? "Must be non-empty text" : decoded.error })
   }

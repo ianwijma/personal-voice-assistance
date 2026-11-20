@@ -107,6 +107,49 @@ export const safeErrorText = (e: unknown, secrets: Secrets = []): string => {
 
 let nextSessionId = 1
 
+/**
+ * One turn's tool handler, bound when the turn is sent (`send`): a tool call is run by the binding of the turn whose
+ * stream announced it, never by "the turn in progress now". `live` is false once the turn ended or was interrupted.
+ */
+interface TurnBinding {
+  readonly handler: ToolHandler
+  live: boolean
+}
+
+/** A tool use the stream announced (an `assistant` message's `tool_use` block), waiting for its MCP call. */
+interface ToolClaim {
+  readonly binding: TurnBinding | undefined
+  /** The block's `tool_use` id: what a call that carries one is matched by. */
+  readonly id: string | undefined
+  readonly name: string
+  readonly input: unknown
+  taken: boolean
+}
+
+const signal = (): { readonly promise: Promise<void>; readonly resolve: () => void } => {
+  let resolve!: () => void
+  const promise = new Promise<void>((r) => (resolve = r))
+  return { promise, resolve }
+}
+
+/** How long an MCP call waits for its turn's stream to announce it (the SDK delivers both from one ordered pipe). */
+export const CLAIM_WAIT_MS = 2_000
+const MAX_CLAIMS = 64
+
+const canonical = (u: unknown): unknown =>
+  Array.isArray(u)
+    ? u.map(canonical)
+    : u !== null && typeof u === "object"
+    ? Object.fromEntries(Object.entries(u as Record<string, unknown>).filter(([, v]) => v !== undefined).sort(([a], [b]) => (a < b ? -1 : 1)).map(([k, v]) => [k, canonical(v)]))
+    : u
+
+/** The MCP call's arguments are the announced input (the server's schema may have dropped keys it does not know). */
+const sameInput = (announced: unknown, args: Record<string, unknown>): boolean => {
+  if (announced === null || typeof announced !== "object" || Array.isArray(announced)) return Object.keys(args).length === 0
+  const a = canonical(announced) as Record<string, unknown>
+  return Object.entries(canonical(args) as Record<string, unknown>).every(([k, v]) => JSON.stringify(a[k]) === JSON.stringify(v))
+}
+
 export class ClaudeSession {
   readonly id = nextSessionId++
   /** The system prompt the session runs with; undefined while provisional and unused. */
@@ -141,7 +184,12 @@ export class ClaudeSession {
   private inputClosed = false
   private listener: TurnListener | undefined
   private busy = false
-  private toolHandler: ToolHandler | undefined
+  /** The turn in progress (its handler), from `send` until it ends or is interrupted. */
+  private binding: TurnBinding | undefined
+  /** Tool uses the stream announced, oldest first (bounded). */
+  private readonly claims: Array<ToolClaim> = []
+  /** Resolved whenever the stream delivers a message (or the session dies): a waiting tool call looks again. */
+  private progress: { readonly promise: Promise<void>; readonly resolve: () => void } = signal()
   private mcp: ReturnType<ClaudeSdk["mcpServer"]> | undefined
 
   private readonly sdk: ClaudeSdk
@@ -161,7 +209,7 @@ export class ClaudeSession {
     this.toolKey = toolKey(config.tools)
     this.lastUsedAt = now()
     // The MCP server always exists when tools exist; its handler forwards to the turn in progress.
-    this.mcp = config.tools.length > 0 ? sdk.mcpServer(config.tools, (name, args) => this.callTool(name, args)) : undefined
+    this.mcp = config.tools.length > 0 ? sdk.mcpServer(config.tools, (name, args, toolUseId) => this.callTool(name, args, toolUseId)) : undefined
     const self = this
     async function* input(): AsyncGenerator<SDKUserMessage> {
       for (;;) {
@@ -236,7 +284,7 @@ export class ClaudeSession {
    */
   async bind(system: string, tools: ReadonlyArray<SessionTool>, timeoutMs: number): Promise<void> {
     if (tools.length > 0) {
-      this.mcp = this.sdk.mcpServer(tools, (name, args) => this.callTool(name, args))
+      this.mcp = this.sdk.mcpServer(tools, (name, args, toolUseId) => this.callTool(name, args, toolUseId))
       await withTimeout(this.query.setMcpServers({ [MCP_SERVER_NAME]: this.mcp }), timeoutMs, "Registering the assistant's tools timed out")
     }
     this.toolKey = toolKey(tools)
@@ -265,7 +313,7 @@ export class ClaudeSession {
   send(text: string, listener: TurnListener, tools: ToolHandler): void {
     if (this.dead !== undefined) throw new SessionError(this.dead, "unavailable")
     this.listener = listener
-    this.toolHandler = tools
+    this.binding = { handler: tools, live: true }
     this.busy = true
     this.used = true
     this.lastUsedAt = this.now()
@@ -276,7 +324,7 @@ export class ClaudeSession {
   /** The turn's `result` arrived (or it failed): the session is idle again. */
   endTurn(): void {
     this.listener = undefined
-    this.toolHandler = undefined
+    this.unbind()
     this.busy = false
     this.lastUsedAt = this.now()
   }
@@ -288,7 +336,8 @@ export class ClaudeSession {
    */
   interrupt(ackMs: number): void {
     if (!this.busy || this.dead !== undefined) return
-    this.toolHandler = undefined
+    // Its tool calls are refused from now on, whether they arrive before or after the next turn starts.
+    if (this.binding !== undefined) this.binding.live = false
     this.draining = new Promise<void>((resolve) => {
       const done = () => {
         clearTimeout(timer)
@@ -322,8 +371,9 @@ export class ClaudeSession {
     }
     const listener = this.listener
     this.listener = undefined
-    this.toolHandler = undefined
+    this.unbind()
     this.busy = false
+    this.progress.resolve()
     listener?.died(this.dead)
   }
 
@@ -335,17 +385,69 @@ export class ClaudeSession {
           this.kill(this.dead ?? "Claude Code ended the session")
           return
         }
+        this.record(r.value)
         this.listener?.message(r.value)
+        const progress = this.progress
+        this.progress = signal()
+        progress.resolve()
       }
     } catch (e) {
       this.kill(this.dead ?? `Claude Code stopped: ${safeErrorText(e, this.secrets)}`)
     }
   }
 
-  private callTool(name: string, args: Record<string, unknown>) {
-    const handler = this.toolHandler
-    if (handler === undefined) return Promise.resolve({ content: "The turn was interrupted; do not continue.", isError: true })
-    return handler(name, args)
+  /** The turn ended: its binding is dead, and its tool uses that were never called expire a moment later. */
+  private unbind(): void {
+    const ended = this.binding
+    this.binding = undefined
+    if (ended === undefined) return
+    ended.live = false
+    // A call the SDK had already read before the turn's end reaches `callTool` within this macrotask and is refused
+    // by the dead binding; after that, nothing of that turn is left to match a later call.
+    setImmediate(() => {
+      for (let i = this.claims.length - 1; i >= 0; i--) if (this.claims[i]!.binding === ended) this.claims.splice(i, 1)
+    })
+  }
+
+  /** Remember the tool uses an `assistant` message of the turn in progress announces. */
+  private record(message: SDKMessage): void {
+    if (message.type !== "assistant" || message.parent_tool_use_id !== null) return
+    const content = (message.message as { readonly content?: unknown } | undefined)?.content
+    if (!Array.isArray(content)) return
+    const prefix = `mcp__${MCP_SERVER_NAME}__`
+    for (const block of content as ReadonlyArray<{ readonly type?: unknown; readonly id?: unknown; readonly name?: unknown; readonly input?: unknown }>) {
+      if (block?.type !== "tool_use" || typeof block.name !== "string") continue
+      const name = block.name.startsWith(prefix) ? block.name.slice(prefix.length) : block.name
+      this.claims.push({ binding: this.binding, id: typeof block.id === "string" ? block.id : undefined, name, input: block.input, taken: false })
+    }
+    if (this.claims.length > MAX_CLAIMS) this.claims.splice(0, this.claims.length - MAX_CLAIMS)
+  }
+
+  /**
+   * An MCP tool call from Claude Code: run by the turn whose stream announced it. Claude Code sends the model's
+   * `tool_use` id with the request (`_meta["claudecode/toolUseId"]`): the call is matched to the announcement with that
+   * id, and to nothing else. Only a call without one (an older Claude Code) is matched by name and input to the oldest
+   * unanswered announcement. There, an identical call of a turn that ended or was cancelled, arriving after its
+   * announcements were purged, can take a later turn's matching claim and run with that later turn's handler and
+   * context; the later turn's own call is then refused. For a call that carries an id (what Claude Code sends): a call
+   * whose turn ended or was interrupted is refused, so is one no turn announced within `CLAIM_WAIT_MS`, and it is
+   * never given to whatever turn happens to be in progress.
+   */
+  private async callTool(name: string, args: Record<string, unknown>, toolUseId?: string): Promise<{ readonly content: string; readonly isError: boolean }> {
+    const deadline = this.now() + CLAIM_WAIT_MS
+    const matches = (c: ToolClaim) => !c.taken && c.name === name && (toolUseId !== undefined ? c.id === toolUseId : sameInput(c.input, args))
+    for (;;) {
+      const claim = this.claims.find(matches)
+      if (claim !== undefined) {
+        claim.taken = true
+        const binding = claim.binding
+        if (binding === undefined || !binding.live) return { content: "The turn this call belongs to has ended; it was not run. Do not continue.", isError: true }
+        return binding.handler(name, args)
+      }
+      const left = deadline - this.now()
+      if (this.dead !== undefined || left <= 0) return { content: "This call could not be matched to a turn; it was not run.", isError: true }
+      await Promise.race([this.progress.promise, new Promise<void>((resolve) => setTimeout(resolve, Math.min(left, 100)))])
+    }
   }
 }
 

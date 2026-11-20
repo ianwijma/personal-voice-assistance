@@ -13,6 +13,9 @@
   "dependencies": {
     "@effect/platform-node": "catalog:",
     "@pva/core": "workspace:*",
+    "@pva/language": "workspace:*",
+    "@pva/module-contracts": "workspace:*",
+    "@pva/net": "workspace:*",
     "effect": "catalog:"
   },
   "devDependencies": {

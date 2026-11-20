@@ -19,6 +19,12 @@ import { EnvInfo } from "./env.ts"
 import { JobInfo, ModelSet } from "./jobs.ts"
 import { VaultInfo } from "./vault.ts"
 import { ConversationId, ConversationReason, SessionInfo, SessionKey } from "./sessions.ts"
+import { HealthInfo } from "./health.ts"
+import { HouseholdEventMessage, HouseholdGapMessage, HouseholdSnapshotMessage } from "./household.ts"
+import { NotificationResolvedMessage, NotificationRingMessage } from "./notifications.ts"
+import { PresentDismissMessage, PresentShowMessage, PresentUpdateMessage } from "./presentation.ts"
+import { OutputVolumeMessage } from "./volume.ts"
+import { FieldActionResult } from "./settings.ts"
 
 /**
  * Text frames from the assistant to the browser. Binary frames from the
@@ -223,7 +229,14 @@ export const Result = Schema.Struct({
    * Protocol 7: present only on the successful result of `device.save`: the revision the saved device or defaults
    * have now, so the page can wait until that revision has reached it (the lists are pushed after the result).
    */
-  rev: Schema.optionalKey(NonNegativeInt)
+  rev: Schema.optionalKey(NonNegativeInt),
+  /** Protocol 10: present only on the result of `module.action` that ran: what the handler said, shown by the button. */
+  action: Schema.optionalKey(FieldActionResult),
+  /**
+   * Additive within protocol 11 (P9): on the result of `notification.action`, the sentence to show for the press (the
+   * module's answer, or "I can't do that right now"), in the household's language.
+   */
+  say: Schema.optionalKey(Schema.String.check(Schema.isMaxLength(300)))
 })
 
 /**
@@ -387,6 +400,15 @@ export const DeviceTypesMessage = Schema.Struct({
   types: Schema.Array(DeviceTypeInfo)
 })
 
+/**
+ * Protocol 9, admin connections only: the issue registry changed (a check started or finished, a module became
+ * unavailable or available again, a module's start failed). Always the whole registry.
+ */
+export const HealthMessage = Schema.Struct({
+  type: Schema.Literal("health"),
+  health: HealthInfo
+})
+
 export const ServerMessage = Schema.Union([
   Welcome,
   Session,
@@ -423,7 +445,17 @@ export const ServerMessage = Schema.Union([
   DeviceSetupMessage,
   ConversationHistory,
   AssistantsMessage,
-  DeviceTypesMessage
+  DeviceTypesMessage,
+  HealthMessage,
+  HouseholdSnapshotMessage,
+  HouseholdEventMessage,
+  HouseholdGapMessage,
+  NotificationRingMessage,
+  NotificationResolvedMessage,
+  OutputVolumeMessage,
+  PresentShowMessage,
+  PresentUpdateMessage,
+  PresentDismissMessage
 ]).pipe(Schema.toTaggedUnion("type"))
 export type ServerMessage = typeof ServerMessage.Type
 export type ServerMessageType = ServerMessage["type"]

@@ -1,6 +1,5 @@
 import { Schema } from "effect"
-import { ChoiceOption, NumberField, BooleanField, ChoiceField, MultiChoiceField, SecretField, SecretState, TextField } from "./settings.ts"
-import { FieldError, FieldKey } from "./common.ts"
+import { SettingField, type SettingFieldType, SettingsForm, SettingsPatch, SettingValue } from "./settings.ts"
 
 /**
  * Module kinds, agent kinds, route reasons and the extended settings field types (docs/AGENTS-AND-INTENTS.md §5). The
@@ -38,166 +37,21 @@ export const RouteReason = Schema.Literals(["explicit", "trigger", "armed", "sti
 export type RouteReason = typeof RouteReason.Type
 
 // ---------------------------------------------------------------------------
-// New settings field types
+// The extended settings field types
 
-const common = {
-  key: FieldKey,
-  label: Schema.String,
-  description: Schema.optionalKey(Schema.String),
-  apply: Schema.Literals(["live", "reload"]),
-  advanced: Schema.optionalKey(Schema.Boolean),
-  locked: Schema.optionalKey(Schema.Struct({ reason: Schema.String }))
-}
-
-/** A list of short strings (aliases, greeting words, rooms): chips with an "add" input. Value: `string[]`. */
-export const TextListField = Schema.Struct({
-  type: Schema.Literal("textList"),
-  ...common,
-  default: Schema.Array(Schema.String),
-  maxItems: Schema.optionalKey(Schema.Int),
-  itemMaxLength: Schema.optionalKey(Schema.Int),
-  placeholder: Schema.optionalKey(Schema.String)
-})
-
-const itemCommon = {
-  key: FieldKey,
-  label: Schema.String,
-  description: Schema.optionalKey(Schema.String)
-}
-
-/** The field types allowed inside a record (no secrets, no nesting, no actions). */
-export const RecordItemField = Schema.Union([
-  Schema.Struct({
-    type: Schema.Literal("text"),
-    ...itemCommon,
-    default: Schema.String,
-    placeholder: Schema.optionalKey(Schema.String),
-    maxLength: Schema.optionalKey(Schema.Int)
-  }),
-  Schema.Struct({
-    type: Schema.Literal("number"),
-    ...itemCommon,
-    default: Schema.Finite,
-    integer: Schema.Boolean,
-    min: Schema.optionalKey(Schema.Finite),
-    max: Schema.optionalKey(Schema.Finite),
-    step: Schema.optionalKey(Schema.Finite),
-    unit: Schema.optionalKey(Schema.String)
-  }),
-  Schema.Struct({ type: Schema.Literal("boolean"), ...itemCommon, default: Schema.Boolean }),
-  Schema.Struct({ type: Schema.Literal("choice"), ...itemCommon, default: Schema.String, options: Schema.Array(ChoiceOption) }),
-  Schema.Struct({
-    type: Schema.Literal("multichoice"),
-    ...itemCommon,
-    default: Schema.Array(Schema.String),
-    options: Schema.Array(ChoiceOption)
-  }),
-  Schema.Struct({
-    type: Schema.Literal("textList"),
-    ...itemCommon,
-    default: Schema.Array(Schema.String),
-    maxItems: Schema.optionalKey(Schema.Int),
-    itemMaxLength: Schema.optionalKey(Schema.Int)
-  })
-]).pipe(Schema.toTaggedUnion("type"))
-export type RecordItemField = typeof RecordItemField.Type
-
-/** One record: item field key → value. */
-export const RecordValue = Schema.Record(FieldKey, Schema.Union([Schema.String, Schema.Finite, Schema.Boolean, Schema.Array(Schema.String)]))
-export type RecordValue = typeof RecordValue.Type
-
-/**
- * An ordered list of records with the same fields (routing rules, rooms with
- * aliases). Rendered as a list of compact rows, each expanding into a small form
- * built from `itemFields`; add, remove and (if `orderable`) move up/down.
- * Value: `RecordValue[]`.
+/*
+ * Protocol 10: `TextListField`, `RecordsField` (with `RecordItemField` and `RecordValue`), `ComboField`,
+ * `ActionField` and `InfoField` moved to `settings.ts` and joined `SettingField`, so agent, module and section forms
+ * share one wire form. The `V2` names stay as aliases.
  */
-export const RecordsField = Schema.Struct({
-  type: Schema.Literal("records"),
-  ...common,
-  default: Schema.Array(RecordValue),
-  itemFields: Schema.Array(RecordItemField),
-  /** Singular noun for buttons: "Add rule". */
-  itemLabel: Schema.String,
-  /** Item field whose value titles a collapsed row. */
-  titleKey: FieldKey,
-  maxItems: Schema.optionalKey(Schema.Int),
-  /** Order matters (first match wins); show move controls. */
-  orderable: Schema.Boolean
-})
+export { ActionField, ComboField, InfoField, RecordItemField, RecordsField, RecordValue, TextListField } from "./settings.ts"
 
-/**
- * Free text with suggestions (a combobox): a model name picked from the
- * backend's own model list, with any other name allowed when `allowCustom`.
- * The server fills `options` from the running instance; `optionsNote` says
- * where they came from ("From the server's model list", "Agent not running: type a name").
- * Value: `string`.
- */
-export const ComboField = Schema.Struct({
-  type: Schema.Literal("combo"),
-  ...common,
-  default: Schema.String,
-  options: Schema.Array(ChoiceOption),
-  allowCustom: Schema.Boolean,
-  maxLength: Schema.optionalKey(Schema.Int),
-  placeholder: Schema.optionalKey(Schema.String),
-  optionsNote: Schema.optionalKey(Schema.String)
-})
-
-/**
- * A button that runs something on the server ("Test", "Play a sample",
- * "Refresh model list"). It has no value. Pressing it sends `module.action` or
- * `settings.action`; the `result.detail` text is shown under the button until
- * the form is closed. Disabled while the form is dirty if `requiresSaved`.
- */
-export const ActionField = Schema.Struct({
-  type: Schema.Literal("action"),
-  ...common,
-  buttonLabel: Schema.String,
-  /** Ask "Are you sure?" with this text first. */
-  confirm: Schema.optionalKey(Schema.String),
-  /** The action uses the saved settings: disable it while there are unsaved edits. */
-  requiresSaved: Schema.Boolean
-})
-
-/** Read-only text computed by the server ("Logged in with a Max plan", "Last test: 912 ms"). Value: `string`. */
-export const InfoField = Schema.Struct({
-  type: Schema.Literal("info"),
-  ...common,
-  tone: Schema.optionalKey(Schema.Literals(["neutral", "ok", "warning", "error"]))
-})
-
-/** v2 field set: v1's six plus the five above. Replaces `SettingField` at integration. */
-export const SettingFieldV2 = Schema.Union([
-  TextField,
-  SecretField,
-  NumberField,
-  BooleanField,
-  ChoiceField,
-  MultiChoiceField,
-  TextListField,
-  RecordsField,
-  ComboField,
-  ActionField,
-  InfoField
-]).pipe(Schema.toTaggedUnion("type"))
-export type SettingFieldV2 = typeof SettingFieldV2.Type
-export type SettingFieldTypeV2 = SettingFieldV2["type"]
-
-/** v2 values: v1's plus a list of records. `action` fields have no value; `info` fields have a string. */
-export const SettingValueV2 = Schema.Union([Schema.String, Schema.Finite, Schema.Boolean, Schema.Array(Schema.String), Schema.Array(RecordValue)])
-export type SettingValueV2 = typeof SettingValueV2.Type
-
-export const SettingsFormV2 = Schema.Struct({
-  fields: Schema.Array(SettingFieldV2),
-  values: Schema.Record(FieldKey, SettingValueV2),
-  secrets: Schema.Record(FieldKey, SecretState),
-  errors: Schema.Array(FieldError)
-})
-export type SettingsFormV2 = typeof SettingsFormV2.Type
-
-export const SettingsPatchV2 = Schema.Struct({
-  values: Schema.Record(FieldKey, Schema.NullOr(SettingValueV2)),
-  secrets: Schema.Record(FieldKey, Schema.NullOr(Schema.String.check(Schema.isMaxLength(4096))))
-})
-export type SettingsPatchV2 = typeof SettingsPatchV2.Type
+export const SettingFieldV2 = SettingField
+export type SettingFieldV2 = SettingField
+export type SettingFieldTypeV2 = SettingFieldType
+export const SettingValueV2 = SettingValue
+export type SettingValueV2 = SettingValue
+export const SettingsFormV2 = SettingsForm
+export type SettingsFormV2 = SettingsForm
+export const SettingsPatchV2 = SettingsPatch
+export type SettingsPatchV2 = SettingsPatch

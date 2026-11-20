@@ -124,6 +124,26 @@ The box in the middle of the voice page (`.stage-vis`, at most 720 px wide and 4
 
 **Cost.** A stage canvas has many more pixels than the box (1280 × 800 is 5.9 times a 720 × 240 box; 1920 × 1080 at pixel ratio 2 is 48 times a box at ratio 1). The host caps a stage canvas's backing store at 4.2 million device pixels (`STAGE_MAX_PIXELS` in `host.ts`: the pixel ratio is lowered until the backing store, each side rounded to whole pixels, fits, below 1 when the CSS viewport alone is larger than the cap, but never below 0.5, `STAGE_MIN_RATIO`; 1280 × 800 at ratio 2 fits, 1920 × 1080 at ratio 2 gets ratio 1.42, 3840 × 2160 at ratio 1 gets 0.71; only a window of more than about 16.8 million CSS pixels goes past the cap, at ratio 0.5), so use the `dpr` from `resize`. Per-pixel work (full-canvas fills, `getImageData`, offscreen layers, shaders) grows with the canvas: size such work by a pixel budget, not by the canvas, and measure at 1920 × 1080 too. Measured (2026-11-16, headless Chromium, software raster, the baseline speaking / hearing with a loud voice): `frame()` itself 0.05 to 0.08 ms at every size; with the drawing rasterised (forced by a 1-pixel `getImageData`), 0.56 / 0.91 ms at 1280 × 800 ratio 1, 1.64 / 2.67 ms at 1280 × 800 ratio 2, 2.41 / 3.98 ms at 1920 × 1080 ratio 2 uncapped and 1.14 / 1.93 ms capped (the box today: 0.51 / 0.68 ms at ratio 1, 1.22 / 1.76 ms at ratio 2). In the page the host measured the baseline's `frame()` at 0.13 to 0.19 ms at 1280 × 800 ratio 1 and 0.14 to 0.19 ms at 1920 × 1080 ratio 2.
 
+### 2.7 The presentation stage (P10)
+
+Since P10 the voice page shows what modules present (cards, lists, timers, images, the weather) and P9's notification
+cards in **one presentation stage** (docs/PRESENTING.md "The voice page"). **Nothing changes for a character**: the
+contract, the frame, the box (`.stage-vis`), the stage canvas and `focus` are exactly as before, and no character is
+told what is presented. Where the stage sits, so a character author can leave it room:
+
+- a column at most 420 px wide, centred under the box, its bottom just above the controls (96 px above the bottom of
+  the page), growing upward as far as `max(160px, min(42dvh, 100dvh − 540px))` and scrolling within itself beyond
+  that, so on ordinary screens it stays below the box; on a very short screen it may cover the lower part of the
+  stage, never the box's centre at the heights the page supports;
+- it is drawn above the page (`z-index` 60), opaque cards with a border and the panel shadow, so glow under it is hidden
+  rather than fought with;
+- it slides 200 px left with the stage while the desktop chat is open (1024 to 1439 px wide), as the box does;
+- the page's scroll area gets the stage's height as extra bottom padding (`--pva-present-h`), so long captions scroll
+  above it; the focus moves with that scroll as it always did (§2.6).
+
+Atmosphere drawn outside the focus may run under the stage; what makes the mode readable belongs inside the focus, as
+before.
+
 ## 3. The manifest
 
 What a character declares about itself: the `Character` object in `apps/web/src/characters/contract.ts` (in the lab, the `Design` object). The host checks it on every load (`manifest.ts`) and refuses a character whose manifest is incomplete; the compatibility tests check it too (§6.7).

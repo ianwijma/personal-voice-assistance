@@ -62,8 +62,41 @@
  * entry or `device.save` and a version 8 page could not read a version 7 server's devices. Additive, within 8:
  * `Assistant.look`, `DeviceOwn`/`DeviceSettingsPatch` `look` and `voice`, `DeviceSetup.look` and `DeviceSetup.assistants[].look`,
  * `assistant.create.saveAnyway`, `TraceConfig.voiceFrom`, `usedByDevices` on voices and resource status.
+ *
+ * 9: module API v2 (docs/MODULES-PLAN.md §4 P1). `ModuleState` gains `unavailable` (a new member of a closed set:
+ * a version 8 page would refuse a module in that state), with `ModuleInfo.unavailable` (reason and fix). Additive,
+ * within 9: `ModuleInfo.version` / `apiVersion` / `templates`, `ToolInfo.risk` / `sensitivity` / `latency`, the
+ * issue registry (`health`, `admin.snapshot.health`) and "Check again" (`health.check`, admin only).
+ *
+ * 10: extended settings fields and module routes (docs/MODULES-PLAN.md §4 P3). `SettingField` gains `textList`,
+ * `records`, `combo`, `action` and `info` and `SettingValue` a list of records (new members of closed sets: a
+ * version 9 page would refuse a form that uses them); `ErrorCode` gains `unknown_action` and `not_running`.
+ * Additive, within 10: `module.action` (admin only) and `Result.action`, `ModuleInfo.routes`, `ModuleInfo.toolsLeft`,
+ * `ModuleInfo.details` (a light snapshot entry whose complete entry follows in `module.changed`), and the module route
+ * API (`moduleRoutes.ts`); the household messages to voice pages (§4 P4: `household.snapshot`, `household.event`,
+ * `household.gap`, `household.ts`), which a page that does not show household data ignores.
+ *
+ * 11: people, rooms and device capabilities (docs/MODULES-PLAN.md §4 P5). `DeviceSettingsKey` gains `place` and
+ * `capabilities` and `DeviceSettings` requires both (`DevicePlace`, `CapabilityOverrides`), so a version 10 peer would
+ * refuse a version 11 device entry. Additive, within 11: `hello.device.capabilities` and `device.caps`
+ * (`DeviceCapabilities`, `DeviceLiveState`), `DeviceRecord.declared`, `DeviceListInfo.declared` / `live`, and
+ * `RecordItemField.hidden` (a record field kept but not drawn: a person's id in Members), `EnvEntry.refused` (a known
+ * variable that is not read, with why: `HOUSEHOLD_MEMBERS`). `DevicePlace.room` is one line of text.
+ * P9, additive within 11 (docs/NOTIFICATIONS.md): `notification.ring` and `notification.resolved` (server → voice
+ * pages; a page that does not know them ignores them), `notification.action` (a request a newer page sends; an older
+ * page never sends it, and the server needs nothing from a page that does not) and `Result.say`. No closed set
+ * gains a member: a press of an action whose handler is not running is answered with the existing `not_running`.
+ * P7, additive within 11 (docs/PHRASES.md): `TraceInfo.phrase` (an optional key: a taken utterance's execution trace),
+ * `output.volume` (server → the voice connections of one device: the reply
+ * output's gain; a page that does not know it ignores it and the server needs nothing from it) and the optional
+ * `DevicePlace.ringingWithoutWake` (absent means on; an older peer ignores the key, a newer one accepts its absence). No
+ * closed set gains a member, so the version stays 11.
+ * P10, additive within 11 (docs/PRESENTING.md): `present.show`, `present.update` and `present.dismiss` (server → voice
+ * pages; a page that does not know them ignores them, and it is sent none, because it declares no presentation kinds)
+ * and `present.action` (a request only a newer page sends). No closed set the decoder checks gains a member: the kinds
+ * live inside the new messages, and `present.kinds` in a declaration was always an open record. So the version stays.
  */
-export const PROTOCOL_VERSION = 8
+export const PROTOCOL_VERSION = 11
 
 /** Path of the WebSocket endpoint, on the same origin as the UI in production. */
 export const WS_PATH = "/ws"
@@ -93,6 +126,12 @@ export const CloseCode = {
   helloTimeout: 4401,
   /** A message failed validation in a way that makes the connection unusable (e.g. binary frame before `hello`). */
   badMessage: 4402,
+  /**
+   * P5: a setting that decides what the device may be told or sent changed (its privacy, its default person, its
+   * speaker or display overrides, or a person left Members). The device's session ended with its connections; the
+   * page reconnects at once and starts a fresh session ("Settings changed; the conversation started again").
+   */
+  settingsChanged: 4205,
   /** The connection fell too far behind (send buffer over the limit); reconnect to get a fresh snapshot. */
   tooSlow: 4408,
   /** Connection limit reached. */

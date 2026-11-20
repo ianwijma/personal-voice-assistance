@@ -8,6 +8,7 @@ import {
   encodeClientMessage,
   FrameKind,
   PROTOCOL_VERSION,
+  REPLY_VOLUME,
   type ServerMessage,
   type ServerMessageOf,
   writeFrameHeader
@@ -37,6 +38,11 @@ export interface AudioPort {
   readonly socketLost: () => void
   /** The page's audio graph is running (so a reconnect may resume ownership). */
   readonly running: () => boolean
+  /**
+   * P7: the reply output's gain (`output.volume`; 0..1). Set back to the default at every `welcome`, so a server that
+   * restarted (and forgot the device's level) and the page never disagree. Optional: an audio port without it keeps 1.
+   */
+  readonly replyVolume?: (volume: number) => void
 }
 
 export interface ConnectionHooks {
@@ -86,6 +92,9 @@ export const defaultTiming: Timing = {
   backoffBaseMs: 250,
   backoffMaxMs: 5000
 }
+
+/** P5: shown once the page is back after the server ended its session because a setting changed (`CloseCode.settingsChanged`). */
+export const SETTINGS_CHANGED_NOTICE = "Settings changed; the conversation started again"
 
 /** Microphone frames are dropped (not queued) when more than this is waiting to be sent: 500 ms of audio. */
 export const MIC_BUFFER_LIMIT = 16_000
@@ -143,6 +152,8 @@ export const makeConnection = (options: ConnectionOptions): Connection => {
   const pendingRequests = new Map<string, { resolve: (r: ResultMessage) => void; timer: ReturnType<typeof setTimeout> }>()
   let pingSeq = 0
   let outstandingPing: { id: number; at: number } | undefined
+  /** P5: the server ended this device's session because its settings changed: say so after the next welcome. */
+  let settingsChanged = false
 
   const isOpen = () => ws !== undefined && welcomed && ws.readyState === WebSocket.OPEN
 
@@ -218,10 +229,16 @@ export const makeConnection = (options: ConnectionOptions): Connection => {
         if (m.protocol !== PROTOCOL_VERSION) return // the server closes with 4400
         welcomed = true
         outstandingPing = undefined
+        // P7: the server sends the device's reply volume after the welcome when it is not the default.
+        audio.replyVolume?.(REPLY_VOLUME.default)
         store.dispatch(m)
         Deferred.doneUnsafe(welcomedSignal, Effect.void)
         const resumed = m.snapshot.role === "owner" && audio.running()
         if (resumed) micSeq = 0
+        if (settingsChanged) {
+          settingsChanged = false
+          store.dispatch({ type: "local/toast", message: SETTINGS_CHANGED_NOTICE, tone: "info" })
+        }
         hooks.afterWelcome?.(resumed)
         return
       }
@@ -240,6 +257,10 @@ export const makeConnection = (options: ConnectionOptions): Connection => {
         break
       case "reply.stop":
         if (owner) audio.replyStop(m.turnId)
+        break
+      case "output.volume":
+        // Every tab of the device keeps it (the one that owns the audio plays; another may take over).
+        audio.replyVolume?.(m.volume)
         break
     }
     store.dispatch(m)
@@ -359,6 +380,18 @@ export const makeConnection = (options: ConnectionOptions): Connection => {
       if (error.code === CloseCode.protocolMismatch) {
         store.dispatch({ type: "local/connection", status: "outdated", attempt: 0 })
         return
+      }
+      if (error.code === CloseCode.settingsChanged) {
+        // The device's session ended on purpose (P5): what it showed goes now, not at the next welcome.
+        store.dispatch({ type: "local/session-ended" })
+        settingsChanged = true
+        // Back at once, once, after an established session; closes before a welcome count as failures (back-off).
+        if (error.welcomed) {
+          failures = 0
+          store.dispatch({ type: "local/connection", status: "reconnecting", attempt: 1 })
+          yield* Effect.sleep(Duration.millis(timing.backoffBaseMs))
+          continue
+        }
       }
       if (error.welcomed) failures = 0
       failures++

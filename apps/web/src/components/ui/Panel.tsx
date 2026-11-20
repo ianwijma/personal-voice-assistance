@@ -14,9 +14,11 @@ const FOCUSABLE = 'a[href],button:not([disabled]),textarea:not([disabled]),input
  * panel such as the chat popover on a wide screen), Esc closes (when focus is inside), and focus returns to where it
  * was on close.
  */
-export const useDialog = (ref: RefObject<HTMLElement | null>, open: boolean, onClose: () => void, initialFocus?: string, opts: { readonly trap?: boolean; readonly inertBackground?: boolean } = {}) => {
+export const useDialog = (ref: RefObject<HTMLElement | null>, open: boolean, onClose: () => void, initialFocus?: string, opts: { readonly trap?: boolean; readonly inertBackground?: boolean; readonly extraFocus?: string } = {}) => {
   const trapRef = useRef(true)
   trapRef.current = opts.trap !== false
+  const extraFocusRef = useRef(opts.extraFocus)
+  extraFocusRef.current = opts.extraFocus
   const closeRef = useRef(onClose)
   closeRef.current = onClose
   useEffect(() => {
@@ -29,7 +31,10 @@ export const useDialog = (ref: RefObject<HTMLElement | null>, open: boolean, onC
     // The dialog container can always take focus, so focus never has to stay outside it.
     if (!el.hasAttribute("tabindex")) el.tabIndex = -1
     const usable = (x: HTMLElement) => !(x as HTMLButtonElement).disabled && x.getAttribute("aria-disabled") !== "true" && x.closest("[inert]") === null && (x.offsetParent !== null || x === document.activeElement)
-    const enabled = () => Array.from(el.querySelectorAll<HTMLElement>(FOCUSABLE)).filter(usable)
+    // Voice dialogs also own the fixed notification strip, outside their layout so a ring cannot shift controls.
+    const dialogItems = () => Array.from(el.querySelectorAll<HTMLElement>(FOCUSABLE)).filter(usable)
+    const extraItems = () => extraFocusRef.current === undefined ? [] : Array.from(document.querySelectorAll<HTMLElement>(`${extraFocusRef.current} :is(${FOCUSABLE})`)).filter(usable)
+    const enabled = () => [...dialogItems(), ...extraItems()]
     const wanted = initialFocus !== undefined ? el.querySelector<HTMLElement>(initialFocus) : null
     const first = wanted !== null && usable(wanted) ? wanted : (enabled()[0] ?? el)
     first.focus({ preventScroll: true })
@@ -46,6 +51,14 @@ export const useDialog = (ref: RefObject<HTMLElement | null>, open: boolean, onC
       if (items.length === 0) {
         e.preventDefault()
         el.focus({ preventScroll: true })
+        return
+      }
+      const extra = extraItems()
+      if (extra.length > 0 && ((!e.shiftKey && active === dialogItems().at(-1)) || extra.includes(active as HTMLElement))) {
+        // Bridge the two DOM regions at their edges; native Tab still handles the dialog's own controls.
+        e.preventDefault()
+        const index = items.indexOf(active as HTMLElement)
+        items[(index + (e.shiftKey ? -1 : 1) + items.length) % items.length]!.focus()
         return
       }
       const firstItem = items[0]!

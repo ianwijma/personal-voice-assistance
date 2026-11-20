@@ -12,6 +12,7 @@ import {
   isEmptyPatch,
   onlyReloadFields,
   reconcile,
+  resetDraftValue,
   someReloadFields
 } from "@/lib/forms.ts"
 
@@ -45,7 +46,19 @@ export interface FormState {
   readonly localErrors: Readonly<Record<string, string>>
   /** Warnings returned by the last save: shown above the footer until "Save anyway" or an edit. */
   readonly confirm: ReadonlyArray<FieldError>
+  /**
+   * New for every fresh draft (Cancel, a save, a new form): the fields are drawn again from it, so text a renderer
+   * keeps for itself (a number being typed, a list item not added yet) goes with the draft it belonged to.
+   */
+  readonly epoch: number
+  /**
+   * Per field, raised by "Reset to the default": that field alone is drawn again, so its renderer's private state
+   * (text being typed, a rejected item, a record's row state) and its local error go with the value it replaced.
+   */
+  readonly fieldEpochs: Readonly<Record<string, number>>
 }
+
+let epochSeq = 0
 
 export interface PageFormView {
   readonly def: PageFormDef
@@ -54,6 +67,11 @@ export interface PageFormView {
   readonly shown: (field: SettingField) => boolean
   readonly patch: SettingsPatch
   readonly dirty: boolean
+  /**
+   * The local errors that count: those of fields still in the form and shown now. A field hidden by `visibleWhen`,
+   * left out by `only`, or gone from a new form is not saved, so its leftover error cannot hold Save.
+   */
+  readonly localErrors: Readonly<Record<string, string>>
 }
 
 export interface SaveFns {
@@ -66,7 +84,9 @@ const fresh = (def: PageFormDef): FormState => ({
   sync: { draft: initialDraft(def.form), baseRevision: def.revision, stale: false },
   serverErrors: [],
   localErrors: {},
-  confirm: []
+  confirm: [],
+  epoch: ++epochSeq,
+  fieldEpochs: {}
 })
 
 export const usePageForms = (defs: ReadonlyArray<PageFormDef>, saved: (key: string) => unknown, fns: SaveFns) => {
@@ -88,7 +108,9 @@ export const usePageForms = (defs: ReadonlyArray<PageFormDef>, saved: (key: stri
         if (state === undefined) {
           next = { ...next, [def.key]: fresh(def) }
         } else if (prev !== undefined && (prev.revision !== def.revision || prev.form !== def.form)) {
-          const sync = reconcile(state.sync, prev.form, def.form, def.revision)
+          // Fields that show a local error count as edited, as for Save and Test (`computeViews`).
+          const invalid = Object.keys(computeViews([prev], { [def.key]: state }, saved)[0]!.localErrors)
+          const sync = reconcile(state.sync, prev.form, def.form, def.revision, invalid)
           if (sync !== state.sync) next = { ...next, [def.key]: { ...state, sync } }
         }
         previous.current.set(def.key, def)
@@ -106,7 +128,7 @@ export const usePageForms = (defs: ReadonlyArray<PageFormDef>, saved: (key: stri
 
   const dirtyViews = views.filter((v) => v.dirty)
   const dirty = dirtyViews.length > 0
-  const hasLocalErrors = views.some((v) => Object.keys(v.state.localErrors).length > 0)
+  const hasLocalErrors = views.some((v) => Object.keys(v.localErrors).length > 0)
 
   return {
     views,
@@ -122,6 +144,25 @@ export const usePageForms = (defs: ReadonlyArray<PageFormDef>, saved: (key: stri
     setDraft: (key: string, f: (d: Draft) => Draft) => {
       setSavedFlash(false)
       update(key, (s) => ({ ...s, confirm: [], sync: { ...s.sync, draft: f(s.sync.draft) } }))
+    },
+    /**
+     * "Reset to the default" of one field: its value replaced by the default (saved as `null`), its local error
+     * cleared and its renderer drawn again (`fieldEpochs`), other fields untouched.
+     */
+    resetField: (key: string, field: SettingField) => {
+      setSavedFlash(false)
+      update(key, (s) => {
+        const { [field.key]: _gone, ...localErrors } = s.localErrors
+        return {
+          ...s,
+          confirm: [],
+          localErrors,
+          // The refused save's errors of this field were about the value it no longer has.
+          serverErrors: s.serverErrors.filter((e) => e.key !== field.key),
+          fieldEpochs: { ...s.fieldEpochs, [field.key]: (s.fieldEpochs[field.key] ?? 0) + 1 },
+          sync: { ...s.sync, draft: resetDraftValue(s.sync.draft, field) }
+        }
+      })
     },
     setLocalError: (key: string, field: string, message: string | undefined) =>
       update(key, (s) => {
@@ -161,29 +202,40 @@ export const usePageForms = (defs: ReadonlyArray<PageFormDef>, saved: (key: stri
       setSaving(true)
       setSavedFlash(false)
       let allOk = true
-      for (const view of toSave) {
-        update(view.def.key, ({ message: _m, ...s }) => ({ ...s, serverErrors: [], confirm: [] }))
-        // continuation(state): the saved form is read from `latest.current` / `previous.current` when the answer comes.
-        const result = view.def.kind === "section"
-          ? await fns.section(view.def.id, view.patch, options.confirm === true) // continuation(state): see above
-          : await fns.module(view.def.id, view.patch) // continuation(state): see above
-        if (result.ok) {
-          // The broadcast (section.changed / module.changed) arrived first and carries the saved values.
-          const def = latest.current.find((d) => d.key === view.def.key) ?? view.def
-          previous.current.set(def.key, def)
-          update(view.def.key, () => fresh(def))
-          continue
+      // Review round 4: whatever happens to a request (refused before it is sent, a lost connection), the save ends
+      // and the form says why; Save and Cancel are usable again.
+      try {
+        for (const view of toSave) {
+          update(view.def.key, ({ message: _m, ...s }) => ({ ...s, serverErrors: [], confirm: [] }))
+          // continuation(state): the saved form is read from `latest.current` / `previous.current` when the answer comes.
+          let result: ResultMessage
+          try {
+            result = view.def.kind === "section"
+              ? await fns.section(view.def.id, view.patch, options.confirm === true) // continuation(state): see above
+              : await fns.module(view.def.id, view.patch) // continuation(state): see above
+          } catch (e) {
+            const why = e instanceof Error && e.message !== "" ? e.message : String(e)
+            result = { type: "result", requestId: "", ok: false, error: { code: "internal", message: `The settings were not saved: ${why}`.slice(0, 500) } }
+          }
+          if (result.ok) {
+            // The broadcast (section.changed / module.changed) arrived first and carries the saved values.
+            const def = latest.current.find((d) => d.key === view.def.key) ?? view.def
+            previous.current.set(def.key, def)
+            update(view.def.key, () => fresh(def))
+            continue
+          }
+          allOk = false
+          const fieldErrors = result.error?.fieldErrors ?? []
+          const warnings = result.error?.warnings ?? []
+          update(view.def.key, (s) => {
+            const { message: _m, ...rest } = s
+            const message = fieldErrors.length === 0 && warnings.length === 0 ? result.error?.message ?? "The settings were not saved." : undefined
+            return { ...rest, serverErrors: fieldErrors, confirm: warnings, ...(message !== undefined ? { message } : {}) }
+          })
         }
-        allOk = false
-        const fieldErrors = result.error?.fieldErrors ?? []
-        const warnings = result.error?.warnings ?? []
-        update(view.def.key, (s) => {
-          const { message: _m, ...rest } = s
-          const message = fieldErrors.length === 0 && warnings.length === 0 ? result.error?.message ?? "The settings were not saved." : undefined
-          return { ...rest, serverErrors: fieldErrors, confirm: warnings, ...(message !== undefined ? { message } : {}) }
-        })
+      } finally {
+        setSaving(false)
       }
-      setSaving(false)
       if (allOk) {
         setSavedFlash(true)
         if (options.reload === true) await fns.reload() // continuation(none): nothing runs after the reload's answer
@@ -211,6 +263,11 @@ const computeViews = (
     const lookup = def.kind === "section" ? pageLookup : draftLookup(state.sync.draft, () => undefined)
     const shown = (field: SettingField) => (def.only === undefined || def.only.includes(field.key)) && fieldVisible(field, lookup)
     const patch = def.readOnly ? { values: {}, secrets: {} } : computePatch(def.form, state.sync.draft, shown)
-    return { def, state, lookup, shown, patch, dirty: !isEmptyPatch(patch) }
+    const localErrors: Record<string, string> = {}
+    for (const field of def.form.fields) {
+      if (Object.hasOwn(state.localErrors, field.key) && shown(field)) localErrors[field.key] = state.localErrors[field.key]!
+    }
+    // Text a field could not take yet (`localErrors`) is an edit too: leaving the page asks first, Cancel is offered.
+    return { def, state, lookup, shown, patch, localErrors, dirty: !isEmptyPatch(patch) || Object.keys(localErrors).length > 0 }
   })
 }

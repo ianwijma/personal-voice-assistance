@@ -180,7 +180,7 @@ test.describe("Shared settings › Home and Routing", () => {
   test("Home: location, time zone, language, units and date format save through settings.update", async ({ page, baseURL }) => {
     await loginAdmin(page, baseURL, "#settings/shared/home")
     const form = page.getByTestId("form-s-home")
-    await expect(form.locator("[data-field]")).toHaveCount(5)
+    await expect(form.locator("[data-field]")).toHaveCount(8)
     await form.locator("[data-field=HOME_LOCATION]").getByRole("textbox").fill("Utrecht, Netherlands")
     await form.locator("[data-field=HOME_TIME_ZONE]").getByRole("textbox").fill("Europe/Amsterdam")
     await form.locator("[data-field=HOME_LANGUAGE]").getByRole("radio", { name: "Dutch (Netherlands)" }).click()

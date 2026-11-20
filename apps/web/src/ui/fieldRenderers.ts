@@ -1,6 +1,11 @@
 import type { ComponentType } from "react"
 import type { SettingField, SettingFieldType } from "@pva/protocol"
+import { ActionField } from "@/components/fields/ActionField.tsx"
 import { BooleanField } from "@/components/fields/BooleanField.tsx"
+import { ComboField } from "@/components/fields/ComboField.tsx"
+import { InfoField } from "@/components/fields/InfoField.tsx"
+import { RecordsField } from "@/components/fields/RecordsField.tsx"
+import { TextListField } from "@/components/fields/TextListField.tsx"
 import { ChoiceField } from "@/components/fields/ChoiceField.tsx"
 import { MultiChoiceField } from "@/components/fields/MultiChoiceField.tsx"
 import { NumberField } from "@/components/fields/NumberField.tsx"
@@ -19,7 +24,13 @@ export const fieldRenderers: { readonly [T in SettingFieldType]: ComponentType<F
   number: NumberField,
   boolean: BooleanField,
   choice: ChoiceField,
-  multichoice: MultiChoiceField
+  multichoice: MultiChoiceField,
+  // Protocol 10 (docs/SETTINGS-UI.md §3.2): the extended field types.
+  textList: TextListField,
+  records: RecordsField,
+  combo: ComboField,
+  action: ActionField,
+  info: InfoField
 }
 
 /**

@@ -61,8 +61,13 @@ At most 64 devices are kept (least recently seen dropped first; devices with own
 
 A device's **settings** are the sections of `DeviceSettings`: `assistants` (the ordered assistants that answer here, each
 with its wake phrases and an optional follow-up time), `withoutPhrase`, `matching`, `voicePage`, `interruptMode`, `audio`,
-`captions`. Effective settings = built-in defaults ← the type's defaults (admin: Devices › Every browser) ← the device's own
-sections (admin: Devices › the device; each section "Own value · Reset"). They are stored in `data/settings.json` version 4
+`captions`, `look`, `voice`, and since protocol 11 `place` (room, privacy, always on, accepts from others, quiet room, default
+person) and `capabilities` (what the owner takes away from what the device declares in `hello.device.capabilities`;
+docs/ARCHITECTURE.md, "People, rooms and device capabilities"; saving a change of privacy, default person or a
+capabilities override ends the device's session: its pages are closed with `CloseCode.settingsChanged`, reconnect at
+once and show "Settings changed; the conversation started again"; at the close, everything the page showed of the old
+session goes: the conversation, the draft, the stage's caption, what the recogniser heard and the notices). Effective settings = built-in defaults ← the type's defaults (admin: Devices › Every browser) ← the device's own
+sections (admin: Devices › the device; each section "Own value · Reset"). They are stored in `data/settings.json` version 5
 (`deviceTypes`, `devices`). Protocol 5's `DeviceProfile` (activation, one phrase list, follow-up, voice, interrupt mode,
 audio, captions) was that, flat and per field; its stored form is read only by the version 3 migration.
 
@@ -273,7 +278,7 @@ New and changed messages (schema constant → `type`):
 | server | `Result` (changed) | `result` | + `admin?: AdminSession` (successful `admin.login` only) |
 | server | `EngineSummaryMessage` | `engine.summary` | `{ engine: EngineSummary }`, everyone |
 | server | `AdminStateMessage` | `admin.state` | `{ admin: AdminState }`, the connection concerned |
-| server | `AdminSnapshotMessage` | `admin.snapshot` | `{ snapshot: AdminSnapshot }`, admin only |
+| server | `AdminSnapshotMessage` | `admin.snapshot` | `{ snapshot: AdminSnapshot }`, admin only. Protocol 10: a module that does not fit the snapshot's share is a light entry there (`ModuleInfo.details: "follow"`), and its complete `module.changed` follows at once in the same send (docs/ARCHITECTURE.md, Bounds) |
 | server | `DeviceProfileMessage` | `device.profile` | `{ deviceId?, profile, editable }`, the device's connections |
 | server | `Frontends` | `frontends` | `{ frontends: FrontendKindInfo[] }`, admin only |
 | server | `Devices` | `devices` | `{ devices: DeviceInfo[] }`, admin only |

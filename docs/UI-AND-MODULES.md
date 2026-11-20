@@ -186,6 +186,8 @@ A module cannot depend on the assistant's services (it cannot speak, listen or c
 
 ### 1.2 Declaring a module (real code: `packages/core/src/ModuleDefinition.ts`, `Settings.ts`)
 
+This is module API version 1, which every module without `apiVersion` keeps. Version 2 adds optional fields (§1.10).
+
 ```ts
 export const defineModule: <const S extends SettingsSpec = {}>(definition: {
   readonly id: string                // persistence key and protocol id: /^[a-z][a-z0-9-]{0,39}$/
@@ -221,6 +223,11 @@ Settings fields (`Setting.*` in `Settings.ts`; each maps to exactly one protocol
 | `Setting.boolean` | `boolean` | `default` | switch |
 | `Setting.choice` | union of the option values | `options: [{ value, label, description? }]`, `default` | segmented control (≤ 4 options) or select |
 | `Setting.multichoice` | `ReadonlyArray<value>` | `options`, `default` | checkbox list |
+| `Setting.textList` (protocol 10, §1.11) | `ReadonlyArray<string>` | `default` ([]), `maxItems` (50), `itemMaxLength` (60), `placeholder`, `overridable`; env: comma-separated | chips with an "add" input |
+| `Setting.records` (§1.11) | `ReadonlyArray<{ … }>` | `item` (flat: `text`, `number`, `boolean`, `choice`, `multichoice`, `textList`; no secrets), `itemLabel`, `titleKey`, `default`, `maxItems`, `orderable`, `check(list)`; env: JSON | rows that open into a small form |
+| `Setting.combo` (§1.11) | `string` | `default`, `options`, `allowCustom` (true), `maxLength`, `placeholder`; the running instance adds options (`settingOptions`) | input with suggestions |
+| `Setting.action` (§1.11) | nothing | `buttonLabel`, `confirm`, `requiresSaved` (true); the handler is a `fieldActions` entry | a button with its result |
+| `Setting.info` (§1.11) | nothing | `tone`; the value is the running instance's `info()[key]` | read-only text |
 
 `env: "NAME"` on any field means: when that environment variable (or `.env` entry) is set and non-empty, it provides the value and the field is shown read-only in the UI with "Set by NAME in the environment". This is how today's `.env` configuration keeps working after the migration (`WEATHER_DEFAULT_PLACE`, `WEATHER_UNITS`).
 
@@ -327,25 +334,29 @@ The **module host** (`packages/core/src/ModuleHost.ts`, new, Node-free; persiste
 |---|---|---|---|
 | `disabled` | Not running; intent off | startup with intent off; disable completed | `starting` on enable |
 | `starting` | `start` is running (10 s limit) | enable; startup with intent on; retry | `running`, `error` |
-| `running` | Instance is in the snapshot | `start` succeeded | `stopping` on disable; stays `running` on reconfigure |
-| `stopping` | Removed from the snapshot; scope closes after a 10 s grace | disable | `disabled` |
+| `running` | Instance is in the snapshot | `start` succeeded | `stopping` on disable, and on a reconfigure that changes what it runs (then `starting`); stays `running` on one that does not |
+| `stopping` | Removed from the snapshot; its calls in flight get up to 10 s, then its scope closes | disable; a change of what it runs | `disabled`, or `starting` again |
 | `error` | Intent on, not running. `error` says why | start failed or timed out; saved settings invalid; tool name clash | `starting` on enable (retry) or reconfigure; `disabled` on disable |
+| `unavailable` | Cannot run on this server (protocol 9, §1.10.3); `unavailable` says why and how to fix it | a required program or the platform is missing, or an unsupported `apiVersion` | `starting` (if wanted) once "Check again" finds it available |
 
 Rules:
 
-- **One operation per module at a time.** A second request for the same module while one runs gets `result` with `busy`. Operations on different modules run concurrently.
+- **Triggers write the desired state; one worker applies it, one module at a time, stop before start** (module API v2
+  review round 3, docs/ARCHITECTURE.md "Module host"). Enable, disable, configure, an assistant's change, the vault,
+  Check again and restarts each write what should be true and wait for a pass that began after the write; passes never
+  overlap, so a disable while an enable starts is applied right after it, not refused, and a second `module.configure`
+  is applied after the first. A caller that gives up (a timed-out request) only stops waiting: the change stays, is
+  saved and is applied.
 - **Enable**: resolve settings. Invalid → `error` (form errors), intent saved as on, `result` with `invalid_settings`. Tool names clash with another running module → `error` ("Tool name `weather` is already used by module X"), `result` with `module_start_failed`. Otherwise `starting` → `start` → `running` (a new snapshot is published) or `error` (`result` with `module_start_failed` and the start error's message). Intent is saved as on in every case, so a module that failed because a key was missing comes up by itself after the key is fixed and the assistant restarts. Enabling a module in `error` is the retry.
-- **Disable**: intent saved as off; the module leaves the snapshot immediately (`stopping`); its scope is closed 10 s later (or at shutdown), so a tool call already running finishes normally. Tools must time out well under 10 s anyway (weather: 3 s).
-- **Reconfigure** (`module.configure`): `applySettingsPatch`; invalid → `result` with `invalid_settings` and `fieldErrors`, nothing changes. Then, by state:
-  - `running`: start a new instance with the new settings while the old one keeps serving. Success → swap it into a new snapshot, retire the old one (10 s grace), save the settings. Failure → keep the old instance, **do not save**, `result` with `module_start_failed`. Saved settings always match what runs.
-  - `disabled`: save; nothing starts.
-  - `error`: save (the old settings did not work either), then start → `running` or `error`.
-- **A turn in flight** keeps the snapshot it took at its start, including a pending speculative turn that is later promoted. Changes apply from the next turn. If the model calls a tool of a module disabled during the turn, the tool still runs (its scope is in its grace period).
+- **Disable**: intent saved as off; the module leaves the snapshot immediately (`stopping`); a tool call already running gets up to 10 s to finish (then it is interrupted), and the scope closes as soon as nothing of it runs. Tools must time out well under 10 s anyway (weather: 3 s). `disable` answers once it has stopped.
+- **Reconfigure** (`module.configure`): `applySettingsPatch`; invalid → `result` with `invalid_settings` and `fieldErrors`, nothing changes. While it runs, settings it could not start with are refused the same way. Otherwise the settings are saved, and if what the module runs changes, it is **stopped and started again**: withdrawn from the snapshot, its calls in flight finish (10 s at most), its scope closes, then the new one starts. A start that fails leaves the module down (`error`, on the Health page), and `result` is `module_start_failed`; nothing old keeps running beside or instead of it. While it restarts the module is absent: its tools are not offered and its services are not there, which consumers handle anyway.
+- **A turn in flight** keeps the snapshot it took at its start, including a pending speculative turn that is later promoted. Changes apply from the next turn. If the model calls a tool of a module that was withdrawn during the turn, the call is refused ("… was stopped or started again since this turn began; ask again"); a call already running when it was withdrawn finishes, within 10 s.
 - **System prompt and cache.** The system prompt of a turn is `base prompt + instructions of running modules (catalog order) + voice block`, built when the snapshot changes. A module change that alters the tool list or the instructions changes the cached prefix (tools → system → messages), so the next request writes a new cache entry: expect a slower first token on that one turn, visible in its trace. Context providers do not affect the cache.
 - **Context providers** are wrapped by the host with a 50 ms timeout; a slow provider contributes nothing to that turn and logs a warning (it must not add latency to every turn).
 - **Runtime trouble after start** (the Home Assistant server goes away): tools return `ToolError` as today; the module may set an `error`-tone status. The host does not restart modules automatically.
-- **Startup**: modules with intent on start concurrently with the engine build; neither waits for the other. A module still starting when the first turn begins is simply not in that turn's snapshot.
-- **Shutdown**: every module scope is closed (no grace).
+- **Startup**: in the CLI modes, modules with intent on start concurrently with the engine build; neither waits for the other. In serve mode the host starts nothing before `startEnabled`, which serve mode calls once what the modules depend on is built. A module still starting when the first turn begins is simply not in that turn's snapshot.
+- **Shutdown**: every module is withdrawn first, in one step (nothing of any module stays published or callable, and every host object answers `ModuleStopped`); then the parts are closed, consumers first, without grace; the whole close is bounded (30 s), and module code that does not finish closing in time is left to finish on its own and logged.
+- **The grace period** covers the calls admitted to the stopping module itself (its tools, actions and context providers). A call another module makes into its service while it stops may fail; the consumer handles that failure.
 
 ### 1.5 Validation and error reporting
 
@@ -454,6 +465,439 @@ The UI, persistence, enable switch, settings form and status line come for free.
 - Per-module permissions beyond the existing speculative flag; confirmation before side-effecting tools.
 - Hot-loading module code from disk (the catalog is compiled in).
 - Automatic restart of a module after runtime failures.
+
+### 1.10 Module API version 2 (docs/MODULES-PLAN.md §4 P1)
+
+Everything in this section is optional. A module without `apiVersion` is version 1 and behaves exactly as §1.2–§1.4
+describe; its `start` gets `{ settings, setStatus }` and nothing else. The contract is in
+`packages/core/src/ModuleApi.ts`, `ModuleDefinition.ts`, `Gateway.ts` and `TurnContext.ts`.
+
+```ts
+MODULE_API = { current: 2, supports: [1, 2] }       // a module outside the range is `unavailable`
+
+defineModule({
+  apiVersion: 2,
+  id, name, description, settings, kind?, enabledByDefault?, enabledWhenSet?,   // as in version 1
+  version?: "0.3.0",                                // shown in the UI
+  requires?: ReadonlyArray<Requirement>,             // judged before anything starts (§1.10.3)
+  platforms?: { os?: ["linux"], arch?: ["x64", "arm64"] },
+  health?: ({ settings, running }) => Effect<ReadonlyArray<Issue>>,   // cheap; 5 s; never on a turn
+  templates?: [{ id: "dj", name: "DJ", prompt, purpose?, handles?, modules?, suggestedPhrases? }],
+  declaredActions?: [{ id: "play", label, description, examples? }],   // known while unavailable (§1.10.3)
+  uses?: ["lists"],                                 // other modules this one needs while it is demanded
+  shared?: (ctx: SharedContext<A>) => Effect<SharedPart<X>, ModuleStartError, Scope>,
+  start: (ctx: ModuleContextV2<A, X>) => Effect<ModuleInstance, ModuleStartError, Scope>
+})
+
+interface SharedContext<A>      { settings: Partial<A>; settingsFor(assistantId?): A | undefined; host: ModuleHostApi } // + later members
+interface ModuleContextV2<A, X> { settings: A; setStatus; shared: X; host: ModuleHostApi } // + later members
+interface SharedPart<X>         { value: X; services?: ReadonlyArray<ProvidedService>; contributions?: ReadonlyArray<ProvidedContribution> }
+const Lists = ServiceKey<ListsService>("lists")           // provided with services: [Lists.of(impl)]
+const Sections = ContributionKey<Section>("briefing.sections") // contributed with contributions: [Sections.of(section)]
+
+interface ModuleHostApi {
+  view(): HostView                                   // module states, vault locked, engine summary, devices, Home values
+  service<T>(key: ServiceKey<T>): T | undefined      // live; undefined while no demanded module provides it
+  contributions<T>(key: ContributionKey<T>): Effect<ReadonlyArray<T>>   // live, catalog order, for the caller's assistant
+  contributionsFor<T>(key, assistantId | undefined): ReadonlyArray<T>    // the same, named explicitly (undefined: all)
+  actions: { list: Effect<ReadonlyArray<CatalogAction>>; run(request): Effect<ActionRunResult> }  // the turn's catalogue
+  requestRestart(reason): Effect<void>               // stop the module, then start it again (at most every 5 s)
+  reportMissingProgram(tool): Effect<void>           // a required program failed with ENOENT/EACCES
+}
+```
+
+#### 1.10.1 Two lifetimes
+
+`start` keeps running once per distinct set of effective settings (§1.4, docs/ASSISTANTS.md §2.6): tools, actions,
+context providers, instructions. `shared` runs **once per module** while the module is **demanded**: a switched-on
+assistant has it on (serve mode's demand), its own switch is on (no demand: the CLI modes, agents), or a demanded module
+names it in `uses` (transitively; a module that is unavailable does not run, so it demands nothing). It gets the
+module's shared settings only: the `overridable` fields, which an assistant may own, are left out (hence
+`Partial<A>`), and only those fields are validated for it (an assistant-owned field's invalid shared value does not
+stop it; each instance validates its own effective settings in full). Shared code acting for a caller asks
+`ctx.settingsFor(assistantId)`: the shared (not overridable) values and that assistant's own value of each overridable
+field over the shared default; the
+current shared defaults with no assistant, `undefined` when they are not valid. It answers from the latest accepted
+state of the run (who has the module on, their own values, the saved values and the defaults as of the last change that
+kept the run), with the secrets the run started with. Not every change that alters its answer restarts the module: an
+assistant joining or leaving an existing instance, assistants swapping between equal instances, and a changed default
+or saved value of an overridable field that no running instance uses (Amsterdam to London while the module runs only
+for `uses`) keep the run, and the same `settingsFor` answers London from then on. A change that does alter an instance
+restarts the module as below. So a module must not cache what `settingsFor` answers (or other shared state derived
+from it) on the assumption that every relevant change restarts it: ask when acting. Sockets, caches, handlers,
+services and contributions belong there. What it returns as `value`, every instance receives as `ctx.shared`.
+
+The shared part and the instances it serves start, run, stop and close **together** (docs/ARCHITECTURE.md "Module
+host"):
+
+- They are published **only if the shared part and every instance started**: the shared part starts first (10 s),
+  then every instance with its value, one after another; then every registration is checked (services, tool names,
+  P3's routes, P6's job handlers, …) and everything is published in one synchronous step. If anything fails, what did
+  start is closed (instances first) and the module is down (`error`, with the reason on the Health page); a `uses`
+  consumer runs without the service and says the other module is off. An assistant whose own values are not valid is
+  never started: it gets an error of its own, and the others run.
+- Any change of what it runs (a shared setting, Home moving a linked default, an assistant joining with settings no
+  instance has yet, a configured secret, a restart) **stops it, then starts it again**: everything it published is
+  withdrawn in one step, its calls in flight get up to 10 s, its instances and then its shared part are closed, and
+  only then does the new one start. For that moment the module is absent. There is never an old and a new one at
+  once. Assistants that only move between equal instances change nothing that runs.
+- A start that failed is tried again when something it depends on changes (its settings, its secrets or the vault, its
+  requirements' probe results, a restart) or on Check again; not otherwise.
+- Every part started is either published or closed, also when the host closes during a start. Stopping closes a
+  consumer before the providers it uses and an instance before its shared part, one after the other. Module code that
+  does not finish closing within 5 s is left to finish on its own and reported on the Health page.
+- When demand ends the module is withdrawn at once and closed once its calls in flight are done (10 s at most).
+- Order: a module starts after the modules in its `uses` have started or failed in the same pass (they are published
+  by then), so it can look them up during its own start. A cycle in `uses` is an error for every module in it
+  (`<id>.uses`), found when the catalogue is read; they never start. Every pass evaluates demand for every module, so
+  a provider follows its consumers transitively.
+- A module used only through `uses` (no instance) is `running` while its shared part runs, and its `health()` gets
+  `running: true`.
+- `requestRestart` (from a live shared part or instance) stops the module and starts it again. It is recorded in one
+  step (an interrupted caller made it whole or not at all). Requests are taken up at most once per 5 s, the ones in
+  between merged into the next restart: a module cannot restart itself in a tight loop (this is not a minimum
+  distance between two restarts). One made after the last one was taken up always leads to another, so a tool list
+  that changed again is not lost. A request from a part that is starting, from a start that failed, or from a part
+  being stopped (a finalizer) is ignored. The restart starts with the module's current settings and the secrets it ran with (a locked vault does
+  not stop it). Restarts and every other start run outside any turn: the new start never sees the requesting tool's
+  `CurrentTurn`. A host object that old code keeps after its part closed answers with `ModuleStopped`.
+#### 1.10.2 Services and contributions
+
+A **service** is one typed object a module offers others under a `ServiceKey<T>`: `host.service(key)` returns the
+published shared part's service, or `undefined` while no demanded module provides it (a consumer then says the other
+module is off). One provider per key: a second module providing the same key gets a start error ("The service "x" is
+already provided by module Y"). A **contribution** is a value any number of modules add under a `ContributionKey<T>`;
+`host.contributions(key)` is the live list in catalog order, an `Effect`: for a caller acting for an assistant (its
+fiber's `CurrentTurn`, or a job made for an assistant) it holds only the contributions of modules that assistant has
+on, read from the fiber's own context, so it holds after any `yield*` (in serve mode a caller with no principal gets
+none). Native code (a socket callback, an `await` inside a promise) names the assistant explicitly:
+`host.contributionsFor(key, assistantId)`, with `undefined` for every provider's, deliberately (services are not
+filtered: §2 row 18 of the plan). Both are read live at each call, so start order and
+restarts cannot lose a registration, and nothing registers itself with another module. Because services come from the
+once-per-module part, a module with several instances still has exactly one provider.
+
+#### 1.10.3 Requirements and `unavailable`
+
+`requires` lists two kinds: a **program on the server** (`{ tool, version?, optional?, why }`) and the **network**
+(`{ network: "lan" | "internet", optional?, why? }`, not probed yet: `unchecked`). The app keeps one program registry
+with probes (`apps/assistant/src/requirements.ts`: argv and a version pattern per program, no shell, 5 s, a fixed
+`PATH` with `data/tools/bin` first, cached; looked up in a `Map`, so a name like `constructor` is just an unknown
+program). The registry is **empty** in this version: no first version of a module needs a program, and the module that
+first needs one adds its entry with its own PR. A program it does not know is missing. Probed at start and on "Check
+again", never on a turn. A missing required requirement, an `apiVersion` outside `MODULE_API.supports` or another
+platform makes the module **`unavailable`** (`ModuleInfo.unavailable`: reason and fix, e.g. the `apt install` line for
+the detected distribution). It is never started. Each assistant that has it on gets one instructions line instead
+("Music is not set up on this server (yt-dlp is missing). If you are asked for anything it does, say so in one
+sentence; …"), which changes the cached prefix only when availability changes. Its `declaredActions` stay known on the
+intent path: the turn's registry carries stand-ins (`AssistantModule.intentActions`, not offered as tools) that answer with
+"Music is not set up on this server (yt-dlp is missing).", and `host.actions.run` answers `unavailable` with that line,
+so "play jazz" never falls through to another action.
+
+A version is whatever the entry's pattern captures, and it counts only if it is a strict semver string, prerelease and
+build parts included (`6.1.0`, `0.35.0-rc.1`, `1.2.3+build.5`); anything else (`6.1`, `v1.2.3`, `0.35.0~rc1`,
+`3.14.0rc1`) is an **unknown** version. No other version style is normalised. A `version` range is node-semver
+(comparators, `||`, `^`, `~`, x- and hyphen ranges); an unknown version satisfies no range, a prerelease only a range
+that allows it, and a range that cannot be read is a missing requirement that says so. A module whose required
+program fails at run time with ENOENT or EACCES calls `host.reportMissingProgram(tool)` (`isMissingProgramError`
+classifies the error): the app marks it missing in its cache (a probe already running when it is reported cannot undo
+that), no probe runs on the turn path, and every module is judged again. Requirements on a device, on memory, disk or a
+GPU are not part of this version.
+
+#### 1.10.4 Health
+
+`health()` returns issues (`Issue = { id, module?, device?, severity: error | warning | info, title, detail, fix?:
+{ kind: command | link | job, label, value? } }`). The host keeps an **issue registry**: per module the missing
+requirements, why it is unavailable, a failed start (kept current), module code that hung while stopping (until Check
+again), and the last `health()` result. Every issue is normalised where it enters, whoever reported it: id, module,
+device, title and the fix's label and value are one line each, a detail keeps its line breaks, no other control
+character survives (no terminal escape reaches doctor's output or the page), every text is clipped to the wire's
+limits; one that still does not fit is replaced by a warning that says so. Only the registry bounds them: a module's
+whole list is sorted by severity (so an error after many warnings is kept), and at most `MAX_HEALTH_ISSUES` (100) and
+256 KB in all are kept, the most severe first, the true number left out said in one last issue ("And 12 more
+issues"); every list the
+protocol gained for this (issues, templates per module, a template's modules and phrases, a tool's risks) has a
+maximum, so no message exceeds the frame limit.
+
+`pnpm start doctor` prints every module's requirements and health, one line per issue with its fix, and exits 1 on an
+error. A requirement is an error for a module the assistants use (directly, or through `uses`), and only a warning for
+one nobody uses; doctor reads the same demand as serve mode and starts nothing (`ModuleHost.evaluate`). It reads the
+saved settings and the key vault read-only and strictly: when they cannot be read (the vault stays locked, a file
+cannot be read, parts of the settings were dropped, or the settings are blocked) it says why in one line and exits 2,
+never judging the defaults. It says nothing about the machine itself: the wider checks (disk space, TLS files, the
+port, speech models) belong to the deployment work (docs/MODULES-PLAN.md §7).
+
+Admin › Diagnostics › Health shows the same registry (`health`, `admin.snapshot.health`) grouped by module and, within
+a module, with the device an issue is about (its name, else its id), with "Check again" (`health.check`): it probes
+again, judges every module again and **tries again every module that is down after a failed start**, whether or not a
+probe result changed, then runs every `health()`. It is answered as soon as the check has started (`health` with
+`checking: true` first); the outcome follows as `health`.
+
+#### 1.10.5 The turn and the execution gateway
+
+`CurrentTurn` (`TurnContext.ts`, a `Context.Reference<TurnContext | undefined>`) is provided around every tool call,
+every action run and the gathering of context providers of a turn whose setup names its origin (serve mode:
+`TurnSetup.turnContext` with the assistant, device id and name); it holds the turn id, conversation id, assistant,
+device, room and person (both later), `source` (`voice`, `text`, `touch`, `phrase`, `routine`) and `connection`, an
+opaque reference to the connection the request came in on (a voice turn: the tab that owns the device's audio as the
+turn starts; a typed turn: the tab that typed it, `TextInput.connection`). The Claude Code bridge captures it at the
+turn's start and gives it to every tool call the SDK makes **for that turn**: Claude Code announces each tool use in
+the turn's stream before it calls the tool, and the bridge routes a call only to the turn whose stream announced it
+(the same `tool_use` id, which Claude Code sends with the call), never to "the turn in progress now"; a call of a turn
+that ended or was interrupted is refused, and one waiting inside the bridge when its turn is cancelled does not start.
+A call that arrives without an id (an older Claude Code) is matched by name and input instead; then a late identical
+call of an ended turn can take a later turn's matching claim and run with that later turn's handler and context, and
+the later turn's own call is refused. The guarantee above holds for calls that carry an id. It is `undefined` in the CLI modes; a job
+carries its own origin (`CurrentJob`, P6).
+
+Every tool call and action run goes through one **execution gateway** (`Gateway.ts`): `ToolRegistry.run` (the model's
+tool loop and the bridge), `ToolRegistry.runAction` (the intent agent) and `host.actions.run`. The tools and actions
+the host publishes are sealed: their own `execute`/`run` only refuse, so nothing reaches module code but through it.
+Its admission takes a **principal**: a turn, a job, the local principal of the CLI modes (explicit: the host is made
+with `localPrincipal: true`), or (P9) a notification, passed explicitly and admitted by the notification whatever
+modules the device's assistant has on. In serve mode a call with no turn and no job is refused ("it has no turn, job
+or other principal to run for"), so is a local one, and so is one whose parts do not belong together (the assistant
+does not exist, the device is not known or does not have that assistant, the connection is not that device's, a
+person is named). It validates the input (a generated action tool's input becomes the action's values **once**: the
+checks see those values and `run` receives exactly them) and checks, in order: the principal; the assistant has the
+module on; the tool (an action's generated tool name) is not in its `offTools`; only then the module's risk function
+(bounded: one that throws, answers an undeclared class or takes over 2 ms refuses the call with a generic sentence,
+the details go to the log); the risk policy hook (empty until P8). There is no confirmation hook; an action declared
+`confirm: true` is refused on every path while confirmation is off, as before, and no caller can claim a
+confirmation. The intent agent speaks an action's announcement only after the gateway admitted it. A refusal is an
+error result for the model ("Not run: …"); nothing reaches `execute` or `run` another way. The registries the host and serve mode build all carry the host's gateway; input decoders are made when a
+registry is built, never on a call.
+
+Tools and actions may declare `risk` (`read | change | message | money | security`, or `{ classes, of }`: a function
+of the validated input with the classes it can return; an answer outside them is refused), `sensitivity`
+(`household`, `personal`, `{ kind: "personal", owner }` with a person id or `"unknown"`, or a function deciding it per
+result, `sensitivityOf`) and `latency` (`instant | quick | slow | background`). Absent: `risk` is `read` for a
+speculative tool and `change` otherwise, `sensitivity` `household`, `latency` `quick`. `ModuleInfo.tools` shows them:
+`risk` when fixed, `risks` every class a call can have (what a later policy filters by), `sensitivity` `per-result`
+for a function. They are carried, not enforced (P8). A risk function without declared classes is a start error.
+
+#### 1.10.6 Templates
+
+`templates` are suggested assistants, plain data; `ModuleInfo.templates` lists them with ids `<moduleId>.<id>`. The
+new-assistant wizard offers them under "Start from": the template's prompt and modules on, its name, purpose and
+Handles where nothing was typed (a value an earlier template filled in counts as not typed, so switching templates
+replaces it), and its first suggested phrase for the places ticked in step 6. A template's module ids and suggested
+phrases are checked against the wire's limits when the module is defined. A template never
+becomes an assistant by itself, and a module update never changes an assistant made from one.
+
+### 1.11 Extended settings fields, field actions and module routes (docs/MODULES-PLAN.md §4 P3)
+
+Protocol 10. The five field types that were defined for agent forms (`textList`, `records`, `combo`, `action`, `info`,
+docs/AGENTS-AND-INTENTS.md §4.3) are members of `SettingField` itself, so module forms, agent forms and settings
+sections share one wire form and one set of renderers (`SettingFieldV2` and the other `V2` names are aliases now).
+Nothing of a module runs in the browser.
+
+**Values.** `textList`, `records` and `combo` are ordinary values: saved in the module's entry of `settings.json`,
+read from the environment (`records` as JSON, `textList` comma-separated; the field is then locked), validated by
+the field, and `overridable` where the module says so (an assistant may then own its rooms). `records` stay flat
+(§3.3 of the plan): an item is a set of non-secret simple fields; nested configuration is JSON in a validated text
+field. `action` has no value and `info` has one only the server sets: neither is ever in a patch (refused: "An action
+has no value", "Read-only"), saved, or in the settings a module receives (`SettingsOf` leaves both out). Settings
+saved before a module gained such fields load unchanged: the new fields take their defaults, and stray values under
+an action or info key are ignored and dropped by the next save.
+
+**Info and combo options.** The host describes the form with the values of the running instance (its instance with
+the shared settings): `info()[key]` fills an info field ("" while it does not run), and `settingOptions()[key]` is
+added to the static options of an open combo (`allowCustom`), with `optionsNote` saying where they came from ("Not
+running: type a name"). A closed combo accepts only its static options on every path a value arrives by (the form,
+the environment, an assistant's own value, a button's draft), so only those are shown on it. Both are read whenever
+the module is described: on every status line, after every button press, and when a version 2 instance calls
+`refreshForm()`; `info` and `settingOptions` are called on the instance (a class's methods may use `this`), and only
+the instance's own keys count. Both pass the page boundary (below): an info value's secrets are replaced, and a
+runtime option's label, description and implication too, while an option whose machine value holds a secret is
+dropped (a changed value would change what choosing it means); only `value`, `label`, `description`, `implication`
+and known `tags` of a runtime option are passed on. The same applies to `ModuleHost.settingOptions` (the model
+pickers). They never take part in an instance's settings key.
+
+**Secrets and the admin page** (review round 3). Three parts, each with its own guarantee:
+
+1. **The host itself never puts a secret on a page or in an admin response**, by construction and by field kind, not
+   by looking at text. A secret field's value is never in a form (`SettingsForm.secrets` says only whether it is set
+   and where from), never in an assistant's own values (a secret cannot be one), never quoted by a validation message
+   (no host message quotes a rejected value of any field: "PICK in the environment is not valid: …"), never in an
+   environment-view entry (keys and kinds only), never in a draft a button press applies (secrets stay the saved
+   ones) and never in a generated Test's answer about a provider failure (a generic sentence; details go to the
+   log). A route token's secret is shown once, in the answer to the mint that made it; only its hash is stored, and
+   no list, view or log shows it again. Token labels and purposes are what an admin (or the module) entered.
+2. **Text written by a module's own code is the module's responsibility.** Modules are compiled into the app and
+   trusted. **Never put a secret, or anything derived from one, in a status line, an error, an action result, an
+   `info` value, an option label or value, a route path, description or token name, or a token label.** Say what
+   happened instead ("Signed in", "The key was refused").
+3. **The page boundary** (`packages/core/src/PageBoundary.ts`) is a safety net under part 2 with an exact contract.
+   Before module-written text reaches an admin page (field-action results, `info` values, runtime combo options on
+   the form and in `settingOptions`, status lines, start errors and failed saves, Health issues, the messages of a
+   field's own `check` in the form, in an assistant's own values and in a refused save, tool names and descriptions,
+   route paths, token names and descriptions, token labels and the route call log), **every exact, case-sensitive
+   occurrence** of a current or earlier value of a secret field of that module, of any length from one character up
+   (the empty string is no value), is replaced by `[secret]`; overlapping occurrences become one. Matching happens on
+   the whole text before it is clipped, and a text longer than 64 KB is not shown at all. Current values: saved,
+   proposed and environment ones. Earlier values: those the module's code was given, kept for as long as any holder
+   that received them lives (a shared part or instance of the module until it is closed, a field-action press until it
+   has ended and been answered, a health check until its issues are published), with no eviction while it lives.
+   Tokens the module mints through `host.routeTokens` are kept the same way, with the minting part as holder. At most
+   1024 distinct values are kept per module; a value beyond that is not forgotten: while any holder given such a
+   value lives, every text of that module is replaced by one fixed sentence (and its runtime options are dropped). A
+   runtime option whose machine value holds a value is dropped. A route path that holds a value is shown redacted and
+   such a token name is not shown (the live route is unchanged). **It does not promise to find a secret that module
+   code encoded, split, hashed or transformed** (URL- or JSON-escaped, upper-cased, cut in two): only exact
+   occurrences. A module whose secret is one letter gets heavily redacted text, which is correct.
+
+**Field actions.** A button's handler is, in this order: the definition's `fieldActions[key]` (runs whether or not
+the module runs: a Test button that checks an address before it is saved), the running instance's
+`fieldActions[key]` (it needs the instance: "Switch everything off"), or the host's generated `test` of an agent or
+decision provider (whose form now ends with that button). A handler gets `{ settings, draft }`: the module's
+settings (environment > saved > linked default, secrets included, no assistant's own values), or, for a button with
+`requiresSaved: false` pressed while the form has edits, the page's draft values applied over them (secrets are
+always the saved ones). Settings that do not resolve are the result and nothing runs ("Not run: Token: Not set"; a
+draft value the field refuses, a required key not saved, a saved value no longer valid). Handlers are an object's own
+keys or its class's methods, never inherited names such as `constructor`, and are called on their object, outside
+any turn. **Ownership** (`packages/core/src/FieldActionOwner.ts`): a press belongs to what runs it, the host for a
+definition's handler, the published main instance's part for an instance's handler or a generated Test. The owner
+ties its lifetime, its button's busy state and its cleanup together: one press per button at a time (`busy`), and the
+button stays busy until the press's fiber has really ended (never freed by a timer; an old press cannot free a newer
+one). Owners belong to parts: an instance part is made with its own when it starts, and closing the part (by the
+host's ordinary close step, whenever and in whatever order the host closes things: instances before their shared
+part, consumers before providers) first stops its presses, interrupting each and waiting until it has ended, and only
+then closes the part's scope, so what a press uses (the instance's resources, then its shared part's) is still open
+for its cleanup; both within the host's time limit for closing a part, past which the part is abandoned and reported
+like a finalizer that hangs. A press is admitted only by a published part; one in flight when its module is withdrawn
+gets the host's grace period, like the module's calls, and is interrupted when the part is closed. The host's own owner is made with the host. When
+the host closes, it stops admitting anything, signals its own presses, withdraws every module and signals their
+presses and calls, all in one step; only then does it wait (bounded) for its own presses' cleanup, before any module's
+resources are released. From then on every press is answered `not_running`, as is a press on a part being closed. **Slots** (`packages/core/src/ModuleSlots.ts`): a press runs in a slot of its module, at most 4 at once
+(`MAX_PRESS_SLOTS`, across all its owners, so restarts cannot pile them up). `ModuleSlots.run` is the only way a press
+starts: it takes the slot, starts the press's fiber and puts an observer on it in one step, and the observer gives the
+slot back exactly once, when that fiber has really ended, whatever ended the wait for it. At the cap a press is
+refused `busy` before any module code runs, and Health says so (`<module>.presses-busy`) until one of the module's
+slots is free again. The answer never waits for cleanup: it is the first of the press's result, its 8 s deadline
+("Did not finish within 8 s"), its owner being stopped after the grace period (`not_running`) and its caller being
+interrupted (no answer); in the last three the press is interrupted and not waited for, and its slot and its button stay
+taken until its interruption and finalizers have ended. A press that never ends keeps its slot until the process
+stops (docs/MODULES-PLAN.md §3.5). Only a declared `action` field (or the generated
+`test` of an agent or decision provider) is a button: a `fieldActions` entry without a field is never run
+(`unknown_action`). A failure or defect is answered with one generic
+sentence ("It failed; the server's log says why.") and its details go to the server's log; a generated Test's
+provider failure too ("Failed after N ms; the server's log says why."). Result text passes the page boundary and is
+then clipped to 500 characters; a generated agent Test redacts the answer before quoting it short. The page sends `module.action { moduleId, key, values? }` (admin only); the
+`result` carries `action: { ok, text, tone }`, shown next to the button. Codes: `unknown_module`,
+`unknown_action` (not a button), `not_running` (an instance handler of a module that does not run), `busy`.
+A "Test" press runs to its result or its time limit whether or not the page that pressed it is still connected; its
+result is discarded if nobody is there (closing the page does not stop it).
+
+**Module routes.** A version 2 module's `shared` part may return `routes`; each is answered under
+`/api/modules/<moduleId>/<path>` while that shared part is the published one (so a stopped module's paths answer
+404 at once). Routes are one registration kind of the module host (docs/ARCHITECTURE.md "Module host:
+registrations"): the "route" registrar in `ModuleHost.ts` checks a started shared part's routes before the module is
+published (`routeProblem`: a bad route fails the start, and the module stays down; at most 32 routes, paths of at
+most 200 characters, a known body mode), the step that publishes the module
+puts its routes in the live route table under the module id, and the step that withdraws it (a stop, a restart,
+shutdown) deletes that entry; while a module restarts its paths are absent. A route is therefore answered only while
+its module is published; a handler runs as one of the module's calls in flight, so a request in flight when the
+module is withdrawn finishes within the grace period or is interrupted and answered 503. The route table knows only
+"published or not". The
+router, guards, tokens and call log only read
+`ModuleHost.routes()`. The contract is `packages/core/src/ModuleRoutes.ts`; the server is `apps/assistant/src/serve/moduleRoutes.ts`.
+
+```ts
+interface ModuleRoute {
+  method: "GET" | "POST" | "PUT" | "PATCH" | "DELETE"
+  path: string                       // "hook/:name": segments of [A-Za-z0-9._~-] (not . or ..) or :param; "" = root
+  guards?: ReadonlyArray<"admin" | "token" | "lan">   // every declared guard must pass
+  public?: boolean                   // required (and only allowed) without guards; a public route is a GET, no body
+  token?: string                     // the token name a `token` guard accepts
+  body?: "json" | "bytes" | "none"   // default json for POST/PUT/PATCH, none for GET/DELETE
+  bodyLimitBytes?: number            // default 8 KB, at most 1 MB
+  rateLimit?: { perAddress?: number; total?: number }   // per minute; default 30 per caller, 120 in all
+  timeoutMs?: number                 // default 5 s, at most 30 s
+  description?: string
+  handler: (req: RouteRequest) => Effect<RouteResponse, unknown>
+}
+RouteRequest  = { method, path, params, query, queryAll, headers /* no authorization */, body, address, token?: { id, name, label } }
+                // params, query, queryAll and headers have no prototype: `query.constructor` is a parameter or undefined
+RouteResponse = { status /* 200–599 */, headers?, body?: string | Uint8Array | json }
+```
+
+- **Start checks** (`routeProblem`, a start error of the shared part): a route without guards and without
+  `public: true`; a public route with guards, a body or a method other than GET; `admin` together with `token` (both
+  read the one `Authorization` header); a `token` guard without a token name (or a name without the guard); bad paths
+  (a `.` or `..` segment too, which a URL resolves away), duplicate routes, limits out of range.
+- **Order of a request**: path (404; `..` is resolved first and what is left must still be under `/api/modules/`),
+  method (405 with `Allow`), another site (403, below), rate limit per caller address and per route (429 with
+  `Retry-After`; before the guards, so tokens cannot be guessed quickly), guards (`lan` 403, `admin` 401, `token` 503
+  while the vault is locked, else 401), body (413 over the limit or on a route that reads none, 415 not JSON, 400 bad
+  JSON; a chunked body is counted as it arrives), the route is still its module's published one (503 "restarted or
+  stopped meanwhile": the body may have taken its time), then the handler. Whatever goes wrong unexpectedly in any of
+  these steps is a 500 for that request, never the process's.
+- **The handler** runs in a **slot** of its module (`ModuleSlots`, as presses do), in its own fiber in its shared
+  part's scope (when that part is closed the handler is interrupted). At most 16 handlers of a module run at once
+  (`MAX_ROUTE_SLOTS`): the slot is taken before the handler starts and given back exactly once, when its fiber has
+  really ended (an observer on the fiber), however the wait for it ended. At the cap a request is answered 503 with
+  `Retry-After` (`ROUTE_BUSY_RETRY_S`) before any module code runs, and Health says so (`<module>.routes-busy`) until
+  one of the module's slots is free again. **The answer never waits for cleanup**: it is the first of the handler's
+  result, its time limit (504), the host's stop signal once a restart's or a stop's grace period is over (503,
+  `PublishedRoute.stopped`) and the caller going away (nothing to answer); in the last three the handler is
+  interrupted and not waited for, and its slot stays taken until its interruption and finalizers have ended. A
+  handler that never ends keeps its slot until the process stops (docs/MODULES-PLAN.md §3.5); nothing is abandoned
+  on top. A failure or defect answers 500 (logged; nothing of it is sent).
+  The response must have a final status (200–599; anything else is a 500, logged), and header names and values must
+  be valid (else the whole answer is a 500, and the call log records the status really sent). Nothing here runs on a
+  turn or the WebSocket. Answers carry `Cache-Control: no-store` and `nosniff`; a handler cannot set framing headers
+  or CORS headers (dropped): no CORS header is ever sent for module routes.
+- **Another site**: every route that is not `public` refuses (403) a request a browser marks as cross-site, before the
+  rate limit, the guards and the body: `Sec-Fetch-Site` other than `same-origin`, `same-site` or `none`, or an `Origin`
+  that is not this server's own (`<scheme>://<Host>`, the Host having passed the allowed-hosts check of §4.6;
+  `SERVE_ALLOWED_ORIGINS` does not count, as no CORS is sent). A page elsewhere could otherwise make the browser of
+  someone at home send a simple POST from a home address. A request with neither header (a script, a webhook
+  sender) is judged by the guards alone. With `SERVE_BEHIND_PROXY` the scheme is ignored (a proxy that terminates
+  TLS makes it unknowable upstream) and the `Origin`'s host and port must equal the `Host` header exactly, so **the
+  proxy must pass `Host` through unchanged** (Caddy and `tailscale serve` do by default); no forwarding header is
+  read. A sibling origin on another port, a foreign origin and `null` are still refused. A `public` route answers only GET (the browser arriving on an OAuth callback
+  from the provider's site) and reads no body.
+- **Rate limits**: a route's total is counted apart from the per-address windows and is never pushed out by many
+  addresses; per-address windows are bounded (4096, the oldest goes first), an IPv6 caller is counted by its /64, and
+  no window is made for an address once the route's total is reached.
+- **`lan`**: the socket's address is private or loopback (IPv4 10/8, 172.16/12, 192.168/16, 127/8, 169.254/16; IPv6
+  ::1, fc00::/7, fe80::/10; IPv4-mapped judged as IPv4; 100.64/10 is not the home network). **Reverse proxies:** the
+  server cannot tell a proxied request from a local one by itself: a proxy on the same host that forwards to
+  `127.0.0.1` without adding any header makes every outside caller look like loopback. So the owner says so with the
+  start-up setting `SERVE_BEHIND_PROXY` (default false, shown with where it is set among the start-up values of the
+  environment view). Declared, the `lan` guard refuses every request (a `lan` route is then unreachable by design, and
+  the module page says so on each such route); callers from outside use a `token` route. Not declared, the socket's
+  address is trusted as it is, so a proxy in front that is not declared defeats `lan`. Forwarding headers
+  (`Forwarded`, `X-Forwarded-For`, `X-Real-IP`, …) are never read for the address either way, and without a declared
+  proxy their presence still fails `lan`. The host check (§4.6) applies first: a hook called by a name other than an
+  IP or `localhost` needs that name in `SERVE_ALLOWED_HOSTS`.
+- **`admin`**: the admin session token (`Authorization: Bearer`), as the voice API.
+- **`token`**: a route token of this module with the route's token name. Tokens are minted one per caller (`label`:
+  who it is for), kept with the module secrets under `@route-tokens` (in the key vault once there is one, before that
+  in `data/secrets.json` 0600; moved into the vault with the other keys), only as a SHA-256 of the secret, which is
+  shown once. A presented token is hashed and compared with every candidate in constant time. Revoking one stops it
+  at once. While the vault is locked tokens cannot be checked, listed or minted: token routes answer 503 with a plain
+  reason. A module holds at most 20 tokens, judged inside the store's serialized save (two mints at once cannot both
+  take the last place). While the settings files are damaged and wait for the owner's save (`blocked()`), no token can
+  be minted or revoked (409 `blocked`, checked again inside the serialized save): a token change never counts as the
+  owner's word that the files are right, so it never unblocks the store or starts anything. A mint or revoke that
+  waited behind another save while the vault was locked is refused as locked (503), checked inside the serialized
+  save, never acknowledged without effect. One canonical list of the stored records decides checking, listing, the
+  limit, mint and revoke (`keptTokens`): a record counts only if its id and details are what the wire allows, its
+  secret's hash is not an earlier record's, and it is within its module's 20, in a fixed order (when made, then id).
+  Any other record is ignored for checking and listing alike, with one Health issue (`route-tokens.ignored`) saying how
+  many, and a mint or revoke saves exactly the list after its change, so ignored records are dropped from the file
+  then and can never take a revoked token's place. Modules mint, list and revoke their own through `host.routeTokens` (`mint(name, label)`,
+  `list`, `revoke(id)`); the owner does it on the module page, choosing the token's purpose (its name) when the
+  module's routes accept more than one.
+- **Admin view** (`GET /api/module-routes[?module=<id>]`, admin token): each module's routes with guards and limits,
+  the last 20 calls of each (time, caller address, status, token label, why it was refused; memory only; every ending
+  is recorded once, a caller that went away before the answer as `499` "Cancelled"), and its
+  tokens (also of a module that does not run, so a stopped module's tokens can be revoked without starting it), and
+  `behindProxy`; `POST /api/module-routes/<id>/tokens { name, label }` mints (201, the secret once), `DELETE
+  /api/module-routes/<id>/tokens/<tokenId>` revokes; a module that is not installed is 404 (a stopped one is fine).
+  The log keeps the last 20 calls of at most 256 routes (the least recently called goes first). The module page shows
+  this as "Web addresses", for any module that has routes or tokens, running or not.
 
 ---
 
@@ -888,6 +1332,11 @@ A drawer with five tabs (Modules, Assistant, Keys & access, This device, About; 
 | `boolean` | Switch |
 | `choice` | Radio rows with tag chips for ≤ 4 options that carry `tags`; segmented control for ≤ 4 plain options; select otherwise. The selected option's description, tags and `implication` line below |
 | `multichoice` | Checkbox list with descriptions |
+| `textList` | Chips with a remove button and an input that adds on Enter or a comma (Backspace removes the last); counter near `maxItems` |
+| `records` | One row per record titled by `titleKey` with a summary of the other values; a row opens into a small form built from the same renderers; **Add <itemLabel>**, remove, move up/down when `orderable`; the whole list is the value, compared deeply |
+| `combo` | Input with the options as suggestions (`optionsNote` under it); without `allowCustom` a value outside them blocks Save |
+| `action` | Button (`buttonLabel`, `confirm` asks first); disabled with "Save first" while the form has edits if `requiresSaved`, else the press carries the draft; spinner, then the result in its tone next to it; never in a patch |
+| `info` | Read-only text with a tone dot; "—" while empty; never in a patch |
 | any, `locked` | Value shown read-only with a pin and the reason (".env" or "the environment", from `source`) |
 | any, `visibleWhen` | Shown only while the condition holds on the page's draft; hidden fields are not sent |
 | any, `source: saved` | "Changed · Reset" next to the label; Reset sends `null` on save |
@@ -1025,7 +1474,7 @@ packages/audio-web/   WebAudioInput / WebAudioOutput over an abstract link (no w
 packages/core/        additive changes (§4.3) + ModuleHost.ts + EchoGate.ts
 ```
 
-`pnpm start serve` runs it; settings: `SERVE_HOST` (default `127.0.0.1`), `SERVE_PORT` (8787), `SERVE_ALLOWED_ORIGINS`, `SERVE_ALLOWED_HOSTS`, `SERVE_TLS_CERT` + `SERVE_TLS_KEY` (PEM paths; when both are set the server speaks HTTPS/WSS on the same port), `PVA_WEB_DIR` (default `<repo>/apps/web/out`), `PVA_DATA_DIR`.
+`pnpm start serve` runs it; settings: `SERVE_HOST` (default `127.0.0.1`), `SERVE_PORT` (8787), `SERVE_ALLOWED_ORIGINS`, `SERVE_ALLOWED_HOSTS`, `SERVE_BEHIND_PROXY` (default false: say true when a reverse proxy is in front, so module routes' `lan` guard refuses everyone, §1.11), `SERVE_TLS_CERT` + `SERVE_TLS_KEY` (PEM paths; when both are set the server speaks HTTPS/WSS on the same port), `PVA_WEB_DIR` (default `<repo>/apps/web/out`), `PVA_DATA_DIR`.
 
 Startup order: HTTP first (so the UI loads and shows "starting"), then in parallel the module host and the engine build. The engine runs the voice loop over `AudioInput` from the web backend; when nobody owns the audio, that input is the noise floor.
 
@@ -1082,6 +1531,7 @@ Serve mode always runs `Conversation` with `bargeIn: true`; the interrupt modes 
 
 - GET/HEAD only. `/` → `index.html`; `/x` → `x.html` if it exists; files under `PVA_WEB_DIR` with a path-traversal guard. `/_next/static/*`: `Cache-Control: public, max-age=31536000, immutable`; everything else `no-cache`. Content types for html, js, css, json, svg, png, ico, woff2, txt. If the directory is missing: HTTP 503 with a one-line page "UI not built: run `pnpm --filter @pva/web build`".
 - Cross-origin isolation (`SERVE_CROSS_ORIGIN_ISOLATION`, default on): every static response, error pages included, carries `Cross-Origin-Opener-Policy: same-origin`, `Cross-Origin-Embedder-Policy: require-corp` and `Cross-Origin-Resource-Policy: same-origin`. Only the document's own COOP and COEP are required for `crossOriginIsolated`; same-origin subresources need no header under `require-corp`, and worklets take the document's policy. Sending them everywhere covers every path the page can be loaded at and any future dedicated worker (which needs its own COEP).
+- `/api/modules/<id>/…`: module routes (§1.11), with their own guards; the rest of `/api/` is admin only.
 - Binds to `127.0.0.1` by default. Binding elsewhere prints a warning: there is no login in v1, and anyone who can reach the port can use the assistant and change its settings.
 - **Reaching it from another device** (needed: the assistant's machine has no sound card): the microphone needs a secure context. Supported routes, simplest first: (1) an SSH tunnel from the laptop (`ssh -L 8787:localhost:8787 <host>`, then `http://localhost:8787`: a secure context, no certificate); (2) `SERVE_TLS_CERT`/`SERVE_TLS_KEY` with a certificate the device trusts (own CA, or a real hostname with a DNS-01 certificate); (3) a reverse proxy (Caddy, Tailscale serve) in front of the default loopback binding. A phone needs (2) or (3).
 

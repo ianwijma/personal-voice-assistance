@@ -277,6 +277,18 @@ export interface HomeValues {
 }
 
 /**
+ * The Home section's values as `linkedModuleDefaults` reads them, from a lookup of a Home key's value (serve mode
+ * passes its sections, the module test kit its test household's Home values): absent location and zone are `""`,
+ * units anything but `imperial` are metric, an absent date format is `en-GB`.
+ */
+export const homeValuesOf = (value: (key: string) => unknown): HomeValues => ({
+  location: String(value("HOME_LOCATION") ?? ""),
+  units: value("HOME_UNITS") === "imperial" ? "imperial" : "metric",
+  timeZone: String(value("HOME_TIME_ZONE") ?? ""),
+  dateFormat: String(value("HOME_DATE_FORMAT") ?? "en-GB")
+})
+
+/**
  * Module defaults computed from Home (§2.6): Weather `defaultPlace` ← `HOME_LOCATION`, Weather `units` ← `HOME_UNITS`,
  * Clock `timeZone` ← `HOME_TIME_ZONE`, Clock `locale` ← `HOME_DATE_FORMAT`. A saved or environment value of the
  * module, or an assistant's own value, wins over them.

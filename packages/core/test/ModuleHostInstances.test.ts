@@ -1,7 +1,8 @@
 // Module instances keyed by effective settings (docs/ASSISTANTS.md §2.6, WP-12b): assistants with equal settings
 // share one instance, an assistant with its own value of an `overridable` field runs a second, the run rule (a module
-// runs while a switched-on assistant wants it), grace on stop, restarts only where settings changed, failure isolation,
-// linked defaults.
+// runs while a switched-on assistant wants it), linked defaults. Since P1 review round 3 the module is the unit: a
+// change of its instances stops all of it (calls in flight get the grace period) before it starts again, and a start
+// is published only if every instance started (docs/ARCHITECTURE.md "Module host").
 import { assert, describe, it } from "@effect/vitest"
 import type { ModuleInfo } from "@pva/protocol"
 import { Effect, Fiber, Schema } from "effect"
@@ -88,7 +89,8 @@ const setup = (
         const parts = host.snapshot().assistantParts.get(assistantId) ?? []
         const tool = parts.flatMap((p) => p.module.tools ?? []).find((t) => t.name === "say")
         if (tool === undefined) return undefined
-        return String(yield* tool.execute({}))
+        // Through the gateway: a published tool's own `execute` only refuses.
+        return String(yield* host.gateway.tool("dates", tool, {}))
       })
     return { host, probe, state, info, ask }
   })
@@ -106,11 +108,11 @@ describe("module instances (WP-12b)", () => {
       assert.deepStrictEqual(info().instances, [{ assistants: ["a", "b"], own: [], state: "running" }])
       assert.isTrue(info().enabled)
 
-      // B gets its own date format: a second instance; A keeps its instance (not restarted).
+      // B gets its own date format: a second instance; the module stops and starts again with both.
       state.demand = [{ assistantId: "a" }, { assistantId: "b", own: { format: "nl-NL" } }]
       yield* host.refresh
-      assert.deepStrictEqual(probe.starts.map((s) => s.format), ["en-GB", "nl-NL"])
-      assert.deepStrictEqual(probe.closes, [])
+      assert.deepStrictEqual(probe.starts.map((s) => s.format), ["en-GB", "en-GB", "nl-NL"])
+      assert.deepStrictEqual(probe.closes, ["en-GB@here"], "the old instance closed before the new ones started")
       assert.strictEqual(yield* ask("a"), "en-GB@here")
       assert.strictEqual(yield* ask("b"), "nl-NL@here")
       assert.strictEqual(yield* host.snapshot().registry.context, "## Date\ndate in en-GB", "the shared registry is the shared instance")
@@ -119,17 +121,16 @@ describe("module instances (WP-12b)", () => {
         { assistants: ["b"], own: ["format"], state: "running" }
       ])
       assert.deepStrictEqual(info().tools.map((t) => t.name), ["say"])
-      // A third with the same own value shares B's instance.
+      // A third with the same own value shares B's instance: only who uses which changes, nothing restarts.
       state.demand = [...state.demand, { assistantId: "c", own: { format: "nl-NL" } }]
       yield* host.refresh
-      assert.strictEqual(probe.starts.length, 2)
+      assert.strictEqual(probe.starts.length, 3)
       assert.strictEqual(host.snapshot().assistantParts.get("b")![0], host.snapshot().assistantParts.get("c")![0])
-      // An own value equal to the shared one is the shared instance.
+      // An own value equal to the shared one is the shared instance (B's own instance goes: a restart).
       state.demand = [{ assistantId: "a" }, { assistantId: "b", own: { format: "en-GB" } }]
       yield* host.refresh
       assert.strictEqual(host.snapshot().assistantParts.get("a")![0], host.snapshot().assistantParts.get("b")![0])
-      yield* advance(10_000)
-      assert.deepStrictEqual(probe.closes, ["nl-NL@here"], "the instance nobody uses any more closed after the grace period")
+      assert.deepStrictEqual(probe.closes, ["en-GB@here", "en-GB@here", "nl-NL@here"])
     }).pipe(Effect.scoped))
 
   it.effect("the run rule: no assistant wants it, nothing runs; the saved switch is not read and enable/disable are refused", () =>
@@ -167,80 +168,100 @@ describe("module instances (WP-12b)", () => {
       assert.strictEqual(yield* ask("b"), "en-GB@here")
     }).pipe(Effect.scoped))
 
-  it.effect("grace on stop: an instance nobody wants leaves the snapshot at once, a tool call in flight finishes, it closes after 10 s", () =>
+  it.effect("grace on stop: withdrawn at once, a tool call in flight finishes within the grace period, then it closes", () =>
     Effect.gen(function*() {
       const { host, info, probe, state } = yield* setup({ toolMillis: 3_000 })
       state.demand = [{ assistantId: "a" }, { assistantId: "b", own: { format: "en-US" } }]
       yield* host.startEnabled
       const tool = host.snapshot().assistantParts.get("b")![0]!.module.tools![0]!
-      const call = yield* Effect.forkChild(tool.execute({}))
+      const call = yield* Effect.forkChild(host.gateway.tool("dates", tool, {}))
       yield* advance(10)
       state.demand = [{ assistantId: "a" }]
-      yield* host.refresh
-      assert.deepStrictEqual(host.snapshot().assistantParts.get("b"), undefined)
-      assert.deepStrictEqual(info().instances, [{ assistants: ["a"], own: [], state: "running" }])
+      const refreshing = yield* Effect.forkChild(host.refresh)
+      yield* advance(10)
+      assert.deepStrictEqual(host.snapshot().parts, [], "the whole module is withdrawn while it stops")
+      assert.strictEqual(info().state, "stopping")
       yield* advance(3_000)
-      assert.strictEqual(yield* Fiber.join(call), "en-US@here", "the call finished on the retired instance")
-      assert.deepStrictEqual(probe.closes, [], "still in its grace period")
-      yield* advance(7_000)
-      assert.deepStrictEqual(probe.closes, ["en-US@here"])
-      // Nobody at all: stopping, then disabled after the grace period.
+      assert.strictEqual(yield* Fiber.join(call), "en-US@here", "the call finished on the withdrawn instance")
+      yield* Fiber.join(refreshing)
+      assert.deepStrictEqual(probe.closes.sort(), ["en-GB@here", "en-US@here"])
+      assert.deepStrictEqual(info().instances, [{ assistants: ["a"], own: [], state: "running" }])
+      // A call that outlives the grace period is interrupted, and the stop goes on.
+      const long = yield* Effect.forkChild(host.gateway.tool("dates", host.snapshot().parts[0]!.module.tools![0]!, {}))
+      yield* advance(10)
       state.demand = []
-      yield* host.refresh
+      const stopping = yield* Effect.forkChild(host.refresh)
+      yield* advance(10)
       assert.deepStrictEqual([info().state, info().enabled], ["stopping", false])
-      assert.deepStrictEqual(host.snapshot().parts, [])
-      yield* advance(10_000)
-      assert.deepStrictEqual(probe.closes, ["en-US@here", "en-GB@here"])
+      yield* advance(2_000)
+      assert.strictEqual(probe.closes.length, 2, "it waits for the call")
+      yield* advance(1_000)
+      yield* Fiber.join(stopping)
+      yield* Fiber.join(long)
+      assert.strictEqual(probe.closes.length, 3)
       assert.strictEqual(info().state, "disabled")
     }).pipe(Effect.scoped))
 
-  it.effect("a change of the shared settings restarts only the instances it affects", () =>
+  it.effect("a change of the shared settings stops the module and starts it again with every instance", () =>
     Effect.gen(function*() {
       const { ask, host, probe, state } = yield* setup()
       state.demand = [{ assistantId: "a" }, { assistantId: "b", own: { format: "nl-NL" } }]
       yield* host.startEnabled
       assert.strictEqual(probe.starts.length, 2)
-      // The shared format: only A's instance (B has its own) restarts.
       assert.deepStrictEqual(yield* host.configure("dates", { values: { format: "en-US" }, secrets: {} }), { ok: true })
-      assert.deepStrictEqual(probe.starts.map((s) => s.format), ["en-GB", "nl-NL", "en-US"])
+      assert.deepStrictEqual(probe.starts.slice(2).map((s) => s.format).sort(), ["en-US", "nl-NL"])
       assert.strictEqual(yield* ask("a"), "en-US@here")
       assert.strictEqual(yield* ask("b"), "nl-NL@here")
-      // A shared field nobody overrides: both restart.
-      assert.deepStrictEqual(yield* host.configure("dates", { values: { format: "en-US", place: "there" }, secrets: {} }), { ok: true })
-      assert.deepStrictEqual(probe.starts.slice(3).map((s) => `${s.format}@${s.place}`).sort(), ["en-US@there", "nl-NL@there"])
-      // Saving the same values again restarts nothing; a new secret restarts every instance.
-      yield* host.configure("dates", { values: { format: "en-US", place: "there" }, secrets: {} })
-      assert.strictEqual(probe.starts.length, 5)
+      // Saving the same values again restarts nothing; a new secret restarts it; the same secret again does not.
+      yield* host.configure("dates", { values: { format: "en-US" }, secrets: {} })
+      assert.strictEqual(probe.starts.length, 4)
       yield* host.configure("dates", { values: {}, secrets: { token: "t" } })
-      assert.strictEqual(probe.starts.length, 7)
-      // A shared change that one instance cannot start with changes nothing at all.
+      assert.strictEqual(probe.starts.length, 6)
+      yield* host.configure("dates", { values: {}, secrets: { token: "t" } })
+      assert.strictEqual(probe.starts.length, 6, "an unchanged secret saved again changes nothing")
+      // A shared change that one instance cannot start with: the module is down (nothing of it serves), and says why.
       const failed = yield* host.configure("dates", { values: { format: "fail" }, secrets: {} })
       assert.strictEqual(failed.ok ? "" : failed.error.code, "module_start_failed")
-      assert.strictEqual(yield* ask("a"), "en-US@there")
-      assert.strictEqual(host.modules()[0]!.settings.values.format, "en-US")
+      assert.strictEqual(yield* ask("a"), undefined)
+      assert.strictEqual(yield* ask("b"), undefined)
+      assert.strictEqual(host.modules()[0]!.state, "error")
+      assert.strictEqual(probe.closes.length, probe.starts.filter((st) => st.format !== "fail").length, "everything that started closed")
     }).pipe(Effect.scoped))
 
-  it.effect("a module failure of one instance does not take down the other", () =>
+  it.effect("an instance that fails takes its module down (all or nothing); a valid change starts it again", () =>
     Effect.gen(function*() {
       const { ask, host, info, state } = yield* setup()
       state.demand = [{ assistantId: "a" }, { assistantId: "b", own: { format: "fail" } }]
       yield* host.startEnabled
-      assert.strictEqual(yield* ask("a"), "en-GB@here")
-      assert.strictEqual(yield* ask("b"), undefined, "B's instance did not start: B has no tool of it")
+      assert.strictEqual(yield* ask("a"), undefined)
+      assert.strictEqual(yield* ask("b"), undefined)
       assert.deepStrictEqual(info().instances, [
-        { assistants: ["a"], own: [], state: "running" },
+        { assistants: ["a"], own: [], state: "error", error: "This format cannot start" },
         { assistants: ["b"], own: ["format"], state: "error", error: "This format cannot start" }
       ])
-      assert.deepStrictEqual([info().state, info().error], ["error", "This format cannot start (for b)"])
-      assert.deepStrictEqual(host.snapshot().registry.specs.map((s) => s.name), ["say"])
-      // B fixes its value: its instance runs, A's is untouched.
+      assert.deepStrictEqual([info().state, info().error], ["error", "This format cannot start"])
+      assert.isTrue(host.issues.all().some((i) => i.id === "dates.start"))
+      // B fixes its value: the module starts again, both run.
       state.demand = [{ assistantId: "a" }, { assistantId: "b", own: { format: "nl-NL" } }]
       yield* host.refresh
+      assert.strictEqual(yield* ask("a"), "en-GB@here")
       assert.strictEqual(yield* ask("b"), "nl-NL@here")
       assert.strictEqual(info().state, "running")
     }).pipe(Effect.scoped))
 
-  it.effect("linked defaults: used when nothing is saved, a saved value wins; a changed default restarts the instances it moves", () =>
+  it.effect("an assistant whose own value is not valid gets an error of its own; the others run", () =>
+    Effect.gen(function*() {
+      const { ask, host, info, probe, state } = yield* setup()
+      state.demand = [{ assistantId: "a" }, { assistantId: "b", own: { format: "klingon" } }]
+      yield* host.startEnabled
+      assert.strictEqual(yield* ask("a"), "en-GB@here")
+      assert.strictEqual(yield* ask("b"), undefined)
+      assert.strictEqual(probe.starts.length, 1, "never grouped with A's valid instance, never started")
+      assert.strictEqual(info().state, "error")
+      assert.match(info().error!, /\(for b\)$/)
+    }).pipe(Effect.scoped))
+
+  it.effect("linked defaults: used when nothing is saved, a saved value wins; a changed default restarts the module", () =>
     Effect.gen(function*() {
       const { ask, host, info, state } = yield* setup({ defaults: { format: "nl-NL" } })
       state.demand = [{ assistantId: "a" }, { assistantId: "b", own: { format: "en-US" } }]
@@ -259,31 +280,17 @@ describe("module instances (WP-12b)", () => {
       assert.strictEqual(yield* ask("a"), "en-GB@here")
     }).pipe(Effect.scoped))
 
-  it.effect("a replaced instance keeps serving until its replacement has started", () =>
-    Effect.gen(function*() {
-      const { ask, host, state } = yield* setup({ defaults: { format: "nl-NL" } })
-      state.demand = [{ assistantId: "a" }]
-      yield* host.startEnabled
-      state.defaults = { format: "en-US" }
-      const fiber = yield* Effect.forkChild(host.refresh)
-      // Before the new instance has published (the refresh has not run yet or is starting), A still has a tool.
-      assert.include(["nl-NL@here", "en-US@here"], yield* ask("a"))
-      yield* Fiber.join(fiber)
-      assert.strictEqual(yield* ask("a"), "en-US@here")
-    }).pipe(Effect.scoped))
-
-  it.effect("an assistant leaving a shared instance keeps it until its own instance has started", () =>
+  it.effect("while a replacement starts the module is absent: an assistant has no tool of it, never two of it", () =>
     Effect.gen(function*() {
       const { ask, host, info, state } = yield* setup({ slowFormat: "nl-NL" })
       state.demand = [{ assistantId: "a" }, { assistantId: "b" }]
       yield* host.startEnabled
-      // B gets an own value whose instance takes a second to start; A keeps the shared one.
       state.demand = [{ assistantId: "a" }, { assistantId: "b", own: { format: "nl-NL" } }]
       const fiber = yield* Effect.forkChild(host.refresh)
       yield* advance(10)
-      assert.deepStrictEqual(info().instances?.map((r) => [r.assistants, r.state]), [[["a"], "running"], [["b"], "starting"]])
-      assert.strictEqual(yield* ask("b"), "en-GB@here", "B is served by the shared instance while its own starts")
-      assert.strictEqual(yield* ask("a"), "en-GB@here")
+      assert.deepStrictEqual(info().instances?.map((r) => [r.assistants, r.state]), [[["a"], "starting"], [["b"], "starting"]])
+      assert.strictEqual(yield* ask("b"), undefined)
+      assert.strictEqual(yield* ask("a"), undefined)
       yield* advance(1_000)
       yield* Fiber.join(fiber)
       assert.strictEqual(yield* ask("b"), "nl-NL@here")
