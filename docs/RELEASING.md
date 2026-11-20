@@ -1,7 +1,8 @@
 # Releasing
 
 The [Release workflow](../.github/workflows/release.yml) checks and tests the code, bumps the version, tags it, builds
-the container image and pushes it, and creates a GitHub Release. Nothing is published to npm (the packages are
+the container image and pushes it, creates a GitHub Release and, for a stable release, deploys it to production
+([Deployment](#deployment)). Nothing is published to npm (the packages are
 `private`).
 
 Each release is:
@@ -11,6 +12,7 @@ Each release is:
 | The image `ghcr.io/ianwijma/personal-voice-assistant:X.Y.Z` (linux/amd64) | GitHub Container Registry. The tag is the version without the `v`. How to run it: [DEPLOYMENT.md](DEPLOYMENT.md). |
 | The git tag `vX.Y.Z` | On the release commit on `main`, which sets `"version"` in the root `package.json`. |
 | The GitHub Release `vX.Y.Z` | Its notes start with the image reference and its digest, followed by GitHub's generated notes. |
+| Production on `X.Y.Z` (stable releases only) | A `PVA: deploy vX.Y.Z` commit on the homelab repository's `develop` branch, which Argo CD syncs. |
 
 A release does not move the `main` or `sha-…` image tags and there is no `latest` tag: those rules are the Image
 workflow's ([DEPLOYMENT.md](DEPLOYMENT.md), "Image"). The release commit is pushed by the workflow's own token, so it
@@ -38,7 +40,8 @@ The version lives in the root `package.json` only. The workspace packages stay a
    typecheck, the tests (four shards), the latency tests and the image build run side by side, each as its own job.
 9. When all of those are green and the plan is correct, click **Review deployments**, tick `release` and
    **Approve and deploy**. To stop, click **Reject** instead.
-10. Wait for **Build image** and **Release** to go green and check the new GitHub Release.
+10. Wait for **Build image** and **Release** to go green and check the new GitHub Release. For a stable release, wait
+    for **Deploy** too: its summary links the homelab commit.
 
 One release runs at a time. A second run waits for the first; starting a third replaces the waiting one.
 
@@ -65,6 +68,8 @@ Release candidates, step by step (keep the same **Version bump** each time):
   `org.opencontainers.image.*` labels.
 - **Release:** creates the GitHub Release with the image reference and digest and the generated notes
   (`scripts/release/publish.sh`).
+- **Deploy:** for a stable release only, sets the production image tag in the homelab repository and pushes it
+  ([Deployment](#deployment)).
 
 The longer steps live in `scripts/release/` (`plan.sh`, `publish.sh`); each documents the environment variables it
 reads at the top.
@@ -74,6 +79,9 @@ pushed. Nothing is committed, tagged or released.
 
 ### If it fails
 
+- **Deploy failed:** click **Re-run failed jobs**. If production already has the version, it commits nothing and
+  succeeds. A push that keeps being rejected (someone else pushing to `develop`) is retried 3 times after a
+  `git pull --rebase`; a rebase conflict on the same line needs a look at the homelab repository first.
 - **Build image or Release failed:** click **Re-run failed jobs**. It builds the tag that was already pushed, without
   bumping again. A release that was already created is kept; if the image was built again, the digest in its notes is
   corrected.
@@ -84,6 +92,43 @@ pushed. Nothing is committed, tagged or released.
 - **Version failed at the push:** `main` got new commits after the run started. Start a new run; nothing was pushed.
 - **"may not run releases":** only the repository owner can release, unless the `RELEASE_ACTORS` repository variable
   lists your GitHub login.
+
+## Deployment
+
+Production runs from the homelab repository (`ianwijma/homelab`, default branch `develop`). Argo CD syncs
+`kubernetes/apps/pva/production` from `develop` automatically, and the image tag is pinned there in
+`kubernetes/apps/pva/production/kustomization.yaml`:
+
+```yaml
+images:
+  - name: ghcr.io/ianwijma/personal-voice-assistant
+    newTag: 1.3.0
+```
+
+The workflow's last job, **Deploy**, changes that `newTag` to the new version (without the `v`) with `yq`, commits it
+as `github-actions[bot]` with the message `PVA: deploy vX.Y.Z` and a link to the release run, and pushes it to
+`develop`. The run summary links the homelab commit.
+
+| Run | Deploys? |
+|---|---|
+| Stable release (`release`, dry run unticked), e.g. `1.3.0` | Yes, once the GitHub Release is created. No extra approval: the `release` approval covers it. |
+| Prerelease, e.g. `1.3.0-rc.0` | No. Test a candidate with a preview deployment or by hand. |
+| Dry run | No. |
+| Push to `main` (the `sha-…` and `main` image tags) | No. Those images no longer reach production; only a release does. |
+
+It fails if it can't find or change `newTag`, unless the file already holds the version: then it commits nothing and
+succeeds, so a re-run is safe.
+
+**Access:** the job checks out and pushes to `ianwijma/homelab` with the repository secret `HOMELAB_DEPLOY_KEY`, an
+ed25519 private key whose public half is a **write** deploy key on `ianwijma/homelab` ("pva-release (write, PVA
+release workflow)"). The job itself has no permissions on this repository. The private key is kept on the devbox at
+`~/.config/k3s/pva-release-deploy-key` and in the secret manager as `homelab/github/pva-release-deploy-key`. To rotate
+it, generate a new key, replace the deploy key on `ianwijma/homelab` and the `HOMELAB_DEPLOY_KEY` secret, and update
+both stored copies.
+
+**Roll back:** revert the `PVA: deploy vX.Y.Z` commit on the homelab repository's `develop` branch
+(`git revert <sha>` and push, or revert it on GitHub). Argo CD syncs production back to the previous tag. The release
+itself (tag, image, GitHub Release) stays; the next stable release deploys over the revert as usual.
 
 ## One-time setup
 

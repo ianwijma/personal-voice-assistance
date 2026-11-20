@@ -15,7 +15,9 @@ release, by `.github/workflows/release.yml` ([RELEASING.md](RELEASING.md)):
 | pull request from this repository with the label `preview` | `pr-<number>-<full head commit sha>` (the head commit, not the merge commit) |
 | a release (the Release workflow, after approval) | `X.Y.Z`, the version without the `v` of its `vX.Y.Z` git tag; a release candidate is `X.Y.Z-rc.N` |
 
-There is no `latest` tag. Pull requests from forks never build. A labelled PR gets a LAN-only preview deployment in the
+There is no `latest` tag. Pull requests from forks never build. Production in the homelab cluster runs only release
+images: a stable release sets its `X.Y.Z` tag in the homelab repository ([RELEASING.md](RELEASING.md), "Deployment").
+The `sha-…` and `main` tags of a push to `main` never reach production. A labelled PR gets a LAN-only preview deployment in the
 homelab cluster at `https://pva-pr-<n>.k3s.lab.wijma.cloud`, started from a copy of production's data volume.
 
 A preview expires after 7 days: the daily `Preview expiry` workflow removes the `preview` label from a PR when nothing was
