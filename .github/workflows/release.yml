@@ -21,12 +21,18 @@ run-name: Release ${{ inputs.version_bump }} ${{ inputs.release_type }}${{ input
 #    ghcr.io/ianwijma/personal-voice-assistant:X.Y.Z (linux/amd64, docs/DEPLOYMENT.md).
 # 4. `release` creates the GitHub Release, with the image reference and its digest
 #    at the top of the notes.
+# 5. `deploy`, for a stable release only (never a prerelease or a dry run), sets
+#    `newTag: X.Y.Z` in kubernetes/apps/pva/production/kustomization.yaml on the `develop`
+#    branch of ianwijma/homelab and pushes it with the HOMELAB_DEPLOY_KEY deploy key.
+#    Argo CD then rolls production to the new image. No approval of its own: the
+#    `release` approval covers it.
 #
 # A dry run does everything except push and release: the image is built from the
 # commit with the new version applied, but not pushed.
 #
-# If `image` or `release` fails, use "Re-run failed jobs": it builds the tag that
-# was already pushed and does not bump the version again.
+# If `image`, `release` or `deploy` fails, use "Re-run failed jobs": it builds the tag
+# that was already pushed and does not bump the version again; `deploy` commits nothing
+# when production already has the version.
 
 on:
   workflow_dispatch:
@@ -388,3 +394,103 @@ jobs:
           PRERELEASE: ${{ needs.plan.outputs.prerelease }}
           DIGEST: ${{ needs.image.outputs.digest }}
         run: scripts/release/publish.sh
+
+  # Production runs from the homelab repository: Argo CD syncs
+  # kubernetes/apps/pva/production from its `develop` branch. This job pins the new image
+  # there. Prereleases and dry runs never deploy. The `release` environment approval on
+  # `version` already covers this job, so it asks for none of its own.
+  deploy:
+    name: Deploy ${{ needs.plan.outputs.tag }} to production
+    needs: [plan, release]
+    if: ${{ !inputs.dry_run && needs.plan.outputs.prerelease == 'false' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    # Nothing in this repository: the push goes to ianwijma/homelab with the deploy key.
+    permissions: {}
+    env:
+      VERSION: ${{ needs.plan.outputs.version }}
+      TAG: ${{ needs.plan.outputs.tag }}
+      KUSTOMIZATION: kubernetes/apps/pva/production/kustomization.yaml
+      HOMELAB_BRANCH: develop
+      RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+    steps:
+      # With credentials: the ssh key stays configured for the push below. Its public half
+      # is a write deploy key on ianwijma/homelab (docs/RELEASING.md, "Deployment").
+      - name: Check out ianwijma/homelab
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ianwijma/homelab
+          ref: develop
+          ssh-key: ${{ secrets.HOMELAB_DEPLOY_KEY }}
+
+      - name: Set the production image tag to ${{ needs.plan.outputs.version }}
+        id: edit
+        run: |
+          # yq (mikefarah v4) is preinstalled on ubuntu-latest. It keeps the comments.
+          current="$(IMAGE="$IMAGE" yq '.images[] | select(.name == strenv(IMAGE)) | .newTag' "$KUSTOMIZATION")"
+          if [[ -z "$current" || "$current" == "null" ]]; then
+            echo "::error::${KUSTOMIZATION} has no newTag for ${IMAGE}."
+            exit 1
+          fi
+          # A re-run after the push: production already has this version.
+          if [[ "$current" == "$VERSION" ]]; then
+            echo "Production already runs ${VERSION}; nothing to commit."
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            echo "sha=$(git log -1 --format=%H -- "$KUSTOMIZATION")" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          IMAGE="$IMAGE" VERSION="$VERSION" \
+            yq -i '(.images[] | select(.name == strenv(IMAGE)) | .newTag) = strenv(VERSION)' "$KUSTOMIZATION"
+          after="$(IMAGE="$IMAGE" yq '.images[] | select(.name == strenv(IMAGE)) | .newTag' "$KUSTOMIZATION")"
+          if [[ "$after" != "$VERSION" ]] || git diff --quiet -- "$KUSTOMIZATION"; then
+            echo "::error::Could not set newTag to ${VERSION} in ${KUSTOMIZATION} (it holds '${after}')."
+            exit 1
+          fi
+          git diff -- "$KUSTOMIZATION"
+          echo "previous=${current}" >> "$GITHUB_OUTPUT"
+          echo "changed=true" >> "$GITHUB_OUTPUT"
+
+      - name: Commit and push to ${{ env.HOMELAB_BRANCH }}
+        id: push
+        if: steps.edit.outputs.changed == 'true'
+        run: |
+          # The same identity as the `version` job.
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit -m "PVA: deploy ${TAG}" -m "Release run: ${RUN_URL}" -- "$KUSTOMIZATION"
+          # Someone else may push to develop meanwhile: rebase on it and try again.
+          for attempt in 1 2 3 4; do
+            if git push origin "HEAD:refs/heads/${HOMELAB_BRANCH}"; then
+              echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            if [[ "$attempt" == 4 ]]; then break; fi
+            echo "Push rejected (attempt ${attempt}); rebasing on ${HOMELAB_BRANCH} and retrying."
+            git pull --rebase origin "$HOMELAB_BRANCH"
+          done
+          echo "::error::Could not push to ianwijma/homelab ${HOMELAB_BRANCH} after 3 retries."
+          exit 1
+
+      - name: Summarize the deployment
+        env:
+          CHANGED: ${{ steps.edit.outputs.changed }}
+          PREVIOUS: ${{ steps.edit.outputs.previous }}
+          SHA: ${{ steps.push.outputs.sha || steps.edit.outputs.sha }}
+        run: |
+          {
+            if [[ "$CHANGED" == "true" ]]; then
+              echo "## Deployed ${TAG} to production"
+              echo
+              echo "\`${IMAGE}:${VERSION}\` (was \`${PREVIOUS}\`), in \`${KUSTOMIZATION}\` on ianwijma/homelab \`${HOMELAB_BRANCH}\`."
+              echo
+              echo "Homelab commit: https://github.com/ianwijma/homelab/commit/${SHA}"
+              echo
+              echo "Argo CD syncs it from there. To roll back, revert that commit."
+            else
+              echo "## Production already runs ${TAG}"
+              echo
+              echo "\`${KUSTOMIZATION}\` on ianwijma/homelab \`${HOMELAB_BRANCH}\` already pins \`${IMAGE}:${VERSION}\`; nothing was committed."
+              echo
+              echo "Last homelab commit to it: https://github.com/ianwijma/homelab/commit/${SHA}"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
