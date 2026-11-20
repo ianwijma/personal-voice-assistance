@@ -129,9 +129,9 @@ would close both limits.
 On every other device an alarm is its time, its repetition and its device: "One alarm: tomorrow at quarter to seven
 in the morning on Robin's phone, every weekday.".
 
-Its name is not even matched there: "cancel the pills alarm" on the kitchen display answers "I don't know an alarm
-called pills here.", since finding it would tell that the name exists. Its time is matched ("cancel the quarter to
-seven alarm").
+Its name is not even matched there: "cancel the pills alarm" on the kitchen display asks "Which alarm do you mean?
+Say its clock time and date, or say \"named\" followed by its name.", since finding it would tell that the name exists.
+Its time is matched ("cancel the quarter to seven alarm").
 
 The ring goes only to its own device. The decision is made when answering, for the device that asks.
 
@@ -216,7 +216,17 @@ nothing, even when an alarm has that name; say “named This Weekend” (or “g
 explicitly. An unparsed explicit clock also asks. An implicit name must match the complete captured selector,
 ignoring case and surrounding whitespace; a leftover alarm noun or unknown qualifier asks instead of falling back
 to a shorter name or the only alarm. For example, “half past noon alarm” cannot select an alarm named Half Past Noon.
-A recognized clock such as “at 12:30” still selects by time.
+A recognized clock such as “at 12:30” still selects by time. An implicit name containing any word the day/time reader
+knows (days, clock words, numbers or relations such as before/after/until/by/from/between/this/next, also in Dutch)
+cannot cancel by name alone: the whole selector must read as a day or time, otherwise the module asks, naming the
+local name candidates and their times, and cancels nothing. For example, “before noon” asks whether Before Noon at
+13:15 is the name or whether the person means alarms before noon; “named Before Noon” selects the name explicitly.
+Words of order or position (ordinals, last/next/previous, earliest/latest/soonest/newest/oldest/other,
+also in Dutch) follow the same rule: if they also match a name, the module asks with the local candidates and
+cancels nothing; without a name match, unsupported ordering asks too. “Cancel the first alarm” therefore asks
+when First Alarm is a name, while “named First Alarm” selects it explicitly. When the selector exactly matches
+one name and contains no word of time, day, relation or order, that alarm is the one meant, whatever else its name
+could be taken for.
 
 The direct path understands “wake me at seven” / “zet een wekker om half acht”, complete date/repetition clauses
 such as “set an alarm every weekday at noon”, and cancellation by clock time or a name after an article, possessive
