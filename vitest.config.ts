@@ -26,6 +26,8 @@ export default defineConfig({
         test: {
           name: "latency",
           environment: "node",
+          // The same limit as the node project on the two-core CI machine: a slow run passed the default 5 s in two tests.
+          ...(process.env.CI ? { testTimeout: 20_000 } : {}),
           include: latency,
           exclude,
           // After the other projects, alone: nothing else keeps the cores busy while these measure.
