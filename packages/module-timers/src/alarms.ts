@@ -350,6 +350,33 @@ export const alarmsModule = defineModule({
           return written
         })
 
+      /** Replace every grouped row and job together; a terminal row gets a harmless due job until cancellation. */
+      const commitGroup = (entries: ReadonlyArray<{ readonly row: Row<Alarm>; readonly value: Alarm }>) =>
+        Effect.gen(function*() {
+          const now = yield* Clock.currentTimeMillis
+          const prepared: Array<{ readonly row: Row<Alarm>; readonly planned: Alarm; readonly job: PreparedJob }> = []
+          for (const { row, value } of entries) {
+            const phased = withPhase(value, now)
+            const next = nextAtOf(phased)
+            const planned: Alarm = { ...phased, pending: next !== undefined, nextAt: next ?? 0 }
+            // Replacing even a terminal row's job here prevents any old plan surviving a partial cancellation.
+            const job = yield* ctx.scheduler.prepare({ handler: "due", key: `alarm:${row.id}`, payload: { id: row.id }, at: next ?? now, origin: { deviceId: value.deviceId } })
+            prepared.push({ row, planned, job })
+            yield* Effect.yieldNow
+          }
+          const options = yield* actorNow()
+          const written = yield* ctx.store.transaction((tx) => prepared.map(({ row, planned, job }) => {
+            const out = tx.collection(alarms).update(row.id, () => planned, { expectRev: row.rev, ...options })
+            job.writeIn(tx)
+            return out
+          }))
+          for (const row of written) {
+            if (!row.value.pending) yield* Effect.ignore(ctx.scheduler.cancel({ key: `alarm:${row.id}` }))
+            yield* Effect.yieldNow
+          }
+          return written
+        })
+
       // -- reconcile -------------------------------------------------------------------------------------------------------
 
       /**
@@ -502,6 +529,15 @@ export const alarmsModule = defineModule({
         ? open.keys.has(`alarm:${row.id}:${row.value.owed.n}`)
         : row.value.ring !== undefined && open.ids.has(row.value.ring.notification)
 
+      const readOpen = Effect.map(ctx.notify.list(), (notifications): Open => ({ ids: new Set(notifications.map((n) => n.id)), keys: new Set(notifications.map((n) => n.key)) }))
+      const nextRingAt = (row: Row<Alarm>, open: Open, now: number): number =>
+        Math.min(row.value.next?.at ?? Infinity, row.value.ring?.again ?? Infinity, row.value.owed !== undefined && (ringingNow(row, open) || now - row.value.owed.at <= DELIVER_WITHIN_MS) ? row.value.owed.at : Infinity)
+      const nextRingWords = (row: Row<Alarm>, open: Open, now: number, lang: Language): string => {
+        const at = nextRingAt(row, open, now)
+        const nominal = row.value.next?.at === at ? row.value.next : row.value.owed?.at === at && row.value.owed.snoozed !== true ? row.value.owed : undefined
+        return nominal !== undefined ? momentOf(nominal.date, nominal.time, now, row.value.timeZone, lang) : instantWords(at, now, row.value.timeZone, lang)
+      }
+
       const readLive = (forCancel = false) =>
         Effect.gen(function*() {
           const set = yield* readSet
@@ -516,15 +552,13 @@ export const alarmsModule = defineModule({
               yield* Effect.yieldNow
             }
           }
-          const notifications = yield* ctx.notify.list()
-          const open: Open = { ids: new Set(notifications.map((n) => n.id)), keys: new Set(notifications.map((n) => n.key)) }
+          const open = yield* readOpen
           const pending = yield* readPending
           const ended = pending.rows.filter((r) => r.value.phase === "ended")
           const ringing = ended.filter((r) => ringingNow(r, open))
           const cleanup = forCancel ? ended.filter((r) => !ringing.includes(r) && r.value.withdraw !== undefined) : []
           const all = [...current, ...ringing, ...cleanup]
-          const upcoming = (r: Row<Alarm>) => Math.min(r.value.next?.at ?? Infinity, r.value.ring?.again ?? Infinity, r.value.owed !== undefined && (ringingNow(r, open) || now - r.value.owed.at <= DELIVER_WITHIN_MS) ? r.value.owed.at : Infinity)
-          return { rows: all.sort((a, b) => upcoming(a) - upcoming(b)), open, cut: set.cut || pending.cut }
+          return { rows: all.sort((a, b) => nextRingAt(a, open, now) - nextRingAt(b, open, now)), open, cut: set.cut || pending.cut }
         })
 
       const callDevice = Effect.map(CurrentTurn, (turn) => turn?.deviceId)
@@ -550,7 +584,7 @@ export const alarmsModule = defineModule({
           : v.name !== undefined
           ? say(texts, lang, repeat ? "itemNamedRepeat" : "itemNamed", { name: v.name, moment, rule })
           : repeat ? say(texts, lang, "itemRepeat", { moment, rule }) : moment
-        if (v.ring?.again !== undefined) return say(texts, lang, "itemAgain", { what, moment: instantWords(v.ring.again, now, z, lang) })
+        if (v.ring?.again !== undefined) return say(texts, lang, "itemAgain", { what, moment: nextRingWords(row, open, now, lang) })
         if (ringing) return say(texts, lang, "itemRinging", { what })
         if (v.next === undefined && v.withdraw !== undefined) return say(texts, lang, "itemCleanup", { what })
         return what
@@ -673,8 +707,9 @@ export const alarmsModule = defineModule({
             const id = randomUUID()
             const written = yield* commit(undefined, id, value).pipe(Effect.mapError((e) => e instanceof ActionError ? e : failure(e)))
             if (written.id !== id) {
-              const next = advance(written.value, now).next!
-              return say(texts, lang, "alreadySet", { moment: momentOf(next.date, next.time, now, written.value.timeZone, lang) })
+              const row = { ...written, value: advance(written.value, now) }
+              const open = yield* readOpen.pipe(Effect.mapError(unreadable))
+              return say(texts, lang, "alreadySet", { moment: nextRingWords(row, open, now, lang) })
             }
             const moment = momentOf(value.next!.date, value.next!.time, now, z, lang)
             // Said on the device it was set on, which is the device it rings on: its name may be echoed here.
@@ -705,24 +740,24 @@ export const alarmsModule = defineModule({
             // it again finishes that.
             const t = yield* resolve(which, here, now, true)
             if (t.kind === "answer") return t.say
-            const cancelOne = (t: OneTarget) => Effect.gen(function*() {
+            const prepareCancel = (t: OneTarget): Effect.Effect<{ readonly row: Row<Alarm>; readonly value?: Alarm; readonly reply: (after: Row<Alarm> | undefined) => string }, ActionError> => Effect.gen(function*() {
               const row = t.row
               const v = row.value
               const z = v.timeZone
               const pendingSay = (after: Row<Alarm> | undefined, text: string) => (ringLeft(after) ? say(texts, lang, "ringPending") : text)
               if (!isRepeating(v) || v.next === undefined) {
-                const after = yield* Effect.flatMap(ended(row, now), (value) => change(row, value)).pipe(Effect.mapError(failure))
+                const value = yield* ended(row, now).pipe(Effect.mapError(failure))
                 const text = v.next !== undefined ? say(texts, lang, "cancelled", { moment: momentOf(v.next.date, v.next.time, now, z, lang) }) : v.ring?.again !== undefined
                   ? say(texts, lang, "cancelledAgain")
                   : say(texts, lang, "finished")
-                return pendingSay(after, text)
+                return { row, value, reply: (after) => pendingSay(after, text) }
               }
               const rule = ruleWords(v, lang)
               // A repeating alarm: only the next, or all of them. Never guessed (docs/MODULES-PLAN.md §2 row 6).
-              if (scope === undefined) return say(texts, lang, "scope", { rule })
+              if (scope === undefined) return { row, reply: () => say(texts, lang, "scope", { rule }) }
               if (scope === "all") {
-                const after = yield* Effect.flatMap(ended(row, now), (value) => change(row, value)).pipe(Effect.mapError(failure))
-                return pendingSay(after, say(texts, lang, "cancelledRepeat", { rule }))
+                const value = yield* ended(row, now).pipe(Effect.mapError(failure))
+                return { row, value, reply: (after) => pendingSay(after, say(texts, lang, "cancelledRepeat", { rule })) }
               }
               if (t.snoozed || v.ring?.again !== undefined || (v.owed !== undefined && !t.ringing && now - v.owed.at <= DELIVER_WITHIN_MS) || v.withdraw !== undefined) {
                 // The current occurrence (including an owed snooze or its unfinished withdrawal) comes before the series.
@@ -731,23 +766,33 @@ export const alarmsModule = defineModule({
                 const moment = momentOf(occurrence.date, occurrence.time, now, z, lang)
                 const cleanup = v.withdraw !== undefined && v.owed === undefined && v.ring?.again === undefined
                 const snoozed = t.snoozed || v.ring?.again !== undefined || v.owed?.snoozed === true
-                const after = yield* Effect.flatMap(letGo(row.id, v, now), (value) => change(row, value)).pipe(Effect.mapError(failure))
-                return say(texts, lang, ringLeft(after) ? (snoozed ? "cancelledAgainPendingNext" : "occurrencePendingNext") : cleanup ? "cleanupNext" : snoozed ? "cancelledAgainNext" : "occurrenceCancelledNext", { moment, next })
+                const value = yield* letGo(row.id, v, now).pipe(Effect.mapError(failure))
+                return { row, value, reply: (after) => say(texts, lang, ringLeft(after) ? (snoozed ? "cancelledAgainPendingNext" : "occurrencePendingNext") : cleanup ? "cleanupNext" : snoozed ? "cancelledAgainNext" : "occurrenceCancelledNext", { moment, next }) }
               }
               const moment = momentOf(v.next.date, v.next.time, now, z, lang)
               const following = nextOf(v, v.next.at)
               const { next: _n, ...rest } = v
-              yield* change(row, following !== undefined ? { ...rest, next: following } : rest).pipe(Effect.mapError(failure))
-              return following === undefined
+              return { row, value: following !== undefined ? { ...rest, next: following } : rest, reply: () => following === undefined
                 ? say(texts, lang, "skippedLast", { moment })
-                : say(texts, lang, "skipped", { moment, next: momentOf(following.date, following.time, now, z, lang) })
+                : say(texts, lang, "skipped", { moment, next: momentOf(following.date, following.time, now, z, lang) }) }
             })
-            if (t.kind === "one") return yield* cancelOne(t)
-            const replies: Array<string> = []
+            if (t.kind === "one") {
+              const plan = yield* prepareCancel(t)
+              return plan.reply(plan.value === undefined ? plan.row : yield* change(plan.row, plan.value).pipe(Effect.mapError(failure)))
+            }
+            const plans = []
             for (const target of t.targets) {
-              replies.push(yield* cancelOne(target))
+              plans.push(yield* prepareCancel(target))
               yield* Effect.yieldNow
             }
+            const changes = plans.flatMap((p) => p.value === undefined ? [] : [{ row: p.row, value: p.value }])
+            const committed = changes.length === 0 ? [] : yield* commitGroup(changes).pipe(Effect.mapError(failure))
+            const after = new Map<string, Row<Alarm> | undefined>()
+            for (const row of committed) {
+              after.set(row.id, yield* reconcile(row.id, undefined, true).pipe(Effect.catch(() => Effect.succeed(row))))
+              yield* Effect.yieldNow
+            }
+            const replies = plans.map((p) => p.reply(after.get(p.row.id) ?? p.row))
             return say(texts, lang, "duplicateResult", { count: t.targets.length, result: listOf([...new Set(replies)], lang) })
           }))
       }
