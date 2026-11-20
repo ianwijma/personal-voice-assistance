@@ -119,6 +119,10 @@ export const ErrorCode = Schema.Literals([
   "limit_reached",
   /** Protocol 7: `device.pick` on a device whose settings do not allow it. */
   "not_allowed",
+  /** Protocol 10: `module.action` names a key that is not an action of that module. */
+  "unknown_action",
+  /** Protocol 10: `module.action` on a module that is not running (an action that needs its running instance). */
+  "not_running",
   "internal"
 ])
 export type ErrorCode = typeof ErrorCode.Type

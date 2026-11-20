@@ -1,8 +1,11 @@
 import { Schema } from "effect"
+import { NotificationAction } from "./notifications.ts"
+import { PresentAction } from "./presentation.ts"
 import { AdminToken } from "./admin.ts"
 import { Assistant, AssistantBody, AssistantId, MAX_ASSISTANTS } from "./assistants.ts"
 import {
   ClientId,
+  FieldKey,
   ModuleId,
   NonNegativeFinite,
   NonNegativeInt,
@@ -14,9 +17,10 @@ import {
 import { MAX_TEXT_INPUT_CHARS } from "./constants.ts"
 import { MAX_MOVE_KEYS } from "./env.ts"
 import { DeviceSettingsPatch, DeviceTarget } from "./devices.ts"
-import { DeviceHello, DeviceId, DeviceName, FrontendRole, WakePhrase } from "./frontends.ts"
+import { DeviceHello, DeviceId, FrontendRole, SavedDeviceName, WakePhrase } from "./frontends.ts"
+import { DeviceCapabilities, DeviceLiveState } from "./capabilities.ts"
 import { JobAction, ToolId } from "./jobs.ts"
-import { SettingsPatch } from "./settings.ts"
+import { SettingsPatch, SettingValue } from "./settings.ts"
 import { Password } from "./vault.ts"
 
 /**
@@ -178,6 +182,20 @@ export const ModuleConfigure = Schema.Struct({
   requestId: RequestId,
   moduleId: ModuleId,
   patch: SettingsPatch
+})
+
+/**
+ * Protocol 10, admin only: press an `action` field of a module's form ("Test"). Answered with `result`, whose
+ * `action` is what the handler said (`ok: true` on the result means it ran; `action.ok` says whether it worked).
+ * `values`: the page's draft (non-secret values) for a field with `requiresSaved: false`; the handler then sees
+ * them over the saved settings. Absent: the saved settings.
+ */
+export const ModuleAction = Schema.Struct({
+  type: Schema.Literal("module.action"),
+  requestId: RequestId,
+  moduleId: ModuleId,
+  key: FieldKey,
+  values: Schema.optionalKey(Schema.Record(FieldKey, SettingValue))
 })
 
 /**
@@ -389,8 +407,8 @@ export const DeviceSave = Schema.Struct({
   requestId: RequestId,
   target: DeviceTarget,
   rev: NonNegativeInt,
-  /** Devices only. */
-  name: Schema.optionalKey(DeviceName),
+  /** Devices only. One line (`SavedDeviceName`): a name with a line break or a control character is refused. */
+  name: Schema.optionalKey(SavedDeviceName),
   settings: DeviceSettingsPatch,
   saveAnyway: Schema.optionalKey(Schema.Boolean)
 })
@@ -410,6 +428,29 @@ export const DevicePick = Schema.Struct({
   type: Schema.Literal("device.pick"),
   requestId: RequestId,
   withoutPhrase: Schema.Union([AssistantId, Schema.Literal(""), Schema.Literal("typesafe")])
+})
+
+/**
+ * Protocol 9, admin only: "Check again" on the Health page. The server probes every program the modules need again,
+ * re-judges which modules are available (starting those that now are, and trying again every module that is not
+ * running), runs every module's `health()`, and sends `health`. Answered with `result` as soon as the check has started (it can take longer than a
+ * page waits for an answer): `health` with `checking: true` comes first, and the outcome arrives as `health` with
+ * `checking: false`. A check already running is not started twice.
+ */
+export const HealthCheck = Schema.Struct({
+  type: Schema.Literal("health.check"),
+  requestId: RequestId
+})
+
+/**
+ * Protocol 11 (P5), voice connections with a device: what the device can do changed (`capabilities`: a resize, a
+ * rotation; the whole declaration again), and/or its live state (`live`: visible, last interaction). Sent at most once
+ * a second. Not answered; ignored from admin connections and from voice connections without a device.
+ */
+export const DeviceCaps = Schema.Struct({
+  type: Schema.Literal("device.caps"),
+  capabilities: Schema.optionalKey(DeviceCapabilities),
+  live: Schema.optionalKey(DeviceLiveState)
 })
 
 export const ClientMessage = Schema.Union([
@@ -448,7 +489,12 @@ export const ClientMessage = Schema.Union([
   AssistantDelete,
   DeviceSave,
   ConversationRead,
-  DevicePick
+  DevicePick,
+  HealthCheck,
+  ModuleAction,
+  DeviceCaps,
+  NotificationAction,
+  PresentAction
 ]).pipe(Schema.toTaggedUnion("type"))
 export type ClientMessage = typeof ClientMessage.Type
 export type ClientMessageType = ClientMessage["type"]

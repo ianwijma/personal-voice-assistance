@@ -151,6 +151,9 @@ const seedDeviceOwn = (longPhrase = false): Map<string, { own: DeviceOwn; rev: n
     ["d-kitchen-ipad-0001", { rev: 0, own: { assistants: [{ assistant: "jeff", phrases: ["Hey Jeff"] }, { assistant: "keuken", phrases: ["Hé keuken", "Hey keuken"], followUpSeconds: 15 }], captions: { captions: false, speakTyped: false } } }]
   ])
 
+/** The person the sample phone belongs to (mock/server.ts seeds Members with Sam and Robin). */
+export const SAM_ID = "p-sam00001"
+
 export interface Known {
   readonly id: string
   readonly name: string
@@ -173,6 +176,8 @@ export interface AssistantsMock {
   readonly touch: (id: string, patch: Partial<AssistantBody>) => boolean
   /** A device was forgotten: its own settings go. */
   readonly forgetDevice: (id: string) => void
+  /** Protocol 11: people removed from Members are no device's default person any more. True when something changed. */
+  readonly clearDefaultPeople: (known: ReadonlySet<string>) => boolean
 }
 
 /** What the server knows about modules that the assistants' checks need (mock/server.ts gives it). */
@@ -184,6 +189,8 @@ export interface ModuleCatalog {
   readonly checkOwn: (moduleId: string, own: Readonly<Record<string, unknown>>) => ReadonlyArray<{ readonly field: string; readonly message: string }>
   /** The problem of a language-model account that is not set up (OpenRouter without a key, the home model without an address). */
   readonly accountProblem: (account: string) => string | undefined
+  /** Protocol 11: whether a person id is in Members (a `place.defaultPerson` must be, as on the server). */
+  readonly isPerson?: (id: string) => boolean
 }
 
 export const createAssistantsMock = (catalog: ModuleCatalog): AssistantsMock => {
@@ -327,6 +334,11 @@ export const createAssistantsMock = (catalog: ModuleCatalog): AssistantsMock => 
     saveDevice: ({ target, rev, settings, saveAnyway }) => {
       const patch = Object.fromEntries(Object.entries(settings).filter(([, v]) => v !== undefined)) as Record<string, unknown>
       const known = new Set(assistants.map((a) => a.id))
+      // As the server: a default person must be in Members.
+      const person = settings.place?.defaultPerson
+      if (person !== undefined && person !== null && catalog.isPerson !== undefined && !catalog.isPerson(person)) {
+        return refusal([{ code: "invalid", path: "place.defaultPerson", message: "That person is not in Members (any more): pick another, or nobody." }])
+      }
       if (target.kind === "type") {
         if (target.type !== WEB_VOICE_KIND) return fail("unknown_device", `No device type ${target.type}.`)
         if (rev !== typeRev) return fail("stale", "The defaults changed since this page read them; reload them.")
@@ -364,6 +376,22 @@ export const createAssistantsMock = (catalog: ModuleCatalog): AssistantsMock => 
     },
     forgetDevice: (id) => {
       deviceOwn.delete(id)
+    },
+    clearDefaultPeople: (known) => {
+      let changed = false
+      const gone = (p: string | null) => p !== null && !known.has(p)
+      if (gone(typeSettings.place.defaultPerson)) {
+        typeSettings = { ...typeSettings, place: { ...typeSettings.place, defaultPerson: null } }
+        typeRev += 1
+        changed = true
+      }
+      for (const [id, record] of deviceOwn) {
+        const place = record.own.place
+        if (place === undefined || !gone(place.defaultPerson)) continue
+        deviceOwn.set(id, { own: { ...record.own, place: { ...place, defaultPerson: null } }, rev: record.rev + 1 })
+        changed = true
+      }
+      return changed
     }
   }
   return mock

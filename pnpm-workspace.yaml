@@ -16,6 +16,30 @@ catalog:
   "@types/ws": 8.18.2
   tsx: 4.23.15
   "@playwright/test": 1.65.0
+  semver: 7.8.6
+  "@types/semver": 7.7.1
+  # Module libraries (docs/MODULES-PLAN.md Appendix A), pinned by the scaffold (P11) for the module packages.
+  "@mozilla/readability": 0.6.0
+  "@types/nspell": 2.1.6
+  "@types/suncalc": 1.9.2
+  "@types/turndown": 5.0.6
+  date-holidays: 3.39.2
+  dictionary-en: 4.0.0
+  dictionary-nl: 2.0.0
+  feedsmith: 3.0.1
+  fuse.js: 7.5.0
+  ical.js: 2.2.1
+  linkedom: 0.18.15
+  mathjs: 15.2.0
+  nspell: 2.1.5
+  pdfjs-dist: 6.5.438
+  suncalc: 2.1.4
+  turndown: 7.2.5
+
+# pdfjs-dist renders pages with this native canvas when it is there; reading a PDF's text (web-search's read_page) does
+# not need it, so it is not installed: no native code, and jsdom's resolution for the web tests stays as it was.
+ignoredOptionalDependencies:
+  - "@napi-rs/canvas"
 
 onlyBuiltDependencies:
   - esbuild

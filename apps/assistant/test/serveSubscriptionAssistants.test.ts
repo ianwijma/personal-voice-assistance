@@ -182,9 +182,10 @@ describe("Claude subscription per assistant (WP-13a)", () => {
     await typed(page, "alpha", "one again", "t3")
     await typed(page, "bravo", "two again", "t4")
     // Alpha's session answers with the new model from this turn on (no new Claude Code process); Bravo's is as it was.
-    expect(qa.received.at(-1)).toBe("one again")
+    // Each turn's text comes after its per-turn context (P5: the device line), as for every agent turn.
+    expect(qa.received.at(-1)).toMatch(/<\/context>\n\none again$/)
     expect(modelOf(qa)).toBe("claude-haiku-5-5")
-    expect(qb.received.at(-1)).toBe("two again")
+    expect(qb.received.at(-1)).toMatch(/<\/context>\n\ntwo again$/)
     expect(qb.retunes).toHaveLength(bravoRetunes)
     expect(modelOf(qb)).toBe("claude-opus-5-5")
     expect(fake.queries).toHaveLength(sessions)

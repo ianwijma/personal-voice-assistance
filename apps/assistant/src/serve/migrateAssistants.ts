@@ -21,7 +21,9 @@ import {
   type ProfileOverrides,
   type QuietSpell,
   WEB_VOICE_KIND,
-  FOLLOW_ASSISTANT
+  FOLLOW_ASSISTANT,
+  BUILT_IN_PLACE,
+  NO_OVERRIDES
 } from "@pva/protocol"
 import * as SherpaStt from "@pva/stt-sherpa"
 import { defaultSystemPrompt } from "../config.ts"
@@ -106,7 +108,8 @@ export interface AssistantsData {
 }
 
 export interface SettingsFile extends AssistantsData {
-  readonly version: 4
+  /** `SETTINGS_VERSION` (`SettingsStore.ts`): 5 since P5. */
+  readonly version: 5
   /** The save that wrote this file (see `SettingsStore.ts`, "Revisions"). */
   readonly revision?: number
   /** Module shared settings; `enabled` is mirrored into the migrated assistant and read by today's module host. */
@@ -475,7 +478,9 @@ const settingsFromProfile = (p: DeviceProfile, assistantId: string): DeviceSetti
   },
   captions: { captions: p.captions, speakTyped: p.speakReplies },
   look: FOLLOW_ASSISTANT,
-  voice: FOLLOW_ASSISTANT
+  voice: FOLLOW_ASSISTANT,
+  place: BUILT_IN_PLACE,
+  capabilities: NO_OVERRIDES
 })
 
 /** The fields present in `overrides`. */
@@ -702,7 +707,7 @@ export const migrateToV4 = (input: MigrationInput): SettingsFile => {
   }
 
   return {
-    version: 4,
+    version: 5,
     ...(file.revision !== undefined ? { revision: file.revision } : {}),
     modules: file.modules,
     assistant: file.assistant,

@@ -35,6 +35,10 @@
  *                   web-voice default (asleep after a claim) and a third device that has it among three phrases.
  *   admin-disabled  no admin password: `admin.state.enabled` is false and every login is refused.
  *   admin-backoff   every wrong admin password refuses logins for 30 s.
+ *   health          like typed (protocol 9): Diagnostics › Health lists a module error and a module warning for one
+ *                   device (the kitchen speaker); the Music module is unavailable (yt-dlp is missing) and suggests a
+ *                   DJ template; Check again takes 1 s and clears the speaker warning. Every other scenario has an
+ *                   empty, checked registry.
  * In every scenario the vault starts as "none" (no vault yet) unless the scenario says otherwise.
  *
  * Protocol 5 (docs/FRONTENDS-AND-ACTIVATION.md): pages say `frontend: "voice" | "admin"` in hello. The admin
@@ -50,6 +54,14 @@
  *
  * Control endpoints (for tests): GET /mock/log (client messages and microphone stats), POST /mock/reset,
  * POST /mock/turn (run the scripted voice turn now), POST /mock/send {"messages": [ServerMessage…]} (broadcast),
+ * POST /mock/notify {"title", "ring"?, "deviceId"?, "actions"?, "handlerDown"?} (P9: a notification card, delivered as the
+ * server does, again after each hello while open), POST /mock/notify/resolve {"id"}, POST /mock/volume {"deviceId",
+ * "direction" | "to"} (P7: the device's reply volume as a spoken "louder"/"quieter" changes it, `output.volume` to its
+ * voice pages now and after each welcome while it is not the default),
+ * POST /mock/present {"presentation", "options"? (lifetime, expiresInMs), "id"?, "deviceId"?, "handlerDown"?} (P10: a
+ * presentation shown as the server does: the shared checks, bounds, decision and selection, again after each hello while
+ * live; household content only and no `key`: refused with a 400 that says the mock does not model them),
+ * POST /mock/present/dismiss {"id"}, POST /mock/present/clear (tests: end every presentation, so a test starts from none),
  * POST /mock/drop (terminate every socket), POST /mock/offline {"ms": 3000} (drop and refuse connections for a while),
  * POST /mock/admin/end {"reason": "idle" | "expired"} (end every admin session), POST /mock/wake {"phrase", "armed"}
  * (the owner said the wake phrase), POST /mock/heard {"text", "matched"?, "accepted"?, "source"?} (a tester line; `accepted: null` or `source: null` leaves that field out), POST /mock/state
@@ -90,6 +102,7 @@
  * recogniser downloads as the Models page's jobs); POST /mock/models/state {"provider", "state"} forces a state.
  */
 import { randomBytes } from "node:crypto"
+import { Schema } from "effect"
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http"
 import {
   hearerOf,
@@ -102,12 +115,14 @@ import {
   DEFAULT_CONVERSATION_IDLE_MINUTES,
   DEFAULT_MAX_VOICE_SESSIONS,
   DEFAULT_SESSION_DISCARD_MINUTES,
+  type DeclaredCapabilities,
   type DeviceListInfo,
   BUILT_IN_WEB_VOICE_SETTINGS,
   WAKE_ARMED_MS,
   WAKE_TEST_MAX_MS,
   WEB_VOICE_KIND,
   decodeClientMessage,
+  deviceTypeOf,
   decodeMicFrame,
   encodeReplyFrame,
   encodeServerMessage,
@@ -117,6 +132,7 @@ import {
   type HistoryItem,
   type JobInfo,
   type ModelSet,
+  type HealthInfo,
   type ModuleInfo,
   PROTOCOL_VERSION,
   type ServerMessage,
@@ -135,14 +151,20 @@ import {
   type VoiceEntry,
   voiceFor
 } from "@pva/protocol"
-import { exampleEngineStatus, exampleSnapshot, exampleVoiceSection, exampleWeatherModule } from "@pva/protocol/examples"
+import { answerHealthCheck } from "./health.ts"
+import { exampleEngineStatus, exampleHealth, exampleSnapshot, exampleUnavailableModule, exampleVoiceSection, exampleWeatherModule } from "@pva/protocol/examples"
 import { type WebSocket, WebSocketServer } from "ws"
-import { createAssistantsMock } from "./assistants.ts"
+import { createAssistantsMock, SAM_ID } from "./assistants.ts"
+import { type CapabilityParts, reconcileCapability } from "./capabilities.ts"
+import { fieldValueError } from "./fieldChecks.ts"
 import { seedTraces } from "./traces.ts"
 import { createVoiceAssistants, scenarioSettings, scriptedTurn } from "./voiceAssistants.ts"
 import { encodeWav, MOCK_PROVIDERS } from "./voices.ts"
 import { createModelPickersMock } from "./modelPickers.ts"
-import type { Condition, FieldError } from "@pva/protocol"
+import { createModuleRoutesMock, DEMO_DEFINITION_ACTIONS, demoHomeAction, demoHomeModule, TokenRefusal } from "./demoHome.ts"
+import { createScheduledJobsMock, MockSchedulerError } from "./scheduledJobs.ts"
+import { decideRisk, decodeRiskPolicy, DEFAULT_RISK_POLICY, FIXED_REASON, FIXED_RISK_CLASSES, RISK_POLICY_KEYS, riskLanguageOf, riskPageTexts, riskPolicyPatchProblems, riskSpoken } from "@pva/protocol"
+import { boundaryKey, changeReplyVolume, checkDietList, checkMembersValue, cleanDeviceName, type Condition, decideDelivery, decidePresentation, type DeviceCapabilities, deviceOutputsFrom, devicePresentFrom, type FieldError, MAX_LIVE_PER_MODULE, MAX_LIVE_TOTAL, MAX_PINNED_PER_DEVICE, NO_REPLY_VOLUMES, PRESENT_KIND_VERSIONS, type Presentation, PRESENTATION_ID, PresentationWire, presentationProblem, type PresentKindName, presentLifetime, presentWireContent, type ReplyVolumes, selectPresentations, type ShowOptions, showOptionsProblem, speakerAllowedFrom } from "@pva/protocol"
 
 const PORT = Number(process.env.MOCK_PORT ?? 8787)
 const HOST = process.env.MOCK_HOST ?? "127.0.0.1"
@@ -161,7 +183,8 @@ const SCENARIOS = [
   "long-phrase",
   "latency",
   "admin-disabled",
-  "admin-backoff"
+  "admin-backoff",
+  "health"
 ] as const
 /** The admin password of the mock (`PVA_ADMIN_PASSWORD` on the real server). */
 const ADMIN_PASSWORD = "admin password"
@@ -177,6 +200,8 @@ const REPLY_RATE = 22_050
 
 const isScenario = (s: unknown): s is Scenario => typeof s === "string" && (SCENARIOS as ReadonlyArray<string>).includes(s)
 let scenario: Scenario = isScenario(process.env.MOCK_SCENARIO) ? process.env.MOCK_SCENARIO : "voice"
+/** The scenarios with remembered devices (and, protocol 11, Sam and Robin in Members). */
+const seededDeviceScenario = () => scenario === "devices" || scenario === "wake" || scenario === "long-phrase" || scenario === "latency"
 
 const log = (...args: Array<unknown>) => {
   if (process.env.MOCK_QUIET !== "1") console.log("[mock]", ...args)
@@ -326,8 +351,15 @@ const initialModules = (): Array<ModuleInfo> => [
     protected: true,
     kind: "agent",
     group: "agents"
-  }
+  },
+  ...(scenario === "health" ? [clone(exampleUnavailableModule)] : []),
+  // Protocol 10: records, text lists, a combo, an info value, buttons and module routes.
+  demoHomeModule()
 ]
+
+/** Protocol 9: the issue registry (`health`). */
+const initialHealth = (): HealthInfo =>
+  scenario === "health" ? { ...clone(exampleHealth), checkedAt: Date.now() - 120_000 } : { issues: [], checkedAt: Date.now(), checking: false }
 
 const sherpa = { key: "STT_PROVIDER", in: ["sherpa"] }
 const deepgram = { key: "STT_PROVIDER", in: ["deepgram"] }
@@ -544,7 +576,7 @@ const initialSections = (): Array<SettingsSection> => [
     form: {
       fields: [
         { type: "text", key: "HOME_LOCATION", label: "Location", description: "Town and country, e.g. \"Amsterdam, Netherlands\". Every assistant is told; the weather uses it when you name no place.", apply: "live", default: "", placeholder: "Amsterdam, Netherlands", maxLength: 200, source: "default" },
-        { type: "text", key: "HOME_TIME_ZONE", label: "Time zone", description: "IANA name, e.g. Europe/Amsterdam. Empty: this machine's zone.", apply: "live", default: "", placeholder: "Europe/Amsterdam", maxLength: 64, source: "default" },
+        { type: "text", key: "HOME_TIME_ZONE", label: "Time zone", description: "IANA name, e.g. Europe/Amsterdam (not an offset such as +01:00). Empty: this machine's zone.", apply: "live", default: "", placeholder: "Europe/Amsterdam", maxLength: 64, source: "default" },
         {
           type: "choice",
           key: "HOME_LANGUAGE",
@@ -574,9 +606,120 @@ const initialSections = (): Array<SettingsSection> => [
           default: "en-GB",
           options: [{ value: "en-GB", label: "13 November 2026" }, { value: "en-US", label: "November 13, 2026" }, { value: "nl-NL", label: "13 november 2026" }],
           source: "default"
-        }
+        },
+        { type: "text", key: "HOME_CURRENCY", label: "Currency", description: "Three-letter code of the household's money, e.g. EUR, USD, GBP (any three capital letters are accepted; use the ISO 4217 code). The default of modules that handle prices.", apply: "live", default: "EUR", placeholder: "EUR", maxLength: 3, source: "default" },
+        {
+          type: "choice",
+          key: "HOME_CUP_SIZE",
+          label: "Cup size",
+          description: "How big \"a cup\" is in recipes and shopping lists.",
+          apply: "live",
+          default: "metric",
+          options: [{ value: "metric", label: "Metric cup (250 ml)" }, { value: "us", label: "US cup (236.6 ml)" }],
+          source: "default"
+        },
+        { type: "text", key: "HOME_API_CONTACT", label: "API contact", description: "An email address or web address put in the User-Agent of requests to public web services that ask who is calling. Empty: none is sent.", apply: "live", default: "", placeholder: "you@example.com", maxLength: 200, source: "default" }
       ],
-      values: { HOME_LOCATION: "", HOME_TIME_ZONE: "", HOME_LANGUAGE: "en-GB", HOME_UNITS: "metric", HOME_DATE_FORMAT: "en-GB" },
+      values: { HOME_LOCATION: "", HOME_TIME_ZONE: "", HOME_LANGUAGE: "en-GB", HOME_UNITS: "metric", HOME_DATE_FORMAT: "en-GB", HOME_CURRENCY: "EUR", HOME_CUP_SIZE: "metric", HOME_API_CONTACT: "" },
+      secrets: {},
+      errors: []
+    },
+    revision: 1
+  },
+  {
+    // Protocol 11 (docs/MODULES-PLAN.md §4 P5): the household's people and diets. A person's id is made by the server
+    // when the person is added (hidden in the record); removing someone clears every device's default person there.
+    id: "members",
+    title: "Members",
+    group: "modules",
+    page: { id: "members", title: "Members", description: "The people who live here, and what they eat. A device's default person (Devices › a device › Place) says whose data a turn there means." },
+    order: 6,
+    form: {
+      fields: [
+        {
+          type: "records",
+          key: "HOUSEHOLD_MEMBERS",
+          label: "People",
+          description: "Each person's name, other names, and diet. A device points at one of them as its default person; removing someone clears that, and ends the session on every device (its pages reconnect and start a new conversation). Their stored data stays in the household database but is shown and told nowhere any more.",
+          apply: "live",
+          default: [],
+          itemFields: [
+            { type: "text", key: "id", label: "Id", default: "", maxLength: 40, hidden: true },
+            { type: "text", key: "name", label: "Name", description: "As the household says it: \"Sam\".", default: "", maxLength: 60, placeholder: "Sam" },
+            { type: "textList", key: "aliases", label: "Also called", description: "Other names people use for them: \"Sammie\", \"Mum\".", default: [], maxItems: 10, itemMaxLength: 40 },
+            { type: "text", key: "pronunciation", label: "Pronunciation", description: "How the voice should say the name, spelled as it sounds (\"Shiv-awn\"). Empty: as written.", default: "", maxLength: 60 },
+            { type: "textList", key: "allergies", label: "Allergies", description: "Never in their food: \"nuts\", \"shellfish\". Empty: the household's.", default: [], maxItems: 30, itemMaxLength: 60, placeholder: "nuts" },
+            { type: "textList", key: "diets", label: "Diets", description: "\"vegetarian\", \"halal\". Empty: the household's.", default: [], maxItems: 30, itemMaxLength: 60, placeholder: "vegetarian" },
+            { type: "textList", key: "dislikes", label: "Dislikes", description: "Left out where possible: \"coriander\". Empty: the household's.", default: [], maxItems: 30, itemMaxLength: 60, placeholder: "coriander" }
+          ],
+          itemLabel: "person",
+          titleKey: "name",
+          maxItems: 24,
+          orderable: false,
+          source: "default"
+        },
+        { type: "textList", key: "HOUSEHOLD_DIET_ALLERGIES", label: "Household allergies", description: "For everyone who has none of their own: what the kitchen never suggests.", apply: "live", default: [], maxItems: 30, itemMaxLength: 60, placeholder: "nuts", source: "default" },
+        { type: "textList", key: "HOUSEHOLD_DIET_DIETS", label: "Household diets", description: "For everyone who has none of their own.", apply: "live", default: [], maxItems: 30, itemMaxLength: 60, placeholder: "vegetarian", source: "default" },
+        { type: "textList", key: "HOUSEHOLD_DIET_DISLIKES", label: "Household dislikes", description: "For everyone who has none of their own.", apply: "live", default: [], maxItems: 30, itemMaxLength: 60, placeholder: "coriander", source: "default" }
+      ],
+      values: {
+        HOUSEHOLD_MEMBERS: seededDeviceScenario()
+          ? [
+            { id: SAM_ID, name: "Sam", aliases: ["Sammie"], pronunciation: "", allergies: ["nuts"], diets: [], dislikes: ["coriander"] },
+            { id: "p-robin0002", name: "Robin", aliases: [], pronunciation: "", allergies: [], diets: ["vegetarian"], dislikes: [] }
+          ]
+          : [],
+        HOUSEHOLD_DIET_ALLERGIES: [],
+        HOUSEHOLD_DIET_DIETS: [],
+        HOUSEHOLD_DIET_DISLIKES: []
+      },
+      secrets: {},
+      errors: []
+    },
+    revision: 1
+  },
+  {
+    // P8: the household's risk policy, as the server declares it (`riskSection` in sectionDefinitions.ts): money and
+    // security fixed at Refuse (locked with the reason). Saves are checked with the server's own `riskPolicyValueProblem`.
+    id: "risk",
+    title: "Risk policy",
+    group: "modules",
+    page: { id: "risk", title: "Risk policy", description: "What the assistant may do on its own, for every assistant on every device. A refused call is not run; the assistant says why." },
+    order: 7,
+    protected: true,
+    form: {
+      fields: [
+        ...(["read", "change", "message"] as const).map((cls) => ({
+          type: "choice" as const,
+          key: RISK_POLICY_KEYS[cls],
+          label: riskPageTexts("en").classes[cls],
+          description: cls === "read"
+            ? "Lookups that change nothing: the weather, what is on a list, the time."
+            : cls === "change"
+            ? "Lights, timers, lists, reminders, speaking or ringing on the house's own devices."
+            : "Mail, chat or a call to people outside the house, or anything in your name on an outside channel. No module sends one yet.",
+          apply: "live" as const,
+          default: DEFAULT_RISK_POLICY[cls],
+          options: [
+            { value: "allow", label: riskPageTexts("en").outcomes.allow, description: "The assistant does it." },
+            { value: "confirm", label: riskPageTexts("en").outcomes.confirm, description: "Refused, saying it needs your confirmation: the assistant cannot ask for it yet." },
+            { value: "deny", label: riskPageTexts("en").outcomes.deny, description: "Refused, saying this household does not allow it." }
+          ],
+          source: "default" as const
+        })),
+        ...FIXED_RISK_CLASSES.map((cls) => ({
+          type: "choice" as const,
+          key: RISK_POLICY_KEYS[cls],
+          label: riskPageTexts("en").classes[cls],
+          description: cls === "money" ? "Purchases and payments." : "Unlocking, disarming, opening a garage door or a gate.",
+          apply: "live" as const,
+          default: "deny",
+          options: [{ value: "deny", label: riskPageTexts("en").outcomes.deny }],
+          locked: { reason: FIXED_REASON },
+          source: "default" as const
+        }))
+      ],
+      values: { RISK_READ: "allow", RISK_CHANGE: "allow", RISK_MESSAGE: "confirm", RISK_MONEY: "deny", RISK_SECURITY: "deny" },
       secrets: {},
       errors: []
     },
@@ -655,6 +798,14 @@ const initialSections = (): Array<SettingsSection> => [
 ]
 
 /** Every section's value of `key` (keys are global), and whether a secret is set. */
+/**
+ * P8, as the real gateway decides a press (a notification's action, a presentation's tick or button): the saved policy
+ * through the shared decoder, `decideRisk` with the handler's class (the mock's handlers declare none: `change`), and on
+ * a refusal the policy's spoken sentence in the household's language. `undefined`: allowed.
+ */
+const mockPressRefusal = (): string | undefined =>
+  riskSpoken(riskLanguageOf(valueOf("HOME_LANGUAGE")), decideRisk(decodeRiskPolicy((key) => valueOf(key)), ["change"], "change"))
+
 const valueOf = (key: string, list: ReadonlyArray<SettingsSection> = sections): unknown => {
   for (const x of list) if (Object.hasOwn(x.form.values, key)) return x.form.values[key]
   return undefined
@@ -807,6 +958,11 @@ interface Conn {
   testerUntil?: number | undefined
   /** Protocol 6: the device the tester follows; undefined = the most recently active session. */
   testerDevice?: string | undefined
+  /** P10: what this connection's own page declared last (its hello, then `device.caps`): it is sent only those kinds. */
+  ownCaps?: DeviceCapabilities | undefined
+  /** Protocol 11: the page's live state (`device.caps.live`). */
+  visible?: boolean
+  lastInteractionAt?: number
 }
 
 interface Reply {
@@ -872,15 +1028,67 @@ let connSeq = 0
 const voiceSessions = new Map<string, VSession>()
 let conversationSeq = 0
 let modules = initialModules()
+// Reads the mock's vault each time (declared below): locked, tokens are neither listed nor changed.
+const moduleRoutesMock = createModuleRoutesMock(() => vault.state === "locked")
+/** P6: the scheduled jobs (as the real server's /api/scheduler/jobs). */
+let scheduledJobsMock = createScheduledJobsMock()
+/** Buttons whose press is running (`<module>/<key>`): a second press is `busy`, as on the host. */
+const pressing = new Set<string>()
 /** Protocol 7: assistants, device types and the devices' own sections (mock/assistants.ts). */
 const assistantsMock = createAssistantsMock({
   modules: () => modules,
   toolNames: (id) => runningTools(id).map((t) => t.name),
   checkOwn: (id, own) => checkOwn(id, own),
-  accountProblem: (account) => accountProblem(account)
+  accountProblem: (account) => accountProblem(account),
+  // Read when a device is saved: `sections` is set before any request arrives.
+  isPerson: (id) => memberIds().has(id)
 })
 /** Protocol 7, the voice connection's side: the device's setup, a conversation per assistant, who has the turn (mock/voiceAssistants.ts). */
-const voice = createVoiceAssistants(assistantsMock, () => newConversationInfo())
+const voice = createVoiceAssistants(assistantsMock, () => newConversationInfo(), (deviceId) => speakerAllowedOf(deviceId))
+/**
+ * Protocol 11, as the server: reply audio is sent to a device only while its effective settings and its latest
+ * declaration allow speech (`speakerAllowedFrom`, shared with the server); its setup's speaking flags follow it.
+ */
+const speakerAllowedOf = (deviceId: string | undefined): boolean =>
+  speakerAllowedFrom(assistantsMock.deviceFields(deviceId ?? "").settings, deviceId === undefined ? undefined : devices.get(deviceId)?.declared?.capabilities)
+/**
+ * Protocol 11, as the server (`boundaryKey`, shared): what decides what each voice connection's device may be told or
+ * sent, by session key. Taken before a save and compared after it: a session whose key changed is ended with its
+ * connections (`CloseCode.settingsChanged`); every one when a person left Members.
+ */
+const boundaries = (): Map<string, string> => {
+  const members = memberIds()
+  const out = new Map<string, string>()
+  const keys = new Set<string>([...voiceSessions.keys(), ...[...conns].flatMap((c) => (c.frontend === "voice" && keyOf(c) !== undefined ? [keyOf(c)!] : []))])
+  for (const key of keys) {
+    const deviceId = voiceSessions.get(key)?.deviceId ?? [...conns].find((c) => keyOf(c) === key)?.deviceId
+    const known = deviceId !== undefined && devices.has(deviceId)
+    const settings = assistantsMock.deviceFields(known ? deviceId! : "").settings
+    out.set(key, known ? boundaryKey(settings, (id) => members.has(id)) : `unknown|${boundaryKey({ ...settings, place: { ...settings.place, defaultPerson: null } }, () => false)}`)
+  }
+  return out
+}
+/** End the sessions whose boundary changed since `before` (all of them: `everyone`). */
+const endChangedSessions = (before: ReadonlyMap<string, string>, everyone = false) => {
+  const after = boundaries()
+  for (const [key, was] of before) {
+    const now = after.get(key)
+    if (!everyone && now === was) continue
+    // A device not known before and known now (its first registration) is not a boundary.
+    if (!everyone && was.startsWith("unknown|") && now !== undefined && !now.startsWith("unknown|")) continue
+    const v = voiceSessions.get(key)
+    if (v !== undefined) dropSession(v)
+    for (const c of [...conns]) {
+      if (c.frontend !== "voice" || keyOf(c) !== key) continue
+      // Nothing more is sent on it from here on.
+      c.welcomed = false
+      conns.delete(c)
+      mockHeld.delete(c.id)
+      mockPresentHeld.delete(c.id)
+      c.ws.close(CloseCode.settingsChanged, "settings changed")
+    }
+  }
+}
 /** The `wake` and `long-phrase` scenarios sleep until the phrase: saved on the web-voice type, as admin would. */
 const seedVoiceScenario = () => {
   const patch = scenarioSettings(scenario, LONG_PHRASE)
@@ -898,6 +1106,7 @@ let jobs: Array<JobInfo> = []
 let jobSeq = 0
 const jobTimers = new Map<string, ReturnType<typeof setInterval>>()
 let traces: Array<TraceInfo> = scenario === "latency" ? seedTraces() : []
+let health: HealthInfo = initialHealth()
 let turnSeq = 20
 let scriptTimers: Array<ReturnType<typeof setTimeout>> = []
 const clientLog: Array<Record<string, unknown>> = []
@@ -917,17 +1126,77 @@ interface DeviceRecord {
   name: string
   firstSeen: number
   lastSeen: number
+  /** Protocol 11: what it declared last (hello, `device.caps`). */
+  declared?: DeclaredCapabilities
 }
 const HOUR = 3_600_000
+/** The people of Members now (their ids). */
+const memberIds = (): ReadonlySet<string> => {
+  const value = sections.find((x) => x.id === "members")?.form.values.HOUSEHOLD_MEMBERS
+  const ids: Array<string> = []
+  for (const r of Array.isArray(value) ? value : []) {
+    const id = typeof r === "object" && r !== null && !Array.isArray(r) ? (r as Record<string, unknown>).id : undefined
+    if (typeof id === "string") ids.push(id)
+  }
+  return new Set(ids)
+}
+/** The ids of people removed from Members since the scenario started (the server's `HOUSEHOLD_MEMBERS_RETIRED`). */
+let retiredMemberIds = new Set<string>()
+/**
+ * Protocol 11, as the server (`withPersonIds`): an incoming id is kept only when it is a committed member's and not
+ * retired, for the first row that carries it; every other row (a new person, a copied row, a stale tab's row of someone
+ * removed, a made-up id) gets a fresh id, never a committed, retired or supplied one. In the patch itself.
+ */
+const withPersonIds = (patch: SettingsPatch) => {
+  const list = patch.values.HOUSEHOLD_MEMBERS
+  if (!Array.isArray(list)) return
+  const committed = memberIds()
+  const supplied = new Set(list.flatMap((r) => (typeof r === "object" && r !== null && !Array.isArray(r) && typeof (r as Record<string, unknown>).id === "string" ? [(r as Record<string, unknown>).id as string] : [])))
+  const used = new Set<string>()
+  const fresh = () => {
+    for (;;) {
+      const id = `p-${randomBytes(4).toString("hex")}`
+      if (!committed.has(id) && !retiredMemberIds.has(id) && !supplied.has(id) && !used.has(id)) return id
+    }
+  }
+  ;(patch.values as Record<string, SettingValue | null>).HOUSEHOLD_MEMBERS = list.map((r) => {
+    if (typeof r !== "object" || r === null || Array.isArray(r)) return r
+    const record = r as Record<string, unknown>
+    const given = typeof record.id === "string" ? record.id : undefined
+    const id = given !== undefined && committed.has(given) && !retiredMemberIds.has(given) && !used.has(given) ? given : fresh()
+    used.add(id)
+    return { ...record, id }
+  }) as unknown as SettingValue
+}
 const seededDevices = (): Map<string, DeviceRecord> => {
-  if (scenario !== "devices" && scenario !== "wake" && scenario !== "long-phrase" && scenario !== "latency") return new Map()
+  if (!seededDeviceScenario()) return new Map()
   const now = Date.now()
   return new Map([
     ...(scenario === "long-phrase"
       ? [["d-living-room-0003", { id: "d-living-room-0003", kind: WEB_VOICE_KIND, name: "Living room tablet", firstSeen: now - 20 * 24 * HOUR, lastSeen: now - 5 * 60_000 }] as [string, DeviceRecord]]
       : []),
-    ["d-kitchen-ipad-0001", { id: "d-kitchen-ipad-0001", kind: WEB_VOICE_KIND, name: "Kitchen iPad", firstSeen: now - 40 * 24 * HOUR, lastSeen: now - 2 * HOUR }],
-    ["d-pixel-phone-0002", { id: "d-pixel-phone-0002", kind: WEB_VOICE_KIND, name: "Android phone · Chrome", firstSeen: now - 9 * 24 * HOUR, lastSeen: now - 3 * 24 * HOUR }]
+    ["d-kitchen-ipad-0001", {
+      id: "d-kitchen-ipad-0001",
+      kind: WEB_VOICE_KIND,
+      name: "Kitchen iPad",
+      firstSeen: now - 40 * 24 * HOUR,
+      lastSeen: now - 2 * HOUR,
+      declared: {
+        capabilities: { v: 1, display: { class: "standard", widthPx: 1024, heightPx: 768, dpr: 2, touch: "coarse", colour: true }, present: { kinds: {} }, speaker: { media: ["speech", "audio"] }, microphone: { farField: false } },
+        seenAt: now - 2 * HOUR
+      }
+    }],
+    ["d-pixel-phone-0002", {
+      id: "d-pixel-phone-0002",
+      kind: WEB_VOICE_KIND,
+      name: "Android phone · Chrome",
+      firstSeen: now - 9 * 24 * HOUR,
+      lastSeen: now - 3 * 24 * HOUR,
+      declared: {
+        capabilities: { v: 1, display: { class: "compact", widthPx: 412, heightPx: 915, dpr: 2.63, touch: "coarse", colour: true }, present: { kinds: {} }, speaker: { media: ["speech", "audio"] }, microphone: { farField: false }, openUrl: true },
+        seenAt: now - 3 * 24 * HOUR
+      }
+    }]
   ])
 }
 /** Six words: wake phrases may be this long (the UI must not cut or jump on them). */
@@ -939,8 +1208,10 @@ const deviceInfos = (): Array<DeviceListInfo> => {
   const now = Date.now()
   return [...devices.values()]
     .map((d) => {
-      const connections = [...conns].filter((c) => c.welcomed && c.deviceId === d.id).length
-      return { ...d, lastSeen: connections > 0 ? now : d.lastSeen, connections, audioOwner: voiceSessions.get(d.id)?.owner !== undefined, ...assistantsMock.deviceFields(d.id) }
+      const open = [...conns].filter((c) => c.welcomed && c.deviceId === d.id)
+      const connections = open.length
+      const live = connections === 0 ? undefined : { visible: open.some((c) => c.visible !== false), ...(open.some((c) => c.lastInteractionAt !== undefined) ? { lastInteractionAt: Math.max(...open.map((c) => c.lastInteractionAt ?? 0)) } : {}) }
+      return { ...d, lastSeen: connections > 0 ? now : d.lastSeen, connections, audioOwner: voiceSessions.get(d.id)?.owner !== undefined, ...assistantsMock.deviceFields(d.id), ...(live !== undefined ? { live } : {}) }
     })
     .sort((a, b) => b.lastSeen - a.lastSeen)
 }
@@ -958,7 +1229,7 @@ const adminState = (c: Conn, extra: Partial<AdminState> = {}): AdminState => {
 const sendAdminSnapshot = (c: Conn) =>
   sendTo(c, {
     type: "admin.snapshot",
-    snapshot: { engine, modules, sections, traces: traces.slice(-20), vault: vaultInfo(c), env, models, jobs, devices: deviceInfos(), sessions: sessionInfos(), assistants: assistantInfos(), deviceTypes: assistantsMock.deviceTypes() }
+    snapshot: { engine, modules, sections, traces: traces.slice(-20), vault: vaultInfo(c), env, models, jobs, devices: deviceInfos(), sessions: sessionInfos(), assistants: assistantInfos(), deviceTypes: assistantsMock.deviceTypes(), health }
   })
 const devicesChanged = () => broadcast({ type: "devices", devices: deviceInfos() })
 const assistantInfos = () => assistantsMock.infos([...devices.values()].map((d) => ({ id: d.id, name: d.name })))
@@ -1036,8 +1307,14 @@ const sessionFor = (c: Conn): VSession | undefined => {
 }
 const sessionName = (v: VSession) => (v.deviceId === undefined ? "A browser tab without a device id" : devices.get(v.deviceId)?.name ?? "A device")
 const connsOf = (v: VSession) => [...conns].filter((c) => c.welcomed && keyOf(c) === v.key)
-/** A message about a session's turns: only to that device's connections. */
+/**
+ * Review round 3: the session is still the device's (not dropped). A delayed callback of a dropped session (a boundary
+ * change, a discard) sends nothing, also not to its successor, which has the same key.
+ */
+const alive = (v: VSession) => voiceSessions.get(v.key) === v
+/** A message about a session's turns: only to that device's connections, and only while it is the device's session. */
 const toSession = (v: VSession, m: ServerMessage) => {
+  if (!alive(v)) return
   for (const c of connsOf(v)) sendTo(c, m)
 }
 const startedSessions = () => [...voiceSessions.values()].filter((v) => v.started).sort((a, b) => b.lastActive - a.lastActive)
@@ -1126,6 +1403,10 @@ const dropSession = (v: VSession) => {
   v.discardTimer = undefined
   if (v.reply !== undefined) clearReply(v.reply)
   if (v.awakeTimer !== undefined) clearTimeout(v.awakeTimer)
+  // Its sentence being heard goes too (the scripted turn it would start).
+  if (v.hearingEnd !== undefined) clearTimeout(v.hearingEnd)
+  v.hearingEnd = undefined
+  v.hearingFor = undefined
   voiceSessions.delete(v.key)
   sessionsChanged()
 }
@@ -1217,7 +1498,33 @@ const requireAdmin = (c: Conn, requestId: string): boolean => {
   return true
 }
 
+type NotificationCardWire = Extract<ServerMessage, { type: "notification.ring" }>["notification"]
+/** Open notifications: the card, its device (absent: everywhere), whether its module's handler is down. */
+const mockNotifications = new Map<string, { readonly card: Omit<NotificationCardWire, "show" | "sound" | "texts">; readonly deviceId?: string; readonly handlerDown: boolean }>()
+/** What each voice connection holds (by connection id), as the server keeps it per connection; gone with the connection. */
+const mockHeld = new Map<string, Set<string>>()
+/** Ids are never reused: every id ever issued or named (kept across resets), and a counter that skips them. */
+let mockNotifySeq = 0
+const mockNotifyIds = new Set<string>()
+/**
+ * The service's own words on the card and in its answers, in the saved household language (as `NotifyTexts` in
+ * packages/core: the test compares the two).
+ */
+const MOCK_NOTIFY_TEXTS = {
+  en: { cantNow: "I can't do that right now.", done: "Done.", region: "Notifications", startAudio: "Start audio to hear it." },
+  nl: { cantNow: "Dat kan ik nu niet doen.", done: "Klaar.", region: "Meldingen", startAudio: "Zet het geluid aan om het te horen." }
+} as const
+const mockNotifyTexts = () => (String(valueOf("HOME_LANGUAGE") ?? "").toLowerCase().startsWith("nl") ? MOCK_NOTIFY_TEXTS.nl : MOCK_NOTIFY_TEXTS.en)
+/** The reply volumes, in the server's one state machine (`changeReplyVolume`, `@pva/protocol`): the same steps, cap and drops. */
+let mockVolumes: ReplyVolumes = NO_REPLY_VOLUMES
 const resetState = () => {
+  mockVolumes = NO_REPLY_VOLUMES
+  mockNotifications.clear()
+  mockHeld.clear()
+  for (const p of mockPresentations.values()) clearTimeout(p.timer)
+  mockPresentations.clear()
+  mockPresentHeld.clear()
+  mockMediaTokens.clear()
   for (const t of scriptTimers) clearTimeout(t)
   scriptTimers = []
   for (const v of voiceSessions.values()) {
@@ -1228,6 +1535,9 @@ const resetState = () => {
   voiceSessions.clear()
   lastSessions = ""
   modules = initialModules()
+  moduleRoutesMock.reset()
+  scheduledJobsMock = createScheduledJobsMock()
+  pressing.clear()
   forcedErrors.clear()
   models = initialModels()
   sections = withWarnings(initialSections())
@@ -1239,6 +1549,7 @@ const resetState = () => {
   loginRefusedUntil = 0
   logoutFails = false
   devices = seededDevices()
+  retiredMemberIds = new Set()
   assistantsMock.reset(scenario === "long-phrase")
   syncCapabilities()
   voice.reset()
@@ -1252,6 +1563,7 @@ const resetState = () => {
   jobTimers.clear()
   jobs = []
   traces = scenario === "latency" ? seedTraces() : []
+  health = initialHealth()
   turnSeq = 20
   clientLog.length = 0
 }
@@ -1265,8 +1577,197 @@ const after = (ms: number, f: () => void) => {
 const sendTo = (c: Conn, m: ServerMessage) => {
   if (c.ws.readyState === c.ws.OPEN) c.ws.send(encodeServerMessage(m))
 }
+
+// ---- P9: notifications, as the real server delivers them (docs/NOTIFICATIONS.md)
+
+const notifyConns = (deviceId: string | undefined) => [...conns].filter((c) => c.welcomed && c.frontend === "voice" && c.deviceId !== undefined && (deviceId === undefined || c.deviceId === deviceId))
+/**
+ * The server's reconciliation, for one connection: every open notification of its device decided with the shared
+ * decision function (`decideDelivery`) over the device's effective outputs (`deviceOutputsFrom`), sent per device; a
+ * card the connection holds and may not any more is withdrawn. (The mock has no do not disturb and no personal content.)
+ */
+/** The shared decision for one notification on a device now. */
+const decideMock = (deviceId: string, n: { readonly card: { readonly priority: "normal" | "ring" } }) => {
+  const outputs = deviceOutputsFrom(assistantsMock.deviceFields(deviceId).settings, devices.get(deviceId)?.declared?.capabilities)
+  return decideDelivery({ kind: "notification", priority: n.card.priority, personal: false, mayReveal: true, dnd: false, device: { connected: true, canSpeak: outputs.speak, canShow: outputs.show } })
+}
+const reconcileMock = (c: Conn) => {
+  if (c.frontend !== "voice" || c.deviceId === undefined || !c.welcomed || !conns.has(c)) return
+  const deviceId = c.deviceId
+  const held = mockHeld.get(c.id) ?? new Set<string>()
+  mockHeld.set(c.id, held)
+  const texts = mockNotifyTexts()
+  for (const [id, n] of mockNotifications) {
+    if (n.deviceId !== undefined && n.deviceId !== deviceId) continue
+    const d = decideMock(deviceId, n)
+    if (d.deliver) {
+      sendTo(c, { type: "notification.ring", notification: { ...n.card, show: d.show, sound: d.sound, texts: { region: texts.region, startAudio: texts.startAudio } } })
+      held.add(id)
+    } else if (held.delete(id)) sendTo(c, { type: "notification.resolved", id, outcome: "withdrawn" })
+  }
+}
+/** After a hello (which may have changed the device's declaration): every connection of the device, as the server. */
+const notificationsAfterWelcome = (c: Conn) => {
+  if (c.deviceId === undefined) return reconcileMock(c)
+  for (const x of notifyConns(c.deviceId)) reconcileMock(x)
+}
+
+// ---- P7: the reply volume, as the real server keeps it (docs/PHRASES.md "Louder and quieter")
+
+/** After a voice page's welcome: its device's level when it is not the default (the page went back to the default). */
+const volumeAfterWelcome = (c: Conn) => {
+  if (c.frontend !== "voice" || c.deviceId === undefined) return
+  const level = mockVolumes.get(c.deviceId)
+  if (level !== undefined) sendTo(c, { type: "output.volume", volume: level })
+}
+/** One "louder" / "quieter" or a level for a device, as the server changes it: every send of the transition goes out in this step. */
+const changeMockVolume = (deviceId: string, change: "louder" | "quieter" | { readonly to: number }) => {
+  const t = changeReplyVolume(mockVolumes, deviceId, change)
+  mockVolumes = t.volumes
+  for (const send of t.sends) for (const c of notifyConns(send.deviceId)) sendTo(c, { type: "output.volume", volume: send.volume })
+  return t.change
+}
+const resolveMockNotification = (id: string, outcome: string) => {
+  const n = mockNotifications.get(id)
+  if (n === undefined) return false
+  mockNotifications.delete(id)
+  for (const c of conns) if (mockHeld.get(c.id)?.delete(id) === true) sendTo(c, { type: "notification.resolved", id, outcome })
+  return true
+}
+// ---- P10: presentations, as the real server shows them (docs/PRESENTING.md)
+
+/** Live presentations: what the module showed (checked by the shared checks), its device (absent: every device), its lifetime. */
+const mockPresentations = new Map<string, {
+  presentation: Presentation
+  revision: string
+  readonly deviceId?: string
+  readonly lifetime: "transient" | "pinned"
+  readonly shownAt: number
+  readonly endsAt: number
+  readonly handlerDown: boolean
+  readonly timer: ReturnType<typeof setTimeout>
+}>()
+/** What each voice connection holds of them, per connection as the server keeps it (with its image addresses); gone with it. */
+const mockPresentHeld = new Map<string, Map<string, { readonly fp: string; readonly revision: string; readonly token: string | undefined }>>()
+/** Image addresses: token → the connection and presentation it was made for (as the server's `mediaFor`). */
+const mockMediaTokens = new Map<string, { readonly connId: string; readonly id: string }>()
+let mockPresentSeq = 0
+const mockPresentIds = new Set<string>()
+/** The mock's one image (a 1 × 1 PNG): every image presentation shows it, built in, bounded. */
+const MOCK_IMAGE = Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==", "base64")
+/** The Presenter's own words, in the saved household language (as `PresentTexts` in packages/core: the test compares the two). */
+const MOCK_PRESENT_TEXTS = {
+  en: { region: "On screen", loading: "Loading the image…", imageMissing: "The image is not available.", timerDone: "Done", credit: "Image:", high: "High", low: "Low", done: "Done.", failed: "That didn't work.", cantNow: "I can't do that right now." },
+  nl: { region: "Op het scherm", loading: "De afbeelding wordt geladen…", imageMissing: "De afbeelding is niet beschikbaar.", timerDone: "Klaar", credit: "Afbeelding:", high: "Hoog", low: "Laag", done: "Klaar.", failed: "Dat lukte niet.", cantNow: "Dat kan ik nu niet doen." }
+} as const
+const mockPresentTexts = () => (String(valueOf("HOME_LANGUAGE") ?? "").toLowerCase().startsWith("nl") ? MOCK_PRESENT_TEXTS.nl : MOCK_PRESENT_TEXTS.en)
+/** The shared decision for one presentation for one connection now, with the kinds its own page declared (as the server). */
+const decidePresentMock = (c: Conn, kind: PresentKindName) => {
+  const record = devices.get(c.deviceId!)?.declared?.capabilities
+  const caps = record === undefined ? undefined : { ...record, present: { kinds: c.ownCaps?.present?.kinds ?? {} } }
+  const outputs = devicePresentFrom(assistantsMock.deviceFields(c.deviceId!).settings, caps)
+  return decidePresentation({ kind, personal: false, mayReveal: true, device: { connected: true, ...outputs } })
+}
+/** What a page is sent of a presentation (without `serverNow`), as the server's `wireOf`. */
+const mockWire = (id: string, p: { readonly presentation: Presentation; readonly revision: string; readonly lifetime: "transient" | "pinned"; readonly shownAt: number }, token: string | undefined, interactive: boolean) => {
+  const texts = mockPresentTexts()
+  return {
+    id,
+    revision: p.revision,
+    lifetime: p.lifetime,
+    shownAt: p.shownAt,
+    v: PRESENT_KIND_VERSIONS[p.presentation.kind],
+    content: presentWireContent(p.presentation, token === undefined ? undefined : { state: "ready", token }),
+    buttons: (p.presentation.buttons ?? []).map((b) => ({ id: b.id, label: b.label })),
+    interactive: interactive && p.presentation.handler !== undefined,
+    texts: { region: texts.region, loading: texts.loading, imageMissing: texts.imageMissing, failed: texts.failed, timerDone: texts.timerDone, credit: texts.credit, high: texts.high, low: texts.low }
+  }
+}
+const isPresentationWire = Schema.is(PresentationWire)
+/** The request fields of `POST /mock/present`; anything else is refused. */
+const MOCK_PRESENT_FIELDS: ReadonlyArray<string> = ["id", "presentation", "options", "deviceId", "handlerDown"]
+/**
+ * What the mock does not model, refused with a 400 rather than done differently (review round 2, R7; docs/PRESENTING.md
+ * "The web mock"): it has no privacy model, so only household presentations; it has no keyed replacement, so no `key`.
+ */
+const MOCK_PRESENT_NO_PRIVACY = "the mock shows household presentations only (it has no privacy model): leave sensitivity out or say household"
+const MOCK_PRESENT_NO_KEY = "the mock does not replace by key: leave options.key out (dismiss and show again)"
+/** A presentation's end, as the server's: gone at its end, its pages reconciled. */
+const endMockPresentation = (id: string) => {
+  const p = mockPresentations.get(id)
+  if (p === undefined) return false
+  clearTimeout(p.timer)
+  mockPresentations.delete(id)
+  reconcilePresentEverywhere()
+  return true
+}
+const pruneEndedMock = () => {
+  const now = Date.now()
+  for (const [id, p] of [...mockPresentations]) if (p.endsAt <= now) endMockPresentation(id)
+}
+const newMockToken = () => randomBytes(24).toString("base64url")
+/**
+ * The server's reconciliation for one connection: what applies to its device now, decided with the shared function and
+ * that connection's own kinds, what it shows of it (`selectPresentations`), withdrawals first.
+ */
+const reconcilePresentMock = (c: Conn) => {
+  if (c.frontend !== "voice" || c.deviceId === undefined || !c.welcomed || !conns.has(c)) return
+  const deviceId = c.deviceId
+  const held = mockPresentHeld.get(c.id) ?? new Map<string, { readonly fp: string; readonly revision: string; readonly token: string | undefined }>()
+  mockPresentHeld.set(c.id, held)
+  const now = Date.now()
+  const chosen = selectPresentations([...mockPresentations].filter(([, p]) => p.endsAt > now && (p.deviceId === undefined || p.deviceId === deviceId)).map(([id, p]) => ({
+    id,
+    revision: p.revision,
+    lifetime: p.lifetime,
+    shownAt: p.shownAt,
+    decision: decidePresentMock(c, p.presentation.kind)
+  })))
+  const want = new Set(chosen.map((x) => x.id))
+  for (const [id, h] of [...held]) {
+    if (want.has(id)) continue
+    held.delete(id)
+    if (h.token !== undefined) mockMediaTokens.delete(h.token)
+    sendTo(c, { type: "present.dismiss", id })
+  }
+  for (const x of chosen) {
+    const p = mockPresentations.get(x.id)!
+    const before = held.get(x.id)
+    const token = p.presentation.kind === "image" ? before?.token ?? newMockToken() : undefined
+    if (token !== undefined) mockMediaTokens.set(token, { connId: c.id, id: x.id })
+    const wire = mockWire(x.id, p, token, x.decision.interactive)
+    const fp = JSON.stringify(wire)
+    if (before?.fp === fp) continue
+    sendTo(c, { type: before === undefined ? "present.show" : "present.update", presentation: { ...wire, serverNow: Date.now() } })
+    held.set(x.id, { fp, token, revision: p.revision })
+  }
+}
+const reconcilePresentEverywhere = () => {
+  for (const c of notifyConns(undefined)) reconcilePresentMock(c)
+}
+/** `GET /media/<token>`, as the server's: only a token made for an open connection that holds that image; the same headers. */
+const serveMockMedia = (path: string, res: ServerResponse) => {
+  const t = mockMediaTokens.get(path.slice("/media/".length))
+  const c = t === undefined ? undefined : [...conns].find((x) => x.id === t.connId)
+  if (t === undefined || c === undefined || mockPresentHeld.get(c.id)?.has(t.id) !== true) {
+    res.writeHead(404, { "Content-Type": "text/plain; charset=utf-8", "X-Content-Type-Options": "nosniff", "Cache-Control": "no-store" })
+    return res.end("Not found")
+  }
+  res.writeHead(200, {
+    "Content-Type": "image/png",
+    "Content-Length": String(MOCK_IMAGE.length),
+    "X-Content-Type-Options": "nosniff",
+    "Content-Security-Policy": "default-src 'none'; sandbox",
+    "Content-Disposition": "inline; filename=\"image.png\"",
+    "Cross-Origin-Resource-Policy": "same-origin",
+    "Referrer-Policy": "no-referrer",
+    "Cache-Control": "private, no-store"
+  })
+  return res.end(MOCK_IMAGE)
+}
+
 /** Messages that carry admin data: only admin connections get them (protocol 5). */
-const ADMIN_ONLY: ReadonlySet<ServerMessage["type"]> = new Set(["engine", "module.changed", "section.changed", "vault", "env", "job", "models", "devices", "assistants", "device.types", "sessions", "trace", "wake.heard", "admin.snapshot"])
+const ADMIN_ONLY: ReadonlySet<ServerMessage["type"]> = new Set(["engine", "module.changed", "section.changed", "vault", "env", "job", "models", "devices", "assistants", "device.types", "sessions", "trace", "wake.heard", "admin.snapshot", "health"])
 let lastSummary = ""
 const broadcast = (m: ServerMessage) => {
   const adminOnly = ADMIN_ONLY.has(m.type)
@@ -1683,6 +2184,8 @@ const runReply = (v: VSession, opts: {
   assistantId?: string | undefined
 }) => {
   if (v.reply !== undefined) interruptReply(v.reply)
+  // As the server: never spoken where no reply audio is sent (the override, or a declaration without speech).
+  opts = { ...opts, spoken: opts.spoken && speakerAllowedOf(v.deviceId) }
   const assistantId = opts.assistantId ?? voice.answeringOf(v, v.deviceId)
   const conv = voice.convFor(v, assistantId)
   const withId = assistantId === undefined ? {} : { assistantId }
@@ -1728,7 +2231,15 @@ const runReply = (v: VSession, opts: {
     return
   }
   const c = v.owner
+  // Review round 3: speech is decided again where audio would leave (a declaration may have taken it away since the
+  // turn started): the play stops there, as the server stops it.
+  const mayStillSpeak = () => {
+    if (speakerAllowedOf(v.deviceId)) return true
+    interruptReply(r)
+    return false
+  }
   r.timers.push(setTimeout(() => {
+    if (!alive(v) || r.ended || r.awaitingStop === true || !mayStillSpeak()) return
     if (c === undefined || c.ws.readyState !== c.ws.OPEN) {
       toSession(v, { type: "error", error: { code: "turn_failed", message: "No audio client: the reply could not be played.", turnId } })
       endTurn(r, "failed")
@@ -1749,6 +2260,7 @@ const runReply = (v: VSession, opts: {
   // Clauses go to TTS one after another, faster than real time.
   opts.clauses.forEach((text, i) => {
     r.timers.push(setTimeout(() => {
+      if (!alive(v) || r.ended || r.awaitingStop === true || !mayStillSpeak()) return
       toSession(v, { type: "assistant.text", turnId, clause: i, text, voice: runningVoiceKey(), ...withId })
       if (c !== undefined) sendReplyAudio(c, turnId, pcms[i]!)
       if (i === opts.clauses.length - 1 && c !== undefined) sendTo(c, { type: "reply.end", turnId })
@@ -1770,7 +2282,7 @@ const WEATHER_TURN = {
  * `armed: false` names the assistant first).
  */
 const runVoiceTurn = (v: VSession | undefined, opts: { assistantId?: string | undefined; phrase?: string | undefined } = {}) => {
-  if (v === undefined || v.owner === undefined) return
+  if (v === undefined || v.owner === undefined || !alive(v)) return
   const assistantId = opts.assistantId ?? voice.answeringOf(v, v.deviceId)
   const script = scriptedTurn(assistantId, WEATHER_TURN)
   v.hearingFor = assistantId
@@ -1782,6 +2294,7 @@ const runVoiceTurn = (v: VSession | undefined, opts: { assistantId?: string | un
   words.forEach((w, i) => after(250 + i * 260, () => toSession(v, { type: "transcript", text: w })))
   v.hearingEnd = after(250 + words.length * 260 + 350, () => {
     v.hearingEnd = undefined
+    if (!alive(v)) return
     sendHeard(v, script.userText, opts.phrase, true)
     runReply(v, { source: "voice", userText: script.userText, clauses: script.clauses, spoken: true, tool: script.tool, assistantId })
   })
@@ -1811,6 +2324,7 @@ const applyPatch = (form: SettingsForm, patch: SettingsPatch): SettingsForm => {
   for (const [k, v] of Object.entries(patch.values)) {
     const field = form.fields.find((f) => f.key === k)
     if (field === undefined || field.type === "secret") continue
+    if (field.type === "action" || field.type === "info") continue
     values[k] = v === null ? (field.default as SettingValue) : v
     sources[k] = v === null ? "default" : "saved"
   }
@@ -1829,6 +2343,7 @@ const validate = (form: SettingsForm, patch: SettingsPatch) => {
     const field = form.fields.find((f) => f.key === k)
     if (field === undefined) errors.push({ key: null, message: `Unknown setting ${k}.` })
     else if (field.locked !== undefined) errors.push({ key: k, message: `${field.locked.reason}; change it there.` })
+    else if (fieldValueError(field, v) !== undefined) errors.push({ key: k, message: fieldValueError(field, v)! })
     else if (field.type === "number" && typeof v === "number" && ((field.min !== undefined && v < field.min) || (field.max !== undefined && v > field.max))) {
       errors.push({ key: k, message: `Must be between ${field.min} and ${field.max}.` })
     } else if (k === "defaultPlace" && typeof v === "string" && /atlantis/i.test(v)) errors.push({ key: k, message: "Open-Meteo does not know this place." })
@@ -1867,14 +2382,6 @@ const runningStatus = (id: string, m: ModuleInfo) =>
   : m.status
 /** A failure injected into a capability module's instances (tests: `/mock/module-error`); a saved token with "good" in it clears it. */
 const forcedErrors = new Map<string, string>()
-const ownableKeys = (m: ModuleInfo) => new Set(m.settings.fields.filter((f) => f.overridable === true && f.type !== "secret").map((f) => f.key))
-/** An instance's key: the effective non-secret values (an assistant's own applied), as the host keys them. */
-const instanceKey = (m: ModuleInfo, own: Readonly<Record<string, SettingValue>> | undefined) => {
-  const over = ownableKeys(m)
-  const values: Record<string, SettingValue> = { ...m.settings.values }
-  for (const [k, v] of Object.entries(own ?? {})) if (over.has(k)) values[k] = v
-  return JSON.stringify(Object.keys(values).sort().map((k) => [k, values[k]]))
-}
 /** The field errors the module's own checks give an assistant's own values (`ModuleHost.checkOwn`). */
 const checkOwn = (moduleId: string, own: Readonly<Record<string, unknown>>) => {
   const m = modules.find((x) => x.id === moduleId)
@@ -1883,44 +2390,15 @@ const checkOwn = (moduleId: string, own: Readonly<Record<string, unknown>>) => {
   return validate(m.settings, { values, secrets: {} }).flatMap((e) => (e.key === null ? [] : [{ field: e.key, message: e.message }]))
 }
 /**
- * A capability module runs while at least one switched-on assistant has it on; assistants whose effective values are
- * equal share one instance, an assistant with its own values may run another. Module infos are updated (and pushed)
- * only when they change. The shared instance is listed first.
+ * Every capability module follows the assistants (`reconcileCapability`, mock/capabilities.ts: an unavailable one
+ * stays unavailable). Module infos are updated (and pushed) only when they change.
  */
+const capabilityParts: CapabilityParts = { forced: (id) => forcedErrors.get(id), runningStatus, runningTools, instanceStatus }
 const syncCapabilities = () => {
   const list = assistantsMock.assistants()
   for (const m of [...modules]) {
     if (m.kind !== "capability") continue
-    const wanting = list.filter((a) => a.on && a.modules[m.id]?.on === true)
-    const over = ownableKeys(m)
-    const sharedKey = instanceKey(m, undefined)
-    const groups = new Map<string, { assistants: Array<string>; own: Set<string>; values: Record<string, SettingValue> | undefined }>()
-    for (const a of wanting) {
-      const own = a.modules[m.id]!.own
-      const key = instanceKey(m, own)
-      const g = groups.get(key) ?? { assistants: [], own: new Set<string>(), values: key === sharedKey ? undefined : (own as Record<string, SettingValue> | undefined) }
-      g.assistants.push(a.id)
-      if (key !== sharedKey) for (const [k, v] of Object.entries(own ?? {})) if (over.has(k) && JSON.stringify(v) !== JSON.stringify(m.settings.values[k])) g.own.add(k)
-      groups.set(key, g)
-    }
-    const forced = forcedErrors.get(m.id)
-    const status = runningStatus(m.id, m)
-    const ordered = [...groups.entries()].sort(([a], [b]) => (a === sharedKey ? -1 : b === sharedKey ? 1 : 0)).map(([, g]) => g)
-    const instances = ordered.map((g) => ({
-      assistants: g.assistants,
-      own: [...g.own],
-      state: forced !== undefined ? ("error" as const) : ("running" as const),
-      ...(forced !== undefined ? { error: `${forced} (for ${g.assistants.join(", ")})` } : instanceStatus(m.id, m, g.values) !== undefined ? { status: instanceStatus(m.id, m, g.values)! } : {})
-    }))
-    const { error: _e, status: _s, ...rest } = m
-    const next: ModuleInfo = {
-      ...rest,
-      enabled: wanting.length > 0,
-      state: wanting.length === 0 ? "disabled" : forced !== undefined ? "error" : "running",
-      tools: wanting.length > 0 && forced === undefined ? [...runningTools(m.id)] : [],
-      ...(wanting.length > 0 && forced !== undefined ? { error: forced } : wanting.length > 0 && status !== undefined ? { status } : {}),
-      instances
-    }
+    const next = reconcileCapability(m, list, capabilityParts)
     const same = (a: ModuleInfo, b: ModuleInfo) => JSON.stringify({ ...a, revision: 0 }) === JSON.stringify({ ...b, revision: 0 })
     if (!same(m, next)) setModule(m.id, () => next)
   }
@@ -1959,7 +2437,9 @@ const startModule = (c: Conn, requestId: string, id: string) => {
       : id === "claude-subscription"
       ? { text: `Ready · ${String(m.settings.values.model)} · max plan`, tone: "ok" as const }
       : m.status
-    setModule(id, (x) => ({ ...x, state: "running", tools, ...(status !== undefined ? { status } : {}) }))
+    // Its declared routes are published again with the start.
+    const routes = initialModules().find((x) => x.id === id)?.routes
+    setModule(id, (x) => ({ ...x, state: "running", tools, ...(status !== undefined ? { status } : {}), ...(routes !== undefined ? { routes } : {}) }))
     result(c, requestId, true)
     if (id === "claude-subscription") refreshEngine()
   })
@@ -2101,8 +2581,9 @@ const onClientMessage = (c: Conn, m: ClientMessage) => {
         startModule(c, m.requestId, m.moduleId)
         return
       }
+      // As the real host: its routes are withdrawn when it starts stopping (its tokens are kept).
       setModule(m.moduleId, (x) => {
-        const { error: _e, status: _s, ...rest } = x
+        const { error: _e, status: _s, routes: _r, ...rest } = x
         return { ...rest, enabled: false, state: "stopping", tools: [] }
       })
       result(c, m.requestId, true)
@@ -2134,15 +2615,40 @@ const onClientMessage = (c: Conn, m: ClientMessage) => {
       if (i === -1) return result(c, m.requestId, false, { code: "unknown_section", message: `No section ${m.sectionId}.` })
       const section = sections[i]!
       if (refuseLocked(c, m.requestId, section.protected)) return
+      // P8: the risk policy as the server checks it (`riskPolicyValueProblem`, the same function): a settable class takes
+      // one of the three outcomes, money and security only Refuse (or back to the default), and those two are never
+      // written.
+      if (section.id === "risk") {
+        const problems = riskPolicyPatchProblems(m.patch.values, m.patch.secrets)
+        if (problems.length > 0) return result(c, m.requestId, false, { code: "invalid_settings", message: problems[0]!.message, fieldErrors: problems })
+      }
+      const fixedKey = (k: string) => section.id === "risk" && FIXED_RISK_CLASSES.some((cls) => RISK_POLICY_KEYS[cls] === k)
       // Fields hidden after the patch (visibleWhen) are neither validated nor saved, as on the real server.
       const after = (key: string) => (Object.hasOwn(m.patch.values, key) && m.patch.values[key] !== null ? m.patch.values[key] : valueOf(key))
       const shown = (key: string) => holds(section.form.fields.find((f) => f.key === key)?.visibleWhen, after)
       const patch: SettingsPatch = {
-        values: Object.fromEntries(Object.entries(m.patch.values).filter(([k]) => shown(k))),
+        values: Object.fromEntries(Object.entries(m.patch.values).filter(([k]) => shown(k) && !fixedKey(k))),
         secrets: Object.fromEntries(Object.entries(m.patch.secrets).filter(([k]) => shown(k)))
       }
       const errors = validate(section.form, patch)
       if (errors.length > 0) return result(c, m.requestId, false, { code: "invalid_settings", message: "Some settings are not valid.", fieldErrors: errors })
+      // Protocol 11: Members is checked as the server checks it (`checkMembersValue` and `checkDietList`, the same
+      // functions), and every new person gets an id.
+      if (section.id === "members") {
+        const problems: Array<{ key: string; message: string }> = []
+        const list = patch.values.HOUSEHOLD_MEMBERS
+        if (list !== undefined && list !== null) {
+          const problem = checkMembersValue(list)
+          if (problem !== undefined) problems.push({ key: "HOUSEHOLD_MEMBERS", message: problem })
+        }
+        for (const key of ["HOUSEHOLD_DIET_ALLERGIES", "HOUSEHOLD_DIET_DIETS", "HOUSEHOLD_DIET_DISLIKES"]) {
+          const value = patch.values[key]
+          const problem = value === null ? undefined : checkDietList(section.form.fields.find((f) => f.key === key)?.label ?? key, value)
+          if (problem !== undefined) problems.push({ key, message: problem })
+        }
+        if (problems.length > 0) return result(c, m.requestId, false, { code: "invalid_settings", message: problems[0]!.message, fieldErrors: problems })
+        withPersonIds(patch)
+      }
       const candidate = sections.map((x, j) => (j === i ? { ...x, form: applyPatch(x.form, patch) } : x))
       const fresh = <E extends FieldError>(a: ReadonlyArray<E>, b: ReadonlyArray<E>) => b.filter((e) => !a.some((x) => x.key === e.key && x.message === e.message))
       const before = checks(sections)
@@ -2153,19 +2659,70 @@ const onClientMessage = (c: Conn, m: ClientMessage) => {
       if (newWarnings.length > 0 && m.confirmWarnings !== true) {
         return result(c, m.requestId, false, { code: "invalid_settings", message: "Check the warnings below, then save anyway or change the settings", warnings: newWarnings })
       }
+      const membersBefore = memberIds()
+      const boundariesBefore = boundaries()
       const committed = withWarnings(candidate)
       const changed = new Set(committed.filter((x, j) => j === i || JSON.stringify(x.form) !== JSON.stringify(sections[j]!.form)).map((x) => x.id))
       sections = committed.map((x) => (changed.has(x.id) ? { ...x, revision: x.revision + 1 } : x))
       for (const x of sections) if (changed.has(x.id)) broadcast({ type: "section.changed", section: x })
       if (changed.has("routing")) routingChanged()
       if (changed.has("llm-openai-accounts")) assistantsChanged()
+      if (changed.has("members")) {
+        const removed = [...membersBefore].some((id) => !memberIds().has(id))
+        // As the server: a removed person's id is retired, never issued or kept again.
+        for (const id of membersBefore) if (!memberIds().has(id)) retiredMemberIds.add(id)
+        if (assistantsMock.clearDefaultPeople(memberIds())) assistantsChanged()
+        // As the server: a person leaving Members ends every device's session.
+        if (removed) endChangedSessions(boundariesBefore, true)
+      }
       result(c, m.requestId, true)
+      // P10, as the server: every saved settings change decides every device's presentations again (the language too).
+      reconcilePresentEverywhere()
       const needsReload = Object.keys({ ...patch.values, ...patch.secrets }).some((k) => section.form.fields.find((f) => f.key === k)?.apply === "reload")
       const path = `${section.group ?? "general"}/${section.page?.id ?? section.id}`
       if (needsReload && (!engine.reloadPending || !(engine.reloadPendingFor ?? []).includes(path))) {
         engine = { ...engine, reloadPending: true, reloadPendingFor: [...(engine.reloadPendingFor ?? []).filter((p) => p !== path), path] }
         broadcast({ type: "engine", engine })
       }
+      return
+    }
+    case "module.action": {
+      if (requireAdmin(c, m.requestId)) return
+      const mod = modules.find((x) => x.id === m.moduleId)
+      if (mod === undefined) return result(c, m.requestId, false, { code: "unknown_module", message: `No module ${m.moduleId}.` })
+      const field = mod.settings.fields.find((f) => f.key === m.key)
+      if (field?.type !== "action") return result(c, m.requestId, false, { code: "unknown_action", message: `${mod.name} has no action "${m.key}"` })
+      // As the host: an instance's button needs its module running; one press per button at a time.
+      if (mod.state !== "running" && !DEMO_DEFINITION_ACTIONS.has(`${mod.id}/${m.key}`)) {
+        return result(c, m.requestId, false, { code: "not_running", message: `${mod.name} is not running` })
+      }
+      const pressKey = `${mod.id}/${m.key}`
+      if (pressing.has(pressKey)) return result(c, m.requestId, false, { code: "busy", message: "That button is still running" })
+      pressing.add(pressKey)
+      const values = !field.requiresSaved && m.values !== undefined ? { ...mod.settings.values, ...m.values } : mod.settings.values
+      const action = demoHomeAction(m.key, values) ?? { ok: true, text: "Done.", tone: "ok" as const }
+      after(500, () => {
+        pressing.delete(pressKey)
+        sendTo(c, { type: "result", requestId: m.requestId, ok: true, action })
+      })
+      return
+    }
+    case "health.check": {
+      if (requireAdmin(c, m.requestId)) return
+      // As the server: the current health first, then the result; the outcome follows as `health`. A check already
+      // running is joined, not started again (one completion for any number of requests).
+      const state = { health }
+      answerHealthCheck(state, {
+        send: (message) => sendTo(c, message),
+        broadcast: (message) => {
+          health = state.health
+          broadcast(message)
+        },
+        result: () => result(c, m.requestId, true),
+        after,
+        finished: (h) => ({ ...h, issues: h.issues.filter((i) => i.id !== "music.speaker.kitchen"), checkedAt: Date.now() })
+      })
+      health = state.health
       return
     }
     case "engine.reload": {
@@ -2268,11 +2825,11 @@ const onClientMessage = (c: Conn, m: ClientMessage) => {
       if (requireAdmin(c, m.requestId)) return
       const record = devices.get(m.id)
       if (record === undefined) return result(c, m.requestId, false, { code: "unknown_device", message: "This device is not known (any more)." })
+      const before = boundaries()
       devices.delete(m.id)
       assistantsMock.forgetDevice(m.id)
-      // A device that is connected now is recorded again as new.
-      const now = Date.now()
-      if ([...conns].some((x) => x.welcomed && x.deviceId === m.id)) devices.set(m.id, { ...record, firstSeen: now, lastSeen: now })
+      // As the server: a connected device's session ends (known → not known); its pages say hello again as a new device.
+      endChangedSessions(before)
       pushSetups()
       result(c, m.requestId, true)
       devicesChanged()
@@ -2304,15 +2861,21 @@ const onClientMessage = (c: Conn, m: ClientMessage) => {
     case "device.save": {
       if (requireAdmin(c, m.requestId)) return
       if (m.target.kind === "device" && !devices.has(m.target.id)) return result(c, m.requestId, false, { code: "unknown_device", message: "That device is not known." })
+      // The name went through the protocol's `SavedDeviceName` (one line, no control characters) when it was decoded.
       const name = m.name === undefined ? undefined : m.name.trim()
       if (name !== undefined && m.target.kind === "device" && name === "") return result(c, m.requestId, false, { code: "invalid_settings", message: "A device needs a name.", fieldErrors: [{ key: "name", message: "A device needs a name." }] })
+      const before = boundaries()
       const r = assistantsMock.saveDevice(m)
       if (r.ok && name !== undefined && m.target.kind === "device") {
         const record = devices.get(m.target.id)
         if (record !== undefined) record.name = name
       }
       sendTo(c, r.ok ? { type: "result", requestId: m.requestId, ok: true } : { type: "result", requestId: m.requestId, ok: false, ...(r.error !== undefined ? { error: r.error } : {}) })
-      if (r.ok) assistantsChanged()
+      if (r.ok) {
+        // As the server: privacy, the default person or an output override changed: those devices' sessions end.
+        endChangedSessions(before)
+        assistantsChanged()
+      }
       return
     }
     case "wake.test": {
@@ -2374,6 +2937,81 @@ const onClientMessage = (c: Conn, m: ClientMessage) => {
     case "ping":
       sendTo(c, { type: "pong", id: m.id })
       return
+    case "notification.action": {
+      // P9, as the real server: from a voice page of the card's device; `stop` always works; another action needs its
+      // module's handler (POST /mock/notify with "handlerDown": true makes it answer "I can't do that right now").
+      if (c.frontend !== "voice" || c.deviceId === undefined) return result(c, m.requestId, false, { code: "bad_message", message: "A notification is answered from a voice page of its device" })
+      const n = mockNotifications.get(m.id)
+      const texts = mockNotifyTexts()
+      const cant = { type: "result" as const, requestId: m.requestId, ok: false, error: { code: "not_running" as const, message: texts.cantNow }, say: texts.cantNow }
+      // As the server: only a connection that holds the card may press it (Stop too), and only while the decision
+      // still allows it on the device (a page whose card should have gone is reconciled, and refused).
+      if (mockHeld.get(c.id)?.has(m.id) !== true || n === undefined) return sendTo(c, { ...cant, error: { code: "bad_message", message: cant.say } })
+      if (!decideMock(c.deviceId, n).deliver) {
+        for (const x of notifyConns(c.deviceId)) reconcileMock(x)
+        return sendTo(c, { ...cant, error: { code: "bad_message", message: cant.say } })
+      }
+      if (m.actionId !== "stop" && !n.card.actions.some((a) => a.id === m.actionId)) return sendTo(c, { ...cant, error: { code: "bad_message", message: cant.say } })
+      if (m.actionId !== "stop" && n.handlerDown) return sendTo(c, cant)
+      // P8, as the real gateway: a module's action is decided by the saved policy (its class: change); `stop` is the host's.
+      const refusedN = m.actionId === "stop" ? undefined : mockPressRefusal()
+      if (refusedN !== undefined) return sendTo(c, { type: "result", requestId: m.requestId, ok: false, error: { code: "bad_message", message: refusedN }, say: refusedN })
+      resolveMockNotification(m.id, m.actionId)
+      return sendTo(c, { type: "result", requestId: m.requestId, ok: true, say: texts.done })
+    }
+    case "present.action": {
+      // P10, as the real server: only from a connection that holds it, while the decision (with its own kinds) lets it be
+      // pressed there; a tick of an item it has (the mock acts as the module: it ticks the item and shows the change); a
+      // button it has; its handler down ("handlerDown": true) answers "I can't do that right now".
+      if (c.frontend !== "voice" || c.deviceId === undefined) return result(c, m.requestId, false, { code: "bad_message", message: "A presentation is answered from a voice page of its device" })
+      pruneEndedMock()
+      const p = mockPresentations.get(m.id)
+      const texts = mockPresentTexts()
+      const cant = (code: "bad_message" | "not_running") => sendTo(c, { type: "result", requestId: m.requestId, ok: false, error: { code, message: texts.cantNow }, say: texts.cantNow })
+      if (p === undefined || mockPresentHeld.get(c.id)?.get(m.id)?.revision !== m.revision || p.revision !== m.revision) return cant("bad_message")
+      const d = decidePresentMock(c, p.presentation.kind)
+      if (!d.show || !d.interactive || p.presentation.handler === undefined) {
+        reconcilePresentMock(c)
+        return cant("bad_message")
+      }
+      if (m.action === "tick") {
+        const list = p.presentation
+        if (list.kind !== "list" || list.style !== "checklist" || m.done === undefined || !list.items.some((i) => i.id === m.item)) return cant("bad_message")
+        if (p.handlerDown) return cant("not_running")
+        const refusedTick = mockPressRefusal()
+        if (refusedTick !== undefined) return sendTo(c, { type: "result", requestId: m.requestId, ok: false, error: { code: "bad_message", message: refusedTick }, say: refusedTick })
+        p.revision = newMockToken()
+        p.presentation = { ...list, items: list.items.map((i) => (i.id === m.item ? { ...i, done: m.done! } : i)) }
+        reconcilePresentEverywhere()
+        return sendTo(c, { type: "result", requestId: m.requestId, ok: true, say: texts.done })
+      }
+      if (!(p.presentation.buttons ?? []).some((b) => b.id === m.action)) return cant("bad_message")
+      if (p.handlerDown) return cant("not_running")
+      const refusedButton = mockPressRefusal()
+      if (refusedButton !== undefined) return sendTo(c, { type: "result", requestId: m.requestId, ok: false, error: { code: "bad_message", message: refusedButton }, say: refusedButton })
+      return sendTo(c, { type: "result", requestId: m.requestId, ok: true, say: texts.done })
+    }
+    case "device.caps": {
+      // Protocol 11: what the device can do changed, or its live state; admin's device list follows.
+      if (c.frontend !== "voice" || c.deviceId === undefined) return
+      const record = devices.get(c.deviceId)
+      if (m.capabilities !== undefined && record !== undefined) devices.set(c.deviceId, { ...record, declared: { capabilities: m.capabilities, seenAt: Date.now() } })
+      if (m.capabilities !== undefined) {
+        c.ownCaps = m.capabilities
+        for (const x of notifyConns(c.deviceId)) reconcilePresentMock(x)
+      }
+      if (m.live !== undefined) {
+        c.visible = m.live.visible
+        if (m.live.lastInteractionAt !== undefined) c.lastInteractionAt = m.live.lastInteractionAt
+      }
+      devicesChanged()
+      // Whether replies are spoken here follows what it declared (the setup says so); so do its notification cards.
+      if (m.capabilities !== undefined) {
+        pushSetups()
+        for (const x of notifyConns(c.deviceId)) reconcileMock(x)
+      }
+      return
+    }
   }
 }
 
@@ -2419,13 +3057,15 @@ wss.on("connection", (ws: WebSocket) => {
       c.frontend = m.frontend
       const tokenSent = m.frontend === "admin" ? m.adminToken : undefined
       if (tokenSent !== undefined && sessions.has(tokenSent)) c.session = tokenSent
-      if (m.frontend === "voice" && m.device !== undefined) {
+      if (m.frontend === "voice" && m.device !== undefined && deviceTypeOf(m.device.kind) !== undefined) {
         const now = Date.now()
         const known = devices.get(m.device.id)
+        const declared = m.device.capabilities !== undefined ? { declared: { capabilities: m.device.capabilities, seenAt: now } } : {}
         devices.set(m.device.id, known === undefined
-          ? { id: m.device.id, kind: m.device.kind, name: m.device.name, firstSeen: now, lastSeen: now }
-          : { ...known, lastSeen: now })
+          ? { id: m.device.id, kind: m.device.kind, name: cleanDeviceName(m.device.name), firstSeen: now, lastSeen: now, ...declared }
+          : { ...known, lastSeen: now, ...declared })
         c.deviceId = m.device.id
+        c.ownCaps = m.device.capabilities
       }
       c.welcomed = true
       const v = sessionFor(c)
@@ -2462,6 +3102,11 @@ wss.on("connection", (ws: WebSocket) => {
         }
       })
       if (isAdminConn(c)) sendAdminSnapshot(c)
+      volumeAfterWelcome(c)
+      notificationsAfterWelcome(c)
+      // P10: every page of the device, as the server (a hello may have changed what it declared).
+      if (c.deviceId === undefined) reconcilePresentMock(c)
+      else for (const x of notifyConns(c.deviceId)) reconcilePresentMock(x)
       if (c.deviceId !== undefined) devicesChanged()
       if (resumed) {
         sessionUpdate(v, "resumed")
@@ -2473,7 +3118,11 @@ wss.on("connection", (ws: WebSocket) => {
   })
   ws.on("close", () => {
     conns.delete(c)
+    mockHeld.delete(c.id)
+    for (const h of mockPresentHeld.get(c.id)?.values() ?? []) if (h.token !== undefined) mockMediaTokens.delete(h.token)
+    mockPresentHeld.delete(c.id)
     log(c.id, "closed")
+    if (c.deviceId !== undefined) for (const x of notifyConns(c.deviceId)) reconcilePresentMock(x)
     if (c.deviceId !== undefined) {
       const record = devices.get(c.deviceId)
       if (record !== undefined) record.lastSeen = Date.now()
@@ -2652,6 +3301,57 @@ const apiRoute = async (req: IncomingMessage, res: ServerResponse, path: string,
       throw new ApiFail(400, "invalid_request", "The request body is not valid JSON")
     }
   }
+  /** A refused token operation, answered as the real server does (status and code). */
+  const refusedAs = <A>(f: () => A): A => {
+    try {
+      return f()
+    } catch (error) {
+      if (error instanceof TokenRefusal) throw new ApiFail(error.status, error.code, error.message)
+      throw error
+    }
+  }
+  // P6: the scheduled jobs, a page at a time (as the real server's /api/scheduler/jobs).
+  if (path === "scheduler/jobs") {
+    only("GET")
+    const limit = query.get("limit")
+    try {
+      return { status: 200, body: scheduledJobsMock.list(query.get("cursor") ?? undefined, limit === null ? undefined : Number(limit)) }
+    } catch (e) {
+      if (e instanceof MockSchedulerError) throw new ApiFail(e.status, e.code, e.message)
+      throw e
+    }
+  }
+  const cancelJob = /^scheduler\/jobs\/([A-Za-z0-9_.:-]{1,200})\/cancel$/.exec(path)
+  if (cancelJob !== null) {
+    only("POST")
+    if (!scheduledJobsMock.cancel(cancelJob[1]!)) throw new ApiFail(404, "not_found", "There is no such live or failed job (it may have finished or been removed)")
+    return { status: 200, body: { cancelled: true } }
+  }
+  // Protocol 10: the admin view of module routes and their tokens (as the real server's /api/module-routes).
+  const routesMatch = /^module-routes(?:\/([a-z][a-z0-9-]{0,39})\/tokens(?:\/([a-f0-9]{8,32}))?)?$/.exec(path)
+  if (routesMatch !== null) {
+    const [, moduleId, tokenId] = routesMatch
+    if (moduleId === undefined) {
+      only("GET")
+      const id = query.get("module")
+      return { status: 200, body: moduleRoutesMock.view(modules.filter((x) => id === null || x.id === id)) }
+    }
+    // As the server: tokens only for an installed module (running or not).
+    if (!modules.some((x) => x.id === moduleId)) throw new ApiFail(404, "not_found", `There is no module "${moduleId}"`)
+    if (tokenId === undefined) {
+      only("POST")
+      const b = await body()
+      if (typeof b.name !== "string" || !/^[a-z][a-z0-9-]{0,31}$/.test(b.name) || typeof b.label !== "string" || b.label.trim() === "") {
+        throw new ApiFail(400, "invalid_request", "A token needs a name and a label")
+      }
+      const name = b.name
+      const label = b.label
+      return { status: 201, body: refusedAs(() => moduleRoutesMock.mint(moduleId, name, label)) }
+    }
+    only("DELETE")
+    if (!refusedAs(() => moduleRoutesMock.revoke(moduleId, tokenId))) throw new ApiFail(404, "not_found", "There is no such token (it may have been revoked already)")
+    return { status: 200, body: { revoked: true } }
+  }
   if (path === "voice-providers") {
     only("GET")
     return { status: 200, body: { providers: MOCK_PROVIDERS.map(providerStatus) } }
@@ -2816,7 +3516,8 @@ const handleApi = async (req: IncomingMessage, res: ServerResponse, url: URL) =>
 const readBody = (req: IncomingMessage) =>
   new Promise<string>((resolve) => {
     let body = ""
-    req.on("data", (d: Buffer) => (body += d.toString("utf8")))
+    req.setEncoding("utf8")
+    req.on("data", (d: string) => (body += d))
     req.on("end", () => resolve(body))
   })
 
@@ -2843,6 +3544,7 @@ const http = createServer((req, res) => {
         connections: conns.size
       })
     }
+    if (url.pathname.startsWith("/media/") && (req.method === "GET" || req.method === "HEAD")) return serveMockMedia(url.pathname, res)
     if (req.method !== "POST") return json(res, 404, { error: "not found" })
     const body = await readBody(req)
     const payload = body === "" ? {} : (JSON.parse(body) as Record<string, unknown>)
@@ -2970,6 +3672,109 @@ const http = createServer((req, res) => {
         const v = targetSession(payload.deviceId)
         for (const x of v !== undefined ? [v] : [...voiceSessions.values()]) setState(x, state)
         return json(res, 200, { ok: true })
+      }
+      case "/mock/volume": {
+        // P7: {"deviceId", "direction": "louder" | "quieter"} or {"deviceId", "to": 0..1}: the device's reply volume,
+        // as the server changes it for a spoken "louder" or "quieter" (the mock has no recogniser), sent to its voice pages.
+        if (typeof payload.deviceId !== "string") return json(res, 400, { error: "deviceId is required" })
+        const change = payload.direction === "louder" || payload.direction === "quieter"
+          ? payload.direction
+          : typeof payload.to === "number" ? { to: payload.to } : undefined
+        if (change === undefined) return json(res, 400, { error: "direction (louder, quieter) or to (0..1) is required" })
+        return json(res, 200, changeMockVolume(payload.deviceId, change))
+      }
+      case "/mock/notify": {
+        // P9: a notification delivered as the server would: {"id"?, "title", "text"?, "ring"?, "silent"?, "deviceId"?
+        // (absent: everywhere), "actions"? [{ id, label }], "handlerDown"?}. Sent to the voice pages of its device now
+        // and to each that says hello while it is open.
+        // An id is never used twice: a named one already issued or named is refused; a generated one skips them all.
+        if (typeof payload.id === "string" && mockNotifyIds.has(payload.id)) return json(res, 409, { error: "that id was used already" })
+        let id = typeof payload.id === "string" ? payload.id : `n-mock-${++mockNotifySeq}`
+        while (typeof payload.id !== "string" && mockNotifyIds.has(id)) id = `n-mock-${++mockNotifySeq}`
+        mockNotifyIds.add(id)
+        const title = typeof payload.title === "string" ? payload.title.slice(0, 60) : "Notification"
+        const ring = payload.ring === true
+        const card: Omit<NotificationCardWire, "show" | "sound" | "texts"> = {
+          id,
+          title,
+          ...(typeof payload.text === "string" ? { text: payload.text.slice(0, 200) } : {}),
+          priority: ring ? "ring" : "normal",
+          actions: [{ id: "stop", label: "Stop" }, ...(Array.isArray(payload.actions) ? (payload.actions as Array<{ id: string; label: string }>).slice(0, 2) : [])],
+          sentAt: Date.now()
+        }
+        const deviceId = typeof payload.deviceId === "string" ? payload.deviceId : undefined
+        mockNotifications.set(id, { card, ...(deviceId !== undefined ? { deviceId } : {}), handlerDown: payload.handlerDown === true })
+        for (const c of notifyConns(deviceId)) reconcileMock(c)
+        return json(res, 200, { id })
+      }
+      case "/mock/present": {
+        // P10: a presentation shown as the server would: {"id"?, "presentation": what a module passes to show, "options"?
+        // { lifetime?, expiresInMs?, key? }, "deviceId"? (absent: every device), "handlerDown"?}. Checked by the shared
+        // checks before anything changes (a refused one consumes no id and replaces nothing); its lifetime and end by the
+        // shared helper; at its end it is removed. A transient one ends the earlier transient ones of the same devices;
+        // an id is never used twice; an image shows the mock's built-in picture, through `/media/<token>`.
+        // Review round 2 (R7): the whole request is checked before any id is consumed or anything changes; what the mock
+        // does not model is refused; admission uses the server's own live bounds (the mock is one module).
+        if (typeof payload !== "object" || payload === null || Array.isArray(payload)) return json(res, 400, { error: "a presentation request is an object" })
+        pruneEndedMock()
+        const now = Date.now()
+        const extra = Object.keys(payload).find((k) => !MOCK_PRESENT_FIELDS.includes(k))
+        if (extra !== undefined) return json(res, 400, { error: `unknown field ${extra}` })
+        if (payload.id !== undefined && (typeof payload.id !== "string" || !PRESENTATION_ID.test(payload.id))) return json(res, 400, { error: `id must match ${PRESENTATION_ID}` })
+        if (payload.deviceId !== undefined && (typeof payload.deviceId !== "string" || !devices.has(payload.deviceId))) return json(res, 400, { error: "deviceId names no device the mock knows" })
+        if (payload.handlerDown !== undefined && typeof payload.handlerDown !== "boolean") return json(res, 400, { error: "handlerDown is true or false" })
+        const presentation = payload.presentation as Presentation | undefined
+        const options = payload.options as ShowOptions | undefined
+        const problem = presentationProblem(presentation, now) ?? showOptionsProblem(options, (presentation as { kind?: PresentKindName } | undefined)?.kind)
+        if (problem !== undefined) return json(res, 400, { error: problem })
+        if (presentation!.sensitivity !== undefined && presentation!.sensitivity !== "household") return json(res, 400, { error: MOCK_PRESENT_NO_PRIVACY })
+        if (options?.key !== undefined) return json(res, 400, { error: MOCK_PRESENT_NO_KEY })
+        if (typeof payload.id === "string" && mockPresentIds.has(payload.id)) return json(res, 409, { error: "that id was used already" })
+        const deviceId = typeof payload.deviceId === "string" ? payload.deviceId : undefined
+        const { lifetime, expiresAt } = presentLifetime(presentation!, options, now)
+        const overlaps = (other: { readonly deviceId?: string }) => deviceId === undefined || other.deviceId === undefined || other.deviceId === deviceId
+        // As the server: the transients this one would end do not count against it.
+        const counted = [...mockPresentations.values()].filter((p) => p.endsAt > now && !(lifetime === "transient" && p.lifetime === "transient" && overlaps(p)))
+        if (counted.length >= MAX_LIVE_PER_MODULE || counted.length >= MAX_LIVE_TOTAL) return json(res, 409, { error: "limit" })
+        if (lifetime === "pinned" && counted.filter((p) => p.lifetime === "pinned" && overlaps(p)).length >= MAX_PINNED_PER_DEVICE) return json(res, 409, { error: "limit" })
+        // What a page would be sent of it decodes as the protocol says (an image with a token of the right form).
+        const sampleId = typeof payload.id === "string" ? payload.id : "p-mock-check"
+        const sample = { ...mockWire(sampleId, { presentation: presentation!, revision: "check", lifetime, shownAt: now }, presentation!.kind === "image" ? "t".repeat(32) : undefined, true), serverNow: now }
+        if (!isPresentationWire(sample)) return json(res, 400, { error: "the presentation does not make a valid page message" })
+        let id = typeof payload.id === "string" ? payload.id : `p-mock-${++mockPresentSeq}`
+        while (typeof payload.id !== "string" && mockPresentIds.has(id)) id = `p-mock-${++mockPresentSeq}`
+        mockPresentIds.add(id)
+        if (lifetime === "transient") for (const [other, p] of [...mockPresentations]) if (p.lifetime === "transient" && overlaps(p)) endMockPresentation(other)
+        mockPresentations.set(id, {
+          presentation: presentation!,
+          revision: newMockToken(),
+          ...(deviceId !== undefined ? { deviceId } : {}),
+          lifetime,
+          shownAt: now,
+          endsAt: expiresAt,
+          handlerDown: payload.handlerDown === true,
+          timer: setTimeout(() => endMockPresentation(id), Math.max(0, expiresAt - now))
+        })
+        reconcilePresentEverywhere()
+        return json(res, 200, { id, lifetime, expiresAt })
+      }
+      case "/mock/present/clear": {
+        // Tests: every presentation ends (pages reconciled), so a test starts from none whatever an earlier one left.
+        const ids = [...mockPresentations.keys()]
+        for (const id of ids) endMockPresentation(id)
+        return json(res, 200, { cleared: ids.length })
+      }
+      case "/mock/present/dismiss": {
+        const id = typeof payload.id === "string" ? payload.id : ""
+        return json(res, 200, { dismissed: endMockPresentation(id) })
+      }
+      case "/mock/notify/held": {
+        // The bookkeeping (tests): how many connections the mock keeps what they hold for, and how many are open.
+        return json(res, 200, { held: mockHeld.size, voiceConnections: notifyConns(undefined).length })
+      }
+      case "/mock/notify/resolve": {
+        const id = typeof payload.id === "string" ? payload.id : ""
+        return json(res, 200, { resolved: resolveMockNotification(id, typeof payload.outcome === "string" ? payload.outcome : "resolved") })
       }
       case "/mock/send": {
         const messages = Array.isArray(payload.messages) ? payload.messages : []

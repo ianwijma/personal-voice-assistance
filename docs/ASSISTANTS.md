@@ -40,7 +40,7 @@ Sections: 1 decisions · 2 data model · 3 run time · 4 existing concepts · 5 
 | Routing a sentence | A wake phrase wins: the whole sentence after it goes to that assistant. Otherwise, during an assistant's follow-up time, it stays with that assistant. Otherwise "Answers without a phrase" decides. TypeSafe is optional, hosted and per device: one Choice over the device's assistants, described by their Handles, plus a Noul for "does any fit". A timeout, an error or "none fits" goes to the fallback. With TypeSafe on, an assistant without a phrase still counts as reachable. |
 | Recogniser | One per device; speech recognition always runs on the server. A device uses the Hearing settings of the assistant that answers without a phrase, else those of the first in its list (also with TypeSafe). The other assistants' Hearing settings are not used on that device, and the UI says so. |
 | Conversations | One per assistant per device, each with its own history, id and idle clock. The reset time comes from the assistant, and "never" is allowed. |
-| Shared settings | Home (location, time zone, language, units, date format); each module's shared settings; language-model accounts; speech models; voice providers and favourites; routing (TypeSafe key and model); limits. Module settings resolve assistant's own → shared → module default. |
+| Shared settings | Home (location, time zone, language, units, date format, currency, cup size, API contact); each module's shared settings; language-model accounts; speech models; voice providers and favourites; routing (TypeSafe key and model); limits. Module settings resolve assistant's own → shared → module default. |
 | Voice page | The assistant's name, with a menu, in the top bar. Picking there changes who answers without a phrase on that device; an admin toggle per device allows it. The chat shows one conversation per assistant, with a switcher. The settings sheet loses Voice and Activation. Follow-up time is not shown for now. |
 | Diagnostics | Each trace carries the assistant, the device, who chose the assistant (phrase, follow-up, default, or TypeSafe with its probability and time) and a snapshot of the latency-relevant configuration at that turn. |
 | Latency | Everything that can add delay (the TypeSafe call, extra speech-model workers, per-assistant language-model instances and their warm-up, more voices) is measured through `TurnTrace` in its work package. No latency claims from reasoning. |
@@ -183,11 +183,19 @@ DeviceSettings = Struct({
                   outputPath: OutputPath, prebufferMs: PrebufferMs }),   // the last two web-voice only (advanced)
   captions: Struct({ captions: Boolean, speakTyped: Boolean }),         // web-voice only; speakTyped was `speakReplies`
   look: DeviceLook,                             // { from: "assistant" } | { from: "device", look }: the stage's character for every assistant, or each one's (LOOKS-AND-VOICES.md)
-  voice: DeviceVoice                            // { from: "assistant" } | { from: "device", voice }: the voice of every assistant on the device, or each one's own
+  voice: DeviceVoice,                           // { from: "assistant" } | { from: "device", voice }: the voice of every assistant on the device, or each one's own
+  place: DevicePlace,                           // protocol 11 (P5): { room, privacy: private | shared | public, alwaysOn, acceptsFromOthers (true),
+                                                //   quietRoom, defaultPerson: PersonId | null }; built-in shared, nobody's
+  capabilities: CapabilityOverrides             // protocol 11 (P5): { noDisplay, excludeKinds, noSpeaker }: can only take away what it declares
 })
+// P5 round 2: saving a change of place.privacy, place.defaultPerson or any capabilities override (the device's, or its
+// type's where it follows them), forgetting a connected device, or removing a person from Members ends the session of
+// each device it affects (every device for Members): its connections close with CloseCode.settingsChanged and its
+// pages reconnect to a new session. Room, name, alwaysOn, acceptsFromOthers and quietRoom do not end it.
 DeviceOwn = Partial(DeviceSettings)             // each key present = own value; absent = follows the type defaults
 
-DeviceRecord (stored) = { kind: DeviceKind, name: DeviceName, firstSeen, lastSeen, own: DeviceOwn }
+DeviceRecord (stored) = { kind: DeviceKind, name: DeviceName, firstSeen, lastSeen, own: DeviceOwn,
+                          declared?: { capabilities: DeviceCapabilities, seenAt } }   // protocol 11: its last declaration
 DeviceType (code registry, replaces FRONTEND_KINDS, serve/frontends.ts:44) =
   { kind, title ("Browsers"), one ("browser"), many, description, keys: ReadonlyArray<keyof DeviceSettings>,
     builtIn: DeviceSettings }
@@ -205,7 +213,8 @@ vault for secrets.
 
 | Page (mock-up) | Section and keys |
 |---|---|
-| Home | new section `home`: `HOME_LOCATION` (text ≤ 200), `HOME_TIME_ZONE` (IANA, empty = this machine's), `HOME_LANGUAGE` (BCP 47: en-GB, en-US, nl-NL, de-DE), `HOME_UNITS` (metric \| imperial), `HOME_DATE_FORMAT` (en-GB \| en-US \| nl-NL) |
+| Home | new section `home`: `HOME_LOCATION` (text ≤ 200), `HOME_TIME_ZONE` (IANA name, not an offset; empty = this machine's), `HOME_LANGUAGE` (BCP 47: en-GB, en-US, nl-NL, de-DE), `HOME_UNITS` (metric \| imperial), `HOME_DATE_FORMAT` (en-GB \| en-US \| nl-NL), `HOME_CURRENCY` (three capital letters, the ISO 4217 code meant; any such code is accepted; default EUR), `HOME_CUP_SIZE` (metric 250 ml \| us 236.6 ml), `HOME_API_CONTACT` (text ≤ 200, no default; goes in the `User-Agent` of public API calls, see `@pva/net`) |
+| Members | protocol 11 (P5), section `members`: `HOUSEHOLD_MEMBERS` (records: a hidden server-made `id`, name, aliases, pronunciation, allergies, diets, dislikes; at most 24; names one line and unique as `memberNameKey` compares them), `HOUSEHOLD_DIET_ALLERGIES`, `HOUSEHOLD_DIET_DIETS`, `HOUSEHOLD_DIET_DISLIKES` (the household's diet, for everyone who has none of their own). **`HOUSEHOLD_MEMBERS` is never read from the environment** (a list of people with server-issued ids cannot live in an environment variable): the environment view lists it under "Not read" with the reason, and the start logs a warning. A device's `place.defaultPerson` names one of them. One serialized operation (`MembersGate`, `serve/people.ts`) owns every change to people and the references to them: a Members save (admin or `People.setDiet`, whose read, check and write are one step) clears every device's and type's default person that it removed before anything else runs, and every device or type save checks its default person against the committed Members inside it, so no dangling reference is committed. Every id is the server's: a save keeps an incoming id only when it is a committed member's, any other row gets a fresh one, and a removed person's id is kept in `HOUSEHOLD_MEMBERS_RETIRED` (a server-kept key beside the section, not a field; absent in older files) so that no id is issued twice. **One function decides who is a member** (`effectiveMembersOf`, `serve/people.ts`), and People, the privacy rule, the feed, the ambient facts, the gateway, default-person saves and their clean-up all read it: the saved value is validated as a whole like an admin save (a value that does not pass, such as a field of the wrong type or two people with the same name in a hand-edited file, makes everyone nobody in memory until it is corrected: personal content is withheld everywhere and no turn has a person, and a Health issue, "Members cannot be read", says so. Nothing is written because of it: devices keep their stored default person, no id is retired and the file is left as it is. The admin save that corrects it keeps every id the saved records carried, except retired ones, so devices and stored personal rows belong to the same people again), then a record without a valid id, with a retired id, or with an id an earlier record has gets a fresh, deterministic one, and a device's reference to an id two records shared counts as none. The repaired list is written back at start; if that write fails, a Health issue says so and the server keeps serving the repaired list. **A removed person's person-scoped data stays in the household database** and is delivered to no page and no turn any more (the privacy rule refuses an owner who is not a member). Deleting it is a known gap: the store has no command for one person's data yet; until it has, the only way is deleting `data/household.db` (docs/ARCHITECTURE.md, "People, rooms and device capabilities") |
 | Modules | each module's settings in `modules[id].settings`, through `module.configure` (unchanged message) |
 | Language model accounts | `anthropic`: ANTHROPIC_API_KEY, ANTHROPIC_BASE_URL · `claude-subscription`: the agent module's optIn, claudePath, proxy, debugLogs · `openrouter`: its module's key · `home-model`: its module's address and key |
 | Routing | new section `routing`: `TYPESAFE_API_KEY` (secret), `TYPESAFE_MODEL` (default `jev-1.14.0`, shown pinned), `TYPESAFE_BASE_URL` (advanced) |
@@ -219,7 +228,8 @@ linked to (§2.6).
 
 ### 2.5 Storage
 
-`data/settings.json` version 4. It is written atomically and carries one `revision`, as today
+`data/settings.json` version 4 (version 5 since P5: the same structure, with the `place` and `capabilities`
+sections, `declared` on device records and Members; §6 "Version 5"). It is written atomically and carries one `revision`, as today
 (serve/SettingsStore.ts:96-102):
 
 ```jsonc
@@ -603,7 +613,9 @@ the migrated assistant stay (§6, "What was built").
 
 `PROTOCOL_VERSION = 7` (`packages/protocol/src/constants.ts`; built; the voice-provider work kept 6). Since then
 looks and voices (docs/LOOKS-AND-VOICES.md) took **8**: the `look` and `voice` device sections are new members of the
-closed set `DeviceSettingsKey` and required in `DeviceSettings`.
+closed set `DeviceSettingsKey` and required in `DeviceSettings`. Module API v2 took 9, extended settings fields 10, and
+people, rooms and device capabilities (docs/MODULES-PLAN.md §4 P5) **11**: the `place` and `capabilities` device sections,
+the same way (a stored type entry without them takes the built-in's when it loads).
 
 The voice-node design claims 7 for itself (docs/VOICE-NODES.md §2), but its code is at 5: it branches from #3
 (93ed0fd), before voice sessions. **Order**: voice providers merge first (no bump), then this design's WP-2 (7), then
@@ -715,6 +727,19 @@ to the assistant's Voice tab. The picker component already takes only a key and 
 the Voice tab saves through `assistant.save`.
 
 ## 6. Migration
+
+**Version 5 (P5, people, rooms and device capabilities).** A version-4 file is migrated at load by `migrateV4ToV5`:
+nothing in it changes meaning (a type entry without `place` or `capabilities` reads as the built-in's; a device's own
+sections never had them), the original is kept as `settings.json.v4-backup`, and version 5 is written at once with the
+same revision (the CLI modes migrate in memory). A file of a newer version than the assistant reads stops the start
+(serve and the CLI modes), and is left untouched: never set aside, never overwritten. The check runs before anything
+is written to the data directory (no leftover tidied, no unfinished save recovered, nothing migrated), and covers both
+sides of an unfinished save's journal as well as `settings.json` itself. An assistant from before P5
+cannot refuse a version-5 file the same way (it does not know the rule): it sets the file aside as
+`settings.json.corrupt-<time>` (kept, not changed) and starts from the defaults. To go back to such a build, stop the
+server and copy `settings.json.v4-backup` over `settings.json` first.
+
+**Version 4.**
 
 It runs at load when `settings.json` is version 3 (or 2/1, migrated to 3 first as today). The original is kept as
 `settings.json.v3-backup`, and version 4 is written at once (the server is the only writer, holding the lock). The CLI
@@ -983,7 +1008,7 @@ rule per key. A device with no assistant runs no recogniser; a recogniser that c
 `engine_failed`), typed text still works, and every other device hears. A save that would load local models needing more than 75 %
 of the free memory is refused with a warning until `saveAnyway`.
 
-**Home, modules (WP-12a to WP-12c).** Section `home` (location, time zone, language, units, date format) feeds every assistant's
+**Home, modules (WP-12a to WP-12c).** Section `home` (location, time zone, language, units, date format; since the modules plan P2 also currency, cup size and the API contact for `User-Agent` headers) feeds every assistant's
 prompt (one line, always present) and the linked defaults of Weather (`defaultPlace` is `HOME_LOCATION` itself, not "", so the
 module stays independent of the app) and Clock. `overridable` fields can be per assistant (never a secret, never an address);
 resolution per field is own value > environment > saved > linked default > the field's default (own wins over the environment too).

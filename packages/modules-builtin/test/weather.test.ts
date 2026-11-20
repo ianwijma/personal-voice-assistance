@@ -136,7 +136,7 @@ describe("weather module definition", () => {
 
   it("an invalid environment value is reported on the field", () => {
     const resolved = resolveSettings(weatherModule().settings, { stored: {}, secrets: {}, env: { WEATHER_UNITS: "kelvin" } })
-    assert.deepStrictEqual(resolved.form.errors, [{ key: "units", message: "WEATHER_UNITS=kelvin is not valid: Must be one of: celsius, fahrenheit" }])
+    assert.deepStrictEqual(resolved.form.errors, [{ key: "units", message: "WEATHER_UNITS in the environment is not valid: Must be one of: celsius, fahrenheit" }])
   })
 })
 

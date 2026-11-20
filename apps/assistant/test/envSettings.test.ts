@@ -1,15 +1,18 @@
 // P4 (docs/SETTINGS-UI.md §4.4): the environment with origins, "Move to settings", and the CLI on the saved
 // settings. Everything runs in temporary directories with temporary vaults.
-import { makeModuleHost } from "@pva/core"
+import { makeModuleHost, Setting } from "@pva/core"
 import type { ClientMessage } from "@pva/protocol"
 import { Config, ConfigProvider, Effect, Logger, References } from "effect"
 import { chmodSync, mkdtempSync, readdirSync, readFileSync, statSync, writeFileSync } from "node:fs"
+import fsPromises from "node:fs/promises"
+import { syncBuiltinESMExports } from "node:module"
+import { parseEnv } from "node:util"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { afterEach, describe, expect, it, vi } from "vitest"
 import { cliConfigProvider, explainMissingKey, loadCliSettings } from "../src/cliSettings.ts"
 import { commentOutKeys, makeEnvView, parseEnvFile, scanEnvAssignments } from "../src/envView.ts"
-import { makeEnvMover } from "../src/serve/envSettings.ts"
+import { envInfo, makeEnvCatalog, makeEnvMover } from "../src/serve/envSettings.ts"
 import { makeSections } from "../src/serve/sections.ts"
 import { loadSettingsStore } from "../src/serve/SettingsStore.ts"
 import { openVault } from "../src/serve/Vault.ts"
@@ -218,6 +221,134 @@ describe("Move to settings (the mover)", () => {
   })
 })
 
+describe("whole env move ordering (review round 5)", () => {
+  const run = Effect.runPromise
+  const setup = async (texts: string[]) => {
+    const dir = tmp("pva-whole-move-")
+    const paths = texts.map((text, i) => {
+      const path = join(dir, `${i}.env`)
+      writeFileSync(path, text)
+      return path
+    })
+    const load = () => makeEnvView({ processEnv: {}, files: paths.map((path) => ({ path, text: readFileSync(path, "utf8") })) })
+    const view = load()
+    const store = await run(openStore(dir))
+    const sections = makeSections(store, view.record)
+    let announcements = 0
+    let releases = 0
+    view.subscribe(() => { releases++ })
+    const options = { view, store, sections, catalog: [], host: {} as never, vaultState: () => "none" as const, onMoved: () => { announcements++ } }
+    return { dir, paths, load, view, store, sections, options, announcements: () => announcements, releases: () => releases }
+  }
+
+  it("a mixed Move all keeps both keys locked after one post-save read fails; Retry and a page save survive restart", async () => {
+    const t = await setup(["HOME_LANGUAGE=nl-NL\nHOME_TIME_ZONE=Europe/Amsterdam\n", "# loaded\n"])
+    const originalRead = fsPromises.readFile
+    let reads = 0
+    fsPromises.readFile = (async (...args: Parameters<typeof originalRead>) => {
+      if (args[0] === t.paths[1] && ++reads === 2) throw Object.assign(new Error("one post-save read failed"), { code: "EIO" })
+      return Reflect.apply(originalRead, fsPromises, args)
+    }) as typeof originalRead
+    syncBuiltinESMExports()
+    try {
+      const mover = makeEnvMover(t.options)
+      const keys = mover.info().entries.filter((entry) => entry.movable).map((entry) => entry.key)
+      expect(await run(mover.move(keys))).toMatchObject({ ok: false, moved: [], error: { message: expect.stringMatching(/retry the move/i) } })
+      expect(keys.map(t.view.get)).toEqual(["nl-NL", "Europe/Amsterdam"])
+      expect([t.releases(), t.announcements()]).toEqual([0, 0])
+      expect((await run(t.sections.update("home", { values: { HOME_TIME_ZONE: "Australia/Sydney" }, secrets: {} }))).result.ok).toBe(false)
+      const retry = mover.info().entries.filter((entry) => entry.movable).map((entry) => entry.key)
+      expect(retry).toEqual(keys)
+      expect(await run(mover.move(retry))).toEqual({ ok: true, moved: keys })
+      expect((await run(t.sections.update("home", { values: { HOME_TIME_ZONE: "Australia/Sydney" }, secrets: {} }))).result.ok).toBe(true)
+      const restarted = makeSections(await run(loadSettingsStore(t.dir, { readOnly: true })), t.load().record)
+      expect(restarted.list().find((section) => section.id === "home")?.form.values.HOME_TIME_ZONE).toBe("Australia/Sydney")
+      expect(t.announcements()).toBe(1)
+    } finally {
+      fsPromises.readFile = originalRead
+      syncBuiltinESMExports()
+    }
+  })
+
+  for (const key of ["HOME_TIME_ZONE", "ANTHROPIC_API_KEY", "STT_SHERPA_THREADS", "SYSTEM_PROMPT"]) {
+    it(`retains ${key} until every rewrite is checked and retries after one failed verification read`, async () => {
+      const value = key === "HOME_TIME_ZONE" ? "Europe/Amsterdam" : key === "STT_SHERPA_THREADS" ? "3" : "example-value"
+      const t = await setup([`${key}=${value}\n`])
+      const originalRead = fsPromises.readFile
+      let failNext = false
+      fsPromises.readFile = (async (...args: Parameters<typeof originalRead>) => {
+        if (failNext && args[0] === t.paths[0]) {
+          failNext = false
+          throw Object.assign(new Error("one verification read failed"), { code: "EIO" })
+        }
+        return Reflect.apply(originalRead, fsPromises, args)
+      }) as typeof originalRead
+      syncBuiltinESMExports()
+      let once = true
+      const mover = makeEnvMover({ ...t.options, commentOut: async (...args) => {
+        expect(t.view.get(key)).toBe(value)
+        expect([t.releases(), t.announcements()]).toEqual([0, 0])
+        const result = await commentOutKeys(...args)
+        if (once) { once = false; failNext = true }
+        return result
+      } })
+      try {
+        expect(await run(mover.move([key]))).toMatchObject({ ok: false, moved: [], error: { message: expect.stringMatching(/retry the move/i) } })
+        expect(t.view.get(key)).toBe(value)
+        expect(parseEnv(readFileSync(t.paths[0]!, "utf8"))[key]).toBeUndefined()
+        expect([t.releases(), t.announcements()]).toEqual([0, 0])
+        expect(await run(mover.move([key]))).toEqual({ ok: true, moved: [key] })
+        expect(t.view.get(key)).toBeUndefined()
+        expect(t.announcements()).toBe(1)
+      } finally {
+        fsPromises.readFile = originalRead
+        syncBuiltinESMExports()
+      }
+    })
+  }
+
+  for (const failedFile of [0, 1]) {
+    it(`keeps all keys of a mixed batch locked when rewrite ${failedFile + 1} fails, including a completed sibling`, async () => {
+      const t = await setup(["HOME_LANGUAGE=nl-NL\n", "HOME_TIME_ZONE=Europe/Amsterdam\n"])
+      let fail = true
+      const mover = makeEnvMover({ ...t.options, commentOut: async (...args) => {
+        expect([t.view.get("HOME_LANGUAGE"), t.view.get("HOME_TIME_ZONE")]).toEqual(["nl-NL", "Europe/Amsterdam"])
+        expect([t.releases(), t.announcements()]).toEqual([0, 0])
+        if (fail && args[0] === t.paths[failedFile]) { fail = false; throw new Error("one rewrite failed") }
+        return commentOutKeys(...args)
+      } })
+      const keys = ["HOME_LANGUAGE", "HOME_TIME_ZONE"]
+      expect(await run(mover.move(keys))).toMatchObject({ ok: false, moved: [], error: { message: expect.stringMatching(/retry the move/i) } })
+      expect(keys.map(t.view.get)).toEqual(["nl-NL", "Europe/Amsterdam"])
+      expect([t.releases(), t.announcements()]).toEqual([0, 0])
+      expect(await run(mover.move(keys))).toEqual({ ok: true, moved: keys })
+      expect(keys.map(t.view.get)).toEqual([undefined, undefined])
+      expect(t.announcements()).toBe(1)
+    })
+  }
+
+  it("saves a module field while its override stays locked until the rewrite is checked", async () => {
+    const t = await setup(["GREETER_GREETING=welcome\n"])
+    const module = { ...greeterModule, settings: { greeting: Setting.text({ label: "Greeting", default: "hello", env: "GREETER_GREETING" }) } }
+    await run(Effect.scoped(Effect.gen(function*() {
+      const host = yield* makeModuleHost({ catalog: [module], persistence: t.store.modulePersistence, env: t.view.record })
+      yield* host.startEnabled
+      const announced: Array<boolean> = []
+      host.subscribe((info) => announced.push(info.settings.fields.some((field) => field.locked !== undefined)))
+      const mover = makeEnvMover({ ...t.options, catalog: [module], host, commentOut: async (...args) => {
+        expect(t.view.get("GREETER_GREETING")).toBe("welcome")
+        expect(t.store.settings().modules.greeter?.settings?.greeting).toBe("welcome")
+        expect(announced).toEqual([])
+        expect([t.releases(), t.announcements()]).toEqual([0, 0])
+        return commentOutKeys(...args)
+      } })
+      expect(yield* mover.move(["GREETER_GREETING"])).toEqual({ ok: true, moved: ["GREETER_GREETING"] })
+      expect(t.view.get("GREETER_GREETING")).toBeUndefined()
+      expect(announced).toEqual([false])
+    })))
+  })
+})
+
 // ---------------------------------------------------------------------------
 // Through serve mode and the protocol
 
@@ -362,5 +493,22 @@ describe("CLI modes on the saved settings", () => {
     const { dir, vaultPath } = await withVault()
     const loaded = await quiet(loadCliSettings({ env: {}, dataDir: dir, vaultPath }))
     expect(loaded.settings.vaultState).toBe("locked")
+  })
+})
+
+describe("SERVE_BEHIND_PROXY (PR 90 review round 1)", () => {
+  it("is a start-up value: shown with where it is set (file and line, or the process), never movable", () => {
+    const view = makeEnvView({ processEnv: {}, files: [{ path: "/x/.env", text: "SERVE_PORT=1\nSERVE_BEHIND_PROXY=true\n" }] })
+    expect(envInfo(view, makeEnvCatalog([])).entries.find((e) => e.key === "SERVE_BEHIND_PROXY")).toEqual({
+      key: "SERVE_BEHIND_PROXY",
+      origin: "file",
+      file: "/x/.env",
+      line: 2,
+      kind: "bootstrap",
+      secret: false,
+      movable: false
+    })
+    const fromProcess = makeEnvView({ processEnv: { SERVE_BEHIND_PROXY: "1" }, files: [] })
+    expect(envInfo(fromProcess, makeEnvCatalog([])).entries.find((e) => e.key === "SERVE_BEHIND_PROXY")).toMatchObject({ origin: "process", kind: "bootstrap" })
   })
 })

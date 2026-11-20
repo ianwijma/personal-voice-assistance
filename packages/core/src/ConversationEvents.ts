@@ -7,6 +7,7 @@ import type { SttEvent, ToolCall, ToolResult } from "./Domain.ts"
 import type { Router, RouterState } from "./Routing.ts"
 import type { Llm, Tts } from "./Services.ts"
 import type { ToolRegistry } from "./ToolRegistry.ts"
+import type { ConnectionRef, TurnOrigin } from "./TurnContext.ts"
 import type { Trace, TurnOutcome } from "./TurnTrace.ts"
 
 /**
@@ -108,6 +109,11 @@ export type ConversationInput =
     readonly speak: boolean
     /** The agent chosen in the composer (route reason `explicit`); absent = routed like speech. */
     readonly agentId?: string | undefined
+    /**
+     * The connection (tab) that typed it (module API v2): the turn's `CurrentTurn.connection`, over the setup's
+     * (which names the tab that owns the device's audio).
+     */
+    readonly connection?: ConnectionRef | undefined
   }
   | { readonly _tag: "Interrupt" }
   /** `routing.set`: make an agent sticky, or `null` to go back to the default. Applied at once; starts no turn. */
@@ -179,6 +185,13 @@ export interface TurnSetup {
    * is not spoken never waits. Absent: `tts.sampleRate` is final already.
    */
   readonly ttsReady?: Effect.Effect<void> | undefined
+  /**
+   * Who and where the turn is for (module API v2, `TurnContext.ts`): the assistant, the device and its name (later
+   * the room and the person). `Conversation` adds the turn id, conversation id and source and provides the result as
+   * `CurrentTurn` around every tool call and action run of the turn. Absent (the CLI modes): `CurrentTurn` stays
+   * `undefined` (docs/MODULES-PLAN.md P1: absent in CLI modes and jobs).
+   */
+  readonly turnContext?: TurnOrigin | undefined
 }
 
 /**

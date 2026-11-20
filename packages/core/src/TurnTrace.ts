@@ -1,4 +1,4 @@
-import type { AgentKind, RouteReason, TraceRoute } from "@pva/protocol"
+import type { AgentKind, RiskDecision, RouteReason, TraceRoute } from "@pva/protocol"
 import { Context, Effect, Layer } from "effect"
 
 export const traceMarks = [
@@ -57,6 +57,11 @@ export interface Trace {
    * with the marks.
    */
   events?: Array<TraceEventRecord>
+  /**
+   * P8: what the risk policy decided for each call of the turn that reached the decision (the execution gateway adds
+   * one entry per decision, on every path that runs inside the turn), in order. Absent until the first.
+   */
+  calls?: Array<TraceCall>
   /** Voices that spoke in this turn, in order of first use (filled by the voice router). */
   readonly voices: Array<string>
   /** The agent that answered (agent conversations; replaced when a fallback agent takes over). */
@@ -80,6 +85,17 @@ export interface Trace {
   route?: TraceRoute
   /** A snapshot of the latency-relevant configuration the turn used (protocol 7 `TraceConfig`), when known. */
   config?: unknown
+}
+
+/** One decision of the risk policy in a turn (`Trace.calls`). */
+export interface TraceCall {
+  /** The tool's name; an action's generated tool name; a handler's `<module>/<name>`. */
+  readonly name: string
+  readonly outcome: RiskDecision["outcome"]
+  /** The class it was decided by (`unjudged`: its risk function failed). */
+  readonly by: RiskDecision["by"]
+  /** Allowed and run, but its `personal` result was withheld from the model (the asking device may not reveal it). */
+  withheld?: boolean
 }
 
 export interface TraceAgent {
@@ -202,6 +218,9 @@ export const formatTrace = (trace: Trace): string => {
     parts.push(`audible=${ms(start + trace.client.outputLatencyMs - origin)} (+${ms(trace.client.outputLatencyMs)} output latency)`)
   }
   if (trace.tools.length > 0) parts.push(`tools: ${trace.tools.map((t) => `${t.name} ${ms(t.ms)}`).join(", ")}`)
+  if (trace.calls !== undefined && trace.calls.length > 0) {
+    parts.push(`risk: ${trace.calls.map((c) => `${c.name} ${c.outcome}(${c.by})${c.withheld === true ? " withheld" : ""}`).join(", ")}`)
+  }
   if (trace.voices.length > 0) parts.push(`voices: ${trace.voices.join(", ")}`)
   if (trace.endedAt !== undefined) parts.push(`total=${ms(trace.endedAt - origin)}`)
   return parts.join(" ")

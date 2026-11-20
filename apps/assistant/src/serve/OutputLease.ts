@@ -41,6 +41,13 @@ export interface OutputLeaseOptions {
 export interface OutputLease {
   /** The output `holder` (an assistant's conversation) plays through. One per holder; cheap to make. */
   readonly output: (holder: string) => AudioOutput["Service"]
+  /**
+   * P9 (announcements): play only if nothing plays now and `gate()` answers "go", both decided under the lease's lock
+   * in the same step as the play starts, so it never takes the speaker from a reply. Otherwise nothing starts and the
+   * answer is `{ notStarted }`: "busy" (something plays) or what the gate said. A play that starts later (a reply)
+   * supersedes this one as usual (it fails `AudioError("superseded")`).
+   */
+  readonly playIfFree: <E>(holder: string, audio: Stream.Stream<Uint8Array, E>, sampleRate: number, gate: () => string) => Effect.Effect<"played" | { readonly notStarted: string }, E | AudioError>
   /** Who plays now, if anyone. */
   readonly holder: () => string | undefined
 }
@@ -118,5 +125,36 @@ export const makeOutputLease = (shared: AudioOutput["Service"], options: OutputL
         )
     })
 
-  return { output, holder: () => current?.holder }
+  /** Under the lock: start `start` only if nothing plays and the gate says go. */
+  const beginIfFree = (holder: string, start: Effect.Effect<void, unknown>, gate: () => string): Effect.Effect<Play | { readonly notStarted: string }> =>
+    lock.withPermits(1)(Effect.gen(function*() {
+      if (current !== undefined) return { notStarted: "busy" }
+      const answer = gate()
+      if (answer !== "go") return { notStarted: answer }
+      const fiber = yield* Effect.forkDetach(Effect.interruptible(start))
+      const play: Play = { holder, fiber, superseded: false, ended: false }
+      current = play
+      notify(() => options.onStart?.(holder))
+      return play
+    }))
+
+  const playIfFree = <E>(holder: string, audio: Stream.Stream<Uint8Array, E>, sampleRate: number, gate: () => string): Effect.Effect<"played" | { readonly notStarted: string }, E | AudioError> =>
+    Effect.acquireUseRelease(
+      beginIfFree(holder, shared.play(audio, sampleRate), gate),
+      (play): Effect.Effect<"played" | { readonly notStarted: string }, E | AudioError> =>
+        "notStarted" in play
+          ? Effect.succeed(play)
+          : Effect.flatMap(Fiber.await(play.fiber), (exit) => {
+            if (Exit.isSuccess(exit)) return Effect.succeed("played" as const)
+            if (play.superseded && Cause.hasInterruptsOnly(exit.cause)) return Effect.fail(new AudioError({ message: SUPERSEDED }))
+            return Effect.failCause(exit.cause as Cause.Cause<E | AudioError>)
+          }),
+      (play) =>
+        "notStarted" in play ? Effect.void : Effect.gen(function*() {
+          yield* Fiber.interrupt(play.fiber)
+          ended(play, yield* Fiber.await(play.fiber))
+        })
+    )
+
+  return { output, playIfFree, holder: () => current?.holder }
 }

@@ -1,4 +1,7 @@
 import {
+  CurrentTurn,
+  CurrentTurnCommit,
+  CurrentTurnTrace,
   type Agent,
   type AgentEvent,
   addTraceEvent,
@@ -366,6 +369,15 @@ export const makeClaudeAgent = async (options: ClaudeAgentOptions): Promise<Clau
     Stream.callback<AgentEvent, AgentError>((queue) =>
       Effect.gen(function*() {
         const controller = new AbortController()
+        // The SDK calls tools from outside this fiber: the turn's context is captured here and given to each call, with
+        // the turn's trace (the execution gateway records its risk decisions there).
+        const currentTurn = yield* CurrentTurn
+        const currentCommit = yield* CurrentTurnCommit
+        const runTool = (call: ToolCall) => input.tools.run(call).pipe(
+          Effect.provideService(CurrentTurn, currentTurn),
+          Effect.provideService(CurrentTurnCommit, currentCommit),
+          Effect.provideService(CurrentTurnTrace, input.trace)
+        )
         let session: ClaudeSession | undefined
         let settled = false
         let emittedText = false
@@ -446,19 +458,23 @@ export const makeClaudeAgent = async (options: ClaudeAgentOptions): Promise<Clau
             emit({ _tag: "ToolStarted", call })
             let started = clock()
             let span: ReturnType<typeof beginTraceSpan> | undefined
+            // Cancelled while this call waited (the native yield, or promotion): it does not start. Checked inside the
+            // effect, so even an effect that would finish synchronously never runs after cancellation.
+            const live = <A>(effect: Effect.Effect<A>): Effect.Effect<A, SessionError> =>
+              Effect.suspend(() => (controller.signal.aborted ? Effect.fail(new SessionError("the turn was interrupted", "failed")) : effect))
             try {
-              if (!input.tools.isSpeculative(name)) await Effect.runPromise(input.promoted, { signal: controller.signal })
+              if (!input.tools.isSpeculative(name)) await Effect.runPromise(live(input.promoted), { signal: controller.signal })
               // The tool's own time: after the wait for the turn to be confirmed (a speculative turn's tool span must not begin before 0).
               started = clock()
               // Recorded at its start: a tool still running when the turn is interrupted is on the time line too.
               span = beginTraceSpan(input.trace, "tool", started, name)
-              const ran = await Effect.runPromise(input.tools.run(call), { signal: controller.signal })
+              const ran = await Effect.runPromise(live(runTool(call)), { signal: controller.signal })
               // A failed tool returns its error as a result (it does not throw): a diagnostic, redacted like the
               // catch path's (after the final review). A successful result is content and passes untouched.
               const result = ran.isError ? { ...ran, content: redact(ran.content, secrets) } : ran
               const ms = Math.round(clock() - started)
               input.trace.tools.push({ name, ms })
-              span.end(started + ms)
+              span?.end(started + ms)
               emit({ _tag: "ToolFinished", result, ms })
               return { content: result.content, isError: result.isError }
             } catch (e) {

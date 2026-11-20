@@ -18,6 +18,9 @@ import { makeModelAgent } from "./ModelAgent.ts"
 import { armAgent, initialRouterState, type RouteDecision, type Router, type RouterState, setActiveAgent } from "./Routing.ts"
 import { AudioInput, AudioOutput, Llm, Stt, Tts, type TtsAudio } from "./Services.ts"
 import { ToolRegistry } from "./ToolRegistry.ts"
+import { defaultGateway } from "./Gateway.ts"
+import { confirmedRunnerOf } from "./GatewayPrivate.ts"
+import { type ConnectionRef, CurrentTurn, CurrentTurnCommit, makeTurnContext, type TurnCommit, type TurnContext } from "./TurnContext.ts"
 import { addTraceEvent, beginTraceSpan, CurrentTurnTrace, type Trace, TurnTrace, type TurnOutcome } from "./TurnTrace.ts"
 import { ACTION_TIMEOUT_MS, ActionError, type ActionOutcome, actionToolName, type RegisteredAction } from "./Actions.ts"
 import { confirmationQuestion, describeProposal } from "./Decision.ts"
@@ -435,6 +438,8 @@ interface ActiveTurn {
   speaking: boolean
   done: boolean
   readonly promoted: Deferred.Deferred<void>
+  /** Work held until the turn is committed (`TurnCommit.whenCommitted`, R8): run at promotion, dropped when discarded. */
+  readonly onCommit: Array<() => void>
   readonly trace: Trace
   readonly plan: TurnPlan
   /** An agent asked for a reply while the turn was still pending: arm it at promotion. */
@@ -453,6 +458,8 @@ interface ReplyContext {
   readonly spoken: boolean
   readonly speculative: boolean
   readonly promoted: Effect.Effect<void>
+  /** Whether the turn is committed, for the calls it makes (`CurrentTurnCommit`, R8). */
+  readonly commit: TurnCommit
   readonly history: ReadonlyArray<Message>
   /** Messages evicted before `history[0]` when the snapshot was taken. */
   readonly historyStart: number
@@ -513,13 +520,15 @@ export const makeConversationWithSetup = Effect.fnUntraced(function*(options: Co
     }
     const { agents, perRegistry } = forLlm
     const known = perRegistry.get(registry)
-    if (known !== undefined) return known
+    // P8: a registry's actions are those the risk policy offers when they are read; a list made for other actions
+    // (a policy saved since) is made again, so a turn never offers what the policy of its start refuses.
+    if (known !== undefined && (registry.actions === undefined || known.actions === registry.actions)) return known
     // A hand-made registry may have no action lookup (or no specs): then it offers no actions.
     const actionFor = registry.actionFor
-    const actions = actionFor === undefined ? [] : (registry.specs ?? []).flatMap((spec) => {
+    const actions = registry.actions ?? (actionFor === undefined ? [] : (registry.specs ?? []).flatMap((spec) => {
       const action = actionFor(spec.name)
       return action === undefined ? [] : [action]
-    })
+    }))
     const set: AgentSet = { ...agents, actions }
     perRegistry.set(registry, set)
     return set
@@ -527,11 +536,40 @@ export const makeConversationWithSetup = Effect.fnUntraced(function*(options: Co
   return yield* makeConversationCore(
     {
       ...options,
-      setup: Effect.map(options.setup, (s): AgentTurnSetup => ({ system: s.system, registry: s.registry, agents: agentsFor(s.registry, s.llm ?? defaultLlm), ...(s.tts !== undefined ? { tts: s.tts } : {}), ...(s.maxToolRounds !== undefined ? { maxToolRounds: s.maxToolRounds } : {}), ...(s.ttsReady !== undefined ? { ttsReady: s.ttsReady } : {}) }))
+      setup: Effect.map(options.setup, (s): AgentTurnSetup => ({ system: s.system, registry: s.registry, agents: agentsFor(s.registry, s.llm ?? defaultLlm), ...(s.tts !== undefined ? { tts: s.tts } : {}), ...(s.maxToolRounds !== undefined ? { maxToolRounds: s.maxToolRounds } : {}), ...(s.ttsReady !== undefined ? { ttsReady: s.ttsReady } : {}), ...(s.turnContext !== undefined ? { turnContext: s.turnContext } : {}) }))
     },
     true
   )
 })
+
+/**
+ * The turn's context (`CurrentTurn`) when its setup names its origin (serve mode), else `undefined`: nothing is
+ * provided and tools read `undefined` (the CLI modes).
+ */
+const turnContextOf = (
+  setup: TurnSetup | undefined,
+  trace: Trace,
+  conversationId: string,
+  source: "voice" | "text" = trace.mode
+): TurnContext | undefined =>
+  setup?.turnContext === undefined ? undefined : makeTurnContext({ turnId: trace.id, conversationId, source }, setup.turnContext)
+
+/** The commit state of a turn that starts committed (a typed turn without speech). */
+const COMMITTED: TurnCommit = { committed: () => true, whenCommitted: (f) => f() }
+
+/**
+ * The turn (`CurrentTurn`, when its setup names its origin) and its trace (`CurrentTurnTrace`: P8, the execution
+ * gateway records each decision of the risk policy in it) around a turn's tool calls and action runs.
+ */
+const withCurrentTurn = <A, E, R>(effect: Effect.Effect<A, E, R>, turn: TurnContext | undefined, trace: Trace): Effect.Effect<A, E, R> => {
+  const traced = Effect.provideService(effect, CurrentTurnTrace, trace)
+  return turn === undefined ? traced : Effect.provideService(traced, CurrentTurn, turn)
+}
+
+const withCurrentTurnStream = <A, E, R>(stream: Stream.Stream<A, E, R>, turn: TurnContext | undefined, trace: Trace): Stream.Stream<A, E, R> => {
+  const traced = Stream.provideService(stream, CurrentTurnTrace, trace)
+  return turn === undefined ? traced : Stream.provideService(traced, CurrentTurn, turn)
+}
 
 /** A conversation answered by agents, routed per turn (docs/AGENTS-AND-INTENTS.md §1.3). */
 export const makeAgentConversation = (options: AgentConversationOptions) => makeConversationCore(options, false)
@@ -725,7 +763,7 @@ const makeConversationCore = Effect.fnUntraced(function*(options: AgentConversat
    * to the turn (its speech interrupted, its consumer gone) cancels it half-way; the 5 s limit; its
    * outcome kept in `record`, emitted, and written into history even after the turn has ended.
    */
-  const startConfirmed = (entry: PendingEntry, trace: Trace, describe: string): Effect.Effect<ActionRecord> =>
+  const startConfirmed = (entry: PendingEntry, trace: Trace, describe: string, setup: AgentTurnSetup | undefined): Effect.Effect<ActionRecord> =>
     Effect.gen(function*() {
       const action = entry.intent.action
       const def = action.definition
@@ -740,11 +778,20 @@ const makeConversationCore = Effect.fnUntraced(function*(options: AgentConversat
       // Recorded at its launch: Stop may end the turn (its time line published) while the action still runs detached;
       // it is then shown as started, without a duration.
       const span = beginTraceSpan(trace, "action", start, name)
-      const work = Effect.suspend(() => def.run(params as never)).pipe(
-        Effect.timeoutOrElse({
-          duration: ACTION_TIMEOUT_MS,
-          orElse: () => Effect.fail(new ActionError({ message: `${def.label} did not finish within ${ACTION_TIMEOUT_MS / 1000} seconds.` }))
-        })
+      const work = withCurrentTurn(
+        // Through the execution gateway's own confirmed path (the owner said yes; the access checks still apply).
+        // Only core reaches it; every public path refuses an action that needs confirmation.
+        Effect.suspend(() => {
+          const confirmed = confirmedRunnerOf(setup?.registry, defaultGateway)
+          return confirmed === undefined ? Effect.fail(new ActionError({ message: "Not run: there is no confirmed path for this action." })) : confirmed(action, params)
+        }).pipe(
+          Effect.timeoutOrElse({
+            duration: ACTION_TIMEOUT_MS,
+            orElse: () => Effect.fail(new ActionError({ message: `${def.label} did not finish within ${ACTION_TIMEOUT_MS / 1000} seconds.` }))
+          })
+        ),
+        turnContextOf(setup, trace, conversationId),
+        trace
       )
       record.fiber = yield* Effect.forkDetach(Effect.interruptible(work).pipe(
         Effect.exit,
@@ -809,7 +856,7 @@ const makeConversationCore = Effect.fnUntraced(function*(options: AgentConversat
       if (pendingIntents.current(now) !== entry) return drop(now >= entry.until ? "lapsed" : "unavailable")
       const consumed = consumeConfirmation(pendingIntents, entry, { turnId: trace.id, now, actions: setup.agents.actions ?? [] })
       if (consumed === undefined) return drop("unavailable")
-      answer.resolution = { kind: "ran", entry, record: yield* startConfirmed(entry, trace, describe) }
+      answer.resolution = { kind: "ran", entry, record: yield* startConfirmed(entry, trace, describe, plan.setup) }
     }))
 
   const armFor = (set: AgentSet | undefined, agentId: string) =>
@@ -1024,7 +1071,9 @@ const makeConversationCore = Effect.fnUntraced(function*(options: AgentConversat
     }))
 
   const reply = (ctx: ReplyContext): Stream.Stream<string, AgentError> =>
-    Stream.suspend(() => (ctx.plan.answer !== undefined ? answerReply(ctx, ctx.plan.answer) : agentReply(ctx)))
+    Stream.suspend(() => (ctx.plan.answer !== undefined ? answerReply(ctx, ctx.plan.answer) : agentReply(ctx))).pipe(
+      Stream.provideService(CurrentTurnCommit, ctx.commit)
+    )
 
   const agentReply = (ctx: ReplyContext): Stream.Stream<string, AgentError> =>
     Stream.suspend(() => {
@@ -1035,8 +1084,10 @@ const makeConversationCore = Effect.fnUntraced(function*(options: AgentConversat
       const decision = plan.decision!
       const set = setup.agents
       const maxToolRounds = setup.maxToolRounds ?? set.maxToolRounds ?? options.maxToolRounds ?? 5
+      // Every tool call and action run of the turn (and every fiber its agent forks) sees the turn (`CurrentTurn`).
+      const current = turnContextOf(setup, trace, ctx.conversationId, ctx.source)
 
-      return Stream.unwrap(Effect.map(setup.registry.context, (context) => {
+      return withCurrentTurnStream(Stream.unwrap(Effect.map(setup.registry.context, (context) => {
         /**
          * Record THE proposal of this turn (review round 6); false when one exists already. A proposal
          * whose question cannot state the values is REFUSED (round 7): the reason is returned, nothing
@@ -1188,7 +1239,7 @@ const makeConversationCore = Effect.fnUntraced(function*(options: AgentConversat
 
         const head = plan.notice === undefined ? Stream.empty : unrecorded(turnId, plan.notice, true, log)
         return head.pipe(Stream.concat(run(plan.agent!, 0)))
-      }))
+      })), current, trace)
     })
 
   // -------------------------------------------------------------------------
@@ -1378,6 +1429,7 @@ const makeConversationCore = Effect.fnUntraced(function*(options: AgentConversat
         spoken: false,
         speculative: false,
         promoted: Effect.void,
+        commit: COMMITTED,
         history: history.slice(),
         historyStart: evicted,
         conversationId,
@@ -1399,6 +1451,13 @@ const makeConversationCore = Effect.fnUntraced(function*(options: AgentConversat
       let current: ActiveTurn | undefined
 
       const live = () => (current !== undefined && !current.done ? current : undefined)
+      const runCommitted = (f: () => void) => {
+        try {
+          f()
+        } catch {
+          // Held work must not change the turn.
+        }
+      }
 
       const contextOf = (turn: ActiveTurn, log: TurnLog, history: ReadonlyArray<Message>, historyStart: number, conversationId: string): ReplyContext => ({
         plan: turn.plan,
@@ -1409,6 +1468,13 @@ const makeConversationCore = Effect.fnUntraced(function*(options: AgentConversat
         spoken: turn.spoken,
         speculative: turn.trace.speculative,
         promoted: Deferred.await(turn.promoted),
+        commit: {
+          committed: () => !turn.pending,
+          whenCommitted: (f) => {
+            if (!turn.pending) runCommitted(f)
+            else if (!turn.done) turn.onCommit.push(f)
+          }
+        },
         history,
         historyStart,
         conversationId,
@@ -1554,7 +1620,13 @@ const makeConversationCore = Effect.fnUntraced(function*(options: AgentConversat
         speculative: boolean,
         source: "voice" | "text" = "voice",
         spoken = true,
-        how: { readonly explicitAgent?: string | undefined; readonly say?: string; readonly answerable?: PendingEntry | undefined } = {}
+        how: {
+          readonly explicitAgent?: string | undefined
+          readonly say?: string
+          readonly answerable?: PendingEntry | undefined
+          /** The connection that typed it (`TextInput.connection`): the turn's, over the setup's. */
+          readonly connection?: ConnectionRef | undefined
+        } = {}
       ) =>
         Effect.gen(function*() {
           // Idle reset, decided here at the turn's start (a speculative turn and its promotion see the same
@@ -1562,7 +1634,8 @@ const makeConversationCore = Effect.fnUntraced(function*(options: AgentConversat
           // to the old conversation.
           const reset = how.say === undefined && (yield* resetIfIdle)
           const answerable = reset ? undefined : how.answerable
-          const setup = yield* options.setup
+          const read = yield* options.setup
+          const setup = how.connection === undefined || read.turnContext === undefined ? read : { ...read, turnContext: { ...read.turnContext, connection: how.connection } }
           const plan: TurnPlan = how.say !== undefined
             ? { canned: how.say, tts: setup.tts, ttsReady: setup.ttsReady }
             : planTurn(setup, text, source, how.explicitAgent, answerable)
@@ -1573,7 +1646,7 @@ const makeConversationCore = Effect.fnUntraced(function*(options: AgentConversat
             tt.mark(trace, "endOfTurn")
             yield* Deferred.succeed(promoted, undefined)
           }
-          const turn: ActiveTurn = { text, source, spoken, pending: speculative, speaking: false, done: false, promoted, trace, plan }
+          const turn: ActiveTurn = { text, source, spoken, pending: speculative, speaking: false, done: false, promoted, onCommit: [], trace, plan }
           const log = newLog(plan, text)
           current = turn
           emit(turnStarted(trace, source, text, speculative, spoken, plan))
@@ -1586,6 +1659,8 @@ const makeConversationCore = Effect.fnUntraced(function*(options: AgentConversat
             Effect.onExit((exit) =>
               Effect.suspend(() => {
                 turn.done = true
+                // Discarded (or ended) before it was committed: what it held for its commit is dropped (R8).
+                if (turn.pending) turn.onCommit.length = 0
                 if (current === turn) current = undefined
                 return finishTurn(log, trace, spoken, exit, turn.pending, turn.stopped === true)
               })
@@ -1689,6 +1764,7 @@ const makeConversationCore = Effect.fnUntraced(function*(options: AgentConversat
                 emit({ _tag: "TurnPromoted", turnId: turn.trace.id })
                 yield* commitPlan(turn.plan, turn.trace)
                 if (turn.expectReply !== undefined && !overruled(turn.plan)) armFor(turn.plan.setup?.agents, turn.expectReply)
+                for (const f of turn.onCommit.splice(0)) runCommitted(f)
                 return yield* Deferred.succeed(turn.promoted, undefined)
               }
               if (turn !== undefined) {
@@ -1722,7 +1798,7 @@ const makeConversationCore = Effect.fnUntraced(function*(options: AgentConversat
               const answerable = asked?.entry
               // Deliberate input: replaces whatever runs, whatever the barge-in setting.
               if (turn !== undefined) yield* interrupt(turn)
-              return yield* start(event.text, false, "text", event.speak, { explicitAgent: event.agentId, answerable })
+              return yield* start(event.text, false, "text", event.speak, { explicitAgent: event.agentId, answerable, connection: event.connection })
             }
             case "Say": {
               cancelled = undefined

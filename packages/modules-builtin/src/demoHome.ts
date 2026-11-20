@@ -1,4 +1,4 @@
-import { defineAction, defineModule, makeTool, Param, type ParamOption } from "@pva/core"
+import { defineAction, defineModule, makeTool, ModuleStartError, Param, type ParamOption, Setting, type SettingsOf } from "@pva/core"
 import { Effect, Schema } from "effect"
 
 /**
@@ -7,8 +7,10 @@ import { Effect, Schema } from "effect"
  * named lamps, on/off and brightness. Nothing leaves the process; the state
  * resets when the module restarts.
  *
- * The house is a constant for now; the `rooms` and `lights` settings (`records`
- * fields) come with the settings widening (build plan piece G/H).
+ * The house is set up in the module's form (protocol 10, docs/MODULES-PLAN.md §4 P3): `rooms` and `lights` are
+ * `records` fields (a room: name and other names; a lamp: name, room and other names), with the house below as
+ * their defaults. The form also shows what is on (`info`), a "Check" button that checks the draft before it is
+ * saved (a definition-level field action) and "Switch everything off" (the running instance's).
  */
 
 export interface DemoRoom {
@@ -112,6 +114,117 @@ export const makeDemoHouse = (rooms: ReadonlyArray<DemoRoom> = defaultRooms, lam
 
 export type DemoHouse = ReturnType<typeof makeDemoHouse>
 
+/**
+ * A room or lamp id from its name: "Living room" → "living_room", "Café" → "cafe". Letters without an ASCII form
+ * leave nothing; such a name gets an id by its place (`houseIds`).
+ */
+export const roomId = (name: string): string =>
+  name.trim().normalize("NFKD").replace(/\p{M}+/gu, "").toLowerCase().replace(/[^a-z0-9]+/g, "_").replace(/^_+|_+$/g, "")
+
+const sameName = (a: string, b: string) => a.trim().toLowerCase() === b.trim().toLowerCase()
+
+/**
+ * The ids a house gets: a room's from its name (else `room_<n>`), its main light `<room>_main`, a lamp's from its name
+ * (else `lamp_<n>`). Targets and lights are found by these ids, so they must all differ (`houseProblem`).
+ */
+export const houseIds = (rooms: ReadonlyArray<{ readonly name: string }>, lights: ReadonlyArray<{ readonly name: string }>) => ({
+  rooms: rooms.map((r, i) => roomId(r.name) || `room_${i + 1}`),
+  lamps: lights.map((l, i) => roomId(l.name) || `lamp_${i + 1}`)
+})
+
+/** Two names that would get the same id (a room, a lamp, or a lamp and a room's main light), or undefined. */
+const idClash = (rooms: ReadonlyArray<{ readonly name: string }>, lights: ReadonlyArray<{ readonly name: string }>): string | undefined => {
+  const ids = houseIds(rooms, lights)
+  const roomBy = new Map<string, string>()
+  for (const [i, id] of ids.rooms.entries()) {
+    const other = roomBy.get(id)
+    if (other !== undefined) return `"${other}" and "${rooms[i]!.name.trim()}" are too alike: give rooms names that differ in more than spaces, punctuation or accents`
+    roomBy.set(id, rooms[i]!.name.trim())
+  }
+  // A lamp's id shares a space with the main lights' (`kitchen_main`, the main light of Kitchen).
+  const lightBy = new Map<string, string>(ids.rooms.map((id, i) => [`${id}_main`, `${rooms[i]!.name.trim()} light`]))
+  for (const [i, id] of ids.lamps.entries()) {
+    const other = lightBy.get(id)
+    if (other !== undefined) return `"${lights[i]!.name.trim()}" is too alike to "${other}": give it another name`
+    lightBy.set(id, lights[i]!.name.trim())
+  }
+  return undefined
+}
+
+/** Problems of a house as the form describes it, or undefined. */
+export const houseProblem = (rooms: ReadonlyArray<{ readonly name: string }>, lights: ReadonlyArray<{ readonly name: string; readonly room: string }>): string | undefined => {
+  const names = [...rooms.map((r) => r.name), ...lights.map((l) => l.name)].map((n) => n.trim())
+  if (names.some((n) => n.length === 0)) return "Every room and lamp needs a name"
+  const twice = names.find((n, i) => names.findIndex((m) => sameName(m, n)) !== i)
+  if (twice !== undefined) return `"${twice}" is used twice`
+  const clash = idClash(rooms, lights)
+  if (clash !== undefined) return clash
+  const lost = lights.find((l) => !rooms.some((r) => sameName(r.name, l.room)))
+  return lost === undefined ? undefined : `${lost.name} is in "${lost.room}", which is not one of the rooms`
+}
+
+/** Problems of the lamps alone (names, ids among themselves), checked when they are saved. */
+const lampsProblem = (lights: ReadonlyArray<{ readonly name: string }>): string | undefined => {
+  const names = lights.map((l) => l.name.trim())
+  if (names.some((n) => n.length === 0)) return "Every lamp needs a name"
+  const twice = names.find((n, i) => names.findIndex((m) => sameName(m, n)) !== i)
+  if (twice !== undefined) return `"${twice}" is used twice`
+  return idClash([], lights)
+}
+
+const demoSettings = {
+  rooms: Setting.records({
+    label: "Rooms",
+    description: "Each room has a main light. Other names are what you may call it (\"lounge\").",
+    itemLabel: "room",
+    titleKey: "name",
+    maxItems: 20,
+    item: {
+      name: Setting.text({ label: "Name", maxLength: 40 }),
+      aliases: Setting.textList({ label: "Other names", maxItems: 10, itemMaxLength: 40 })
+    },
+    default: defaultRooms.map((r) => ({ name: r.name, aliases: r.aliases })),
+    check: (rooms) => houseProblem(rooms, [])
+  }),
+  lights: Setting.records({
+    label: "Lamps",
+    description: "Lamps besides the main lights, each in one of the rooms.",
+    itemLabel: "lamp",
+    titleKey: "name",
+    maxItems: 20,
+    item: {
+      name: Setting.text({ label: "Name", maxLength: 40 }),
+      room: Setting.text({ label: "Room", maxLength: 40, placeholder: "Living room" }),
+      aliases: Setting.textList({ label: "Other names", maxItems: 10, itemMaxLength: 40 })
+    },
+    default: defaultLamps.map((l) => ({ name: l.name, room: defaultRooms.find((r) => r.id === l.room)!.name, aliases: l.aliases })),
+    check: lampsProblem
+  }),
+  state: Setting.info({ label: "Now" }),
+  check: Setting.action({
+    label: "Check the house",
+    description: "Checks the rooms and lamps above, also before they are saved.",
+    buttonLabel: "Check",
+    requiresSaved: false
+  }),
+  allOff: Setting.action({ label: "Every light", buttonLabel: "Switch everything off", confirm: "Switch every light of the demo home off?" })
+}
+
+type DemoSettings = SettingsOf<typeof demoSettings>
+
+/** The house a module's settings describe (rooms by name; a lamp's room by that room's name). */
+export const houseFrom = (settings: Pick<DemoSettings, "rooms" | "lights">) => {
+  const ids = houseIds(settings.rooms, settings.lights)
+  const rooms: Array<DemoRoom> = settings.rooms.map((r, i) => ({ id: ids.rooms[i]!, name: r.name.trim(), aliases: r.aliases }))
+  const lamps: Array<DemoLamp> = settings.lights.map((l, i) => ({
+    id: ids.lamps[i]!,
+    name: l.name.trim(),
+    room: rooms.find((r) => sameName(r.name, l.room))?.id ?? (roomId(l.room) || "room"),
+    aliases: l.aliases
+  }))
+  return makeDemoHouse(rooms, lamps)
+}
+
 /** The actions and tool of a house; `changed` is called after every change (status line). */
 export const demoHomeContributions = (house: DemoHouse, changed: () => void = () => {}) => {
   const target = Param.dynamic({ label: "Room or light", options: () => house.targets })
@@ -188,14 +301,37 @@ export const demoHomeModule = defineModule({
   id: "demo-home",
   name: "Demo home",
   description: "A pretend house with rooms and lights, to try commands like \"hey Jev, turn on the living room lights\". Nothing real is switched.",
-  start: ({ setStatus }) =>
-    Effect.sync(() => {
-      const house = makeDemoHouse()
+  settings: demoSettings,
+  fieldActions: {
+    check: ({ settings }) =>
+      Effect.sync(() => {
+        const problem = houseProblem(settings.rooms, settings.lights)
+        const lamps = settings.lights.length
+        return problem === undefined
+          ? { ok: true, text: `${settings.rooms.length} rooms and ${lamps} ${lamps === 1 ? "lamp" : "lamps"}; every lamp is in one of the rooms.`, tone: "ok" as const }
+          : { ok: false, text: problem, tone: "error" as const }
+      })
+  },
+  start: ({ setStatus, settings }) =>
+    Effect.gen(function*() {
+      const problem = houseProblem(settings.rooms, settings.lights)
+      if (problem !== undefined) return yield* new ModuleStartError({ message: `The demo home: ${problem}.` })
+      const house = houseFrom(settings)
       const status = () => setStatus({ text: `${house.rooms.length} rooms · ${house.onCount()} lights on`, tone: "neutral" })
       status()
       return {
         ...demoHomeContributions(house, status),
-        instructions: "The demo home is pretend: its lights exist only inside the assistant."
+        instructions: "The demo home is pretend: its lights exist only inside the assistant.",
+        info: () => ({ state: house.describe() }),
+        fieldActions: {
+          allOff: () =>
+            Effect.sync(() => {
+              const was = house.onCount()
+              house.switchTo("all", false)
+              status()
+              return { ok: true, text: was === 0 ? "Every light was already off." : `Switched ${was} ${was === 1 ? "light" : "lights"} off.`, tone: "ok" as const }
+            })
+        }
       }
     })
 })

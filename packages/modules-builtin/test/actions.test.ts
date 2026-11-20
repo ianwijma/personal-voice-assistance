@@ -4,7 +4,7 @@ import { makeModuleHost, readOnlyPersistence, type RegisteredAction } from "@pva
 import { Effect } from "effect"
 import { TestClock } from "effect/testing"
 import { clockActions, clockModule } from "../src/clock.ts"
-import { demoHomeContributions, demoHomeModule, makeDemoHouse } from "../src/demoHome.ts"
+import { demoHomeContributions, demoHomeModule, houseFrom, houseProblem, makeDemoHouse } from "../src/demoHome.ts"
 import { makeWeatherParts, weatherModule } from "../src/weather.ts"
 
 const byId = (actions: ReadonlyArray<{ readonly id: string }>, id: string) => actions.find((a) => a.id === id)! as RegisteredAction["definition"]
@@ -84,6 +84,44 @@ describe("demo home", () => {
     })))
 })
 
+describe("demo home ids (review round 1)", () => {
+  const room = (name: string) => ({ name, aliases: [] as Array<string> })
+  const lamp = (name: string, inRoom: string) => ({ name, room: inRoom, aliases: [] as Array<string> })
+
+  it("refuses names that would share an id: punctuation, non-Latin names, a lamp named like a main light", () => {
+    assert.match(houseProblem([room("Living room"), room("Living-room")], []) ?? "", /"Living room" and "Living-room" are too alike/)
+    assert.match(houseProblem([room("Living room"), room("living  room!")], []) ?? "", /too alike/)
+    assert.match(houseProblem([room("Kitchen")], [lamp("Kitchen main", "Kitchen")]) ?? "", /"Kitchen main" is too alike to "Kitchen light"/)
+    assert.match(houseProblem([room("Hall")], [lamp("Desk lamp", "Hall"), lamp("Desk-lamp", "Hall")]) ?? "", /too alike/)
+    // Names without an ASCII form get ids by place, so they do not clash.
+    assert.strictEqual(houseProblem([room("寝室"), room("台所")], [lamp("ランプ", "寝室")]), undefined)
+    assert.strictEqual(houseProblem([room("Café"), room("Cafe bar")], []), undefined)
+  })
+
+  it("switches one room only when two rooms differ in letters a slug would lose", () =>
+    Effect.runSync(Effect.gen(function*() {
+      const house = houseFrom({ rooms: [room("寝室"), room("台所")], lights: [lamp("ランプ", "台所")] })
+      assert.deepStrictEqual(house.rooms.map((r) => r.id), ["room_1", "room_2"])
+      assert.deepStrictEqual(house.lamps.map((l) => [l.id, l.room]), [["lamp_1", "room_2"]])
+      const { actions } = demoHomeContributions(house)
+      yield* byId(actions, "lights_on").run({ target: "area:room_1" })
+      assert.deepStrictEqual(house.lights.filter((l) => l.on).map((l) => l.name), ["寝室 light"])
+    })))
+
+  it.effect("the module refuses such a house at start, and the records refuse the lamps when saved", () =>
+    Effect.gen(function*() {
+      const host = yield* makeModuleHost({
+        catalog: [demoHomeModule],
+        persistence: readOnlyPersistence({ modules: { "demo-home": { enabled: true, settings: { rooms: [room("Kitchen")], lights: [lamp("Kitchen main", "Kitchen")] } } }, secrets: {} }),
+        env: {}
+      })
+      yield* host.startEnabled
+      assert.match(host.modules()[0]!.error ?? "", /too alike/)
+      const saved = yield* host.configure("demo-home", { values: { lights: [lamp("Desk lamp", "Kitchen"), lamp("Desk_lamp", "Kitchen")] }, secrets: {} })
+      assert.isFalse(saved.ok)
+    }))
+})
+
 describe("clock.time_now", () => {
   const at = Date.UTC(2026, 10, 13, 13, 32) // 14:32 in Amsterdam
 
@@ -136,11 +174,12 @@ describe("weather.today", () => {
       assert.match(error.message, /set a home location/)
     }))
 
-  it.effect("the module offers the action but no generated tool (the weather tool exists)", () =>
+  it.effect("the module offers its actions but no generated tool (each has a tool of its own, or is for the typed path only)", () =>
     Effect.scoped(Effect.gen(function*() {
       const host = yield* makeModuleHost({ catalog: [weatherModule({ fetch })], persistence: readOnlyPersistence(), env: {} })
       yield* host.startEnabled
-      assert.deepStrictEqual(host.snapshot().registry.specs.map((s) => s.name), ["weather"])
-      assert.deepStrictEqual(host.snapshot().actions.map((a) => a.id), ["weather.today"])
+      // `weather` and the two tools of the local-info extension; the three actions are not also tools.
+      assert.deepStrictEqual(host.snapshot().registry.specs.map((s) => s.name), ["weather", "weather_rain_soon", "weather_forecast"])
+      assert.deepStrictEqual(host.snapshot().actions.map((a) => a.id), ["weather.today", "weather.rain_soon", "weather.tomorrow"])
     })))
 })

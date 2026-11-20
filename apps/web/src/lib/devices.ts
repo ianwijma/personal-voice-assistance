@@ -20,7 +20,7 @@ import { deepEqual } from "./assistants.ts"
  */
 
 /** A section of the page. `assign` is two keys of the settings: the list and who answers without a phrase. */
-export type SectionId = "assign" | "phrases" | "voicePage" | "look" | "voice" | "interrupting" | "audio" | "captions"
+export type SectionId = "assign" | "phrases" | "voicePage" | "look" | "voice" | "place" | "capabilities" | "interrupting" | "audio" | "captions"
 
 export const SECTION_KEYS: Readonly<Record<SectionId, ReadonlyArray<DeviceSettingsKey>>> = {
   assign: ["assistants", "withoutPhrase"],
@@ -28,6 +28,8 @@ export const SECTION_KEYS: Readonly<Record<SectionId, ReadonlyArray<DeviceSettin
   voicePage: ["voicePage"],
   look: ["look"],
   voice: ["voice"],
+  place: ["place"],
+  capabilities: ["capabilities"],
   interrupting: ["interruptMode"],
   audio: ["audio"],
   captions: ["captions"]
@@ -75,7 +77,9 @@ export const settingsOf = (base: DeviceBase, edit: DeviceEdit): DeviceSettings =
   audio: valueOf(base, edit, "audio"),
   captions: valueOf(base, edit, "captions"),
   look: valueOf(base, edit, "look"),
-  voice: valueOf(base, edit, "voice")
+  voice: valueOf(base, edit, "voice"),
+  place: valueOf(base, edit, "place"),
+  capabilities: valueOf(base, edit, "capabilities")
 })
 
 const keyOwn = (base: DeviceBase, edit: DeviceEdit, k: DeviceSettingsKey): boolean =>

@@ -2,7 +2,7 @@ import { assert, describe, it } from "@effect/vitest"
 import { Cause, Effect, Exit, Fiber, Schema } from "effect"
 import { ToolError } from "../src/Errors.ts"
 import { type AssistantModule, makeTool } from "../src/Module.ts"
-import { makeToolRegistry } from "../src/ToolRegistry.ts"
+import { makeToolRegistry, toolSpec } from "../src/ToolRegistry.ts"
 
 const add = makeTool({
   name: "add",
@@ -110,5 +110,38 @@ describe("ToolRegistry: review finding 11", () => {
       yield* Effect.yieldNow
       const exit = yield* Fiber.interrupt(fiber).pipe(Effect.andThen(Fiber.await(fiber)))
       assert.isTrue(Exit.isFailure(exit) && Cause.hasInterruptsOnly(exit.cause))
+    }))
+})
+
+describe("toolSpec: patterns a model provider refuses", () => {
+  // StoredText's pattern (@pva/module-contracts): the Anthropic API refuses a pattern that names surrogate code units.
+  const STORED = /^[^\u0000-\u0007\u000b\u000e-\u001f\ud800-\udfff]*$/u
+  const stored = Schema.String.check(Schema.isMaxLength(60), Schema.isPattern(STORED))
+  const tool = makeTool({
+    name: "keep",
+    description: "Keep a text",
+    parameters: Schema.Struct({
+      text: stored,
+      tags: Schema.Array(stored),
+      code: Schema.String.check(Schema.isMaxLength(2), Schema.isPattern(/^[a-z]+$/u))
+    }),
+    execute: ({ text }) => Effect.succeed({ kept: text })
+  })
+
+  it("leaves a surrogate pattern out of the schema sent to the model, wherever it is, and keeps everything else", () => {
+    const schema = toolSpec(tool).inputSchema as { properties: Record<string, Record<string, unknown>> }
+    assert.deepStrictEqual(schema.properties.text, { type: "string", maxLength: 60 })
+    assert.deepStrictEqual(schema.properties.tags!.items, { type: "string", maxLength: 60 })
+    assert.deepStrictEqual(schema.properties.code, { type: "string", maxLength: 2, pattern: "^[a-z]+$" })
+    assert.notInclude(JSON.stringify(toolSpec(tool)), "ud800")
+  })
+
+  it.effect("still refuses such a text when the tool is called", () =>
+    Effect.gen(function*() {
+      const registry = makeToolRegistry([{ name: "keeper", tools: [tool] }])
+      const bad = yield* registry.run({ id: "1", name: "keep", input: { text: "a\ud800b", tags: [], code: "ab" } })
+      assert.isTrue(bad.isError)
+      const good = yield* registry.run({ id: "2", name: "keep", input: { text: "fine", tags: ["x"], code: "ab" } })
+      assert.isFalse(good.isError)
     }))
 })

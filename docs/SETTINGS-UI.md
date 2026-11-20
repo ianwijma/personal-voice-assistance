@@ -85,6 +85,43 @@ login), P8 (search), P9.
 
 Leftovers for later pieces are listed in §6.
 
+## Status: extended fields and module routes (modules P3, protocol 10, 2026-11-18)
+
+The five extended field types (`textList`, `records`, `combo`, `action`, `info`; docs/AGENTS-AND-INTENTS.md §4.3) are
+members of `SettingField`, so every generated form (module, agent, section) can use them, and the generic renderers
+draw them (docs/UI-AND-MODULES.md §1.11, §3.7). Built:
+
+| Piece | Where | Notes |
+|---|---|---|
+| Protocol | `packages/protocol/src/settings.ts` (the five types, `FieldActionResult`), `client.ts` (`module.action`), `server.ts` (`Result.action`), `moduleRoutes.ts` | Protocol 10: new members of the closed field and value sets; `SettingFieldV2` & co. are aliases |
+| Core | `Settings.ts` (`Setting.textList`, `records`, `combo`, `action`, `info`; `isEditableSetting`), `SettingsExtra.ts` | Stored, loaded, resolved per layer (env, saved, an assistant's own values for `overridable` fields); `action`/`info` never saved or patched, left out of `SettingsOf` |
+| Host | `ModuleHost.ts` (`fieldAction(id, key, values?)`, the described form's info values, combo options and the agents' Test button) | 8 s (answered at the deadline, cleanup in the background), one press per button at a time, busy until the press has really ended (`FieldActionOwner`: an instance's presses are stopped before it closes); the draft only for `requiresSaved: false`; settings that do not resolve are the result; failures are a generic sentence; secrets reach no page by construction, and everything the module's code writes passes the page boundary's exact safety net (`PageBoundary.ts`, docs/UI-AND-MODULES.md "Secrets and the admin page": every exact occurrence of a current or earlier secret value, any length, replaced by `[secret]` before clipping; earlier values kept while what received them lives; runtime options with a secret value dropped); only a declared action field is a button; presses that do not stop are capped per module; a closed combo shows only its static options |
+| Renderers | `fields/TextListField.tsx`, `RecordsField.tsx` (item fields through the same renderers), `ComboField.tsx`, `ActionField.tsx`, `InfoField.tsx`; `lib/forms.ts` (deep equality, buttons and info never in a patch); `settings/FieldRow.tsx` (no Custom/Reset marker on them) | One renderer per type (`ui/fieldRenderers.ts`, a missing one is a compile error). A text item that could not be added, and an item field's invalid text inside a record, are local errors of the form (§3.3): Save waits, the page counts as edited, Cancel clears them (the fields are drawn again from the fresh draft). Records keep a stable identity per row (which one is open, its typed text and its problems move with it); removing a row removes its problems. Only the local errors of fields still in the form and shown count (`PageFormView.localErrors`), and a field row that goes (hidden by `visibleWhen`, gone from a new form) clears its own: an invalid combo that is hidden no longer holds Save. **One rule for the form's state** (review round 3): a button press, a save or a reset acts on exactly what is shown. While any shown field holds what it cannot accept (a local error), Save and every button of the form are refused with that field's error ("Fix this first: Levels: Level 1, Low: …"), and a press with the draft sends only the shown fields' values. "Reset to the default" replaces the field's value and draws that field alone again (`FormState.fieldEpochs`), so its private state (text being typed, a rejected item, a record's rows) and its local error go with it; Save then sends `null` for it. Cancel draws the whole form again |
+| Module page | `settings/ModuleRoutes.tsx` | "Web addresses" for any module with routes or tokens, running or not (a stopped module's tokens can be revoked); a token's purpose (its name) is chosen when the routes accept several and shown on each token; `lan` routes are marked unreachable when `SERVE_BEHIND_PROXY` is set |
+| Modules | `modules-builtin/src/demoHome.ts` (rooms and lamps as records, Check, Switch everything off, Now), `module-home-assistant` (Test, Connected to, Rooms and lights) | |
+| Mock | `apps/web/mock/demoHome.ts` | The demo home with every new type, `module.action`, `/api/module-routes` (as the server: nothing listed or changed while the mock's vault is locked, 503; at most 20 tokens, 409; labels of 1 to 80 characters, 400; back to the seeded tokens on `/mock/reset` and a scenario change) |
+| Bounds | `packages/protocol/src/settings.ts` (`MAX_*`, `BoundedChoiceOption`, `RecordsValue`, `TextListValue`) | Every new string, list and record bounded on the wire both ways; the constructors refuse declarations outside them; the host cuts runtime options to 200 and 32 KB; a module's whole form is checked once against the wire schema and an 8 KiB budget (`MODULE_FORM_BUDGET_BYTES`, the complete field array), what the instance adds is trimmed to it ("and N more"); the complete form as it is sent (messages after the page boundary, the generated Test button) with its listed tools is at most 48 KiB (`MODULE_FORM_MAX_BYTES`: a larger save is refused, larger saved settings are invalid and show no form, longer messages are cut); one module's whole projection is at most 256 KiB as one `module.changed` (`MODULE_FRAME_MAX_BYTES`: routes, tools, instance errors, then the form shortened in that order), and the modules of one admin snapshot at most 448 KiB together (`ADMIN_MODULES_SHARE_BYTES`): a module that does not fit is a light entry there (`details: "follow"`, shown as loading) and its complete projection follows at once in its own `module.changed`; defaults are decoded by their own field |
+
+Sections do not declare buttons yet (a section's handler would be the server's: `settings.action` is still not in the
+protocol); a button outside a module form is shown disabled.
+
+## Status: the risk policy (modules P8, first version, 2026-11-19)
+
+The household's risk policy (docs/MODULES.md §4) is a household section like Home and Members, on its own page:
+**Shared settings › Risk policy**. (This "P8" is the modules plan's, docs/MODULES-PLAN.md §4; not this document's
+search phase.)
+
+| Piece | Where | Notes |
+|---|---|---|
+| Section | `apps/assistant/src/serve/sectionDefinitions.ts` (`riskSection`, id `risk`, group `modules`, page `risk`, order 7, **protected**: admin only) | `RISK_READ`, `RISK_CHANGE`, `RISK_MESSAGE`: a choice of **Run it** / **Refuse: needs confirmation** / **Refuse** (`allow` / `confirm` / `deny`), defaults `allow`, `allow`, `confirm`, applied live (no reload). `RISK_MONEY`, `RISK_SECURITY`: a choice with only Refuse, no environment variable |
+| Fixed fields | `sections.ts` (`SectionDefinition.fixed`: key → value and reason) | Shown locked with the reason ("Fixed at Refuse: devices are not authenticated yet …", `FIXED_REASON`), never written; a saved value of a hand-edited file is dropped when the values are read (every reader sees Refuse) and taken out of the file at the section's next save; a save that sets one to anything but Refuse is refused with the reason and writes nothing |
+| Validation | `SectionDefinition.checkPatch` = `riskPolicyPatchProblems` (`@pva/protocol`) first, then the fixed check and `applySettingsPatch`; one save, one lock, as every section | An unknown outcome or an opened money/security refuses the whole save (`invalid_settings`, the first problem's message, every problem as a field error), nothing written. A typo in a hand-edited file is that field's error on the page, and the policy reads that class's default meanwhile |
+| Reading | `riskPolicy.ts` (`effectiveRiskPolicy`, `servePolicyReader`), `sections.ts` (`riskPolicy()`) | One canonical reader (the section's fields resolved as every reader resolves them, then decoded), published into an in-memory record when the sections are made, in the settings store's first commit listener (the synchronous step that commits a new state: before every other commit listener, the save's caller or any other fiber runs; from the committed values alone) and on `announceAll`; the gateway reads the record as a field, so a call made at or after the commit gets the new policy, as does the next tool list, and no call builds definitions or touches a file. The settings `ConfigProvider` serves the policy's keys as the reader resolves them, including the CLI's environment-only fallback when the store cannot be loaded; the CLI modes read them through the same function once at their start (`modules.ts`) |
+| Page | `apps/web/src/lib/settingsTree.ts` (`SHARED_PAGES` "Risk policy"), `ui/adminRegistry.ts` (`risk-extra`), `settings/pages/RiskPolicyPage.tsx` | The generic form (the fixed rows drawn by `FieldRow` as locked values with a padlock and the reason; locked fields are never in a patch), and under it **What the assistant says when it refuses**: for each class the saved outcome and the sentence the person hears, in the household's language (Home › Language: Dutch or English), made with `decodeRiskPolicy`, `decideRisk` and `riskSpoken` from `@pva/protocol`. The form's own labels are English, like every admin page |
+| Mock | `apps/web/mock/server.ts` (section `risk`) | The same fields; a save is checked with `riskPolicyPatchProblems` (the real section's function: the same answers, `riskPolicySaveParity.test.ts`) before the generic checks, and money/security are never written. A press (a notification's action, a presentation's tick or button) is decided with the shared decoder, `decideRisk` (class `change`) and the shared spoken refusal; `stop` is never refused |
+
+Not built: a policy per assistant or per device (the plan's later P8), Connections and OAuth.
+
 ## Status: phase 2b (P4 and P7, 2026-11-14)
 
 **Built: P4 and P7** (protocol 4). Still not built: P6 (tools, Claude login: the jobs model is ready for it), P8, P9.
@@ -265,7 +302,9 @@ not in the UI unless stated); *drop* = remove.
 | `CLOCK_TIME_ZONE` | IANA zone | Home's time zone (WP-12a), else the machine's | `modules-builtin/src/clock.ts` | yes | **UI** → Modules › Clock |
 | `WEATHER_DEFAULT_PLACE`, `WEATHER_UNITS` | Place, units | Home's location and units (WP-12a) | `weather.ts` | yes | **UI** → Modules › Weather |
 | `HOME_ASSISTANT_URL`, `HOME_ASSISTANT_TOKEN` | HA address, token | — | `module-home-assistant/src/module.ts:43,51` | in the catalog since WP-12c | **UI**, token in the vault → Modules › Home Assistant |
-| `HOME_LOCATION`, `HOME_TIME_ZONE`, `HOME_LANGUAGE`, `HOME_UNITS`, `HOME_DATE_FORMAT` | Home (docs/ASSISTANTS.md §2.4) | —, the machine's, `en-GB`, `metric`, `en-GB` | section `home` (`sectionDefinitions.ts`); the prompts' Home line and the modules' linked defaults | yes (WP-12a) | **UI** → Shared settings › Home |
+| `HOME_LOCATION`, `HOME_TIME_ZONE`, `HOME_LANGUAGE`, `HOME_UNITS`, `HOME_DATE_FORMAT`, `HOME_CURRENCY`, `HOME_CUP_SIZE`, `HOME_API_CONTACT` | Home (docs/ASSISTANTS.md §2.4) | —, the machine's, `en-GB`, `metric`, `en-GB`, `EUR`, `metric`, — | section `home` (`sectionDefinitions.ts`); the prompts' Home line and the modules' linked defaults | yes (WP-12a) | **UI** → Shared settings › Home |
+| `HOUSEHOLD_DIET_ALLERGIES`, `HOUSEHOLD_DIET_DIETS`, `HOUSEHOLD_DIET_DISLIKES` | Members: the household's diet (protocol 11, P5) | none | section `members` (`serve/people.ts`); the `People` service | yes | **UI** → Shared settings › Members |
+| `HOUSEHOLD_MEMBERS` | Members: the people. **Not read from the environment**: people get ids the server makes and keeps, which an environment variable cannot hold. The environment view lists it under "Not read" with that reason (`EnvEntry.refused`), and the start logs a warning | none | section `members`, saved values only | no | **UI** → Shared settings › Members; remove the variable |
 | `RECORD_HEARD_AUDIO`, `RECORD_HEARD_AUDIO_MAX_FILES` | Save what the recogniser heard | false, 50 | read only through `sections.value` (`serveMode.ts:163–164`); env only as a lock | yes | **UI** → Diagnostics › Recordings |
 
 ### 1.6 Serve mode, paths and bootstrap
@@ -478,7 +517,7 @@ the module form), then embedded cards (tool card, downloads, engine list). It ma
 | Need | Existing | New / changed |
 |---|---|---|
 | Generated form | `SettingsForm.tsx` (draft, patch, server errors, stale "Changed in another tab", Advanced disclosure) | Save/Cancel move to a sticky page footer (one footer per page; with two forms on a page, Save saves both and reports per form); `visibleWhen`; warnings; "default"/"changed" marker + "Reset to default" per field (sends `null`, already supported by `SettingsPatch`) |
-| Field renderers | `fields/*.tsx`, `ui/fieldRenderers.ts` | Choice options render `tags` as chips and disable `unavailable` options with the reason and an inline action ("Download · 640 MB"); the v2 types from AGENTS-AND-INTENTS §4.3 when piece G lands |
+| Field renderers | `fields/*.tsx`, `ui/fieldRenderers.ts` | Choice options render `tags` as chips and disable `unavailable` options with the reason and an inline action ("Download · 640 MB"); the v2 types from AGENTS-AND-INTENTS §4.3 since protocol 10 (text lists, records, combos, buttons, info values; docs/UI-AND-MODULES.md §1.11) |
 | Module page | `ModuleCard.tsx` (switch, status, error/Retry, form, tools) | Becomes `ModulePage`: the same parts laid out as a page (switch in the header); `ModuleCard` stays for compact lists (Overview) |
 | Engines list, voices list | `AssistantTab.tsx` | Split: engines → Overview and the category pages; reload bar → global shell |
 | Device settings | `DeviceTab.tsx` | Split into three pages; no logic change |
@@ -670,10 +709,30 @@ each file with `util.parseEnv(readFileSync(path))` (available in this Node **[ru
 2. Rewrite the file: back it up as `.env.bak-<timestamp>` (0600), replace the line with
    `# KEY moved to the settings UI on 2026-11-14` (never echo the value), and write atomically (temp + rename, keeping
    the file mode).
-3. `envView.release(key)` → forms re-resolve. The field unlocks and now shows `source: "saved"`/`"vault"`. Broadcast
-   `section.changed`/`module.changed`.
+3. Only after every rewrite of the move has succeeded and been checked, release all its keys from `envView` →
+   forms re-resolve. The fields unlock and now show `source: "saved"`/`"vault"`. Broadcast `section.changed`/`module.changed`.
+   If any rewrite or check fails, every key of the move stays locked, no move announcement is sent, and the answer says
+   to retry. This order applies to every kind of key, both a single Move and Move all.
 4. If a released key is a reload field, set `reloadPending`. The running engines keep the old value until the reload,
    so nothing changes mid-turn.
+
+For every kind of key, the move first reads every loaded file and compares its parsed values for the moved keys
+with the declarations captured at startup (or after this mover's own successful rewrites). A changed declaration or unreadable file refuses the move before any settings are saved;
+restart the assistant to reload the `.env` files, then retry. The override and field lock stay in place until the value
+is saved and every loaded file has been checked with Node's parser to contain no assignment for any key of the move.
+After saving, the mover rereads every loaded file and compares its full text with the pre-save check; the rewrite
+also rereads its file immediately before replacement. A changed or unreadable file keeps the override locked and
+returns the retry sentence; hand edits require restarting the assistant to reload the files first. The line scanner
+uses Node's whitespace rules before a quote and includes Unicode line separators inside comments. Before replacement,
+Node's parser must confirm that every other key keeps its value; the mover checks those values again after rewriting.
+Shadowed declarations are removed first, the winning declaration last; a failed or incomplete rewrite leaves earlier
+declarations in place, the override effective and the field locked. The value is already saved, and retrying the move
+finishes the remaining rewrites. A completed rewrite whose verification read failed is remembered: Retry accepts the
+key's verified absence, but refuses an unexpected replacement value. File rewrites, release and the section
+announcement finish without caller interruption between them. An unrelated Home save does not write `HOME_LANGUAGE`.
+
+A move rewrites the file it has just read, so the files must not be edited by hand while a move runs; an edit made
+in the instant between that read and the rewrite can be lost.
 
 The Overrides page (Keys & access › Settings from outside) is derived client-side from every form's `locked` fields,
 plus a server-provided list of known `.env` keys that match no field (`unusedEnvKeys`, so typos like

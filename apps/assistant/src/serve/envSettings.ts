@@ -2,11 +2,14 @@ import type { ModuleDefinition, ModuleHost, Setting, SettingsSpec } from "@pva/c
 import type { HostResult } from "@pva/core"
 import type { EnvEntry, EnvInfo, EnvKind, SettingsGroup, SettingsPatch, SettingValue } from "@pva/protocol"
 import { Effect } from "effect"
+import { readFile } from "node:fs/promises"
+import { parseEnv } from "node:util"
 import { type CommentOutResult, commentOutKeys, type EnvOrigin, type EnvView } from "../envView.ts"
 import { assistantFieldOf, MIGRATED_ASSISTANT_ID } from "./migrateAssistants.ts"
 import type { Sections } from "./sections.ts"
 import { sectionDefinitions } from "./sectionDefinitions.ts"
 import type { SettingsStore } from "./SettingsStore.ts"
+import { MEMBERS_ENV_REFUSED, MEMBERS_KEY } from "./people.ts"
 
 /**
  * Settings set outside the UI (docs/SETTINGS-UI.md §4.4): which environment
@@ -32,7 +35,8 @@ export const BOOTSTRAP_KEYS: ReadonlySet<string> = new Set([
   "SERVE_HOST",
   "SERVE_PORT",
   "SERVE_TLS_CERT",
-  "SERVE_TLS_KEY"
+  "SERVE_TLS_KEY",
+  "SERVE_BEHIND_PROXY"
 ])
 
 /** Benchmarks, tests and the command-line modes' audio (docs/SETTINGS-UI.md §1). */
@@ -91,6 +95,12 @@ const ENGINE_KEYS: Readonly<Record<string, string>> = {
 }
 /** `VOICE_<NAME>_<KEY>`: a per-voice override of an engine key (or `VOICE_<NAME>_PROVIDER`). */
 const VOICE_KEY = /^VOICE_[A-Z0-9]+_(.+)$/
+
+/**
+ * Variables the assistant knows and refuses to read, with why (shown in the environment view; protocol 11
+ * `EnvEntry.refused`). `HOUSEHOLD_MEMBERS`: people have ids the server makes.
+ */
+export const REFUSED_KEYS: Readonly<Record<string, string>> = { [MEMBERS_KEY]: MEMBERS_ENV_REFUSED }
 
 const isSecretName = (key: string) => /(_API_KEY|_TOKEN|_SECRET|_PASSWORD)$/.test(key)
 
@@ -210,7 +220,8 @@ export const envInfo = (view: EnvView, envCatalog: EnvCatalog): EnvInfo => {
     const origin = view.origin(key)
     if (origin === undefined) continue
     const kind = envCatalog.kind(key)
-    if (origin.kind === "process" && kind === "unknown") continue
+    const refused = Object.hasOwn(REFUSED_KEYS, key) ? REFUSED_KEYS[key] : undefined
+    if (origin.kind === "process" && kind === "unknown" && refused === undefined) continue
     const target = envCatalog.target(key)
     entries.push({
       key,
@@ -219,7 +230,8 @@ export const envInfo = (view: EnvView, envCatalog: EnvCatalog): EnvInfo => {
       kind,
       secret: isSecretTarget(target, key) || BOOTSTRAP_KEYS.has(key) && isSecretName(key),
       ...(target !== undefined && kind === "setting" ? { page: { path: [...target.path], title: target.title } } : {}),
-      movable: origin.kind === "file" && kind === "setting"
+      movable: origin.kind === "file" && kind === "setting",
+      ...(refused !== undefined ? { refused } : {})
     })
   }
   return { files: [...view.files], entries }
@@ -245,10 +257,15 @@ export const makeEnvMover = (options: {
   readonly onMoved: () => void
   /** For tests. */
   readonly now?: () => Date
-  readonly commentOut?: (path: string, keys: ReadonlyArray<string>, now: Date) => Promise<CommentOutResult>
+  readonly commentOut?: (path: string, keys: ReadonlyArray<string>, now: Date, expectedText?: string) => Promise<CommentOutResult>
 }): EnvMover => {
   const envCatalog = makeEnvCatalog(options.catalog)
   const commentOut = options.commentOut ?? commentOutKeys
+  // Advance only after our own verified rewrites, so a partial move can still be retried.
+  const expectedFiles = new Map(options.view.files.map((file) => [file, Object.fromEntries(
+    Object.entries(options.view.fileValues(file)).filter(([key]) => envCatalog.kind(key) === "setting")
+  )]))
+  const pendingFiles = new Map<string, Set<string>>()
   let busy = false
 
   const fail = (code: "invalid_settings" | "locked" | "busy" | "internal", message: string): HostResult => ({ ok: false, error: { code, message } })
@@ -280,7 +297,29 @@ export const makeEnvMover = (options: {
 
       busy = true
       try {
+        const plannedKeys = planned.map((p) => p.key)
+        const checkedFiles = new Map<string, string>()
+        for (const file of options.view.files) {
+          const current = yield* Effect.tryPromise(async () => {
+            const text = await readFile(file, "utf8")
+            return { text, values: parseEnv(text) }
+          }).pipe(Effect.result)
+          if (current._tag === "Success") {
+            // A rename can succeed before its verification read fails. Absence on Retry completes that check.
+            for (const key of pendingFiles.get(file) ?? []) {
+              if (current.success.values[key] === undefined) {
+                delete expectedFiles.get(file)![key]
+                pendingFiles.get(file)!.delete(key)
+              }
+            }
+            checkedFiles.set(file, current.success.text)
+          }
+          if (current._tag === "Failure" || plannedKeys.some((key) => current.success.values[key] !== expectedFiles.get(file)?.[key])) {
+            return fail("invalid_settings", `${file} changed or could not be read: restart the assistant to reload .env files before moving these settings`)
+          }
+        }
         const moved: Array<Planned> = []
+        const released: Array<string> = []
         for (const p of planned) {
           const secret = isSecretTarget(p.target, p.key)
           // The value is checked like one typed on the page (no value in the message).
@@ -291,36 +330,89 @@ export const makeEnvMover = (options: {
               continue
             }
           }
-          options.view.release(p.key)
-          const saved = yield* save(p, secret)
+          // Every key stays effective and locked until every rewrite of this move is verified.
+          const saved = yield* Effect.uninterruptible(save(p, secret))
           if (!saved.ok) {
-            options.view.restore(p.key, p.text, p.origin)
             problems.push(`${p.key}: ${saved.message}`)
             continue
           }
           moved.push(p)
         }
         if (moved.length > 0) {
-          // Comment the lines out, one rewrite per file. A failure here leaves the value saved and the line in place.
-          const byFile = new Map<string, Array<string>>()
-          for (const p of moved) byFile.set(p.origin.path, [...(byFile.get(p.origin.path) ?? []), p.key])
-          for (const [file, fileKeys] of byFile) {
-            const result = yield* Effect.tryPromise(() => commentOut(file, fileKeys, (options.now ?? (() => new Date()))())).pipe(Effect.result)
-            if (result._tag === "Failure") {
-              const code = (result.failure.cause as NodeJS.ErrnoException | undefined)?.code ?? "error"
-              problems.push(`${fileKeys.join(", ")} saved, but ${file} could not be changed (${code}): comment the lines out by hand`)
-              yield* Effect.logWarning(`Moved ${fileKeys.join(", ")} into the settings, but could not edit ${file} (${code})`)
-            } else {
-              yield* Effect.logInfo(`Moved ${fileKeys.join(", ")} from ${file} into the settings (backup: ${result.success.backup})`)
+          yield* Effect.uninterruptible(Effect.gen(function*() {
+            // Saving can yield to a hand edit. Check every loaded path again before removing any declaration.
+            for (const [file, text] of checkedFiles) {
+              const unchanged = yield* Effect.tryPromise(async () => await readFile(file, "utf8") === text).pipe(Effect.result)
+              if (unchanged._tag === "Failure" || !unchanged.success) {
+                problems.push(`${file} changed or could not be read: retry the move; if the file was edited by hand, restart the assistant to reload .env files first`)
+                return
+              }
             }
-          }
-          options.sections.announceAll()
-          options.onMoved()
+            // Remove shadowed declarations first and the winning one last. If a rewrite fails, leave earlier
+            // declarations of that key in place: even a restart during this step still reads the chosen value.
+            const byFile = new Map<string, Array<string>>()
+            for (const file of [...options.view.files].reverse()) {
+              const fileKeys = moved.filter((p) => expectedFiles.get(file)?.[p.key] !== undefined).map((p) => p.key)
+              if (fileKeys.length > 0) byFile.set(file, fileKeys)
+            }
+            const failedKeys = new Set<string>()
+            for (const [file, plannedKeys] of byFile) {
+              const fileKeys = plannedKeys.filter((key) => !failedKeys.has(key))
+              if (fileKeys.length === 0) continue
+              const result = yield* Effect.tryPromise(async () => {
+                const rewritten = await commentOut(file, fileKeys, (options.now ?? (() => new Date()))(), checkedFiles.get(file))
+                const pending = pendingFiles.get(file) ?? new Set<string>()
+                for (const key of fileKeys) pending.add(key)
+                pendingFiles.set(file, pending)
+                // A completed write is not proof that the line scanner removed every Node-readable assignment.
+                const remaining = parseEnv(await readFile(file, "utf8"))
+                const before = checkedFiles.has(file) ? parseEnv(checkedFiles.get(file)!) : undefined
+                if (before !== undefined && [...new Set([...Object.keys(before), ...Object.keys(remaining)])]
+                  .some((key) => !fileKeys.includes(key) && before[key] !== remaining[key])) {
+                  throw new Error("Another environment value changed after rewriting")
+                }
+                if (fileKeys.some((key) => Object.hasOwn(remaining, key))) throw new Error("An environment assignment remains after rewriting")
+                return rewritten
+              }).pipe(Effect.result)
+              if (result._tag === "Failure") {
+                for (const key of fileKeys) failedKeys.add(key)
+                const code = (result.failure.cause as NodeJS.ErrnoException | undefined)?.code ?? "error"
+                problems.push(`${fileKeys.join(", ")} saved, but ${file} could not be changed (${code}): retry the move; if the file was edited by hand, restart the assistant to reload .env files first`)
+                yield* Effect.logWarning(`Moved ${fileKeys.join(", ")} into the settings, but could not edit ${file} (${code})`)
+              } else {
+                const expected = expectedFiles.get(file)
+                if (expected !== undefined) for (const key of fileKeys) {
+                  delete expected[key]
+                  pendingFiles.get(file)?.delete(key)
+                }
+                yield* Effect.logInfo(`Moved ${fileKeys.join(", ")} from ${file} into the settings (backup: ${result.success.backup})`)
+              }
+            }
+            // Even a path with no original declaration must be free of the moved key before unlocking.
+            const movedKeys = moved.filter((p) => !failedKeys.has(p.key)).map((p) => p.key)
+            if (movedKeys.length > 0) for (const file of options.view.files) {
+              const remaining = yield* Effect.tryPromise(async () => parseEnv(await readFile(file, "utf8"))).pipe(Effect.result)
+              const unverified = movedKeys.filter((key) => remaining._tag === "Failure" || Object.hasOwn(remaining.success, key))
+              if (unverified.length > 0) {
+                for (const key of unverified) failedKeys.add(key)
+                problems.push(`${unverified.join(", ")} saved, but ${file} could not be verified: retry the move; if the file was edited by hand, restart the assistant to reload .env files first`)
+              }
+            }
+            if (failedKeys.size === 0) {
+              for (const p of moved) {
+                options.view.release(p.key)
+                released.push(p.key)
+              }
+              if (moved.some((p) => p.target.kind === "module")) yield* options.host.refresh
+              options.sections.announceAll()
+              options.onMoved()
+            }
+          }))
         }
         if (problems.length > 0) {
-          return { ...fail("invalid_settings", problems.join("; ")), moved: moved.map((p) => p.key) }
+          return { ...fail("invalid_settings", problems.join("; ")), moved: released }
         }
-        return { ok: true, moved: moved.map((p) => p.key) } as const
+        return { ok: true, moved: released } as const
       } finally {
         busy = false
       }

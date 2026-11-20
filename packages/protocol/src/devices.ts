@@ -4,6 +4,7 @@ import type { AssistantHearing, Issue } from "./assistants.ts"
 import { DeviceLook, DeviceVoice, FOLLOW_ASSISTANT, Look, lookFor } from "./looks.ts"
 import { InterruptMode, NonNegativeFinite, OutputPath } from "./common.ts"
 import { DeviceId, DeviceInfo, DeviceName, FrontendKindId, PrebufferMs, WAKE_PHRASES_MAX, WakeMatch, WakePhrase, wakeWords, WEB_VOICE_KIND } from "./frontends.ts"
+import { BUILT_IN_PLACE, canSpeak, CapabilityOverrides, DeclaredCapabilities, type DeviceCapabilities, DeviceLiveState, DevicePlace, NO_OVERRIDES } from "./capabilities.ts"
 
 /**
  * Devices, device types and assignments (docs/ASSISTANTS.md §2.3, §2.6, protocol 7 schemas). Pure and browser-safe.
@@ -79,7 +80,11 @@ export const DeviceSettings = Schema.Struct({
   /** The character on the voice stage for every assistant on the device, or each assistant's (docs/LOOKS-AND-VOICES.md). */
   look: DeviceLook,
   /** The voice of every assistant on the device, or each assistant's own. */
-  voice: DeviceVoice
+  voice: DeviceVoice,
+  /** Protocol 11 (P5): its room, how private it is, whose it is by default (`capabilities.ts`). */
+  place: DevicePlace,
+  /** Protocol 11 (P5): what the owner took away from what it declares (`effectiveCapabilities`). */
+  capabilities: CapabilityOverrides
 })
 export type DeviceSettings = typeof DeviceSettings.Type
 
@@ -93,7 +98,9 @@ export const DeviceSettingsKey = Schema.Literals([
   "audio",
   "captions",
   "look",
-  "voice"
+  "voice",
+  "place",
+  "capabilities"
 ])
 export type DeviceSettingsKey = typeof DeviceSettingsKey.Type
 export const DEVICE_SETTINGS_KEYS: ReadonlyArray<DeviceSettingsKey> = DeviceSettingsKey.literals
@@ -108,7 +115,9 @@ export const DeviceOwn = Schema.Struct({
   audio: Schema.optionalKey(DeviceAudio),
   captions: Schema.optionalKey(DeviceCaptions),
   look: Schema.optionalKey(DeviceLook),
-  voice: Schema.optionalKey(DeviceVoice)
+  voice: Schema.optionalKey(DeviceVoice),
+  place: Schema.optionalKey(DevicePlace),
+  capabilities: Schema.optionalKey(CapabilityOverrides)
 })
 export type DeviceOwn = typeof DeviceOwn.Type
 
@@ -122,7 +131,9 @@ export const DeviceSettingsPatch = Schema.Struct({
   audio: Schema.optionalKey(Schema.NullOr(DeviceAudio)),
   captions: Schema.optionalKey(Schema.NullOr(DeviceCaptions)),
   look: Schema.optionalKey(Schema.NullOr(DeviceLook)),
-  voice: Schema.optionalKey(Schema.NullOr(DeviceVoice))
+  voice: Schema.optionalKey(Schema.NullOr(DeviceVoice)),
+  place: Schema.optionalKey(Schema.NullOr(DevicePlace)),
+  capabilities: Schema.optionalKey(Schema.NullOr(CapabilityOverrides))
 })
 export type DeviceSettingsPatch = typeof DeviceSettingsPatch.Type
 
@@ -132,7 +143,9 @@ export const DeviceRecord = Schema.Struct({
   name: DeviceName,
   firstSeen: NonNegativeFinite,
   lastSeen: NonNegativeFinite,
-  own: DeviceOwn
+  own: DeviceOwn,
+  /** Protocol 11 (P5): what it declared last (`hello.device.capabilities`, `device.caps`), kept while it is offline. */
+  declared: Schema.optionalKey(DeclaredCapabilities)
 })
 export type DeviceRecord = typeof DeviceRecord.Type
 
@@ -167,7 +180,9 @@ export const BUILT_IN_WEB_VOICE_SETTINGS: DeviceSettings = {
   audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true, speakAloud: true, outputPath: "direct", prebufferMs: 60 },
   captions: { captions: true, speakTyped: true },
   look: FOLLOW_ASSISTANT,
-  voice: FOLLOW_ASSISTANT
+  voice: FOLLOW_ASSISTANT,
+  place: BUILT_IN_PLACE,
+  capabilities: NO_OVERRIDES
 }
 
 export const WEB_VOICE_DEVICE_TYPE: DeviceTypeDefinition = {
@@ -543,7 +558,11 @@ export const DeviceRecordInfo = Schema.Struct({
   hearer: Schema.NullOr(AssistantId),
   rev: Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)),
   connections: Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)),
-  audioOwner: Schema.Boolean
+  audioOwner: Schema.Boolean,
+  /** Protocol 11: what it declared last, and when. */
+  declared: Schema.optionalKey(DeclaredCapabilities),
+  /** Protocol 11: whether it is visible now and when it was last used (connected devices). */
+  live: Schema.optionalKey(DeviceLiveState)
 })
 export type DeviceRecordInfo = typeof DeviceRecordInfo.Type
 
@@ -556,7 +575,11 @@ export const DeviceListInfo = Schema.Struct({
   own: DeviceOwn,
   settings: DeviceSettings,
   hearer: Schema.NullOr(AssistantId),
-  rev: Schema.Int.check(Schema.isGreaterThanOrEqualTo(0))
+  rev: Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)),
+  /** Protocol 11 (P5): what it declared last, and when ("What it can do" in admin). */
+  declared: Schema.optionalKey(DeclaredCapabilities),
+  /** Protocol 11: whether a tab of it is visible now and when it was last used (while connected). */
+  live: Schema.optionalKey(DeviceLiveState)
 })
 export type DeviceListInfo = typeof DeviceListInfo.Type
 
@@ -597,8 +620,17 @@ export type DeviceSetup = typeof DeviceSetup.Type
 export const deviceSetupFrom = (
   settings: DeviceSettings,
   assistants: ReadonlyMap<string, Pick<Assistant, "id" | "name" | "purpose" | "on" | "look">>,
-  options: { readonly deviceId?: string | undefined; readonly canAuto: boolean }
+  options: {
+    readonly deviceId?: string | undefined
+    readonly canAuto: boolean
+    /**
+     * P5: whether the server will send reply audio to this device (its effective speaker: the `capabilities` section's
+     * "Don't use its speaker", and a declaration whose speaker plays speech). Absent: from the override alone.
+     */
+    readonly speakerAllowed?: boolean
+  }
 ): DeviceSetup => {
+  const speaks = options.speakerAllowed ?? !settings.capabilities.noSpeaker
   const listed = settings.assistants.flatMap((a) => {
     const known = assistants.get(a.assistant)
     if (known === undefined) return []
@@ -613,8 +645,30 @@ export const deviceSetupFrom = (
     canPick: settings.voicePage.pick && listed.length > 1,
     canAuto: options.canAuto,
     interruptMode: settings.interruptMode,
-    audio: settings.audio,
-    captions: settings.captions,
+    // P5: where the server sends no reply audio (the override, or a declaration without speech), nothing is said to
+    // be spoken here, typed replies included: the flags agree with what is sent.
+    audio: speaks ? settings.audio : { ...settings.audio, speakAloud: false },
+    captions: speaks ? settings.captions : { ...settings.captions, speakTyped: false },
     ...(settings.look.from === "device" ? { look: settings.look.look } : {})
   }
+}
+
+/**
+ * P5: whether reply audio is sent to a device: not when its effective `capabilities` section says "Don't use its
+ * speaker", nor when its latest declaration has no speaker that plays speech. A device that never declared anything (a
+ * page of an older build) may. The server (`deviceFacts.ts`, where audio leaves) and the mock decide with this.
+ */
+export const speakerAllowedFrom = (settings: Pick<DeviceSettings, "capabilities">, declared: DeviceCapabilities | undefined): boolean =>
+  !settings.capabilities.noSpeaker && (declared === undefined || canSpeak(declared))
+
+/**
+ * P5: what decides what a device may be told or sent, as one comparable text: its privacy, its default person while a
+ * member, and its output overrides (no speaker, no display, excluded kinds). When a save changes it, the device's
+ * session ends with its connections (`CloseCode.settingsChanged`); the room, name, always-on, accepts-from-others and
+ * quiet-room are not in it. The server (`deviceFacts.ts`) and the mock compare with this.
+ */
+export const boundaryKey = (settings: Pick<DeviceSettings, "place" | "capabilities">, isMember: (id: string) => boolean): string => {
+  const caps = settings.capabilities
+  const person = settings.place.defaultPerson !== null && isMember(settings.place.defaultPerson) ? settings.place.defaultPerson : ""
+  return `${settings.place.privacy}|${person}|${caps.noSpeaker ? 1 : 0}|${caps.noDisplay ? 1 : 0}|${[...caps.excludeKinds].sort().join(",")}`
 }

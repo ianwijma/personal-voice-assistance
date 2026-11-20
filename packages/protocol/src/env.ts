@@ -27,7 +27,12 @@ export const EnvEntry = Schema.Struct({
   /** The settings page that shows it (`#settings/<category>/<page>` as a path), when there is one. */
   page: Schema.optionalKey(Schema.Struct({ path: Schema.Array(Schema.String), title: Schema.String })),
   /** "Move to settings" is possible: a setting from a `.env` file. */
-  movable: Schema.Boolean
+  movable: Schema.Boolean,
+  /**
+   * Protocol 11: the assistant does not read this variable and says why (`HOUSEHOLD_MEMBERS`: people get ids the
+   * server makes, which an environment variable cannot hold). Shown instead of a page link.
+   */
+  refused: Schema.optionalKey(Schema.String)
 })
 export type EnvEntry = typeof EnvEntry.Type
 

@@ -21,6 +21,8 @@ import { EnvInfo } from "./env.ts"
 import { JobInfo, ModelSet } from "./jobs.ts"
 import { VaultInfo } from "./vault.ts"
 import { AdminState } from "./admin.ts"
+import { AssistantTemplate, HealthInfo, MAX_MODULE_TEMPLATES, MAX_TOOL_RISKS, ModuleUnavailable } from "./health.ts"
+import { MAX_ROUTES_PER_MODULE, ModuleRouteInfo } from "./moduleRoutes.ts"
 
 /** A one-line status a running module publishes, e.g. "Connected · 143 entities". */
 export const StatusLine = Schema.Struct({
@@ -29,14 +31,46 @@ export const StatusLine = Schema.Struct({
 })
 export type StatusLine = typeof StatusLine.Type
 
-export const ModuleState = Schema.Literals(["disabled", "starting", "running", "stopping", "error"])
+/**
+ * Protocol 9 adds `unavailable`: the module cannot run on this server (a program or platform it needs is missing, or
+ * it was written for an unsupported module API; `ModuleInfo.unavailable` says why). It is never started. A page that
+ * does not know a state shows it as `error`.
+ */
+export const ModuleState = Schema.Literals(["disabled", "starting", "running", "stopping", "error", "unavailable"])
 export type ModuleState = typeof ModuleState.Type
+
+/**
+ * Protocol 9: what a tool or action may do (module-definition §B.5). `read`: lookups; `change`: lights, music, timers;
+ * `message`: send mail or chat as the owner; `money`: purchases, bookings; `security`: locks, alarms, cameras.
+ * Inferred when a module does not say: a speculative tool is `read`, any other `change`. Carried only; a later
+ * protocol enforces it with a policy.
+ */
+export const ToolRisk = Schema.Literals(["read", "change", "message", "money", "security"])
+export type ToolRisk = typeof ToolRisk.Type
+/**
+ * Protocol 9: whose a result is (docs/MODULES-PLAN.md §2 row 8): `household` (default), `personal` (one person's; the
+ * module names the owner, or it is unknown), or `per-result` (the module decides for each result).
+ */
+export const ToolSensitivity = Schema.Literals(["household", "personal", "per-result"])
+export type ToolSensitivity = typeof ToolSensitivity.Type
+/** Protocol 9: how long a call usually takes: `instant` (< 50 ms), `quick` (< 1 s), `slow` (seconds), `background`. Default `quick`. */
+export const ToolLatency = Schema.Literals(["instant", "quick", "slow", "background"])
+export type ToolLatency = typeof ToolLatency.Type
 
 export const ToolInfo = Schema.Struct({
   name: Schema.String,
   description: Schema.String,
   /** Read-only: may run before the user has finished speaking. */
-  speculative: Schema.Boolean
+  speculative: Schema.Boolean,
+  /** Protocol 9: the declared or inferred class; absent when it depends on the input (or from an older server). */
+  risk: Schema.optionalKey(ToolRisk),
+  /**
+   * Protocol 9: every class a call can have: `[risk]` for a fixed class, the declared list when the class depends on
+   * the input (a cover tool: `change` and `security`). A later policy leaves a tool out of a list by these.
+   */
+  risks: Schema.optionalKey(Schema.Array(ToolRisk).check(Schema.isMaxLength(MAX_TOOL_RISKS))),
+  sensitivity: Schema.optionalKey(ToolSensitivity),
+  latency: Schema.optionalKey(ToolLatency)
 })
 export type ToolInfo = typeof ToolInfo.Type
 
@@ -67,6 +101,11 @@ export const ModuleInfo = Schema.Struct({
   status: Schema.optionalKey(StatusLine),
   /** Tools of the running instance (empty while it is not running). */
   tools: Schema.Array(ToolInfo),
+  /**
+   * Protocol 10: tools of the running instance not listed in `tools` (the admin view lists at most 100, and a
+   * module's tools count toward what its form may take); the page says "and N more". Absent = none left out.
+   */
+  toolsLeft: Schema.optionalKey(NonNegativeInt),
   settings: SettingsForm,
   /** Increases on every change to this module; a client keeps the highest it has seen. */
   revision: NonNegativeInt,
@@ -88,7 +127,27 @@ export const ModuleInfo = Schema.Struct({
    * one switched-on assistant has it on", `state` sums up the instances (`error` when one fails), and each instance
    * is listed with its assistants. Absent: one instance at most, following `enabled`.
    */
-  instances: Schema.optionalKey(Schema.Array(ModuleInstanceInfo))
+  instances: Schema.optionalKey(Schema.Array(ModuleInstanceInfo)),
+  /** Protocol 9: why it is `unavailable` (present exactly then). */
+  unavailable: Schema.optionalKey(ModuleUnavailable),
+  /** Protocol 9: the module's own version (its manifest's `version`), shown in the UI. */
+  version: Schema.optionalKey(Schema.String.check(Schema.isMaxLength(40))),
+  /** Protocol 9: the module API it was written for (absent = 1). */
+  apiVersion: Schema.optionalKey(Schema.Int),
+  /** Protocol 9: the assistants it suggests (the new-assistant flow offers them). Absent = none. */
+  templates: Schema.optionalKey(Schema.Array(AssistantTemplate).check(Schema.isMaxLength(MAX_MODULE_TEMPLATES))),
+  /**
+   * Protocol 10: the HTTP routes its shared part declares (docs/UI-AND-MODULES.md §1.11), while it runs. Absent =
+   * none. The recent calls and the tokens are read through the admin API (`GET /api/module-routes`).
+   */
+  routes: Schema.optionalKey(Schema.Array(ModuleRouteInfo).check(Schema.isMaxLength(MAX_ROUTES_PER_MODULE))),
+  /**
+   * Protocol 10: `"follow"` on a module of `admin.snapshot` whose complete entry did not fit the snapshot's share of
+   * its frame: this entry carries only its identity, switch, state and short error (an empty form, no tools), and the
+   * complete entry follows at once, in its own `module.changed` of the same send. A page shows the module as loading
+   * until then, never makes a form of it, and keeps a complete entry it already has. Absent = complete.
+   */
+  details: Schema.optionalKey(Schema.Literal("follow"))
 })
 export type ModuleInfo = typeof ModuleInfo.Type
 
@@ -301,6 +360,34 @@ export type TraceEventName = typeof TRACE_EVENT_NAMES[number]
  * One turn's latency trace. Marks are milliseconds relative to end of turn
  * (negative: done early by a promoted speculative turn), as in the CLI's latency line.
  */
+/** What took an utterance and what it came to (`TraceInfo.phrase`). */
+export const PhraseTraceInfo = Schema.Struct({
+  by: Schema.Literals(["ringing", "control", "command"]),
+  /** The control, the action (`<module>.<action>`), or the ringing match ("stop", or the action id). */
+  name: Schema.String.check(Schema.isMaxLength(120)),
+  /** The outcome (`PhraseDid`: "ran", "stopped-ring", "refused", "failed", …). */
+  did: Schema.String.check(Schema.isMaxLength(40)),
+  why: Schema.optionalKey(Schema.String.check(Schema.isMaxLength(300))),
+  /** The class the execution gateway judged a command's call as, and its refusal. */
+  risk: Schema.optionalKey(Schema.String.check(Schema.isMaxLength(20))),
+  refused: Schema.optionalKey(Schema.String.check(Schema.isMaxLength(300))),
+  /**
+   * P8 (additive): the household risk policy's decision for the command's action, when one was taken: its outcome and
+   * the class it was decided by (as for the model's call of the same action).
+   */
+  decision: Schema.optionalKey(Schema.Struct({
+    outcome: Schema.Literals(["allow", "confirm", "deny"]),
+    by: Schema.String.check(Schema.isMaxLength(20))
+  })),
+  /** The person the command ran for (a Members id). */
+  person: Schema.optionalKey(Schema.String.check(Schema.isMaxLength(64))),
+  /** How long the module's action ran. */
+  actionMs: Schema.optionalKey(Schema.Finite.check(Schema.isGreaterThanOrEqualTo(0))),
+  /** P10: the action also showed a presentation (its outcome carried one, handed to the Presenter). */
+  presented: Schema.optionalKey(Schema.Boolean)
+})
+export type PhraseTraceInfo = typeof PhraseTraceInfo.Type
+
 export const TraceInfo = Schema.Struct({
   turnId: TurnId,
   mode: TurnSource,
@@ -340,7 +427,12 @@ export const TraceInfo = Schema.Struct({
    * Everything measured in the turn, ordered by `at` (at most 200 entries): from the user starting to speak to the
    * reply's end. It repeats the `marks` (same names) and adds the rest. Absent: an older server.
    */
-  timeline: Schema.optionalKey(Schema.Array(TraceEvent))
+  timeline: Schema.optionalKey(Schema.Array(TraceEvent)),
+  /**
+   * P7, additive within 11 (docs/PHRASES.md "Traces"): present on the execution trace of a taken utterance (a phrase
+   * command, a host control, the ringing window), which is no conversation turn; an older page ignores the key.
+   */
+  phrase: Schema.optionalKey(PhraseTraceInfo)
 })
 export type TraceInfo = typeof TraceInfo.Type
 
@@ -443,6 +535,8 @@ export const AdminSnapshot = Schema.Struct({
   /** Protocol 7: the assistants (replaces nothing yet). */
   assistants: Schema.optionalKey(Schema.Array(AssistantInfo)),
   /** Protocol 7: the device types with their defaults (replaces `frontends`). */
-  deviceTypes: Schema.optionalKey(Schema.Array(DeviceTypeInfo))
+  deviceTypes: Schema.optionalKey(Schema.Array(DeviceTypeInfo)),
+  /** Protocol 9: the issue registry (Diagnostics › Health). Absent: the server keeps none (tests). */
+  health: Schema.optionalKey(HealthInfo)
 })
 export type AdminSnapshot = typeof AdminSnapshot.Type

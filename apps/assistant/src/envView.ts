@@ -24,7 +24,8 @@ export interface EnvAssignment {
   readonly lines: number
 }
 
-const ASSIGNMENT = /^\s*(?:export\s+)?([\w.-]+)\s*=\s*(.*)$/
+// Node ignores carriage returns and skips only spaces and tabs before a quoted value.
+const ASSIGNMENT = /^[ \t\r]*(?:export[ \t\r]+)?([\w.-]+)[ \t\r]*=[ \t\r]*(.*)$/s
 
 /**
  * The assignments of a `.env` text, in order (a key assigned twice appears twice; the last one wins, as in
@@ -77,6 +78,10 @@ export interface EnvView {
   readonly locationOf: (key: string) => { readonly file: string; readonly line: number } | undefined
   /** The `.env` files read, in the order they were applied (the first one wins). */
   readonly files: ReadonlyArray<string>
+  /** Every loaded file that declares a key, including declarations shadowed by an earlier file. */
+  readonly declaredIn: (key: string) => ReadonlyArray<string>
+  /** Parsed declarations at startup, including shadowed values, for move-time validation. */
+  readonly fileValues: (path: string) => Readonly<Record<string, string>>
   /** Every set variable (non-empty), including redacted ones (their value is gone, their origin is kept). */
   readonly keys: () => ReadonlyArray<string>
   /**
@@ -105,9 +110,14 @@ export const makeEnvView = (options: EnvViewOptions): EnvView => {
   const origins = new Map<string, EnvOrigin>()
   for (const key of Object.keys(record)) origins.set(key, { kind: "process" })
   const files: Array<string> = []
+  const declarations = new Map<string, Array<string>>()
+  const fileValues = new Map<string, Record<string, string>>()
   for (const file of options.files ?? []) {
     files.push(file.path)
-    for (const { key, value, line } of parseEnvFile(file.text)) {
+    const parsed = parseEnvFile(file.text)
+    fileValues.set(file.path, Object.fromEntries(parsed.map(({ key, value }) => [key, value])))
+    for (const { key, value, line } of parsed) {
+      declarations.set(key, [...(declarations.get(key) ?? []), file.path])
       if (Object.hasOwn(record, key)) continue
       record[key] = value
       origins.set(key, { kind: "file", path: file.path, line })
@@ -137,11 +147,14 @@ export const makeEnvView = (options: EnvViewOptions): EnvView => {
       return o?.kind === "file" ? { file: o.path, line: o.line } : undefined
     },
     files,
+    declaredIn: (key) => declarations.get(key) ?? [],
+    fileValues: (path) => fileValues.get(path) ?? {},
     keys: () => [...Object.keys(record).filter((k) => (record[k] ?? "") !== ""), ...redacted.keys()],
     redact: (key) => {
       const origin = origins.get(key)
       if (!Object.hasOwn(record, key) || origin === undefined) return
       if ((record[key] ?? "") !== "") redacted.set(key, origin)
+      for (const values of fileValues.values()) delete values[key]
       delete record[key]
       origins.delete(key)
       if (options.mirror !== undefined) delete options.mirror[key]
@@ -186,9 +199,11 @@ export interface CommentOutResult {
 export const commentOutKeys = async (
   path: string,
   keys: ReadonlyArray<string>,
-  now: Date = new Date()
+  now: Date = new Date(),
+  expectedText?: string
 ): Promise<CommentOutResult> => {
   const text = await readFile(path, "utf8")
+  if (expectedText !== undefined && text !== expectedText) throw new Error("The environment file changed before rewriting")
   const { mode } = await stat(path)
   const wanted = new Set(keys)
   const eol = text.includes("\r\n") ? "\r\n" : "\n"
@@ -205,14 +220,23 @@ export const commentOutKeys = async (
   }
   for (; next < lines.length; next++) out.push(lines[next]!)
 
+  const rewritten = out.join(eol)
+  const originalValues = parseEnv(text)
+  const rewrittenValues = parseEnv(rewritten)
+  const otherKeys = new Set([...Object.keys(originalValues), ...Object.keys(rewrittenValues)].filter((key) => !wanted.has(key)))
+  if ([...otherKeys].some((key) => originalValues[key] !== rewrittenValues[key])) {
+    throw new Error("Rewriting would change another environment value")
+  }
+
   const stamp = now.toISOString().replace(/[:.]/g, "-")
   const backup = `${path}.bak-${stamp}`
   await copyFile(path, backup)
   await chmod(backup, 0o600)
   const tmp = join(dirname(path), `.${basename(path)}.${randomBytes(6).toString("hex")}.tmp`)
   try {
-    await writeFile(tmp, out.join(eol), { mode: mode & 0o777 })
+    await writeFile(tmp, rewritten, { mode: mode & 0o777 })
     await chmod(tmp, mode & 0o777)
+    if (await readFile(path, "utf8") !== text) throw new Error("The environment file changed before rewriting")
     await rename(tmp, path)
   } catch (error) {
     await unlink(tmp).catch(() => {})

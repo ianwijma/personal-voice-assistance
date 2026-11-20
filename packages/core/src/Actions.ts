@@ -1,6 +1,8 @@
+import type { Presentation, ShowOptions } from "./Present.ts"
 import { Effect, Schema } from "effect"
 import { ToolError } from "./Errors.ts"
-import { makeTool, type Tool } from "./Module.ts"
+import { makeTool, type RiskByInput, type Tool, type ToolMetadata } from "./Module.ts"
+import type { ActionPhrases } from "./Phrases.ts"
 import { editDistance, normalizePhrase, phoneticKey } from "./TextMatching.ts"
 import { parseDuration } from "./ValueParsing.ts"
 
@@ -148,9 +150,13 @@ export class ActionError extends Schema.TaggedError<ActionError>()("ActionError"
 export interface ActionOutcome {
   /** Spoken after the action ran (a query's answer: "It's 14:32."). */
   readonly say?: string
+  /** P10: shown on the device the action ran for (docs/PRESENTING.md); `say` is still spoken. */
+  readonly present?: Presentation
+  /** P10: how it is shown (lifetime, key, end). */
+  readonly show?: ShowOptions
 }
 
-export interface ActionDefinition<P extends ActionParams = ActionParams> {
+export interface ActionDefinition<P extends ActionParams = ActionParams> extends ToolMetadata<ParamValues<P>> {
   /** Unique within the module: `/^[a-z][a-z0-9_]{0,39}$/`. The global id is `<moduleId>.<id>`. */
   readonly id: string
   /** Short imperative label for the UI and default confirmations: "Turn lights on". */
@@ -180,7 +186,22 @@ export interface ActionDefinition<P extends ActionParams = ActionParams> {
    * is committed. Leave it out for queries, whose answer comes from `run`.
    */
   readonly announce?: (params: ParamValues<P>) => string
-  /** Do it. Must finish well within 5 s (the intent agent's limit); it is not interrupted once started. */
+  /**
+   * P7 (docs/PHRASES.md): phrase commands that run this action without the language model, per language, after the
+   * wake phrase or in a follow-up window: words and `{param}` slots ("set a timer for {duration}"), at most
+   * `PHRASE_LIMITS` (8 a language, 8 words, 2 slots, every required parameter a slot; the host's own phrases are
+   * reserved). Checked when the module starts: a phrase outside the rules refuses the start, naming it.
+   */
+  readonly phrases?: ActionPhrases
+  /**
+   * P7: run by a phrase that interrupted a reply, the action is meant to end that reply (default false: the interrupted
+   * reply is spoken again after the action's answer, as after "louder").
+   */
+  readonly endsReply?: boolean
+  /**
+   * Do it. Must finish well within 5 s (the intent agent's limit); it is not interrupted once started. Read the turn
+   * it runs in with `yield* CurrentTurn` (`undefined` when run outside a turn: a routine from a job, a test).
+   */
   readonly run: (params: ParamValues<P>) => Effect.Effect<ActionOutcome | void, ActionError>
 }
 
@@ -273,8 +294,14 @@ const paramSchema = (param: ActionParam): Schema.Codec<unknown, unknown> => {
 }
 
 /** Check and convert one tool input value to what `run` expects. */
+/**
+ * What a parameter that was not given receives, on every path (a tool call, a typed action, a phrase command): its
+ * declared default, `false` for a yes/no parameter, else `undefined`.
+ */
+export const omittedParamValue = (param: ActionParam): unknown => (param.kind === "boolean" ? false : "default" in param ? param.default : undefined)
+
 const toParamValue = (name: string, param: ActionParam, value: unknown): unknown => {
-  if (value === undefined) return param.kind === "boolean" ? false : "default" in param ? param.default : undefined
+  if (value === undefined) return omittedParamValue(param)
   switch (param.kind) {
     case "choice":
       return value
@@ -370,27 +397,21 @@ export const actionTool = (registered: RegisteredAction): Tool => {
     description: `${sentenceOf(def.label)} ${def.description}${confirm}`,
     parameters: Schema.Struct(fields) as unknown as Schema.Codec<Readonly<Record<string, unknown>>, unknown>,
     speculative: def.speculative === true,
-    execute: (input: Readonly<Record<string, unknown>>) =>
-      Effect.suspend(() => {
-        // Never through a registry: only core's confirmation (`consumeConfirmation`) runs such an action.
-        if (needsYes) return Effect.fail(new ToolError({ message: "Not run: this action needs the owner's confirmation, which only the assistant can ask for." }))
-        let values: Record<string, any>
-        try {
-          values = actionValues(registered, input)
-        } catch (error) {
-          return Effect.fail(error instanceof ToolError ? error : new ToolError({ message: String(error) }))
-        }
-        return def.run(values).pipe(
-          Effect.timeoutOrElse({
-            duration: ACTION_TIMEOUT_MS,
-            orElse: () => Effect.fail(new ActionError({ message: `${def.label} did not finish within ${ACTION_TIMEOUT_MS / 1000} s` }))
-          }),
-          Effect.mapError((error) => new ToolError({ message: error.message, cause: error })),
-          Effect.map((outcome) => outcome?.say ?? def.announce?.(values) ?? "ok")
-        )
-      })
+    // A risk that depends on the values is judged on what `run` would receive (a dynamic name resolved, a duration
+    // parsed); the gateway judges a call of this tool on the action's values directly (`Gateway.ts`).
+    ...(def.risk !== undefined ? { risk: typeof def.risk === "string" ? def.risk : riskOfValues(registered, def.risk) } : {}),
+    ...(def.sensitivity !== undefined ? { sensitivity: def.sensitivity } : {}),
+    ...(def.latency !== undefined ? { latency: def.latency } : {}),
+    // Only the execution gateway runs it (`Gateway.ts`): it turns the input into the action's values once, admits
+    // the call and runs the action. Called directly, it refuses.
+    execute: () => Effect.fail(new ToolError({ message: "Not run: an action's tool runs only through the execution gateway." }))
   })
   return { ...tool, action: registered }
 }
+
+const riskOfValues = (registered: RegisteredAction, risk: RiskByInput): RiskByInput<Readonly<Record<string, unknown>>> => ({
+  classes: risk.classes,
+  of: (input) => risk.of(actionValues(registered, input))
+})
 
 const sentenceOf = (s: string) => (/[.!?]$/.test(s) ? s : `${s}.`)

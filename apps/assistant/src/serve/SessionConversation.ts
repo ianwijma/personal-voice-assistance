@@ -52,6 +52,8 @@ export interface SessionConversationOptions {
   readonly onEvent: (event: ConversationEvent) => void
   /** A new conversation started (`newConversation`, or the conversation's idle reset). */
   readonly onConversation?: (conversation: ConversationInfo, reason: "new" | "idle") => void
+  /** A conversation ended (a new one started, or the session ended): its conversation-scoped data goes. */
+  readonly onConversationEnded?: (conversationId: string) => void
   /** The recognition stream on its way to the conversation (echo gate, wake gate, transcript, state). Not used with `speech`. */
   readonly gate?: (events: Stream.Stream<SttEvent, unknown>) => Stream.Stream<SttEvent, unknown>
   /**
@@ -160,6 +162,7 @@ export const makeSessionConversation = (options: SessionConversationOptions): Ef
 
     const onEvent = (event: ConversationEvent) => {
       if (event._tag === "ConversationStarted") {
+        if (conversationInfo.id !== event.conversationId) options.onConversationEnded?.(conversationInfo.id)
         conversationInfo = { id: event.conversationId, startedAt: Date.now() }
         options.onConversation?.(conversationInfo, event.reason)
       }
@@ -310,6 +313,7 @@ export const makeSessionConversation = (options: SessionConversationOptions): Ef
           Effect.sync(() => {
             history = []
             lastTurnAt = undefined
+            options.onConversationEnded?.(conversationInfo.id)
             conversationInfo = { id: globalThis.crypto.randomUUID(), startedAt: Date.now() }
             options.onConversation?.(conversationInfo, "new")
             return conversationInfo
@@ -328,7 +332,7 @@ export const makeSessionConversation = (options: SessionConversationOptions): Ef
         const d = detach
         detach = undefined
         const id = conversationInfo.id
-        return Effect.andThen(d ?? Effect.void, endUsedAgents(id))
+        return Effect.andThen(d ?? Effect.void, Effect.andThen(endUsedAgents(id), Effect.sync(() => options.onConversationEnded?.(id))))
       })
     } satisfies SessionConversation
   })
