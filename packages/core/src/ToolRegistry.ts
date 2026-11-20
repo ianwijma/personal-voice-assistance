@@ -52,9 +52,31 @@ const isEmptyStruct = (schema: Schema.Top): boolean => {
 export const toolSpec = (tool: Tool): ToolSpec => {
   if (isEmptyStruct(tool.parameters)) return { name: tool.name, description: tool.description, inputSchema: { type: "object", properties: {} } }
   const document = Schema.toJsonSchemaDocument(tool.parameters)
-  const inputSchema: Record<string, unknown> = { ...document.schema }
-  if (Object.keys(document.definitions).length > 0) inputSchema.$defs = document.definitions
+  const inputSchema = withoutSurrogatePatterns({ ...document.schema }) as Record<string, unknown>
+  if (Object.keys(document.definitions).length > 0) inputSchema.$defs = withoutSurrogatePatterns(document.definitions)
   return { name: tool.name, description: tool.description, inputSchema }
+}
+
+/** A `\uD800`–`\uDFFF` escape in a pattern's source: a surrogate code unit, on its own or as the end of a range. */
+const SURROGATE_ESCAPE = /\\u[dD][89a-fA-F][0-9a-fA-F]{2}/
+
+/**
+ * The schema without the `pattern` of any string whose pattern names surrogate code units, as `StoredText`'s does
+ * (`@pva/module-contracts`: "no lone surrogates"). The Anthropic API refuses such a pattern ("tools.N.custom.input_schema:
+ * JSON schema is invalid"; measured 2026-11-20 with Claude Code 2.1.323: `^[^\ud800-\udfff]*$` is refused, the same
+ * pattern without that range is accepted), and one refused tool fails the whole request. Nothing is lost: the pattern
+ * only tells the model what not to send, and the registry decodes every call's input with the tool's own schema, which
+ * still has the check. Other keywords and other patterns stay.
+ */
+const withoutSurrogatePatterns = (value: unknown): unknown => {
+  if (Array.isArray(value)) return value.map(withoutSurrogatePatterns)
+  if (value === null || typeof value !== "object") return value
+  const out: Record<string, unknown> = {}
+  for (const [key, child] of Object.entries(value)) {
+    if (key === "pattern" && typeof child === "string" && SURROGATE_ESCAPE.test(child)) continue
+    out[key] = withoutSurrogatePatterns(child)
+  }
+  return out
 }
 
 const errorResult = (call: ToolCall, content: string): ToolResult => ({
