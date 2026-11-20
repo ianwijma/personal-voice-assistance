@@ -1,7 +1,7 @@
 # Modules: where the work stands
 
 Status of the work planned in [MODULES-PLAN.md](MODULES-PLAN.md), kept here so it does not depend on any one working
-session. Updated 2026-11-20, 16:20. Nothing below is merged into `main`; the owner merges.
+session. Updated 2026-11-20, 16:53. Nothing below is merged into `main`; the owner merges.
 
 **State: the work is done and waits for the owner.** Every preparation part, every module that was not deferred and
 every follow-up has an open pull request, has had at least one complete Sol review, and has its findings fixed. On
@@ -42,10 +42,10 @@ pull request "[GPT Review] …" into the reviewed branch; then Astra looked agai
 | #122 lists follow-up | #131 | `89beb5a8` | 12, 5, 3, 3, 3, 3, 1 | approved in round 8 |
 | #114 reminders | #133 | `93e86c27` | 16, 9, 8, 4, 4, 2, 1 | approved in round 8 |
 | #108 presentation (P10) | #136 | `47602005` | 26, 14, 7, 3, 4, 2, 2, 1, 1 | core approved in round 6, the voice page in round 10 |
-| #117 timers and alarms | #134 | `85b4a62b` | 16, 10, 4, 2, 3, 2, 7, 6, 2, 2, then 2, 1, 1, 1, 2 | **not approved; stopped by the owner after fifteen rounds.** Rounds 9 to 13 found only further words the module's lists missed (the owner: feedback about word lists is ignored, that mechanism will be redone). Rounds 14 and 15 found one real case (the same unnamed alarm set twice could not be cancelled: fixed) and two small ones in that fix, which are **not fixed**: a cancel or skip of a group of identical alarms is not one transaction, so one failed write can leave half of it done; and the "already set" answer gives the next regular time, not a pending snooze's |
+| #117 timers and alarms | #134 | `61bdf42d` | 16, 10, 4, 2, 3, 2, 7, 6, 2, 2, then 2, 1, 1, 1, 2, 2 | **not approved after sixteen rounds; ended by the owner.** Rounds 9 to 13 found only further words the module's lists missed (the owner: feedback about word lists is ignored, that mechanism will be redone). Rounds 14 to 16 were about the same unnamed alarm set twice: it is no longer created twice, and a group of identical alarms is cancelled or skipped in one transaction. **Two cases from the last review are open:** two such alarms that were snoozed for different lengths are still treated as identical, so cancelling "the 10:01 alarm" removes both; and after one failed send or write the "already set" answer can name a ring that is already past. No tests were written for the last fixes, by the owner's decision |
 
 **All six together: `t3/modules-13-all-gpt-review`, pull request #137 "[GPT Review] …" into `t3/modules-13-all`
-(`9c4b6bf4`).** The six do not simply add up: the presentation fixes (#136) and the risk policy on top of it changed
+(`8b5738fb`).** The six do not simply add up: the presentation fixes (#136) and the risk policy on top of it changed
 the same places, so combining them needed four conflict resolutions and four further fixes that exist only on this
 branch (two risk-policy test fixtures without the revision a press must now carry; showings admitted in the same
 millisecond were ordered by their random ids; the compact stage's height with the fixed notification strip). On it,
