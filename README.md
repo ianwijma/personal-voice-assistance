@@ -177,7 +177,8 @@ To use a file instead of a microphone, run `AUDIO_BACKEND=file AUDIO_INPUT_FILE=
 
 ### Web UI (serve mode)
 
-To run it from a container image (Kubernetes included), see [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md).
+To run it from a container image (Kubernetes included), see [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md). Versioned images come from
+releases: [docs/RELEASING.md](docs/RELEASING.md).
 
 ```sh
 pnpm serve     # builds the UI (apps/web/out), then starts the assistant serving it on http://127.0.0.1:8787

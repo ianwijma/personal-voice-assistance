@@ -1,7 +1,7 @@
 import { defineConfig } from "vitest/config"
 import { latencyTestFiles } from "./vitest.latency.ts"
 
-const include = ["packages/*/test/**/*.test.ts", "apps/*/test/**/*.test.ts", "docs/research/*/lab/test/**/*.test.ts"]
+const include = ["packages/*/test/**/*.test.ts", "apps/*/test/**/*.test.ts", "docs/research/*/lab/test/**/*.test.ts", "scripts/**/*.test.ts"]
 const exclude = ["**/node_modules/**", "apps/web/**"]
 /** Test files that import `latencyBound.ts` (vitest.latency.ts): the `latency` project, the rest is `node`. */
 export const latency = latencyTestFiles(import.meta.dirname)

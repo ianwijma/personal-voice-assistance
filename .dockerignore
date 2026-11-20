@@ -5,6 +5,7 @@
 apps/web/out
 apps/web/screenshots
 docs
+scripts
 models
 data
 audio-out
