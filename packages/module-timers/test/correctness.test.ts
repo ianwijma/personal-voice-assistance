@@ -175,7 +175,7 @@ it.effect("9: an alarm card cannot exceed the 50-set limit", () => Effect.gen(fu
   yield* kit.action("set", { when: "10:01" })
   yield* kit.advance(MIN)
   const card = ringing(kit)[0]!
-  for (let i = 0; i < 50; i++) yield* kit.action("set", { when: "11:00" })
+  for (let i = 0; i < 50; i++) yield* kit.action("set", { when: "11:00", name: `alarm ${i}` })
   assert.include((yield* kit.notify.press(card.id, "snooze", { device: "kitchen-display" })).say!, "already 50")
   assert.strictEqual(ringing(kit).length, 1)
   const set = yield* scan<Alarm>((q) => kit.moduleStore().collection(alarms).list({ where: { phase: "set" }, ...q }), 10, 60)

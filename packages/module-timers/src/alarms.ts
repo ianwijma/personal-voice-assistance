@@ -150,6 +150,14 @@ const instantWords = (at: number, now: number, zone: string, language: Language)
 const isRepeating = (value: Alarm): boolean => value.rrule !== undefined && value.dtstart !== undefined
 const specOf = (value: Alarm) => ({ rrule: value.rrule!, dtstart: value.dtstart!, timeZone: value.timeZone })
 
+/** The schedule, name and device a person can distinguish, independent of row/job/delivery identity. */
+const sameAlarm = (a: Alarm, b: Alarm, now?: number): boolean => {
+  if (a.deviceId !== b.deviceId || a.timeZone !== b.timeZone || a.name?.toLowerCase() !== b.name?.toLowerCase()
+    || a.rrule !== b.rrule || a.next?.time !== b.next?.time) return false
+  const next = now !== undefined && a.next !== undefined && a.next.at <= now && isRepeating(a) ? nextOf(a, now) : a.next
+  return next?.date === b.next?.date && next?.time === b.next?.time && next?.at === b.next?.at
+}
+
 /** "every weekday": the rule without its time (a moment says the time). */
 const ruleWords = (value: Alarm, language: Language): string => {
   if (!isRepeating(value)) return ""
@@ -278,7 +286,8 @@ export interface AlarmsOps {
   readonly cancel: (which: string | undefined, scope: Scope) => Effect.Effect<string, ActionError>
 }
 
-type Target = { readonly kind: "one"; readonly row: Row<Alarm>; readonly snoozed: boolean; readonly ringing: boolean } | { readonly kind: "answer"; readonly say: string }
+type OneTarget = { readonly kind: "one"; readonly row: Row<Alarm>; readonly snoozed: boolean; readonly ringing: boolean }
+type Target = OneTarget | { readonly kind: "many"; readonly targets: ReadonlyArray<OneTarget> } | { readonly kind: "answer"; readonly say: string }
 
 export const alarmsModule = defineModule({
   apiVersion: 2,
@@ -316,12 +325,27 @@ export const alarmsModule = defineModule({
           const options = yield* actorNow(actor)
           const written = yield* ctx.store.transaction((tx) => {
             const c = tx.collection(alarms)
+            if (row === undefined) {
+              // Admission and insertion share the transaction, including requests after a restart.
+              let after: Row<Alarm> | undefined
+              let count = 0
+              while (count < SCAN_SET) {
+                const page = c.list({ where: { phase: "set" }, orderBy: { field: "createdAt", direction: "asc" }, limit: PAGE, ...(after !== undefined ? { after } : {}) })
+                const duplicate = page.find((r) => sameAlarm(r.value, planned, now))
+                if (duplicate !== undefined) return duplicate
+                count += page.length
+                if (page.length < PAGE) break
+                after = page.at(-1)
+              }
+              if (count >= MAX_ALARMS) return undefined
+            }
             const out = row === undefined ? c.insert(planned, { id, ...options }) : c.update(id, () => planned, { expectRev: row.rev, ...options })
             job?.writeIn(tx)
             // A job that goes with this write (the Health report of a missed ring): both or neither.
             for (const j of extra) j.writeIn(tx)
             return out
           })
+          if (written === undefined) return yield* Effect.fail(fail(say(texts, language(), "full", { count: MAX_ALARMS })))
           if (job === undefined && row?.value.pending === true) yield* Effect.ignore(ctx.scheduler.cancel({ key: `alarm:${id}` }))
           return written
         })
@@ -557,9 +581,14 @@ export const alarmsModule = defineModule({
         Effect.gen(function*() {
           const lang = language()
           const read = yield* readLive(forCancel).pipe(Effect.mapError(unreadable))
-          const one = (row: Row<Alarm>, snoozed = false): Target => ({ kind: "one", row, snoozed, ringing: ringingNow(row, read.open) })
-          const ask = (rows: ReadonlyArray<Row<Alarm>>, cutShort: boolean): Target =>
-            answer(say(texts, lang, cutShort ? "whichCut" : "which", { count: rows.length, list: listOf(rows.map((r) => itemOf(r, here, read.open, now, lang)), lang) }))
+          const one = (row: Row<Alarm>, snoozed = false): OneTarget => ({ kind: "one", row, snoozed, ringing: ringingNow(row, read.open) })
+          const ask = (rows: ReadonlyArray<Row<Alarm>>, cutShort: boolean, target = (r: Row<Alarm>) => one(r)): Target => {
+            const first = rows[0]!
+            const items = rows.map((r) => itemOf(r, here, read.open, now, lang))
+            if (forCancel && !cutShort && !read.cut && rows.length > 1 && rows.every((r, i) => sameAlarm(first.value, r.value)
+              && items[0] === items[i])) return { kind: "many", targets: rows.map(target) }
+            return answer(say(texts, lang, cutShort ? "whichCut" : "which", { count: rows.length, list: listOf(items, lang) }))
+          }
           const named = /^(?:(?:alarm|wekker)\s+)?(?:called|named|genaamd)\s+/iu.test(which ?? "")
           const clock = !named && /^(?:(?:alarm|wekker)\s+)?(?:at|om)\s+/iu.test(which ?? "")
           which = which?.replace(/^(?:(?:alarm|wekker)\s+)?(?:called|named|genaamd)\s+/iu, "")
@@ -583,8 +612,7 @@ export const alarmsModule = defineModule({
           // A time request matches times, even when a local name has the same words.
           if (time?.kind === "ok") {
             const at = read.rows.filter((r) => timesOf(r, read.open, now).some((t) => t.hour === time.value.hour && t.minute === time.value.minute))
-            if (at.length === 1) {
-              const row = at[0]!
+            const atTime = (row: Row<Alarm>) => {
               const ring = row.value.ring
               // A delivered snooze selected only by its effective time is the occurrence to stop, not the next series day.
               const snoozedAt = row.value.owed?.snoozed === true && ringingNow(row, read.open) ? row.value.owed.at
@@ -593,7 +621,8 @@ export const alarmsModule = defineModule({
                 && row.value.next?.time !== timeText(time.value)
               return one(row, snoozed)
             }
-            if (at.length > 1) return ask(at, false)
+            if (at.length === 1) return atTime(at[0]!)
+            if (at.length > 1) return ask(at, false, atTime)
             const words = timeWords({ hour: time.value.hour, minute: time.value.minute }, lang)
             return read.cut ? yield* Effect.fail(unreadable()) : answer(say(texts, lang, "noTimeMatch", { time: words }))
           }
@@ -641,9 +670,12 @@ export const alarmsModule = defineModule({
               value = { ...base, next: { date: dateText(at.value.date), time: timeText(at.value.time), at: at.value.instant } }
             }
             if (value.next!.at > DateTime.toEpochMillis(DateTime.add(DateTime.setZoneNamedUnsafe(DateTime.makeUnsafe(now), z), { years: 1 }))) return say(texts, lang, "tooFar")
-            const read = yield* readSet.pipe(Effect.mapError(failure))
-            if (read.cut || read.rows.length >= MAX_ALARMS) return yield* Effect.fail(fail(say(texts, lang, "full", { count: MAX_ALARMS })))
-            yield* commit(undefined, randomUUID(), value).pipe(Effect.mapError(failure))
+            const id = randomUUID()
+            const written = yield* commit(undefined, id, value).pipe(Effect.mapError((e) => e instanceof ActionError ? e : failure(e)))
+            if (written.id !== id) {
+              const next = advance(written.value, now).next!
+              return say(texts, lang, "alreadySet", { moment: momentOf(next.date, next.time, now, written.value.timeZone, lang) })
+            }
             const moment = momentOf(value.next!.date, value.next!.time, now, z, lang)
             // Said on the device it was set on, which is the device it rings on: its name may be echoed here.
             if (isRepeating(value)) {
@@ -672,42 +704,51 @@ export const alarmsModule = defineModule({
             // An alarm whose ring is still being taken away is a candidate too (by name on its device, or by time): cancelling
             // it again finishes that.
             const t = yield* resolve(which, here, now, true)
-            if (t.kind !== "one") return t.say
-            const row = t.row
-            const v = row.value
-            const z = v.timeZone
-            const pendingSay = (after: Row<Alarm> | undefined, text: string) => (ringLeft(after) ? say(texts, lang, "ringPending") : text)
-            if (!isRepeating(v) || v.next === undefined) {
-              const after = yield* Effect.flatMap(ended(row, now), (value) => change(row, value)).pipe(Effect.mapError(failure))
-              const text = v.next !== undefined ? say(texts, lang, "cancelled", { moment: momentOf(v.next.date, v.next.time, now, z, lang) }) : v.ring?.again !== undefined
-                ? say(texts, lang, "cancelledAgain")
-                : say(texts, lang, "finished")
-              return pendingSay(after, text)
+            if (t.kind === "answer") return t.say
+            const cancelOne = (t: OneTarget) => Effect.gen(function*() {
+              const row = t.row
+              const v = row.value
+              const z = v.timeZone
+              const pendingSay = (after: Row<Alarm> | undefined, text: string) => (ringLeft(after) ? say(texts, lang, "ringPending") : text)
+              if (!isRepeating(v) || v.next === undefined) {
+                const after = yield* Effect.flatMap(ended(row, now), (value) => change(row, value)).pipe(Effect.mapError(failure))
+                const text = v.next !== undefined ? say(texts, lang, "cancelled", { moment: momentOf(v.next.date, v.next.time, now, z, lang) }) : v.ring?.again !== undefined
+                  ? say(texts, lang, "cancelledAgain")
+                  : say(texts, lang, "finished")
+                return pendingSay(after, text)
+              }
+              const rule = ruleWords(v, lang)
+              // A repeating alarm: only the next, or all of them. Never guessed (docs/MODULES-PLAN.md §2 row 6).
+              if (scope === undefined) return say(texts, lang, "scope", { rule })
+              if (scope === "all") {
+                const after = yield* Effect.flatMap(ended(row, now), (value) => change(row, value)).pipe(Effect.mapError(failure))
+                return pendingSay(after, say(texts, lang, "cancelledRepeat", { rule }))
+              }
+              if (t.snoozed || v.ring?.again !== undefined || (v.owed !== undefined && !t.ringing && now - v.owed.at <= DELIVER_WITHIN_MS) || v.withdraw !== undefined) {
+                // The current occurrence (including an owed snooze or its unfinished withdrawal) comes before the series.
+                const occurrence = v.owed ?? v.ring ?? v.withdraw!
+                const next = momentOf(v.next.date, v.next.time, now, z, lang)
+                const moment = momentOf(occurrence.date, occurrence.time, now, z, lang)
+                const cleanup = v.withdraw !== undefined && v.owed === undefined && v.ring?.again === undefined
+                const snoozed = t.snoozed || v.ring?.again !== undefined || v.owed?.snoozed === true
+                const after = yield* Effect.flatMap(letGo(row.id, v, now), (value) => change(row, value)).pipe(Effect.mapError(failure))
+                return say(texts, lang, ringLeft(after) ? (snoozed ? "cancelledAgainPendingNext" : "occurrencePendingNext") : cleanup ? "cleanupNext" : snoozed ? "cancelledAgainNext" : "occurrenceCancelledNext", { moment, next })
+              }
+              const moment = momentOf(v.next.date, v.next.time, now, z, lang)
+              const following = nextOf(v, v.next.at)
+              const { next: _n, ...rest } = v
+              yield* change(row, following !== undefined ? { ...rest, next: following } : rest).pipe(Effect.mapError(failure))
+              return following === undefined
+                ? say(texts, lang, "skippedLast", { moment })
+                : say(texts, lang, "skipped", { moment, next: momentOf(following.date, following.time, now, z, lang) })
+            })
+            if (t.kind === "one") return yield* cancelOne(t)
+            const replies: Array<string> = []
+            for (const target of t.targets) {
+              replies.push(yield* cancelOne(target))
+              yield* Effect.yieldNow
             }
-            const rule = ruleWords(v, lang)
-            // A repeating alarm: only the next, or all of them. Never guessed (docs/MODULES-PLAN.md §2 row 6).
-            if (scope === undefined) return say(texts, lang, "scope", { rule })
-            if (scope === "all") {
-              const after = yield* Effect.flatMap(ended(row, now), (value) => change(row, value)).pipe(Effect.mapError(failure))
-              return pendingSay(after, say(texts, lang, "cancelledRepeat", { rule }))
-            }
-            if (t.snoozed || v.ring?.again !== undefined || (v.owed !== undefined && !t.ringing && now - v.owed.at <= DELIVER_WITHIN_MS) || v.withdraw !== undefined) {
-              // The current occurrence (including an owed snooze or its unfinished withdrawal) comes before the series.
-              const occurrence = v.owed ?? v.ring ?? v.withdraw!
-              const next = momentOf(v.next.date, v.next.time, now, z, lang)
-              const moment = momentOf(occurrence.date, occurrence.time, now, z, lang)
-              const cleanup = v.withdraw !== undefined && v.owed === undefined && v.ring?.again === undefined
-              const snoozed = t.snoozed || v.ring?.again !== undefined || v.owed?.snoozed === true
-              const after = yield* Effect.flatMap(letGo(row.id, v, now), (value) => change(row, value)).pipe(Effect.mapError(failure))
-              return say(texts, lang, ringLeft(after) ? (snoozed ? "cancelledAgainPendingNext" : "occurrencePendingNext") : cleanup ? "cleanupNext" : snoozed ? "cancelledAgainNext" : "occurrenceCancelledNext", { moment, next })
-            }
-            const moment = momentOf(v.next.date, v.next.time, now, z, lang)
-            const following = nextOf(v, v.next.at)
-            const { next: _n, ...rest } = v
-            yield* change(row, following !== undefined ? { ...rest, next: following } : rest).pipe(Effect.mapError(failure))
-            return following === undefined
-              ? say(texts, lang, "skippedLast", { moment })
-              : say(texts, lang, "skipped", { moment, next: momentOf(following.date, following.time, now, z, lang) })
+            return say(texts, lang, "duplicateResult", { count: t.targets.length, result: listOf([...new Set(replies)], lang) })
           }))
       }
 
