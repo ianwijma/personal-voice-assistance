@@ -1,7 +1,7 @@
 # Modules: where the work stands
 
 Status of the work planned in [MODULES-PLAN.md](MODULES-PLAN.md), kept here so it does not depend on any one working
-session. Updated 2026-11-20, 11:08. Nothing below is merged into `main`; the owner merges.
+session. Updated 2026-11-20, 11:25. Nothing below is merged into `main`; the owner merges.
 
 **State: the work is done and waits for the owner.** Every preparation part, every module that was not deferred and
 every follow-up has an open pull request, has had at least one complete Sol review, and has its findings fixed. On
@@ -51,9 +51,9 @@ millisecond were ordered by their random ids; the compact stage's height with th
 locally: `pnpm check` passes; `pnpm test` 10,700 passed and none failed before the last, layout-only commit, and on
 the final code 10,698 passed with 2 failing under load that pass alone (the SQLite presentation contract's case a5; a
 store latency bound at 10.98 ms against 10 ms); the browser tests pass (253 of 253). Checked again by the lead on the
-final head: the latency tests the way CI runs them pass (39 files, 449 tests), the full suite has 10,699 passed and
-one failing under load (the music room-lookup bound again), the browser tests pass (253 of 253). **CI is green on
-#137 and on all seven GPT pull requests (#131 to #137)**, seen 2026-11-20, 08:24.
+final head (`8bf553fb`, with the last timers fixes): `pnpm check` passes, the full suite passes (10,839 tests, none
+failed), the latency tests the way CI runs them pass (449), the browser tests pass (253 of 253). **CI is green on
+all 51 open pull requests of this work (#87 to #137)**, seen 2026-11-20, 11:25.
 
 **To take the fixes: merge #130, then #137** (the six fix pull requests can then be closed). The fix pull requests
 are not part of #130. Taking single ones into their own branches instead means resolving the four conflicts between
