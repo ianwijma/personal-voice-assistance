@@ -43,6 +43,7 @@ export * from "./PhraseSets.ts"
 export * from "./PhraseRunner.ts"
 export * from "./PhraseTexts.ts"
 export * from "./SessionControl.ts"
+export * from "./Reports.ts"
 export * from "./Privacy.ts"
 export * from "./PromptText.ts"
 export {

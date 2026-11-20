@@ -19,6 +19,7 @@ import {
 import { householdDbPath, makeSqliteStore, type SqliteHouseholdStore } from "@pva/store-sqlite"
 import { Effect, type Scope } from "effect"
 import { existsSync } from "node:fs"
+import { reportsStorage } from "./reports/store.ts"
 
 /**
  * The household store and the event bus in the app (docs/STORING-DATA.md): serve mode opens `data/household.db`
@@ -51,7 +52,8 @@ const assemble = (
 ) =>
   Effect.gen(function*() {
     // P6: the scheduler's collections (core.scheduler) are judged and upgraded with the modules'.
-    yield* store.prepare(declared(catalog), [schedulerStorage, notifyStorage, presentStorage])
+    // Reports (docs/REPORTS.md) are the host's own core collections (`core.reports`).
+    yield* store.prepare(declared(catalog), [schedulerStorage, notifyStorage, presentStorage, reportsStorage])
     for (const d of catalog) {
       const verdict = store.availability(d.id)
       if (verdict !== undefined && d.storage !== undefined) log(`Module ${d.name}: ${verdict.reason}`)

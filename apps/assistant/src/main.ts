@@ -29,6 +29,7 @@ import { LlmLayer, SttLayer } from "./providers.ts"
 import { sayCommand } from "./say.ts"
 import { DataDirLockError } from "./serve/DataDirLock.ts"
 import { serveMode } from "./serve/serveMode.ts"
+import { recentWarningsLogger } from "./recentLog.ts"
 import { DataDirConfig, SettingsStoreError } from "./serve/SettingsStore.ts"
 import { VaultPathConfig } from "./serve/Vault.ts"
 import { askVaultPassword, type CliSettings, CliSettingsRef, explainMissingKey, withCliSettings } from "./cliSettings.ts"
@@ -56,7 +57,9 @@ const StderrLogger = Logger.layer([
     const level = logLevel === "Warn" ? "warning: " : logLevel === "Error" ? "error: " : ""
     midLine = false
     process.stderr.write(`${prefix}${level}${text}${cause.reasons.length > 0 ? `\n${Cause.pretty(cause)}` : ""}\n`)
-  })
+  }),
+  // The recent warnings and errors, in memory, for a report (docs/REPORTS.md).
+  recentWarningsLogger
 ])
 
 // Text mode uses the same system prompt as voice mode, so the model behaves the same.

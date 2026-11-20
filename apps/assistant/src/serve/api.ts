@@ -5,6 +5,7 @@ import {
   type ApiErrorBody,
   FavouriteRequest,
   MAX_API_BODY_BYTES,
+  MAX_REPORT_REQUEST_BYTES,
   MintRouteTokenRequest,
   type ModelRefJson,
   ModelRequest,
@@ -26,6 +27,8 @@ import type { ModelCatalog } from "./ModelCatalog.ts"
 import type { ModelFavourites } from "./ModelFavourites.ts"
 import type { ModuleRouter } from "./moduleRoutes.ts"
 import { type AdminScheduler, schedulerRoute } from "./schedulerApi.ts"
+import type { ReportsHost } from "./reports/Reports.ts"
+import { reportsRoute } from "./reportsApi.ts"
 import type { Models } from "./models.ts"
 import { ApiFailure, type VoiceCatalog } from "./VoiceCatalog.ts"
 
@@ -56,6 +59,8 @@ export interface ApiOptions {
   readonly moduleRoutes?: ModuleRouter
   /** P6: the scheduled jobs (`/api/scheduler/jobs`, `schedulerApi.ts`). Absent: an empty list, `available: false`. */
   readonly scheduler?: AdminScheduler
+  /** Reports (`/api/reports`, `reportsApi.ts`). Absent: an empty list, `available: false`. */
+  readonly reports?: ReportsHost
 }
 
 /** A JSON answer, or a WAV body. */
@@ -78,8 +83,8 @@ const decode = <S extends Schema.Top & { readonly DecodingServices: never }>(sch
   return Effect.fail(badRequest(`The request is not valid: ${first}`, key !== undefined ? [{ key, message: "Not valid" }] : undefined))
 }
 
-/** Reads a JSON body (at most `MAX_API_BODY_BYTES`). An empty body is `undefined`. */
-const readJson = (req: http.IncomingMessage): Effect.Effect<unknown, ApiFailure> =>
+/** Reads a JSON body (at most `limit`, default `MAX_API_BODY_BYTES`). An empty body is `undefined`. */
+const readJson = (req: http.IncomingMessage, limit: number = MAX_API_BODY_BYTES): Effect.Effect<unknown, ApiFailure> =>
   Effect.callback<unknown, ApiFailure>((resume) => {
     const chunks: Array<Buffer> = []
     let size = 0
@@ -91,8 +96,8 @@ const readJson = (req: http.IncomingMessage): Effect.Effect<unknown, ApiFailure>
     }
     req.on("data", (chunk: Buffer) => {
       size += chunk.length
-      if (size > MAX_API_BODY_BYTES) {
-        finish(Effect.fail(new ApiFailure({ status: 413, code: "too_large", message: `The request body is larger than ${MAX_API_BODY_BYTES} bytes` })))
+      if (size > limit) {
+        finish(Effect.fail(new ApiFailure({ status: 413, code: "too_large", message: `The request body is larger than ${limit} bytes` })))
         req.resume()
         return
       }
@@ -186,6 +191,9 @@ export const makeApi = (options: ApiOptions) => {
       }
       const scheduled = schedulerRoute(path, method, query, options.scheduler)
       if (scheduled !== undefined) return yield* scheduled
+      // Reports: a PUT carries a whole issue body, so this route alone reads up to `MAX_REPORT_REQUEST_BYTES`.
+      const reported = reportsRoute(path, method, query, () => readJson(req, MAX_REPORT_REQUEST_BYTES), options.reports)
+      if (reported !== undefined) return yield* reported
       if (path === "voice-providers") {
         yield* only("GET")
         return json(200, { providers: yield* catalog.providers })

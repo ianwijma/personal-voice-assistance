@@ -33,7 +33,7 @@ const STATE: Readonly<Record<ScheduledJob["state"], { readonly label: string; re
 const LIVE = new Set<ScheduledJob["state"]>(["scheduled", "running"])
 
 /** "in 6 min", "3 min ago", or a date and time further out. */
-const when = (at: number, now: number): string => {
+export const when = (at: number, now: number): string => {
   const s = Math.round((at - now) / 1000)
   const abs = Math.abs(s)
   if (abs < 45) return s >= 0 ? "now" : "just now"

@@ -70,6 +70,7 @@ import { type CommandSet, hostCommandSet, phraseLanguageOf } from "./Phrases.ts"
 import { makePhraseSets } from "./PhraseSets.ts"
 import { Playback } from "./Playback.ts"
 import { DeviceControl, SessionControl } from "./SessionControl.ts"
+import { type ReportDrafted, type ReportInput, Reports, type ReportsSettings } from "./Reports.ts"
 import { type EchoGate, makeEchoGate } from "./EchoGate.ts"
 import type { RouteTarget } from "./RouteGate.ts"
 import type { RegisteredAction } from "./Actions.ts"
@@ -513,6 +514,24 @@ export interface StartTestModuleOptions {
    * so an image presentation is shown without its image (`unavailable`), as serve mode shows one it could not fetch.
    */
   readonly media?: MediaPort
+  /**
+   * The core's `Reports` (docs/REPORTS.md) as the kit stands in for it: a plain recorder. `false` leaves it out (as in
+   * the CLI modes). A function answers each draft (default: `draft`; the kit decides nothing about sending, so a test
+   * asserts what the module asked for: `input.send`). What was drafted and configured is in `kit.reports`.
+   */
+  readonly reports?: false | ((input: ReportInput, settings: ReportsSettings | undefined, n: number) => ReportDrafted)
+}
+
+/** What the kit's `Reports` stand-in saw (`kit.reports`). */
+export interface KitReports {
+  /** Every draft a module asked for, in order (the turn is the kit's `CurrentTurn` when it was asked: `turns`). */
+  readonly drafted: ReadonlyArray<ReportInput>
+  /** The settings the module handed over now (`configure`; `undefined` once it took them back). */
+  readonly settings: () => ReportsSettings | undefined
+  /** Every `configure` call, in order (the token included: never pass this to `expectNoSecrets`). */
+  readonly configured: ReadonlyArray<ReportsSettings | undefined>
+  /** The `CurrentTurn` each draft was asked in (`undefined`: outside a turn), in order. */
+  readonly turns: ReadonlyArray<TurnContext | undefined>
 }
 
 /**
@@ -901,6 +920,10 @@ export const startTestModule = (definition: ModuleDefinition<any>, options: Star
         const was = replying.has(deviceId)
         return Effect.as(setReplying(deviceId, false), was)
       })
+    const reportsDrafted: Array<ReportInput> = []
+    const reportsTurns: Array<TurnContext | undefined> = []
+    const reportsConfigured: Array<ReportsSettings | undefined> = []
+    let reportSettings: ReportsSettings | undefined
     const kitServices: ReadonlyArray<ProvidedService> = [
       SessionControl.of({
         stopReply: (deviceId) => Effect.zipWith(kitStopReply(deviceId), notify.stopSpeech(deviceId), (a, b) => a || b),
@@ -917,7 +940,26 @@ export const startTestModule = (definition: ModuleDefinition<any>, options: Star
             return `kit-conversation-${++conversations}`
           })
       }),
-      DeviceControl.of({ replyVolume: (deviceId) => replyVolumeOf(volumes, deviceId), changeReplyVolume: kitVolume })
+      DeviceControl.of({ replyVolume: (deviceId) => replyVolumeOf(volumes, deviceId), changeReplyVolume: kitVolume }),
+      // The core's `Reports` (serve mode's keeps a report with the host's record of the conversation): the kit records
+      // what a module asked for and answers as the test says.
+      ...(options.reports === false
+        ? []
+        : [Reports.of({
+          draft: (input) =>
+            Effect.flatMap(CurrentTurn, (turn) => Effect.sync(() => {
+              reportsDrafted.push(input)
+              reportsTurns.push(turn)
+              const n = reportsDrafted.length
+              if (typeof options.reports === "function") return options.reports(input, reportSettings, n)
+              return { id: `kit-report-${n}`, status: "draft" as const }
+            })),
+          configure: (settings) =>
+            Effect.sync(() => {
+              reportsConfigured.push(settings)
+              reportSettings = settings
+            })
+        })])
     ]
     const host = yield* makeModuleHost({
       catalog,
@@ -1149,6 +1191,8 @@ export const startTestModule = (definition: ModuleDefinition<any>, options: Star
       asTurn: <A, E, R>(effect: Effect.Effect<A, E, R>, as?: TurnContext | TestTurnInput) => checked("after asTurn", Effect.suspend(() => Effect.provideService(effect, CurrentTurn, asTurn(as)))),
       /** A service published now (the module's own, a stand-in's, or the core's). */
       service: <T>(key: ServiceKey<T>): T | undefined => host.service(key),
+      /** The core's `Reports` stand-in: what was drafted and the settings handed over (`options.reports`). */
+      reports: { drafted: reportsDrafted, settings: () => reportSettings, configured: reportsConfigured, turns: reportsTurns } satisfies KitReports as KitReports,
       /** The contributions under `key` that a turn's assistant sees (default the first device's turn). */
       contributions: <T>(key: ContributionKey<T>, as?: TurnContext | TestTurnInput) => checked("after reading contributions", Effect.suspend(() => host.contributions(key).pipe(Effect.provideService(CurrentTurn, asTurn(as))))),
       /**

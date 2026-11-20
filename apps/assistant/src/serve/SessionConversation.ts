@@ -33,6 +33,9 @@ import type { BuiltEngines, Engine } from "./Engine.ts"
 
 export type SendOutcome = "accepted" | "busy" | "not_running"
 
+/** Why a conversation ended: the idle reset, a new conversation asked for (`conversation.new`), or the session's end. */
+export type ConversationEndReason = "idle" | "new" | "end"
+
 export interface SessionConversationOptions {
   readonly engine: Engine
   /** The microphone this conversation transcribes itself (with `gate`). Not used when `speech` is given. */
@@ -52,8 +55,16 @@ export interface SessionConversationOptions {
   readonly onEvent: (event: ConversationEvent) => void
   /** A new conversation started (`newConversation`, or the conversation's idle reset). */
   readonly onConversation?: (conversation: ConversationInfo, reason: "new" | "idle") => void
-  /** A conversation ended (a new one started, or the session ended): its conversation-scoped data goes. */
-  readonly onConversationEnded?: (conversationId: string) => void
+  /**
+   * A conversation ended (a new one started, or the session ended): its conversation-scoped data goes. `history` is
+   * what it held when it ended (its last committed turn; a report keeps it as the previous conversation, docs/REPORTS.md).
+   */
+  readonly onConversationEnded?: (conversationId: string, history: ReadonlyArray<Message>, reason: ConversationEndReason) => void
+  /**
+   * Whether anything keeps an ended conversation's history now (a report's previous conversation: only while the report
+   * module runs). When it says no, no copy of the history is made and `onConversationEnded` gets an empty one.
+   */
+  readonly keepsEndedHistory?: () => boolean
   /** The recognition stream on its way to the conversation (echo gate, wake gate, transcript, state). Not used with `speech`. */
   readonly gate?: (events: Stream.Stream<SttEvent, unknown>) => Stream.Stream<SttEvent, unknown>
   /**
@@ -147,6 +158,11 @@ export const makeSessionConversation = (options: SessionConversationOptions): Ef
     let history: ReadonlyArray<Message> = []
     let conversationInfo: ConversationInfo = options.initialConversation ?? { id: globalThis.crypto.randomUUID(), startedAt: Date.now() }
     let lastTurnAt: number | undefined
+    /**
+     * The running conversation's history as of its last ended turn: what an idle reset (which empties the history
+     * before it says so) hands `onConversationEnded`.
+     */
+    let committed: ReadonlyArray<Message> = []
     /** The running conversation (while the loop runs on a build). */
     let live: Conversation["Service"] | undefined
     let ready = false
@@ -161,8 +177,11 @@ export const makeSessionConversation = (options: SessionConversationOptions): Ef
     let restart: { readonly agents: boolean; readonly signal: Deferred.Deferred<void> } | undefined
 
     const onEvent = (event: ConversationEvent) => {
+      // A discarded turn changed nothing in the history; nothing is copied while nothing keeps it.
+      if (event._tag === "TurnEnded" && event.outcome !== "discarded" && live !== undefined && options.keepsEndedHistory?.() === true) committed = Effect.runSync(live.history)
       if (event._tag === "ConversationStarted") {
-        if (conversationInfo.id !== event.conversationId) options.onConversationEnded?.(conversationInfo.id)
+        if (conversationInfo.id !== event.conversationId) options.onConversationEnded?.(conversationInfo.id, committed, event.reason)
+        committed = []
         conversationInfo = { id: event.conversationId, startedAt: Date.now() }
         options.onConversation?.(conversationInfo, event.reason)
       }
@@ -311,9 +330,11 @@ export const makeSessionConversation = (options: SessionConversationOptions): Ef
         return Effect.andThen(
           endUsedAgents(conversationInfo.id),
           Effect.sync(() => {
+            const ended = history
             history = []
+            committed = []
             lastTurnAt = undefined
-            options.onConversationEnded?.(conversationInfo.id)
+            options.onConversationEnded?.(conversationInfo.id, options.keepsEndedHistory?.() === true ? ended : [], "new")
             conversationInfo = { id: globalThis.crypto.randomUUID(), startedAt: Date.now() }
             options.onConversation?.(conversationInfo, "new")
             return conversationInfo
@@ -332,7 +353,7 @@ export const makeSessionConversation = (options: SessionConversationOptions): Ef
         const d = detach
         detach = undefined
         const id = conversationInfo.id
-        return Effect.andThen(d ?? Effect.void, Effect.andThen(endUsedAgents(id), Effect.sync(() => options.onConversationEnded?.(id))))
+        return Effect.andThen(d ?? Effect.void, Effect.andThen(endUsedAgents(id), Effect.sync(() => options.onConversationEnded?.(id, options.keepsEndedHistory?.() === true ? history : [], "end"))))
       })
     } satisfies SessionConversation
   })

@@ -446,6 +446,13 @@ export interface ModuleHostOptions {
    */
   readonly coreServices?: ReadonlyArray<ProvidedService>
   /**
+   * Core services given per calling module: `forModule(moduleId)` answers the service a part of that module sees under
+   * `key`, or `undefined` (`host.service` then answers `undefined` for that module). For a service only one module may
+   * use, or that must know who calls (the report module's `Reports`, docs/REPORTS.md). Asked once per part; the answer
+   * is wrapped like a `coreServices` one (`ModuleStopped` once the part closed). No module may provide these keys.
+   */
+  readonly moduleCoreServices?: ReadonlyArray<{ readonly key: ServiceKey<any>; readonly forModule: (moduleId: string) => unknown }>
+  /**
    * P6: `ctx.scheduler` of version 2 modules (`SchedulerEngine.forPart`), given the part and a runner that runs a job as
    * a call in flight of the part's published module. Absent (the CLI modes): `handle` registers nothing and every other
    * call fails `unavailable`.
@@ -728,6 +735,8 @@ export const makeModuleHost = Effect.fnUntraced(function*(options: ModuleHostOpt
   const household = options.household ?? { store: makeClosedStore("There is no household store in this mode."), events: makeEventBus() }
   /** P5: the core's own services by key id (`options.coreServices`). */
   const coreServices = new Map((options.coreServices ?? []).map((p) => [p.key.id, p.service] as const))
+  /** The core's services given per calling module, by key id (`options.moduleCoreServices`). */
+  const moduleCoreServices = new Map((options.moduleCoreServices ?? []).map((p) => [p.key.id, p.forModule] as const))
   const listeners = new Set<(info: ModuleInfo) => void>()
 
   // -- The catalogue --------------------------------------------------------------------------------------------------
@@ -1702,7 +1711,7 @@ export const makeModuleHost = Effect.fnUntraced(function*(options: ModuleHostOpt
         clash: (claim, owner) => `The service "${claim}" is already provided by module ${owner}`,
         // P5: a key the core provides is never a module's.
         validate: () => {
-          const core = services.find((p) => coreServices.has(p.key.id))
+          const core = services.find((p) => coreServices.has(p.key.id) || moduleCoreServices.has(p.key.id))
           return core === undefined ? undefined : `The service "${core.key.id}" is provided by the assistant itself`
         },
         publish: () => {
@@ -2933,6 +2942,14 @@ export const makeModuleHost = Effect.fnUntraced(function*(options: ModuleHostOpt
     // P5: the core's services as this part sees them, made once per part.
     const coreViews = new Map<string, unknown>()
     const serviceHere = <T>(key: ServiceKey<T>): T | undefined => {
+      const perModule = moduleCoreServices.get(key.id)
+      if (perModule !== undefined) {
+        if (!coreViews.has(key.id)) {
+          const own = perModule(entry.def.id)
+          coreViews.set(key.id, own === undefined ? undefined : coreServiceView(own, now, effect))
+        }
+        return coreViews.get(key.id) as T | undefined
+      }
       const core = coreServices.get(key.id)
       if (core === undefined) return service(key)
       if (!coreViews.has(key.id)) coreViews.set(key.id, coreServiceView(core, now, effect))

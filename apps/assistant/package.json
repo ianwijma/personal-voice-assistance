@@ -36,6 +36,7 @@
     "@pva/module-notifications": "workspace:*",
     "@pva/module-presence": "workspace:*",
     "@pva/module-reminders": "workspace:*",
+    "@pva/module-report": "workspace:*",
     "@pva/module-routines": "workspace:*",
     "@pva/module-timers": "workspace:*",
     "@pva/module-web-search": "workspace:*",

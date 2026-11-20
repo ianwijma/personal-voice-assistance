@@ -185,6 +185,7 @@ import { defaultPairingConfig, newNodeId, newPairCode, type NodeRecord, pairedNo
 import { createModelPickersMock } from "./modelPickers.ts"
 import { createModuleRoutesMock, DEMO_DEFINITION_ACTIONS, demoHomeAction, demoHomeModule, TokenRefusal } from "./demoHome.ts"
 import { createScheduledJobsMock, MockSchedulerError } from "./scheduledJobs.ts"
+import { createReportsMock, MockReportError } from "./reports.ts"
 import { decideRisk, decodeRiskPolicy, DEFAULT_RISK_POLICY, FIXED_REASON, FIXED_RISK_CLASSES, RISK_POLICY_KEYS, riskLanguageOf, riskPageTexts, riskPolicyPatchProblems, riskSpoken } from "@pva/protocol"
 import { boundaryKey, changeReplyVolume, checkDietList, checkMembersValue, cleanDeviceName, type Condition, decideDelivery, decidePresentation, type DeviceCapabilities, deviceOutputsFrom, devicePresentFrom, type FieldError, MAX_LIVE_PER_MODULE, MAX_LIVE_TOTAL, MAX_PINNED_PER_DEVICE, NO_REPLY_VOLUMES, PRESENT_KIND_VERSIONS, type Presentation, PRESENTATION_ID, PresentationWire, presentationProblem, type PresentKindName, presentLifetime, presentWireContent, type ReplyVolumes, selectPresentations, type ShowOptions, showOptionsProblem, speakerAllowedFrom } from "@pva/protocol"
 
@@ -1056,6 +1057,8 @@ let modules = initialModules()
 const moduleRoutesMock = createModuleRoutesMock(() => vault.state === "locked")
 /** P6: the scheduled jobs (as the real server's /api/scheduler/jobs). */
 let scheduledJobsMock = createScheduledJobsMock()
+/** The reports (as the real server's /api/reports). */
+let reportsMock = createReportsMock()
 /** Buttons whose press is running (`<module>/<key>`): a second press is `busy`, as on the host. */
 const pressing = new Set<string>()
 /** Protocol 7: assistants, device types and the devices' own sections (mock/assistants.ts). */
@@ -1613,6 +1616,7 @@ const resetState = () => {
   modules = initialModules()
   moduleRoutesMock.reset()
   scheduledJobsMock = createScheduledJobsMock()
+  reportsMock = createReportsMock()
   pressing.clear()
   forcedErrors.clear()
   models = initialModels()
@@ -3465,6 +3469,32 @@ const apiRoute = async (req: IncomingMessage, res: ServerResponse, path: string,
     only("POST")
     if (!scheduledJobsMock.cancel(cancelJob[1]!)) throw new ApiFail(404, "not_found", "There is no such live or failed job (it may have finished or been removed)")
     return { status: 200, body: { cancelled: true } }
+  }
+  // Reports: the drafts people made by telling the assistant about a problem or an idea (as the real server's /api/reports).
+  const reportRoute = /^reports(?:\/([A-Za-z0-9_.:-]{1,64})(\/send)?)?$/.exec(path)
+  if (reportRoute !== null) {
+    const [, id, send] = reportRoute
+    try {
+      if (id === undefined) {
+        only("GET")
+        const limit = query.get("limit")
+        return { status: 200, body: reportsMock.list(query.get("cursor") ?? undefined, limit === null ? undefined : Number(limit)) }
+      }
+      if (send !== undefined) {
+        only("POST")
+        return { status: 200, body: reportsMock.send(id) }
+      }
+      only("GET", "PUT", "DELETE")
+      if (method === "GET") return { status: 200, body: reportsMock.get(id) }
+      if (method === "DELETE") {
+        reportsMock.remove(id)
+        return { status: 200, body: { removed: true } }
+      }
+      return { status: 200, body: reportsMock.update(id, (await body()) as never) }
+    } catch (e) {
+      if (e instanceof MockReportError) throw new ApiFail(e.status, e.code, e.message)
+      throw e
+    }
   }
   // Protocol 10: the admin view of module routes and their tokens (as the real server's /api/module-routes).
   const routesMatch = /^module-routes(?:\/([a-z][a-z0-9-]{0,39})\/tokens(?:\/([a-f0-9]{8,32}))?)?$/.exec(path)

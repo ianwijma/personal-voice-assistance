@@ -66,7 +66,7 @@ import { type HeardAudio, makeHeardAudio } from "./HeardAudio.ts"
 import { makeOutputLease } from "./OutputLease.ts"
 import { makePublisher, type Publisher } from "./Publisher.ts"
 import { makeTypesafeDecide, type RoutingService, typesafeNow } from "./routing.ts"
-import { makeSessionConversation, type SendOutcome, type SessionConversation } from "./SessionConversation.ts"
+import { type ConversationEndReason, makeSessionConversation, type SendOutcome, type SessionConversation } from "./SessionConversation.ts"
 import { type DispatchRoute, type DispatchTarget, makeSessionDispatcher, type RouteDecision, type SessionDispatcher } from "./SessionDispatcher.ts"
 import { makeStateTracker, type StateTracker } from "./StateTracker.ts"
 
@@ -195,8 +195,13 @@ export interface VoiceSessionOptions {
    * outcome, timings, the outcome), published where turn traces are; it is no conversation turn and no history entry.
    */
   readonly onPhraseTrace?: (trace: TraceInfo) => void
-  /** One of its conversations ended (conversation-scoped household data is deleted). */
-  readonly conversationEnded?: (conversationId: string) => void
+  /**
+   * One of its conversations ended (conversation-scoped household data is deleted): whose it was and the history it
+   * held (a report's previous conversation, docs/REPORTS.md).
+   */
+  readonly conversationEnded?: (conversationId: string, ended: { readonly assistant: string; readonly history: ReadonlyArray<Message>; readonly reason: ConversationEndReason }) => void
+  /** Whether an ended conversation's history is kept by anything now (`SessionConversationOptions.keepsEndedHistory`). */
+  readonly keepsEndedHistory?: () => boolean
   /** What one minute of `newConversationAfter` is, in ms (tests shorten it). Default 60 000. */
   readonly minuteMs?: number
   readonly maxPendingInputs?: number
@@ -919,7 +924,8 @@ export const makeVoiceSession = (options: VoiceSessionOptions): Effect.Effect<Vo
               options.send({ type: "conversation", id: info.id, reason, startedAt: info.startedAt, assistantId: assistant })
               options.onChange(false)
             },
-            ...(options.conversationEnded !== undefined ? { onConversationEnded: options.conversationEnded } : {}),
+            ...(options.conversationEnded !== undefined ? { onConversationEnded: (id: string, history: ReadonlyArray<Message>, reason: ConversationEndReason) => options.conversationEnded?.(id, { assistant, history, reason }) } : {}),
+            ...(options.keepsEndedHistory !== undefined ? { keepsEndedHistory: options.keepsEndedHistory } : {}),
             // Events queued while the engines were rebuilt are stale: each run after the first starts empty.
             speech: () => (runs++ === 0 ? Stream.fromQueue(inbox) : Stream.unwrap(Effect.as(Queue.clear(inbox), Stream.fromQueue(inbox)))),
             // The assistant's quiet spell ("never" = no reset) and tool rounds, read live.

@@ -31,7 +31,8 @@ const NEW = [
   "bin-day",
   "presence",
   "news",
-  "routines"
+  "routines",
+  "report"
 ]
 const docs = join(import.meta.dirname, "..", "..", "..", "docs")
 

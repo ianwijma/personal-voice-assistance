@@ -16,6 +16,7 @@ import { catalog as newsModules } from "@pva/module-news"
 import { catalog as notificationsModules } from "@pva/module-notifications"
 import { catalog as presenceModules } from "@pva/module-presence"
 import { catalog as remindersModules } from "@pva/module-reminders"
+import { catalog as reportModules } from "@pva/module-report"
 import { catalog as routinesModules } from "@pva/module-routines"
 import { catalog as timersModules } from "@pva/module-timers"
 import { catalog as webSearchModules } from "@pva/module-web-search"
@@ -62,6 +63,8 @@ export const moduleCatalog: ReadonlyArray<ModuleDefinition<any>> = [
   ...presenceModules,
   ...newsModules,
   ...routinesModules,
+  // Reports (docs/REPORTS.md): a problem or a feature idea, kept for the owner and sent to the project on GitHub.
+  ...reportModules,
   // Off by default and behind its own opt-in switch; answers when LLM_PROVIDER=claude-subscription.
   claudeSubscriptionAgent
 ]
