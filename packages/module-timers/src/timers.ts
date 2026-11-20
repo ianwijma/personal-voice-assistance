@@ -13,7 +13,7 @@ import {
   type Row,
   Setting
 } from "@pva/core"
-import { speakDuration } from "@pva/language"
+import { parseDuration, speakDuration } from "@pva/language"
 import { homeLanguage, isLine, type Language, say, StoredText, Timers, TIMERS_LIMITS, TimersError, type TimerInfo, type TimersService } from "@pva/module-contracts"
 import { Clock, Effect, Schema, Semaphore } from "effect"
 import { randomUUID } from "node:crypto"
@@ -122,7 +122,7 @@ const itemOf = (row: Row<Timer>, shown: Shown, now: number, language: Language):
   const left = speakLeft(leftOf(row.value, now), language)
   if (shown === "ringing") return say(texts, language, "itemRinging", { name })
   if (shown === "waiting") return say(texts, language, "itemWaiting", { name })
-  if (shown === "cleanup") return say(texts, language, "itemCleanup", { name })
+  if (shown === "cleanup") return say(texts, language, row.value.withdraw !== undefined ? "itemCleanup" : "itemScreenCleanup", { name })
   if (row.value.state === "paused") return say(texts, language, "itemPaused", { name, left })
   if (row.value.snoozed === true) return say(texts, language, "itemSnoozed", { name, left })
   return say(texts, language, "itemLeft", { name, left })
@@ -130,7 +130,7 @@ const itemOf = (row: Row<Timer>, shown: Shown, now: number, language: Language):
 
 /** The ambient line: at most three running timers among the rows the host read (the most recently changed ones). */
 const ambientLine = (rows: ReadonlyArray<Row<Timer>>, now: number): string | undefined => {
-  const active = rows.filter((r) => r.value.phase === "active")
+  const active = rows.filter((r) => r.value.phase === "active" && (r.value.state !== "running" || r.value.dueAt > now))
   if (active.length === 0) return undefined
   const items = active.slice(0, 3).map((r) => itemOf(r, "active", now, "en"))
   const more = active.length > 3 ? `, and ${active.length - 3} more` : ""
@@ -222,6 +222,11 @@ type Target =
 
 const fail = (message: string) => new ActionError({ message })
 
+const timerTarget = (name: string | undefined): string | undefined => {
+  if (name === undefined || /^(?:timer|timers)$/iu.test(name)) return undefined
+  return name.replace(/^timer\s+(?:called|named|genaamd)\s+/iu, "")
+}
+
 /** The shared part's operations (`ctx.shared`): every read and change of a timer goes through them, one at a time. */
 export interface TimersOps {
   readonly start: (input: { readonly durationMs: number; readonly name?: string | undefined }) => Effect.Effect<string, ActionError>
@@ -273,8 +278,10 @@ export const timersModule = defineModule({
             const next = nextAtOf(e.value, now)
             const job = next === undefined ? undefined : yield* ctx.scheduler.prepare({ handler: "due", key: `timer:${e.id}`, payload: { id: e.id }, at: next, origin: { deviceId: e.value.deviceId } })
             prepared.push({ row: e.row, id: e.id, planned: { ...e.value, pending: next !== undefined, nextAt: next ?? 0 }, job })
+            if (prepared.length % PAGE === 0) yield* Effect.yieldNow
           }
           const options = yield* actorNow(actor)
+          if (entries.length > 1) yield* Effect.yieldNow
           const written = yield* ctx.store.transaction((tx) => {
             const c = tx.collection(timers)
             const rows = prepared.map((p) => {
@@ -286,7 +293,12 @@ export const timersModule = defineModule({
             for (const j of extra) j.writeIn(tx)
             return rows
           })
-          for (const p of prepared) if (p.job === undefined && p.row?.value.pending === true) yield* Effect.ignore(ctx.scheduler.cancel({ key: `timer:${p.id}` }))
+          if (entries.length > 1) yield* Effect.yieldNow
+          for (let i = 0; i < prepared.length; i++) {
+            const p = prepared[i]!
+            if (p.job === undefined && p.row?.value.pending === true) yield* Effect.ignore(ctx.scheduler.cancel({ key: `timer:${p.id}` }))
+            if ((i + 1) % PAGE === 0) yield* Effect.yieldNow
+          }
           return written
         })
 
@@ -345,11 +357,16 @@ export const timersModule = defineModule({
           const owed = v.owed!
           const later = (x: Timer) => ({ value: { ...x, owed: { ...owed, attempts: owed.attempts + 1, retryAt: now + RETRY_RING_MS } }, jobs: [] })
           if (now - owed.at >= ringMs()) {
+            // The send may have succeeded just before the deadline and lost its outcome write. Recover that open ring.
+            const open = yield* Effect.result(ctx.notify.list())
+            if (open._tag === "Failure") return later(v)
+            const sent = open.success.find((n) => n.key === `timer:${id}:${owed.n}`)
+            if (sent !== undefined) return { value: { ...withoutKey(v, "owed"), ring: { n: owed.n, notification: sent.id, at: sent.sentAt, until: sent.expiresAt } }, jobs: [] }
             const report = yield* Effect.result(ctx.scheduler.prepare({
               handler: "trouble",
               key: `trouble:${id}:${owed.n}`,
               inMs: 0,
-              payload: { message: `A timer could not ring: the notification service refused it until its ring time had passed (${cut(displayName(v, "en"), 80)}).` }
+              payload: { message: `A timer could not ring within its delivery window (${cut(displayName(v, "en"), 80)}).` }
             }))
             if (report._tag === "Failure") return later(v)
             const { owed: _o, ...rest } = v
@@ -371,7 +388,7 @@ export const timersModule = defineModule({
           const late = now - owed.at
           const sent = yield* Effect.result(ctx.notify.send({
             title: out.name !== undefined ? say(texts, lang, "title", { Name: cut(capitalise(name), 40) }) : say(texts, lang, "titlePlain"),
-            text: late >= 60_000 ? say(texts, lang, "ringTextLate", { duration, late: speakLeft(late, lang) }) : say(texts, lang, "ringText", { duration }),
+            text: late > 0 ? say(texts, lang, "ringTextLate", { duration, late: speakLeft(late, lang) }) : say(texts, lang, "ringText", { duration }),
             priority: "ring",
             key: `timer:${id}:${owed.n}`,
             expiresInMs: ringMs(),
@@ -450,6 +467,16 @@ export const timersModule = defineModule({
       // -- reading ---------------------------------------------------------------------------------------------------------
 
       const readActive = scan<Timer>((q) => store.list({ where: { phase: "active" }, orderBy: { field: "createdAt", direction: "asc" }, ...q }), PAGE, SCAN_ACTIVE)
+      const readCurrentActive = (rearming?: string) => Effect.gen(function*() {
+        const read = yield* readActive
+        const now = yield* Clock.currentTimeMillis
+        // Under the lock, due timers leave the active count with their ring still owed to their own job.
+        for (const row of read.rows) if (row.id !== rearming && row.value.state === "running" && row.value.dueAt <= now) {
+          yield* commit(row, row.id, advance(row.value, now))
+          yield* Effect.yieldNow
+        }
+        return { ...read, rows: read.rows.filter((r) => r.id !== rearming && (r.value.state !== "running" || r.value.dueAt > now)) }
+      })
       const readPending = scan<Timer>((q) => store.list({ where: { pending: true }, orderBy: { field: "nextAt", direction: "asc" }, ...q }), PAGE, SCAN_PENDING)
 
       /**
@@ -457,24 +484,30 @@ export const timersModule = defineModule({
        * timers that ended but still owe clean-up (a ring or a countdown to take away), which only a cancel looks at.
        */
       const readRinging = Effect.gen(function*() {
-        const open = new Set((yield* ctx.notify.list()).map((n) => n.id))
+        const notifications = yield* ctx.notify.list()
+        const open = new Set(notifications.map((n) => n.id))
+        const keys = new Set(notifications.map((n) => n.key))
         const pending = yield* readPending
         const ringing: Array<Row<Timer>> = []
         const waiting: Array<Row<Timer>> = []
         const cleanup: Array<Row<Timer>> = []
         for (const row of pending.rows) {
           if (row.value.phase !== "ended") continue
-          if (row.value.state === "done" && row.value.owed !== undefined) waiting.push(row)
+          if (row.value.state === "done" && row.value.owed !== undefined) {
+            // A send can have succeeded before its outcome write failed. Only this occurrence's key proves it rang.
+            if (keys.has(`timer:${row.id}:${row.value.owed.n}`)) ringing.push(row)
+            else waiting.push(row)
+          }
           else if (row.value.state === "done" && row.value.ring !== undefined && open.has(row.value.ring.notification)) ringing.push(row)
           else if (row.value.withdraw !== undefined || row.value.screen !== undefined) cleanup.push(row)
         }
-        return { ringing, waiting, cleanup, cut: pending.cut }
+        return { ringing, waiting, cleanup, notifications, cut: pending.cut }
       })
 
       const readAll = Effect.gen(function*() {
         const active = yield* readActive
         const r = yield* readRinging
-        return { active: active.rows, ringing: r.ringing, waiting: r.waiting, cleanup: r.cleanup, cut: active.cut || r.cut }
+        return { active: active.rows, ringing: r.ringing, waiting: r.waiting, cleanup: r.cleanup, notifications: r.notifications, cut: active.cut || r.cut }
       })
 
       /** What a request can mean: listed timers; for a cancel, also timers that still owe clean-up (finding 9). */
@@ -485,7 +518,7 @@ export const timersModule = defineModule({
       ) => [
         ...all.ringing.map((row) => ({ row, shown: "ringing" as Shown })),
         ...all.waiting.map((row) => ({ row, shown: "waiting" as Shown })),
-        ...[...all.active].sort((x, y) => leftOf(x.value, now) - leftOf(y.value, now)).map((row) => ({ row, shown: "active" as Shown })),
+        ...[...all.active].sort((x, y) => leftOf(x.value, now) - leftOf(y.value, now)).map((row) => ({ row, shown: (row.value.state === "running" && row.value.dueAt <= now ? "waiting" : "active") as Shown })),
         ...(forCancel ? all.cleanup.map((row) => ({ row, shown: "cleanup" as Shown })) : [])
       ]
 
@@ -495,16 +528,16 @@ export const timersModule = defineModule({
           const lang = language()
           const all = yield* readAll.pipe(Effect.mapError(unreadable))
           const candidates = candidatesOf(all, now, forCancel)
-          const key = name === undefined ? "" : nameKey(name)
-          const matches = key === "" ? candidates : candidates.filter((c) => c.row.value.name !== undefined && nameKey(c.row.value.name) === key)
+          const key = name === undefined ? undefined : nameKey(name)
+          const matches = key === undefined ? candidates : candidates.filter((c) => c.row.value.name !== undefined && nameKey(c.row.value.name) === key)
           if (matches.length === 1) return { kind: "one", row: matches[0]!.row, shown: matches[0]!.shown }
           if (matches.length === 0) {
-            if (key !== "") return { kind: "unknown", name: name! }
+            if (key !== undefined) return { kind: "unknown", name: name! }
             if (all.cut) return yield* Effect.fail(unreadable())
             return { kind: "none" }
           }
           const list = listOf(matches.map((c) => itemOf(c.row, c.shown, now, lang)), lang)
-          return { kind: "ask", say: say(texts, lang, key === "" && all.cut ? "whichCut" : "which", { count: matches.length, list }) }
+          return { kind: "ask", say: say(texts, lang, key === undefined && all.cut ? "whichCut" : "which", { count: matches.length, list }) }
         })
 
       const notOne = (t: Exclude<Target, { kind: "one" }>): string => {
@@ -553,11 +586,11 @@ export const timersModule = defineModule({
       const startTimer = (input: { readonly durationMs: number; readonly name?: string | undefined; readonly deviceId: string; readonly room?: string | undefined }) =>
         locked(Effect.gen(function*() {
           const now = yield* Clock.currentTimeMillis
-          const active = yield* readActive
+          const active = yield* readCurrentActive()
           if (active.cut || active.rows.length >= TIMERS_LIMITS.running) return { kind: "limit" } satisfies StartOutcome as StartOutcome
           if (input.name !== undefined) {
             const key = nameKey(input.name)
-            const same = active.rows.find((r) => r.value.name !== undefined && key !== "" && nameKey(r.value.name) === key)
+            const same = active.rows.find((r) => r.value.name !== undefined && nameKey(r.value.name) === key)
             if (same !== undefined) return { kind: "duplicate", row: same } satisfies StartOutcome as StartOutcome
           }
           const id = randomUUID()
@@ -583,7 +616,8 @@ export const timersModule = defineModule({
         }))
 
       /** A change of a timer, then everything owed after it done at once. Inside the lock. */
-      const change = (row: Row<Timer>, value: Timer, actor?: Actor) => Effect.andThen(commit(row, row.id, value, actor), () => reconcile(row.id, actor, true))
+      const change = (row: Row<Timer>, value: Timer, actor?: Actor) => Effect.flatMap(commit(row, row.id, value, actor), (committed) =>
+        reconcile(row.id, actor, true).pipe(Effect.catch(() => Effect.succeed(committed))))
 
       /**
        * Let go of the row's current occurrence (finding 2): the one way cancel, more time, pause and a button's follow-up
@@ -591,13 +625,16 @@ export const timersModule = defineModule({
        * record failed is looked for among the open notifications by its occurrence's key and becomes the ring to take away;
        * only then is the owed delivery forgotten. Fails (and nothing is changed) when the open notifications cannot be read.
        */
-      const letGo = (id: string, v: Timer, now: number, keepRing = false) =>
+      const letGo = (id: string, v: Timer, now: number, keepRing = false, snapshot?: ReadonlyArray<{ readonly id: string; readonly key?: string; readonly expiresAt: number }>) =>
         Effect.gen(function*() {
-          let out = v
+          const notifications = snapshot ?? (yield* ctx.notify.list())
+          const open = new Set(notifications.map((n) => n.id))
+          let out = v.withdraw !== undefined && !open.has(v.withdraw.notification) ? withoutKey(v, "withdraw") : v
+          if (out.ring !== undefined && !open.has(out.ring.notification) && !keepRing) out = withoutKey(out, "ring")
           if (out.ring !== undefined && !keepRing) out = withdrawing(withoutKey(out, "ring"), out.ring, now) ?? out
           if (out.owed !== undefined) {
             const key = `timer:${id}:${out.owed.n}`
-            const sent = (yield* ctx.notify.list()).find((n) => n.key === key)
+            const sent = notifications.find((n) => n.key === key)
             if (sent !== undefined) {
               const taken = withdrawing(out, { notification: sent.id, until: sent.expiresAt }, now)
               if (taken === undefined) return yield* Effect.fail(new Error("a second ring to take away"))
@@ -622,8 +659,8 @@ export const timersModule = defineModule({
         })
 
       /** The timer cancelled: nothing more rings; its occurrence is let go. */
-      const cancelled = (row: Row<Timer>, now: number) =>
-        Effect.map(letGo(row.id, row.value, now), (v) => {
+      const cancelled = (row: Row<Timer>, now: number, snapshot?: ReadonlyArray<{ readonly id: string; readonly key?: string; readonly expiresAt: number }>) =>
+        Effect.map(letGo(row.id, row.value, now, false, snapshot), (v) => {
           const { snoozed: _s, ...rest } = v
           return { ...rest, state: "cancelled" as const, phase: "ended" as const, endedAt: row.value.phase === "ended" ? row.value.endedAt : now }
         })
@@ -655,7 +692,7 @@ export const timersModule = defineModule({
           locked(Effect.gen(function*() {
             const lang = language()
             const now = yield* Clock.currentTimeMillis
-            if (name !== undefined && nameKey(name) !== "") {
+            if (name !== undefined) {
               const t = yield* resolve(name, now)
               return t.kind === "one" ? oneAnswer(t.row, t.shown, now, lang) : notOne(t)
             }
@@ -677,8 +714,8 @@ export const timersModule = defineModule({
             const Name = capitalise(displayName(row.value, lang))
             if (t.shown !== "active") {
               // A timer that came due given more time runs again for that long; its ring is withdrawn.
-              if (deltaMs <= 0) return say(texts, lang, "notPausedRinging", { Name })
-              const active = yield* readActive.pipe(Effect.mapError(failure))
+              if (deltaMs <= 0) return say(texts, lang, t.shown === "waiting" ? "oneWaiting" : "notPausedRinging", { Name })
+              const active = yield* readCurrentActive(row.id).pipe(Effect.mapError(failure))
               if (active.cut || active.rows.length >= TIMERS_LIMITS.running) return yield* Effect.fail(fail(say(texts, lang, "full", { count: TIMERS_LIMITS.running })))
               const after = yield* Effect.flatMap(rearmed(row.id, row.value, now, deltaMs, { snoozed: false }), (value) => change(row, value)).pipe(Effect.mapError(failure))
               return say(texts, lang, leftovers(after).ring ? "restartedPending" : "restarted", { Name, left: speakLeft(deltaMs, lang) })
@@ -703,7 +740,11 @@ export const timersModule = defineModule({
             if (t.kind !== "one") return notOne(t)
             const row = t.row
             const Name = capitalise(displayName(row.value, lang))
-            if (t.shown !== "active") return say(texts, lang, "notPausedRinging", { Name })
+            if (row.value.state === "running" && row.value.dueAt <= now) {
+              yield* commit(row, row.id, advance(row.value, now)).pipe(Effect.mapError(failure))
+              return say(texts, lang, "oneWaiting", { Name })
+            }
+            if (t.shown !== "active") return say(texts, lang, t.shown === "waiting" ? "oneWaiting" : "notPausedRinging", { Name })
             if (row.value.state === "paused") {
               // Already paused: what is still owed for it (a countdown to take down) is done now.
               const after = yield* reconcile(row.id, undefined, true).pipe(Effect.mapError(failure))
@@ -726,7 +767,7 @@ export const timersModule = defineModule({
             if (t.kind !== "one") return notOne(t)
             const row = t.row
             const Name = capitalise(displayName(row.value, lang))
-            if (t.shown !== "active") return say(texts, lang, "notPausedRinging", { Name })
+            if (t.shown !== "active") return say(texts, lang, t.shown === "waiting" ? "oneWaiting" : "notPausedRinging", { Name })
             if (row.value.state !== "paused") return say(texts, lang, "notPaused", { Name, left: speakLeft(leftOf(row.value, now), lang) })
             const left = row.value.leftMs ?? 1_000
             const { leftMs: _l, screenSkip: _k, ...rest } = row.value
@@ -738,20 +779,27 @@ export const timersModule = defineModule({
           locked(Effect.gen(function*() {
             const lang = language()
             const now = yield* Clock.currentTimeMillis
-            if (all) {
+            if (all && name === undefined) {
               const read = yield* readAll.pipe(Effect.mapError(unreadable))
               // Timers still owing clean-up are cancelled again too: their clean-up is tried now (finding 9).
               const rows = [...read.active, ...read.ringing, ...read.waiting, ...read.cleanup]
               if (rows.length === 0) return say(texts, lang, "cancelledNone")
               // Every row in one transaction (all or none), then what is owed for each done.
               const values: Array<{ readonly row: Row<Timer>; readonly id: string; readonly value: Timer }> = []
-              for (const row of rows) values.push({ row, id: row.id, value: yield* cancelled(row, now).pipe(Effect.mapError(failure)) })
+              for (const row of rows) {
+                values.push({ row, id: row.id, value: yield* cancelled(row, now, read.notifications).pipe(Effect.mapError(failure)) })
+                if (values.length % PAGE === 0) yield* Effect.yieldNow
+              }
               yield* commitAll(values).pipe(Effect.mapError(failure))
               let pending = false
-              for (const row of rows) {
-                const after = yield* reconcile(row.id, undefined, true).pipe(Effect.mapError(failure))
-                const l = leftovers(after)
-                pending ||= l.ring || l.screen
+              for (let i = 0; i < rows.length; i++) {
+                const after = yield* Effect.result(reconcile(rows[i]!.id, undefined, true))
+                if (after._tag === "Failure") pending = true
+                else {
+                  const l = leftovers(after.success)
+                  pending ||= l.ring || l.screen
+                }
+                if ((i + 1) % PAGE === 0) yield* Effect.yieldNow
               }
               if (pending) return say(texts, lang, "cancelledAllPending", { count: rows.length })
               return say(texts, lang, read.cut ? "cancelledAllCut" : "cancelledAll", { count: rows.length })
@@ -763,7 +811,7 @@ export const timersModule = defineModule({
             const Name = capitalise(displayName(row.value, lang))
             const after = yield* Effect.flatMap(cancelled(row, now), (value) => change(row, value)).pipe(Effect.mapError(failure))
             const l = leftovers(after)
-            if (t.shown === "cleanup") return say(texts, lang, l.ring || l.screen ? "stoppedPending" : "finished", { Name })
+            if (t.shown === "cleanup") return say(texts, lang, l.ring ? "stoppedPending" : l.screen ? "screenPending" : "finished", { Name })
             if (l.ring) return say(texts, lang, "ringPending", { Name })
             if (l.screen) return say(texts, lang, "screenPending", { Name })
             return say(texts, lang, t.shown === "active" ? "cancelled" : "cancelledRinging", { Name })
@@ -847,9 +895,15 @@ export const timersModule = defineModule({
             const snooze = press.actionId === "snooze"
             const now = yield* Clock.currentTimeMillis
             const answer = (v: Timer) => (snooze ? say(texts, lang, "snoozed", { Name, left: speakLeft(leftOf(v, now), lang) }) : say(texts, lang, "moreDone", { Name }))
-            if (row.value.ring.pressed === press.notificationId) return { say: row.value.phase === "active" ? answer(row.value) : say(texts, lang, "ringEnded") }
-            const active = yield* readActive
+            if (row.value.ring.pressed === press.notificationId) {
+              if (row.value.phase !== "active") return { say: say(texts, lang, "ringEnded") }
+              const left = leftOf(row.value, now)
+              return { say: !snooze && left === MORE_MINUTES * 60_000 ? say(texts, lang, "moreDone", { Name }) : say(texts, lang, "snoozed", { Name, left: speakLeft(left, lang) }) }
+            }
+            const active = yield* readCurrentActive(row.id)
             if (active.cut || active.rows.length >= TIMERS_LIMITS.running) return { say: say(texts, lang, "full", { count: TIMERS_LIMITS.running }), keepOpen: true }
+            const duplicate = row.value.name === undefined ? undefined : active.rows.find((r) => r.id !== row.id && r.value.name !== undefined && nameKey(r.value.name) === nameKey(row.value.name!))
+            if (duplicate !== undefined) return { say: say(texts, lang, "duplicate", { name: duplicate.value.name!, left: speakLeft(leftOf(duplicate.value, now), lang) }), keepOpen: true }
             const after = yield* Effect.flatMap(
               rearmed(row.id, row.value, now, snooze ? snoozeMs() : MORE_MINUTES * 60_000, { snoozed: snooze, pressed: press.notificationId }),
               (value) => change(row, value, actor)
@@ -901,18 +955,29 @@ export const timersModule = defineModule({
         defineAction({
           id: "start",
           label: "Start a timer",
-          description: "Start a countdown timer of a duration, optionally with a name (\"pasta\"). It rings on this device; its countdown shows on the screens of this room.",
-          examples: ["set a timer for ten minutes", "set a pasta timer for 8 minutes", "zet een timer op tien minuten", "zet een eieren timer op zes minuten"],
+          description: "Start a countdown timer of a duration, optionally with a name. It rings on this device; its countdown shows on the screens of this room.",
+          examples: ["set a timer for ten minutes", "start a timer for 8 minutes", "zet een timer op tien minuten", "zet een timer op zes minuten"],
           params: {
             duration: Param.duration({ label: "Duration", minMs: TIMERS_LIMITS.minMs, maxMs: TIMERS_LIMITS.maxMs }),
-            name: Param.text({ label: "Name", after: ["called", "named", "genaamd"], optional: true, maxWords: 3 })
+            name: Param.text({ label: "Name", after: ["called", "named", "genaamd"], optional: true, maxWords: 3 }),
+            inlineName: Param.text({ label: "Named timer clause", after: ["a", "an", "the", "een", "de"], optional: true, maxWords: 64 })
           },
           phrases: {
-            en: ["set a timer for {duration}", "set a {name} timer for {duration}", "start a timer for {duration}", "timer for {duration}", "set the timer for {duration}"],
+            en: ["set a timer for {duration}", "set a {name} timer for {duration}", "start a timer for {duration}", "start a {name} timer for {duration}", "timer for {duration}", "set the timer for {duration}"],
             nl: ["zet een timer op {duration}", "zet een timer van {duration}", "zet een timer voor {duration}", "timer van {duration}", "timer op {duration}", "zet een {name} timer op {duration}"]
           },
           risk: "change",
-          run: ({ duration, name }) => Effect.map(ctx.shared.start({ durationMs: duration, name }), (s) => ({ say: s }))
+          run: ({ duration, name, inlineName }) => {
+            const lang = homeLanguage(ctx.host.view())
+            const clause = inlineName?.match(/^(?:(.+?)\s+)?timer\s+(?:for|op|van|voor)\s+(.+)$/iu)
+            const parsed = clause === undefined || clause === null ? undefined : parseDuration(clause[2]!, lang)
+            if (/\b(?:repeat\p{L}*|recurr\p{L}*|every|each|intervals?|period\p{L}*|(?:(?:half|bi|twice)-?)?(?:second|minute|hour|dai|week|fortnight|month|quarter|year)ly|herhaa?l\p{L}*|terugker\p{L}*|elk\p{L}*|ieder\p{L}*|\p{L}*(?:seconde|minuut|uur|dage|weke|maande|jaar|kwartier)lijks(?:e)?)\b/iu.test(`${name ?? ""} ${clause?.[1] ?? ""}`)) return Effect.succeed({ say: say(texts, lang, "noRepeat") })
+            // Never discard a supplied clause's unknown name, suffix or mismatched duration.
+            if (inlineName !== undefined && (parsed?.kind !== "ok" || parsed.value !== duration || name !== undefined && nameKey(name) !== nameKey(clause![1] ?? ""))) {
+              return Effect.succeed({ say: say(texts, lang, "startTarget") })
+            }
+            return Effect.map(ctx.shared.start({ durationMs: duration, name: name ?? clause?.[1] }), (s) => ({ say: s }))
+          }
         }),
         defineAction({
           id: "list",
@@ -931,48 +996,56 @@ export const timersModule = defineModule({
           id: "adjust",
           label: "Change a timer's time",
           description: "Add time to a timer, or take time off it. A ringing timer given more time runs again for that long.",
-          examples: ["add five minutes to the pasta timer", "take a minute off the timer", "doe er vijf minuten bij"],
+          examples: ["add five minutes to the timer", "take a minute off the timer", "doe er vijf minuten bij"],
           params: {
             amount: Param.duration({ label: "Amount", minMs: 1_000, maxMs: TIMERS_LIMITS.maxMs }),
-            change: Param.choice({ label: "Add or take off", options: [{ value: "add", label: "add", aliases: ["erbij"] }, { value: "remove", label: "take off", aliases: ["eraf", "minder"] }], default: "add", optional: true }),
-            name: Param.text({ label: "Name", after: ["to", "from", "off", "bij", "van"], optional: true, maxWords: 3 })
+            change: Param.choice({ label: "Add or take off", options: [{ value: "add", label: "add", aliases: ["erbij"] }, { value: "remove", label: "take off", aliases: ["off", "subtract", "remove", "eraf", "minder"] }] }),
+            name: Param.text({ label: "Name", after: ["the", "my", "our", "de", "mijn", "onze"], optional: true, maxWords: 64 })
           },
           risk: "change",
-          run: ({ amount, change, name }) => Effect.map(ctx.shared.adjust(name, change === "remove" ? -amount : amount), (s) => ({ say: s }))
+          run: ({ amount, change, name }) => Effect.map(ctx.shared.adjust(timerTarget(name), change === "remove" ? -amount : amount), (s) => ({ say: s }))
         }),
         defineAction({
           id: "pause",
           label: "Pause a timer",
           description: "Pause a running timer; it keeps what it has left until it is resumed.",
           examples: ["pause the timer", "pause the pasta timer", "pauzeer de timer"],
-          params: { name: Param.text({ label: "Name", after: ["the"], optional: true, maxWords: 3 }) },
+          params: { name: Param.text({ label: "Name", after: ["the", "my", "our", "de", "mijn", "onze", "called", "named", "genaamd"], maxWords: 64 }) },
           risk: "change",
-          run: ({ name }) => Effect.map(ctx.shared.pause(name), (s) => ({ say: s }))
+          run: ({ name }) => Effect.map(ctx.shared.pause(timerTarget(name)), (s) => ({ say: s }))
         }),
         defineAction({
           id: "resume",
           label: "Resume a timer",
           description: "Let a paused timer run again from what it had left.",
           examples: ["resume the timer", "start the pasta timer again", "laat de timer weer lopen"],
-          params: { name: Param.text({ label: "Name", after: ["the"], optional: true, maxWords: 3 }) },
+          params: { name: Param.text({ label: "Name", after: ["the", "my", "our", "de", "mijn", "onze", "called", "named", "genaamd"], maxWords: 64 }) },
           risk: "change",
-          run: ({ name }) => Effect.map(ctx.shared.resume(name), (s) => ({ say: s }))
+          run: ({ name }) => Effect.map(ctx.shared.resume(timerTarget(name)), (s) => ({ say: s }))
         }),
         defineAction({
           id: "cancel",
           label: "Cancel a timer",
           description: "Cancel a timer (a ringing one stops), or every timer when all is asked for.",
-          examples: ["cancel the timer", "cancel the eggs timer", "cancel all timers", "annuleer de timer"],
+          examples: ["cancel the timer", "cancel the named timer", "cancel all timers", "annuleer de timer"],
           params: {
-            name: Param.text({ label: "Name", after: ["the"], optional: true, maxWords: 3 }),
-            all: Param.boolean({ label: "All timers", question: "Does the speaker want every timer cancelled?" })
+            name: Param.text({ label: "Name", after: ["the", "my", "our", "de", "mijn", "onze", "called", "named", "genaamd"], optional: true, maxWords: 64 }),
+            all: Param.boolean({ label: "All timers", question: "Does the speaker want every timer cancelled?" }),
+            bulk: Param.text({ label: "Explicit all target (timers)", after: ["all", "alle"], optional: true, maxWords: 64 })
           },
           phrases: {
             en: ["cancel the timer", "cancel the {name} timer", "cancel timer", "stop the timer", "stop the {name} timer", "delete the timer"],
             nl: ["annuleer de timer", "annuleer de {name} timer", "annuleer de timer {name}", "stop de timer", "zet de timer uit", "zet de {name} timer uit"]
           },
           risk: "change",
-          run: ({ name, all }) => Effect.map(ctx.shared.cancel(name, all), (s) => ({ say: s }))
+          run: ({ name, all, bulk }) => {
+            const target = timerTarget(name)
+            const explicitAll = bulk !== undefined && /^(?:(?:the|my|our|de|mijn|onze)\s+)?timers$/iu.test(bulk)
+            if ((bulk !== undefined && !explicitAll) || (explicitAll && target !== undefined) || (all && target === undefined && !explicitAll)) {
+              return Effect.succeed({ say: say(texts, homeLanguage(ctx.host.view()), "cancelTarget") })
+            }
+            return Effect.map(ctx.shared.cancel(target, explicitAll && target === undefined), (s) => ({ say: s }))
+          }
         })
       ]
     })

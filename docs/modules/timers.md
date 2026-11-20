@@ -58,7 +58,7 @@ own: a job can fail for good after its retries while the store is busy.
   makes it run again for five minutes, with its countdown.
 - **The buttons act only on the timer's current ring.** A press of any other card (an older one, or one whose sending
   could not be recorded yet) is answered "That ring has ended." and changes nothing. A press is done once per
-  notification: run again for the same card, it answers the same and changes nothing.
+  notification: run again for the same card, it reports the committed time still left and changes nothing.
 - **Stop** is the host's: on the card, as the spoken "stop", or "stop" without the wake phrase while it rings (the
   ringing window). The button labels can also be said while it rings ("snooze", "five more minutes").
 - A ring **stops by itself** after the ring setting's minutes.
@@ -70,11 +70,13 @@ busy, **stays owed** and is tried again every 30 seconds for as long as it would
 While it waits, the timer is listed as "done and waiting to ring". A restart keeps it.
 
 When a place comes free in time, it rings and says how late: "The 2 minutes timer ended two and a half minutes ago,
-while I couldn't ring.". A timer due while the server or the module was down rings as soon as the module runs again,
-and says how late.
+while I couldn't ring.". A timer due while the server or the module was down rings on restart if it is still inside
+its delivery window, and says how late.
 
-If no place comes free in its whole ring time, it is recorded as missed and the Health page says so. A module has no
-other way to raise a Health issue, so a job of its own (`trouble`) fails on purpose. That job is written in the same
+Before giving up at the delivery deadline, the module checks for an open notification under this ring's key. It records
+that notification with its existing expiry if found; if the lookup fails, delivery stays owed. Otherwise the timer is
+recorded as missed and the Health page says so. A module
+has no other way to raise a Health issue, so a job of its own (`trouble`) fails on purpose. That job is written in the same
 transaction that gives the ring up: if it cannot be written, the ring is not given up, and stays owed.
 
 ### Delivery is at least once
@@ -82,9 +84,12 @@ transaction that gives the ring up: if it cannot be written, the ring is not giv
 The order is: write the owed ring, send it under its key, write that it was sent. If the server fails between the send
 and that last write, the next reconcile finds the ring still owed:
 
-- if its notification is still open, the module only records it;
+- if its notification is still open, the module only records it, even beyond the delivery window;
 - if nobody stopped it, it rings once;
 - if someone pressed **Stop in that moment, the ring can sound a second time.** A ring is never lost this way.
+
+An open ring recovered after a lost outcome write remains available to voice cancellation. This also covers a refused
+first send followed by a successful retry whose outcome write failed across the delivery deadline.
 
 What would close this is below the module: see "Missing below".
 
@@ -106,8 +111,8 @@ the owed ring forgotten.
 
 ### Taking away and clean-up
 
-Taking a ring away and taking a countdown off the screen are owed work in the row. They are cleared only when they
-succeeded, and tried again a minute later by the job, also for a timer that is paused or ended and also after a
+Taking a ring away and taking a countdown off the screen are owed work in the row. Outside the combined-failure limits
+below, they are cleared only when they succeeded, and tried again a minute later by the job, also for a timer that is paused or ended and also after a
 restart. A ring is retried until it stops by itself; a countdown until it ends by itself, 10 minutes after its moment.
 After a restart the countdown is taken down by showing its key again (a countdown ending now) and dismissing that.
 
@@ -121,15 +126,21 @@ The sentences say what is true:
   now."). Lists of running timers do not show it.
 
 The countdown is recorded in the row as "may be on a screen" before it is shown. So a countdown whose showing could
-not be recorded (the store failed just after) is still known, and taken away by a cancel, also after a restart. A
-countdown that cannot be shown after three tries is left out (the timer still runs and rings); typically that is the
+not be recorded (the store failed just after) is still known, and taken away by a cancel, also after a restart, subject
+to the combined-failure limits below. A countdown that cannot be shown after three tries is left out (the timer still runs and rings); typically that is the
 Presenter's bound of 8 per module. An old countdown that could not be replaced after a change is taken down instead,
-so a screen never counts down to the wrong moment.
+subject to those same limits.
+
+Two combined-failure limits remain: if a countdown show succeeds but its outcome write fails and a retry after restart
+is refused, cancellation can forget the still-visible countdown; if dismissal keeps failing across a restart, a
+cleanup replacement can outlive the stored cleanup deadline and cancellation can report success while it stays visible,
+but both presentations end by their own lifetime (the original due time plus ten minutes, or ten minutes after the
+cleanup replacement was shown).
 
 ### Which timer is meant
 
 - **By name**: "the pasta timer", compared without case, accents, punctuation, a leading article and a trailing
-  "timer".
+  "timer"; when that leaves no words (such as "A"), the supplied label is matched exactly, ignoring case.
 - **With no name**: the only one there is (running, paused, snoozed, ringing or waiting to ring).
 - **Otherwise a question** that lists them: "There are 2 timers: eggs timer with 6 minutes left and pasta timer paused
   with 10 minutes left. Which one?". **Never the first of several.**
@@ -164,34 +175,56 @@ Everything is local: no outside service, no network.
 
 ## Tools
 
-There are six typed actions, each with English and Dutch `examples`, so the intent path runs them without the language
-model. The model is offered each as the tool `timers_<id>`.
+There are six typed actions, each with English and Dutch `examples`; the intent path can run them directly. The model is offered each as the tool `timers_<id>`.
 
 The three things people say most are also **phrase commands** (after the wake phrase, with no model call). Every action
 that changes something is `change`; `list` is a plain read. Each answers with one sentence in the household's language.
 
 | Tool | Parameters | Example | Answer |
 |---|---|---|---|
-| `timers_start` | `duration` (a duration), `name?` (text) | "set a pasta timer for eight minutes" | "Pasta timer, 8 minutes." / "Timer set for 10 minutes." |
+| `timers_start` | `duration` (a duration), `name?` (text), `inlineName?` (the complete named timer clause) | "set a pasta timer for eight minutes" | "Pasta timer, 8 minutes." / "Timer set for 10 minutes." |
 | `timers_list` | `name?` | "how long is left on the pasta" | "Pasta timer: 6 minutes 10 seconds left." |
-| `timers_adjust` | `amount` (a duration), `change?` (`add`, `remove`), `name?` | "add five minutes to the pasta timer" | "Pasta timer: a quarter of an hour left." |
-| `timers_pause` | `name?` | "pause the timer" | "Pasta timer paused with 4 minutes 10 seconds left." |
-| `timers_resume` | `name?` | "start the pasta timer again" | "Pasta timer runs again: 4 minutes 10 seconds left." |
-| `timers_cancel` | `name?`, `all?` (yes/no) | "cancel the eggs timer" | "Eggs timer cancelled." / a ringing one: "Eggs timer stopped." |
+| `timers_adjust` | `amount` (a duration), `change` (`add`, `remove`), `name?` | "add five minutes to the pasta timer" | "Pasta timer: a quarter of an hour left." |
+| `timers_pause` | `name` | "pause the timer" | "Pasta timer paused with 4 minutes 10 seconds left." |
+| `timers_resume` | `name` | "start the pasta timer again" | "Pasta timer runs again: 4 minutes 10 seconds left." |
+| `timers_cancel` | `name?`, `all?` (yes/no), `bulk?` (explicit all-timers target) | "cancel the eggs timer" | "Eggs timer cancelled." / a ringing one: "Eggs timer stopped." |
 
-**Phrase commands.** A name is a text slot of at most three words, resolved by the action with its own "I don't know a
-timer called …" sentence.
+The typed path preserves names after “my”, “our”, “the”, “mijn”, “onze”, “de”, and explicit naming words.
+These named requests never fall back to a different sole timer. Pause and resume require a target; if the typed
+path cannot extract it, they ask. Structured calls can use `name: "timer"` for an unqualified timer target.
+Cancellation requires the literal bulk target after “all” or “alle” (`bulk: "timers"` in a structured call);
+an uncertain `all: true` alone asks for a target. A name and an explicit bulk target together also ask. Adjustment requires its direction; “take a minute off” means
+subtraction, and an unresolved direction asks instead of adding by default. Structured adjustment calls supply
+`change: "add"` or `change: "remove"`.
+
+Named “set” and “start” phrases preserve the entire name. If the typed fallback reads the same words as both a
+named timer clause and its duration, core hands the complete request to the conversational agent without creating
+an unnamed or partly named timer.
+
+The direct path understands the phrase table below, targets after an article, possessive or explicit naming word,
+and additions/subtractions with a duration and direction. A captured start clause must contain a complete name (if
+present), timer noun and matching duration; unknown text asks instead of starting an unnamed timer. Bare named
+adjustments/cancellations and other wording can be handed to the assistant's model when extraction cannot resolve
+them. A timer never repeats; what is said between the command and “timer” becomes its name unless it contains a
+repetition form (repeat…/recurr…/period…, every/each/interval, a time unit ending in -ly with optional half-/bi-/twice-,
+or Dutch herhaal…/herhal…/terugker…/elk…/ieder… and a time unit ending in -lijks/-lijkse), in which case the request
+is refused with a repeating-alarm suggestion. Actions receive declared
+parameters, not the utterance, so they cannot inspect words extraction never supplied.
+
+**Phrase commands.** Start and list names take at most three words; cancel names take at most 64 words, subject to
+the stored name limit of 60 characters. The action resolves each name with its own "I don't know a timer called …" sentence.
 
 | Action | English | Dutch |
 |---|---|---|
-| start | "set a timer for {duration}", "set a {name} timer for {duration}", "start a timer for {duration}", "timer for {duration}", "set the timer for {duration}" | "zet een timer op {duration}", "zet een timer van {duration}", "zet een timer voor {duration}", "timer van {duration}", "timer op {duration}", "zet een {name} timer op {duration}" |
+| start | "set a timer for {duration}", "set a {name} timer for {duration}", "start a timer for {duration}", "start a {name} timer for {duration}", "timer for {duration}", "set the timer for {duration}" | "zet een timer op {duration}", "zet een timer van {duration}", "zet een timer voor {duration}", "timer van {duration}", "timer op {duration}", "zet een {name} timer op {duration}" |
 | list | "how long is left", "how much time is left", "how long is left on the timer", "how long is left on the {name}", "how long is left on the {name} timer" | "hoe lang nog", "hoeveel tijd is er nog", "hoe lang duurt de timer nog", "hoe lang duurt de {name} nog", "hoe lang duurt de {name} timer nog", "hoeveel tijd heeft de {name} timer nog" |
 | cancel | "cancel the timer", "cancel the {name} timer", "cancel timer", "stop the timer", "stop the {name} timer", "delete the timer" | "annuleer de timer", "annuleer de {name} timer", "annuleer de timer {name}", "stop de timer", "zet de timer uit", "zet de {name} timer uit" |
 
 "Stop" alone while it rings is the host's (its essential control and the ringing window), not a phrase of this module.
 
 - **Adjusting**: time taken off that would end it is refused, with what it has ("That would end it now: pasta timer has
-  only 2 minutes left.").
+  only 2 minutes left."). Once an adjustment and its job are committed, the answer confirms it; a later countdown
+  failure is retried by reconciliation and never asks the person to apply the same adjustment again.
 - **Refusals**, in both languages:
   - 50 timers already;
   - a name that runs already;
@@ -286,6 +319,12 @@ timer's moment and its handler being entered is not real time in this test. In s
 earliest due time on the runtime's timer (at most 10 s at a time, comparing the wall clock with the monotonic one).
 SQLite on a file is not measured here either; the store's own latency tests give a `schedule` a 0.3 ms median and a
 notification `send` a 0.37 ms median.
+
+The cancel-all check in `packages/module-timers/test/bulkCancelLatency.test.ts` samples a real 1 ms heartbeat while
+cancelling 190 expired timers (batches of 50, 50, 50 and 40, expired a minute apart), four rounds on the in-memory store. It
+asserts the longest gap stays below `bound(10)` ms, including the one atomic batch write and the keyed job
+cancellations. The heartbeat must also advance during the pending-row scan. Page reads, preparation and cleanup
+yield in batches so audio can keep running between them.
 
 ## Contract readings
 

@@ -88,6 +88,7 @@ export const MEDIA_HASH = /^[0-9a-f]{64}$/
 export const MEDIA_TOKEN = /^[A-Za-z0-9_-]{32}$/
 
 const line = (max: number) => Schema.String.check(Schema.isMaxLength(max))
+export const PresentationRevision = Schema.String.check(Schema.isPattern(/^[A-Za-z0-9_:-]{1,96}$/))
 export const PresentationId = Schema.String.check(Schema.isPattern(PRESENTATION_ID))
 
 export const PresentButton = Schema.Struct({
@@ -161,6 +162,8 @@ export const PresentPageTexts = Schema.Struct({
   loading: Schema.String.check(Schema.isMinLength(1), Schema.isMaxLength(60)),
   /** An image that could not be fetched or was refused. */
   imageMissing: Schema.String.check(Schema.isMinLength(1), Schema.isMaxLength(60)),
+  /** A press without a server answer (optional for older servers). */
+  failed: Schema.optional(Schema.String.check(Schema.isMinLength(1), Schema.isMaxLength(60))),
   /** A timer at zero. */
   timerDone: Schema.String.check(Schema.isMinLength(1), Schema.isMaxLength(30)),
   /** Before a credit ("Image:"). */
@@ -174,6 +177,8 @@ export type PresentPageTexts = typeof PresentPageTexts.Type
 /** What a voice connection holds of one presentation. */
 export const PresentationWire = Schema.Struct({
   id: PresentationId,
+  /** The displayed showing and content revision; echoed by every press. */
+  revision: PresentationRevision,
   /** `pinned` stays until it is dismissed or ends (restored after a reconnect); `transient`: one at a time, briefly. */
   lifetime: Schema.Literals(["transient", "pinned"]),
   /** Epoch ms it was shown (the server's clock). */
@@ -202,6 +207,8 @@ export const PresentAction = Schema.Struct({
   type: Schema.Literal("present.action"),
   requestId: RequestId,
   id: PresentationId,
+  /** The displayed showing and content revision; echoed by every press. */
+  revision: PresentationRevision,
   action: Schema.String.check(Schema.isPattern(PRESENT_ACTION_ID)),
   item: Schema.optionalKey(Schema.String.check(Schema.isPattern(LIST_ITEM_ID))),
   done: Schema.optionalKey(Schema.Boolean)
@@ -293,12 +300,12 @@ export const selectPresentations = (candidates: ReadonlyArray<PresentCandidate>)
 // What a module shows, and its checks (the server and the web mock run the same ones)
 
 /** Line breaks, control characters and bidirectional overrides: never in a one-line value (the core's `NOT_ONE_LINE`). */
-const NOT_ONE_LINE = /[\p{Cc}\p{Zl}\p{Zp}\u202A-\u202E\u2066-\u2069]/u
+const NOT_ONE_LINE = /[\p{Cc}\p{Zl}\p{Zp}\p{Bidi_Control}]/u
 /**
  * Storable text: no control character other than tab, line feed, carriage return, backspace and form feed, and no lone
  * surrogate (the core's `NOTIFY_TEXT`), so each UTF-16 unit costs at most two characters of JSON.
  */
-export const PRESENT_TEXT = /^[^\u0000-\u0007\u000b\u000e-\u001f\ud800-\udfff]*$/u
+export const PRESENT_TEXT = /^[^\u0000-\u0007\u000b\u000e-\u001f\u007f-\u009f\ud800-\udfff]*$/u
 
 /** A transient presentation stays this long when the module says nothing, at least `PRESENT_MIN_EXPIRY_MS`, at most 5 minutes. */
 export const PRESENT_DEFAULT_EXPIRY_MS = { transient: 30_000, pinned: 4 * 3_600_000 } as const

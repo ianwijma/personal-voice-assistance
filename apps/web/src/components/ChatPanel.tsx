@@ -22,13 +22,14 @@ import { useMediaQuery, WIDE_QUERY } from "./useMediaQuery.ts"
 export function ChatPanel() {
   const client = useClient()
   const open = useClientState((s) => s.ui.chatOpen)
+  const covered = useClientState((s) => s.ui.sheetOpen || s.ui.shortcutsOpen)
   // P5 round 3: a session the server ended takes the draft with it (the composer starts afresh); round 4: the message
   // list's scroll state too (it starts at the bottom of the new session).
   const sessionSeq = useClientState((s) => s.sessionSeq)
   const ref = useRef<HTMLElement>(null)
   const close = () => client.store.dispatch({ type: "local/ui", patch: { chatOpen: false } })
   const modal = !useMediaQuery(WIDE_QUERY)
-  useDialog(ref, open, close, "#chat-input", { trap: modal })
+  useDialog(ref, open && !covered, close, "#chat-input", { trap: modal, extraFocus: "#voice-notifications" })
   // Phone: the bottom sheet rides above the on-screen keyboard and shrinks to fit what is left.
   const inset = useKeyboardInset()
   const lift = inset > 0 && typeof window !== "undefined" && window.innerWidth < 640
@@ -45,17 +46,18 @@ export function ChatPanel() {
         ref={ref}
         role="dialog"
         aria-modal={modal || undefined}
+        aria-owns={covered ? undefined : "voice-notifications"}
         aria-labelledby="chat-title"
         data-testid="chat-panel"
-        style={lift ? { bottom: inset, height: `min(85dvh, calc(100dvh - ${inset + 16}px))` } : undefined}
+        style={lift ? { bottom: inset, height: `min(85dvh, calc(100dvh - ${inset + 16}px - var(--pva-notifications-space, 88px)))` } : undefined}
         className={[
           "fixed z-40 flex flex-col overflow-hidden border-line bg-surface shadow-panel",
           // phone: bottom sheet
-          "inset-x-0 bottom-0 h-[85dvh] rounded-t-lg border-t animate-[pva-sheet-up_320ms_var(--ease-out)]",
+          "inset-x-0 bottom-0 h-[min(85dvh,calc(100dvh-var(--pva-notifications-space,88px)))] rounded-t-lg border-t animate-[pva-sheet-up_320ms_var(--ease-out)]",
           // tablet: right sheet
-          "sm:inset-x-auto sm:right-0 sm:top-0 sm:h-dvh sm:w-[400px] sm:rounded-none sm:border-l sm:border-t-0 sm:animate-[pva-slide-in_320ms_var(--ease-out)]",
+          "sm:inset-x-auto sm:right-0 sm:top-[var(--pva-notifications-space,88px)] sm:h-[calc(100dvh-var(--pva-notifications-space,88px))] sm:w-[400px] sm:rounded-none sm:border-l sm:border-t-0 sm:animate-[pva-slide-in_320ms_var(--ease-out)]",
           // desktop: popover
-          "lg:bottom-6 lg:right-6 lg:top-auto lg:h-[min(640px,calc(100dvh-120px))] lg:rounded-lg lg:border lg:animate-[pva-rise_240ms_var(--ease-out)]"
+          "lg:bottom-6 lg:right-6 lg:top-auto lg:h-[min(640px,calc(100dvh-var(--pva-notifications-space,88px)-32px))] lg:rounded-lg lg:border lg:animate-[pva-rise_240ms_var(--ease-out)]"
         ].join(" ")}
       >
         <div className="mx-auto mt-2 h-1 w-10 shrink-0 rounded-full bg-line sm:hidden" aria-hidden="true" />

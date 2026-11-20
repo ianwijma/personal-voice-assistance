@@ -631,7 +631,7 @@ export const clientExamples: { readonly [T in ClientMessageType]: Extract<Client
   // P9 (additive within 11): a press on a ring card's button.
   "notification.action": { type: "notification.action", requestId: "n1", id: "n-4f2a", actionId: "stop" },
   // P10 (additive within 11): a tick on a checklist item.
-  "present.action": { type: "present.action", requestId: "p1", id: "p-7c1d", action: "tick", item: "milk", done: true },
+  "present.action": { type: "present.action", requestId: "p1", id: "p-7c1d", revision: "show-1:1", action: "tick", item: "milk", done: true },
   ...assistantsClientExamples
 }
 
@@ -683,6 +683,7 @@ export const exampleHouseholdSnapshotFinal: Extract<ServerMessage, { readonly ty
 /** P10: a pinned checklist as a voice connection holds it. */
 export const examplePresentation = {
   id: "p-7c1d",
+  revision: "show-1:1",
   lifetime: "pinned",
   shownAt: 1_763_100_600_000,
   serverNow: 1_763_100_600_000,
@@ -690,7 +691,7 @@ export const examplePresentation = {
   content: { kind: "list", title: "Shopping", style: "checklist", items: [{ id: "milk", text: "Milk", done: false }, { id: "eggs", text: "Eggs", done: false }] },
   buttons: [{ id: "clear", label: "Clear ticked" }],
   interactive: true,
-  texts: { region: "On screen", loading: "Loading the image…", imageMissing: "The image is not available.", timerDone: "Done", credit: "Image:", high: "High", low: "Low" }
+  texts: { region: "On screen", loading: "Loading the image…", imageMissing: "The image is not available.", failed: "That didn't work.", timerDone: "Done", credit: "Image:", high: "High", low: "Low" }
 } as const
 
 export const serverExamples: { readonly [T in ServerMessageType]: Extract<ServerMessage, { readonly type: T }> } = {

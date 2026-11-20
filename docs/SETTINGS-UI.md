@@ -116,7 +116,7 @@ search phase.)
 | Section | `apps/assistant/src/serve/sectionDefinitions.ts` (`riskSection`, id `risk`, group `modules`, page `risk`, order 7, **protected**: admin only) | `RISK_READ`, `RISK_CHANGE`, `RISK_MESSAGE`: a choice of **Run it** / **Refuse: needs confirmation** / **Refuse** (`allow` / `confirm` / `deny`), defaults `allow`, `allow`, `confirm`, applied live (no reload). `RISK_MONEY`, `RISK_SECURITY`: a choice with only Refuse, no environment variable |
 | Fixed fields | `sections.ts` (`SectionDefinition.fixed`: key → value and reason) | Shown locked with the reason ("Fixed at Refuse: devices are not authenticated yet …", `FIXED_REASON`), never written; a saved value of a hand-edited file is dropped when the values are read (every reader sees Refuse) and taken out of the file at the section's next save; a save that sets one to anything but Refuse is refused with the reason and writes nothing |
 | Validation | `SectionDefinition.checkPatch` = `riskPolicyPatchProblems` (`@pva/protocol`) first, then the fixed check and `applySettingsPatch`; one save, one lock, as every section | An unknown outcome or an opened money/security refuses the whole save (`invalid_settings`, the first problem's message, every problem as a field error), nothing written. A typo in a hand-edited file is that field's error on the page, and the policy reads that class's default meanwhile |
-| Reading | `riskPolicy.ts` (`effectiveRiskPolicy`, `servePolicyReader`), `sections.ts` (`riskPolicy()`) | One canonical reader (the section's fields resolved as every reader resolves them, then decoded), published into an in-memory record when the sections are made, in the settings store's first commit listener (the synchronous step that commits a new state: before every other commit listener, the save's caller or any other fiber runs; from the committed values alone) and on `announceAll`; the gateway reads the record as a field, so a call made at or after the commit gets the new policy, as does the next tool list, and no call builds definitions or touches a file. The settings `ConfigProvider` serves the policy's keys as the reader resolves them; the CLI modes read them through the same function once at their start (`modules.ts`) |
+| Reading | `riskPolicy.ts` (`effectiveRiskPolicy`, `servePolicyReader`), `sections.ts` (`riskPolicy()`) | One canonical reader (the section's fields resolved as every reader resolves them, then decoded), published into an in-memory record when the sections are made, in the settings store's first commit listener (the synchronous step that commits a new state: before every other commit listener, the save's caller or any other fiber runs; from the committed values alone) and on `announceAll`; the gateway reads the record as a field, so a call made at or after the commit gets the new policy, as does the next tool list, and no call builds definitions or touches a file. The settings `ConfigProvider` serves the policy's keys as the reader resolves them, including the CLI's environment-only fallback when the store cannot be loaded; the CLI modes read them through the same function once at their start (`modules.ts`) |
 | Page | `apps/web/src/lib/settingsTree.ts` (`SHARED_PAGES` "Risk policy"), `ui/adminRegistry.ts` (`risk-extra`), `settings/pages/RiskPolicyPage.tsx` | The generic form (the fixed rows drawn by `FieldRow` as locked values with a padlock and the reason; locked fields are never in a patch), and under it **What the assistant says when it refuses**: for each class the saved outcome and the sentence the person hears, in the household's language (Home › Language: Dutch or English), made with `decodeRiskPolicy`, `decideRisk` and `riskSpoken` from `@pva/protocol`. The form's own labels are English, like every admin page |
 | Mock | `apps/web/mock/server.ts` (section `risk`) | The same fields; a save is checked with `riskPolicyPatchProblems` (the real section's function: the same answers, `riskPolicySaveParity.test.ts`) before the generic checks, and money/security are never written. A press (a notification's action, a presentation's tick or button) is decided with the shared decoder, `decideRisk` (class `change`) and the shared spoken refusal; `stop` is never refused |
 
@@ -709,10 +709,30 @@ each file with `util.parseEnv(readFileSync(path))` (available in this Node **[ru
 2. Rewrite the file: back it up as `.env.bak-<timestamp>` (0600), replace the line with
    `# KEY moved to the settings UI on 2026-11-14` (never echo the value), and write atomically (temp + rename, keeping
    the file mode).
-3. `envView.release(key)` → forms re-resolve. The field unlocks and now shows `source: "saved"`/`"vault"`. Broadcast
-   `section.changed`/`module.changed`.
+3. Only after every rewrite of the move has succeeded and been checked, release all its keys from `envView` →
+   forms re-resolve. The fields unlock and now show `source: "saved"`/`"vault"`. Broadcast `section.changed`/`module.changed`.
+   If any rewrite or check fails, every key of the move stays locked, no move announcement is sent, and the answer says
+   to retry. This order applies to every kind of key, both a single Move and Move all.
 4. If a released key is a reload field, set `reloadPending`. The running engines keep the old value until the reload,
    so nothing changes mid-turn.
+
+For every kind of key, the move first reads every loaded file and compares its parsed values for the moved keys
+with the declarations captured at startup (or after this mover's own successful rewrites). A changed declaration or unreadable file refuses the move before any settings are saved;
+restart the assistant to reload the `.env` files, then retry. The override and field lock stay in place until the value
+is saved and every loaded file has been checked with Node's parser to contain no assignment for any key of the move.
+After saving, the mover rereads every loaded file and compares its full text with the pre-save check; the rewrite
+also rereads its file immediately before replacement. A changed or unreadable file keeps the override locked and
+returns the retry sentence; hand edits require restarting the assistant to reload the files first. The line scanner
+uses Node's whitespace rules before a quote and includes Unicode line separators inside comments. Before replacement,
+Node's parser must confirm that every other key keeps its value; the mover checks those values again after rewriting.
+Shadowed declarations are removed first, the winning declaration last; a failed or incomplete rewrite leaves earlier
+declarations in place, the override effective and the field locked. The value is already saved, and retrying the move
+finishes the remaining rewrites. A completed rewrite whose verification read failed is remembered: Retry accepts the
+key's verified absence, but refuses an unexpected replacement value. File rewrites, release and the section
+announcement finish without caller interruption between them. An unrelated Home save does not write `HOME_LANGUAGE`.
+
+A move rewrites the file it has just read, so the files must not be edited by hand while a move runs; an edit made
+in the instant between that read and the rewrite can be lost.
 
 The Overrides page (Keys & access › Settings from outside) is derived client-side from every form's `locked` fields,
 plus a server-provided list of known `.env` keys that match no field (`unusedEnvKeys`, so typos like

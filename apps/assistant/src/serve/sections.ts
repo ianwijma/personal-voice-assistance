@@ -44,7 +44,7 @@ export interface Sections {
   ) => Effect.Effect<SectionUpdate>
   /** The effective value of a field (environment > saved > default). */
   readonly value: (key: string) => SettingValue | undefined
-  /** Environment first, then the saved values and secrets: what the providers read. */
+  /** Resolved risk values; other keys environment first, then saved values and secrets: what providers read. */
   readonly configProvider: () => ConfigProvider.ConfigProvider
   /** Called with a section after it changed. */
   readonly subscribe: (listener: (section: SettingsSection) => void) => () => void
@@ -320,7 +320,14 @@ export const makeSections = (
           patched = { ...patched, stored: out }
         }
         // The values after this save, for every section (keys are global), and the keys it writes.
-        const keys = [...Object.keys(d.spec), ...(d.storedKeys ?? [])]
+        // An unrelated Home edit must not replace a concurrently moved language from its earlier snapshot.
+        const sectionKeys = [...Object.keys(d.spec), ...(d.storedKeys ?? [])].filter((key) =>
+          id !== "home" || key !== "HOME_LANGUAGE" || Object.hasOwn(patch.values, key) || Object.hasOwn(patch.secrets, key))
+        // A risk edit writes only its patch and fixed-key cleanup: a concurrent environment move writes its own
+        // key directly to the store and must not be replaced from this edit's earlier snapshot.
+        const keys = id === "risk"
+          ? sectionKeys.filter((key) => Object.hasOwn(patch.values, key) || Object.hasOwn(patch.secrets, key) || Object.hasOwn(d.fixed ?? {}, key))
+          : sectionKeys
         const replace = <V>(base: Readonly<Record<string, V>>, next: Readonly<Record<string, V>>) => {
           const out: Record<string, V> = { ...base }
           for (const key of keys) {
@@ -379,9 +386,9 @@ export const makeSections = (
       for (const [key, value] of Object.entries(stored)) values[key] = encode(value)
       for (const [key, value] of Object.entries(secrets)) values[key] = value
       // P8: the policy's keys as the canonical reader resolves them (a saved value of the wrong type is its default,
-      // never the string it would encode to); the environment's own value still comes first.
-      for (const [key, value] of Object.entries(riskPolicyValues(riskRecord))) values[key] = value
-      return ConfigProvider.orElse(ConfigProvider.fromEnvRecord(nonEmptyEnv()), ConfigProvider.fromEnvRecord(values))
+      // never the string it would encode to). These resolved values also take precedence over raw environment text.
+      const env = { ...nonEmptyEnv(), ...riskPolicyValues(riskRecord) }
+      return ConfigProvider.orElse(ConfigProvider.fromEnvRecord(env), ConfigProvider.fromEnvRecord(values))
     },
     subscribe: (listener) => {
       listeners.add(listener)

@@ -2,7 +2,7 @@
 // sends (show, update, dismiss; emptied at a welcome and when the session ends), one renderer per kind with every word
 // the host shows from the server, both themes and both languages, ticks and buttons sent as present.action with the
 // answer shown while it is held, a countdown to the server's instant on a page whose clock is off, long and many, the
-// notification cards first in the same stage, and the page's declaration of the kinds.
+// notification cards separate from the presentation stage, and the page's declaration of the kinds.
 import { act, cleanup, fireEvent, render, screen } from "@testing-library/react"
 import { afterEach, describe, expect, it, vi } from "vitest"
 import { MAX_PRESENTATIONS_PER_PAGE, PRESENT_KIND_VERSIONS, type PresentationWire, type ServerMessage } from "@pva/protocol"
@@ -21,11 +21,12 @@ afterEach(() => {
   document.documentElement.classList.remove("dark")
 })
 
-const EN = { region: "On screen", loading: "Loading the image…", imageMissing: "The image is not available.", timerDone: "Done", credit: "Image:", high: "High", low: "Low" }
-const NL = { region: "Op het scherm", loading: "De afbeelding wordt geladen…", imageMissing: "De afbeelding is niet beschikbaar.", timerDone: "Klaar", credit: "Afbeelding:", high: "Hoog", low: "Laag" }
+const EN = { region: "On screen", loading: "Loading the image…", imageMissing: "The image is not available.", timerDone: "Done", credit: "Image:", high: "High", low: "Low", failed: "That didn't work." }
+const NL = { region: "Op het scherm", loading: "De afbeelding wordt geladen…", imageMissing: "De afbeelding is niet beschikbaar.", timerDone: "Klaar", credit: "Afbeelding:", high: "Hoog", low: "Laag", failed: "Dat lukte niet." }
 
 const wire = (id: string, content: PresentationWire["content"], extra: Partial<PresentationWire> = {}): PresentationWire => ({
   id,
+  revision: `${id}:1`,
   lifetime: "pinned",
   shownAt: 1_000,
   serverNow: 1_000,
@@ -138,7 +139,7 @@ describe("ticks and buttons", () => {
     await act(async () => {
       fireEvent.click(screen.getAllByRole("checkbox")[0]!)
     })
-    expect(request).toHaveBeenCalledWith({ type: "present.action", id: "l", action: "tick", item: "milk", done: true })
+    expect(request).toHaveBeenCalledWith({ type: "present.action", id: "l", revision: "l:1", action: "tick", item: "milk", done: true })
     expect(screen.getByText("Ticked.")).toBeTruthy()
     await act(async () => {
       fireEvent.click(screen.getByText("Later"))
@@ -231,8 +232,8 @@ describe("a page without its server", () => {
   })
 })
 
-describe("long and many, and the notification cards in the same stage", () => {
-  it("many long presentations and cards stay in one region that scrolls within the viewport; long text wraps; the cards come first", () => {
+describe("long and many, with notifications in their own fixed region", () => {
+  it("many long presentations scroll within the viewport; long text wraps; rings do not enter the stage", () => {
     const longCard = (i: number): PresentationWire => wire(`c${i}`, { kind: "card", title: "T".repeat(60), text: "x".repeat(300), facts: Array.from({ length: 6 }, () => ({ label: "L".repeat(30), value: "V".repeat(60) })) }, { shownAt: i })
     const ring: ServerMessage = { ...serverExamples["notification.ring"], notification: { ...serverExamples["notification.ring"].notification, id: "n1" } }
     mount(run([ring, ...Array.from({ length: MAX_PRESENTATIONS_PER_PAGE }, (_, i) => show(longCard(i)))]))
@@ -241,21 +242,56 @@ describe("long and many, and the notification cards in the same stage", () => {
     expect(scroller.className).toContain("overflow-y-auto")
     expect(scroller.className).toMatch(/max-h-/)
     expect(screen.getAllByTestId("presentation")).toHaveLength(MAX_PRESENTATIONS_PER_PAGE)
-    // The notification cards first, then the presentations.
-    const order = [...scroller.querySelectorAll("[data-testid=notification-card],[data-testid=presentation]")].map((e) => e.getAttribute("data-testid"))
-    expect(order[0]).toBe("notification-card")
+    // A ring must not change this stage's size or move presentations underneath an aimed-at pointer.
+    expect(screen.queryByTestId("notification-card")).toBeNull()
     expect(screen.getAllByRole("heading").every((h) => h.className.includes("overflow-wrap:anywhere"))).toBe(true)
   })
 
   it("a transient presentation is drawn first, then the pinned ones oldest first; nothing at all draws nothing", () => {
     mount(run([
-      show(wire("p2", CARD, { shownAt: 20 })),
+      show(wire("p2", { ...CARD, title: "Newer" }, { shownAt: 20 })),
       show(wire("t", { ...CARD, title: "Now" }, { lifetime: "transient", shownAt: 30 })),
-      show(wire("p1", CARD, { shownAt: 10 }))
+      show(wire("p1", { ...CARD, title: "Older" }, { shownAt: 10 }))
     ]))
     expect(screen.getAllByTestId("presentation").map((e) => e.getAttribute("data-lifetime"))).toEqual(["transient", "pinned", "pinned"])
+    expect(screen.getAllByRole("heading").map((h) => h.textContent)).toEqual(["Now", "Older", "Newer"])
     cleanup()
-    mount(initialState)
+    mount(run([serverExamples["notification.ring"]]))
     expect(screen.queryByTestId("present-stage")).toBeNull()
   })
+})
+
+// b4: the stable key belongs to multiple showings; interactions belong to the displayed revision.
+it("a replacement clears a pending press and ignores its reply, and clears an answer already shown", async () => {
+  let finish: (v: unknown) => void = () => undefined
+  const request = vi.fn(() => new Promise((resolve) => { finish = resolve }))
+  const drink = (title: string, revision: string) => wire("drink", { ...CARD, title }, { revision, buttons: [{ id: "choose", label: "Choose" }] })
+  const { store } = mount(run([show(drink("Tea", "tea:1"))]), request)
+  await act(async () => fireEvent.click(screen.getByRole("button")))
+  await act(async () => store.dispatch(update(drink("Coffee", "coffee:2"))))
+  expect((screen.getByRole("button") as HTMLButtonElement).disabled).toBe(false)
+  await act(async () => finish({ ok: true, say: "Tea selected." }))
+  expect(screen.queryByText("Tea selected.")).toBeNull()
+  await act(async () => fireEvent.click(screen.getByRole("button")))
+  await act(async () => finish({ ok: true, say: "Coffee selected." }))
+  expect(screen.getByText("Coffee selected.")).toBeTruthy()
+  await act(async () => store.dispatch(update(drink("Water", "water:3"))))
+  expect(screen.queryByText("Coffee selected.")).toBeNull()
+})
+
+
+it.each(["timeout", "rejection"])("r2 b5: a Dutch presentation uses its localized fallback after a transport %s", async (fault) => {
+  const request = vi.fn(() => fault === "timeout"
+    ? Promise.resolve({ ok: false, error: { message: "The assistant did not answer in time." } })
+    : Promise.reject(new Error("Connection lost")))
+  mount(run([show(wire("dutch", CARD, { texts: NL, buttons: [{ id: "choose", label: "Kies" }] }))]), request)
+  await act(async () => fireEvent.click(screen.getByRole("button", { name: "Kies" })))
+  expect(screen.getByRole("status").textContent).toBe(NL.failed)
+  expect((screen.getByRole("button") as HTMLButtonElement).disabled).toBe(false)
+})
+
+it("r2 b5: a server's press answer takes precedence over the transport fallback", async () => {
+  mount(run([show(wire("dutch", CARD, { texts: NL, buttons: [{ id: "choose", label: "Kies" }] }))]), async () => ({ ok: false, say: "Probeer straks opnieuw.", error: { message: "Diagnostic" } }))
+  await act(async () => fireEvent.click(screen.getByRole("button")))
+  expect(screen.getByRole("status").textContent).toBe("Probeer straks opnieuw.")
 })

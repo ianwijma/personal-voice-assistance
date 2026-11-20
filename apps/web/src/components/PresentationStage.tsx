@@ -4,27 +4,25 @@ import { useEffect, useLayoutEffect, useRef, useState } from "react"
 import { formatRemaining, remainingMs } from "@/lib/countdown.ts"
 import { type HeldPresentation, pageClock } from "@/lib/state.ts"
 import { useClient, useClientState } from "./context.tsx"
-import { NotificationCards } from "./NotificationCards.tsx"
 import { cx } from "./ui/controls.tsx"
 
 /**
  * P10: the presentation stage (docs/PRESENTING.md "The voice page"; docs/CHARACTERS.md §2.7). One layout on every
  * character: a column centred under the character's box, just above the controls, that grows upward as far as it may
- * without covering the box (at least 160 px on a short screen) and scrolls within itself beyond that; it slides with the
- * stage while the desktop chat is open. The character's box, its canvas and the focus it is given are exactly as before:
+ * without covering the box (at least 160 px on a short screen) and scrolls within itself beyond that. The character's
+ * box, its canvas and the focus it is given are exactly as before:
  * the stage only adds bottom padding to the page's scroll area (`--pva-present-h`) so captions can scroll clear of it.
  *
- * It holds the notification cards first (P9, unchanged: `NotificationCards`), then the presentations, a transient one
- * first, then the pinned ones. Every word the host shows comes from the server in the household's language
+ * It holds presentations, a transient one first, then the pinned ones. Open page menus and dialogs hide them;
+ * notifications have their own fixed region above those surfaces. Every word the host shows comes from the server in the household's language
  * (`texts`); every text of a presentation passed the server's page boundary and is put on the page as text, never as
- * markup. An image is only ever `/media/<hash>`, the server's copy.
+ * markup. An image is only ever `/media/<token>`, the server's copy.
  */
-export function PresentationStage() {
-  const shownCards = useClientState((s) => s.notifications.some((c) => c.show))
+export function PresentationStage({ obscured = false }: { readonly obscured?: boolean }) {
   const items = useClientState((s) => s.presentations)
   const chatOpen = useClientState((s) => s.ui.chatOpen)
   const inner = useRef<HTMLDivElement>(null)
-  const empty = !shownCards && items.length === 0
+  const empty = items.length === 0
   // The stage's scroll area keeps the region's height clear at its bottom (captions scroll above it).
   useLayoutEffect(() => {
     const root = typeof document === "undefined" ? undefined : document.documentElement
@@ -43,14 +41,14 @@ export function PresentationStage() {
       ro.disconnect()
       root.style.setProperty("--pva-present-h", "0px")
     }
-  }, [empty])
+  }, [empty, obscured])
   if (empty) return null
   const ordered = [...items.filter((p) => p.lifetime === "transient"), ...items.filter((p) => p.lifetime === "pinned").sort((a, b) => a.shownAt - b.shownAt)]
   return (
     <div
       data-testid="present-stage"
       className={cx(
-        "pointer-events-none fixed inset-x-0 bottom-[calc(96px+env(safe-area-inset-bottom))] z-[60] flex justify-center px-4 transition-transform duration-[320ms] ease-out",
+        "pointer-events-none fixed inset-x-0 bottom-[calc(96px+env(safe-area-inset-bottom))] z-[5] flex justify-center px-4 transition-transform duration-[320ms] ease-out",
         chatOpen && "lg:max-[1439px]:-translate-x-[200px]"
       )}
     >
@@ -58,11 +56,16 @@ export function PresentationStage() {
         ref={inner}
         className="pointer-events-auto flex max-h-[max(160px,min(42dvh,calc(100dvh-540px)))] w-full max-w-[420px] flex-col gap-2 overflow-y-auto overscroll-contain scrollbar-quiet pt-1"
       >
-        <NotificationCards />
         {ordered.length > 0
           ? (
-            <section aria-label={ordered[0]!.texts.region} data-testid="presentations" className="flex w-full flex-col gap-2">
-              {ordered.map((p) => <PresentationCard key={p.id} p={p} />)}
+            <section
+              aria-label={ordered[0]!.texts.region}
+              data-testid="presentations"
+              hidden={obscured}
+              inert={obscured}
+              className={cx("w-full flex-col gap-2", obscured ? "hidden" : "flex")}
+            >
+              {ordered.map((p) => <PresentationCard key={`${p.id}:${p.revision}`} p={p} />)}
             </section>
           )
           : null}
@@ -87,7 +90,7 @@ function PresentationCard({ p }: { readonly p: HeldPresentation }) {
   const press = (key: string, message: { readonly action: string; readonly item?: string; readonly done?: boolean }) => {
     if (!p.interactive || pending.has(key)) return
     setPending((x) => new Set(x).add(key))
-    const current = () => mounted.current && client.store.get().presentations.some((x) => x.id === p.id)
+    const current = () => mounted.current && client.store.get().presentations.some((x) => x.id === p.id && x.revision === p.revision)
     const done = () => {
       if (!mounted.current) return
       setPending((x) => {
@@ -97,10 +100,13 @@ function PresentationCard({ p }: { readonly p: HeldPresentation }) {
       })
     }
     // continuation(identity): shows this presentation's own answer, only while it is still held.
-    void client.request({ type: "present.action", id: p.id, ...message }).then((r) => {
+    void client.request({ type: "present.action", id: p.id, revision: p.revision, ...message }).then((r) => {
       done()
-      if (current()) setSaid(r.say ?? (r.ok ? undefined : r.error?.message))
-    }, done)
+      if (current()) setSaid(r.say ?? (r.ok ? undefined : p.texts.failed))
+    }, () => {
+      done()
+      if (current()) setSaid(p.texts.failed)
+    })
   }
   return (
     <article

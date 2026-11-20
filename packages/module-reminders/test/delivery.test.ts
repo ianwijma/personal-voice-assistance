@@ -322,10 +322,14 @@ describe("answering: done and snooze", () => {
       yield* kit.present.settle
       assert.deepStrictEqual(kit.present.shown(SAM), [])
       assert.deepStrictEqual((yield* kit.notify.all).map((x: any) => x.state), ["resolved"])
-      assert.deepStrictEqual((yield* liveJobs(kit)).filter((j) => j.handler !== "tidy"), [])
+      assert.deepStrictEqual(row.value.stop?.notes, [Number(n.key!.split(":").at(-1))])
+      assert.strictEqual((yield* jobOf(kit, row.id))[0]?.dueAt, (yield* kit.now) + 5_000)
       // The button's write names the device it was pressed on.
       const changed = kit.events.filter((e: any) => e.type === "reminders.reminders.changed")
       assert.deepStrictEqual((changed.at(-1) as any)?.actor, { kind: "ui", deviceId: SAM })
+      yield* kit.advance(6_100)
+      assert.isUndefined((yield* theRow(kit)).value.stop)
+      assert.deepStrictEqual((yield* liveJobs(kit)).filter((j) => j.handler !== "tidy"), [])
     }))
 
   it.effect("snooze: rings again later, the setting decides how long, and the same press run again does not push it further", () =>
@@ -395,6 +399,7 @@ describe("answering: done and snooze", () => {
       const n = yield* ring(kit)
       yield* kit.notify.press(n.id, "done", { device: SAM })
       assert.strictEqual((yield* kit.notify.press(n.id, "snooze", { device: SAM })).ok, false)
+      assert.strictEqual(spoken(yield* kit.tool("reminders_done", { which: "mum" }, { device: SAM })), "That one was already done.")
       assert.strictEqual(spoken(yield* kit.tool("reminders_done", { which: "mum" }, { device: SAM })), "I don't have a reminder called mum.")
     }))
 })
@@ -524,6 +529,7 @@ describe("jobs", () => {
         yield* kit.runJob(job!.id)
         assert.strictEqual(faults.runs.due, entered + 1, name)
         assert.deepStrictEqual(yield* kit.notify.all, [], name)
+        if (name === "moved") assert.strictEqual((yield* jobOf(kit, row.id))[0]?.dueAt, row.value.dueAt! + H)
       }
     }))
 

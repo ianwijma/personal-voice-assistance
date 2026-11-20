@@ -48,7 +48,7 @@ describe("setting alarms", () => {
       assert.isTrue(jobs.every((j) => j.origin.deviceId === "kitchen-display"))
     }))
 
-  it.effect("repeating: the rule, and the first one; a time is needed; a time past or too far is refused", () =>
+  it.effect("repeating: the rule, and the first one; a time is needed; a time past is refused", () =>
     Effect.gen(function*() {
       const kit = yield* startTestModule(alarmsModule)
       assert.strictEqual(said(yield* kit.action("set", { when: "every weekday at 6:45" })), "Alarm set every weekday; the first one is tomorrow at quarter to seven in the morning.")
@@ -68,7 +68,8 @@ describe("setting alarms", () => {
     Effect.gen(function*() {
       const kit = yield* startTestModule(alarmsModule)
       for (let i = 0; i < MAX_ALARMS; i++) yield* kit.action("set", { when: `${String(5 + Math.floor(i / 12)).padStart(2, "0")}:${String((i % 12) * 5).padStart(2, "0")}` })
-      assert.strictEqual(said(yield* kit.action("set", { when: "9:00" })), "There are already 50 alarms, the most I keep. Cancel one first.")
+      assert.include(said(yield* kit.action("set", { when: "9:00" }))!, "already set")
+      assert.strictEqual(said(yield* kit.action("set", { when: "9:10" })), "There are already 50 alarms, the most I keep. Cancel one first.")
       assert.strictEqual(said(yield* kit.action("list", {})), "50 alarms: tomorrow at five o'clock at night, tomorrow at five past five at night, tomorrow at ten past five at night and 47 more.")
       // The last one, by its time, past the first pages.
       assert.strictEqual(said(yield* kit.action("cancel", { which: "9:05" })), "The alarm for tomorrow at five past nine in the morning is cancelled.")
@@ -87,7 +88,7 @@ describe("an alarm's name only on its own device", () => {
         assert.notInclude(answer!, "pills")
       }
       // Its name does not find it elsewhere (that would tell the name is there); its time does.
-      assert.strictEqual(said(yield* kit.action("cancel", { which: "pills", scope: "all" }, { device: "kitchen-display" })), "I don't know an alarm called pills here.")
+      assert.strictEqual(said(yield* kit.action("cancel", { which: "pills", scope: "all" }, { device: "kitchen-display" })), "Which alarm do you mean? Say its clock time and date, or say \"named\" followed by its name.")
       assert.strictEqual(said(yield* kit.action("cancel", { which: "quarter to seven", scope: "all" }, { device: "kitchen-display" })), "The alarm every weekday is cancelled.")
       // It rang nowhere and is gone.
       assert.deepStrictEqual(yield* setRows(kit), [])

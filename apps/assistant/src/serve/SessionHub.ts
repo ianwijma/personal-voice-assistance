@@ -1364,6 +1364,7 @@ export const makeSessionHub = (options: HubOptions): SessionHub => {
         const pressed = Effect.map(
           present.press({
             presentationId: message.id,
+            revision: message.revision,
             action: message.action,
             ...(message.item !== undefined ? { item: message.item } : {}),
             ...(message.done !== undefined ? { done: message.done } : {}),

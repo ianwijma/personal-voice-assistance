@@ -5,6 +5,7 @@
 // boundary change, no reply audio where the effective capabilities have no speech, and the one-line device name.
 import { type ChildProcess, spawn } from "node:child_process"
 import { createServer } from "node:net"
+import { request as httpRequest } from "node:http"
 import { join } from "node:path"
 import { type ClientMessage, CloseCode, decodeServerMessage, encodeClientMessage, PROTOCOL_VERSION, type ServerMessage, type ServerMessageOf } from "@pva/protocol"
 import { WebSocket } from "ws"
@@ -27,7 +28,7 @@ const freePort = () =>
 beforeAll(async () => {
   const port = await freePort()
   url = `ws://127.0.0.1:${port}/ws`
-  mock = spawn(join(webDir, "node_modules", ".bin", "tsx"), ["mock/server.ts"], {
+  mock = spawn("timeout", ["300", process.execPath, "--import", join(webDir, "node_modules", "tsx", "dist", "loader.mjs"), "mock/server.ts"], {
     cwd: webDir,
     env: { ...process.env, MOCK_PORT: String(port), MOCK_HOST: "127.0.0.1", MOCK_SCENARIO: "devices", MOCK_QUIET: "1" },
     stdio: ["ignore", "pipe", "pipe"]
@@ -44,8 +45,11 @@ beforeAll(async () => {
   })
 }, 40_000)
 
-afterAll(() => {
-  mock?.kill("SIGTERM")
+afterAll(async () => {
+  if (mock === undefined || mock.exitCode !== null) return
+  const stopped = new Promise<void>((resolve) => mock!.once("exit", () => resolve()))
+  mock.kill("SIGTERM")
+  await stopped
 })
 
 class Peer {
@@ -94,6 +98,10 @@ class Peer {
     const requestId = `r${++this.seq}`
     const from = this.messages.length
     // `raw`: as a page could send it, without the client's own encoding check.
+    if (m.type === "present.action" && m.revision === undefined) {
+      const held = this.messages.filter((x) => (x.type === "present.show" || x.type === "present.update") && x.presentation.id === m.id).at(-1)
+      m = { ...m, revision: held && "presentation" in held ? held.presentation.revision : "missing" }
+    }
     if (raw) this.ws.send(JSON.stringify({ ...m, requestId }))
     else this.send({ ...m, requestId } as ClientMessage)
     return this.waitFor("result", (r) => r.requestId === requestId, from)
@@ -274,18 +282,19 @@ describe("the mock, through its handlers, as the server", { timeout: 30_000 }, (
     expect(timer.body.lifetime).toBe("pinned")
     expect(timer.body.expiresAt).toBe(endsAt + 10 * 60_000)
     await page.waitFor("present.show", (m) => m.presentation.id === timer.body.id)
-    // b12: seven pins that stay (the timer and six more), then one that ends by itself: the eighth, the bound; one more
-    // is refused. Only one request lies between the short one and that check, and it lives five seconds, so the check
-    // does not race its end even on a slow machine.
+    // Refusal uses eight long-lived pins; expiry is a separate admission after a dismissal.
     const pins: Array<string> = []
     for (let i = 0; i < 6; i++) {
       const r = await post("/mock/present", { options: { lifetime: "pinned" }, presentation: card(`P${i}`) })
       expect(r.status).toBe(200)
       pins.push(r.body.id!)
     }
-    const valid = await post("/mock/present", { options: { lifetime: "pinned", expiresInMs: 5_000 }, presentation: card("Valid") })
-    expect(valid.status).toBe(200)
+    const eighth = await post("/mock/present", { options: { lifetime: "pinned" }, presentation: card("Eighth") })
+    expect(eighth.status).toBe(200)
     expect((await post("/mock/present", { options: { lifetime: "pinned" }, presentation: card("Full") })).body.error).toBe("limit")
+    expect((await post("/mock/present/dismiss", { id: eighth.body.id })).body).toEqual({ dismissed: true })
+    const valid = await post("/mock/present", { options: { lifetime: "pinned", expiresInMs: 3_000 }, presentation: card("Valid") })
+    expect(valid.status).toBe(200)
     await page.waitFor("present.show", (m) => m.presentation.id === valid.body.id)
     // No dismissal: its end alone frees its place (waited for as the event it is, not for a fixed time).
     await page.waitFor("present.dismiss", (m) => m.id === valid.body.id, 0, 20_000)
@@ -376,16 +385,70 @@ describe("the mock, through its handlers, as the server", { timeout: 30_000 }, (
     shown.push(replacing.body.id!)
     // A dismissal gives its place back; an end does too.
     expect((await post("/mock/present/dismiss", { id: onB[0] })).body).toEqual({ dismissed: true })
-    // A short one fills the bound again (it lives five seconds: only one request lies between it and the check).
-    const short = await pin("d-mock-round2c", "Short", { lifetime: "pinned", expiresInMs: 5_000 })
-    expect(short.status).toBe(200)
+    const eighth = await pin("d-mock-round2c", "Long lived")
+    expect(eighth.status).toBe(200)
     expect((await pin("d-mock-round2c", "Full again")).body.error).toBe("limit")
+    expect((await post("/mock/present/dismiss", { id: eighth.body.id })).body).toEqual({ dismissed: true })
+    const short = await pin("d-mock-round2c", "Short", { lifetime: "pinned", expiresInMs: 3_000 })
+    expect(short.status).toBe(200)
     // Its end, waited for as the event it is: then there is room.
     await c.waitFor("present.dismiss", (m) => m.id === short.body.id, 0, 20_000)
     expect((await pin("d-mock-round2c", "Fits again")).status).toBe(200)
     for (const id of shown) await post("/mock/present/dismiss", { id })
     void b
     for (const p of pages) p.ws.close()
+  })
+
+  it("b5: an unrecognized device kind is welcomed but never registered for presentations", async () => {
+    await clearPresentations()
+    const http = url.replace(/^ws/, "http").replace(/\/ws$/, "")
+    const page = await Peer.open({ device: { id: "future-screen-01", kind: "future-screen", name: "Future", capabilities: { v: 1, display: { class: "standard", widthPx: 800, heightPx: 600, dpr: 1, touch: "coarse", colour: true }, present: { kinds: { image: 1 } } } } })
+    try {
+      const response = await fetch(`${http}/mock/present`, { method: "POST", body: JSON.stringify({ deviceId: "future-screen-01", presentation: { kind: "image", url: "https://example.org/a", alt: "A", credit: "C", spoken: "A" } }) })
+      expect(response.status).toBe(400)
+      expect(page.messages.some((m) => m.type === "present.show")).toBe(false)
+    } finally { page.ws.close() }
+  })
+
+  it("b7: UTF-8 split across HTTP chunks reaches the page unchanged", async () => {
+    await clearPresentations()
+    const http = url.replace(/^ws/, "http").replace(/\/ws$/, "")
+    const page = await Peer.open({ device: { id: "utf8-screen-01", kind: "web-voice", name: "UTF8", capabilities: { v: 1, display: { class: "standard", widthPx: 800, heightPx: 600, dpr: 1, touch: "coarse", colour: true }, present: { kinds: { card: 1 } } } } })
+    try {
+      const body = Buffer.from(JSON.stringify({ presentation: { kind: "card", title: "Café", spoken: "Coffee" } }))
+      const split = body.indexOf(Buffer.from("é")) + 1
+      const id = await new Promise<string>((resolve, reject) => {
+        const req = httpRequest(`${http}/mock/present`, { method: "POST" }, (res) => {
+          let text = ""
+          res.setEncoding("utf8")
+          res.on("data", (chunk: string) => { text += chunk })
+          res.on("end", () => resolve((JSON.parse(text) as { id: string }).id))
+        })
+        req.once("error", reject)
+        req.write(body.subarray(0, split))
+        setTimeout(() => req.end(body.subarray(split)), 30)
+      })
+      const shown = await page.waitFor("present.show", (m) => m.presentation.id === id)
+      expect(shown.presentation.content).toMatchObject({ title: "Café" })
+    } finally { page.ws.close() }
+  })
+
+  it("b8: null and other non-object requests return 400 and consume no presentation id", async () => {
+    await clearPresentations()
+    const http = url.replace(/^ws/, "http").replace(/\/ws$/, "")
+    const generated = async () => {
+      const response = await fetch(`${http}/mock/present`, { method: "POST", body: JSON.stringify({ presentation: { kind: "card", title: "Valid", spoken: "Valid" } }) })
+      expect(response.status).toBe(200)
+      const { id } = await response.json() as { id: string }
+      expect(id).toMatch(/^p-mock-\d+$/)
+      return Number(id.slice("p-mock-".length))
+    }
+    const before = await generated()
+    for (const value of [null, [], 1, "text"]) {
+      const response = await fetch(`${http}/mock/present`, { method: "POST", body: JSON.stringify(value) })
+      expect(response.status, JSON.stringify(value)).toBe(400)
+    }
+    expect(await generated()).toBe(before + 1)
   })
 
   it("P7: the reply volume as the server keeps it: output.volume to the device's voice pages, again after a welcome, with the server's step and bounds", async () => {

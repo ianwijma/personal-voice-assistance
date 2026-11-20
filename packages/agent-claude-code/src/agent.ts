@@ -1,5 +1,6 @@
 import {
   CurrentTurn,
+  CurrentTurnCommit,
   CurrentTurnTrace,
   type Agent,
   type AgentEvent,
@@ -369,10 +370,12 @@ export const makeClaudeAgent = async (options: ClaudeAgentOptions): Promise<Clau
         // The SDK calls tools from outside this fiber: the turn's context is captured here and given to each call, with
         // the turn's trace (the execution gateway records its risk decisions there).
         const currentTurn = yield* CurrentTurn
-        const runTool = (call: ToolCall) => {
-          const traced = Effect.provideService(input.tools.run(call), CurrentTurnTrace, input.trace)
-          return currentTurn === undefined ? traced : Effect.provideService(traced, CurrentTurn, currentTurn)
-        }
+        const currentCommit = yield* CurrentTurnCommit
+        const runTool = (call: ToolCall) => input.tools.run(call).pipe(
+          Effect.provideService(CurrentTurn, currentTurn),
+          Effect.provideService(CurrentTurnCommit, currentCommit),
+          Effect.provideService(CurrentTurnTrace, input.trace)
+        )
         let session: ClaudeSession | undefined
         let settled = false
         let emittedText = false

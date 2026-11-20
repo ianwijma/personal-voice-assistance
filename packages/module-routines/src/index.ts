@@ -55,7 +55,7 @@ export const routinesModule = defineModule({
           // Not a tool of its own: the model has `routines_run`. Its phrases are in the assistant's set all the same.
           offerAsTool: false,
           risk: "change",
-          run: () => Effect.map(begin(routine), (answer) => (answer.kind === "refused" ? { say: answer.text } : {}))
+          run: () => Effect.map(begin(routine), (answer) => (answer.kind !== "started" ? { say: answer.text } : {}))
         })
       })
 
@@ -83,10 +83,11 @@ export const routinesModule = defineModule({
       const stop = defineAction({
         id: "stop",
         label: "Cancel the routine",
-        description: "Cancel the routine running on this device: no further step starts and its line stops. An action already under way may still complete.",
+        description: "Cancel the routine running on this device: no further step starts; request its line to stop. An action already under way may still complete.",
         examples: [...CANCEL_PHRASES.en, ...CANCEL_PHRASES.nl, "stop the good night routine"],
         params: {},
         phrases: { en: [...CANCEL_PHRASES.en], nl: [...CANCEL_PHRASES.nl] },
+        endsReply: true,
         risk: "change",
         run: () => Effect.map(ctx.shared.cancel(language()), (answer) => ({ say: answer.text }))
       })
@@ -108,16 +109,20 @@ export const routinesModule = defineModule({
             if (found.kind === "none") return { spoken: say(texts, lang, "unknown") }
             if (found.kind === "ambiguous") {
               const names = found.routines.map((r) => nameIn(r.name, lang))
-              return { spoken: say(texts, lang, "which", { list: `${names.slice(0, -1).join(", ")} ${say(texts, lang, "or")} ${names.at(-1)}` }) }
+              const shown = names.slice(0, 3)
+              const list = `${shown.slice(0, -1).join(", ")} ${say(texts, lang, "or")} ${shown.at(-1)}`
+              return { spoken: names.length > shown.length
+                ? say(texts, lang, "whichMore", { list, count: names.length - shown.length })
+                : say(texts, lang, "which", { list }) }
             }
             const answer = yield* begin(found.routine)
-            return answer.kind === "refused" ? { spoken: answer.text } : { spoken: say(texts, lang, "started", { name: nameIn(found.routine.name, lang) }) }
+            return answer.kind !== "started" ? { spoken: answer.text } : { spoken: say(texts, lang, "started", { name: nameIn(found.routine.name, lang) }) }
           })
       })
 
       const list = makeTool({
         name: "routines_list",
-        description: "List the owner's routines: each one's name, the phrases that start it in the household's language, how many steps it has, and whether it is running now.",
+        description: "List the total and up to three routines, with at most two phrase examples in the household's language, step counts and running state. Omitted routines and phrases are counted.",
         parameters: Schema.Struct({}),
         speculative: true,
         execute: () =>
@@ -127,9 +132,11 @@ export const routinesModule = defineModule({
             const now = ctx.shared.running()
             return {
               count: routines.length,
-              routines: routines.map((r) => ({
+              omitted: Math.max(0, routines.length - 3),
+              routines: routines.slice(0, 3).map((r) => ({
                 name: nameIn(r.name, lang),
-                phrases: [...r.phrases[lang]],
+                phrases: r.phrases[lang].slice(0, 2),
+                omittedPhrases: Math.max(0, r.phrases[lang].length - 2),
                 steps: r.steps.length,
                 ...(now.has(r.key) ? { running: true } : {})
               }))

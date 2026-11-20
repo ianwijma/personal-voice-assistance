@@ -175,6 +175,7 @@ export const presentWorld = (
     /** Keep no record of messages and decisions (the latency test). */
     readonly unrecorded?: boolean
     readonly observe?: Parameters<typeof makePresentEngine>[0]["observe"]
+    readonly newId?: () => string
     /** What the Presenter is given as its scheduler (a test injects refusals); default the real one. */
     readonly wrapScheduler?: (scheduler: SchedulerEngine) => SchedulerEngine
     /** The modules' tool is `speculative: true` (it may run before its turn is committed). */
@@ -224,6 +225,7 @@ export const presentWorld = (
         }),
         ...(o.media !== undefined ? { media: () => ({ fetch: o.media! }) } : {}),
         ...(o.observe !== undefined ? { observe: o.observe } : {}),
+        ...(o.newId !== undefined ? { newId: o.newId } : {}),
         gateway: () => hostRef?.gateway,
         pageText: (m, text, max) => hostRef?.pageText(m, text, max) ?? String(text).slice(0, max),
         language: () => "en",
@@ -301,7 +303,7 @@ export const presentWorld = (
     }
     const shownOn = (deviceId: string) => [...holds(firstTab(deviceId)).values()]
     const pressOn = (deviceId: string, presentationId: string, action: string, extra: { item?: string; done?: boolean } = {}, tab = firstTab(deviceId)) =>
-      Effect.tap(made.present.press({ presentationId, action, ...extra, deviceId, ...(tab !== undefined ? { connection: makeConnectionRef(tab.id) } : {}) }), () => settle)
+      Effect.tap(made.present.press({ presentationId, revision: holds(tab).get(presentationId)?.revision ?? "missing", action, ...extra, deviceId, ...(tab !== undefined ? { connection: makeConnectionRef(tab.id) } : {}) }), () => settle)
     return {
       ...made,
       held,
@@ -412,7 +414,7 @@ export const presentContract = (name: string, open: OpenPresentStore) =>
       Effect.gen(function*() {
         const { world } = yield* start()
         const bad = yield* world.toolOn("kitchen-display", { forModel: "x", present: { kind: "card", title: "", spoken: "s" } })
-        assert.match(bad.content, /\[Screen: Not showing it: the presentation was not valid \(title must be text\)\.\]$/)
+        assert.match(bad.content, /\[Screen: Not showing it: the presentation was not valid \(check its fields and options\)\.\]$/)
         for (let i = 0; i < MAX_LIVE_PER_MODULE; i++) yield* world.showOn("kitchen-display", card(`C${i}`), { lifetime: "pinned", expiresInMs: HOUR }, "board", { room: "Kitchen" }).pipe(Effect.ignore)
         const over = yield* world.toolOn("kitchen-display", { forModel: "x", present: card() })
         assert.match(over.content, /Not showing it: too much is on screen \(.*\)\. Say this instead: Bins out\.\]$/)
@@ -767,9 +769,9 @@ export const presentContract = (name: string, open: OpenPresentStore) =>
         // A page that goes: its address stops working at once.
         yield* world.close(second)
         assert.isUndefined(world.present.mediaFor(theirs))
-        // The same key and address again keeps what was fetched; the earlier handle no longer acts on it (another show).
+        // A fresh show asks the cache again (it reuses only a usable cached file); the earlier handle no longer acts on it (another show).
         const again = yield* world.showOn("kitchen-display", image("https://example.org/heron.png"), { lifetime: "pinned", key: "pic" })
-        assert.deepStrictEqual(fetched, ["https://example.org/heron.png"])
+        assert.deepStrictEqual(fetched, ["https://example.org/heron.png", "https://example.org/heron.png"])
         assert.isFalse(yield* h.dismiss)
         yield* world.showOn("robins-phone", image("https://example.org/no.png"))
         assert.deepStrictEqual((world.shownOn("robins-phone")[0]?.content as { image: unknown }).image, { state: "failed" })
@@ -1396,7 +1398,9 @@ export const presentContract = (name: string, open: OpenPresentStore) =>
           assert.isTrue(Exit.isSuccess(shown), `${name} at ${bound}: ${Exit.isFailure(shown) ? Cause.pretty(shown.cause) : ""}`)
           if (Exit.isSuccess(shown)) yield* shown.value.dismiss
           const [bad, badOptions] = at(past)
-          assert.strictEqual(reasonOf(yield* Effect.exit(world.showOn("kitchen-display", bad as Presentation, badOptions as never))), "invalid", `${name} at ${past}`)
+          const rejected = yield* Effect.exit(world.showOn("kitchen-display", bad as Presentation, badOptions as never))
+          assert.strictEqual(reasonOf(rejected), "invalid", `${name} at ${past}`)
+          if (name === "handler name" && Exit.isFailure(rejected)) assert.include((Cause.squash(rejected.cause) as Error).message, "handler must match")
         }
       }))
     // ---- Round 3

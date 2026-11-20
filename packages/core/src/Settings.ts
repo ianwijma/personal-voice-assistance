@@ -482,7 +482,7 @@ export const applySettingsPatch = (
   spec: SettingsSpec,
   sources: SettingsSources,
   patch: SettingsPatch,
-  /** `includeHidden`: save fields whose `visibleWhen` does not hold too ("Move to settings" keeps every value). */
+  /** Internal "Move to settings": save hidden and environment-locked fields while their overrides stay effective. */
   options: { readonly includeHidden?: boolean } = {}
 ): PatchResult => {
   const stored: Record<string, SettingValue> = {}
@@ -529,7 +529,7 @@ export const applySettingsPatch = (
       errors.push({ key, message: wantSecret ? "Not a secret" : "Secrets go in the secrets part of the patch" })
       return undefined
     }
-    if (envValue(setting, sources.env) !== undefined) {
+    if (envValue(setting, sources.env) !== undefined && options.includeHidden !== true) {
       errors.push({ key, message: `Set by ${setting.env} in the environment; change it there` })
       return undefined
     }

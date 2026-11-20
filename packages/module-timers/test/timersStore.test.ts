@@ -83,8 +83,8 @@ describe("one change at a time", () => {
       const kit = yield* startTestModule(timersModule)
       yield* kit.action("start", { duration: "10 minutes", name: "pasta" })
       const [a, b] = yield* Effect.all([
-        kit.action("adjust", { amount: "1 minute" }, { device: "kitchen-display" }),
-        kit.action("adjust", { amount: "2 minutes" }, { device: "robins-phone", conversationId: "c-robin" })
+        kit.action("adjust", { amount: "1 minute", change: "add" }, { device: "kitchen-display" }),
+        kit.action("adjust", { amount: "2 minutes", change: "add" }, { device: "robins-phone", conversationId: "c-robin" })
       ], { concurrency: "unbounded" })
       assert.sameMembers([said(a), said(b)], ["Pasta timer: 11 minutes left.", "Pasta timer: 13 minutes left."])
       assert.strictEqual(said(yield* kit.action("list", {})), "Pasta timer: 13 minutes left.")
@@ -138,7 +138,7 @@ describe("a store that is busy or fails", () => {
       const kit = yield* startTestModule(hookedTimers(hooks))
       for (const name of ["a", "b", "c"]) yield* kit.action("start", { duration: "10 minutes", name })
       hooks.throwAtWrite = { n: 2, failure: new StoreError({ reason: "failed", message: "test: mid-write" }) }
-      assert.strictEqual(said(yield* kit.action("cancel", { all: true })), "That didn't work with the timers; try again.")
+      assert.strictEqual(said(yield* kit.action("cancel", { all: true, bulk: "timers" })), "That didn't work with the timers; try again.")
       hooks.throwAtWrite = undefined
       assert.strictEqual((yield* activeRows(kit)).length, 3)
       assert.strictEqual((yield* liveRingJobs(kit)).length, 3)
@@ -206,7 +206,7 @@ describe("the Timers service", () => {
       assert.strictEqual(said(yield* kit.action("list", {})), "50 timers: t0 timer with 1 minute left, t1 timer with 2 minutes left, t2 timer with 3 minutes left and 47 more.")
       // The last one, by name, past the first pages.
       assert.strictEqual(said(yield* kit.action("list", { name: "t49" })), "T49 timer: 50 minutes left.")
-      assert.strictEqual(said(yield* kit.action("cancel", { all: true })), "Cancelled 50 timers.")
+      assert.strictEqual(said(yield* kit.action("cancel", { all: true, bulk: "timers" })), "Cancelled 50 timers.")
       assert.deepStrictEqual(yield* liveRingJobs(kit), [])
     }))
 
@@ -286,7 +286,7 @@ describe("data", () => {
       const line = timers.ambient!(rows as ReadonlyArray<Row<Timer>>, { now, turn: undefined })
       assert.strictEqual(line, "Timers running (most recently changed): rice timer paused with 9 minutes 58 seconds left, bread timer with 9 minutes 59 seconds left, eggs timer with 9 minutes 57 seconds left, and 1 more.")
       assert.isUndefined(timers.ambient!([], { now, turn: undefined }))
-      yield* kit.action("cancel", { all: true })
+      yield* kit.action("cancel", { all: true, bulk: "timers" })
       assert.isUndefined(timers.ambient!((yield* kit.moduleStore().collection(timers).list({ limit: 10 })) as ReadonlyArray<Row<Timer>>, { now, turn: undefined }))
     }))
 

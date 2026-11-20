@@ -2,7 +2,7 @@
 // the one decoder at every call (a save applies to the next), bounded and validated on save (an invalid save writes
 // nothing), and money and security fixed at Refuse through the admin API and in a hand-edited settings file.
 import { decodeRiskPolicy, DEFAULT_RISK_POLICY, FIXED_REASON } from "@pva/protocol"
-import { Effect } from "effect"
+import { Config, ConfigProvider, Effect } from "effect"
 import { mkdtempSync, readFileSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
@@ -92,4 +92,12 @@ describe("the risk policy section", () => {
     expect(policyOf(sections)).toEqual({ ...DEFAULT_RISK_POLICY, message: "allow" })
     expect(riskSection(sections).form.fields.find((f) => f.key === "RISK_MESSAGE")?.locked?.reason).toMatch(/^Set by RISK_MESSAGE/)
   })
+})
+
+it("the ConfigProvider serves resolved risk values ahead of raw environment strings", async () => {
+  const sections = makeSections(await Effect.runPromise(openStore(mkdtempSync(join(tmpdir(), "pva-risk-")))), {
+    RISK_MONEY: "allow", RISK_SECURITY: "confirm", RISK_READ: " deny ", RISK_CHANGE: "invalid"
+  })
+  const read = (key: string) => Effect.runPromise(Config.String(key).pipe(Effect.provideService(ConfigProvider.ConfigProvider, sections.configProvider())))
+  expect(await Promise.all(["RISK_MONEY", "RISK_SECURITY", "RISK_READ", "RISK_CHANGE", "RISK_MESSAGE"].map(read))).toEqual(["deny", "deny", "deny", "allow", "confirm"])
 })

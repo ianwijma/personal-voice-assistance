@@ -1,5 +1,5 @@
 import { claudeSubscriptionAgent } from "@pva/agent-claude-code"
-import { makeModuleHost, RISK_POLICY_KEYS, riskLanguageOf, type ModuleDefinition, type ModuleDemand, type ModuleHost, type ModulePersistence, type ModuleSnapshot, readOnlyPersistence, type TurnSetup, withContextProvider } from "@pva/core"
+import { makeModuleHost, RISK_POLICY_KEYS, type ModuleDefinition, type ModuleDemand, type ModuleHost, type ModulePersistence, type ModuleSnapshot, readOnlyPersistence, type TurnSetup, withContextProvider } from "@pva/core"
 import { homeAssistantModule } from "@pva/module-home-assistant"
 import { catalog as assistantControlsModules } from "@pva/module-assistant-controls"
 import { catalog as briefingModules } from "@pva/module-briefing"
@@ -24,7 +24,7 @@ import type { Assistant, ModuleInfo } from "@pva/protocol"
 import { Config, Effect, type Scope } from "effect"
 import { CliSettingsRef } from "./cliSettings.ts"
 import { makeRequirementChecker, type RequirementChecker } from "./requirements.ts"
-import { effectiveRiskPolicy } from "./serve/riskPolicy.ts"
+import { effectiveRiskLanguage, effectiveRiskPolicy } from "./serve/riskPolicy.ts"
 import { DataDirConfig, loadSettingsStore } from "./serve/SettingsStore.ts"
 import { openVault, VaultPathConfig } from "./serve/Vault.ts"
 import { openCliHousehold } from "./serve/household.ts"
@@ -169,6 +169,7 @@ export const startCliModules = (
       stored: {},
       env: { [RISK_POLICY_KEYS.read]: saved.read, [RISK_POLICY_KEYS.change]: saved.change, [RISK_POLICY_KEYS.message]: saved.message }
     })
+    const riskLanguage = loaded?.riskLanguage ?? effectiveRiskLanguage({ stored: {}, env: { HOME_LANGUAGE: saved.language } })
     const host = yield* makeModuleHost({
       catalog,
       persistence,
@@ -180,7 +181,7 @@ export const startCliModules = (
       localPrincipal: true,
       // The household's risk policy, decided as serve mode decides it (money and security are refused here too). No
       // `mayReveal`: the CLI modes have no devices, and the person at the terminal is who asked.
-      gatewayHooks: { policy: () => riskPolicy, language: () => riskLanguageOf(saved.language) },
+      gatewayHooks: { policy: () => riskPolicy, language: () => riskLanguage },
       programMissing: (tool) => checker.markMissing(tool)
     })
     yield* host.startEnabled

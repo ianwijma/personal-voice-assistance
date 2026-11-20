@@ -275,7 +275,12 @@ export interface ClientState {
    * session ends: the server sends what is open again after a welcome. `quiet`: a button was
    * pressed here, so the page's ring cue stops for it at once (the server's `resolved` takes the card down).
    */
-  readonly notifications: ReadonlyArray<NotificationCard & { readonly quiet?: boolean }>
+  readonly notifications: ReadonlyArray<NotificationCard & {
+    readonly quiet?: boolean
+    /** Local action state belongs to this holding, across stage/chat remounts; withdrawal takes it away. */
+    readonly pendingActions?: ReadonlyArray<{ readonly actionId: string }>
+    readonly said?: string | undefined
+  }>
   /**
    * P10: the presentations on this device (`present.show` / `present.update` until `present.dismiss`), in the order the
    * server gave them; never cut here (the server sends a page at most `MAX_PRESENTATIONS_PER_PAGE`). Emptied at every
@@ -406,7 +411,8 @@ export type LocalAction =
    */
   | { readonly type: "local/session-ended" }
   /** P9: a button of a card was pressed here: its cue stops now (the card stays until the server resolves it). */
-  | { readonly type: "local/notification-pressed"; readonly id: string }
+  | { readonly type: "local/notification-pressed"; readonly id: string; readonly press?: { readonly actionId: string } }
+  | { readonly type: "local/notification-answered"; readonly id: string; readonly press: { readonly actionId: string }; readonly answer?: { readonly say?: string | undefined } }
 
 export type Action = ServerMessage | LocalAction
 
@@ -706,7 +712,12 @@ const server: ServerHandlers = {
   // P9: a card shown (or shown again, silent or not), and one taken down.
   "notification.ring": (s, m) => {
     const before = s.notifications.find((n) => n.id === m.notification.id)
-    const card = before?.quiet === true ? { ...m.notification, quiet: true } : m.notification
+    const card = {
+      ...m.notification,
+      ...(before?.quiet === true ? { quiet: true } : {}),
+      ...(before?.pendingActions !== undefined ? { pendingActions: before.pendingActions } : {}),
+      ...(before?.said !== undefined ? { said: before.said } : {})
+    }
     const rest = s.notifications.filter((n) => n.id !== m.notification.id)
     // Never cut: the server enforces the bound (it withdraws before it adds at the bound), and a card dropped here
     // would be a live ring lost without a word.
@@ -742,7 +753,11 @@ const local = (s: ClientState, a: LocalAction): ClientState => {
       // goes too (it may have ended or been withdrawn meanwhile); after the next welcome the server sends what applies.
       return { ...s, pending: {}, audio: withoutPlaying(s.audio), liveTranscript: "", presentations: [] }
     case "local/notification-pressed":
-      return { ...s, notifications: s.notifications.map((n) => (n.id === a.id ? { ...n, quiet: true } : n)) }
+      return { ...s, notifications: s.notifications.map((n) => (n.id === a.id ? { ...n, quiet: true, ...(a.press !== undefined ? { pendingActions: [...(n.pendingActions ?? []), a.press] } : {}) } : n)) }
+    case "local/notification-answered":
+      return { ...s, notifications: s.notifications.map((n) => n.id === a.id && n.pendingActions?.includes(a.press)
+        ? { ...n, pendingActions: n.pendingActions.filter((p) => p !== a.press), ...(a.answer !== undefined ? { said: a.answer.say } : {}) }
+        : n) }
     case "local/session-ended":
       // Not a network drop: the old session is gone for good, and nothing of it stays on screen.
       return {

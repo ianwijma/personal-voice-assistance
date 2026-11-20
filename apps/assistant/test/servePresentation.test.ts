@@ -120,7 +120,7 @@ const holds = (c: ScriptedClient) => {
 let seq = 0
 const tick = (c: ScriptedClient, id: string, item = "milk") => {
   const requestId = `t-${++seq}`
-  c.send({ type: "present.action", requestId, id, action: "tick", item, done: true })
+  c.send({ type: "present.action", requestId, id, revision: holds(c).get(id)?.revision ?? "missing", action: "tick", item, done: true })
   return c.waitFor("result", (m) => m.requestId === requestId, { from: 0 })
 }
 
@@ -198,6 +198,42 @@ describe("presentation through the hub", () => {
     // The slots were given back: the refused ones go through now.
     expect(await tick(pages[0]!, extra.id)).toMatchObject({ ok: true })
     expect(await tick(pages[4]!, ids.get(pages[4]!)![0]!)).toMatchObject({ ok: true })
+  })
+
+  it("b1: a crossed press from a delayed tab cannot run the replacement handler", async () => {
+    await start()
+    const delayed = await page("present-crossed-01")
+    const other = await page("present-crossed-01")
+    await sleep(300)
+    const opts = { lifetime: "pinned", key: "drink" } as const
+    const drink = (title: string): Presentation => ({ kind: "card", title, spoken: title, handler: "answer", buttons: [{ id: "choose", label: title }] })
+    const h = await run(present!.show({ device: delayed.device.id }, drink("Tea"), opts))
+    await until(() => holds(delayed).has(h.id) && holds(other).has(h.id))
+    const tea = holds(delayed).get(h.id)!
+    delayed.ws.pause()
+    try {
+      await run(present!.show({ device: delayed.device.id }, drink("Coffee"), opts))
+      await until(() => holds(other).get(h.id)?.revision !== tea.revision)
+      delayed.send({ type: "present.action", requestId: "crossed", id: tea.id, revision: tea.revision, action: "choose" })
+      await sleep(100)
+    } finally { delayed.ws.resume() }
+    const answer = await delayed.waitFor("result", (m) => m.requestId === "crossed", { from: 0 })
+    expect(answer.ok).toBe(false)
+    expect(presses).toEqual([])
+    const coffee = holds(other).get(h.id)!
+    other.send({ type: "present.action", requestId: "fresh", id: coffee.id, revision: coffee.revision, action: "choose" })
+    expect((await other.waitFor("result", (m) => m.requestId === "fresh", { from: 0 })).ok).toBe(true)
+    expect(presses).toEqual(["choose:"])
+  })
+
+  it("b5: an unknown device kind is welcomed but cannot be targeted or sent presentations", async () => {
+    await start()
+    const c = await ScriptedClient.connect({ url: server!.url, deviceId: "future-screen-01", player: { enabled: false } })
+    clients.push(c)
+    await c.hello({ device: { ...c.device, kind: "future-screen", capabilities: SCREEN as never } })
+    await sleep(100)
+    await expect(run(present!.show({ device: c.device.id }, checklist))).rejects.toThrow(/there is no device/)
+    expect(c.messages.some((m) => m.type === "present.show")).toBe(false)
   })
 
   it("an override that takes the display away ends the session; the page that comes back is shown nothing", async () => {
