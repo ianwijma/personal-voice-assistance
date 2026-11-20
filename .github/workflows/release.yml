@@ -8,12 +8,15 @@ run-name: Release ${{ inputs.version_bump }} ${{ inputs.release_type }}${{ input
 # Run from the GitHub UI: Actions → Release → "Run workflow", pick a version bump
 # and a release type. See docs/RELEASING.md.
 #
-# 1. `plan` typechecks, tests and builds the image (without pushing it), works out the
-#    new version, and writes a summary of what is released now and what this run will
-#    release. It fails on blockers (e.g. the tag already exists). Nothing is changed yet.
-# 2. `version` waits for approval on the `release` environment. Read the summary,
-#    then approve or reject under "Review deployments". Once approved, it commits
-#    the new version to the default branch and pushes the `vX.Y.Z` tag.
+# 1. `plan` works out the new version and writes a summary of what is released now and
+#    what this run will release. It fails on blockers (e.g. the tag already exists).
+#    Then `check`, `test` (four shards), `latency` and `image-check` run side by side:
+#    the same checks as .github/workflows/ci.yml, and the image built without pushing
+#    it. Nothing is changed yet.
+# 2. `version` waits until all of those are green, then for approval on the `release`
+#    environment. Read the summary, then approve or reject under "Review deployments".
+#    Once approved, it commits the new version to the default branch and pushes the
+#    `vX.Y.Z` tag.
 # 3. `image` checks out that tag, builds the container image and pushes it as
 #    ghcr.io/ianwijma/personal-voice-assistant:X.Y.Z (linux/amd64, docs/DEPLOYMENT.md).
 # 4. `release` creates the GitHub Release, with the image reference and its digest
@@ -77,8 +80,8 @@ jobs:
   plan:
     name: Plan release (${{ inputs.version_bump }} ${{ inputs.release_type }})
     runs-on: ubuntu-latest
-    # The same checks as .github/workflows/ci.yml (about 15 minutes), then the image build.
-    timeout-minutes: 50
+    # Only the version and the blockers: the checks below start once this is green.
+    timeout-minutes: 10
     outputs:
       version: ${{ steps.next.outputs.version }}
       tag: ${{ steps.next.outputs.tag }}
@@ -125,8 +128,8 @@ jobs:
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
 
-      # The version and the blockers first: a wrong input or an existing tag fails
-      # within a minute, not after the tests.
+      # A wrong input or an existing tag fails here, within a minute, before any of
+      # the checks start.
       - name: Work out the new version
         id: next
         env:
@@ -151,21 +154,87 @@ jobs:
           PRERELEASE: ${{ steps.next.outputs.prerelease }}
         run: scripts/release/plan.sh
 
-      # The same three steps as .github/workflows/ci.yml. `pnpm check` also builds the
-      # audio worklets the web tests need, so it runs before the tests.
+  # After the plan, the same checks as .github/workflows/ci.yml, each on its own runner
+  # and all at the same time (see the comment there), plus the image build. A failure in
+  # one does not stop the others, so every result is seen; "Re-run failed jobs" re-runs
+  # only the ones that failed.
+  check:
+    name: Typecheck
+    needs: plan
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: pnpm/action-setup@v6
+      - uses: actions/setup-node@v7
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: pnpm
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
       - name: Typecheck
         run: pnpm check
 
+  test:
+    name: Test (${{ matrix.shard }}/4)
+    needs: plan
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        # Keep the 4 in `name` and in `--shard` the same as the length of this list.
+        shard: [1, 2, 3, 4]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: pnpm/action-setup@v6
+      - uses: actions/setup-node@v7
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: pnpm
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+      # The audio worklets and characters the web tests import (`pnpm check` builds them too).
+      - name: Build worklets and characters
+        run: pnpm --filter @pva/web worklets && pnpm --filter @pva/web characters
       - name: Test
-        run: pnpm test --project node --project web
+        run: pnpm test --project node --project web --shard=${{ matrix.shard }}/4
 
+  latency:
+    name: Latency tests
+    needs: plan
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: pnpm/action-setup@v6
+      - uses: actions/setup-node@v7
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: pnpm
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+      - name: Build worklets and characters
+        run: pnpm --filter @pva/web worklets && pnpm --filter @pva/web characters
       - name: Latency tests
         run: pnpm test --project latency --no-file-parallelism
 
-      # Not pushed: this shows before the approval that the image builds. No `context`:
-      # the action then builds the commit straight from git, not this directory with
-      # node_modules and the test output in it. The `image` job still installs and builds
-      # again (its package.json has the new version), only the base layers are reused.
+  # Not pushed: this shows before the approval that the image builds. No checkout and no
+  # `context`: the action builds the commit straight from git. The `image` job still
+  # installs and builds again (its package.json has the new version), only the base
+  # layers are reused.
+  image-check:
+    name: Build the image (not pushed)
+    needs: plan
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
       - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
 
       - name: Build the image (not pushed)
@@ -178,7 +247,8 @@ jobs:
 
   version:
     name: Commit and tag ${{ needs.plan.outputs.tag }}
-    needs: plan
+    # Every check must be green before the approval is asked for.
+    needs: [plan, check, test, latency, image-check]
     runs-on: ubuntu-latest
     timeout-minutes: 10
     # The approval gate: give this environment required reviewers so the run waits

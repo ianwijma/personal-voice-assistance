@@ -34,9 +34,9 @@ The version lives in the root `package.json` only. The workspace packages stay a
 6. **Prerelease identifier** (default `rc`) is only used for prereleases; `beta` gives `1.3.0-beta.0`.
 7. Click **Run workflow**.
 8. Open the run's summary. The plan is there within a minute: the current and new version, the latest GitHub Release
-   and git tag, the image that will be pushed, any blockers, and the changes since the last release. **Plan release**
-   then goes on to the typecheck, the tests and the image build (about 20 minutes).
-9. When **Plan release** is green and the plan is correct, click **Review deployments**, tick `release` and
+   and git tag, the image that will be pushed, any blockers, and the changes since the last release. Then the
+   typecheck, the tests (four shards), the latency tests and the image build run side by side, each as its own job.
+9. When all of those are green and the plan is correct, click **Review deployments**, tick `release` and
    **Approve and deploy**. To stop, click **Reject** instead.
 10. Wait for **Build image** and **Release** to go green and check the new GitHub Release.
 
@@ -54,8 +54,9 @@ Release candidates, step by step (keep the same **Version bump** each time):
 ### What the workflow does
 
 - **Plan:** works out the new version (`scripts/next-version.ts`) and writes the summary. It stops on a blocker: the
-  tag or GitHub Release already exists, or a stable version isn't newer than the latest stable GitHub Release. Then it
-  runs the same typecheck and tests as the CI workflow and builds the image without pushing it.
+  tag or GitHub Release already exists, or a stable version isn't newer than the latest stable GitHub Release.
+- **Checks:** once the plan is green, the same jobs as the CI workflow (typecheck, four test shards, latency tests)
+  and an image build without push run at the same time. If one fails, "Re-run failed jobs" re-runs only that one.
 - **Version:** waits for your approval on the `release` environment, then commits the new version to `main`
   (`chore(release): vX.Y.Z`) and pushes a `vX.Y.Z` tag. If `main` got new commits after the run
   started, it stops instead.
