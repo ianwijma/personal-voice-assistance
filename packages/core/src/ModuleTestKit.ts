@@ -381,6 +381,12 @@ const observedScheduler = (hook: SchedulerHook, uses: Array<SchedulerUse>): Sche
  */
 export const KIT_WAIT_CAP_MS = 10 * 60_000
 
+/**
+ * The most REAL time one wait of the kit gives work that no test-clock timer moves (a task on a worker thread) before
+ * it fails the test: 5 seconds. Only a wait with no pending timer spends it; it ends as soon as the work is done.
+ */
+export const KIT_REAL_WAIT_MS = 5_000
+
 /** The earliest pending timer of the test clock, in ms from now; `undefined` when none is pending, `null` when unknown. */
 const nextTimer = TestClock.testClockWith((clock) =>
   Effect.sync((): number | undefined | null => {
@@ -430,7 +436,17 @@ const follow = <A, E>(what: string, fiber: Fiber.Fiber<A, E>): Effect.Effect<A, 
       yield* letRun(fiber)
       if (fiber.pollUnsafe() !== undefined) return yield* Fiber.join(fiber)
       const elapsed = (yield* Clock.currentTimeMillis) - startedAt
-      const next = yield* nextTimer
+      let next = yield* nextTimer
+      // Nothing the clock can move: the work may be real (a worker thread reading a file, docs/MODULES.md §15), which a
+      // loaded machine does not finish in `letRun`'s few event-loop turns. Give it real time before giving up.
+      if (next === undefined) {
+        const realStart = Date.now()
+        while (next === undefined && fiber.pollUnsafe() === undefined && Date.now() - realStart < KIT_REAL_WAIT_MS) {
+          yield* Effect.promise(() => new Promise<void>((resolve) => setTimeout(resolve, 5)))
+          next = yield* nextTimer
+        }
+        if (fiber.pollUnsafe() !== undefined) return yield* Fiber.join(fiber)
+      }
       const step = next === null ? 1_000 : next
       if (step === undefined || elapsed + step > KIT_WAIT_CAP_MS) {
         fiber.interruptUnsafe()

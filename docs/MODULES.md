@@ -1804,7 +1804,8 @@ values), `startAt`, `started`. It returns handles:
 `configure`, `checkHealth`; and stopping everything when the test's scope closes) **it drives the test clock** from one
 pending timer to the next until the wait is over, so a cleanup that sleeps or a start that never answers runs into the
 host's own limits as it would in serve mode. After `KIT_WAIT_CAP_MS` (10 minutes) of test-clock time it fails the test
-naming what did not finish; it never hangs. Before each move it gives real work a few milliseconds of real time; a
+naming what did not finish; it never hangs. Before each move it gives real work a few milliseconds of real time, and
+when no timer is pending at all up to `KIT_REAL_WAIT_MS` (5 seconds) of it, for work on a worker thread (§15); a
 start that waits longer on real work (a large dynamic `import`) can meet the host's 10 s limit in test-clock time, so
 a test imports such a library once before it starts the kit. `advance(ms)` moves the clock by exactly `ms`.
 
