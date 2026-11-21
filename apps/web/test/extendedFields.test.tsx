@@ -141,6 +141,47 @@ describe("combo, info", () => {
   })
 })
 
+describe("info with steps", () => {
+  const guide: Extract<SettingField, { type: "info" }> = {
+    type: "info",
+    key: "guide",
+    label: "Guide",
+    apply: "live",
+    steps: [
+      { text: "Open the dashboard.", link: { href: "https://developer.spotify.com/dashboard", label: "Open it" } },
+      { text: "Paste the address.", copy: [{ label: "Redirect URI", value: "{origin}/api/cb" }, { label: "Name", value: "Voice {assistant}" }] }
+    ]
+  }
+  it("draws a numbered list, with the page's origin in place of {origin} and nothing else replaced", () => {
+    const { container } = render(<Harness field={guide} initial="" />)
+    expect(container.querySelectorAll("ol > li")).toHaveLength(2)
+    const values = screen.getAllByTestId("info-copy-value").map((e) => e.textContent)
+    expect(values).toEqual([`${window.location.origin}/api/cb`, "Voice {assistant}"])
+    expect(screen.getByTestId("info-guide")).not.toHaveTextContent("—")
+    const link = screen.getByRole("link", { name: "Open it" })
+    expect(link).toHaveAttribute("href", "https://developer.spotify.com/dashboard")
+    expect(link).toHaveAttribute("target", "_blank")
+    expect(link).toHaveAttribute("rel", "noopener noreferrer")
+  })
+  it("copies the substituted value and says Copied", async () => {
+    const writeText = vi.fn(() => Promise.resolve())
+    Object.defineProperty(navigator, "clipboard", { value: { writeText }, configurable: true })
+    Object.defineProperty(window, "isSecureContext", { value: true, configurable: true })
+    render(<Harness field={guide} initial="" />)
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "Copy Redirect URI" }))
+    })
+    expect(writeText).toHaveBeenCalledWith(`${window.location.origin}/api/cb`)
+    expect(screen.getByTestId("info-copied")).toHaveTextContent("Copied")
+    expect(screen.getByTestId("info-copied")).toHaveAttribute("aria-live", "polite")
+  })
+  it("leaves an info field without steps as it was", () => {
+    const { container } = render(<Harness field={state} initial="" />)
+    expect(container.querySelector("ol")).toBeNull()
+    expect(screen.getByTestId("info-state")).toHaveTextContent("—")
+  })
+})
+
 describe("action buttons", () => {
   const context = (dirty: boolean): FieldContext => ({ form: { kind: "module", id: "demo-home" }, dirty, draftValues: { rooms: [{ name: "Hall" }], state: "x" } })
 

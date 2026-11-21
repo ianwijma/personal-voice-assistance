@@ -1,5 +1,9 @@
 import {
   type ChoiceOption,
+  INFO_STEP_LINK_HREF,
+  type InfoStep,
+  MAX_INFO_STEP_COPY,
+  MAX_INFO_STEPS,
   type Condition,
   MAX_COMBO_OPTIONS,
   MAX_FIELD_DESCRIPTION,
@@ -351,13 +355,40 @@ const actionSetting = (o: Omit<Common, "env" | "apply" | "overridable"> & {
   fromEnv: () => fail("An action has no value")
 })
 
+type InfoOptions = Omit<Common, "env" | "apply" | "overridable"> & {
+  readonly tone?: "neutral" | "ok" | "warning" | "error"
+  /** A numbered guide drawn from the definition (static): text, values to copy (`{origin}` becomes the admin page's own origin), a `https://` link. */
+  readonly steps?: ReadonlyArray<InfoStep>
+}
+
+/** The bounds the wire has (`InfoField.steps`), checked where the module is defined. */
+const declareSteps = (label: string, steps: ReadonlyArray<InfoStep> | undefined) => {
+  if (steps === undefined) return
+  const what = `Field "${label.slice(0, 40)}" steps`
+  declare(what, steps.length >= 1 && steps.length <= MAX_INFO_STEPS, `1 to ${MAX_INFO_STEPS} steps`)
+  for (const [n, step] of steps.entries()) {
+    const at = `${what}, step ${n + 1}`
+    textBound(`${at} text`, step.text, 300)
+    declare(at, step.copy === undefined || step.copy.length <= MAX_INFO_STEP_COPY, `at most ${MAX_INFO_STEP_COPY} values to copy`)
+    for (const c of step.copy ?? []) {
+      textBound(`${at} copy label`, c.label, 40)
+      textBound(`${at} copy value`, c.value, 300)
+    }
+    if (step.link !== undefined) {
+      textBound(`${at} link label`, step.link.label, 60)
+      declare(at, step.link.href.length <= 300 && INFO_STEP_LINK_HREF.test(step.link.href), "a link is an absolute https:// address of at most 300 characters, without credentials, spaces or control characters")
+    }
+  }
+}
+
 /** Read-only text from the running instance (`info()[key]`); "" while it does not run. */
-const info = (o: Omit<Common, "env" | "apply" | "overridable"> & { readonly tone?: "neutral" | "ok" | "warning" | "error" }): Setting<string> & { readonly value: "readOnly" } => {
+const info = (o: InfoOptions): Setting<string> & { readonly value: "readOnly" } => {
   declareCommon(o)
+  declareSteps(o.label, o.steps)
   return infoSetting(o)
 }
 
-const infoSetting = (o: Omit<Common, "env" | "apply" | "overridable"> & { readonly tone?: "neutral" | "ok" | "warning" | "error" }): Setting<string> & { readonly value: "readOnly" } => ({
+const infoSetting = (o: InfoOptions): Setting<string> & { readonly value: "readOnly" } => ({
   type: "info",
   secret: false,
   ...visibility(o),
@@ -365,7 +396,12 @@ const infoSetting = (o: Omit<Common, "env" | "apply" | "overridable"> & { readon
   env: undefined,
   value: "readOnly",
   defaultValue: "",
-  describe: (key): SettingField => ({ type: "info", ...commonFields(key, o), ...(o.tone !== undefined ? { tone: o.tone } : {}) }),
+  describe: (key): SettingField => ({
+    type: "info",
+    ...commonFields(key, o),
+    ...(o.tone !== undefined ? { tone: o.tone } : {}),
+    ...(o.steps !== undefined ? { steps: o.steps.map((s) => ({ ...s })) } : {})
+  }),
   decode: () => fail("Read-only"),
   fromEnv: () => fail("Read-only")
 })

@@ -105,6 +105,27 @@ draw them (docs/UI-AND-MODULES.md §1.11, §3.7). Built:
 Sections do not declare buttons yet (a section's handler would be the server's: `settings.action` is still not in the
 protocol); a button outside a module form is shown disabled.
 
+## Guides in an info field (`steps`, additive within protocol 12)
+
+An `info` field may carry `steps`: a numbered guide drawn from the definition (not from the instance), for what the owner has
+to do elsewhere before a setting works (the Spotify "Create app" form). No new field type, so no protocol bump (see the version
+log in `packages/protocol/src/constants.ts`). Up to 12 steps; each has `text` (at most 300 characters), optional `copy` (at most 6
+rows of `label` at most 40 and `value` at most 300: shown in a selectable monospace box with a **Copy** button that says
+"Copied" in an `aria-live` region; over plain http, where there is no clipboard API, the text is selected and copied the old
+way) and an optional `link` (`href`: an absolute `https://` address of at most 300 characters, no credentials, no spaces or
+control characters; `label` at most 60; opened in a new tab with `rel="noopener noreferrer"`).
+
+**`{origin}` is the only substitution.** In a copy `value` the admin page replaces the literal `{origin}` with its own
+`window.location.origin` (the server does not know the address the owner uses; the page does). Everything else is shown
+verbatim, as text. The module's step text must say what the page cannot know (for Media: the server forces `https` for a
+non-loopback host, so a page open over plain `http://` shows an address the server will not send; the module's "Check the
+address the assistant will send" button is the server's own answer).
+
+Fields are drawn in the order the module declares them, so a guide declared first sits above the fields it explains. The
+value of such a field still works as for any info field (shown above the list when not empty; no "—" dash when there are
+steps). Renderer: `fields/InfoField.tsx` (`withOrigin`), copying through `lib/clipboard.ts`. Definition bounds are checked
+in `Setting.info` (`SettingsExtra.ts`); wire bounds in `InfoField` (`settings.ts`).
+
 ## Status: the risk policy (modules P8, first version, 2026-11-19)
 
 The household's risk policy (docs/MODULES.md §4) is a household section like Home and Members, on its own page:

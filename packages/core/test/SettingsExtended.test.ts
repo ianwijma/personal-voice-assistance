@@ -125,3 +125,27 @@ describe("extended fields: describe, save, load, resolve per layer", () => {
     expect(Object.keys(settings)).not.toContain("state")
   })
 })
+
+describe("info steps", () => {
+  const guide = (steps: unknown) => () => Setting.info({ label: "Guide", steps: steps as never })
+  it("describes static steps as a protocol info field, and the value stays read-only", () => {
+    const steps = [{ text: "Open it.", link: { href: "https://example.com/dash", label: "Open" } }, { text: "Paste.", copy: [{ label: "URI", value: "{origin}/cb" }] }]
+    const s = Setting.info({ label: "Guide", steps })
+    const field = s.describe("guide")
+    expect(Schema.is(SettingField)(field)).toBe(true)
+    expect(field).toMatchObject({ type: "info", steps })
+    expect(s.defaultValue).toBe("")
+    expect(Setting.info({ label: "Plain" }).describe("plain")).not.toHaveProperty("steps")
+  })
+  it("refuses steps outside the wire's bounds when the module is defined", () => {
+    expect(guide([{ text: "x".repeat(301) }])).toThrow(/at most 300 characters/)
+    expect(guide([])).toThrow(/1 to 12 steps/)
+    expect(guide(Array.from({ length: 13 }, () => ({ text: "x" })))).toThrow(/1 to 12 steps/)
+    expect(guide([{ text: "x", copy: Array.from({ length: 7 }, () => ({ label: "l", value: "v" })) }])).toThrow(/at most 6 values/)
+    expect(guide([{ text: "x", copy: [{ label: "l".repeat(41), value: "v" }] }])).toThrow(/at most 40 characters/)
+    expect(guide([{ text: "x", link: { href: "http://example.com/", label: "L" } }])).toThrow(/https/)
+    expect(guide([{ text: "x", link: { href: "https://u:p@example.com/", label: "L" } }])).toThrow(/https/)
+    expect(guide([{ text: "x", link: { href: "https://example.com/a b", label: "L" } }])).toThrow(/https/)
+  })
+})
+

@@ -729,7 +729,9 @@ module cannot renew or replace one while the vault is locked. The kit gives `hos
 
 Field kinds (`Setting.*` from `@pva/core`): `text`, `secret`, `number`, `boolean`, `choice`, `multichoice`, `textList`,
 `records` (a list of flat items), `combo` (a choice with suggestions the instance fills), `action` (a button: a "Test"
-handler in `fieldActions`) and `info` (a read-only value the instance sets). A field may be `overridable` (an
+handler in `fieldActions`) and `info` (a read-only value the instance sets). `Setting.info({ label, steps })` makes it a numbered guide from the definition (at most 12 steps: `text`, `copy` rows
+whose `value` may hold `{origin}`, which the admin page replaces with the address it is open on and nothing else, and an
+`https://` `link`); see docs/SETTINGS-UI.md "Guides in an info field". Declare it first to have it above the fields it explains. A field may be `overridable` (an
 assistant may own its value; never a secret, and modules do not mark addresses) and `visibleWhen` another field has one
 of some values.
 

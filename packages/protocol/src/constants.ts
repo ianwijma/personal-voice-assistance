@@ -117,6 +117,9 @@
  * Additive within 12 (docs/modules/media.md "Signing in to Spotify"): the optional `FieldActionResult.link` (an address on the
  * assistant's own origin under `/api/modules/<id>/`, with a label, which the page shows beside a button's answer). An older
  * page ignores the key; an older server never sends it. No closed set gains a member, so the version stays 12.
+ * Additive within 12 (docs/SETTINGS-UI.md "Guides in an info field"): the optional `InfoField.steps` (a numbered guide: text,
+ * values to copy where `{origin}` is replaced by the admin page's own origin, a `https://` link). An older page shows the
+ * field's value only; an older server never sends it. The field type set is unchanged, so the version stays 12.
  */
 export const PROTOCOL_VERSION = 12
 
