@@ -56,6 +56,11 @@ export class NetFailure extends Data.TaggedError("NetFailure")<{
   readonly url: string
   readonly stage: "dns" | "connect" | "response"
   readonly detail: string
+  /**
+   * A POST's connection failed after the request may have been written (it is not sent again): whether it was carried
+   * out is unknown. Absent at the `connect` stage: nothing was written. At the `response` stage it was always written.
+   */
+  readonly requestSent?: true
 }> {
   override get message(): string {
     return `Request failed (${this.stage}): ${this.detail}`

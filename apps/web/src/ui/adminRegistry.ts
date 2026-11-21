@@ -11,6 +11,7 @@ import { SpeechModelsPage, VoiceModelsPage } from "@/components/settings/pages/M
 import { OverridesPage } from "@/components/settings/pages/OverridesPage.tsx"
 import { OverviewPage } from "@/components/settings/pages/OverviewPage.tsx"
 import { RiskPolicyPage } from "@/components/settings/pages/RiskPolicyPage.tsx"
+import { ReportsPage } from "@/components/settings/pages/ReportsPage.tsx"
 import { ScheduledJobsPage } from "@/components/settings/pages/ScheduledJobsPage.tsx"
 import type { ClientPageRef } from "@/lib/settingsTree.ts"
 
@@ -37,6 +38,7 @@ export const settingsPages: ReadonlyArray<SettingsPageEntry> = [
   { group: "keys", id: "keys", title: "Keys", description: "Every key, whether it is set, and what uses it.", order: 20, component: KeysListPage },
   { group: "diagnostics", id: "health", title: "Health", description: "What is missing or wrong on this server, and how to fix it.", order: 10, component: HealthPage },
   { group: "diagnostics", id: "scheduled", title: "Scheduled jobs", description: "The jobs the modules scheduled: when they run next, what failed, and cancel.", order: 15, component: ScheduledJobsPage },
+  { group: "diagnostics", id: "reports", title: "Reports", description: "Problems and ideas people told the assistants about: read them, then send them to GitHub.", order: 17, component: ReportsPage },
   { group: "diagnostics", id: "latency", title: "Latency", description: "How fast the last replies started.", order: 20, wide: true, component: LatencyPage },
   { group: "diagnostics", id: "problems", title: "Problems", description: "Engines and modules that could not start.", order: 30, component: ProblemsPage },
   { group: "diagnostics", id: "overrides", title: "Settings from outside", description: "What .env and the environment set, and moving it into the settings.", order: 40, component: OverridesPage },

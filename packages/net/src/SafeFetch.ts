@@ -782,19 +782,21 @@ const attempt = async (connector: Connector, request: Omit<ConnectRequest, "sign
   }
 }
 
-const run = async (input: string | URL, options: AnyOptions, allowLan: boolean, signal: AbortSignal, deadline: number, expired: () => NetTimeout): Promise<SafeResponse> => {
+const run = async (input: string | URL, options: AnyOptions, allowLan: boolean, signal: AbortSignal, deadline: number, expired: () => NetTimeout, allowPost: boolean = allowLan): Promise<SafeResponse> => {
   const shownInput = shownUrl(input)
   const limit = positive(options.maxBytes, defaultMaxBytes)
   const maxRedirects = options.maxRedirects === undefined ? defaultMaxRedirects : Number.isInteger(options.maxRedirects) && options.maxRedirects >= 0 ? options.maxRedirects : undefined
   const given = options.method ?? "GET"
   if (limit === undefined || maxRedirects === undefined) throw refuse("options", shownInput, "maxBytes must be a positive number and maxRedirects a whole number from 0")
-  // safeFetch is GET and HEAD only, whatever a cast says; a POST, its body and loopback are fetchOwnerConfiguredLan's alone.
-  if (!allowLan && given !== "GET" && given !== "HEAD") throw refuse("options", shownInput, "Only GET and HEAD")
-  if (allowLan && given !== "GET" && given !== "HEAD" && given !== "POST") throw refuse("options", shownInput, "Only GET, HEAD and POST")
+  // safeFetch is GET and HEAD only, whatever a cast says; a POST and its body are fetchOwnerConfiguredLan's and
+  // postFixedPublicJson's alone, and loopback is fetchOwnerConfiguredLan's alone.
+  if (!allowPost && given !== "GET" && given !== "HEAD") throw refuse("options", shownInput, "Only GET and HEAD")
+  if (allowPost && given !== "GET" && given !== "HEAD" && given !== "POST") throw refuse("options", shownInput, "Only GET, HEAD and POST")
   const method = given as ConnectRequest["method"]
-  if (!allowLan && (options.body !== undefined || options.maxRequestBytes !== undefined || options.typedLoopback !== undefined)) {
+  if (!allowPost && (options.body !== undefined || options.maxRequestBytes !== undefined || options.typedLoopback !== undefined)) {
     throw refuse("options", shownInput, "safeFetch takes no body and no loopback option")
   }
+  if (!allowLan && options.typedLoopback !== undefined) throw refuse("options", shownInput, "Only fetchOwnerConfiguredLan takes the loopback option")
   if (options.typedLoopback !== undefined && typeof options.typedLoopback !== "boolean") throw refuse("options", shownInput, "typedLoopback must be true or false")
   const maxRequestBytes = options.maxRequestBytes === undefined ? defaultMaxRequestBytes : options.maxRequestBytes
   if (typeof maxRequestBytes !== "number" || !Number.isInteger(maxRequestBytes) || maxRequestBytes < 1 || maxRequestBytes > maxMaxRequestBytes) {
@@ -849,7 +851,7 @@ const run = async (input: string | URL, options: AnyOptions, allowLan: boolean, 
         lastError = e instanceof Error ? e.message : String(e)
         // A POST is sent once: another address only when this one is certain to have received nothing.
         if (method === "POST" && !requestNotSent(e)) {
-          throw new NetFailure({ url: url.href, stage: "connect", detail: `${lastError} (the POST may or may not have been carried out; it is not sent again)` })
+          throw new NetFailure({ url: url.href, stage: "connect", detail: `${lastError} (the POST may or may not have been carried out; it is not sent again)`, requestSent: true })
         }
       }
     }
@@ -934,7 +936,7 @@ const run = async (input: string | URL, options: AnyOptions, allowLan: boolean, 
  * size (after decompression) and total time limits; honours `options.signal` and Effect interruption. Errors say which rule refused
  * (`NetRefused.rule`).
  */
-const fetchChecked = (url: string | URL, options: AnyOptions, allowLan: boolean): Effect.Effect<SafeResponse, SafeFetchError> =>
+const fetchChecked = (url: string | URL, options: AnyOptions, allowLan: boolean, allowPost: boolean = allowLan): Effect.Effect<SafeResponse, SafeFetchError> =>
   Effect.tryPromise({
     try: (effectSignal) => {
       const timeoutMs = options.timeoutMs ?? defaultTimeoutMs
@@ -949,7 +951,7 @@ const fetchChecked = (url: string | URL, options: AnyOptions, allowLan: boolean)
         else s.addEventListener("abort", abort, { once: true })
       }
       const deadline = Date.now() + timeoutMs
-      return run(url, options, allowLan, controller.signal, deadline, () => new NetTimeout({ url: shown, timeoutMs })).finally(() => {
+      return run(url, options, allowLan, controller.signal, deadline, () => new NetTimeout({ url: shown, timeoutMs }), allowPost).finally(() => {
         clearTimeout(timer)
         for (const s of outside) s.removeEventListener("abort", abort)
         // Stop whatever connection is still open.
@@ -990,3 +992,10 @@ export const safeFetch = (url: string | URL, options: SafeFetchOptions): Effect.
  */
 export const fetchOwnerConfiguredLan = (url: string | URL, options: OwnerConfiguredLanOptions): Effect.Effect<SafeResponse, SafeFetchError> =>
   fetchChecked(url, options, true)
+
+/**
+ * The checked fetch with POST allowed on public addresses, for `./host.ts` (`postFixedPublicJson`) only. Not exported
+ * from the package's main entry (`index.ts` lists what it exports): a module cannot reach it.
+ */
+export const fetchCheckedForHost = (url: string, options: Omit<SafeFetchOptions, "method"> & { readonly method: "POST"; readonly body: JsonBody; readonly maxRequestBytes?: number }): Effect.Effect<SafeResponse, SafeFetchError> =>
+  fetchChecked(url, options, false, true)

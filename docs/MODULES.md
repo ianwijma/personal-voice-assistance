@@ -865,6 +865,9 @@ stream), a WebSocket or a `POST` to a URL a model or a page chose is not in this
     `localhost.`, `x.localhost`, `%6cocalhost`, `[::ffff:127.0.0.1]`, a `URL` object), a name that resolves to loopback and a
     redirect to loopback stay refused. Without the option, every loopback address is refused. The kit's offline network
     resolves `localhost` names to loopback, so your test passes only where serve mode would.
+- **`postFixedPublicJson`** (`@pva/net/host`) is the host's, not a module's: a JSON `POST` to a fixed `https:` public
+  address written in the app's own code (the report filing's GitHub API, docs/REPORTS.md). It is not in `@pva/net`'s
+  main entry, and `packages/net/test/FixedPublicPost.test.ts` fails when a module package imports the host entry.
 - **`makeCachedJson`** for JSON with a time to live, `ETag` and stale-if-error.
 - **`userAgent(contact)`**: put the owner's contact (Home › API contact, `HOME_API_CONTACT`) in the User-Agent **only
   when the owner set one**.
@@ -1937,6 +1940,7 @@ check` behind the shared lock (`flock /workspace/build-cache/ian/pva-heavy.lock 
 | Presence | `module-presence` | A | [presence](modules/presence.md) |
 | News and feeds | `module-news` | A | [news](modules/news.md) |
 | Routines | `module-routines` | B | [routines](modules/routines.md) |
+| Reports | `module-report` | after B | [report](modules/report.md) |
 
 Wave A is written on this scaffold now; wave B after the first versions of P7 to P10 (notifications, phrase commands,
 presentation, the risk policy in admin), with the parts of wave A that needed them. Later, with their own plan: the

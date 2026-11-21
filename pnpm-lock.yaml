@@ -212,6 +212,9 @@ importers:
       '@pva/module-reminders':
         specifier: workspace:*
         version: link:../../packages/module-reminders
+      '@pva/module-report':
+        specifier: workspace:*
+        version: link:../../packages/module-report
       '@pva/module-routines':
         specifier: workspace:*
         version: link:../../packages/module-routines
@@ -1232,6 +1235,31 @@ importers:
       '@pva/language':
         specifier: workspace:*
         version: link:../language
+      '@pva/module-contracts':
+        specifier: workspace:*
+        version: link:../module-contracts
+      effect:
+        specifier: 'catalog:'
+        version: 4.1.4
+    devDependencies:
+      '@effect/vitest':
+        specifier: 'catalog:'
+        version: 4.1.4(effect@4.1.4)(vitest@5.1.0(@opentelemetry/api@1.10.0)(@types/node@22.20.5)(jsdom@31.0.0)(vite@8.3.8(@types/node@22.20.5)(esbuild@0.28.2)(jiti@2.7.0)(tsx@4.23.15)))
+      '@types/node':
+        specifier: 'catalog:'
+        version: 22.20.5
+      typescript:
+        specifier: 'catalog:'
+        version: 7.0.2
+      vitest:
+        specifier: 'catalog:'
+        version: 5.1.0(@opentelemetry/api@1.10.0)(@types/node@22.20.5)(jsdom@31.0.0)(vite@8.3.8(@types/node@22.20.5)(esbuild@0.28.2)(jiti@2.7.0)(tsx@4.23.15))
+
+  packages/module-report:
+    dependencies:
+      '@pva/core':
+        specifier: workspace:*
+        version: link:../core
       '@pva/module-contracts':
         specifier: workspace:*
         version: link:../module-contracts

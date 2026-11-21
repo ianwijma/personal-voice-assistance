@@ -193,3 +193,50 @@ describe("SessionConversation: typed input is admitted where the conversation ta
       yield* t.conversation.end
     }).pipe(Effect.scoped))
 })
+
+describe("SessionConversation: an ended conversation is handed on with its history (docs/REPORTS.md)", () => {
+  it.live("the idle reset, a new conversation and the end each hand on the history and why it ended", () =>
+    Effect.gen(function*() {
+      const ended: Array<{ readonly id: string; readonly history: ReadonlyArray<string>; readonly reason: string }> = []
+      let idleMs: number | undefined
+      const t = yield* setUp({
+        idleResetMs: () => idleMs,
+        keepsEndedHistory: () => true,
+        onConversationEnded: (id, history, reason) => void ended.push({ id, history: contents(history), reason })
+      })
+      const first = t.conversation.conversation().id
+      t.type("one")
+      yield* until(() => t.history().length === 2)
+      // The quiet spell passes: the next turn starts a new conversation, whose history is empty by the time it says so.
+      idleMs = 30
+      yield* Effect.sleep(80)
+      t.type("two")
+      yield* until(() => ended.length === 1 && t.history().length === 2)
+      assert.deepStrictEqual(ended[0], { id: first, history: ["one", "Model: one."], reason: "idle" })
+      idleMs = undefined
+      // `conversation.new` hands on the second one.
+      const second = t.conversation.conversation().id
+      yield* t.conversation.newConversation
+      yield* until(() => ended.length === 2)
+      assert.deepStrictEqual(ended[1], { id: second, history: ["two", "Model: two."], reason: "new" })
+      // The end hands on the last one (empty: nothing was said in it).
+      const third = t.conversation.conversation().id
+      yield* t.conversation.end
+      assert.deepStrictEqual(ended[2], { id: third, history: [], reason: "end" })
+    }))
+
+  it.live("while nothing keeps an ended conversation, no history is copied or handed on", () =>
+    Effect.gen(function*() {
+      const ended: Array<ReadonlyArray<string>> = []
+      let idleMs: number | undefined
+      const t = yield* setUp({ idleResetMs: () => idleMs, keepsEndedHistory: () => false, onConversationEnded: (_id, history) => void ended.push(contents(history)) })
+      t.type("one")
+      yield* until(() => t.history().length === 2)
+      idleMs = 30
+      yield* Effect.sleep(80)
+      t.type("two")
+      yield* until(() => ended.length === 1)
+      assert.deepStrictEqual(ended[0], [])
+      yield* t.conversation.end
+    }))
+})

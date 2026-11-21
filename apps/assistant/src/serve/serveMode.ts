@@ -138,12 +138,18 @@ import { makeVoiceSessions, type VoiceSessions } from "./VoiceSessions.ts"
 import { makeRoutingService, ROUTING_KEYS } from "./routing.ts"
 import { openServeHousehold } from "./household.ts"
 import { makeHouseholdPush } from "./HouseholdPush.ts"
-import { DeviceControl, Devices, hostEvent, makeIssueRegistry, oneLine, People, phraseLanguageOf, Privacy, SessionControl, withContextProvider } from "@pva/core"
+import { DeviceControl, Devices, hostEvent, makeIssueRegistry, oneLine, People, phraseLanguageOf, Privacy, Reports, SessionControl, withContextProvider } from "@pva/core"
 import { ringingWithoutWake } from "@pva/protocol"
 import { makeReplyVolumes, makeServePhrases } from "./phraseCommands.ts"
 import { openServeScheduler } from "./scheduler.ts"
 import { boundaryChanged, makeDeviceFacts, membersRemoved } from "./deviceFacts.ts"
 import { makeMediaCache } from "./media.ts"
+import { recentWarnings } from "../recentLog.ts"
+import { SERVER_VERSION } from "../version.ts"
+import { makePreviousConversations } from "./reports/previous.ts"
+import { makeReports, REPORT_MODULE_ID, type ReportsHost } from "./reports/Reports.ts"
+import { secretLikeEnvValues } from "./reports/scrub.ts"
+import { boundaryOf, makeServeReportSources } from "./reports/serveSources.ts"
 import type { SafeFetchOptions } from "@pva/net"
 import { effectiveMembersOf, makeMembersGate, makePeopleService, MEMBERS_ENV_REFUSED, MEMBERS_KEY, MEMBERS_SECTION_ID } from "./people.ts"
 import { householdBackupIssues, runMaintenance } from "@pva/store-sqlite"
@@ -491,6 +497,37 @@ export const startServe = (options: ServeOptions): Effect.Effect<ServeHandle, Ht
       language: () => notifyLanguageOf(sections.value("HOME_LANGUAGE")),
       log: logInfo
     })
+    // Reports (docs/REPORTS.md): the core's `Reports` for the report module, kept in the household store; what a report
+    // gathers is read when it is drafted (the sessions, assistants and Health issues are bound by then).
+    const startedAt = Date.now()
+    const previousConversations = makePreviousConversations()
+    const reports: ReportsHost = yield* makeReports({
+      store: household.store,
+      sources: makeServeReportSources({
+        sessions: () => sessionsRef,
+        previous: previousConversations,
+        devices: deviceFacts.devices,
+        present,
+        assistants: () => assistantsNow(),
+        homeLanguage: () => sections.value("HOME_LANGUAGE"),
+        issues: () => host.issues.all(),
+        modulesRunning: () => host.modules().filter((m) => m.state === "running").map((m) => m.id),
+        warnings: recentWarnings,
+        version: SERVER_VERSION,
+        startedAt
+      }),
+      knownSecrets: () => {
+        const v = vault.secrets()
+        return [
+          ...(v === undefined ? [] : [...Object.values(v.assistant), ...Object.values(v.modules).flatMap((m) => Object.values(m))]),
+          ...secretLikeEnvValues(env),
+          ...[options.adminPassword, options.vaultPassword].filter((x): x is string => x !== undefined)
+        ]
+      },
+      log: logInfo,
+      // The report module stopped: nothing is kept for reports any more.
+      onStopped: () => previousConversations.clear()
+    })
     // Capabilities run for the assistants that switch them on (`moduleDemand`, below; read from startEnabled on).
     const host = yield* makeModuleHost({
       // P5: the core's own services for modules (`host.service`).
@@ -511,6 +548,8 @@ export const startServe = (options: ServeOptions): Effect.Effect<ServeHandle, Ht
         }),
         DeviceControl.of(replyVolumes.service)
       ],
+      // Reports (docs/REPORTS.md): the report module's alone; every other module's `host.service(Reports)` is undefined.
+      moduleCoreServices: [{ key: Reports, forModule: (moduleId) => (moduleId === REPORT_MODULE_ID ? reports.service : undefined) }],
       routeTokens,
       issues,
       scheduler,
@@ -1581,8 +1620,16 @@ export const startServe = (options: ServeOptions): Effect.Effect<ServeHandle, Ht
             hub?.broadcast({ type: "trace", key, ...(device !== undefined ? { deviceId: device.id } : {}), trace })
           },
           minuteMs,
-          conversationEnded: (conversationId) =>
-            run(household.store.endConversation(conversationId).pipe(Effect.asVoid, Effect.catch((e) => Effect.logWarning(`Conversation data not deleted: ${e.message}`)))),
+          keepsEndedHistory: () => reports.active(),
+          conversationEnded: (conversationId, ended) => {
+            // Kept a while for a report made in the next conversation (docs/REPORTS.md): only while the report module
+            // runs, only one the idle reset ended (never one the person dropped with "New conversation", never a
+            // session's end), under the device's boundary now.
+            if (device !== undefined && ended.reason === "idle" && reports.active()) {
+              previousConversations.ended(device.id, ended.assistant, conversationId, ended.history, boundaryOf(deviceFacts.devices.get(device.id)))
+            }
+            run(household.store.endConversation(conversationId).pipe(Effect.asVoid, Effect.catch((e) => Effect.logWarning(`Conversation data not deleted: ${e.message}`))))
+          },
           ...(reserved !== undefined ? { reservedConversations: reserved } : {}),
           ...(options.stallMs !== undefined ? { stallMs: options.stallMs } : {}),
           // P7: phrase commands, the host's essential controls and the ringing window.
@@ -1604,7 +1651,11 @@ export const startServe = (options: ServeOptions): Effect.Effect<ServeHandle, Ht
       runSync,
       run,
       onChange: (minor) => hub?.sessionsChanged(minor),
-      onDiscard: (key) => hub?.sessionDiscarded(key),
+      onDiscard: (key) => {
+        // A discarded session (its device left, or its boundary changed): what was kept of it for reports goes too.
+        previousConversations.forgetDevice(key)
+        hub?.sessionDiscarded(key)
+      },
       announce: (key, info, assistant) =>
         hub?.toSession(key, { type: "conversation", id: info.id, reason: "new", startedAt: info.startedAt, ...(assistant !== undefined ? { assistantId: assistant } : {}) })
     })
@@ -1680,7 +1731,7 @@ export const startServe = (options: ServeOptions): Effect.Effect<ServeHandle, Ht
       sections,
       sessions,
       run,
-      server: { name: "personal-voice-assistance", version: "0.0.0" },
+      server: { name: "personal-voice-assistance", version: SERVER_VERSION },
       keys,
       access,
       onSectionSaved: (sectionId, needsReload, path) => {
@@ -1902,6 +1953,7 @@ export const startServe = (options: ServeOptions): Effect.Effect<ServeHandle, Ht
       assistantVoice,
       modelCatalog,
       modelFavourites,
+      reports,
       services,
       allowedOrigins: options.allowedOrigins,
       scheme: options.tls === undefined ? "http" : "https"
