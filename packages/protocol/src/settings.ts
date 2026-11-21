@@ -365,12 +365,26 @@ export const ActionField = Schema.Struct({
   requiresSaved: Schema.Boolean
 })
 
+/**
+ * A link a button's answer offers (additive within 12, docs/modules/media.md "Signing in to Spotify"): an address on the
+ * assistant's own origin, under `/api/modules/<id>/`, which the page shows beside the answer so the owner can open it in a
+ * new tab (a sign-in that continues on another site). Never an address on another origin: the page resolves `href` against
+ * its own.
+ */
+export const FieldActionLink = Schema.Struct({
+  href: Schema.String.check(Schema.isMaxLength(400), Schema.isPattern(/^\/api\/modules\/[a-z][a-z0-9-]{0,39}\/[A-Za-z0-9._~/?=&%-]{0,300}$/)),
+  label: Text(60)
+})
+export type FieldActionLink = typeof FieldActionLink.Type
+
 /** What an `action` field's handler said: shown next to its button (`Result.action` of `module.action`). */
 export const FieldActionResult = Schema.Struct({
   ok: Schema.Boolean,
   /** One or two sentences for the owner. At most 500 characters. */
   text: Schema.String.check(Schema.isMaxLength(500)),
-  tone: Schema.optionalKey(Schema.Literals(["neutral", "ok", "warning", "error"]))
+  tone: Schema.optionalKey(Schema.Literals(["neutral", "ok", "warning", "error"])),
+  /** A link the page shows beside the answer (opened by the owner, in a new tab). */
+  link: Schema.optionalKey(FieldActionLink)
 })
 export type FieldActionResult = typeof FieldActionResult.Type
 

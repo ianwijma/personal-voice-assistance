@@ -1,5 +1,5 @@
 {
-  "name": "@pva/module-music",
+  "name": "@pva/module-media",
   "version": "0.0.0",
   "private": true,
   "type": "module",
@@ -14,6 +14,7 @@
     "@pva/core": "workspace:*",
     "@pva/language": "workspace:*",
     "@pva/module-contracts": "workspace:*",
+    "@pva/net": "workspace:*",
     "effect": "catalog:"
   },
   "devDependencies": {

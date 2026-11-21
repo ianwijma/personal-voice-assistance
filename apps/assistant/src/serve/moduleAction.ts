@@ -9,5 +9,5 @@ export type ActionOutcome = { readonly ok: true; readonly action: FieldActionRes
 export const moduleActionOutcome = (host: ModuleHost, message: ClientMessageOf<"module.action">): Effect.Effect<ActionOutcome> =>
   Effect.map(host.fieldAction(message.moduleId, message.key, message.values), (r): ActionOutcome =>
     r.ok
-      ? { ok: true, action: { ok: r.result.ok, text: r.result.text, ...(r.result.tone !== undefined ? { tone: r.result.tone } : {}) } }
+      ? { ok: true, action: { ok: r.result.ok, text: r.result.text, ...(r.result.tone !== undefined ? { tone: r.result.tone } : {}), ...(r.result.link !== undefined ? { link: r.result.link } : {}) } }
       : { ok: false, error: { code: r.code, message: r.message, moduleId: message.moduleId } })

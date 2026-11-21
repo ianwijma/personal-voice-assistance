@@ -114,6 +114,9 @@
  * `DeviceCapabilities.media.players` (the sources its page can play, opaque slugs). A page that does not know them
  * ignores them and, declaring no players, is sent none; an older server ignores `media.state` as `Unknown`. A source is
  * an open string, so no closed set the decoder checks gains a member, and the version stays 12.
+ * Additive within 12 (docs/modules/media.md "Signing in to Spotify"): the optional `FieldActionResult.link` (an address on the
+ * assistant's own origin under `/api/modules/<id>/`, with a label, which the page shows beside a button's answer). An older
+ * page ignores the key; an older server never sends it. No closed set gains a member, so the version stays 12.
  */
 export const PROTOCOL_VERSION = 12
 

@@ -9,7 +9,9 @@ import type { FieldProps } from "./types.ts"
 /**
  * A button that runs something on the server (protocol 10, `action`: "Test"). It sends `module.action`; the result
  * is shown next to it (tone colour) until the form is closed. One press at a time; with `requiresSaved` it waits
- * for Save while the form has unsaved edits, otherwise the press carries the draft. A `confirm` text asks first.
+ * for Save while the form has unsaved edits, otherwise the press carries the draft. A `confirm` text asks first. An
+ * answer may carry a `link` (an address on this server, such as a sign-in that continues on another site): shown as a
+ * link for the owner to open in a new tab, never opened by the page itself (a popup opened after a request is blocked).
  */
 export function ActionField({ field, id, describedBy, disabled, context }: FieldProps<Extract<SettingField, { type: "action" }>>) {
   const client = useClient()
@@ -70,6 +72,18 @@ export function ActionField({ field, id, describedBy, disabled, context }: Field
       >
         {result?.text ?? ""}
       </p>
+      {result?.link !== undefined && (
+        // The server only offers an address on its own origin (`/api/modules/<id>/…`): opened by the owner, in a new tab.
+        <a
+          href={result.link.href}
+          target="_blank"
+          rel="noopener noreferrer"
+          data-testid="action-link"
+          className="min-h-8 w-fit text-[14px] text-voice underline underline-offset-4"
+        >
+          {result.link.label}
+        </a>
+      )}
     </div>
   )
 }

@@ -33,7 +33,9 @@ const house = (probe: { pressed: Array<unknown>; options: Array<{ value: string;
       state: Setting.info({ label: "Now" }),
       check: Setting.action({ label: "Check", buttonLabel: "Check", requiresSaved: false }),
       allOff: Setting.action({ label: "All off", buttonLabel: "All off" }),
-      slow: Setting.action({ label: "Slow", buttonLabel: "Slow" })
+      slow: Setting.action({ label: "Slow", buttonLabel: "Slow" }),
+      signIn: Setting.action({ label: "Sign in", buttonLabel: "Sign in" }),
+      elsewhere: Setting.action({ label: "Elsewhere", buttonLabel: "Elsewhere" })
     },
     fieldActions: {
       check: ({ settings, draft }) =>
@@ -48,6 +50,9 @@ const house = (probe: { pressed: Array<unknown>; options: Array<{ value: string;
         settingOptions: () => ({ scene: probe.options }),
         fieldActions: {
           allOff: () => Effect.succeed({ ok: true, text: "All off", tone: "ok" as const }),
+          // A link to the module's own route is passed on; one that leaves it (another module, another origin) is dropped.
+          signIn: () => Effect.succeed({ ok: true, text: "Opened", link: { href: "/api/modules/house/start?ticket=abc123", label: "Continue" } }),
+          elsewhere: () => Effect.succeed({ ok: true, text: "Not a link", link: { href: "https://example.org/", label: "Away" } }),
           slow: () => Effect.as(Effect.sleep(60_000), { ok: true, text: "late" })
         }
       })
@@ -69,6 +74,18 @@ describe("field actions", () => {
       assert.strictEqual(probe.pressed.length, 2)
       // `allOff` needs saved settings: a draft is not used (and it is the running instance's handler).
       assert.deepStrictEqual(yield* host.fieldAction("house", "allOff", { address: "draft" }), { ok: true, result: { ok: true, text: "All off", tone: "ok" } })
+    }))
+
+  it.effect("an answer may carry a link to the module's own route; any other address is dropped", () =>
+    Effect.gen(function*() {
+      const probe = { pressed: [] as Array<unknown>, options: [], info: "" }
+      const host = yield* hostOf([house(probe)], { house: {} })
+      yield* host.startEnabled
+      assert.deepStrictEqual(yield* host.fieldAction("house", "signIn"), {
+        ok: true,
+        result: { ok: true, text: "Opened", link: { href: "/api/modules/house/start?ticket=abc123", label: "Continue" } }
+      })
+      assert.deepStrictEqual(yield* host.fieldAction("house", "elsewhere"), { ok: true, result: { ok: true, text: "Not a link" } })
     }))
 
   it.effect("a definition handler runs without an instance; an instance handler needs one", () =>

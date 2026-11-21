@@ -1212,6 +1212,29 @@ The visualiser reads the colours from these variables once at start and on `pref
 
 Components: buttons are 40 px (56 px round dock buttons on phones, 48 px on desktop), 1 px `line` border, `surface` fill; primary actions (Start) are a pill with a 1 px `voice` border and `voice` text. Focus ring: 2 px `--color-you`, 2 px offset, on every focusable element.
 
+**Player surface (media module, step 3 of docs/modules/media.md).** Besides presentations the stage can show what a
+device plays, driven by `media.command` and reported by `media.state` (code: `apps/web/src/lib/media/`, UI:
+`apps/web/src/components/media/MediaSurface.tsx`; mounted in `VoiceApp` inside the page's `inert` group, so a modal
+panel covers it). It is not a presentation: it has no id, no lifetime and no server-side close.
+
+- **Music panel (Spotify)**: cover, title, artist, a Spotify mark that links to the track, previous / play-pause / next,
+  a position slider (commits on release), a volume slider and close. On a phone it is a card above the controls
+  (presentations make room: `data-music` on the root moves their bottom edge up); from 1024 px it docks at the right of
+  the stage, beside the character, and presentations stop short of it. The character is not touched. Hidden while the
+  chat is open.
+- **Theatre (YouTube)**: the frame at 16:9, as large as the viewport allows (`--pva-theatre-w`), below a 56 px strip of
+  our own (title or status, close). Nothing is drawn over the frame and its own controls stay; the strip is opaque and
+  outside the frame's rectangle. While the assistant is quiet the character is a badge at the left end of the strip;
+  while it is woken, listens, thinks or speaks it is the normal box again and the frame starts below it (the video is
+  paused by the talk rule meanwhile). See docs/CHARACTERS.md §2.8 for what that means for a character.
+- **Talk rule**: from `open.talk` the page lowers the level to `level` times the user's (about 150 ms; YouTube in steps)
+  or pauses, from the page's own state (`wake` armed, `state` listening / hearing / thinking / speaking, a local reply
+  playing; `isTalking` in `lib/media/index.ts`), and undoes it one second after the talk ends; a pause resumes only when
+  nothing touched it in between. A hidden tab pauses a video (not music).
+- Escape closes it like a presentation (not while the assistant answers, not in a field or dialog, and a presentation
+  goes first). Words: English and Dutch by the page's language (`components/media/texts.ts`).
+- To see it without the server: `POST /mock/media` on the mock (`apps/web/mock/server.ts`).
+
 ### 3.3 The visualiser
 
 A `<canvas>` drawn on `requestAnimationFrame`, outside React, by the **character host** (`apps/web/src/characters/host.ts`): it runs one *character*, a pluggable drawing module, and hands it each frame the visual state (as a mode), both voices' features, the theme colours and the viewer's settings. What a character is, how the host resolves modes, loads characters, validates their options and isolates failures, and how to add one: `docs/CHARACTERS.md`. The default character, and the fallback whenever another fails, is the **sine lines** described below (`characters/library/sine-lines.ts`), which draws every visual state of this section. The host reads a plain mutable object (`levels`, below) and the current visual state; React never re-renders per frame. The choice of character is a per-browser preference with no visible UI yet (`?character=<id>` on the voice page; docs/CHARACTERS.md §4.4).

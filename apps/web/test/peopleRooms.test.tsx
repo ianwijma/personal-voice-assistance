@@ -35,7 +35,9 @@ describe("measuring what this browser can do", () => {
       display: { class: "standard", widthPx: 1024, heightPx: 768, dpr: 2, touch: "coarse", colour: true },
       // P10: the page draws every kind of the first version.
       present: { kinds: { card: 1, list: 1, timer: 1, image: 1, weather: 1 } },
-      speaker: { media: ["speech", "audio"] },
+      // The media module's page: video is shown here, and these sources can be played (nothing is loaded by declaring).
+      speaker: { media: ["speech", "audio", "video"] },
+      media: { players: ["spotify", "youtube"] },
       microphone: { farField: false }
     })
     const desktop = measureCapabilities(env({ width: 1600, height: 900, dpr: 1, matches: (q) => q === "(pointer: fine)", userAgent: "Mozilla/5.0 (X11; Linux x86_64) Chrome/130" }))
@@ -45,6 +47,8 @@ describe("measuring what this browser can do", () => {
     expect(phone).toMatchObject({ display: { class: "compact" }, openUrl: true })
     const quiet = measureCapabilities(env({ audioOut: false, microphone: false, matches: (q) => q === "(monochrome)" }))
     expect(quiet.speaker).toBeUndefined()
+    expect(quiet.media).toBeUndefined() // nothing to play with and no speaker: no players declared
+    expect(measureCapabilities(env({ width: 0, height: 0 })).speaker).toEqual({ media: ["speech", "audio"] }) // no display: no video
     expect(quiet.microphone).toBeUndefined()
     expect(quiet.display).toMatchObject({ touch: "none", colour: false })
   })

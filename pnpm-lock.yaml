@@ -194,12 +194,12 @@ importers:
       '@pva/module-local-info':
         specifier: workspace:*
         version: link:../../packages/module-local-info
+      '@pva/module-media':
+        specifier: workspace:*
+        version: link:../../packages/module-media
       '@pva/module-memory':
         specifier: workspace:*
         version: link:../../packages/module-memory
-      '@pva/module-music':
-        specifier: workspace:*
-        version: link:../../packages/module-music
       '@pva/module-news':
         specifier: workspace:*
         version: link:../../packages/module-news
@@ -1075,7 +1075,7 @@ importers:
         specifier: 'catalog:'
         version: 5.1.0(@opentelemetry/api@1.10.0)(@types/node@22.20.5)(jsdom@31.0.0)(vite@8.3.8(@types/node@22.20.5)(esbuild@0.28.2)(jiti@2.7.0)(tsx@4.23.15))
 
-  packages/module-memory:
+  packages/module-media:
     dependencies:
       '@pva/core':
         specifier: workspace:*
@@ -1086,6 +1086,9 @@ importers:
       '@pva/module-contracts':
         specifier: workspace:*
         version: link:../module-contracts
+      '@pva/net':
+        specifier: workspace:*
+        version: link:../net
       effect:
         specifier: 'catalog:'
         version: 4.1.4
@@ -1103,7 +1106,7 @@ importers:
         specifier: 'catalog:'
         version: 5.1.0(@opentelemetry/api@1.10.0)(@types/node@22.20.5)(jsdom@31.0.0)(vite@8.3.8(@types/node@22.20.5)(esbuild@0.28.2)(jiti@2.7.0)(tsx@4.23.15))
 
-  packages/module-music:
+  packages/module-memory:
     dependencies:
       '@pva/core':
         specifier: workspace:*

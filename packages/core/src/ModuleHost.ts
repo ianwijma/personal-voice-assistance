@@ -3176,7 +3176,8 @@ export const makeModuleHost = Effect.fnUntraced(function*(options: ModuleHostOpt
       // known tone.
       const answer = (result: FieldActionResult): FieldActionHostResult => {
         const tone = result.tone === "neutral" || result.tone === "ok" || result.tone === "warning" || result.tone === "error" ? result.tone : undefined
-        return { ok: true, result: { ok: result.ok === true, text: boundary.text(id, result.text, 500), ...(tone !== undefined ? { tone } : {}) } }
+        const link = fieldActionLink(id, result.link, (text) => boundary.text(id, text, 60))
+        return { ok: true, result: { ok: result.ok === true, text: boundary.text(id, result.text, 500), ...(tone !== undefined ? { tone } : {}), ...(link !== undefined ? { link } : {}) } }
       }
       // The settings it sees: the saved shared ones, or (requiresSaved: false) the page's draft over them. Settings
       // that do not resolve (a required key not set, a saved value no longer valid) are the result: it does not run.
@@ -3509,6 +3510,15 @@ const declaresMember = (object: object, key: string): boolean => {
     if (Object.hasOwn(o, key)) return true
   }
   return false
+}
+
+/** A press's link, as far as the page may be shown it: a path under this module's own `/api/modules/<id>/`; anything else is dropped. */
+const fieldActionLink = (moduleId: string, link: FieldActionResult["link"], label: (text: string) => string): FieldActionResult["link"] => {
+  if (typeof link !== "object" || link === null || typeof link.href !== "string" || typeof link.label !== "string") return undefined
+  if (link.href.length > 400 || !link.href.startsWith(`/api/modules/${moduleId}/`)) return undefined
+  if (!/^\/api\/modules\/[a-z][a-z0-9-]{0,39}\/[A-Za-z0-9._~/?=&%-]{0,300}$/.test(link.href) || link.href.includes("..")) return undefined
+  const shown = label(link.label).trim()
+  return shown === "" ? undefined : { href: link.href, label: shown }
 }
 
 /** The generated `test` field action of an agent or decision-provider instance, if it is one. */

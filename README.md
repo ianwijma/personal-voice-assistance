@@ -66,7 +66,7 @@ An assistant uses only the modules it has switched on. Each has its own page in 
 | [Calendar](docs/modules/calendar.md) | what is on and when you are free, from ICS links (read-only) |
 | [Memory and notes](docs/modules/memory.md) | remembers what you tell it, and forgets it for good |
 | [Smart home](docs/modules/home-assistant.md) | lights, switches, climate and covers through Home Assistant |
-| [Music](docs/modules/music.md) | music per room through Music Assistant |
+| [Media](docs/modules/media.md) | music from Spotify and YouTube videos on the device you talk to |
 | [Presence](docs/modules/presence.md) | who is home, and who just arrived or left |
 | [Broadcast](docs/modules/broadcast.md) | an announcement on every device or in one room |
 | [Briefing](docs/modules/briefing.md) | a short spoken briefing from the other modules |

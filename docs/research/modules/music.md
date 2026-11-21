@@ -1,5 +1,7 @@
 # Music
 
+*Superseded on 2026-11-21 by [the media module](../../modules/media.md): music from Spotify on the asking device's own page; the Home Assistant route this document recommended was built, then removed.*
+
 Research write-up, 2026-11-17. Not an approved design. Outside facts carry inline links checked on this date; claims
 marked **[unverified]** come from memory or a secondary source. Latency figures are estimates to be measured with
 `TurnTrace`, never promises.

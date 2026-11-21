@@ -1251,7 +1251,7 @@ SessionControl (ServiceKey "core.session-control") = { stopReply(deviceId); canc
 DeviceControl (ServiceKey "core.device-control")   = { replyVolume(deviceId): number; changeReplyVolume(deviceId, "louder" | "quieter" | { to }): Effect<VolumeChange> }
 Playback (ServiceKey "playback") = { pause(deviceId); changeVolume(deviceId, { to } | { by }) }   // keyed by device (docs/modules/media.md §4.3); moved here from @pva/module-contracts, which re-exports it
         // pause answers true when something played on that device and the page confirmed it paused; changeVolume { by } needs a level the page reported (else unknown_level);
-        // PLAYBACK_LIMITS = { deviceIdChars: 64, callTimeoutMs: 3000 }; no module provides it until the media module (module-music no longer does)
+        // PLAYBACK_LIMITS = { deviceIdChars: 64, callTimeoutMs: 3000 }; provided by the media module (the music module no longer exists)
 Reports (ServiceKey "core.reports") = { draft(ReportInput): Effect<ReportDrafted>; configure(ReportsSettings | undefined): Effect<void> }
         // given to the module `report` alone (ModuleHostOptions.moduleCoreServices: a core service per calling module);
         // draft reads CurrentTurn itself and sends at once only when ReportInput.send and the setting agree
@@ -1386,7 +1386,7 @@ packages/
                     `test/kit/`: the reference module of docs/MODULES.md. Consumers' tests use stubs (`stubService`), no fakes
   module-<id>/      one package per module of docs/MODULES-PLAN.md §5.1 waves A and B (P11 scaffold: off by default, no tools
                     yet): assistant-controls, timers (timers, alarms), core-tools (calculator, knowledge, system-status),
-                    web-search, lists, notifications, kitchen, music, reminders, images, calendar, memory, broadcast, briefing,
+                    web-search, lists, notifications, kitchen, media, reminders, images, calendar, memory, broadcast, briefing,
                     local-info (bin-day), presence, news, routines; each exports `catalog`, which `apps/assistant/src/modules.ts`
                     lists once; how to write one: docs/MODULES.md, each module's page: docs/modules/<id>.md
 models/             downloaded model files (git-ignored; `pnpm download-models`, or Settings › Models in the web UI)

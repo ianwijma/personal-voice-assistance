@@ -5,8 +5,8 @@ import type { Json, JsonObject } from "./common.ts"
 /**
  * `HomeAssistant`: the smart-home module's connection to Home Assistant, as a **transport** (docs/MODULES-PLAN.md §2
  * row 18, §5.2; docs/research/modules/smart-home.md §5, §7). Provided by `home-assistant`
- * (`packages/module-home-assistant`), used by `music` (media players through Music Assistant) and `presence` (HA
- * `person` entities).
+ * (`packages/module-home-assistant`), used by `presence` (HA `person` entities). (The music module that used its media
+ * players was replaced by `media`, which plays on the asking device's own page and does not use Home Assistant.)
  *
  * **In this version the provider polls.** The network helpers offer no WebSocket yet, so the provider reads Home
  * Assistant over its REST interface on an interval (about a minute) and keeps a cache. Everything below holds with
@@ -17,8 +17,8 @@ import type { Json, JsonObject } from "./common.ts"
  *
  * **A transport, not a domain service.** It carries what the owner exposed in Home Assistant (the Assist exposure list)
  * and nothing else. It is never offered to the model as a tool of its own. A consumer classifies and filters its own
- * tools (music's `music_play` is `change`), and each call it makes through `callService` must fit the call the gateway
- * admitted for it: music's "pause the kitchen" calls `media_player.media_pause` on the kitchen's player, nothing else.
+ * tools (a tool that switches something is `change`), and each call it makes through `callService` must fit the call the
+ * gateway admitted for it: a "pause the kitchen" calls `media_player.media_pause` on the kitchen's player, nothing else.
  *
  * **How a call names what it acts on: entity ids only**, in this version. `target.entityIds` lists 1 to
  * `HA_LIMITS.targets` exposed entity ids; nothing else selects an entity. The provider refuses (`refused`), before
@@ -66,7 +66,7 @@ import type { Json, JsonObject } from "./common.ts"
  * changes it has not taken are dropped and the next thing it gets is a `snapshot` (`reason: "overflow"`) of the cache
  * at that moment, followed by the changes after it. **A snapshot is a state, not news**: a consumer compares it with
  * what it knew and never reads it as things having just happened (presence must not announce everyone as having just
- * arrived after a reconnect; music must not take a player that was already playing for one that just started).
+ * arrived after a reconnect; a media consumer must not take a player that was already playing for one that just started).
  *
  * **Bounds and ids.** Home Assistant chooses every id here; they are stable for as long as the owner does not rename
  * the entity or area in Home Assistant. The provider never cuts an id: an entity or area whose id is longer than
@@ -92,7 +92,7 @@ import type { Json, JsonObject } from "./common.ts"
  *
  * **When smart-home is off or stops**: `host.service(HomeAssistant)` is `undefined`; a stream it gave ends; a call
  * made while it stops may die with `ModuleStopped`. `useService(host, HomeAssistant, …)` makes it `ProviderOff`. A
- * consumer whose whole job is Home Assistant (music, presence) names `home-assistant` in `uses`, and runs `changes()`
+ * consumer whose whole job is Home Assistant (presence) names `home-assistant` in `uses`, and runs `changes()`
  * again when the service is back (look it up again: it is a new provider after a restart).
  *
  * **Privacy.** Where a person is (a `person` entity's state, a phone's zone, anything that follows one person) is

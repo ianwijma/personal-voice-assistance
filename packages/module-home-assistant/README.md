@@ -1,7 +1,7 @@
 # @pva/module-home-assistant
 
 Lights, switches, heating and blinds by room through the owner's Home Assistant; locks, alarm panels, garage doors and
-every cover that is not a blind only read; no scripts; the `HomeAssistant` service (polled) for presence and music. Module id `home-assistant`, module API v2,
+every cover that is not a blind only read; no scripts; the `HomeAssistant` service (polled) for presence. Module id `home-assistant`, module API v2,
 **off by default**. Nothing happens on import; nothing contacts Home Assistant until an assistant has it on.
 
 What it does, its actions and tools, settings, what it stores (nothing; people are read for the service only) and what was left out:

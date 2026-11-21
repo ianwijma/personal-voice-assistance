@@ -1037,11 +1037,11 @@ rely on, with every bound and id.
 |---|---|---|---|---|
 | `Lists` | service: the household's shopping list | lists | kitchen | `lists.ts` |
 | `Timers` | service: start a timer | timers (wave B) | routines; kitchen later | `timers.ts` |
-| `HomeAssistant` | service (a transport) | home-assistant (smart-home) | music (wave B), presence | `homeAssistant.ts` |
-| `Playback` | service: pause and volume of what plays on a device, keyed by device id | media (planned; music no longer provides it) | the host's "stop" (P7; volume later) | `playback.ts` (defined in `@pva/core` since P7, re-exported) |
+| `HomeAssistant` | service (a transport) | home-assistant (smart-home) | presence | `homeAssistant.ts` |
+| `Playback` | service: pause and volume of what plays on a device, keyed by device id | media | the host's "stop" (P7; volume later) | `playback.ts` (defined in `@pva/core` since P7, re-exported) |
 | `BriefingSections` | contribution | weather, bin-day, calendar, news; reminders later | briefing | `briefing.ts` |
 | `WebImages` | service: an image search through the household's SearXNG | web-search | images | `webImages.ts` |
-| `WebVideos` | service: a video search through the household's SearXNG | web-search | media (planned) | `webVideos.ts` |
+| `WebVideos` | service: a video search through the household's SearXNG | web-search | media | `webVideos.ts` |
 
 The core's own are `People`, `Privacy`, `Devices`, `DevicePlayers` (below), and since P7 `SessionControl` (stop the reply, cancel what is pending,
 repeat the last reply, a new conversation) and `DeviceControl` (the reply volume), in `@pva/core` ([PHRASES.md](PHRASES.md)
@@ -2013,7 +2013,7 @@ check` behind the shared lock (`flock /workspace/build-cache/ian/pva-heavy.lock 
 | Lists | `module-lists` | A | [lists](modules/lists.md) |
 | Notifications | `module-notifications` | B | [notifications](modules/notifications.md) |
 | Kitchen | `module-kitchen` | A | [kitchen](modules/kitchen.md) |
-| Music | `module-music` | B | [music](modules/music.md) |
+| Media (music from Spotify, YouTube video) | `module-media` | B | [media](modules/media.md) |
 | Smart home | `module-home-assistant` | A | [home-assistant](modules/home-assistant.md) |
 | Reminders | `module-reminders` | B | [reminders](modules/reminders.md) |
 | Images | `module-images` | B | [images](modules/images.md) |

@@ -1,3 +1,4 @@
+import { MEDIA_SOURCES } from "./media/sources.ts"
 import { type ClientMessage, type DeviceCapabilities, type DeviceLiveState, displayClassOf, PRESENT_KIND_VERSIONS } from "@pva/protocol"
 
 /**
@@ -54,7 +55,15 @@ export const measureCapabilities = (env: CapabilityEnv): DeviceCapabilities => {
     v: 1,
     display: { class: displayClassOf(width, height), widthPx: width, heightPx: height, dpr: Math.round(clampDpr(env.dpr) * 100) / 100, touch, colour },
     present: { kinds: { ...PRESENT_KINDS } },
-    ...(env.audioOut ? { speaker: { media: ["speech", "audio"] as const } } : {}),
+    // `video`: this page can show YouTube's player, and has a screen for it; `media.players`: the sources it can play,
+    // declared with a speaker (the server drops them without one). Declaring loads nothing: a provider's script is
+    // fetched only when the server sends `prepare`.
+    ...(env.audioOut
+      ? {
+        speaker: { media: width > 0 && height > 0 ? (["speech", "audio", "video"] as const) : (["speech", "audio"] as const) },
+        media: { players: [...MEDIA_SOURCES] }
+      }
+      : {}),
     ...(env.microphone ? { microphone: { farField: false } } : {}),
     ...(phone ? { openUrl: true } : {})
   }

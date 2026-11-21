@@ -140,7 +140,7 @@ export interface ModuleTemplate {
 
 /**
  * An action a module offers, declared on the manifest (`ModuleDefinition.declaredActions`) so it stays known while the
- * module is `unavailable` (never started): the intent agent can still recognise "play jazz" as the music module's,
+ * module is `unavailable` (never started): the intent agent can still recognise "play jazz" as the media module's,
  * and core answers with the module's "not set up" line instead of running some other action. Only what a decision
  * model needs to recognise it; the running module's own actions (from `start`) are what runs. `id` is the action's
  * id (`/^[a-z][a-z0-9_]{0,39}$/`).

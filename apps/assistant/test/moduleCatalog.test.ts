@@ -21,7 +21,7 @@ const NEW = [
   "lists",
   "notifications",
   "kitchen",
-  "music",
+  "media",
   "reminders",
   "images",
   "calendar",
