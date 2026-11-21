@@ -137,7 +137,8 @@ retried on a redirect; every other rule of `safeFetch`. `postFixedPublicJson` (h
 (the Spotify refresh token), kept in the key vault next to route tokens, never in settings or the store, never sent to
 a page. Locked vault: the module keeps the token it started with and health says sign-in cannot be renewed.
 
-**4.6 Serving.** Isolation off for the voice page and `Referrer-Policy: strict-origin-when-cross-origin`.
+**4.6 Serving.** Nothing is set by hand: a module declares `page: { thirdPartyEmbeds: true }`, and while such a module
+is enabled in the admin UI the pages are served without isolation. Isolation off for the voice page and `Referrer-Policy: strict-origin-when-cross-origin`.
 The end-to-end test that asserts the isolation state changes with it.
 
 **4.7 `WebVideos` (web-search module).** A second service beside `WebImages`, offered while the SearXNG address is
@@ -266,3 +267,4 @@ Steps 3 and 4 can run in parallel once step 2 is merged.
 4. **Video search goes through SearXNG**, not YouTube's Data API. No Google API key.
 5. **While the assistant listens and speaks**: music lowers, video pauses. Pausing music instead is a setting.
 6. **Module id `media`** replaces `music`; the old settings and the room table are dropped, not migrated.
+7. **Every setting is made in the admin UI**, as for every module: no environment variable and no file edit.

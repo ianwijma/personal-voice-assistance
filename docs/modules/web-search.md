@@ -30,6 +30,16 @@ named, never an address read out). The module is **off by default**.
   usable one, the page's site, the raw title cut to 300 characters and the stated format; a result whose page or picture is
   on a blocked site is dropped, a blocked thumbnail left out. It fetches no picture (the server's media route does), is not
   counted against the daily cap (SearXNG is free) and keeps nothing.
+- **A video search for other modules** (docs/modules/media.md §4.7): beside `WebImages`, under the same condition, the shared
+  part offers `WebVideos` (`@pva/module-contracts`, `webVideos.ts`; for the future `media` module). One call is one SearXNG
+  request (`categories=videos`, JSON, the caller's `safesearch` and language, at most 512 KiB, the caller's time limit
+  within 0.5 to 10 s) through the same owner-configured fetch, the same failure reasons, not counted against the daily cap
+  and keeping nothing. At most ten results (the caller may ask for fewer), each with the video's page address and site, the
+  raw title cut to 300 characters, and, when SearXNG gives them, the length in seconds (read from "12:34", "1:02:03" or a
+  number), an `https` thumbnail, the channel and the publication time. For a YouTube address the video id is read
+  (`youtubeVideoId`: `watch`, `youtu.be`, `embed`, `shorts`, `youtube-nocookie.com`, no look-alike hosts, an id of exactly
+  11 characters); with `site: "youtube"` results without one are dropped. A result on a blocked site is dropped, a blocked
+  thumbnail left out. Embedding is not checked.
 - **A provider's answer that is malformed** (not JSON, no results list, a part present with the wrong type, such as Brave's
   `web` as a list or `null`) is a failure of that provider, so the fallback runs; only an answer without a `web` part at all
   (Brave's way of saying nothing matched) or with an empty list is "I found nothing for that."
@@ -172,7 +182,7 @@ one bounded read of at most 12 of the oldest rows through the `month` index, tho
 - `requires: [{ network: "internet" }]` (Brave and the pages), and `health` as above. SearXNG on the LAN is reached through
   the owner-configured function only.
 - A SearXNG server with JSON output on, or a Brave Search API key. Nothing else; it uses no service from another module
-  and provides one, `WebImages` (above), and no contribution.
+  and provides two, `WebImages` and `WebVideos` (above), and no contribution.
 - Libraries (all in the package, loaded only in the page task's worker): `@mozilla/readability`, `linkedom`, `turndown`;
   `@pva/language` for spoken numbers.
 

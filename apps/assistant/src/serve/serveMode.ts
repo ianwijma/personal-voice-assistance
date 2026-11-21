@@ -127,6 +127,7 @@ import { makeNodes, type Nodes, type RedeemAnswer, spkiPin } from "./nodes.ts"
 import { DataDirConfig, KEYS_LOCKED_MESSAGE, loadSettingsStore, type SaveStep, type SettingsStore, SettingsStoreError } from "./SettingsStore.ts"
 import { makeApi } from "./api.ts"
 import { isModuleRoutePath, makeModuleRouter } from "./moduleRoutes.ts"
+import { makeCredentials } from "./Credentials.ts"
 import { makeRouteTokens } from "./RouteTokens.ts"
 import { makeAssistantVoice } from "./AssistantVoice.ts"
 import { type Favourites, makeFavourites } from "./Favourites.ts"
@@ -372,6 +373,8 @@ export const startServe = (options: ServeOptions): Effect.Effect<ServeHandle, Ht
     // Stored token records that are not valid are ignored, with one Health issue (its registry is the host's, below).
     let tokenIssues: ((ignored: number) => void) | undefined
     const routeTokens = makeRouteTokens({ store, locked: () => vault.state() === "locked", report: (ignored) => tokenIssues?.(ignored) })
+    // Module credentials (`host.credentials`): secrets a module obtained itself, in the same place.
+    const credentials = makeCredentials({ store, locked: () => vault.state() === "locked" })
 
     // The household store (docs/STORING-DATA.md): opened after the writer lock, and every module's data judged and
     // upgraded before any module is made. A database from a newer assistant stops the start here.
@@ -557,6 +560,7 @@ export const startServe = (options: ServeOptions): Effect.Effect<ServeHandle, Ht
       // Reports (docs/REPORTS.md): the report module's alone; every other module's `host.service(Reports)` is undefined.
       moduleCoreServices: [{ key: Reports, forModule: (moduleId) => (moduleId === REPORT_MODULE_ID ? reports.service : undefined) }],
       routeTokens,
+      credentials,
       issues,
       scheduler,
       notify,
@@ -1973,6 +1977,8 @@ export const startServe = (options: ServeOptions): Effect.Effect<ServeHandle, Ht
       allowedHosts: options.allowedHosts ?? [],
       tls: options.tls,
       crossOriginIsolation: options.crossOriginIsolation ?? true,
+      // An enabled module whose page loads other origins' scripts or frames (the media module) ends isolation, live.
+      thirdPartyEmbeds: () => host.thirdPartyEmbeds(),
       hub: hubNow,
       api: (req, res) => (isModuleRoutePath(req.url) ? moduleRouter.handle(req, res) : api(req, res)),
       // P10: `/media/<token>`, a page's own address of an image it holds now.

@@ -14,22 +14,23 @@ export type Resolver = (host: string, signal: AbortSignal) => Promise<ReadonlyAr
 
 /**
  * What the connector is asked: connect to exactly `address` (never resolve `url.hostname` again). `POST` comes only from
- * `fetchOwnerConfiguredLan`, always with `body`.
+ * `fetchOwnerConfiguredLan`, always with `body`; `PUT` and `DELETE` come only from `makeFixedApi` (`FixedApi.ts`), with `body` or
+ * without one (a PUT, POST or DELETE is always written with its `content-length`, `0` when there is no body).
  */
 export interface ConnectRequest {
   readonly url: URL
   readonly address: string
-  readonly method: "GET" | "HEAD" | "POST"
+  readonly method: "GET" | "HEAD" | "POST" | "PUT" | "DELETE"
   /**
    * Lower-case names, already checked. They never hold `Host` or `Accept-Encoding`: the connector derives the Host header and the TLS
    * name from `url` alone and asks for `identity`. For a POST they hold `content-type: application/json` and the body's
    * `content-length`, both set by the helper.
    */
   readonly headers: Readonly<Record<string, string>>
-  /** POST only: the serialised body, sent once on this connection and never again. */
+  /** POST, PUT and DELETE only: the serialised body, sent once on this connection and never again. */
   readonly body?: Uint8Array
   /**
-   * POST only: called by the connector when the connection is made, before it writes a byte of the request. From then on the attempt
+   * POST, PUT and DELETE only: called by the connector when the connection is made, before it writes a byte of the request. From then on the attempt
    * has no time share of its own (only the total limit), because a POST that was written is never moved to another address.
    */
   readonly onConnect?: () => void
@@ -201,7 +202,7 @@ export const makeNodeConnector = (connectorOptions: NodeConnectorOptions = {}): 
     const secure = url.protocol === "https:"
     const hostname = url.hostname.startsWith("[") ? url.hostname.slice(1, -1) : url.hostname
     const isIp = classifyAddress(hostname) !== undefined
-    const sent = method === "POST" ? (body ?? new Uint8Array(0)) : undefined
+    const sent = method !== "GET" && method !== "HEAD" ? (body ?? new Uint8Array(0)) : undefined
     const outgoing: Record<string, string> = Object.create(null)
     for (const [k, v] of Object.entries(headers)) if (k !== "host" && k !== "accept-encoding" && k !== "content-length") outgoing[k] = v
     outgoing["host"] = url.host
@@ -751,6 +752,9 @@ const serialiseBody = (shown: string, body: unknown, limit: number): Uint8Array 
  * finding 7). The attempt's signal follows the request's, so cancelling the request (the total deadline, the caller) still stops a
  * connection that has answered and whose body is being read.
  */
+/** A method that is sent once (never retried, never redirected): everything but GET and HEAD. */
+const sendsRequest = (method: ConnectRequest["method"]): boolean => method !== "GET" && method !== "HEAD"
+
 const attempt = async (connector: Connector, request: Omit<ConnectRequest, "signal" | "onConnect">, signal: AbortSignal, budgetMs: number | undefined): Promise<ConnectResponse> => {
   const own = new AbortController()
   const follow = () => own.abort(signal.reason)
@@ -760,7 +764,7 @@ const attempt = async (connector: Connector, request: Omit<ConnectRequest, "sign
   const timer = budgetMs === undefined ? undefined : setTimeout(() => own.abort(budgetError), budgetMs)
   // A POST's share of the time is for connecting only: once the connector says it is connected, the request may be written, and a
   // POST that may have been written is never cancelled to try another address.
-  const post = request.method === "POST"
+  const post = sendsRequest(request.method)
   const pending = Promise.resolve().then(() => connector({ ...request, ...(post ? { onConnect: () => clearTimeout(timer) } : {}), signal: own.signal }))
   try {
     const response = await raceAbort(pending, own.signal)
@@ -782,7 +786,60 @@ const attempt = async (connector: Connector, request: Omit<ConnectRequest, "sign
   }
 }
 
-const run = async (input: string | URL, options: AnyOptions, allowLan: boolean, signal: AbortSignal, deadline: number, expired: () => NetTimeout, allowPost: boolean = allowLan): Promise<SafeResponse> => {
+/** What `makeFixedApi` hands the checked fetch: the lower-case host names a call may reach, on this hop and on every redirect. */
+export interface FixedApiRules {
+  readonly hosts: ReadonlySet<string>
+}
+
+/** The extra rules of a fixed API call: `https:` only, port 443, a host from the list. */
+const fixedRefusal = (url: URL, rules: FixedApiRules): NetRefused | undefined => {
+  const shown = `${url.protocol}//${url.host}${url.pathname}`
+  if (url.protocol !== "https:") return refuse("scheme", shown, "A fixed API is called over https: only")
+  if (url.port !== "" && url.port !== "443") return refuse("port", shown, `Port ${url.port} is not allowed`)
+  if (!rules.hosts.has(url.hostname.toLowerCase())) return refuse("host-list", shown, `"${url.hostname}" is not one of this API's hosts`)
+  return undefined
+}
+
+/**
+ * The body of a fixed API's PUT, POST or DELETE: none (`undefined`: empty, no type), `{ json }` (`application/json`) or `{ form }`
+ * (a record of strings, `application/x-www-form-urlencoded`), at most `limit` bytes. Never both. The refusal's reason is a constant,
+ * as in `serialiseBody`.
+ */
+const serialiseFixedBody = (shown: string, body: unknown, limit: number): { readonly bytes: Uint8Array; readonly type: string | undefined } => {
+  if (body === undefined) return { bytes: new Uint8Array(0), type: undefined }
+  if (typeof body !== "object" || body === null) throw refuse("body", shown, "A body is { json } or { form }")
+  let text: unknown
+  let type: string
+  try {
+    const hasJson = "json" in body && (body as { json?: unknown }).json !== undefined
+    const hasForm = "form" in body && (body as { form?: unknown }).form !== undefined
+    if (hasJson === hasForm) throw refuse("body", shown, hasJson ? "A body is { json } or { form }, not both" : "A body is { json } or { form }")
+    if (hasJson) {
+      type = "application/json"
+      text = JSON.stringify((body as JsonBody).json)
+    } else {
+      type = "application/x-www-form-urlencoded"
+      const form = (body as { form: unknown }).form
+      if (typeof form !== "object" || form === null || Array.isArray(form)) throw refuse("body", shown, "A form is an object of text values")
+      const params = new URLSearchParams()
+      for (const key of Object.keys(form)) {
+        const value = (form as Record<string, unknown>)[key]
+        if (typeof value !== "string") throw refuse("body", shown, "A form is an object of text values")
+        params.append(key, value)
+      }
+      text = params.toString()
+    }
+  } catch (e) {
+    if (e instanceof NetRefused) throw e
+    throw refuse("body", shown, "The body cannot be serialised")
+  }
+  if (typeof text !== "string") throw refuse("body", shown, "The body cannot be serialised")
+  const bytes = new TextEncoder().encode(text)
+  if (bytes.byteLength > limit) throw refuse("body", shown, `The body is ${bytes.byteLength} bytes, more than the ${limit} allowed`)
+  return { bytes, type }
+}
+
+const run = async (input: string | URL, options: AnyOptions, allowLan: boolean, signal: AbortSignal, deadline: number, expired: () => NetTimeout, allowPost: boolean = allowLan, fixed?: FixedApiRules): Promise<SafeResponse> => {
   const shownInput = shownUrl(input)
   const limit = positive(options.maxBytes, defaultMaxBytes)
   const maxRedirects = options.maxRedirects === undefined ? defaultMaxRedirects : Number.isInteger(options.maxRedirects) && options.maxRedirects >= 0 ? options.maxRedirects : undefined
@@ -791,7 +848,8 @@ const run = async (input: string | URL, options: AnyOptions, allowLan: boolean, 
   // safeFetch is GET and HEAD only, whatever a cast says; a POST and its body are fetchOwnerConfiguredLan's and
   // postFixedPublicJson's alone, and loopback is fetchOwnerConfiguredLan's alone.
   if (!allowPost && given !== "GET" && given !== "HEAD") throw refuse("options", shownInput, "Only GET and HEAD")
-  if (allowPost && given !== "GET" && given !== "HEAD" && given !== "POST") throw refuse("options", shownInput, "Only GET, HEAD and POST")
+  if (fixed === undefined && allowPost && given !== "GET" && given !== "HEAD" && given !== "POST") throw refuse("options", shownInput, "Only GET, HEAD and POST")
+  if (fixed !== undefined && given !== "GET" && given !== "PUT" && given !== "POST" && given !== "DELETE") throw refuse("options", shownInput, "Only GET, PUT, POST and DELETE")
   const method = given as ConnectRequest["method"]
   if (!allowPost && (options.body !== undefined || options.maxRequestBytes !== undefined || options.typedLoopback !== undefined)) {
     throw refuse("options", shownInput, "safeFetch takes no body and no loopback option")
@@ -811,7 +869,15 @@ const run = async (input: string | URL, options: AnyOptions, allowLan: boolean, 
   // The body: serialised here, inside the error boundary, and refused before anything is looked up or connected. The helper owns its
   // type and length.
   let body: Uint8Array | undefined
-  if (method === "POST") {
+  if (fixed !== undefined && sendsRequest(method)) {
+    if ("content-type" in headers) throw refuse("header", shownInput, `The Content-Type of a ${method} is set by the helper`)
+    if (signal.aborted) throw signal.reason
+    const built = serialiseFixedBody(shownInput, options.body, maxRequestBytes)
+    if (signal.aborted) throw signal.reason
+    if (Date.now() >= deadline) throw expired()
+    body = built.bytes
+    headers = { ...headers, ...(built.type === undefined ? {} : { "content-type": built.type }), "content-length": String(body.byteLength) }
+  } else if (method === "POST") {
     if ("content-type" in headers) throw refuse("header", shownInput, "The Content-Type of a POST is set by the helper (application/json)")
     // The one deadline started with the effect, before the body is serialised. Serialising cannot be interrupted, and the timer cannot
     // fire while it runs, so the signal is checked before it and the clock after it (review round 1 of the POST change, finding 2).
@@ -826,6 +892,10 @@ const run = async (input: string | URL, options: AnyOptions, allowLan: boolean, 
   const redirects: Array<string> = []
   let current = checkUrl(input, allowLan)
   if (current instanceof NetRefused) throw current
+  if (fixed !== undefined) {
+    const refused = fixedRefusal(current, fixed)
+    if (refused !== undefined) throw refused
+  }
   // Loopback only for the host the owner typed, on the first hop: never after a redirect, never for a name that resolves to it.
   const typedLoopback = allowLan && options.typedLoopback === true ? typedLoopbackAddresses(input, current) : undefined
   for (let hop = 0; ; hop++) {
@@ -850,8 +920,8 @@ const run = async (input: string | URL, options: AnyOptions, allowLan: boolean, 
         if (signal.aborted) throw signal.reason
         lastError = e instanceof Error ? e.message : String(e)
         // A POST is sent once: another address only when this one is certain to have received nothing.
-        if (method === "POST" && !requestNotSent(e)) {
-          throw new NetFailure({ url: url.href, stage: "connect", detail: `${lastError} (the POST may or may not have been carried out; it is not sent again)`, requestSent: true })
+        if (sendsRequest(method) && !requestNotSent(e)) {
+          throw new NetFailure({ url: url.href, stage: "connect", detail: `${lastError} (the ${method} may or may not have been carried out; it is not sent again)`, requestSent: true })
         }
       }
     }
@@ -859,9 +929,9 @@ const run = async (input: string | URL, options: AnyOptions, allowLan: boolean, 
     const responseHeaders: Record<string, string> = Object.create(null)
     for (const [k, v] of Object.entries(response.headers)) responseHeaders[k.toLowerCase()] = v
     // A POST is sent to one server once: every 3xx answer (300 to 399, 304 included) is refused, nothing is followed.
-    if (method === "POST" && response.status >= 300 && response.status <= 399) {
+    if (sendsRequest(method) && response.status >= 300 && response.status <= 399) {
       closeBody(response.body)
-      throw refuse("post-redirect", url.href, `A ${response.status} answer to a POST is not followed`)
+      throw refuse("post-redirect", url.href, `A ${response.status} answer to a ${method} is not followed`)
     }
     if (redirectStatuses.has(response.status)) {
       closeBody(response.body)
@@ -877,6 +947,10 @@ const run = async (input: string | URL, options: AnyOptions, allowLan: boolean, 
       const checked = checkUrl(next, allowLan)
       // The target came in a header: the refusal names the URL that answered and the rule, never the target's text.
       if (checked instanceof NetRefused) throw refuse(checked.rule, url.href, `The redirect's target is refused (${checked.rule})`)
+      if (fixed !== undefined) {
+        const outside = fixedRefusal(checked, fixed)
+        if (outside !== undefined) throw refuse(outside.rule, url.href, `The redirect's target is refused (${outside.rule})`)
+      }
       if (!sameOrigin(url, checked)) {
         const kept: Record<string, string> = Object.create(null)
         for (const k of Object.keys(headers)) if (crossOriginHeaders.has(k)) kept[k] = headers[k]!
@@ -936,7 +1010,7 @@ const run = async (input: string | URL, options: AnyOptions, allowLan: boolean, 
  * size (after decompression) and total time limits; honours `options.signal` and Effect interruption. Errors say which rule refused
  * (`NetRefused.rule`).
  */
-const fetchChecked = (url: string | URL, options: AnyOptions, allowLan: boolean, allowPost: boolean = allowLan): Effect.Effect<SafeResponse, SafeFetchError> =>
+const fetchChecked = (url: string | URL, options: AnyOptions, allowLan: boolean, allowPost: boolean = allowLan, fixed?: FixedApiRules): Effect.Effect<SafeResponse, SafeFetchError> =>
   Effect.tryPromise({
     try: (effectSignal) => {
       const timeoutMs = options.timeoutMs ?? defaultTimeoutMs
@@ -951,7 +1025,7 @@ const fetchChecked = (url: string | URL, options: AnyOptions, allowLan: boolean,
         else s.addEventListener("abort", abort, { once: true })
       }
       const deadline = Date.now() + timeoutMs
-      return run(url, options, allowLan, controller.signal, deadline, () => new NetTimeout({ url: shown, timeoutMs }), allowPost).finally(() => {
+      return run(url, options, allowLan, controller.signal, deadline, () => new NetTimeout({ url: shown, timeoutMs }), allowPost, fixed).finally(() => {
         clearTimeout(timer)
         for (const s of outside) s.removeEventListener("abort", abort)
         // Stop whatever connection is still open.
@@ -999,3 +1073,11 @@ export const fetchOwnerConfiguredLan = (url: string | URL, options: OwnerConfigu
  */
 export const fetchCheckedForHost = (url: string, options: Omit<SafeFetchOptions, "method"> & { readonly method: "POST"; readonly body: JsonBody; readonly maxRequestBytes?: number }): Effect.Effect<SafeResponse, SafeFetchError> =>
   fetchChecked(url, options, false, true)
+
+/**
+ * The checked fetch for `makeFixedApi` (`FixedApi.ts`): GET, PUT, POST and DELETE over `https:` to the listed hosts only (on every
+ * redirect too), public addresses only. A PUT, POST or DELETE is sent once (every 3xx answer is `NetRefused(post-redirect)`).
+ * Not exported from the package's main entry: a module reaches it through `makeFixedApi`.
+ */
+export const fetchCheckedFixed = (url: string, options: Omit<SafeFetchOptions, "method"> & { readonly method: "GET" | "PUT" | "POST" | "DELETE"; readonly body?: unknown; readonly maxRequestBytes?: number }, rules: FixedApiRules): Effect.Effect<SafeResponse, SafeFetchError> =>
+  fetchChecked(url, options, false, true, rules)

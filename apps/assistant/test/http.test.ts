@@ -475,6 +475,57 @@ describe("http: cross-origin isolation headers (SERVE_CROSS_ORIGIN_ISOLATION)", 
   })
 })
 
+describe("http: modules whose page loads other origins (page.thirdPartyEmbeds)", () => {
+  const embedders = ["Cross-Origin-Opener-Policy", "Cross-Origin-Embedder-Policy", "Cross-Origin-Resource-Policy"]
+  const serve = async (options: { crossOriginIsolation?: boolean; thirdPartyEmbeds: () => boolean }) => {
+    const dir = mkdtempSync(join(tmpdir(), "pva-http-embeds-"))
+    writeFileSync(join(dir, "index.html"), "<!doctype html><title>x</title>")
+    writeFileSync(join(dir, "app.js"), "1")
+    const scope = Effect.runSync(Scope.make())
+    scopes.push(scope)
+    const server = await Effect.runPromise(
+      startHttp({ host: "127.0.0.1", port: 0, webDir: dir, allowedOrigins: [], hub: rejectingHub(), ...options }).pipe(Scope.provide(scope))
+    )
+    return async (path = "/") => {
+      const res = await fetch(`${server.url}${path}`)
+      await res.arrayBuffer()
+      return {
+        isolation: embedders.map((h) => res.headers.get(h)),
+        referrer: res.headers.get("referrer-policy")
+      }
+    }
+  }
+  const on = ["same-origin", "require-corp", "same-origin"]
+  const off = [null, null, null]
+
+  it("isolated by default; not while an enabled module declares it; isolated again once it is off; judged per response", async () => {
+    let declared = false
+    const get = await serve({ thirdPartyEmbeds: () => declared })
+    expect((await get()).isolation).toEqual(on)
+    declared = true
+    expect((await get()).isolation).toEqual(off)
+    expect((await get("/app.js")).isolation).toEqual(off)
+    declared = false
+    expect((await get()).isolation).toEqual(on)
+  })
+
+  it("the environment switch still wins: off stays off", async () => {
+    const get = await serve({ crossOriginIsolation: false, thirdPartyEmbeds: () => false })
+    expect((await get()).isolation).toEqual(off)
+  })
+
+  it("HTML pages carry Referrer-Policy strict-origin-when-cross-origin, in every state; scripts do not need it", async () => {
+    let declared = false
+    const get = await serve({ thirdPartyEmbeds: () => declared })
+    expect((await get()).referrer).toBe("strict-origin-when-cross-origin")
+    declared = true
+    expect((await get()).referrer).toBe("strict-origin-when-cross-origin")
+    expect((await get("/nope")).referrer).toBeNull()
+    const plain = await serve({ crossOriginIsolation: false, thirdPartyEmbeds: () => false })
+    expect((await plain()).referrer).toBe("strict-origin-when-cross-origin")
+  })
+})
+
 describe("http: the admin front end at /admin/", () => {
   /** A UI export with the voice page and the admin page in one of Next's two layouts. */
   const site = (layout: "admin.html" | "admin/index.html") => {

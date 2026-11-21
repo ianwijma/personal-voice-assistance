@@ -704,6 +704,26 @@ results never pass it). `checkModule` starts the module with recognisable secret
 reaches what the module declares or what the admin page shows; what your tools return, speak and store, **your tests
 assert** with the kit's `expectNoSecrets` (§17). Compare a secret with `timingSafeEqual`.
 
+### Credentials a module obtains itself (`host.credentials`)
+
+A settings secret is typed by the owner. A secret your own code obtains (an OAuth refresh token from a callback route)
+goes in `host.credentials`: `get(name)` answers the string or `undefined` when none is set, `set(name, value)` replaces
+it, `clear(name)` answers whether it existed. They are Effects that fail with `CredentialError`, whose `reason` is
+`unavailable` (no vault: outside serve mode, so also in the CLI modes), `locked` (the key vault is locked: the value
+may exist, and **`get` fails `locked` rather than answering `undefined`**, so health can say "sign-in cannot be
+renewed" and not "not signed in"), `invalid`, `limit` or `failed`. Rules: a name matches `^[a-z][a-z0-9-]{0,31}$`; at
+most 8 names per module; a value is a string of at most 4096 bytes. Each module has its own namespace; it can never
+read another's. They work in `shared`, in `start` and in route handlers (which run outside any turn). They are kept in
+the key vault beside route tokens (before a vault exists, in the 0600 secrets file like every other secret), survive a
+restart and a re-keying of the vault, and are never logged (the log redaction knows them), never in a snapshot, Health
+issue or admin API answer, and never sent to a page (the page boundary remembers each value your code reads or writes).
+A credential stays when the module is switched off or removed, as its secrets and route tokens do, so reinstalling the
+module finds it; a module that wants it gone calls `clear`. Locked vault: read the credential when you need it and keep
+what you read for as long as your part runs (the rule of §8: a running module keeps the secrets it started with); a
+module cannot renew or replace one while the vault is locked. The kit gives `host.credentials` an in-memory store
+(`StartTestModuleOptions.credentials`, default fresh, exposed as `kit.credentials` with `lock()`, `unlock()` and
+`dump()`), so a module can be tested without a server.
+
 ## 9. Settings forms
 
 Field kinds (`Setting.*` from `@pva/core`): `text`, `secret`, `number`, `boolean`, `choice`, `multichoice`, `textList`,
@@ -837,11 +857,24 @@ from any site (another site's page can load it in a browser), so it returns only
 network. The first module that has a route brings its route tests, in the app's
 serve tests (`apps/assistant/test/moduleRoutes*.test.ts` show how).
 
+### The page: `page.thirdPartyEmbeds`
+
+The server sends the voice page cross-origin isolated (COOP `same-origin`, COEP `require-corp`, CORP `same-origin`),
+which blocks scripts and frames from other origins that do not opt in (a streaming service's player). A module whose
+page features load such scripts or frames declares `page: { thirdPartyEmbeds: true }` (apiVersion 2; any other field,
+or a value that is not a boolean, is refused). While **an enabled module** declares it, the server omits all three
+headers; it asks at each page response, so switching the module on or off in the admin UI applies from the next page
+load, with no restart and no setting to edit. `SERVE_CROSS_ORIGIN_ISOLATION=false` still turns isolation off for
+everyone. The page copes without isolation (a slightly less exact count of what was heard when a reply is cut off).
+Every HTML page response also carries `Referrer-Policy: strict-origin-when-cross-origin`, which an embedded player
+needs in order to start.
+
 ## 12. The network
 
 Outgoing HTTP is `@pva/net`; **a module never calls `fetch` itself** (nor `node:http`, nor a library that makes its own
-requests). In this wave that is `GET` and `HEAD` to any URL, and a `POST` with a JSON body only to an address the owner
-typed: a module whose first version needs another method (a `PUT`, a WebDAV verb), another body (a form, a file, a
+requests. In this wave that is `GET` and `HEAD` to any URL, a `POST` with a JSON body only to an address the owner
+typed, and `GET`, `PUT`, `POST` and `DELETE` with a JSON or form body to a fixed public API (`makeFixedApi`, below): a
+module whose first version needs another method (a WebDAV verb), another body (a form, a file, a
 stream), a WebSocket or a `POST` to a URL a model or a page chose is not in this wave.
 
 - **`safeFetch(url, { accept, … })`** for public APIs and any URL a model chose: `accept` (the response types you take:
@@ -868,6 +901,18 @@ stream), a WebSocket or a `POST` to a URL a model or a page chose is not in this
 - **`postFixedPublicJson`** (`@pva/net/host`) is the host's, not a module's: a JSON `POST` to a fixed `https:` public
   address written in the app's own code (the report filing's GitHub API, docs/REPORTS.md). It is not in `@pva/net`'s
   main entry, and `packages/net/test/FixedPublicPost.test.ts` fails when a module package imports the host entry.
+- **`makeFixedApi({ hosts })`** (`@pva/net`) for a fixed public API whose `https:` hosts are written in your own code
+  (Spotify: `api.spotify.com`, `accounts.spotify.com`), never an address a model, a page or the owner chose. Hosts are
+  plain DNS names (1 to 8, no IP literal, no wildcard; checked when you construct it, it throws otherwise), matched exactly
+  and without case, on the first hop and on every redirect (`NetRefused` `host-list`). `api.call(url, { method, accept,
+  headers?, json? | form?, maxBytes?, timeoutMs?, maxRequestBytes? })` takes `GET`, `PUT`, `POST` and `DELETE`: `https:`
+  only, port 443, public addresses only (every other rule of `safeFetch`), an `Authorization` header allowed. `json` is
+  sent as `application/json`, `form` (an object of strings) as `application/x-www-form-urlencoded`, never both, none on a
+  `GET`; the helper sets the type and the length (`0` for a `PUT`, `POST` or `DELETE` without a body) and refuses a body
+  over `maxRequestBytes` before connecting. **A `PUT`, `POST` or `DELETE` is sent once**, like the `POST` above: every 3xx
+  answer is refused (`post-redirect`), no retry, `NetFailure.requestSent` says when it was written. A `GET` follows
+  redirects only to listed hosts and drops its credentials when the origin changes. A non-2xx answer reaches you as with
+  `safeFetch`; a 204 has an empty body.
 - **`makeCachedJson`** for JSON with a time to live, `ETag` and stale-if-error.
 - **`userAgent(contact)`**: put the owner's contact (Home › API contact, `HOME_API_CONTACT`) in the User-Agent **only
   when the owner set one**.

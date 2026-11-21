@@ -13,6 +13,7 @@ import { type Effect, Schema } from "effect"
 import type { ActionParam } from "./Actions.ts"
 import type { ModuleEvents } from "./EventBus.ts"
 import type { ModuleStore } from "./HouseholdStore.ts"
+import type { ModuleCredentials } from "./ModuleCredentials.ts"
 import type { ModuleRoute, RouteTokens } from "./ModuleRoutes.ts"
 import type { ModuleNotify, ModuleSpeech } from "./Notify.ts"
 import type { ModulePresent } from "./Present.ts"
@@ -358,6 +359,12 @@ export interface ActionCatalogue {
 export interface ModuleHostApi {
   /** P3: this module's route tokens (`ModuleRoutes.ts`), in the key vault. Fails `unavailable` outside serve mode. */
   readonly routeTokens: RouteTokens
+  /**
+   * This module's own credentials (`ModuleCredentials.ts`): a secret it obtained itself (an OAuth refresh token), kept
+   * in the key vault under its own namespace. Works in `shared`, `start` and route handlers (outside any turn). Fails
+   * `unavailable` outside serve mode and `locked` while the vault is locked.
+   */
+  readonly credentials: ModuleCredentials
   /** A read-only snapshot of the assistant: module states, vault, engines, devices, Home values. */
   readonly view: () => HostView
   /**

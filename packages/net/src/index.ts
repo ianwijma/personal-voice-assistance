@@ -1,6 +1,7 @@
 export * from "./Address.ts"
 export * from "./CachedJson.ts"
 export * from "./Errors.ts"
+export * from "./FixedApi.ts"
 // Listed, not `export *`: `fetchCheckedForHost` stays inside the package (the host's POST is `@pva/net/host`).
 export {
   acceptsType,

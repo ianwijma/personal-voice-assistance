@@ -3,6 +3,7 @@
 // sees it.
 import { contentTypes, fetchOwnerConfiguredLan, type NetRefused, safeFetch, type SafeFetchError, type SafeFetchOptions, type SafeResponse } from "@pva/net"
 import { WEB_IMAGES_LIMITS, type WebImage, type WebImageQuery, WebImagesError, type WebImagesService } from "@pva/module-contracts"
+import { WEB_VIDEOS_LIMITS, type WebVideo, type WebVideoQuery, WebVideosError, type WebVideosService, youtubeVideoId } from "@pva/module-contracts"
 import { Data, Effect } from "effect"
 import { cleanText, HAS_UNWANTED, hostOf, isBlocked, siteOf } from "./clean.ts"
 
@@ -247,6 +248,93 @@ export const makeSearxngImages = (baseUrl: string, blocked: ReadonlyArray<string
       if (body === undefined || !Array.isArray(body.results)) return yield* new WebImagesError({ reason: "invalid", detail: "no results list" })
       const items = (body.results as ReadonlyArray<unknown>).map((r) => objectOf(r)).filter((r): r is Readonly<Record<string, unknown>> => r !== undefined)
       return toImages(items, blocked)
+    })
+})
+
+// ---------------------------------------------------------------------------------------------------------------------
+// SearXNG video search (the `WebVideos` service, `@pva/module-contracts`)
+
+const MAX_VIDEO_SECONDS = 48 * 3_600
+
+/** A video length as SearXNG states it ("12:34", "1:02:03", "754" or the number 754) in whole seconds; anything else is absent. */
+export const videoLengthSeconds = (value: unknown): number | undefined => {
+  let seconds: number | undefined
+  if (typeof value === "number") seconds = value
+  else if (typeof value === "string") {
+    const text = value.trim()
+    if (/^\d{1,6}$/.test(text)) seconds = Number(text)
+    else if (/^\d{1,3}:[0-5]?\d(:[0-5]?\d)?$/.test(text)) seconds = text.split(":").reduce((total, part) => total * 60 + Number(part), 0)
+  }
+  if (seconds === undefined || !Number.isFinite(seconds) || seconds <= 0 || seconds > MAX_VIDEO_SECONDS) return undefined
+  return Math.round(seconds)
+}
+
+/**
+ * The results of a video search, read as the contract says: a result without a usable page, or on a blocked site, is
+ * dropped (with `site: "youtube"`, so is one without a YouTube id); a thumbnail that is not usable or is blocked is left
+ * out. At most `limit` (within `WEB_VIDEOS_LIMITS.results`).
+ */
+export const toVideos = (
+  items: ReadonlyArray<Readonly<Record<string, unknown>>>,
+  blocked: ReadonlyArray<string>,
+  options: { readonly site?: "youtube"; readonly limit?: number } = {}
+): ReadonlyArray<WebVideo> => {
+  const out: Array<WebVideo> = []
+  const limit = Math.min(WEB_VIDEOS_LIMITS.results, Math.max(1, Math.floor(options.limit ?? WEB_VIDEOS_LIMITS.results)))
+  for (const item of items.slice(0, 100)) {
+    const page = typeof item.url === "string" ? item.url.trim() : ""
+    if (page === "" || page.length > WEB_VIDEOS_LIMITS.urlChars || HAS_UNWANTED.test(page) || /\s/.test(page)) continue
+    const host = hostOf(page)
+    const site = siteOf(page)
+    if (host === undefined || site === undefined || isBlocked(host, blocked)) continue
+    const youtubeId = youtubeVideoId(page)
+    if (options.site === "youtube" && youtubeId === undefined) continue
+    const thumbnailUrl = imageAddressOf(item.thumbnail ?? item.thumbnail_src)
+    const lengthSeconds = videoLengthSeconds(item.length)
+    const author = typeof item.author === "string" ? item.author.trim().slice(0, WEB_VIDEOS_LIMITS.authorChars) : ""
+    const published = typeof item.publishedDate === "string" && item.publishedDate.trim() !== "" ? new Date(item.publishedDate) : undefined
+    out.push({
+      title: typeof item.title === "string" ? item.title.slice(0, WEB_VIDEOS_LIMITS.titleChars) : "",
+      url: page,
+      site,
+      ...(youtubeId !== undefined ? { youtubeId } : {}),
+      ...(lengthSeconds !== undefined ? { lengthSeconds } : {}),
+      ...(thumbnailUrl !== undefined && !isBlocked(hostOf(thumbnailUrl) ?? "", blocked) ? { thumbnailUrl } : {}),
+      ...(author !== "" ? { author } : {}),
+      ...(published !== undefined && !Number.isNaN(published.getTime()) ? { publishedDate: published.toISOString() } : {})
+    })
+    if (out.length >= limit) break
+  }
+  return out
+}
+
+/** The `WebVideos` service on a SearXNG server the owner typed (the same owner-configured fetch as the image search). */
+export const makeSearxngVideos = (baseUrl: string, blocked: ReadonlyArray<string>, net: NetDeps): WebVideosService => ({
+  search: (q: WebVideoQuery) =>
+    Effect.gen(function*() {
+      const query = typeof q.query === "string" ? q.query.trim().replace(/ +/g, " ") : ""
+      if (
+        query === "" || q.query.length > WEB_VIDEOS_LIMITS.queryChars || HAS_UNWANTED.test(q.query) || !SAFE_LEVELS.has(q.safeSearch) ||
+        (q.site !== undefined && q.site !== "youtube") ||
+        (q.maxResults !== undefined && !(Number.isInteger(q.maxResults) && q.maxResults >= 1 && q.maxResults <= WEB_VIDEOS_LIMITS.results))
+      ) {
+        return yield* new WebVideosError({ reason: "failed", detail: "the query is outside the contract's bounds" })
+      }
+      const timeoutMs = Math.min(10_000, Math.max(500, Math.round(q.timeoutMs)))
+      const url = searxEndpoint(baseUrl, query, { categories: "videos", safesearch: String(q.safeSearch), language: searxLanguage(q.language) })
+      const response = yield* fetchOwnerConfiguredLan(url, { accept: contentTypes.json, maxBytes: WEB_VIDEOS_LIMITS.answerBytes, timeoutMs, ...net }).pipe(
+        Effect.mapError((e) => {
+          const f = failureOf(e)
+          return new WebVideosError({ reason: f.reason === "key-refused" ? "failed" : f.reason, detail: f.detail })
+        })
+      )
+      if (response.status === 403) return yield* new WebVideosError({ reason: "json-off", detail: "403: JSON output is not enabled in search.formats" })
+      if (response.status === 429) return yield* new WebVideosError({ reason: "rate-limited", detail: "429" })
+      if (response.status < 200 || response.status > 299) return yield* new WebVideosError({ reason: "failed", detail: `status ${response.status}` })
+      const body = objectOf(yield* parseJson(response).pipe(Effect.mapError((e) => new WebVideosError({ reason: "invalid", detail: e.detail }))))
+      if (body === undefined || !Array.isArray(body.results)) return yield* new WebVideosError({ reason: "invalid", detail: "no results list" })
+      const items = (body.results as ReadonlyArray<unknown>).map((r) => objectOf(r)).filter((r): r is Readonly<Record<string, unknown>> => r !== undefined)
+      return toVideos(items, blocked, { ...(q.site !== undefined ? { site: q.site } : {}), ...(q.maxResults !== undefined ? { limit: q.maxResults } : {}) })
     })
 })
 

@@ -500,10 +500,14 @@ export interface SettingsStore {
    * that damaged settings are right, so it never acknowledges them or lets anything start.
    */
   readonly saveRouteTokens: (change: (committed: Readonly<Record<string, string>>) => Readonly<Record<string, string>>) => Effect.Effect<void, SettingsStoreError>
+  /** Module credentials (`Credentials.ts`): as `saveRouteTokens`, for the entry `CREDENTIALS_ENTRY`. */
+  readonly saveCredentials: (change: (committed: Readonly<Record<string, string>>) => Readonly<Record<string, string>>) => Effect.Effect<void, SettingsStoreError>
 }
 
 /** P3: where route tokens are kept among the module secrets; never a module id (they cannot contain "@"). */
 export const ROUTE_TOKENS_ENTRY = "@route-tokens"
+/** Where module credentials are kept among the module secrets, as `moduleId/name` to value; never a module id. */
+export const CREDENTIALS_ENTRY = "@credentials"
 
 export interface LoadOptions {
   /** Never write (CLI modes): a corrupt file is reported but left in place, and saves are ignored. */
@@ -1489,6 +1493,27 @@ export const loadSettingsStore = (directory: string, options: LoadOptions = {}):
 
       const ordered = () => settings.assistants.order.flatMap((id) => (settings.assistants.byId[id] !== undefined ? [settings.assistants.byId[id]!] : []))
 
+      const saveEntry = (what: string, entry: string, change: (committed: Readonly<Record<string, string>>) => Readonly<Record<string, string>>): Effect.Effect<void, SettingsStoreError> =>
+          Effect.suspend(() =>
+            blockedProblem !== undefined
+              ? Effect.fail(new SettingsStoreError({ message: `${what[0]!.toUpperCase() + what.slice(1)} were not saved: ${blockedProblem}` }))
+              : persistSettings(what, (committed) => {
+                // Inside the serialized save too: a token change queued behind another save never reaches the files
+                // of a blocked store.
+                if (blockedProblem !== undefined) throw new KeysUnavailable(`${what[0]!.toUpperCase() + what.slice(1)} were not saved: ${blockedProblem}`)
+                // And the vault's: locked since the change was asked for, the committed tokens cannot be read, so
+                // "no change" would be a lie (a revocation acknowledged while the token stays).
+                if (vaultInUse() && vault!.secrets() === undefined) throw new KeysUnavailable(KEYS_LOCKED_MESSAGE)
+                return {
+                  settings: committed.settings,
+                  secrets: {
+                    ...committed.secrets,
+                    modules: withSecrets(committed.secrets.modules, entry, change(committed.secrets.modules[entry] ?? {}))
+                  }
+                }
+              })
+          )
+
       const store: SettingsStore = {
         directory,
         settings: () => settings,
@@ -1522,26 +1547,8 @@ export const loadSettingsStore = (directory: string, options: LoadOptions = {}):
           initial: { modules: settings.modules, secrets: current().modules },
           save: saveModule
         },
-        saveRouteTokens: (change) =>
-          Effect.suspend(() =>
-            blockedProblem !== undefined
-              ? Effect.fail(new SettingsStoreError({ message: `The route tokens were not saved: ${blockedProblem}` }))
-              : persistSettings("the route tokens", (committed) => {
-                // Inside the serialized save too: a token change queued behind another save never reaches the files
-                // of a blocked store.
-                if (blockedProblem !== undefined) throw new KeysUnavailable(`The route tokens were not saved: ${blockedProblem}`)
-                // And the vault's: locked since the change was asked for, the committed tokens cannot be read, so
-                // "no change" would be a lie (a revocation acknowledged while the token stays).
-                if (vaultInUse() && vault!.secrets() === undefined) throw new KeysUnavailable(KEYS_LOCKED_MESSAGE)
-                return {
-                  settings: committed.settings,
-                  secrets: {
-                    ...committed.secrets,
-                    modules: withSecrets(committed.secrets.modules, ROUTE_TOKENS_ENTRY, change(committed.secrets.modules[ROUTE_TOKENS_ENTRY] ?? {}))
-                  }
-                }
-              })
-          )
+        saveRouteTokens: (change) => saveEntry("the route tokens", ROUTE_TOKENS_ENTRY, change),
+        saveCredentials: (change) => saveEntry("the module credentials", CREDENTIALS_ENTRY, change)
       }
       return store
     },

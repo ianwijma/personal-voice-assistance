@@ -20,7 +20,7 @@ export type OfflineResolver = (host: string, signal: AbortSignal) => Promise<Rea
 export interface OfflineConnectRequest {
   readonly url: URL
   readonly address: string
-  readonly method: "GET" | "HEAD" | "POST"
+  readonly method: "GET" | "HEAD" | "POST" | "PUT" | "DELETE"
   readonly headers: Readonly<Record<string, string>>
   /** A POST's serialised body. */
   readonly body?: Uint8Array
@@ -32,7 +32,7 @@ export interface OfflineConnectRequest {
 /** One request the offline connector was asked to make. */
 export interface OfflineRequest {
   readonly url: string
-  readonly method: "GET" | "HEAD" | "POST"
+  readonly method: "GET" | "HEAD" | "POST" | "PUT" | "DELETE"
   readonly address: string
   readonly headers: Readonly<Record<string, string>>
   /** A POST's body as UTF-8 text, exactly as it was sent; absent for GET and HEAD. */

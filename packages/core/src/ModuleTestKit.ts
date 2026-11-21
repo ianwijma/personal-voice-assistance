@@ -42,6 +42,7 @@ import type { ActionRunResult, ContributionKey, ModuleHostApi, ProvidedContribut
 import { type KnownDevice, Devices, makeDevices } from "./Devices.ts"
 import type { HouseholdStore, ModuleStore, Row } from "./HouseholdStore.ts"
 import { defineModule, type ModuleDefinition } from "./ModuleDefinition.ts"
+import { type CredentialStore, makeMemoryCredentialStore } from "./ModuleCredentials.ts"
 import { makeModuleHost, type ModuleHost, readOnlyPersistence } from "./ModuleHost.ts"
 import type { Registrar, StartedPart } from "./ModuleRegistrations.ts"
 import { takeUnprogrammedStubCalls, UnprogrammedStubCall } from "./ModuleStubs.ts"
@@ -494,6 +495,11 @@ export interface StartTestModuleOptions {
   readonly settings?: Readonly<Record<string, unknown>>
   /** Its secrets (secret fields), as the key vault gives them. */
   readonly secrets?: Readonly<Record<string, string>>
+  /**
+   * Where `host.credentials` keeps values (default: a fresh in-memory store, exposed as `credentials` on the result;
+   * pass your own to share it between two runs, or to lock it).
+   */
+  readonly credentials?: CredentialStore
   /** Stand-ins for the modules it uses: their services (stubs) and contributions (`provide`). */
   readonly provide?: ReadonlyArray<ProvidedModule>
   /** Real modules to run beside it (a provider under test together with its consumer). */
@@ -961,8 +967,10 @@ export const startTestModule = (definition: ModuleDefinition<any>, options: Star
             })
         })])
     ]
+    const credentials = options.credentials ?? makeMemoryCredentialStore()
     const host = yield* makeModuleHost({
       catalog,
+      credentials,
       defaults: homeDefaults,
       persistence: readOnlyPersistence({
         modules: { [id]: { enabled: true, ...(options.settings !== undefined ? { settings: options.settings } : {}) } },
@@ -1164,6 +1172,8 @@ export const startTestModule = (definition: ModuleDefinition<any>, options: Star
       },
       /** P8: every decision of the risk policy so far, on every path (turns, jobs, presses), in order. */
       riskDecisions: (): ReadonlyArray<GatewayDecisionRecord> => riskDecisions.slice(),
+      /** The credentials store `host.credentials` used (the in-memory one unless the options gave another). */
+      credentials,
       /**
        * Call a tool as the model's tool loop does, through the assistant's registry and the real gateway, as the turn
        * (`TurnContext`, or a `TestTurnInput` resolved against the household; default the first device's). A tool the
