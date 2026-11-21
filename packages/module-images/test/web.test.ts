@@ -57,7 +57,7 @@ describe("@pva/module-images, pictures from the web (issue #150)", () => {
       // The search engine's own thumbnail, which is made to be fetched by others; fetched by the server, never the module.
       assert.deepStrictEqual(urls, ["https://tse1.mm.bing.net/th?id=OIP.heron&pid=Api"])
       // Strict safe search by default, the words asked, within the module's time limit.
-      assert.deepStrictEqual(web.calls.search, [[{ query: "grey heron", safeSearch: 2, language: "en-GB", timeoutMs: 3_000 }]])
+      assert.deepStrictEqual(web.calls.search, [[{ query: "grey heron", safeSearch: 2, language: "en-GB", timeoutMs: 6_000 }]])
     }))
 
   it.effect("fallback: a picture on Wikipedia wins and the web is not asked; a page with no picture asks the web by the page's title", () =>
@@ -137,6 +137,66 @@ describe("@pva/module-images, pictures from the web (issue #150)", () => {
       const { deps } = worldNet({ ...standardWorld, en: { ...standardWorld.en, zzzz: [] } })
       const kit = yield* startTestModule(imagesModule(deps), { media: { fetch: () => Effect.succeed({ hash: HASH }) } })
       assert.deepStrictEqual((yield* kit.tool("image_find", { query: "zzzz" })).value, { spoken: "I couldn't find a picture of zzzz on Wikipedia or Wikimedia Commons." })
+    }))
+
+  it.effect("the web search has its own time limit: the tool passes webTimeoutMs, the action what is left of its 4 s, never the Wikimedia 1.5 s", () =>
+    Effect.gen(function*() {
+      const world = { ...standardWorld, en: { ...standardWorld.en, "grey heron": [] } }
+      const tool = yield* startWith([HERON], { webTimeoutMs: 8_000, timeoutMs: 1_000 }, world)
+      yield* tool.kit.tool("image_find", { query: "grey heron" }, { device: "kitchen-display" })
+      assert.strictEqual(tool.web.calls.search?.[0]?.[0].timeoutMs, 8_000)
+      // The action: the budget is 4 s, the web search starts at once and gets all of it (not 1.5 s), or the setting when that is less.
+      for (const mode of ["fallback", "first", "only"]) {
+        const a = yield* startWith([HERON], { webImages: mode }, world)
+        yield* a.kit.action("show", { thing: "grey heron" }, { device: "kitchen-display" })
+        assert.strictEqual(a.web.calls.search?.[0]?.[0].timeoutMs, 4_000, mode)
+      }
+      const short = yield* startWith([HERON], { webTimeoutMs: 1_200 }, world)
+      yield* short.kit.action("show", { thing: "grey heron" }, { device: "kitchen-display" })
+      assert.strictEqual(short.web.calls.search?.[0]?.[0].timeoutMs, 1_200)
+    }))
+
+  it.effect("only: Wikipedia and Commons are not asked at all, page and wiki are ignored, no question is asked", () =>
+    Effect.gen(function*() {
+      const { kit, net, web, urls } = yield* startWith([HERON], { webImages: "only" })
+      const r = yield* kit.tool("image_find", { query: "kiwi" }, { device: "kitchen-display" })
+      assert.isTrue(r.ok)
+      yield* kit.present.settle
+      assert.strictEqual(imageOf(kit)?.credit, "Picture from the web, via birds.example.org")
+      assert.deepStrictEqual(urls, ["https://tse1.mm.bing.net/th?id=OIP.heron&pid=Api"])
+      const chosen = yield* kit.tool("image_find", { query: "kiwi", page: "Kiwi (bird)", wiki: "en" }, { device: "kitchen-display" })
+      assert.isTrue(chosen.ok)
+      assert.deepStrictEqual(net.requests, [])
+      assert.deepStrictEqual(web.calls.search?.map((c) => c[0].query), ["kiwi", "kiwi"])
+      // Nothing found, and a failure naming the web search.
+      const none = yield* startWith([], { webImages: "only" })
+      assert.deepStrictEqual((yield* none.kit.tool("image_find", { query: "zzzz" })).value, { spoken: "I couldn't find a picture of zzzz on the web." })
+      assert.deepStrictEqual(none.net.requests, [])
+      const nl = yield* startWith([], { webImages: "only" }, standardWorld, NL)
+      assert.deepStrictEqual((yield* nl.kit.tool("image_find", { query: "zzzz" })).value, { spoken: "Ik kon geen plaatje van zzzz vinden op internet." })
+      const bad = yield* startWith(() => fails(new WebImagesError({ reason: "timeout", detail: "x" }))(), { webImages: "only" })
+      const f = yield* bad.kit.tool("image_find", { query: "okapi" })
+      assert.isFalse(f.ok)
+      assert.include(f.content, say(texts, "en", "slow", { source: "SearXNG" }))
+      assert.deepStrictEqual(bad.net.requests, [])
+    }))
+
+  it.effect("only without the web-search module's service says what is needed, in both languages, never nothing found; fallback and first stay silent", () =>
+    Effect.gen(function*() {
+      const { deps } = worldNet({ ...standardWorld, en: { ...standardWorld.en, zzzz: [] } })
+      const media = { fetch: () => Effect.succeed({ hash: HASH }) }
+      const en = yield* startTestModule(imagesModule(deps), { media, settings: { webImages: "only" } })
+      const said = say(texts, "en", "webNeeded")
+      assert.include(said, "Web search module")
+      assert.include(said, "SearXNG address")
+      assert.deepStrictEqual((yield* en.tool("image_find", { query: "okapi" })).value, { spoken: said })
+      assert.deepStrictEqual(yield* en.action("show", { thing: "okapi" }), { ok: true, say: said })
+      const nl = yield* startTestModule(imagesModule(deps), { media, settings: { webImages: "only" }, household: NL })
+      assert.deepStrictEqual((yield* nl.tool("image_find", { query: "okapi" })).value, { spoken: say(texts, "nl", "webNeeded") })
+      for (const mode of ["fallback", "first"]) {
+        const k = yield* startTestModule(imagesModule(deps), { media, settings: { webImages: mode } })
+        assert.deepStrictEqual((yield* k.tool("image_find", { query: "zzzz" })).value, { spoken: "I couldn't find a picture of zzzz on Wikipedia or Wikimedia Commons." })
+      }
     }))
 
   it.effect("every text from the web is cleaned, bounded and marked as outside text; the credit's site stays short", () =>

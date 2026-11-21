@@ -37,7 +37,7 @@ never spoken.
   module). The setting `webImages` puts it **after** Wikipedia and Commons (`fallback`, the default: asked only when they
   have no picture, also when they could not be read, instead of "nothing found" or "no picture"), **first** (`first`: its
   best picture is shown and no question is asked; when it has nothing, Wikipedia and Commons as before; a chosen option of a
-  question is always theirs), or not at all (`off`). Without the service the module works exactly as it did without the web.
+  question is always theirs), or **only the web** (`only`: Wikipedia and Commons are not asked at all, there is no question, and a question's `page` and `wiki` are ignored; the outcomes are a picture, "I couldn't find a picture of … on the web", or a failure naming SearXNG), or not at all (`off`). Without the service the module works exactly as it did without the web in `fallback` and `first`. In `only` it says plainly that searching the web for a picture needs the Web search module switched on with a SearXNG address (never "nothing found"); this is only said, not a Health issue, because a module's `health()` receives only its settings and whether it runs, and cannot see another module's service.
   A web picture's licence is not known, and nothing claims one: its credit is "Picture from the web, via birds.example.org"
   (the host of the page it is on; "Plaatje van internet, via …" in Dutch). What it is a picture of is said with the words
   that were asked ("Here is a picture of grey heron."); the result's title is the caption, cleaned and bounded and, for the
@@ -66,7 +66,7 @@ after the wake phrase with no model: "show me a picture of {thing}", "show me a 
 plaatje zien van {thing}". The thing is the slot at the end; the name is looked up as it was said, exactly as the tool does ("The Who", "De Dijk", "A Star Is Born"); only when that finds nothing at all is the text without a leading "a", "an", "the", "een", "de", "het" tried ("an okapi" is "okapi"), and the sentence names what was found. The action
 shows the picture itself (`ctx.present.show("origin", …)`) and says what the Presenter did: "Here is a picture of Okapi." where it was
 shown, and where it was not (a speaker, a page that cannot draw it) "I found a picture of Okapi: …. I can't show it here." Its
-lookup has a budget of **4 s** in all and **1.5 s** a request (an action has 5 s), then a failure is said as one. An ambiguous word
+lookup has a budget of **4 s** in all, **1.5 s** for each Wikipedia or Commons request, and for the web search whatever is left of the 4 s when it starts (at most `webTimeoutMs`; the whole 4 s when it is asked first), because an action has 5 s; then a failure is said as one. An ambiguous word
 asks, as the tool does; a phrase turn is recorded nowhere, so the person answers with a new phrase naming the one they mean ("show me a
 picture of Kiwi (bird)"), which a title match finds exactly. The action offers only names it accepts back, whole: within its 100
 characters, one line, within the phrase's eight words and not cut when said; with no such name it asks the person to say a bit more.
@@ -77,7 +77,7 @@ line, cut at a code-point boundary with an ellipsis, never inside a character; a
 `source` (Wikipedia, Wikimedia Commons or SearXNG), `credit` (and `creditCut` when the author was cut), `ifNotShown`. After it the Presenter adds
 its note (`[Screen: Showing on "Kitchen display". …]`).
 
-How a lookup goes (at most four requests to the two sites and one web search, one lookup at most 9 s for the tool, each request at most the setting's limit):
+How a lookup goes (at most four requests to the two sites and one web search; one lookup at most 9 s for the tool, or 9 s plus the web time limit, never more than 15 s, when the web is used; each request to the two sites at most `timeoutMs`, the web search at most `webTimeoutMs`. The tool host sets no time limit of its own on a tool call, `latency: slow` is only a label; an action has its 5 s):
 
 1. Pages on the household's Wikipedia (`en`, or `nl` for a Dutch household; Dutch then asks `en` when `nl` has nothing),
    `generator=search` with the page's lead image name, description and disambiguation mark; or, after a question, the one page of
@@ -92,7 +92,7 @@ How a lookup goes (at most four requests to the two sites and one web search, on
    module used to ask for was refused; checked live 2026-11-21, issue #150).
 3. When there is no usable picture and the setting allows: a Commons file search (the first usable of five).
 4. With `webImages` `fallback` and still no picture: one SearXNG image search (by the page's title when a page was found, else
-   the words). With `first` this search comes before step 1.
+   the words). With `first` this search comes before step 1. With `only` it is the only step: steps 1 to 3 are skipped.
 
 Every answer is checked for its shape: a complete empty search (`batchcomplete`, no pages) is an empty result, and anything else that is
 not a query answer (no `query`, `pages` not a list, an entry that is not an object, a field of the wrong type) is a failed read, said as one
@@ -135,9 +135,10 @@ sites' public APIs and calls the web-search module's service.
 | Field | Default | Meaning |
 |---|---|---|
 | `commonsFallback` | on | Search Wikimedia Commons when a page has no picture I can use. |
-| `webImages` | `fallback` | Pictures from the web through SearXNG: `off`, `fallback` (when Wikipedia and Commons have none), `first`. |
+| `webImages` | `fallback` | Pictures from the web through SearXNG: `off`, `fallback` (when Wikipedia and Commons have none), `first`, `only` ("Only the web": Wikipedia and Commons are not asked). |
 | `webSafeSearch` | `strict` | SearXNG's `safesearch` for a web picture search: `off` (0), `moderate` (1), `strict` (2). |
-| `timeoutMs` (advanced) | 3,000 ms (500 to 6,000) | The time limit of one request (the web search's too). |
+| `timeoutMs` (advanced) | 3,000 ms (500 to 6,000) | The time limit of one request to Wikipedia or Commons. |
+| `webTimeoutMs` (advanced) | 6,000 ms (1,000 to 10,000) | The time limit of the web picture search (a real SearXNG image search took 1.2 to 3.0 s, as it waits for its engines). |
 
 Nothing is overridable by an assistant, and there is no secret. The module is off by default; with it off nothing changes
 for anyone.
