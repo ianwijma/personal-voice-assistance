@@ -93,16 +93,19 @@ describe("the host's reports", () => {
     const reports = await make(s)
     expect(reports.available()).toBe(true)
     expect(reports.settings()).toEqual({ hasToken: false, sendImmediately: false })
-    const drafted = await run(inTurn(reports, input({ answers: [{ question: "What did you expect?", answer: "A ring." }] })))
+    const drafted = await run(inTurn(reports, input({ description: `It never rang, and my key is ${VAULT_SECRET}`, answers: [{ question: "What did you expect?", answer: "A ring." }] })))
     expect(drafted.status).toBe("draft")
     expect(drafted.id).toMatch(/^r[0-9a-f]{16}$/)
     const page = await run(reports.list({ limit: 20 }))
     expect(page.reports.map((r) => [r.id, r.kind, r.title, r.status, r.deviceName, r.assistantName])).toEqual([[drafted.id, "problem", "The timer did not ring", "draft", "Kitchen display", "Jeff"]])
     const detail = await run(reports.get(drafted.id))
     expect(detail.body.split("\n")[0]).toBe(`<!-- pva-report v1 kind=problem id=${drafted.id} -->`)
-    expect(detail.body).toContain("Set a pasta timer for ten minutes")
     expect(detail.body).toContain("Q1: What did you expect?\nA1: A ring.")
-    // The vault's secret was in the history: it is not in the body.
+    expect(detail.body).toContain("| Device | `Kitchen display` |")
+    // The conversation is gathered, but not in the body.
+    expect(detail.body).not.toContain("Set a pasta timer")
+    expect(detail.body).not.toContain("timer_set")
+    // The vault's secret was in the description: it is not in the body.
     expect(detail.body).not.toContain(VAULT_SECRET)
     expect(detail.body).toContain("[secret]")
     expect(detail.bodyFits).toBe(true)
@@ -112,7 +115,7 @@ describe("the host's reports", () => {
     expect((await run(again.get(drafted.id))).body).toBe(detail.body)
   })
 
-  it("leaves out what is not there and says why", async () => {
+  it("leaves out what is not there", async () => {
     const s = await store()
     const reports = await make(s, {
       sources: sources({
@@ -126,20 +129,19 @@ describe("the host's reports", () => {
     })
     const drafted = await run(inTurn(reports, input()))
     const body = (await run(reports.get(drafted.id))).body
-    expect(body).toContain("## Conversation\n\nNot available: the device has no voice session now")
-    expect(body).toContain("## Device\n\nNot available: the device \"kitchen-display\" is not known (any more).")
-    expect(body).toContain("## Assistant\n\nNot available: it could not be read.")
-    expect(body).toContain("Not available: this mode keeps no log lines.")
+    expect(body).not.toContain("| Device |")
+    expect(body).not.toContain("| Assistant |")
+    expect(body).toContain("| Version | `0.0.0` |")
   })
 
-  it("adds the previous conversation of the device and assistant, and not the report's own", async () => {
+  it("keeps the previous conversation of the device and assistant out of the body, and its boundary", async () => {
     const previous = makePreviousConversations()
     previous.ended("kitchen-display", "jeff", "conversation-0", [{ role: "user", content: "Set a pasta timer" }, { role: "assistant", content: "Set." }])
     const s = await store()
     const reports = await make(s, { sources: sources({ conversation: () => Effect.succeed({ conversationId: "conversation-1", history: [] }), previous: (d, a) => previous.get(d, a) }) })
     const body = (await run(reports.get((await run(inTurn(reports, input()))).id))).body
-    expect(body).toMatch(/## Previous conversation \(ended [0-9T:.-]+Z\)/)
-    expect(body).toContain("Set a pasta timer")
+    expect(body).not.toContain("Previous conversation")
+    expect(body).not.toContain("Set a pasta timer")
     // Another boundary (the device's privacy changed since): not handed on.
     previous.ended("kitchen-display", "jeff", "conversation-0", [{ role: "user", content: "private words" }], "[\"private\",null]")
     expect(previous.get("kitchen-display", "jeff", "[\"public\",null]")).toBeUndefined()
@@ -240,7 +242,7 @@ describe("the host's reports", () => {
   })
 
 
-  it("reads the turn itself: outside a turn it refuses, and it attaches no conversation but the turn's own", async () => {
+  it("reads the turn itself: outside a turn it refuses, and it names the turn's own conversation", async () => {
     const s = await store()
     const reports = await make(s)
     const outside = await Effect.runPromiseExit(reports.service.draft(input()))
@@ -249,7 +251,7 @@ describe("the host's reports", () => {
     // The device's conversation is another one than the turn's: not attached.
     const other = await run(inTurn(reports, input(), makeTestTurn({ device: "kitchen-display", conversationId: "someone-elses" })))
     const body = (await run(reports.get(other.id))).body
-    expect(body).toContain("## Conversation\n\nNot available: the device's conversation changed")
+    expect(body).toContain("| Conversation | `someone-elses` |")
     expect(body).not.toContain("Set a pasta timer")
   })
 
@@ -264,7 +266,7 @@ describe("the host's reports", () => {
     await run(reports.service.configure({ token: TOKEN, sendImmediately: false }))
     const drafted = await run(inTurn(reports, input({ title: `Title ${half}`, description: `desc ${half}` })))
     const detail = await run(reports.get(drafted.id))
-    expect(detail.body).toContain("cut here \ufffd")
+    expect(detail.body).toContain("desc \ufffd")
     expect(wellFormed(detail.body)).toBe(detail.body)
     expect(() => decodeURIComponent(detail.newIssueUrl)).not.toThrow()
     // An owner's edit with a lone half: saved well formed.

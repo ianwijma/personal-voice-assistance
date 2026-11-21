@@ -8,8 +8,8 @@ export { texts } from "./texts.ts"
 /**
  * Reports (docs/modules/report.md, docs/REPORTS.md): the person's way to tell the assistant's developers about a
  * problem or a feature idea. The module is thin: one tool that passes what the person said to the core's `Reports`
- * service, which adds the conversation, the traces, the device, the assistant and the server's state, keeps the
- * report as a draft for the owner, and files it as a GitHub issue when the owner sends it (or at once, when the owner
+ * service, which adds a few facts about where it was said (the device, the assistant, its voice, the conversation id;
+ * never the conversation itself), keeps the report as a draft for the owner, and files it as a GitHub issue when the owner sends it (or at once, when the owner
  * chose that). The module's own settings hold the token and that choice; it hands them to the host from its shared
  * part and takes them back when that part closes.
  *
@@ -27,7 +27,7 @@ const settings = {
   sendImmediately: Setting.boolean({
     label: "Send at once",
     description:
-      "File a new report on GitHub without waiting for you to read it. Reports then go out in your name as they are, to a public repository, nobody reading them first: what the assistant said, tool results and the previous conversation included. The tool needs the message class allowed (Shared settings › Risk policy).",
+      "File a new report on GitHub without waiting for you to read it. Reports then go out in your name as they are, to a public repository, nobody reading them first: what the person said for the report, and the device, assistant and voice it was said with. The tool needs the message class allowed (Shared settings › Risk policy).",
     default: false
   })
 }
@@ -92,7 +92,7 @@ export const reportModule = defineModule({
       const file = makeTool({
         name: "report_file",
         description:
-          `File a report about this assistant itself: a problem (something it did wrong or failed to do) or an idea for a new feature. The conversation, the device, the assistant's setup and the server's recent state are attached automatically, so give only what the person said. ${
+          `File a report about this assistant itself: a problem (something it did wrong or failed to do) or an idea for a new feature. The device, the assistant and its voice are attached automatically; the conversation is not, so put what the person said about the problem or the idea in description. ${
             sends ? "It is sent at once as a public GitHub issue in the owner's name." : "It is kept as a draft for the owner to read and send."
           } Answers with a sentence to say.`,
         parameters: Parameters,
@@ -119,7 +119,7 @@ export const reportModule = defineModule({
       return {
         tools: [file],
         instructions:
-          "When the person reports something wrong with the assistant itself, or suggests a feature for it, use report_file. Before you call it, if the report lacks what a developer needs, ask at most two short questions, one per turn: for a problem, what they expected and what they saw or heard instead (the screen is not captured, so ask what was on it when that matters); for a feature, what it should do and when they would use it. Never invent details, keep the person's own words in description, and do not repeat the conversation: it is attached automatically."
+          "When the person reports something wrong with the assistant itself, or suggests a feature for it, use report_file. Before you call it, if the report lacks what a developer needs, ask at most two short questions, one per turn: for a problem, what they expected and what they saw or heard instead (the screen is not captured, so ask what was on it when that matters); for a feature, what it should do and when they would use it. Never invent details, and keep the person's own words in description. The conversation is not attached: never copy what was said or what tools answered into the report beyond what the person said about the problem or the idea."
       }
     })
 })

@@ -13,16 +13,15 @@ request is an owner-approved exception to docs/MODULES.md §18: the module and t
 ## What it does
 
 The way in. A person says "report a problem: the timer didn't ring" or "I have a feature idea …", and the model calls
-`report_file` with what the person said. The module passes that to the core's `Reports` service, which adds everything
-the server knows about the conversation (the transcript with its tool calls, the previous conversation, the turn
-traces, the device, the assistant, the server, its Health issues and recent warnings), keeps the report as a draft and
-answers. The module itself gathers nothing and stores nothing.
+`report_file` with what the person said. The module passes that to the core's `Reports` service, which adds a few
+facts about where it was said (the device's name and kind, the assistant, the voice, the conversation id, the turn, the
+version; never the conversation itself, docs/REPORTS.md "The issue body"), keeps the report as a draft and answers. The module itself gathers nothing and stores nothing.
 
 Before it files, the model may ask **at most two short questions, one per turn**, when the report lacks what a
 developer needs: for a problem, what the person expected and what they saw or heard instead (the screen is not
 captured, so it asks what was on it when that matters); for a feature, what it should do and when they would use it. It
-never invents details, keeps the person's own words in `description`, and does not repeat the conversation (it is
-attached). The instructions say so; a fuller questionnaire for features is left for later.
+never invents details, keeps the person's own words in `description`, and copies nothing else of the conversation into it
+(the conversation is not attached, and the issue is public). The instructions say so; a fuller questionnaire for features is left for later.
 
 ## Tools
 
@@ -54,7 +53,7 @@ The host reads the turn itself (`CurrentTurn`) and gives `Reports` to this modul
 other module can draft, or change the token or the switch.
 
 **Sensitivity**: `household`. The answer names no personal content (a fixed sentence and an issue number). The report
-itself holds the conversation, and stays with the owner until it is sent (docs/REPORTS.md "Privacy").
+holds what the person said for it, and stays with the owner until it is sent (docs/REPORTS.md "Privacy").
 
 There is no typed action: a report's description is free text, which the intent path's `text` parameter cuts from the
 sentence locally, and the questions before filing need the model. The LLM path only.
@@ -64,7 +63,7 @@ sentence locally, and the questions before filing need the model. The LLM path o
 | Setting | Default | What it does |
 |---|---|---|
 | GitHub token (secret) | none | A fine-grained personal access token with Issues: read and write on `ianwijma/personal-voice-assistance`, kept in the key vault. Without it reports are kept, and the admin page opens GitHub's new-issue page to file each one by hand. |
-| Send at once | off | File a new report without waiting for the owner. It goes out as it is, in the owner's name, to a public repository, nobody reading it first: what the assistant said, tool results and the previous conversation included. The tool is then `message`. |
+| Send at once | off | File a new report without waiting for the owner. It goes out as it is, in the owner's name, to a public repository, nobody reading it first: what the person said for the report, and the device, assistant and voice it was said with. The tool is then `message`. |
 
 The shared part hands both to the host (`Reports.configure`) and takes them back when it closes, so the host uses the
 token only while the module runs with it. A report kept while the module ran can still be read, edited, removed and

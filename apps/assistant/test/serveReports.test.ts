@@ -108,8 +108,9 @@ describe("reports in serve mode", () => {
 
     const detail = decodeDetail(await (await api(`reports/${first.id}`)).json())
     expect(detail.body.split("\n")[0]).toBe(`<!-- pva-report v1 kind=problem id=${first.id} -->`)
-    // The test server knows no such device: the report says so.
-    expect(detail.body).toContain("Not available: the device has no voice session now")
+    // The test server knows no such device: the body names none, but the turn's conversation.
+    expect(detail.body).toContain("## Where it was said")
+    expect(detail.body).not.toContain("| Device |")
     expect(detail.bodyFits).toBe(true)
     expect(detail.newIssueUrl).toMatch(/^https:\/\/github\.com\/ianwijma\/personal-voice-assistance\/issues\/new\?title=/)
 
