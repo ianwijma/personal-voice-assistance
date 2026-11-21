@@ -1,5 +1,5 @@
 import type { AudioClientLink } from "@pva/audio-web"
-import { adminModules, type ConnectionRef, type HostDeviceView, type HostResult, makeConnectionRef, type ModuleHost, type NotifyEngine, type PresentEngine, STOP_ACTION, withinModuleFrame } from "@pva/core"
+import { adminModules, type ConnectionRef, type DevicePlayersEngine, type HostDeviceView, type HostResult, makeConnectionRef, type ModuleHost, type NotifyEngine, type PresentEngine, STOP_ACTION, withinModuleFrame } from "@pva/core"
 import {
   type AdminSnapshot,
   type AdminState,
@@ -181,6 +181,10 @@ export interface VoiceConnection {
   readonly send: (message: ServerMessage) => void
   /** What this connection's own page declared last (its hello, then `device.caps`); P10 sends it only the kinds in it. */
   readonly declared?: () => DeviceCapabilities | undefined
+  /** The device's kind as the hello said it (for the device's settings, which depend on it). */
+  readonly kind?: string
+  /** A voice node (a connection that authenticated as one): it has no page, so no player. */
+  readonly node?: boolean
 }
 
 /** What the hub tells the household push (docs/STORING-DATA.md "Pages"). */
@@ -244,6 +248,13 @@ export interface HubOptions {
    * none of it (`close` absent: a close is answered as not possible here).
    */
   readonly present?: Pick<PresentEngine, "reconcile" | "press" | "busyAnswer"> & Partial<Pick<PresentEngine, "close">>
+  /**
+   * The device players (`DevicePlayers`, docs/modules/media.md §4.1): a `media.state` from a voice page that has a device
+   * is `report`ed (never from admin pages or voice nodes, and the report is validated, cleaned and rate-limited there);
+   * a hello or a changed declaration `refresh`es the device; a closed connection is `closed`. Absent: `media.state` is
+   * ignored.
+   */
+  readonly players?: Pick<DevicePlayersEngine, "report" | "refresh" | "closed">
   /** P5: a device's connections, declaration or live state changed (the device facts rebuild their list). */
   readonly onDeviceChange?: () => void
   /**
@@ -866,6 +877,8 @@ export const makeSessionHub = (options: HubOptions): SessionHub => {
     if (client.helloTimer !== undefined) clearTimeout(client.helloTimer)
     if (!clients.delete(client)) return
     if (client.voice !== undefined) options.household?.closed(client.voice)
+    // Its player state goes and what was waiting for it fails (`DevicePlayers`).
+    options.players?.closed(client.connection.id, client.device?.id)
     if (client.capsTimer !== undefined) clearTimeout(client.capsTimer)
     client.capsTimer = undefined
     // A declaration this tab still held back (its coalescing) is the device's, not the tab's: applied now, with its
@@ -1070,9 +1083,13 @@ export const makeSessionHub = (options: HubOptions): SessionHub => {
         id: client.connection.id,
         deviceId: device?.id,
         send: (m) => send(client, m),
-        declared: () => client.ownCaps
+        declared: () => client.ownCaps,
+        ...(device?.kind !== undefined ? { kind: device.kind } : {}),
+        ...(client.nodeId !== undefined ? { node: true } : {})
       }
       if (firstOfDevice) options.household.deviceConnected(device!.id)
+      // A page that declared players is a player page from its hello on (`DevicePlayers` tells its followers).
+      if (device !== undefined && client.nodeId === undefined) options.players?.refresh(device.id)
       // A device the server already knows starts at once; a new one when its registration is written.
       if (device === undefined || registry.known(device.id)) startHousehold(client)
       // P9: the cards of what is open for its device (ringing again where it rang); a new device once it is recorded.
@@ -1522,6 +1539,14 @@ export const makeSessionHub = (options: HubOptions): SessionHub => {
           return { ok: false, error: { code: "busy", message: busy.say }, say: busy.say } as HostResult
         })
       }
+      case "media.state": {
+        // A player page's report (docs/modules/media.md §4.2): only from a voice page with a device that is not a voice
+        // node (an admin page, a node and a page without a device are ignored, as for `device.caps`). Validated,
+        // cleaned and rate-limited by the service, which drops what does not fit; nothing is answered.
+        if (client.role !== "voice" || client.device === undefined || client.nodeId !== undefined || options.players === undefined) return
+        options.players.report(client.connection.id, client.device.id, message)
+        return
+      }
       case "device.caps": {
         // P5: only a voice connection with a device declares (admin pages and pages without a device are ignored).
         // Bounded here, whatever the page does: an empty message is ignored, the latest one wins, at most one is
@@ -1536,6 +1561,7 @@ export const makeSessionHub = (options: HubOptions): SessionHub => {
           // P10: this page's own kinds, at once (the device's declaration follows, coalesced).
           client.ownCaps = message.capabilities
           options.present?.reconcile(client.device.id)
+          if (client.nodeId === undefined) options.players?.refresh(client.device.id)
         }
         if (message.live !== undefined) pending.live = message.live
         client.capsPending = pending

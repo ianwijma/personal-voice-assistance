@@ -745,6 +745,8 @@ const server: ServerHandlers = {
   "present.show": (s, m) => withPresentation(s, m.presentation),
   "present.update": (s, m) => withPresentation(s, m.presentation),
   "present.dismiss": (s, m) => (s.presentations.some((p) => p.id === m.id) ? { ...s, presentations: s.presentations.filter((p) => p.id !== m.id) } : s),
+  // Additive within 12 (docs/modules/media.md): the player page is a later step; until then a command changes nothing here.
+  "media.command": (s) => s,
   // Protocol 12 (docs/VOICE-NODES.md §7.4): `node.command` goes to a node, never to a page.
   "node.command": (s) => s,
   // A code was redeemed: the Add voice node dialog showing it moves on to "paired".

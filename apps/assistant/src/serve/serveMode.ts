@@ -5,6 +5,7 @@ import {
   LlmError,
   makeModuleHost,
   makeNotifyEngine,
+  makeDevicePlayers,
   makePresentEngine,
   type NotDelivered,
   notifyLanguageOf,
@@ -139,7 +140,7 @@ import { makeVoiceSessions, type VoiceSessions } from "./VoiceSessions.ts"
 import { makeRoutingService, ROUTING_KEYS } from "./routing.ts"
 import { openServeHousehold } from "./household.ts"
 import { makeHouseholdPush } from "./HouseholdPush.ts"
-import { DeviceControl, Devices, hostEvent, makeIssueRegistry, oneLine, People, phraseLanguageOf, Privacy, Reports, SessionControl, withContextProvider } from "@pva/core"
+import { DeviceControl, DevicePlayers, Devices, hostEvent, makeIssueRegistry, oneLine, People, phraseLanguageOf, Privacy, Reports, SessionControl, withContextProvider } from "@pva/core"
 import { ringingWithoutWake } from "@pva/protocol"
 import { makeReplyVolumes, makeServePhrases } from "./phraseCommands.ts"
 import { openServeScheduler } from "./scheduler.ts"
@@ -506,6 +507,18 @@ export const startServe = (options: ServeOptions): Effect.Effect<ServeHandle, Ht
       language: () => notifyLanguageOf(sections.value("HOME_LANGUAGE")),
       log: logInfo
     })
+    // The device players (`DevicePlayers`, docs/modules/media.md §4.1): a module's commands to a page's player and the
+    // page's reports back. The pages (the hub) are bound once they exist; a connection is a page of the device that said
+    // hello, not a voice node, with the sources its own declaration names minus what the owner took away.
+    const devicePlayers = yield* makeDevicePlayers({
+      connections: (deviceId) =>
+        hub === undefined ? [] : hub.voiceConnections().filter((c) => c.deviceId === deviceId && c.node !== true).map((c) => ({
+          id: c.id,
+          send: c.send,
+          sources: () => deviceFacts.mediaOf(deviceId, c.kind, c.declared?.())
+        })),
+      log: logInfo
+    })
     // Reports (docs/REPORTS.md): the core's `Reports` for the report module, kept in the household store; what a report
     // gathers is read when it is drafted (the sessions, assistants and Health issues are bound by then).
     const startedAt = Date.now()
@@ -545,6 +558,7 @@ export const startServe = (options: ServeOptions): Effect.Effect<ServeHandle, Ht
         People.of(people),
         Privacy.of(deviceFacts.privacy),
         Devices.of(deviceFacts.devices),
+        DevicePlayers.of(devicePlayers.service),
         SessionControl.of({
           stopReply: (deviceId) => Effect.suspend(() => sessionsRef?.get(deviceId)?.control.stopReply ?? Effect.succeed(false)),
           cancelPending: (deviceId) => Effect.suspend(() => sessionsRef?.get(deviceId)?.control.cancelPending ?? Effect.succeed(false)),
@@ -800,7 +814,6 @@ export const startServe = (options: ServeOptions): Effect.Effect<ServeHandle, Ht
       language: () => phraseLanguageOf(sections.value("HOME_LANGUAGE")),
       notify,
       ringingAllowed: (deviceId) => ringingWithoutWake(deviceSettingsOf(deviceId).place),
-      room: (deviceId) => deviceFacts.originOf(deviceId).room,
       volume: replyVolumes.service,
       log: (line) => runFork(Effect.logInfo(line))
     })
@@ -1722,6 +1735,7 @@ export const startServe = (options: ServeOptions): Effect.Effect<ServeHandle, Ht
     })
     hub = makeSessionHub({
       household: push.hooks,
+      players: devicePlayers,
       notify,
       // P7: a voice page of a device whose reply volume is not the default is told it after its welcome.
       replyVolume: replyVolumes.levelOf,

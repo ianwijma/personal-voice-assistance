@@ -726,6 +726,31 @@ export const clientExamples: { readonly [T in ClientMessageType]: Extract<Client
   "present.action": { type: "present.action", requestId: "p1", id: "p-7c1d", revision: "show-1:1", action: "tick", item: "milk", done: true },
   // Additive within 12: the viewer closed a presentation marked `closable` (its close button, or Escape).
   "present.close": { type: "present.close", requestId: "p2", id: "p-7c1d", revision: "show-1:1" },
+  // Additive within 12: the page's player state (docs/modules/media.md §4.2).
+  "media.state": {
+    type: "media.state",
+    ack: 3,
+    wants: [{ source: "spotify", what: "credential" }],
+    state: {
+      players: [{ source: "spotify", ready: true, playerId: "9c1f0a5be1c4" }, { source: "youtube", ready: true }],
+      current: {
+        source: "spotify",
+        status: "playing",
+        title: "Feeling Good",
+        artist: "Nina Simone",
+        album: "I Put a Spell on You",
+        artUrl: "https://i.scdn.co/image/ab67616d0000b273",
+        link: "https://open.spotify.com/track/7KXjTSCq5nL1LoYtL7XAwS",
+        ref: "spotify:track:7KXjTSCq5nL1LoYtL7XAwS",
+        durationMs: 175_000,
+        positionMs: 12_500,
+        volume: 0.6,
+        canNext: true,
+        canPrevious: true
+      },
+      visible: true
+    }
+  },
   ...assistantsClientExamples,
   ...nodeClientExamples
 }
@@ -912,6 +937,20 @@ export const serverExamples: { readonly [T in ServerMessageType]: Extract<Server
     }
   },
   "present.dismiss": { type: "present.dismiss", id: "p-7c1d" },
+  // Additive within 12: one command to the page's player (docs/modules/media.md §4.2).
+  "media.command": {
+    type: "media.command",
+    seq: 4,
+    command: {
+      type: "open",
+      source: "youtube",
+      ref: "dQw4w9WgXcQ",
+      kind: "video",
+      title: "How to Sharpen a Knife",
+      autoplay: true,
+      talk: { mode: "pause", level: 0.2 }
+    }
+  },
   ...assistantsServerExamples,
   ...nodeServerExamples
 }

@@ -1,5 +1,6 @@
 import { Schema } from "effect"
 import { NonNegativeFinite } from "./common.ts"
+import { MAX_MEDIA_PLAYERS, MediaSource } from "./media.ts"
 
 /**
  * What a device can do, where it is and for whom (docs/MODULES-PLAN.md §4 P5; presentation-and-device-capabilities.md
@@ -60,7 +61,12 @@ export const DeviceCapabilities = Schema.Struct({
   speaker: Schema.optionalKey(Schema.Struct({ media: Schema.Array(Schema.Literals(["speech", "audio", "video"])).check(Schema.isMaxLength(3)) })),
   microphone: Schema.optionalKey(Schema.Struct({ farField: Schema.Boolean })),
   /** It can open a link in a browser (a phone tab). */
-  openUrl: Schema.optionalKey(Schema.Boolean)
+  openUrl: Schema.optionalKey(Schema.Boolean),
+  /**
+   * Additive within protocol 12 (docs/modules/media.md §4.2): the sources its page can play ("spotify", "youtube"; opaque
+   * slugs), at most `MAX_MEDIA_PLAYERS`. Absent = cannot: the server sends it no `media.command`.
+   */
+  media: Schema.optionalKey(Schema.Struct({ players: Schema.Array(MediaSource).check(Schema.isMaxLength(MAX_MEDIA_PLAYERS)) }))
 })
 export type DeviceCapabilities = typeof DeviceCapabilities.Type
 
@@ -139,6 +145,8 @@ export const effectiveCapabilities = (declared: DeviceCapabilities | undefined, 
   if (declared.speaker !== undefined && !overrides.noSpeaker) out.speaker = declared.speaker
   if (declared.microphone !== undefined) out.microphone = declared.microphone
   if (declared.openUrl === true) out.openUrl = true
+  // A player needs somewhere to show and something to play with: taking the display or the speaker away takes it too.
+  if (declared.media !== undefined && display !== undefined && !overrides.noSpeaker) out.media = declared.media
   return out
 }
 

@@ -134,7 +134,6 @@ describe("@pva/module-music", () => {
         assert.deepStrictEqual(yield* kit.action("pause", { where: "same speaker" }, K()), { ok: true, say: "same speaker has more than one player: Same speaker and Same speaker. Which one?" })
         // The area Garage has no player; two players are named Garage.
         assert.deepStrictEqual(yield* kit.action("pause", { where: "garage" }, K()), { ok: true, say: "garage has more than one player: Garage and Garage. Which one?" })
-        assert.strictEqual((yield* Effect.flip(kit.service(Playback)!.pause("Same speaker"))).reason, "no_player")
         // Past the 200th: one ordinary, one Music Assistant's, and a third: all three counted.
         const many = Array.from({ length: 260 }, (_, i) =>
           player(`media_player.p_${String(i).padStart(3, "0")}`, { name: [0, 250, 255].includes(i) ? "Same speaker" : `Player ${i}`, ...(i === 250 ? { attributes: MASS } : {}) })
@@ -737,94 +736,6 @@ describe("@pva/module-music", () => {
       }))
   })
 
-  describe("Playback, for the host's stop and volume", () => {
-    it.effect("the host's \"stop\" pauses what plays in the device's room, and does nothing where nothing plays", () =>
-      Effect.gen(function*() {
-        const ha = makeHa()
-        const kit = yield* start(ha)
-        const stop = yield* kit.phrases.say("stop", KITCHEN)
-        assert.isTrue(stop.taken && stop.by === "control" && stop.outcome.did === "paused-media")
-        assert.deepStrictEqual(sent(ha), ["media_player.media_pause media_player.kitchen_speaker"])
-        const bedroom = yield* kit.phrases.say("stop", PHONE)
-        assert.isTrue(bedroom.taken && bedroom.outcome.did === "nothing")
-        assert.strictEqual(ha.calls.length, 1)
-      }))
-
-    it.effect("pause answers whether it paused; an unknown state does nothing; a room without a player is no_player", () =>
-      Effect.gen(function*() {
-        const ha = makeHa()
-        const kit = yield* start(ha)
-        const playback = kit.service(Playback)!
-        assert.isTrue(yield* playback.pause("kitchen"))
-        assert.isFalse(yield* playback.pause("Bedroom"))
-        ha.set("media_player.kitchen_speaker", { state: "unknown" })
-        assert.isFalse(yield* playback.pause("Kitchen"))
-        assert.strictEqual((yield* Effect.flip(playback.pause("Garage"))).reason, "no_player")
-        assert.strictEqual((yield* Effect.flip(playback.pause("Attic"))).reason, "no_player")
-        assert.strictEqual((yield* Effect.flip(playback.pause("Hall"))).reason, "no_player")
-        for (const room of ["", " ", "x".repeat(61), "a\nb"]) assert.strictEqual((yield* Effect.flip(playback.pause(room))).reason, "invalid")
-        assert.deepStrictEqual(sent(ha), ["media_player.media_pause media_player.kitchen_speaker"])
-        const early = yield* start(makeHa({ areas: [], entities: [] }, "unknown"))
-        assert.isFalse(yield* early.service(Playback)!.pause("Kitchen"))
-      }))
-
-    it.effect("changeVolume: `to` sends exactly that level and answers it; `by` is always unknown_level and sends nothing", () =>
-      Effect.gen(function*() {
-        const ha = makeHa()
-        const kit = yield* start(ha)
-        const playback = kit.service(Playback)!
-        assert.strictEqual(yield* playback.changeVolume("Kitchen", { to: 0.255 }), 0.255)
-        assert.strictEqual(yield* playback.changeVolume("Bedroom", { to: 0 }), 0)
-        assert.deepStrictEqual(ha.calls.map((c) => c.data), [{ volume_level: 0.255 }, { volume_level: 0 }])
-        for (const by of [0.1, -0.5, 0.005, 1, -1]) assert.strictEqual((yield* Effect.flip(playback.changeVolume("Kitchen", { by }))).reason, "unknown_level", String(by))
-        assert.strictEqual(ha.calls.length, 2)
-        for (const change of [{ to: 1.5 }, { to: -0.1 }, { by: 2 }, { by: Number.NaN }, { to: Number.POSITIVE_INFINITY }]) {
-          assert.strictEqual((yield* Effect.flip(playback.changeVolume("Kitchen", change))).reason, "invalid", JSON.stringify(change))
-        }
-        assert.strictEqual((yield* Effect.flip(playback.changeVolume("Garage", { to: 0.5 }))).reason, "no_player")
-        ha.answer(() => Effect.fail(new HomeAssistantError({ reason: "timeout", detail: "test" })))
-        assert.strictEqual((yield* Effect.flip(playback.changeVolume("Kitchen", { to: 0.5 }))).reason, "timeout")
-        ha.answer(() => Effect.fail(new HomeAssistantError({ reason: "not_connected", detail: "test" })))
-        assert.strictEqual((yield* Effect.flip(playback.changeVolume("Kitchen", { to: 0.5 }))).reason, "failed")
-        assert.strictEqual((yield* Effect.flip(playback.pause("Kitchen"))).reason, "failed")
-      }))
-
-    it.effect("the provider lost after the pause was sent is a failure, never 'nothing was playing'; the host's stop says it couldn't", () =>
-      Effect.gen(function*() {
-        const ha = makeHa()
-        const kit = yield* start(ha)
-        ha.answer(stopped)
-        const e = yield* Effect.flip(kit.service(Playback)!.pause("Kitchen"))
-        assert.instanceOf(e, PlaybackError)
-        assert.strictEqual(e.reason, "failed")
-        assert.strictEqual((yield* Effect.flip(kit.service(Playback)!.changeVolume("Kitchen", { to: 0.4 }))).reason, "failed")
-        const stop = yield* kit.phrases.say("stop", KITCHEN)
-        assert.isTrue(stop.taken && stop.outcome.did === "failed")
-        assert.strictEqual(sent(ha).filter((s) => s.startsWith("media_player.media_pause")).length, 2)
-      }))
-
-    it.effect("with the smart-home module off before anything is sent, pause knows no state and does nothing (false); changeVolume fails", () =>
-      Effect.gen(function*() {
-        const kit = yield* startTestModule(musicModule)
-        assert.isFalse(yield* kit.service(Playback)!.pause("Kitchen"))
-        const e = yield* Effect.flip(kit.service(Playback)!.changeVolume("Kitchen", { to: 0.5 }))
-        assert.instanceOf(e, PlaybackError)
-        assert.strictEqual(e.reason, "failed")
-        const stop = yield* kit.phrases.say("stop", KITCHEN)
-        assert.isTrue(stop.taken && stop.outcome.did === "nothing")
-      }))
-
-    it.effect("a pause that fails is a failure, and the host's stop says it couldn't stop it", () =>
-      Effect.gen(function*() {
-        const ha = makeHa()
-        const kit = yield* start(ha)
-        ha.answer(() => Effect.fail(new HomeAssistantError({ reason: "not_connected", detail: "test" })))
-        assert.strictEqual((yield* Effect.flip(kit.service(Playback)!.pause("Kitchen"))).reason, "failed")
-        const stop = yield* kit.phrases.say("stop", KITCHEN)
-        assert.isTrue(stop.taken && stop.outcome.did === "failed")
-      }))
-  })
-
   describe("settings, health, restart", () => {
     it.effect("refuses settings that cannot be right: a player that is not a media player, a room twice, an empty or long room", () =>
       Effect.gen(function*() {
@@ -855,15 +766,14 @@ describe("@pva/module-music", () => {
         assert.deepStrictEqual(yield* (yield* start(ha, { settings: { useAreas: false, players: [{ room: "Kitchen", player: "media_player.kitchen_speaker" }] } })).checkHealth, [])
       }))
 
-    it.effect("offers its tools and actions while on; works again after a restart; withdraws Playback when stopped", () =>
+    it.effect("offers its tools and actions while on; works again after a restart; provides no Playback", () =>
       Effect.gen(function*() {
         const ha = makeHa()
         const kit = yield* start(ha)
         assert.deepStrictEqual([...kit.toolNames()].sort(), ["music_next", "music_now_playing", "music_pause", "music_play", "music_previous", "music_resume", "music_volume"])
         yield* kit.restart
         assert.deepStrictEqual(yield* kit.action("volume", { change: "up" }, K()), { ok: true, say: "Turned Kitchen speaker up a step." })
-        assert.isDefined(kit.service(Playback))
-        yield* kit.stop
+        // The media module provides `Playback` now (docs/modules/media.md §4.3); music no longer does.
         assert.isUndefined(kit.service(Playback))
       }))
 

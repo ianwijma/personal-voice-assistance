@@ -296,6 +296,18 @@ describe("device facts", () => {
     expect(facts.privacy.mayReveal("p-sam00001", "never-seen")).toBe(false)
   })
 
+  it("mediaOf: the sources a page declared, minus what the owner took away (no display or no speaker takes the players too)", () => {
+    const screen = tablet.display!
+    const withMedia = (extra: Json = {}) => ({ v: 1, display: screen, speaker: { media: ["speech", "audio"] }, media: { players: ["spotify", "youtube"] }, ...extra }) as never
+    expect(facts.mediaOf("kitchen-01", WEB_VOICE_KIND, withMedia())).toEqual(["spotify", "youtube"])
+    expect(facts.mediaOf("kitchen-01", WEB_VOICE_KIND, undefined)).toEqual([])
+    expect(facts.mediaOf("kitchen-01", WEB_VOICE_KIND, { v: 1, display: screen } as never)).toEqual([])
+    // The TV has "no display" saved: the page's declaration does not bring its players back.
+    expect(facts.mediaOf("tv-0000001", WEB_VOICE_KIND, withMedia())).toEqual([])
+    // A page that never declared a display cannot show a player.
+    expect(facts.mediaOf("kitchen-01", WEB_VOICE_KIND, { v: 1, media: { players: ["spotify"] } } as never)).toEqual([])
+  })
+
   it("Devices: effective capabilities, connected, and the best other screen; an override removes the TV's screen", () => {
     expect(facts.devices.get("tv-0000001")!.capabilities.display).toBeUndefined()
     expect(facts.devices.get("tv-0000001")!.declared!.capabilities.display).toBeDefined()

@@ -30,7 +30,6 @@ const portsFor = (over: Omit<Partial<PhrasePorts>, "session"> & { readonly sessi
     notify: () => undefined,
     volume: () => Effect.succeed({ level: 1, atLimit: true }),
     playback: () => undefined,
-    room: () => undefined,
     gateway: () => makeExecutionGateway(),
     turn: (assistant) => ({ turnId: ++turns, conversationId: "c-1", assistantId: assistant, source: "phrase", deviceId: "kitchen-display", person: { id: "p-sam", name: "Sam" } }) as never,
     isPublished: () => true,
@@ -113,11 +112,11 @@ describe("a3: once stop selected a step, a failure to stop it is said, and nothi
       assert.deepStrictEqual(calls, [])
     }))
 
-  it.effect("media whose pause fails or times out: said as a failure; no player for the room is nothing to stop", () =>
+  it.effect("media whose pause fails or times out: said as a failure; no player on the device is nothing to stop", () =>
     Effect.gen(function*() {
       const playback = (pause: PlaybackService["pause"]): PlaybackService => ({ pause, changeVolume: () => Effect.succeed(undefined) }) as never
       const run = (pause: PlaybackService["pause"]) => {
-        const p = portsFor({ playback: () => playback(pause), room: () => "Kitchen" })
+        const p = portsFor({ playback: () => playback(pause) })
         return Effect.map(runTaken(control("stop"), p.ports), (out) => [out.did, out.said])
       }
       assert.deepStrictEqual(yield* run(() => Effect.fail(new PlaybackError({ reason: "failed", detail: "player offline" }))), ["failed", `I couldn't stop that. ${interrupting}`])

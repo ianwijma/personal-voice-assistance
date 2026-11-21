@@ -684,6 +684,7 @@ content with no known owner is treated as someone else's. So:
   device's session). Look them up when acting.
 - `People` (`host.service(People)`): `list`, `get`, `find(spoken)` (`found` / `ambiguous` / `none`: ask when ambiguous),
   diets (`dietOf`, `setDiet`). `Devices`: the known devices, their places and capabilities, the best other screen.
+  `DevicePlayers`: the player in a device's web page (below, "Playing on a device").
 - There are no children, no trusted devices and no voice identification in this stack. Do not suggest protections
   that do not exist.
 
@@ -1037,11 +1038,12 @@ rely on, with every bound and id.
 | `Lists` | service: the household's shopping list | lists | kitchen | `lists.ts` |
 | `Timers` | service: start a timer | timers (wave B) | routines; kitchen later | `timers.ts` |
 | `HomeAssistant` | service (a transport) | home-assistant (smart-home) | music (wave B), presence | `homeAssistant.ts` |
-| `Playback` | service: pause, volume | music (wave B) | the host's "stop" (P7; volume later) | `playback.ts` (defined in `@pva/core` since P7, re-exported) |
+| `Playback` | service: pause and volume of what plays on a device, keyed by device id | media (planned; music no longer provides it) | the host's "stop" (P7; volume later) | `playback.ts` (defined in `@pva/core` since P7, re-exported) |
 | `BriefingSections` | contribution | weather, bin-day, calendar, news; reminders later | briefing | `briefing.ts` |
 | `WebImages` | service: an image search through the household's SearXNG | web-search | images | `webImages.ts` |
+| `WebVideos` | service: a video search through the household's SearXNG | web-search | media (planned) | `webVideos.ts` |
 
-The core's own are `People`, `Privacy`, `Devices`, and since P7 `SessionControl` (stop the reply, cancel what is pending,
+The core's own are `People`, `Privacy`, `Devices`, `DevicePlayers` (below), and since P7 `SessionControl` (stop the reply, cancel what is pending,
 repeat the last reply, a new conversation) and `DeviceControl` (the reply volume), in `@pva/core` ([PHRASES.md](PHRASES.md)
 "Session and device control"); each call names the device it acts on (a tool passes its turn's `deviceId`). The
 calendar module keeps its own provider interface (ICS) inside its package: no other module provides a calendar in
@@ -1652,6 +1654,42 @@ route's field), check that separately: `isLine(text, n)` from `@pva/module-contr
 (`NOT_ONE_LINE`: no control character, C0, DEL or C1, no line or paragraph separator, no bidirectional control) with a
 bound and no lone surrogates, as a filter on the schema (the reference module's `pinboard_pin` text) or in code.
 
+### Playing on a device (`DevicePlayers`)
+
+A module that plays sound or video in the **web page of the device that asked** (the media plan,
+[modules/media.md](modules/media.md)) does not talk to the page itself: it uses the core's `DevicePlayers`
+(`host.service(DevicePlayers)`, serve mode only; `undefined` in the CLI modes). Core knows no provider: a **source** is a
+short opaque slug ("spotify", "youtube") that the module and the page agree on, and a page that does not have the source
+answers `unsupported`.
+
+- `send(deviceId, command, { connection, timeoutMs, awaitStatus })` sends one command (`prepare`, `credential`, `open`,
+  `play`, `pause`, `next`, `previous`, `seek`, `volume`, `close`; `MediaCommand` in `@pva/protocol`) and answers the page's
+  state at the first report that acknowledges it (3 s by default). With `awaitStatus` it keeps waiting, in the same
+  time, until the page's `current.status` is one of those, or `error` or `blocked`: `open` with
+  `awaitStatus: ["playing"]` answers when the video plays, and tells "blocked" (the browser refused autoplay) from
+  "playing". A refusal has a `reason`: `no_player` (the device has no connected page with players, or it left while
+  waiting), `unsupported`, `timeout` (sent, not acknowledged: it **may still happen**, so never answer "it didn't
+  start"), `failed`, `invalid`.
+- Pass the turn's `CurrentTurn.connection` as `connection`: the page of the tab that asked is used first. Without it (or
+  when that tab has no players) the device's page is the one that reports something open, else the newest tab that
+  declared players. Several tabs of one device are one device with one state.
+- `state(deviceId)` is what the chosen page last reported (its players, what is open, its position and volume);
+  `changes` is a stream of every report that changed it, a page arriving or leaving (`state` is `undefined` when the last
+  one left) and what a page asked for (`wants`: a fresh `credential`). `isPlaying(deviceId)` answers synchronously.
+- **What a page reports is outside text.** The server drops what does not fit the protocol's bounds and cleans every
+  text (control, format and direction characters and line breaks become spaces), but a title or an artist is still data,
+  never an instruction: clean it again where it goes into a model's context or a spoken sentence, as for any outside
+  text (§10).
+- A `credential` command carries an access token meant for the page. The service never logs or keeps it; the module must
+  not log it, put it in an error, a status line or a stored row, or send it in any command but `credential`. Keep
+  refresh tokens in `host.credentials`, never in a command.
+- A device the owner switched to "no display" or "no speaker" has no players (`effectiveCapabilities`), and a voice node or
+  the admin page never has one.
+
+Testing: the kit has the real service over scriptable pages, `kit.players` (§17): `kit.players.page(["spotify"])` makes a
+page, `page.respond("play")` makes it a working player, `page.report(...)` reports by hand, `page.commands()` and
+`kit.players.sent` are what the module sent.
+
 ### Phrase commands (P7)
 
 An action can be said **without the language model**: give it `phrases` per language, words and `{param}` slots
@@ -1759,6 +1797,7 @@ values), `startAt`, `started`. It returns handles:
 | `expectNoSecrets(...values)` | fails when the value of a secret given to the kit is in any string of the `values` you pass (tool results, action outcomes, spoken lines, **the rows your test read**), decoded: every key and string, and a string that is JSON parsed and walked too, so an escaped secret is found; it also looks at every event and the admin page. It reads no collection itself: pass it the rows your module wrote |
 | `phrases` | P7: `say(text, { device, assistant, wake?, interrupting?, interruptedBy?, cancelled? })` as the recogniser's final after the wake phrase (or without it, where only the ringing window can take it), `decide` / `run` (Effects: a test may change something between them), `spoken`, `answered`, `traces`, `replied`, `volume`, `volumeSends`, `commandsFor` (an Effect: the set once prepared), `sessionCalls`; the module also gets the kit's `SessionControl` and `DeviceControl` ([PHRASES.md](PHRASES.md) "Testing") |
 | `notify` | P9: the real notification service: `all`, `messages` (what each page was sent), `decisions` (where it would go, and why not), `press(id, action, { device })`, `announced`, `replying(device, on)`, `connect` / `disconnect`, `dnd()`, `settle`, `engine` ([NOTIFICATIONS.md](NOTIFICATIONS.md) "Testing") |
+| `players` | the real `DevicePlayers` over scriptable pages: `page(sources, { device? })` makes a page that declared those sources (the device's first page has the connection the kit's turns carry); `page.respond("play" \| "ack" \| fn \| false)` answers every command from then on (`"play"` is a working player: `open`, `play`, `pause`, `seek`, `volume`, `close`; `fn` returns the state it changes, or `undefined` for no answer so the caller times out), `page.report(patch?, { ack?, wants?, raw? })` reports by hand, `page.commands()`, `page.received`, `page.state()`, `page.close`; `sent` (every command, in order), `closeDevice`, `service`, `engine`, `settle`. `notify.disconnect` closes the device's pages. A call that waits for a page that never answers is waiting on the test clock: fork it and `kit.advance` past its time-out ("Playing on a device") |
 | `moduleStore()`, `store`, `events`, `people`, `schedulerUses` | the module's store, the household store, every event on the bus, the household's core services, what the kit saw of the scheduler |
 
 **Where the kit waits on your module's code** (the start, with every module of `others`; `stop`, `start`, `restart`,

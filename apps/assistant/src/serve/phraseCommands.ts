@@ -40,8 +40,6 @@ export interface ServePhrasesOptions {
   readonly notify: Pick<NotifyEngine, "ringingOn" | "stopRinging" | "stopSpeech" | "press">
   /** The device's "while ringing" setting now (`place.ringingWithoutWake`, default on). */
   readonly ringingAllowed: (deviceId: string) => boolean
-  /** The device's room now, if it has one. */
-  readonly room: (deviceId: string) => string | undefined
   readonly volume: DeviceControlService
   readonly log: (line: string) => void
   /** One preparation step's yield (tests). Default: a macrotask. */
@@ -106,7 +104,6 @@ export const makeServePhrases = (options: ServePhrasesOptions): Effect.Effect<Se
         notify: () => options.notify,
         volume: (direction) => (deviceId === undefined ? Effect.succeed<VolumeChange>({ level: REPLY_VOLUME.default, atLimit: true }) : options.volume.changeReplyVolume(deviceId, direction)),
         playback: () => options.host.service(Playback),
-        room: () => (deviceId === undefined ? undefined : options.room(deviceId)),
         gateway: () => options.host.gateway,
         isPublished,
         pageText: (moduleId, text, max) => options.host.pageText(moduleId, text, max)

@@ -108,6 +108,12 @@
  * `PresentPageTexts.close`. An older server never marks one closable, so a newer page never sends it there (an
  * older server would ignore it as `Unknown` anyway); an older page ignores the keys and never sends it. No closed set
  * the decoder checks gains a member, so the version stays 12.
+ * Additive within 12 (docs/modules/media.md §4.1, §4.2): `media.command` (server → a voice connection that declared
+ * players: one command to the page's player, numbered by `seq`), `media.state` (a request-less report a newer page
+ * sends: its players and what is open, `ack` of the last command handled, `wants`) and the optional
+ * `DeviceCapabilities.media.players` (the sources its page can play, opaque slugs). A page that does not know them
+ * ignores them and, declaring no players, is sent none; an older server ignores `media.state` as `Unknown`. A source is
+ * an open string, so no closed set the decoder checks gains a member, and the version stays 12.
  */
 export const PROTOCOL_VERSION = 12
 

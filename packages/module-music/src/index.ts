@@ -1,4 +1,4 @@
-import { ActionError, CurrentTurn, defineAction, defineModule, makeTool, type ModuleDefinition, Param, Playback, Setting, ToolError } from "@pva/core"
+import { ActionError, CurrentTurn, defineAction, defineModule, makeTool, type ModuleDefinition, Param, Setting, ToolError } from "@pva/core"
 import { homeLanguage, isLine } from "@pva/module-contracts"
 import { Effect, Schema } from "effect"
 import { Answer, type Control, type Kind, makeControl, QUERY_CHARS, type Queue, type Transport } from "./control.ts"
@@ -11,8 +11,8 @@ export { texts }
 
 /**
  * Music per room through the media players of the owner's Home Assistant (Music Assistant's players among them):
- * play by name, pause, resume, next, previous, volume, what is playing; and the `Playback` service for the host's
- * "stop". Route 1 of docs/research/modules/music.md only; docs/modules/music.md says what it does and what is left out.
+ * play by name, pause, resume, next, previous, volume, what is playing. It no longer provides `Playback` (the media
+ * module replaces it: docs/modules/media.md §4.3). Route 1 of docs/research/modules/music.md only; docs/modules/music.md says what it does and what is left out.
  */
 
 /** The most rooms the owner's table names. */
@@ -124,7 +124,7 @@ export const musicModule = defineModule({
   shared: (ctx) =>
     Effect.gen(function*() {
       const control = yield* makeControl(ctx.host, { players: ctx.settings.players ?? [], useAreas: ctx.settings.useAreas ?? true })
-      return { value: control, services: [Playback.of(control.playback)] }
+      return { value: control }
     }),
   start: (ctx) =>
     Effect.sync(() => {

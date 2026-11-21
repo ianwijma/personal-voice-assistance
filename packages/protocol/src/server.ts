@@ -23,6 +23,7 @@ import { ConversationId, ConversationReason, SessionInfo, SessionKey } from "./s
 import { HealthInfo } from "./health.ts"
 import { HouseholdEventMessage, HouseholdGapMessage, HouseholdSnapshotMessage } from "./household.ts"
 import { NotificationResolvedMessage, NotificationRingMessage } from "./notifications.ts"
+import { MediaCommandMessage } from "./media.ts"
 import { PresentDismissMessage, PresentShowMessage, PresentUpdateMessage } from "./presentation.ts"
 import { OutputVolumeMessage } from "./volume.ts"
 import { FieldActionResult } from "./settings.ts"
@@ -414,7 +415,7 @@ export const HealthMessage = Schema.Struct({
 
 /**
  * Every server message. `Schema.toTaggedUnion`'s type-level utilities recurse once per member and exceed the compiler's
- * instantiation depth beyond 47 members (protocol 12 has 49), so the utilities are added at run time as before but typed
+ * instantiation depth beyond 47 members (protocol 12 has 50), so the utilities are added at run time as before but typed
  * by hand: the union, its `tag`, `discriminants` and `cases` (`match`, `guards` and `isAnyOf` exist but are untyped;
  * nothing uses them on this union).
  */
@@ -465,6 +466,7 @@ const ServerMessageUnion = Schema.Union([
   PresentShowMessage,
   PresentUpdateMessage,
   PresentDismissMessage,
+  MediaCommandMessage,
   NodeCommand,
   NodePaired,
   NodeMeter

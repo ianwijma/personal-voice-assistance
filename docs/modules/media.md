@@ -97,37 +97,68 @@ Checked on 2026-11-21 against the providers' own pages unless marked.
 Each is the smallest thing that makes the module possible. They are host changes, so they need the owner's approval
 as the Reports service did (docs/MODULES.md §18).
 
-**4.1 `DevicePlayers` (core service, `packages/core`).** The module's way to a page's player, and the page's way back.
+**4.1 `DevicePlayers` (core service, `packages/core/src/DevicePlayers.ts`).** The module's way to a page's player, and
+the page's way back. Built in step 2; the contract is that file's documentation.
 
 ```ts
 interface DevicePlayersService {
-  /** What the device's page last reported, or `undefined` when it has no player. */
-  readonly state: (deviceId: string) => Effect<PlayerState | undefined>
-  /** Sends a command and waits for the page's next report (at most `ackTimeoutMs`). */
-  readonly send: (deviceId: string, command: PlayerCommand) => Effect<PlayerState, PlayerError>
-  /** Reports as they arrive (ended, error, paused by touch, closed). */
-  readonly changes: Stream<{ deviceId: string; state: PlayerState }>
+  /** The device's last reported state; `undefined` when no connected page of that device declared players. */
+  readonly state: (deviceId: string) => Effect<DevicePlayerState | undefined>
+  /** Sends one command to the device's player page and waits (at most `timeoutMs`, default 3 s) for the first report that acknowledges it. */
+  readonly send: (deviceId: string, command: MediaCommand, options?: {
+    timeoutMs?: number; connection?: ConnectionRef; awaitStatus?: ReadonlyArray<MediaStatus>
+  }) => Effect<DevicePlayerState, DevicePlayerError>
+  /** Every report that changed a device's state, and a player page arriving or leaving (`state` undefined on the last one's disconnect). */
+  readonly changes: Stream<{ deviceId: string; connection: ConnectionRef; state: DevicePlayerState | undefined; wants?: ReadonlyArray<MediaWant> }>
+  /** Synchronous and cheap: the chosen page says `playing` and reported within a minute (the media guard's door, §6). */
+  readonly isPlaying: (deviceId: string) => boolean
 }
 ```
 
-- `PlayerCommand`: `open { source, ref, title, … }`, `play`, `pause`, `next`, `previous`, `seek`, `volume`, `duck`,
-  `close`, and `token` (a fresh Spotify access token for the SDK).
-- `PlayerState`: source (`spotify` | `youtube` | none), status (`loading`, `playing`, `paused`, `ended`, `blocked`,
-  `error`), what is playing (title, artist, art address, duration, position), volume, the Spotify device id once the
-  SDK is ready, and an error code.
-- `source` is an open string on the wire and a closed list in the page: a page that does not know a source answers
-  `error: unsupported`. Core never imports a provider.
+- `DevicePlayerError.reason`: `no_player` (device unknown, not connected, no page with players; also a page that left
+  while the command waited), `unsupported` (the page lacks that source), `timeout` (sent, not acknowledged: it may still
+  happen), `failed`, `invalid`.
+- `awaitStatus`: after the acknowledgement `send` keeps waiting, in the same time, until `current.status` is one of
+  those or `error` or `blocked`: the module waits for `playing` after `open`. A status counts only after the
+  acknowledgement.
+- **Which page** (a device may have several tabs): the connection the caller passes (`CurrentTurn.connection`) if it
+  declared players; else the connection that reports something open (the latest report if several); else the newest
+  connection that declared players. One state per device: its chosen page's. `prepare` is sent with the sources that page
+  has (`unsupported` when none).
+- `MediaCommand`: `prepare { sources: [{ source, config? }] }`, `credential { source, token, expiresAtMs }`,
+  `open { source, ref?, kind?, title?, subtitle?, artUrl?, link?, startAtMs?, autoplay, talk: { mode, level } }`, `play`,
+  `pause`, `next`, `previous`, `seek { toMs } | { byMs }`, `volume { level }`, `close`. **There is no `duck`
+  command**: ducking is `open.talk` (what the page does while the assistant listens and speaks), as §6 has it. The page
+  reports `players: [{ source, ready, playerId?, error? }]` (the Spotify Connect device id is `playerId`) and `current?:
+  { source, status, title?, artist?, album?, artUrl?, link?, ref?, durationMs?, positionMs?, volume?, canNext?,
+  canPrevious?, errorCode? }`.
+- `source` is an open slug on the wire and in core; a page that does not know one answers `unsupported`. Core never
+  imports a provider.
+- Everything a page sends is untrusted: the server validates it against the protocol's bounds, drops what does not fit,
+  cleans every text, takes it only from voice pages with a device (never admin pages or voice nodes) and limits each
+  connection to a burst of 10 reports and 10 a second (the latest over the limit is kept and applied later). Nothing is
+  kept on disk. A `credential` token is never put in a state, an error, a change or a log line.
+- Testing: `kit.players` (docs/MODULES.md §17) is the real service over scriptable pages.
 
-**4.2 Protocol (`packages/protocol`).** Two message types, both additive, so the version stays 12:
+**4.2 Protocol (`packages/protocol/src/media.ts`).** Two message types, both additive, so the version stays 12 (the
+version log in `constants.ts` says so):
 
-- server → page: `media.command { command }` (one message type with the command union inside; the server union is
-  close to the compiler's limit);
-- page → server: `media.state { state }`, rate-limited, sent on every change and every few seconds while playing.
-- `DeviceCapabilities` gains optional `media.players: string[]`; the page also declares `"video"` in `speaker.media`.
+- server → page: `media.command { seq, command }` (one message type with the command union inside; the server union is
+  past the compiler's limit and is typed by hand, and so is the client union now, which `media.state` took to 49);
+- page → server: `media.state { state, ack?, wants? }`, no answer; sent on every change and every few seconds while
+  playing. `ack` is the highest `seq` the page has handled; `wants: [{ source, what: "credential" }]` asks for a fresh
+  token (the module hears it in `changes`).
+- `DeviceCapabilities` gains optional `media: { players: string[] }` (at most 8 slugs); `effectiveCapabilities` drops it
+  when the owner took away the display or the speaker. The page also declares `"video"` in `speaker.media` (step 3).
+- Every text, address (`https:` only), id, number and array is bounded with an exported constant (`MAX_MEDIA_*`,
+  `MEDIA_*`).
 
-**4.3 `Playback` keyed by device.** `pause(deviceId)` and `changeVolume(deviceId, …)`; the room form goes. The
-host's "stop" passes the device it already knows (`PhrasePorts.deviceId`). `pause` answers `true` from the page's
-confirmed state. `changeVolume { by }` works now, because the page reports its level.
+**4.3 `Playback` keyed by device (done in step 2).** `pause(deviceId)` and `changeVolume(deviceId, …)`; the room form is
+gone. The host's "stop" passes the device it already knows (`PhrasePorts.deviceId`; the `room` port went with it).
+`pause` answers `true` when something played on that device and the page confirmed it paused. `changeVolume { by }`
+works now, because the page reports its level (`unknown_level` while it has not). `PLAYBACK_LIMITS` is
+`{ deviceIdChars: 64, callTimeoutMs: 3000 }`. The music module stopped providing `Playback` in this step; nothing
+provides it until the media module (step 4).
 
 **4.4 `@pva/net`: calls to a fixed public API.** A module-usable helper for `https:` hosts named in the module's own
 code (here `api.spotify.com`, `accounts.spotify.com`): GET, PUT, POST, DELETE; a JSON or form body; sent once, never

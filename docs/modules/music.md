@@ -7,7 +7,9 @@ Plays and controls music per room through Music Assistant in Home Assistant.
 > describes the module as it is until that plan's last step removes it. What the new module keeps from this one: the
 > phrase tables for pause, resume, next and previous, the once-per-phrase-invocation record, the English and Dutch
 > text pattern and the cleaning of outside text. What goes: rooms and players, every Home Assistant call, the
-> room-keyed `Playback`.
+> room-keyed `Playback`. **Since media step 2 this module no longer provides `Playback`** (that contract is keyed by device
+> now, and the host's "stop" no longer pauses Home Assistant players); the sections below that describe `Playback` are
+> history.
 
 - Package: `packages/module-music`
 - Plan: [docs/MODULES-PLAN.md](../MODULES-PLAN.md) §5.1 row 8 (wave B)

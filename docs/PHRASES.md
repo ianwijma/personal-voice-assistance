@@ -159,8 +159,8 @@ no module may declare these words in that language):
   ring the device holds, through the notification service's `stopRinging`, the same admission as the card's Stop); the
   announcement being spoken there (`stopSpeech`); a reply being prepared or spoken (every conversation of the device, as
   the page's Stop; a reply this utterance's own start of speech cut off counts); media the `Playback` service says it
-  paused in the device's room (`pause(room)`, within its 3 s; with no provider, no room, or no player for the room, this
-  step does nothing). It says nothing itself. When it selected a ring or an announcement, the reply its start of speech
+  paused on the device (`pause(deviceId)`, keyed by the device the utterance came from, not by a room; within its 3 s;
+  with no provider, no device id, or no player on the device, this step does nothing). It says nothing itself. When it selected a ring or an announcement, the reply its start of speech
   interrupted is said again (the settlement); when it selected the reply, that reply stays stopped. **Once a step is
   selected, the utterance is about that one**: when stopping it fails (the notification service reports the ring could
   not be stopped, the announcement's stop fails, the media's pause fails or takes longer than 3 s), it says "I couldn't
@@ -232,7 +232,7 @@ conversations with no words, so it closes the utterance, discards that speculati
 becomes a turn, nothing of it enters the history, and no tool that is not speculative runs for it** (a speculative turn
 holds such a call until it is promoted). The answer is a canned reply. An utterance that is not taken goes through the
 gates exactly as before. Each fact the run uses is read when it is used: what rings, whether a reply or an announcement
-is active, whether the action is still published, the volume, the room.
+is active, whether the action is still published, the volume.
 
 ### Sets are prepared ahead
 
@@ -325,3 +325,9 @@ actions before the model, switching the assistant, sleep, microphone mute, devic
 module, media volume for louder and quieter, phrases on a notification's actions (a button's label is its phrase),
 matching typed text, fuzzy matching, the admin warning for a routine phrase close to a wake phrase, and the measurement
 of false stops.
+
+The media guard (a device whose player is playing needs the wake phrase for every request; docs/modules/media.md §6) is
+also not here yet. Its input is: `DevicePlayers.isPlaying(deviceId)` is a synchronous read of the page's last report
+(playing, reported within a minute), made so that the route gate can ask it on a turn's path. And "media volume for
+louder and quieter": `Playback.changeVolume(deviceId, { by })` can succeed now (the page reports its level), but the
+host's "louder" and "quieter" still change the reply volume only.

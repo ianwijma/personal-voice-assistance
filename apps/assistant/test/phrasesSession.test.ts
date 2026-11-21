@@ -148,7 +148,6 @@ const session = async (o: {
             return next
           }),
         playback: () => undefined,
-        room: () => "Kitchen",
         gateway: () => makeExecutionGateway(),
         isPublished: () => true,
         pageText: (_m, t, max) => String(t).slice(0, max)

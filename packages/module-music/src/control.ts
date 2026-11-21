@@ -7,9 +7,6 @@ import {
   isLine,
   type JsonObject,
   type Language,
-  PLAYBACK_LIMITS,
-  PlaybackError,
-  type PlaybackService,
   providerOffText,
   say,
   useService
@@ -20,14 +17,14 @@ import { oneLine, playerName, resolvePlayer, ROOM_CHARS, type TableRow } from ".
 import { texts, type TextKey } from "./texts.ts"
 
 /**
- * The module's shared part: every call to a player, and the `Playback` service. It keeps no player state and no
+ * The module's shared part: every call to a player (it no longer provides `Playback`: docs/modules/media.md §4.3). It keeps no player state and no
  * volume between calls: each answer reads the Home Assistant provider's cache at that moment, and each command is sent
  * whatever that cache says (it may be a minute old), with the service's own answer reported. The one record it keeps is
  * the outcome of recent invocations (`once`), so the same invocation never acts twice.
  */
 
-/** Each call to a player waits at most this long (the `Playback` contract's bound; an action has 5 s in all). */
-export const CALL_TIMEOUT_MS = PLAYBACK_LIMITS.callTimeoutMs
+/** Each call to a player waits at most this long (an action has 5 s in all). */
+export const CALL_TIMEOUT_MS = 3_000
 
 /** The longest content id the module sends (Home Assistant takes 2,000; a spoken request is a few words). */
 export const QUERY_CHARS = 200
@@ -340,78 +337,7 @@ export const makeControl = (host: Pick<ModuleHostApi, "service" | "view">, setti
           return result
         }))
 
-    const roomProblem = (room: string) =>
-      !isLine(room, PLAYBACK_LIMITS.roomChars) || room.trim() === "" ? new PlaybackError({ reason: "invalid", detail: "room: one line of 1 to 60 characters" }) : undefined
-
-    /** A failed call as `Playback` reports it: once a call was sent, a failure is never "nothing done". */
-    const playbackError = (e: HomeAssistantError | StoppedDuring) =>
-      new PlaybackError({
-        reason: e._tag === "HomeAssistantError" && e.reason === "timeout" ? "timeout" : "failed",
-        detail: e._tag === "StoppedDuring" ? "the home-assistant module stopped during the call" : `Home Assistant: ${e.reason}`
-      })
-
-    /**
-     * `Playback`'s one deadline: `PLAYBACK_LIMITS.callTimeoutMs` (3 s) from entry. Resolving the room spends from it
-     * (measured in real time: it is work on this thread and yields between its steps), and the call gets only what is
-     * left. Resolving that used it all up is `timeout` with nothing sent.
-     */
-    const deadline = () => {
-      const began = performance.now()
-      return () => PLAYBACK_LIMITS.callTimeoutMs - (performance.now() - began)
-    }
-    const outOfTime = () => new PlaybackError({ reason: "timeout", detail: "resolving the room used the whole budget; nothing was sent" })
-
-    /** `Playback` (packages/core/src/Playback.ts): exactly its two operations, for the host's "stop" and volume. */
-    const playback: PlaybackService = {
-      pause: (room) =>
-        Effect.gen(function*() {
-          const left = deadline()
-          const bad = roomProblem(room)
-          if (bad !== undefined) return yield* bad
-          return yield* useService(host, HomeAssistant, (ha) =>
-            Effect.gen(function*() {
-              const r = yield* resolvePlayer(ha, settings.players, settings.useAreas, room)
-              if (r.kind === "not-yet") return false // the state is not known yet: nothing is done
-              if (r.kind !== "player") return yield* new PlaybackError({ reason: "no_player", detail: r.kind === "ambiguous" ? "several players, none chosen" : r.kind })
-              if (!PLAYING.has(r.entity.state)) return false
-              const remaining = left()
-              if (remaining <= 0) return yield* outOfTime()
-              // Sent: from here a failure, the provider stopping included, is a failure, never "nothing was playing".
-              yield* callPlayer(ha, r.entity, "media_pause", undefined, { value: false }, remaining).pipe(Effect.mapError(playbackError))
-              return true
-            })).pipe(
-              // The smart-home module off before anything was sent: the player's state is not known, so nothing is done.
-              Effect.catchTag("ProviderOff", () => Effect.succeed(false))
-            )
-        }),
-      changeVolume: (room, change) =>
-        Effect.gen(function*() {
-          const left = deadline()
-          const bad = roomProblem(room)
-          if (bad !== undefined) return yield* bad
-          if (!("to" in change)) {
-            if (typeof change.by !== "number" || !Number.isFinite(change.by) || change.by < -1 || change.by > 1) {
-              return yield* new PlaybackError({ reason: "invalid", detail: "a step from -1 to 1" })
-            }
-            // The provider's cache is polled: it never establishes the player's present level, so a step is not taken.
-            return yield* new PlaybackError({ reason: "unknown_level", detail: "the present level is only known from a polled cache" })
-          }
-          const to = change.to
-          if (typeof to !== "number" || !Number.isFinite(to) || to < 0 || to > 1) return yield* new PlaybackError({ reason: "invalid", detail: "a level from 0 to 1" })
-          return yield* useService(host, HomeAssistant, (ha) =>
-            Effect.gen(function*() {
-              const r = yield* resolvePlayer(ha, settings.players, settings.useAreas, room)
-              if (r.kind === "not-yet") return yield* new PlaybackError({ reason: "failed", detail: "no state from Home Assistant yet" })
-              if (r.kind !== "player") return yield* new PlaybackError({ reason: "no_player", detail: r.kind === "ambiguous" ? "several players, none chosen" : r.kind })
-              const remaining = left()
-              if (remaining <= 0) return yield* outOfTime()
-              yield* callPlayer(ha, r.entity, "volume_set", { volume_level: to }, { value: false }, remaining).pipe(Effect.mapError(playbackError))
-              return to
-            })).pipe(Effect.catchTag("ProviderOff", () => Effect.fail(new PlaybackError({ reason: "failed", detail: "the home-assistant module is off" }))))
-        })
-    }
-
-    return { transport, play, volume, nowPlaying, playback }
+    return { transport, play, volume, nowPlaying }
   })
 
 export type Control = Effect.Success<ReturnType<typeof makeControl>>

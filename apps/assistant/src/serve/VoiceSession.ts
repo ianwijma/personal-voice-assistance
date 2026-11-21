@@ -240,7 +240,7 @@ export interface SessionPhrases {
   /** What rings on the device now, or `undefined` when the window cannot open (no device, its "while ringing" is off). */
   readonly ringing: () => ReadonlyArray<RingingCard> | undefined
   /** The runner's ports that are not the session's own (`notify` with the announcement's stop). */
-  readonly ports: Pick<PhrasePorts, "volume" | "playback" | "room" | "gateway" | "isPublished" | "pageText"> & {
+  readonly ports: Pick<PhrasePorts, "volume" | "playback" | "gateway" | "isPublished" | "pageText"> & {
     readonly notify: () => Pick<NotifyEngine, "ringingOn" | "stopRinging" | "press" | "stopSpeech"> | undefined
   }
   /** Every outcome (the log). Must not throw. */

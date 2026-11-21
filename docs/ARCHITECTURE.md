@@ -313,7 +313,7 @@ SharedPart<X>         = { value: X; services?: [ServiceKey<T>.of(impl)]; contrib
 ModuleHostApi = {
   routeTokens: { mint(name, label): Effect<{ token, secret }>; list: Effect<RouteTokenInfo[]>; revoke(id): Effect<boolean> }  // P3
   view(): HostView                                  // module states, vault locked, engine summary, devices, Home values
-  service<T>(key: ServiceKey<T>): T | undefined     // live; the core's own (P5: People, Privacy, Devices; P7: SessionControl, DeviceControl; Reports; ModuleStopped once the part has closed) first, else undefined while no published module provides it
+  service<T>(key: ServiceKey<T>): T | undefined     // live; the core's own (P5: People, Privacy, Devices; DevicePlayers; P7: SessionControl, DeviceControl; Reports; ModuleStopped once the part has closed) first, else undefined while no published module provides it
   contributions<T>(key: ContributionKey<T>): Effect<ReadonlyArray<T>>   // for the calling fiber's principal (its context)
   contributionsFor<T>(key, assistantId | undefined): ReadonlyArray<T>    // explicit, for native callbacks; undefined: all
   actions: { list: Effect<CatalogAction[]>; run(req): Effect<ActionRunResult> }  // the turn's (calling assistant's) catalogue
@@ -831,6 +831,31 @@ mayRevealTo(owner: unknown, place: unknown, isMember): boolean                  
 makePrivacy(placeOf: (deviceId) => PrivacyPlace | undefined, isMember)          // undefined place = not a known device: no
 Devices (ServiceKey "core.devices") = { list(): KnownDevice[]; get(id); otherScreens(from, { person? }); bestOtherScreen(from, …) }
 KnownDevice = { id; name; kind; room?; place; capabilities /* effective */; declared?; connected; visible; lastInteractionAt?; lastSeen }
+DevicePlayers (ServiceKey "core.device-players") = { state(deviceId): Effect<DevicePlayerState | undefined>;
+    send(deviceId, MediaCommand, { timeoutMs?, connection?: ConnectionRef, awaitStatus?: MediaStatus[] }): Effect<DevicePlayerState, DevicePlayerError>;
+    changes: Stream<DevicePlayerChange>;  isPlaying(deviceId): boolean }          // DevicePlayers.ts; serve mode only (absent in the CLI modes)
+DevicePlayerState = { connection: ConnectionRef; sources: string[]; players: MediaPlayerState[]; current?: MediaCurrent; visible?; ack: number; reportedAt?: number }
+DevicePlayerChange = { deviceId; connection: ConnectionRef; state: DevicePlayerState | undefined; wants?: MediaWant[] }   // state undefined: no player page left
+DevicePlayerError.reason: "no_player" | "unsupported" | "timeout" | "failed" | "invalid"      // timeout: sent, not acknowledged, it may still happen
+        // a module's way to the player in a device's web page (docs/modules/media.md §4.1): core knows no provider, `source` is an opaque slug
+        // (`MEDIA_SOURCE`), and a page that lacks one answers `unsupported`. One command is one `media.command { seq, command }` to one page;
+        // `seq` is per connection, assigned here. `send` answers at the first `media.state` whose `ack >= seq` (3 s, `DEVICE_PLAYER_LIMITS.ackTimeoutMs`);
+        // with `awaitStatus` it keeps waiting, in the same time, until `current.status` is one of those or `error`/`blocked` (the status counts only
+        // after the acknowledgement: an older one is not the command's). `prepare` is sent with the sources the page has (`unsupported` if none).
+        // WHICH PAGE (a device may have several tabs): `options.connection` (a module passes `CurrentTurn.connection`) if that page declared players;
+        // else the connection that reports something open (the latest report if several); else the newest connection that declared players.
+        // A page that declared none is never chosen. One state per device: its chosen page's. `isPlaying` is synchronous (the route gate's door).
+        // REPORTS are untrusted: `media.state` is validated against the protocol, dropped when it does not fit, its texts cleaned (`cleanPlayerText`:
+        // control, format and direction characters and line breaks become spaces, clipped to 200), limited to 10 at once and 10 a second per connection
+        // (the latest over the limit is held and applied when the allowance returns), and taken only from voice pages with a device that are not voice
+        // nodes (admin pages and nodes are ignored). Nothing is kept on disk; a `credential` command's token is never in a state, error, change or log line.
+        // serve mode: `makeDevicePlayers` (serve/serveMode.ts) over `hub.voiceConnections()`; sources are `DeviceFacts.mediaOf` (declared minus overrides:
+        // no display or no speaker takes the players); the hub calls `report` (media.state), `refresh` (hello, device.caps) and `closed` (a connection ends).
+        // the kit: harness.players = { page(sources, { device? }); pages(); sent; closeDevice(id); service; engine; settle } and KitPlayerPage
+        // { received; commands(); state(); report(patch?, { ack?, wants?, raw? }); respond(false | "ack" | "play" | fn, model?); close } over the real service
+@pva/protocol media.ts (additive within 12): MediaCommandMessage { type: "media.command"; seq; command: MediaCommand } (server → one page);  MediaStateMessage { type: "media.state"; state:
+    MediaState; ack?; wants? } (page → server, no answer);  MediaCommand = prepare | credential | open | play | pause | next | previous | seek { toMs } | { byMs } | volume | close;
+    DeviceCapabilities.media?: { players: string[] } (≤ 8 slugs; effectiveCapabilities drops it with no display or no speaker);  bounds: MEDIA_* / MAX_MEDIA_* in media.ts
 TargetDevice (HouseholdStore.ts) = { id?; name?; room?; privacy?; defaultPerson? }   // privacy only for a device the server knows
 quotedName(text), plainName(text), QUOTED_NAMES_NOTE (PromptText.ts)          // typed text on its way into a prompt
 ```
@@ -1210,7 +1235,7 @@ UtteranceFacts = { final; language; ringing: RingingCard[] | undefined; wakeAtSt
 UtteranceDecision = { results: RouteResult[]; taken?: Taken }
 Taken = { by: "ringing"; match: RingingMatch } | { by: "phrase"; assistant: string | undefined; route: RouteTarget; match: PhraseMatch; text }
 runTaken(taken, PhrasePorts): Effect<PhraseOutcome>             // the operation, then THE settlement; serve mode and the kit
-PhrasePorts = { deviceId; language(); notify(); session: PhraseSessionPort; volume(dir); playback(); room(); gateway(); turn(assistant);
+PhrasePorts = { deviceId; language(); notify(); session: PhraseSessionPort; volume(dir); playback(); gateway(); turn(assistant);
                 isPublished(assistant, action); pageText; slot: CommandSlot; trace?(PhraseTrace) }
 PhraseSessionPort = { replyActive(); announcementActive(); stopReply; stopAnnouncement; cancelPending; lastReply(); interruptedReply: Effect<KeptReply | undefined>;
                       replyCancelled(); answering(); say(assistant?, text): Effect<"done" | "cut"> }   // replyCancelled: read after each wait (b1)
@@ -1224,7 +1249,9 @@ NotifyEngine.stopRinging(deviceId): Effect<number, NotifyError>  // fails (busy,
 RouteGate.cancelReply()                                         // "never mind": the reply playing counts no more, windows close
 SessionControl (ServiceKey "core.session-control") = { stopReply(deviceId); cancelPending(deviceId); repeatLast(deviceId); newConversation(deviceId) }
 DeviceControl (ServiceKey "core.device-control")   = { replyVolume(deviceId): number; changeReplyVolume(deviceId, "louder" | "quieter" | { to }): Effect<VolumeChange> }
-Playback (ServiceKey "playback") = { pause(room); changeVolume(room, { to } | { by }) }   // moved here from @pva/module-contracts, which re-exports it
+Playback (ServiceKey "playback") = { pause(deviceId); changeVolume(deviceId, { to } | { by }) }   // keyed by device (docs/modules/media.md §4.3); moved here from @pva/module-contracts, which re-exports it
+        // pause answers true when something played on that device and the page confirmed it paused; changeVolume { by } needs a level the page reported (else unknown_level);
+        // PLAYBACK_LIMITS = { deviceIdChars: 64, callTimeoutMs: 3000 }; no module provides it until the media module (module-music no longer does)
 Reports (ServiceKey "core.reports") = { draft(ReportInput): Effect<ReportDrafted>; configure(ReportsSettings | undefined): Effect<void> }
         // given to the module `report` alone (ModuleHostOptions.moduleCoreServices: a core service per calling module);
         // draft reads CurrentTurn itself and sends at once only when ReportInput.send and the setting agree

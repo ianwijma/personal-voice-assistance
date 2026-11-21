@@ -158,7 +158,7 @@ describe("the ringing window", () => {
 })
 
 describe("the host's essential controls", () => {
-  it.effect("stop: what rings first; then a reply being spoken; then media Playback pauses in the room; with nothing, nothing", () =>
+  it.effect("stop: what rings first; then a reply being spoken; then media Playback pauses on the device; with nothing, nothing", () =>
     Effect.gen(function*() {
       const playback = stubService<PlaybackService>("playback", { pause: succeeds(true) })
       const egg = makeEgg()
@@ -171,9 +171,9 @@ describe("the host's essential controls", () => {
       // The reply now.
       assert.strictEqual(did(yield* kit.phrases.say("stop")), "stopped-reply")
       assert.deepStrictEqual(kit.phrases.sessionCalls, [{ deviceId: "kitchen-display", call: "stop" }])
-      // Media in the device's room.
+      // Media on the device: asked by its id, not by a room.
       assert.strictEqual(did(yield* kit.phrases.say("stop")), "paused-media")
-      assert.deepStrictEqual(playback.calls.pause, [["Kitchen"]])
+      assert.deepStrictEqual(playback.calls.pause, [["kitchen-display"]])
       // Nothing playing (the provider says it paused nothing).
       playback.answer("pause", succeeds(false))
       const r = yield* kit.phrases.say("stop")
@@ -186,15 +186,15 @@ describe("the host's essential controls", () => {
       assert.strictEqual(did(yield* kit.phrases.say("stop it")), "nothing")
     }))
 
-  it.effect("a14: a device with no room is not asked about media, even with a Playback provider that would pause", () =>
+  it.effect("a14: a device with no room is asked about media by its id, as any other (Playback is keyed by device)", () =>
     Effect.gen(function*() {
       const playback = stubService<PlaybackService>("playback", { pause: succeeds(true) })
       const kit = yield* startTestModule(makeEgg().definition, {
         provide: [provide("music", { services: [Playback.of(playback.service)] })],
         household: { devices: [{ id: "roomless-01", name: "Roomless" }] }
       })
-      assert.strictEqual(did(yield* kit.phrases.say("stop", { device: "roomless-01" })), "nothing")
-      assert.strictEqual(playback.calls.pause, undefined)
+      assert.strictEqual(did(yield* kit.phrases.say("stop", { device: "roomless-01" })), "paused-media")
+      assert.deepStrictEqual(playback.calls.pause, [["roomless-01"]])
     }))
 
   it.effect("never mind: a pending reply is cancelled (silently); without one, nothing", () =>

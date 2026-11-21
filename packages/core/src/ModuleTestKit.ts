@@ -40,6 +40,8 @@ import { Clock, Deferred, Effect, Exit, Fiber, type Schema, Scope } from "effect
 import { TestClock } from "effect/testing"
 import type { ActionRunResult, ContributionKey, ModuleHostApi, ProvidedContribution, ProvidedService, ServiceKey } from "./ModuleApi.ts"
 import { type KnownDevice, Devices, makeDevices } from "./Devices.ts"
+import { DevicePlayers, makeDevicePlayers } from "./DevicePlayers.ts"
+import { makeKitPlayerPages } from "./DevicePlayersKit.ts"
 import type { HouseholdStore, ModuleStore, Row } from "./HouseholdStore.ts"
 import { defineModule, type ModuleDefinition } from "./ModuleDefinition.ts"
 import { type CredentialStore, makeMemoryCredentialStore } from "./ModuleCredentials.ts"
@@ -926,11 +928,24 @@ export const startTestModule = (definition: ModuleDefinition<any>, options: Star
         const was = replying.has(deviceId)
         return Effect.as(setReplying(deviceId, false), was)
       })
+    // `DevicePlayers`: the real service (its connection choice, acknowledgements, time-outs, rate limit and text cleaning)
+    // over scripted pages (`harness.players`).
+    let kitPlayerConnections: (deviceId: string) => ReadonlyArray<import("./DevicePlayers.ts").PlayerLink> = () => []
+    const devicePlayers = yield* makeDevicePlayers({ connections: (deviceId) => kitPlayerConnections(deviceId) }).pipe(Scope.provide(lifetime))
+    const kitPlayers = makeKitPlayerPages({
+      engine: devicePlayers,
+      connected: (deviceId) => connectedNow.has(deviceId),
+      connectionOf,
+      firstDevice: deviceList[0]?.id ?? "kitchen-display",
+      settle: Effect.suspend(() => settle)
+    })
+    kitPlayerConnections = kitPlayers.connections
     const reportsDrafted: Array<ReportInput> = []
     const reportsTurns: Array<TurnContext | undefined> = []
     const reportsConfigured: Array<ReportsSettings | undefined> = []
     let reportSettings: ReportsSettings | undefined
     const kitServices: ReadonlyArray<ProvidedService> = [
+      DevicePlayers.of(devicePlayers.service),
       SessionControl.of({
         stopReply: (deviceId) => Effect.zipWith(kitStopReply(deviceId), notify.stopSpeech(deviceId), (a, b) => a || b),
         cancelPending: kitCancel,
@@ -1112,7 +1127,6 @@ export const startTestModule = (definition: ModuleDefinition<any>, options: Star
       },
       volume: (direction) => kitVolume(deviceId, direction),
       playback: () => host.service(Playback),
-      room: () => people.devices.get(deviceId)?.room,
       gateway: () => host.gateway,
       turn: (assistant) => turn({ device: deviceId, assistant, source: "phrase", turnId: ++phraseTurns }),
       isPublished,
@@ -1383,6 +1397,8 @@ export const startTestModule = (definition: ModuleDefinition<any>, options: Star
         disconnect: (deviceId: string) =>
           Effect.suspend(() => {
             connectedNow.delete(deviceId)
+            // Its player pages go with it (their state, and what waited for them, as the service's `closed`).
+            kitPlayers.closeDeviceNow(deviceId)
             // Old calls retain their own counter; the next connection starts with four fresh slots.
             pressesByDevice.delete(deviceId)
             // As serve mode: the connection is gone (`deviceOfConnection`, tool calls made with it), and what was being
@@ -1442,6 +1458,19 @@ export const startTestModule = (definition: ModuleDefinition<any>, options: Star
             })), present.busyAnswer)
           })
         },
+        settle
+      },
+      /**
+       * `DevicePlayers` as the module's tests see it: the real service with scriptable pages (docs/MODULES.md). Make a
+       * page with `players.page(["spotify", "youtube"])`, let it answer with `page.respond("play")` or report by hand with
+       * `page.report(...)`, and read the commands the module sent from `page.commands()` or `players.sent`.
+       */
+      players: {
+        ...kitPlayers.api,
+        /** The service itself (what `host.service(DevicePlayers)` returns, before a module's view of it). */
+        service: devicePlayers.service,
+        /** The engine's inputs, for a test of the hub-side rules: `report` a raw message for a connection, `refresh`, `closed`. */
+        engine: devicePlayers,
         settle
       },
       /**

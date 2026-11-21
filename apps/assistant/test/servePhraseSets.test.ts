@@ -38,7 +38,6 @@ describe("serve mode's phrase sets (E3)", () => {
         language: () => "en",
         notify: {} as never,
         ringingAllowed: () => false,
-        room: () => undefined,
         volume: makeReplyVolumes(() => undefined).service,
         log: () => undefined
       }).pipe(Scope.provide(scope)))
