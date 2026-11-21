@@ -40,8 +40,11 @@ import { Clock, Deferred, Effect, Exit, Fiber, type Schema, Scope } from "effect
 import { TestClock } from "effect/testing"
 import type { ActionRunResult, ContributionKey, ModuleHostApi, ProvidedContribution, ProvidedService, ServiceKey } from "./ModuleApi.ts"
 import { type KnownDevice, Devices, makeDevices } from "./Devices.ts"
+import { DevicePlayers, makeDevicePlayers } from "./DevicePlayers.ts"
+import { makeKitPlayerPages } from "./DevicePlayersKit.ts"
 import type { HouseholdStore, ModuleStore, Row } from "./HouseholdStore.ts"
 import { defineModule, type ModuleDefinition } from "./ModuleDefinition.ts"
+import { type CredentialStore, makeMemoryCredentialStore } from "./ModuleCredentials.ts"
 import { makeModuleHost, type ModuleHost, readOnlyPersistence } from "./ModuleHost.ts"
 import type { Registrar, StartedPart } from "./ModuleRegistrations.ts"
 import { takeUnprogrammedStubCalls, UnprogrammedStubCall } from "./ModuleStubs.ts"
@@ -494,6 +497,11 @@ export interface StartTestModuleOptions {
   readonly settings?: Readonly<Record<string, unknown>>
   /** Its secrets (secret fields), as the key vault gives them. */
   readonly secrets?: Readonly<Record<string, string>>
+  /**
+   * Where `host.credentials` keeps values (default: a fresh in-memory store, exposed as `credentials` on the result;
+   * pass your own to share it between two runs, or to lock it).
+   */
+  readonly credentials?: CredentialStore
   /** Stand-ins for the modules it uses: their services (stubs) and contributions (`provide`). */
   readonly provide?: ReadonlyArray<ProvidedModule>
   /** Real modules to run beside it (a provider under test together with its consumer). */
@@ -920,11 +928,24 @@ export const startTestModule = (definition: ModuleDefinition<any>, options: Star
         const was = replying.has(deviceId)
         return Effect.as(setReplying(deviceId, false), was)
       })
+    // `DevicePlayers`: the real service (its connection choice, acknowledgements, time-outs, rate limit and text cleaning)
+    // over scripted pages (`harness.players`).
+    let kitPlayerConnections: (deviceId: string) => ReadonlyArray<import("./DevicePlayers.ts").PlayerLink> = () => []
+    const devicePlayers = yield* makeDevicePlayers({ connections: (deviceId) => kitPlayerConnections(deviceId) }).pipe(Scope.provide(lifetime))
+    const kitPlayers = makeKitPlayerPages({
+      engine: devicePlayers,
+      connected: (deviceId) => connectedNow.has(deviceId),
+      connectionOf,
+      firstDevice: deviceList[0]?.id ?? "kitchen-display",
+      settle: Effect.suspend(() => settle)
+    })
+    kitPlayerConnections = kitPlayers.connections
     const reportsDrafted: Array<ReportInput> = []
     const reportsTurns: Array<TurnContext | undefined> = []
     const reportsConfigured: Array<ReportsSettings | undefined> = []
     let reportSettings: ReportsSettings | undefined
     const kitServices: ReadonlyArray<ProvidedService> = [
+      DevicePlayers.of(devicePlayers.service),
       SessionControl.of({
         stopReply: (deviceId) => Effect.zipWith(kitStopReply(deviceId), notify.stopSpeech(deviceId), (a, b) => a || b),
         cancelPending: kitCancel,
@@ -961,8 +982,10 @@ export const startTestModule = (definition: ModuleDefinition<any>, options: Star
             })
         })])
     ]
+    const credentials = options.credentials ?? makeMemoryCredentialStore()
     const host = yield* makeModuleHost({
       catalog,
+      credentials,
       defaults: homeDefaults,
       persistence: readOnlyPersistence({
         modules: { [id]: { enabled: true, ...(options.settings !== undefined ? { settings: options.settings } : {}) } },
@@ -1104,7 +1127,6 @@ export const startTestModule = (definition: ModuleDefinition<any>, options: Star
       },
       volume: (direction) => kitVolume(deviceId, direction),
       playback: () => host.service(Playback),
-      room: () => people.devices.get(deviceId)?.room,
       gateway: () => host.gateway,
       turn: (assistant) => turn({ device: deviceId, assistant, source: "phrase", turnId: ++phraseTurns }),
       isPublished,
@@ -1164,6 +1186,8 @@ export const startTestModule = (definition: ModuleDefinition<any>, options: Star
       },
       /** P8: every decision of the risk policy so far, on every path (turns, jobs, presses), in order. */
       riskDecisions: (): ReadonlyArray<GatewayDecisionRecord> => riskDecisions.slice(),
+      /** The credentials store `host.credentials` used (the in-memory one unless the options gave another). */
+      credentials,
       /**
        * Call a tool as the model's tool loop does, through the assistant's registry and the real gateway, as the turn
        * (`TurnContext`, or a `TestTurnInput` resolved against the household; default the first device's). A tool the
@@ -1373,6 +1397,8 @@ export const startTestModule = (definition: ModuleDefinition<any>, options: Star
         disconnect: (deviceId: string) =>
           Effect.suspend(() => {
             connectedNow.delete(deviceId)
+            // Its player pages go with it (their state, and what waited for them, as the service's `closed`).
+            kitPlayers.closeDeviceNow(deviceId)
             // Old calls retain their own counter; the next connection starts with four fresh slots.
             pressesByDevice.delete(deviceId)
             // As serve mode: the connection is gone (`deviceOfConnection`, tool calls made with it), and what was being
@@ -1432,6 +1458,19 @@ export const startTestModule = (definition: ModuleDefinition<any>, options: Star
             })), present.busyAnswer)
           })
         },
+        settle
+      },
+      /**
+       * `DevicePlayers` as the module's tests see it: the real service with scriptable pages (docs/MODULES.md). Make a
+       * page with `players.page(["spotify", "youtube"])`, let it answer with `page.respond("play")` or report by hand with
+       * `page.report(...)`, and read the commands the module sent from `page.commands()` or `players.sent`.
+       */
+      players: {
+        ...kitPlayers.api,
+        /** The service itself (what `host.service(DevicePlayers)` returns, before a module's view of it). */
+        service: devicePlayers.service,
+        /** The engine's inputs, for a test of the hub-side rules: `report` a raw message for a connection, `refresh`, `closed`. */
+        engine: devicePlayers,
         settle
       },
       /**

@@ -81,6 +81,17 @@ export interface ModuleInstance extends ModuleContributions {
   readonly instructions?: string
 }
 
+/** What a module needs of the page the server serves (version 2). */
+export interface ModulePage {
+  /**
+   * The module's page features load scripts or frames from other origins (a streaming service's player), so the voice
+   * page cannot be cross-origin isolated while the module is enabled: the server then omits the COOP, COEP and CORP
+   * headers, from the next page load on, and sets `Referrer-Policy: strict-origin-when-cross-origin`. The page copes
+   * without isolation (a slightly less exact count of what was heard when a reply is cut off).
+   */
+  readonly thirdPartyEmbeds?: boolean
+}
+
 export interface ModuleDefinition<S extends SettingsSpec = SettingsSpec> {
   /** Stable id: persistence key and protocol id. Lower case, digits and dashes (`/^[a-z][a-z0-9-]{0,39}$/`). */
   readonly id: string
@@ -138,6 +149,8 @@ export interface ModuleDefinition<S extends SettingsSpec = SettingsSpec> {
   readonly storage?: ModuleStorage
   /** The event types it publishes that voice pages may see (each with a projection). Others stay on the server. */
   readonly events?: ReadonlyArray<EventType>
+  /** What it needs of the served voice page (version 2): see `ModulePage`. */
+  readonly page?: ModulePage
   /**
    * The part that runs once per module (version 2) while it is demanded, with its shared settings only, in a scope the
    * host closes when the module stops (after its instances): sockets, caches, handlers, services and contributions.
@@ -180,11 +193,19 @@ const checkManifest = (
     readonly shared?: unknown
     readonly storage?: ModuleStorage
     readonly events?: ReadonlyArray<EventType>
+    readonly page?: unknown
   }
 ) => {
   if (definition.shared !== undefined && (definition.apiVersion ?? 1) < 2) throw new Error(`Module ${id}: shared needs apiVersion 2`)
   if (definition.storage !== undefined && (definition.apiVersion ?? 1) < 2) throw new Error(`Module ${id}: storage needs apiVersion 2`)
   if (definition.events !== undefined && (definition.apiVersion ?? 1) < 2) throw new Error(`Module ${id}: events needs apiVersion 2`)
+  if (definition.page !== undefined) {
+    if ((definition.apiVersion ?? 1) < 2) throw new Error(`Module ${id}: page needs apiVersion 2`)
+    const page = definition.page as { readonly thirdPartyEmbeds?: unknown } | null
+    if (typeof page !== "object" || page === null || Array.isArray(page)) throw new Error(`Module ${id}: page must be an object`)
+    for (const key of Object.keys(page)) if (key !== "thirdPartyEmbeds") throw new Error(`Module ${id}: page has an unknown field "${key}"`)
+    if (page.thirdPartyEmbeds !== undefined && typeof page.thirdPartyEmbeds !== "boolean") throw new Error(`Module ${id}: page.thirdPartyEmbeds must be true or false`)
+  }
   if (definition.storage !== undefined) checkModuleStorage(id, definition.storage)
   for (const used of definition.uses ?? []) {
     if (!/^[a-z][a-z0-9-]{0,39}$/.test(used) || used === id) throw new Error(`Module ${id}: uses names "${used}", which is not another module id`)
@@ -255,6 +276,7 @@ export const defineModule = <const S extends SettingsSpec = {}, const V extends 
   readonly uses?: ReadonlyArray<string>
   readonly storage?: ModuleStorage
   readonly events?: ReadonlyArray<EventType>
+  readonly page?: ModulePage
   readonly shared?: (context: SharedContext<SettingsOf<S>>) => Effect.Effect<SharedPart<X>, ModuleStartError, Scope.Scope>
   readonly start: (context: ModuleContextOf<V, SettingsOf<S>, X>) => Effect.Effect<ModuleInstance, ModuleStartError, Scope.Scope>
   readonly fieldActions?: Readonly<Record<string, FieldActionHandler<SettingsOf<S>>>>
@@ -283,6 +305,7 @@ export const defineModule = <const S extends SettingsSpec = {}, const V extends 
     ...(definition.uses !== undefined ? { uses: definition.uses } : {}),
     ...(definition.storage !== undefined ? { storage: definition.storage } : {}),
     ...(definition.events !== undefined ? { events: definition.events } : {}),
+    ...(definition.page !== undefined ? { page: definition.page } : {}),
     ...(definition.shared !== undefined ? { shared: definition.shared as NonNullable<ModuleDefinition<S>["shared"]> } : {}),
     ...(definition.fieldActions !== undefined ? { fieldActions: definition.fieldActions } : {}),
     // The host passes the context of the module's version (`ModuleContextOf`).

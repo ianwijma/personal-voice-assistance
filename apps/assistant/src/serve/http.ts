@@ -45,6 +45,12 @@ export interface HttpOptions {
    * so the page is `crossOriginIsolated` and its player can share its count with the page (`SharedArrayBuffer`).
    */
   readonly crossOriginIsolation?: boolean
+  /**
+   * Asked at every static response: does an enabled module load scripts or frames from other origins
+   * (`ModuleDefinition.page.thirdPartyEmbeds`)? Then the isolation headers are left off for that response, whatever
+   * `crossOriginIsolation` says, so enabling the module in the admin UI takes effect on the next page load.
+   */
+  readonly thirdPartyEmbeds?: () => boolean
   /** Requests under `/api/` (docs/VOICE-PROVIDERS.md §5), after the host check. Absent: they get the static 404. */
   readonly api?: (req: http.IncomingMessage, res: http.ServerResponse) => void
   /** P10: requests under `/media/` (docs/PRESENTING.md "Images"), after the host check. Absent: the static 404. */
@@ -156,9 +162,19 @@ export const trailingSlashRedirect = (root: string, url: string): string | undef
   return `${rawPath}/${rest.length > 0 ? `?${rest.join("?")}` : ""}`
 }
 
+/**
+ * HTML pages carry this: a third-party player embedded in the page (YouTube's) refuses to start without a Referer
+ * (error 153), and `same-origin` or `no-referrer` would send none. Only the origin goes to other sites.
+ */
+const referrerPolicy = "strict-origin-when-cross-origin"
+
 /** Every static response's headers go through here (`isolate`: the cross-origin isolation headers). */
 const serveStatic = (webDir: string, isolate: boolean, req: http.IncomingMessage, res: http.ServerResponse) => {
-  const headers = (own: http.OutgoingHttpHeaders): http.OutgoingHttpHeaders => isolate ? { ...own, ...isolationHeaders } : own
+  const headers = (own: http.OutgoingHttpHeaders): http.OutgoingHttpHeaders => {
+    const html = typeof own["Content-Type"] === "string" && own["Content-Type"].startsWith("text/html")
+    const withPolicy = html ? { ...own, "Referrer-Policy": referrerPolicy } : own
+    return isolate ? { ...withPolicy, ...isolationHeaders } : withPolicy
+  }
   if (req.method !== "GET" && req.method !== "HEAD") {
     res.writeHead(405, headers({ Allow: "GET, HEAD" })).end()
     return
@@ -322,7 +338,7 @@ export const startHttp = (options: HttpOptions): Effect.Effect<HttpServer, HttpE
           options.node(req, res)
           return
         }
-        serveStatic(options.webDir, options.crossOriginIsolation ?? true, req, res)
+        serveStatic(options.webDir, (options.crossOriginIsolation ?? true) && options.thirdPartyEmbeds?.() !== true, req, res)
       })
 
       server.on("upgrade", (req, socket, head) => {

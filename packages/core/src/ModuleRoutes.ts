@@ -49,6 +49,14 @@ export interface RouteRequest {
   readonly body: unknown
   /** The caller's address as the socket saw it (forwarding headers are never read). */
   readonly address: string
+  /**
+   * The origin the caller used to reach this server, as the HTTP layer resolved it: the `Host` header (already checked
+   * against the allowed host names) and the scheme the server itself runs on. Only when the server is declared to be
+   * behind a reverse proxy (`SERVE_BEHIND_PROXY`) are `X-Forwarded-Host` (if it is an allowed host) and
+   * `X-Forwarded-Proto` believed; otherwise forwarding headers are ignored. Absent outside serve mode and in tests that
+   * build a request by hand: a module must then fall back to `headers.host` and never read a forwarding header itself.
+   */
+  readonly origin?: { readonly scheme: "http" | "https"; readonly host: string }
   /** The token that passed a `token` guard (its label says who the caller is). */
   readonly token?: { readonly id: string; readonly name: string; readonly label: string }
 }

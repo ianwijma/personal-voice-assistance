@@ -49,7 +49,7 @@ export const SERVICES: Readonly<Record<string, ServiceRule>> = {
   // Thermostats: a temperature (in the installation's unit), a mode.
   "climate.set_temperature": { domain: "climate", fields: { temperature: { kind: "number", min: -100, max: 1_000, required: true } } },
   "climate.set_hvac_mode": { domain: "climate", fields: { hvac_mode: { kind: "choice", values: HVAC_MODES, required: true } } },
-  // Media players: what a music module needs (playback, volume, the source, playing and browsing media).
+  // Media players: what a media-player consumer needs (playback, volume, the source, playing and browsing media).
   "media_player.media_play": { domain: "media_player", fields: {} },
   "media_player.media_pause": { domain: "media_player", fields: {} },
   "media_player.media_play_pause": { domain: "media_player", fields: {} },

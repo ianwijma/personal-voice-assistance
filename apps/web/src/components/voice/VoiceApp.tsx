@@ -5,6 +5,7 @@ import { ChatPanel } from "../ChatPanel.tsx"
 import { shallowEqual } from "@/lib/store.ts"
 import { ClientContext, useClientState } from "../context.tsx"
 import { ControlDock } from "../ControlDock.tsx"
+import { MediaSurface } from "../media/MediaSurface.tsx"
 import { LiveAnnouncer } from "../LiveAnnouncer.tsx"
 import { NotificationCards } from "../NotificationCards.tsx"
 import { PresentationStage } from "../PresentationStage.tsx"
@@ -69,6 +70,8 @@ function Shell() {
             <Stage />
             <ControlDock />
           </main>
+          {/* The player surface (music panel, theatre): inert with the page while a modal panel is open. */}
+          <MediaSurface />
         </div>
         <div className="contents" inert={modal}>
           <ChatPanel />

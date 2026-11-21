@@ -1,5 +1,6 @@
 import { Schema } from "effect"
 import { NotificationAction } from "./notifications.ts"
+import { MediaStateMessage } from "./media.ts"
 import { PresentAction, PresentClose } from "./presentation.ts"
 import { AdminToken } from "./admin.ts"
 import { Assistant, AssistantBody, AssistantId, MAX_ASSISTANTS } from "./assistants.ts"
@@ -456,7 +457,12 @@ export const DeviceCaps = Schema.Struct({
   live: Schema.optionalKey(DeviceLiveState)
 })
 
-export const ClientMessage = Schema.Union([
+/**
+ * Every client message. As for `ServerMessage` (`server.ts`): `Schema.toTaggedUnion`'s type-level utilities recurse once
+ * per member and exceed the compiler's instantiation depth at the 49th (protocol 12 has 49), so they are added at run
+ * time and typed by hand: the union, its `tag`, `discriminants` and `cases`.
+ */
+const ClientMessageUnion = Schema.Union([
   Hello,
   AudioClaim,
   AudioRelease,
@@ -499,13 +505,21 @@ export const ClientMessage = Schema.Union([
   NotificationAction,
   PresentAction,
   PresentClose,
+  MediaStateMessage,
   NodeStatus,
   NodeLevel,
   NodeCommandSend,
   NodePairCreate,
   NodePairCancel
-]).pipe(Schema.toTaggedUnion("type"))
-export type ClientMessage = typeof ClientMessage.Type
+])
+export type ClientMessage = typeof ClientMessageUnion.Type
+const untypedToTaggedUnion = Schema.toTaggedUnion as unknown as (tag: "type") => (union: typeof ClientMessageUnion) => unknown
+export const ClientMessage = untypedToTaggedUnion("type")(ClientMessageUnion) as typeof ClientMessageUnion & {
+  readonly tag: "type"
+  readonly discriminants: ReadonlyArray<ClientMessage["type"]>
+  /** Member schema by discriminant (the codec asks only whether a type is one). */
+  readonly cases: Readonly<Record<ClientMessage["type"], Schema.Top>>
+}
 export type ClientMessageType = ClientMessage["type"]
 export type ClientMessageOf<T extends ClientMessageType> = Extract<ClientMessage, { readonly type: T }>
 

@@ -109,7 +109,7 @@ describe("the keys and the authoring helpers", () => {
   it.effect("a relative volume change without a known level has its own refusal (a stub programmed as the contract says)", () =>
     Effect.gen(function*() {
       const playback = stubService<PlaybackService>("playback", { changeVolume: fails(new PlaybackError({ reason: "unknown_level", detail: "no level yet" })) })
-      const refused = yield* Effect.flip(playback.service.changeVolume("Kitchen", { by: 0.1 }))
+      const refused = yield* Effect.flip(playback.service.changeVolume("kitchen-display", { by: 0.1 }))
       assert.strictEqual(refused.reason, "unknown_level")
     }))
 

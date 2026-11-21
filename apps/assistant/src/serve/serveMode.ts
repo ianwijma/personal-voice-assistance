@@ -5,6 +5,7 @@ import {
   LlmError,
   makeModuleHost,
   makeNotifyEngine,
+  makeDevicePlayers,
   makePresentEngine,
   type NotDelivered,
   notifyLanguageOf,
@@ -113,7 +114,7 @@ import {
 import { isTtsProvider, ttsProviderInfo } from "../providers.ts"
 import { DEFAULT_ASSISTANT_VOICE, voiceEngineName, voiceLabel } from "../voiceSelection.ts"
 import { type EnvMover, makeEnvMover } from "./envSettings.ts"
-import { type HttpError, type HttpServer, startHttp, webDirExists } from "./http.ts"
+import { allowedHostsFrom, type HttpError, type HttpServer, startHttp, webDirExists } from "./http.ts"
 import { makeNodeDist } from "./nodeDist.ts"
 import { type DeviceRegistry, deviceSettingsFrom, makeDeviceRegistry } from "./devices.ts"
 import { type Jobs, makeJobs } from "./jobs.ts"
@@ -127,6 +128,7 @@ import { makeNodes, type Nodes, type RedeemAnswer, spkiPin } from "./nodes.ts"
 import { DataDirConfig, KEYS_LOCKED_MESSAGE, loadSettingsStore, type SaveStep, type SettingsStore, SettingsStoreError } from "./SettingsStore.ts"
 import { makeApi } from "./api.ts"
 import { isModuleRoutePath, makeModuleRouter } from "./moduleRoutes.ts"
+import { makeCredentials } from "./Credentials.ts"
 import { makeRouteTokens } from "./RouteTokens.ts"
 import { makeAssistantVoice } from "./AssistantVoice.ts"
 import { type Favourites, makeFavourites } from "./Favourites.ts"
@@ -138,7 +140,7 @@ import { makeVoiceSessions, type VoiceSessions } from "./VoiceSessions.ts"
 import { makeRoutingService, ROUTING_KEYS } from "./routing.ts"
 import { openServeHousehold } from "./household.ts"
 import { makeHouseholdPush } from "./HouseholdPush.ts"
-import { DeviceControl, Devices, hostEvent, makeIssueRegistry, oneLine, People, phraseLanguageOf, Privacy, Reports, SessionControl, withContextProvider } from "@pva/core"
+import { DeviceControl, DevicePlayers, Devices, hostEvent, makeIssueRegistry, oneLine, People, phraseLanguageOf, Privacy, Reports, SessionControl, withContextProvider } from "@pva/core"
 import { ringingWithoutWake } from "@pva/protocol"
 import { makeReplyVolumes, makeServePhrases } from "./phraseCommands.ts"
 import { openServeScheduler } from "./scheduler.ts"
@@ -372,6 +374,8 @@ export const startServe = (options: ServeOptions): Effect.Effect<ServeHandle, Ht
     // Stored token records that are not valid are ignored, with one Health issue (its registry is the host's, below).
     let tokenIssues: ((ignored: number) => void) | undefined
     const routeTokens = makeRouteTokens({ store, locked: () => vault.state() === "locked", report: (ignored) => tokenIssues?.(ignored) })
+    // Module credentials (`host.credentials`): secrets a module obtained itself, in the same place.
+    const credentials = makeCredentials({ store, locked: () => vault.state() === "locked" })
 
     // The household store (docs/STORING-DATA.md): opened after the writer lock, and every module's data judged and
     // upgraded before any module is made. A database from a newer assistant stops the start here.
@@ -503,6 +507,18 @@ export const startServe = (options: ServeOptions): Effect.Effect<ServeHandle, Ht
       language: () => notifyLanguageOf(sections.value("HOME_LANGUAGE")),
       log: logInfo
     })
+    // The device players (`DevicePlayers`, docs/modules/media.md §4.1): a module's commands to a page's player and the
+    // page's reports back. The pages (the hub) are bound once they exist; a connection is a page of the device that said
+    // hello, not a voice node, with the sources its own declaration names minus what the owner took away.
+    const devicePlayers = yield* makeDevicePlayers({
+      connections: (deviceId) =>
+        hub === undefined ? [] : hub.voiceConnections().filter((c) => c.deviceId === deviceId && c.node !== true).map((c) => ({
+          id: c.id,
+          send: c.send,
+          sources: () => deviceFacts.mediaOf(deviceId, c.kind, c.declared?.())
+        })),
+      log: logInfo
+    })
     // Reports (docs/REPORTS.md): the core's `Reports` for the report module, kept in the household store; what a report
     // gathers is read when it is drafted (the sessions, assistants and Health issues are bound by then).
     const startedAt = Date.now()
@@ -542,6 +558,7 @@ export const startServe = (options: ServeOptions): Effect.Effect<ServeHandle, Ht
         People.of(people),
         Privacy.of(deviceFacts.privacy),
         Devices.of(deviceFacts.devices),
+        DevicePlayers.of(devicePlayers.service),
         SessionControl.of({
           stopReply: (deviceId) => Effect.suspend(() => sessionsRef?.get(deviceId)?.control.stopReply ?? Effect.succeed(false)),
           cancelPending: (deviceId) => Effect.suspend(() => sessionsRef?.get(deviceId)?.control.cancelPending ?? Effect.succeed(false)),
@@ -557,6 +574,7 @@ export const startServe = (options: ServeOptions): Effect.Effect<ServeHandle, Ht
       // Reports (docs/REPORTS.md): the report module's alone; every other module's `host.service(Reports)` is undefined.
       moduleCoreServices: [{ key: Reports, forModule: (moduleId) => (moduleId === REPORT_MODULE_ID ? reports.service : undefined) }],
       routeTokens,
+      credentials,
       issues,
       scheduler,
       notify,
@@ -796,7 +814,6 @@ export const startServe = (options: ServeOptions): Effect.Effect<ServeHandle, Ht
       language: () => phraseLanguageOf(sections.value("HOME_LANGUAGE")),
       notify,
       ringingAllowed: (deviceId) => ringingWithoutWake(deviceSettingsOf(deviceId).place),
-      room: (deviceId) => deviceFacts.originOf(deviceId).room,
       volume: replyVolumes.service,
       log: (line) => runFork(Effect.logInfo(line))
     })
@@ -1592,6 +1609,8 @@ export const startServe = (options: ServeOptions): Effect.Effect<ServeHandle, Ht
           // P5: `CurrentTurn.room` and `.person` (the device's default person).
           place: () => deviceFacts.originOf(device?.id),
           // P5: "Don't use its speaker", or a declaration without one: nothing is sent to be played.
+          // Media guard (docs/modules/media.md §6): while the device's own page plays, every request needs the wake phrase.
+          ...(device !== undefined ? { guard: () => devicePlayers.service.isPlaying(device.id) } : {}),
           speakerAllowed: () => deviceFacts.speakerAllowed(device?.id, device === undefined ? undefined : devices.kindOfDevice(device.id)),
           hearing: hearingOf(device?.id),
           ...(options.hearerSwitchWaitMs !== undefined ? { hearerSwitchWaitMs: options.hearerSwitchWaitMs } : {}),
@@ -1718,6 +1737,7 @@ export const startServe = (options: ServeOptions): Effect.Effect<ServeHandle, Ht
     })
     hub = makeSessionHub({
       household: push.hooks,
+      players: devicePlayers,
       notify,
       // P7: a voice page of a device whose reply volume is not the default is told it after its welcome.
       replyVolume: replyVolumes.levelOf,
@@ -1946,7 +1966,8 @@ export const startServe = (options: ServeOptions): Effect.Effect<ServeHandle, Ht
       tokens: routeTokens,
       services,
       scheme: options.tls === undefined ? "http" : "https",
-      behindProxy: options.behindProxy === true
+      behindProxy: options.behindProxy === true,
+      allowedHosts: allowedHostsFrom(options.allowedHosts ?? [], options.allowedOrigins)
     })
     const api = makeApi({
       moduleRoutes: moduleRouter,
@@ -1973,6 +1994,8 @@ export const startServe = (options: ServeOptions): Effect.Effect<ServeHandle, Ht
       allowedHosts: options.allowedHosts ?? [],
       tls: options.tls,
       crossOriginIsolation: options.crossOriginIsolation ?? true,
+      // An enabled module whose page loads other origins' scripts or frames (the media module) ends isolation, live.
+      thirdPartyEmbeds: () => host.thirdPartyEmbeds(),
       hub: hubNow,
       api: (req, res) => (isModuleRoutePath(req.url) ? moduleRouter.handle(req, res) : api(req, res)),
       // P10: `/media/<token>`, a page's own address of an image it holds now.

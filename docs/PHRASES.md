@@ -159,8 +159,8 @@ no module may declare these words in that language):
   ring the device holds, through the notification service's `stopRinging`, the same admission as the card's Stop); the
   announcement being spoken there (`stopSpeech`); a reply being prepared or spoken (every conversation of the device, as
   the page's Stop; a reply this utterance's own start of speech cut off counts); media the `Playback` service says it
-  paused in the device's room (`pause(room)`, within its 3 s; with no provider, no room, or no player for the room, this
-  step does nothing). It says nothing itself. When it selected a ring or an announcement, the reply its start of speech
+  paused on the device (`pause(deviceId)`, keyed by the device the utterance came from, not by a room; within its 3 s;
+  with no provider, no device id, or no player on the device, this step does nothing). It says nothing itself. When it selected a ring or an announcement, the reply its start of speech
   interrupted is said again (the settlement); when it selected the reply, that reply stays stopped. **Once a step is
   selected, the utterance is about that one**: when stopping it fails (the notification service reports the ring could
   not be stopped, the announcement's stop fails, the media's pause fails or takes longer than 3 s), it says "I couldn't
@@ -232,7 +232,7 @@ conversations with no words, so it closes the utterance, discards that speculati
 becomes a turn, nothing of it enters the history, and no tool that is not speculative runs for it** (a speculative turn
 holds such a call until it is promoted). The answer is a canned reply. An utterance that is not taken goes through the
 gates exactly as before. Each fact the run uses is read when it is used: what rings, whether a reply or an announcement
-is active, whether the action is still published, the volume, the room.
+is active, whether the action is still published, the volume.
 
 ### Sets are prepared ahead
 
@@ -320,8 +320,23 @@ thread for 18–99 ms in one step, with one to ten aliases per option.)
 
 ## Not now
 
-Module windows, `capture`, guards, the `audible` window (wake-free control while a reply plays) and its setting, typed
+Module windows, `capture`, guards other than the media guard (below), the `audible` window (wake-free control while a reply plays) and its setting, typed
 actions before the model, switching the assistant, sleep, microphone mute, device state, earcons and canned replies of a
 module, media volume for louder and quieter, phrases on a notification's actions (a button's label is its phrase),
 matching typed text, fuzzy matching, the admin warning for a routine phrase close to a wake phrase, and the measurement
 of false stops.
+
+The media guard exists, and it is the only guard: while `DevicePlayers.isPlaying(deviceId)` is true for a device, the route
+gate (`makeRouteGate(config, guard)`, `GateGuard = () => boolean`, asked at each decision and never stored) treats that
+device as one that needs the wake phrase for every request. An utterance without a phrase is held and then dropped with the
+target reason `guard` (shown to the admin tester as not accepted); a follow-up window, or a reply in progress, admits nothing
+while the guard holds, and no follow-up window opens while it holds (one that expired meanwhile stays expired; one still
+open when the guard lifts admits again). A phrase works as ever, the phrase alone still arms its one utterance, an utterance
+already accepted stays accepted, and the echo gate and the interrupt modes are untouched. Text and touch input never pass the
+route gate. Core knows only the predicate; serve mode passes `() => devicePlayers.isPlaying(device.id)` per device session
+(`VoiceSession`'s `guard` option), so a device with no player page is never guarded. The check costs one call of the
+predicate, one map lookup, per gate decision; it was not measured. Tests: `packages/core/test/RouteGate.test.ts` ("guard"),
+`apps/assistant/test/serveMediaGuard.test.ts`. Not done: the `asleep` state the page shows follows `withoutPhrase` alone, so
+a guarded device that otherwise answers without a phrase still shows `listening`. And "media volume for
+louder and quieter": `Playback.changeVolume(deviceId, { by })` can succeed now (the page reports its level), but the
+host's "louder" and "quieter" still change the reply volume only.

@@ -152,10 +152,8 @@ export interface PhrasePorts {
   readonly session: PhraseSessionPort
   /** One step of the device's reply volume. */
   readonly volume: (direction: "louder" | "quieter") => Effect.Effect<VolumeChange>
-  /** The `Playback` provider now (`host.service(Playback)`), if one is published. */
+  /** The `Playback` provider now (`host.service(Playback)`), if one is published; "stop" pauses by `deviceId`. */
   readonly playback: () => PlaybackService | undefined
-  /** The device's room now (`place.room`), if it has one. */
-  readonly room: () => string | undefined
   readonly gateway: () => ExecutionGateway
   /** The turn a command of `assistant` runs as (`source: "phrase"`, the device, its person and connection, a fresh turn id). */
   readonly turn: (assistant: string) => TurnContext
@@ -364,13 +362,12 @@ const operate = (taken: Taken, ports: PhrasePorts, rec: TraceRecord): Effect.Eff
             return { did: "stopped-reply", settlement: { resume: false } }
           }
           const playback = ports.playback()
-          const room = ports.room()
-          if (playback !== undefined && room !== undefined) {
-            const r = yield* attempt(playback.pause(room).pipe(
+          if (playback !== undefined && deviceId !== undefined) {
+            const r = yield* attempt(playback.pause(deviceId).pipe(
               Effect.timeoutOrElse({ duration: PLAYBACK_LIMITS.callTimeoutMs, orElse: () => Effect.fail(new PlaybackError({ reason: "timeout", detail: "no answer in time" })) })
             ))
             if (r.ok) return r.value ? { did: "paused-media", settlement: { resume: false } } : { did: "nothing", settlement: { resume: true } }
-            // No player for the room (or no usable room): nothing played there. Anything else: it could not be paused.
+            // No player on the device (or no usable device id): nothing played there. Anything else: it could not be paused.
             if (r.error instanceof PlaybackError && (r.error.reason === "no_player" || r.error.reason === "invalid")) return { did: "nothing", settlement: { resume: true } }
             return couldNotStop("the media could not be paused", addressed)
           }

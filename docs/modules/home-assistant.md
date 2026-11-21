@@ -222,7 +222,7 @@ for the status questions.
 ## The `HomeAssistant` service
 
 The module publishes the transport of `packages/module-contracts/src/homeAssistant.ts` from its `shared` part, under
-the contract's key, for presence and music (wave B). It is never offered to the model. "In this version the provider
+the contract's key, for presence (and, until 2026-11-21, the first music module, which the media module replaced). It is never offered to the model. "In this version the provider
 polls": the polled cache above is its state.
 
 - **Exposed**: people, and the entities of the kinds chosen in the module's shared `domains`. They are read before the
@@ -357,4 +357,4 @@ not cover. **Missing below the module:** a phrase slot that reads a parameter wh
 from a phrase to an existing action's parameter (resolved off the matching path, with the action's own admission).
 
 **Left for later by the plan:** locking, unlocking, arming and disarming; watches; cameras; energy; delayed commands;
-media player control (music's, over the `HomeAssistant` service); the MCP long tail.
+media player control (the first music module used it; the media module plays on the asking device's page instead and does not); the MCP long tail.

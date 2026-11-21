@@ -13,6 +13,7 @@ import { type Effect, Schema } from "effect"
 import type { ActionParam } from "./Actions.ts"
 import type { ModuleEvents } from "./EventBus.ts"
 import type { ModuleStore } from "./HouseholdStore.ts"
+import type { ModuleCredentials } from "./ModuleCredentials.ts"
 import type { ModuleRoute, RouteTokens } from "./ModuleRoutes.ts"
 import type { ModuleNotify, ModuleSpeech } from "./Notify.ts"
 import type { ModulePresent } from "./Present.ts"
@@ -139,7 +140,7 @@ export interface ModuleTemplate {
 
 /**
  * An action a module offers, declared on the manifest (`ModuleDefinition.declaredActions`) so it stays known while the
- * module is `unavailable` (never started): the intent agent can still recognise "play jazz" as the music module's,
+ * module is `unavailable` (never started): the intent agent can still recognise "play jazz" as the media module's,
  * and core answers with the module's "not set up" line instead of running some other action. Only what a decision
  * model needs to recognise it; the running module's own actions (from `start`) are what runs. `id` is the action's
  * id (`/^[a-z][a-z0-9_]{0,39}$/`).
@@ -358,6 +359,12 @@ export interface ActionCatalogue {
 export interface ModuleHostApi {
   /** P3: this module's route tokens (`ModuleRoutes.ts`), in the key vault. Fails `unavailable` outside serve mode. */
   readonly routeTokens: RouteTokens
+  /**
+   * This module's own credentials (`ModuleCredentials.ts`): a secret it obtained itself (an OAuth refresh token), kept
+   * in the key vault under its own namespace. Works in `shared`, `start` and route handlers (outside any turn). Fails
+   * `unavailable` outside serve mode and `locked` while the vault is locked.
+   */
+  readonly credentials: ModuleCredentials
   /** A read-only snapshot of the assistant: module states, vault, engines, devices, Home values. */
   readonly view: () => HostView
   /**

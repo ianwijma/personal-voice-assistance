@@ -10,8 +10,8 @@ import { catalog as imagesModules } from "@pva/module-images"
 import { catalog as kitchenModules } from "@pva/module-kitchen"
 import { catalog as listsModules } from "@pva/module-lists"
 import { catalog as localInfoModules } from "@pva/module-local-info"
+import { catalog as mediaModules } from "@pva/module-media"
 import { catalog as memoryModules } from "@pva/module-memory"
-import { catalog as musicModules } from "@pva/module-music"
 import { catalog as newsModules } from "@pva/module-news"
 import { catalog as notificationsModules } from "@pva/module-notifications"
 import { catalog as presenceModules } from "@pva/module-presence"
@@ -52,7 +52,7 @@ export const moduleCatalog: ReadonlyArray<ModuleDefinition<any>> = [
   ...listsModules,
   ...notificationsModules,
   ...kitchenModules,
-  ...musicModules,
+  ...mediaModules,
   ...remindersModules,
   ...imagesModules,
   ...calendarModules,

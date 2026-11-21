@@ -654,6 +654,32 @@ describe("the mock, through its handlers, as the server", { timeout: 30_000 }, (
     a.ws.close()
   })
 
+  it("the media scenario: POST /mock/media sends prepare and an open per source, numbered per page, and keeps the page's report", async () => {
+    const http = url.replace(/^ws/, "http").replace(/\/ws$/, "")
+    const id = "d-mock-media001"
+    const page = await Peer.open({ device: { id, kind: "web-voice", name: "Media", capabilities: { v: 1, display: { class: "standard", widthPx: 1024, heightPx: 768, dpr: 1, touch: "coarse", colour: true }, speaker: { media: ["speech", "audio", "video"] }, media: { players: ["spotify", "youtube"] } } } })
+    const r = await fetch(`${http}/mock/media`, { method: "POST", body: JSON.stringify({ deviceId: id }) })
+    expect(r.status).toBe(200)
+    await page.waitFor("media.command", (m) => m.command.type === "open" && m.command.source === "youtube")
+    const commands = page.messages.filter((m): m is ServerMessageOf<"media.command"> => m.type === "media.command")
+    expect(commands.map((m) => m.seq)).toEqual([1, 2, 3])
+    expect(commands.map((m) => m.command.type)).toEqual(["prepare", "open", "open"])
+    expect(commands.map((m) => ("source" in m.command ? m.command.source : "-"))).toEqual(["-", "spotify", "youtube"])
+    page.send({ type: "media.state", state: { players: [{ source: "spotify", ready: true, playerId: "dev1" }], current: { source: "youtube", status: "playing", title: "Me at the zoo" } }, ack: 3 })
+    for (let i = 0; i < 40; i++) {
+      const got = (await (await fetch(`${http}/mock/media`)).json()) as { states: Array<{ ack?: number }> }
+      if (got.states.some((x) => x.ack === 3)) break
+      await new Promise((resolve) => setTimeout(resolve, 50))
+    }
+    const states = (await (await fetch(`${http}/mock/media`)).json()) as { states: Array<{ ack?: number; state: { current?: { title?: string } } }> }
+    expect(states.states.find((x) => x.ack === 3)?.state.current?.title).toBe("Me at the zoo")
+    const bad = await fetch(`${http}/mock/media`, { method: "POST", body: JSON.stringify({ deviceId: id, command: { type: "nonsense" } }) })
+    expect(bad.status).toBe(400)
+    const none = await fetch(`${http}/mock/media`, { method: "POST", body: JSON.stringify({ deviceId: "d-nobody" }) })
+    expect(none.status).toBe(404)
+    page.ws.close()
+  })
+
   // Review round 4 (p5-r4b finding 3): the mock issues person ids as the server does.
   it("Members: an id is kept only when it is a committed member's and not retired; the retired ids go with a reset", async () => {
     const http = url.replace(/^ws/, "http").replace(/\/ws$/, "")

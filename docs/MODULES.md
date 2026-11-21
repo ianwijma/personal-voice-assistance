@@ -684,6 +684,7 @@ content with no known owner is treated as someone else's. So:
   device's session). Look them up when acting.
 - `People` (`host.service(People)`): `list`, `get`, `find(spoken)` (`found` / `ambiguous` / `none`: ask when ambiguous),
   diets (`dietOf`, `setDiet`). `Devices`: the known devices, their places and capabilities, the best other screen.
+  `DevicePlayers`: the player in a device's web page (below, "Playing on a device").
 - There are no children, no trusted devices and no voice identification in this stack. Do not suggest protections
   that do not exist.
 
@@ -703,6 +704,26 @@ pages with `[secret]`, but that is a safety net, not a licence (it cannot see an
 results never pass it). `checkModule` starts the module with recognisable secret values and fails (`secret`) when one
 reaches what the module declares or what the admin page shows; what your tools return, speak and store, **your tests
 assert** with the kit's `expectNoSecrets` (§17). Compare a secret with `timingSafeEqual`.
+
+### Credentials a module obtains itself (`host.credentials`)
+
+A settings secret is typed by the owner. A secret your own code obtains (an OAuth refresh token from a callback route)
+goes in `host.credentials`: `get(name)` answers the string or `undefined` when none is set, `set(name, value)` replaces
+it, `clear(name)` answers whether it existed. They are Effects that fail with `CredentialError`, whose `reason` is
+`unavailable` (no vault: outside serve mode, so also in the CLI modes), `locked` (the key vault is locked: the value
+may exist, and **`get` fails `locked` rather than answering `undefined`**, so health can say "sign-in cannot be
+renewed" and not "not signed in"), `invalid`, `limit` or `failed`. Rules: a name matches `^[a-z][a-z0-9-]{0,31}$`; at
+most 8 names per module; a value is a string of at most 4096 bytes. Each module has its own namespace; it can never
+read another's. They work in `shared`, in `start` and in route handlers (which run outside any turn). They are kept in
+the key vault beside route tokens (before a vault exists, in the 0600 secrets file like every other secret), survive a
+restart and a re-keying of the vault, and are never logged (the log redaction knows them), never in a snapshot, Health
+issue or admin API answer, and never sent to a page (the page boundary remembers each value your code reads or writes).
+A credential stays when the module is switched off or removed, as its secrets and route tokens do, so reinstalling the
+module finds it; a module that wants it gone calls `clear`. Locked vault: read the credential when you need it and keep
+what you read for as long as your part runs (the rule of §8: a running module keeps the secrets it started with); a
+module cannot renew or replace one while the vault is locked. The kit gives `host.credentials` an in-memory store
+(`StartTestModuleOptions.credentials`, default fresh, exposed as `kit.credentials` with `lock()`, `unlock()` and
+`dump()`), so a module can be tested without a server.
 
 ## 9. Settings forms
 
@@ -837,11 +858,24 @@ from any site (another site's page can load it in a browser), so it returns only
 network. The first module that has a route brings its route tests, in the app's
 serve tests (`apps/assistant/test/moduleRoutes*.test.ts` show how).
 
+### The page: `page.thirdPartyEmbeds`
+
+The server sends the voice page cross-origin isolated (COOP `same-origin`, COEP `require-corp`, CORP `same-origin`),
+which blocks scripts and frames from other origins that do not opt in (a streaming service's player). A module whose
+page features load such scripts or frames declares `page: { thirdPartyEmbeds: true }` (apiVersion 2; any other field,
+or a value that is not a boolean, is refused). While **an enabled module** declares it, the server omits all three
+headers; it asks at each page response, so switching the module on or off in the admin UI applies from the next page
+load, with no restart and no setting to edit. `SERVE_CROSS_ORIGIN_ISOLATION=false` still turns isolation off for
+everyone. The page copes without isolation (a slightly less exact count of what was heard when a reply is cut off).
+Every HTML page response also carries `Referrer-Policy: strict-origin-when-cross-origin`, which an embedded player
+needs in order to start.
+
 ## 12. The network
 
 Outgoing HTTP is `@pva/net`; **a module never calls `fetch` itself** (nor `node:http`, nor a library that makes its own
-requests). In this wave that is `GET` and `HEAD` to any URL, and a `POST` with a JSON body only to an address the owner
-typed: a module whose first version needs another method (a `PUT`, a WebDAV verb), another body (a form, a file, a
+requests. In this wave that is `GET` and `HEAD` to any URL, a `POST` with a JSON body only to an address the owner
+typed, and `GET`, `PUT`, `POST` and `DELETE` with a JSON or form body to a fixed public API (`makeFixedApi`, below): a
+module whose first version needs another method (a WebDAV verb), another body (a form, a file, a
 stream), a WebSocket or a `POST` to a URL a model or a page chose is not in this wave.
 
 - **`safeFetch(url, { accept, … })`** for public APIs and any URL a model chose: `accept` (the response types you take:
@@ -868,6 +902,18 @@ stream), a WebSocket or a `POST` to a URL a model or a page chose is not in this
 - **`postFixedPublicJson`** (`@pva/net/host`) is the host's, not a module's: a JSON `POST` to a fixed `https:` public
   address written in the app's own code (the report filing's GitHub API, docs/REPORTS.md). It is not in `@pva/net`'s
   main entry, and `packages/net/test/FixedPublicPost.test.ts` fails when a module package imports the host entry.
+- **`makeFixedApi({ hosts })`** (`@pva/net`) for a fixed public API whose `https:` hosts are written in your own code
+  (Spotify: `api.spotify.com`, `accounts.spotify.com`), never an address a model, a page or the owner chose. Hosts are
+  plain DNS names (1 to 8, no IP literal, no wildcard; checked when you construct it, it throws otherwise), matched exactly
+  and without case, on the first hop and on every redirect (`NetRefused` `host-list`). `api.call(url, { method, accept,
+  headers?, json? | form?, maxBytes?, timeoutMs?, maxRequestBytes? })` takes `GET`, `PUT`, `POST` and `DELETE`: `https:`
+  only, port 443, public addresses only (every other rule of `safeFetch`), an `Authorization` header allowed. `json` is
+  sent as `application/json`, `form` (an object of strings) as `application/x-www-form-urlencoded`, never both, none on a
+  `GET`; the helper sets the type and the length (`0` for a `PUT`, `POST` or `DELETE` without a body) and refuses a body
+  over `maxRequestBytes` before connecting. **A `PUT`, `POST` or `DELETE` is sent once**, like the `POST` above: every 3xx
+  answer is refused (`post-redirect`), no retry, `NetFailure.requestSent` says when it was written. A `GET` follows
+  redirects only to listed hosts and drops its credentials when the origin changes. A non-2xx answer reaches you as with
+  `safeFetch`; a 204 has an empty body.
 - **`makeCachedJson`** for JSON with a time to live, `ETag` and stale-if-error.
 - **`userAgent(contact)`**: put the owner's contact (Home › API contact, `HOME_API_CONTACT`) in the User-Agent **only
   when the owner set one**.
@@ -991,12 +1037,13 @@ rely on, with every bound and id.
 |---|---|---|---|---|
 | `Lists` | service: the household's shopping list | lists | kitchen | `lists.ts` |
 | `Timers` | service: start a timer | timers (wave B) | routines; kitchen later | `timers.ts` |
-| `HomeAssistant` | service (a transport) | home-assistant (smart-home) | music (wave B), presence | `homeAssistant.ts` |
-| `Playback` | service: pause, volume | music (wave B) | the host's "stop" (P7; volume later) | `playback.ts` (defined in `@pva/core` since P7, re-exported) |
+| `HomeAssistant` | service (a transport) | home-assistant (smart-home) | presence | `homeAssistant.ts` |
+| `Playback` | service: pause and volume of what plays on a device, keyed by device id | media | the host's "stop" (P7; volume later) | `playback.ts` (defined in `@pva/core` since P7, re-exported) |
 | `BriefingSections` | contribution | weather, bin-day, calendar, news; reminders later | briefing | `briefing.ts` |
 | `WebImages` | service: an image search through the household's SearXNG | web-search | images | `webImages.ts` |
+| `WebVideos` | service: a video search through the household's SearXNG | web-search | media | `webVideos.ts` |
 
-The core's own are `People`, `Privacy`, `Devices`, and since P7 `SessionControl` (stop the reply, cancel what is pending,
+The core's own are `People`, `Privacy`, `Devices`, `DevicePlayers` (below), and since P7 `SessionControl` (stop the reply, cancel what is pending,
 repeat the last reply, a new conversation) and `DeviceControl` (the reply volume), in `@pva/core` ([PHRASES.md](PHRASES.md)
 "Session and device control"); each call names the device it acts on (a tool passes its turn's `deviceId`). The
 calendar module keeps its own provider interface (ICS) inside its package: no other module provides a calendar in
@@ -1607,6 +1654,42 @@ route's field), check that separately: `isLine(text, n)` from `@pva/module-contr
 (`NOT_ONE_LINE`: no control character, C0, DEL or C1, no line or paragraph separator, no bidirectional control) with a
 bound and no lone surrogates, as a filter on the schema (the reference module's `pinboard_pin` text) or in code.
 
+### Playing on a device (`DevicePlayers`)
+
+A module that plays sound or video in the **web page of the device that asked** (the media plan,
+[modules/media.md](modules/media.md)) does not talk to the page itself: it uses the core's `DevicePlayers`
+(`host.service(DevicePlayers)`, serve mode only; `undefined` in the CLI modes). Core knows no provider: a **source** is a
+short opaque slug ("spotify", "youtube") that the module and the page agree on, and a page that does not have the source
+answers `unsupported`.
+
+- `send(deviceId, command, { connection, timeoutMs, awaitStatus })` sends one command (`prepare`, `credential`, `open`,
+  `play`, `pause`, `next`, `previous`, `seek`, `volume`, `close`; `MediaCommand` in `@pva/protocol`) and answers the page's
+  state at the first report that acknowledges it (3 s by default). With `awaitStatus` it keeps waiting, in the same
+  time, until the page's `current.status` is one of those, or `error` or `blocked`: `open` with
+  `awaitStatus: ["playing"]` answers when the video plays, and tells "blocked" (the browser refused autoplay) from
+  "playing". A refusal has a `reason`: `no_player` (the device has no connected page with players, or it left while
+  waiting), `unsupported`, `timeout` (sent, not acknowledged: it **may still happen**, so never answer "it didn't
+  start"), `failed`, `invalid`.
+- Pass the turn's `CurrentTurn.connection` as `connection`: the page of the tab that asked is used first. Without it (or
+  when that tab has no players) the device's page is the one that reports something open, else the newest tab that
+  declared players. Several tabs of one device are one device with one state.
+- `state(deviceId, connection?)` is what the chosen page last reported (pass the turn's `CurrentTurn.connection` to read the page `send` will command) (its players, what is open, its position and volume);
+  `changes` is a stream of every report that changed it, a page arriving or leaving (`state` is `undefined` when the last
+  one left) and what a page asked for (`wants`: a fresh `credential`). `isPlaying(deviceId)` answers synchronously and is device-wide (any of the device's player pages playing counts).
+- **What a page reports is outside text.** The server drops what does not fit the protocol's bounds and cleans every
+  text (control, format and direction characters and line breaks become spaces), but a title or an artist is still data,
+  never an instruction: clean it again where it goes into a model's context or a spoken sentence, as for any outside
+  text (§10).
+- A `credential` command carries an access token meant for the page. The service never logs or keeps it; the module must
+  not log it, put it in an error, a status line or a stored row, or send it in any command but `credential`. Keep
+  refresh tokens in `host.credentials`, never in a command.
+- A device the owner switched to "no display" or "no speaker" has no players (`effectiveCapabilities`), and a voice node or
+  the admin page never has one.
+
+Testing: the kit has the real service over scriptable pages, `kit.players` (§17): `kit.players.page(["spotify"])` makes a
+page, `page.respond("play")` makes it a working player, `page.report(...)` reports by hand, `page.commands()` and
+`kit.players.sent` are what the module sent.
+
 ### Phrase commands (P7)
 
 An action can be said **without the language model**: give it `phrases` per language, words and `{param}` slots
@@ -1714,6 +1797,7 @@ values), `startAt`, `started`. It returns handles:
 | `expectNoSecrets(...values)` | fails when the value of a secret given to the kit is in any string of the `values` you pass (tool results, action outcomes, spoken lines, **the rows your test read**), decoded: every key and string, and a string that is JSON parsed and walked too, so an escaped secret is found; it also looks at every event and the admin page. It reads no collection itself: pass it the rows your module wrote |
 | `phrases` | P7: `say(text, { device, assistant, wake?, interrupting?, interruptedBy?, cancelled? })` as the recogniser's final after the wake phrase (or without it, where only the ringing window can take it), `decide` / `run` (Effects: a test may change something between them), `spoken`, `answered`, `traces`, `replied`, `volume`, `volumeSends`, `commandsFor` (an Effect: the set once prepared), `sessionCalls`; the module also gets the kit's `SessionControl` and `DeviceControl` ([PHRASES.md](PHRASES.md) "Testing") |
 | `notify` | P9: the real notification service: `all`, `messages` (what each page was sent), `decisions` (where it would go, and why not), `press(id, action, { device })`, `announced`, `replying(device, on)`, `connect` / `disconnect`, `dnd()`, `settle`, `engine` ([NOTIFICATIONS.md](NOTIFICATIONS.md) "Testing") |
+| `players` | the real `DevicePlayers` over scriptable pages: `page(sources, { device? })` makes a page that declared those sources (the device's first page has the connection the kit's turns carry); `page.respond("play" \| "ack" \| fn \| false)` answers every command from then on (`"play"` is a working player: `open`, `play`, `pause`, `seek`, `volume`, `close`; `fn` returns the state it changes, or `undefined` for no answer so the caller times out), `page.report(patch?, { ack?, wants?, raw? })` reports by hand, `page.commands()`, `page.received`, `page.state()`, `page.close`; `sent` (every command, in order), `closeDevice`, `service`, `engine`, `settle`. `notify.disconnect` closes the device's pages. A call that waits for a page that never answers is waiting on the test clock: fork it and `kit.advance` past its time-out ("Playing on a device") |
 | `moduleStore()`, `store`, `events`, `people`, `schedulerUses` | the module's store, the household store, every event on the bus, the household's core services, what the kit saw of the scheduler |
 
 **Where the kit waits on your module's code** (the start, with every module of `others`; `stop`, `start`, `restart`,
@@ -1929,7 +2013,7 @@ check` behind the shared lock (`flock /workspace/build-cache/ian/pva-heavy.lock 
 | Lists | `module-lists` | A | [lists](modules/lists.md) |
 | Notifications | `module-notifications` | B | [notifications](modules/notifications.md) |
 | Kitchen | `module-kitchen` | A | [kitchen](modules/kitchen.md) |
-| Music | `module-music` | B | [music](modules/music.md) |
+| Media (music from Spotify, YouTube video) | `module-media` | B | [media](modules/media.md) |
 | Smart home | `module-home-assistant` | A | [home-assistant](modules/home-assistant.md) |
 | Reminders | `module-reminders` | B | [reminders](modules/reminders.md) |
 | Images | `module-images` | B | [images](modules/images.md) |

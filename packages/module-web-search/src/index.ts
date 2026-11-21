@@ -1,17 +1,17 @@
 import { ActionError, CurrentTurn, defineAction, defineModule, makeTool, offThread, offThreadTask, Setting, ToolError, type ModuleDefinition, type Setting as SettingOf } from "@pva/core"
 import { speakNumber } from "@pva/language"
-import { homeLanguage, isLine, say, StoredText, WebImages } from "@pva/module-contracts"
+import { homeLanguage, isLine, say, StoredText, WebImages, WebVideos } from "@pva/module-contracts"
 import { type Connector, type ContentTypePolicy, nodeConnector, nodeResolver, type Resolver, safeFetch, userAgent } from "@pva/net"
 import { Clock, Effect, Schema } from "effect"
 import { blockEntry, canonicalHost, hostOf, isBlocked, siteOf } from "./clean.ts"
 import { charsetOf, PAGE_MAX_BYTES, PAGE_TASK_MEMORY_MB, PAGE_TASK_RESULT_BYTES, PAGE_TASK_TIMEOUT_MS } from "./page.ts"
-import { makeBrave, makeSearxng, makeSearxngImages, type NetDeps, type RawResult, type Recency, type SafeSearch, SearchError, type SearchProvider } from "./providers.ts"
+import { makeBrave, makeSearxng, makeSearxngImages, makeSearxngVideos, type NetDeps, type RawResult, type Recency, type SafeSearch, SearchError, type SearchProvider } from "./providers.ts"
 import { sourcesList } from "./sources.ts"
 import { texts } from "./texts.ts"
 import { bump, dayKey, reserve, summarize, usage, zoneOf } from "./usage.ts"
 
 export { blockEntry, canonicalHost, hostOf } from "./clean.ts"
-export { cleanText, imageAddressOf, makeBrave, makeSearxng, makeSearxngImages, MAX_RESULTS, toImages, toResults } from "./providers.ts"
+export { cleanText, imageAddressOf, makeBrave, makeSearxng, makeSearxngImages, makeSearxngVideos, MAX_RESULTS, toImages, toResults, toVideos, videoLengthSeconds } from "./providers.ts"
 export type { NetDeps, RawResult, SearchProvider } from "./providers.ts"
 export { cutText, sourceLine, sourcesList, spokenSources } from "./sources.ts"
 export { texts } from "./texts.ts"
@@ -239,14 +239,14 @@ export const webSearchModule = (deps: NetDeps = {}) =>
           return { ok: true, tone: "ok" as const, text: `${provider.id === "brave" ? "Brave" : "SearXNG"} answered with ${outcome.length} result${outcome.length === 1 ? "" : "s"}.` }
         })
     },
-    // The household's SearXNG for other modules: an image search (`WebImages`, used by images), offered while the address is
+    // The household's SearXNG for other modules: an image search (`WebImages`, used by images) and a video search (`WebVideos`, used by media), offered while the address is
     // set and valid. Its address, the home-network rule and the blocked sites stay here; nothing of a search is kept.
     shared: (ctx) =>
       Effect.sync(() => {
         const s = ctx.settings as Pick<Cfg, "searxngUrl" | "blockedDomains">
         const url = s.searxngUrl.trim()
         if (url === "" || explainBaseUrl(url) !== undefined) return { value: undefined }
-        return { value: undefined, services: [WebImages.of(makeSearxngImages(url, blockedOf(s), deps))] }
+        return { value: undefined, services: [WebImages.of(makeSearxngImages(url, blockedOf(s), deps)), WebVideos.of(makeSearxngVideos(url, blockedOf(s), deps))] }
       }),
     start: (ctx) =>
       Effect.sync(() => {

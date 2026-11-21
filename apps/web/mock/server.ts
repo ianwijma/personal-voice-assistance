@@ -67,6 +67,13 @@
  * POST /mock/present {"presentation", "options"? (lifetime, expiresInMs), "id"?, "deviceId"?, "handlerDown"?} (P10: a
  * presentation shown as the server does: the shared checks, bounds, decision and selection, again after each hello while
  * live; household content only and no `key`: refused with a 400 that says the mock does not model them),
+ * POST /mock/media {"source"? ("spotify" | "youtube" | "both", default "both"), "deviceId"?, "title"?, "subtitle"?, "ref"?,
+ * "artUrl"? (https), "token"? (a Spotify access token for the page's SDK), "expiresInMs"?, "talk"? ("lower" | "pause" | "none"),
+ * "command"? (one MediaCommand sent as is, e.g. {"type":"close"} or {"type":"pause"})} (the media module's page, docs/modules/media.md §5:
+ * a `prepare` for both players and an `open` for each wanted source, as the module would send them, to the voice pages of
+ * the device; "both" opens Spotify and then YouTube, so the one-thing-at-a-time rule shows. Spotify needs "token" to
+ * connect for real: without one the page asks for it (`wants`) and reports `no_credential` after 10 s. Every `media.state`
+ * the page sends is in GET /mock/log, and the last one per page in GET /mock/media),
  * POST /mock/present/dismiss {"id"}, POST /mock/present/clear (tests: end every presentation, so a test starts from none),
  * POST /mock/drop (terminate every socket), POST /mock/offline {"ms": 3000} (drop and refuse connections for a while),
  * POST /mock/admin/end {"reason": "idle" | "expired"} (end every admin session), POST /mock/wake {"phrase", "armed"}
@@ -186,6 +193,7 @@ import { createModelPickersMock } from "./modelPickers.ts"
 import { createModuleRoutesMock, DEMO_DEFINITION_ACTIONS, demoHomeAction, demoHomeModule, TokenRefusal } from "./demoHome.ts"
 import { createScheduledJobsMock, MockSchedulerError } from "./scheduledJobs.ts"
 import { createReportsMock, MockReportError } from "./reports.ts"
+import { type MediaCommand, MediaCommand as MediaCommandSchema } from "@pva/protocol"
 import { decideRisk, decodeRiskPolicy, DEFAULT_RISK_POLICY, FIXED_REASON, FIXED_RISK_CLASSES, RISK_POLICY_KEYS, riskLanguageOf, riskPageTexts, riskPolicyPatchProblems, riskSpoken } from "@pva/protocol"
 import { boundaryKey, changeReplyVolume, checkDietList, checkMembersValue, cleanDeviceName, type Condition, decideDelivery, decidePresentation, type DeviceCapabilities, deviceOutputsFrom, devicePresentFrom, type FieldError, MAX_LIVE_PER_MODULE, MAX_LIVE_TOTAL, MAX_PINNED_PER_DEVICE, NO_REPLY_VOLUMES, PRESENT_KIND_VERSIONS, type Presentation, PRESENTATION_ID, PresentationWire, presentationProblem, type PresentKindName, presentLifetime, presentWireContent, type ReplyVolumes, selectPresentations, type ShowOptions, showOptionsProblem, speakerAllowedFrom } from "@pva/protocol"
 
@@ -1114,6 +1122,8 @@ const endChangedSessions = (before: ReadonlyMap<string, string>, everyone = fals
       conns.delete(c)
       mockHeld.delete(c.id)
       mockPresentHeld.delete(c.id)
+      mockMediaSeq.delete(c.id)
+      mockMediaStates.delete(c.id)
       c.ws.close(CloseCode.settingsChanged, "settings changed")
     }
   }
@@ -1585,6 +1595,14 @@ const mockHeld = new Map<string, Set<string>>()
 /** Ids are never reused: every id ever issued or named (kept across resets), and a counter that skips them. */
 let mockNotifySeq = 0
 const mockNotifyIds = new Set<string>()
+/** The media module's page (docs/modules/media.md): the next `media.command` number per connection, and the last `media.state` of each. */
+const mockMediaSeq = new Map<string, number>()
+const nextMediaSeq = (connId: string): number => {
+  const n = (mockMediaSeq.get(connId) ?? 0) + 1
+  mockMediaSeq.set(connId, n)
+  return n
+}
+const mockMediaStates = new Map<string, { at: number; ack?: number | undefined; state: unknown; wants?: unknown }>()
 /**
  * The service's own words on the card and in its answers, in the saved household language (as `NotifyTexts` in
  * packages/core: the test compares the two).
@@ -3153,6 +3171,10 @@ const onClientMessage = (c: Conn, m: ClientMessage) => {
       endMockPresentation(m.id)
       return sendTo(c, { type: "result", requestId: m.requestId, ok: true })
     }
+    case "media.state":
+      // The page's player reports (docs/modules/media.md §4.2): kept for GET /mock/media and the log; nothing answers it.
+      if (c.frontend === "voice") mockMediaStates.set(c.id, { at: Date.now(), ack: m.ack, state: m.state, wants: m.wants })
+      return
     case "device.caps": {
       // Protocol 11: what the device can do changed, or its live state; admin's device list follows.
       if (c.frontend !== "voice" || c.deviceId === undefined) return
@@ -3288,6 +3310,8 @@ wss.on("connection", (ws: WebSocket) => {
     mockHeld.delete(c.id)
     for (const h of mockPresentHeld.get(c.id)?.values() ?? []) if (h.token !== undefined) mockMediaTokens.delete(h.token)
     mockPresentHeld.delete(c.id)
+    mockMediaSeq.delete(c.id)
+    mockMediaStates.delete(c.id)
     log(c.id, "closed")
     if (c.deviceId !== undefined) for (const x of notifyConns(c.deviceId)) reconcilePresentMock(x)
     if (c.deviceId !== undefined) {
@@ -3737,6 +3761,7 @@ const http = createServer((req, res) => {
         connections: conns.size
       })
     }
+    if (url.pathname === "/mock/media" && req.method === "GET") return json(res, 200, { states: [...mockMediaStates].map(([conn, state]) => ({ conn, ...state })) })
     if (url.pathname.startsWith("/media/") && (req.method === "GET" || req.method === "HEAD")) return serveMockMedia(url.pathname, res)
     if (req.method !== "POST") return json(res, 404, { error: "not found" })
     const body = await readBody(req)
@@ -3941,6 +3966,32 @@ const http = createServer((req, res) => {
         mockNotifications.set(id, { card, ...(deviceId !== undefined ? { deviceId } : {}), handlerDown: payload.handlerDown === true })
         for (const c of notifyConns(deviceId)) reconcileMock(c)
         return json(res, 200, { id })
+      }
+      case "/mock/media": {
+        const deviceId = typeof payload.deviceId === "string" ? payload.deviceId : undefined
+        const targets = notifyConns(deviceId)
+        if (targets.length === 0) return json(res, 404, { error: "no connected voice page for that device" })
+        const wanted = payload.source === "spotify" || payload.source === "youtube" ? [payload.source] : ["spotify", "youtube"]
+        const talk = { mode: payload.talk === "pause" || payload.talk === "none" ? payload.talk : payload.source === "youtube" ? "pause" : "lower", level: 0.2 } as const
+        const text = (v: unknown, fallback: string) => (typeof v === "string" ? v.slice(0, 200) : fallback)
+        const commands: Array<MediaCommand> = []
+        if (payload.command !== undefined) {
+          const decoded = Schema.decodeUnknownExit(MediaCommandSchema)(payload.command)
+          if (decoded._tag !== "Success") return json(res, 400, { error: "command is not a MediaCommand" })
+          commands.push(decoded.value)
+        } else {
+          commands.push({ type: "prepare", sources: [{ source: "spotify", config: { name: "Mock assistant" } }, { source: "youtube" }] })
+          if (typeof payload.token === "string" && payload.token !== "") {
+            commands.push({ type: "credential", source: "spotify", token: payload.token, expiresAtMs: Date.now() + (typeof payload.expiresInMs === "number" ? payload.expiresInMs : 3_600_000) })
+          }
+          for (const source of wanted) {
+            commands.push(source === "spotify"
+              ? { type: "open", source, title: text(payload.title, "Kind of Blue"), subtitle: text(payload.subtitle, "Miles Davis"), link: "https://open.spotify.com/album/1weenld61qoidwYuZ1GESA", autoplay: true, talk, ...(typeof payload.artUrl === "string" && payload.artUrl.startsWith("https://") ? { artUrl: payload.artUrl } : {}) }
+              : { type: "open", source, ref: typeof payload.ref === "string" ? payload.ref : "jNQXAC9IVRw", kind: "video", title: text(payload.title, "Me at the zoo"), autoplay: true, talk: { ...talk, mode: payload.talk === "lower" || payload.talk === "none" ? payload.talk : "pause" } })
+          }
+        }
+        for (const c of targets) for (const command of commands) sendTo(c, { type: "media.command", seq: nextMediaSeq(c.id), command })
+        return json(res, 200, { sent: commands.map((c) => c.type), pages: targets.length })
       }
       case "/mock/present": {
         // P10: a presentation shown as the server would: {"id"?, "presentation": what a module passes to show, "options"?

@@ -160,6 +160,18 @@ describe("action buttons", () => {
     expect(button).toBeEnabled()
   })
 
+  it("shows a link the answer carries (a sign-in that continues elsewhere) for the owner to open in a new tab, and none otherwise", async () => {
+    const request = vi.fn(async () => ({ type: "result" as const, requestId: "r", ok: true, action: { ok: true, text: "Use the link", link: { href: "/api/modules/media/spotify/start?ticket=abc", label: "Continue to Spotify" } } }))
+    withClient(request as never, <Harness field={check} initial={undefined} context={context(false)} />)
+    expect(screen.queryByTestId("action-link")).toBeNull()
+    await act(async () => fireEvent.click(screen.getByRole("button", { name: "Check" })))
+    const link = screen.getByTestId("action-link")
+    expect(link).toHaveTextContent("Continue to Spotify")
+    expect(link).toHaveAttribute("href", "/api/modules/media/spotify/start?ticket=abc")
+    expect(link).toHaveAttribute("target", "_blank")
+    expect(link).toHaveAttribute("rel", "noopener noreferrer")
+  })
+
   it("waits for Save when it needs the saved settings, and says why a refused press did not run", async () => {
     const request = vi.fn(async () => ({ type: "result" as const, requestId: "r", ok: false, error: { code: "not_running" as const, message: "Demo home is not running" } }))
     const { rerender } = withClient(request as never, <Harness field={allOff} initial={undefined} context={context(true)} />)

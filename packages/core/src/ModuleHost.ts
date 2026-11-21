@@ -5,6 +5,7 @@ import {
   type FieldError,
   MAX_COMBO_OPTIONS,
   MAX_FIELD_LABEL,
+  FIELD_ACTION_LINK_HREF,
   MAX_MODULE_TEMPLATES,
   MAX_OPTIONS_JSON,
   MAX_ROUTE_DESCRIPTION,
@@ -70,6 +71,7 @@ import {
 } from "./ModuleApi.ts"
 import type { FieldActionHandler, FieldActionResult } from "./ModuleContributions.ts"
 import { type FieldActionOwner, makeFieldActionOwner } from "./FieldActionOwner.ts"
+import { CredentialError, type CredentialStore, credentialProblem, type ModuleCredentials } from "./ModuleCredentials.ts"
 import { type ModuleRoute, type PublishedRoute, RouteTokenError, routeInfo, routeProblem, type RouteTokens, type RouteTokenStore } from "./ModuleRoutes.ts"
 import { clipText as clip, jsonBytes, largestField, wholeCodePoints } from "./ModuleFrames.ts"
 import { makePageBoundary } from "./PageBoundary.ts"
@@ -301,6 +303,11 @@ export interface ModuleHost {
    */
   readonly routes: () => ReadonlyArray<PublishedRoute>
   /**
+   * Does an enabled module declare `page.thirdPartyEmbeds`? Read live (a module switched on or off in the admin UI
+   * counts from the next call); the server asks at every page response to decide on cross-origin isolation.
+   */
+  readonly thirdPartyEmbeds: () => boolean
+  /**
    * P3: the page boundary (`PageBoundary`) for module-produced text the app shows itself (route descriptions and the
    * route call log): every secret the module was given since the host started, and every one known now, replaced by
    * `[secret]`, then clipped to `max` characters.
@@ -436,6 +443,8 @@ export interface ModuleHostOptions {
   readonly registrars?: ReadonlyArray<Registrar>
   /** P3: where route tokens are kept (serve mode: the key vault). Absent: `host.routeTokens` fails `unavailable`. */
   readonly routeTokens?: RouteTokenStore
+  /** Where module credentials are kept (serve mode: the key vault; the test kit: memory). Absent: `host.credentials` fails `unavailable`. */
+  readonly credentials?: CredentialStore
   /** P3: time a field action may take. Default `FIELD_ACTION_TIMEOUT_MS`. */
   readonly fieldActionTimeoutMs?: number
   /**
@@ -2939,6 +2948,7 @@ export const makeModuleHost = Effect.fnUntraced(function*(options: ModuleHostOpt
     }
     const effect = <A, E = never>(f: () => Effect.Effect<A, E>): Effect.Effect<A, E> => Effect.suspend(() => (isStopped() ? Effect.die(stoppedError(entry)) : f()))
     const tokens = routeTokensFor(entry.def.id, part)
+    const credentials = credentialsFor(entry.def.id, part)
     // P5: the core's services as this part sees them, made once per part.
     const coreViews = new Map<string, unknown>()
     const serviceHere = <T>(key: ServiceKey<T>): T | undefined => {
@@ -2962,6 +2972,11 @@ export const makeModuleHost = Effect.fnUntraced(function*(options: ModuleHostOpt
           list: effect(() => tokens.list),
           revoke: (id) => effect(() => tokens.revoke(id)),
           mint: (name, label) => effect(() => tokens.mint(name, label))
+        },
+        credentials: {
+          get: (name) => effect(() => credentials.get(name)),
+          set: (name, value) => effect(() => credentials.set(name, value)),
+          clear: (name) => effect(() => credentials.clear(name))
         },
         view: () => now(view),
         service: (key) => now(() => serviceHere(key)),
@@ -3162,7 +3177,8 @@ export const makeModuleHost = Effect.fnUntraced(function*(options: ModuleHostOpt
       // known tone.
       const answer = (result: FieldActionResult): FieldActionHostResult => {
         const tone = result.tone === "neutral" || result.tone === "ok" || result.tone === "warning" || result.tone === "error" ? result.tone : undefined
-        return { ok: true, result: { ok: result.ok === true, text: boundary.text(id, result.text, 500), ...(tone !== undefined ? { tone } : {}) } }
+        const link = fieldActionLink(id, result.link, (text) => boundary.text(id, text, 60))
+        return { ok: true, result: { ok: result.ok === true, text: boundary.text(id, result.text, 500), ...(tone !== undefined ? { tone } : {}), ...(link !== undefined ? { link } : {}) } }
       }
       // The settings it sees: the saved shared ones, or (requiresSaved: false) the page's draft over them. Settings
       // that do not resolve (a required key not set, a saved value no longer valid) are the result: it does not run.
@@ -3284,6 +3300,32 @@ export const makeModuleHost = Effect.fnUntraced(function*(options: ModuleHostOpt
     }
   }
 
+  /**
+   * `host.credentials` of one part. The name and the size of the value are judged here; every value the part reads or
+   * writes is remembered by the page boundary for as long as the part lives, so it never reaches a page.
+   */
+  function credentialsFor(moduleId: string, part: Part): ModuleCredentials {
+    if (options.credentials === undefined) {
+      const none = new CredentialError({ reason: "unavailable", message: "Credentials are kept by the server (serve mode) only" })
+      return { get: () => Effect.fail(none), set: () => Effect.fail(none), clear: () => Effect.fail(none) }
+    }
+    const store = options.credentials.forModule(moduleId)
+    const invalid = (name: string, value?: string) => {
+      const problem = credentialProblem(name, value)
+      return problem === undefined ? undefined : Effect.fail(new CredentialError({ reason: "invalid", message: problem }))
+    }
+    return {
+      get: (name) =>
+        invalid(name) ?? Effect.tap(store.get(name), (v) => Effect.sync(() => {
+          if (v !== undefined) boundary.remember(moduleId, part, [v])
+        })),
+      set: (name, value) => invalid(name, value) ?? Effect.tap(store.set(name, value), () => Effect.sync(() => boundary.remember(moduleId, part, [value]))),
+      clear: (name) => invalid(name) ?? store.clear(name)
+    }
+  }
+
+  const thirdPartyEmbeds = (): boolean => entries.some((e) => e.def.page?.thirdPartyEmbeds === true && e.catalogError === undefined && wantedBy(e, e.want))
+
   /** P3: the live routes, from the route table publication fills. */
   const routes = (): ReadonlyArray<PublishedRoute> =>
     [...routeTable].flatMap(([moduleId, live]) => live.routes.map((route) => ({ moduleId, route, scope: live.scope, stopped: live.stopped })))
@@ -3312,6 +3354,7 @@ export const makeModuleHost = Effect.fnUntraced(function*(options: ModuleHostOpt
     gateway,
     fieldAction,
     routes,
+    thirdPartyEmbeds,
     routeView,
     pageText,
     settingOptions,
@@ -3468,6 +3511,15 @@ const declaresMember = (object: object, key: string): boolean => {
     if (Object.hasOwn(o, key)) return true
   }
   return false
+}
+
+/** A press's link, as far as the page may be shown it: a path under this module's own `/api/modules/<id>/`; anything else is dropped. */
+const fieldActionLink = (moduleId: string, link: FieldActionResult["link"], label: (text: string) => string): FieldActionResult["link"] => {
+  if (typeof link !== "object" || link === null || typeof link.href !== "string" || typeof link.label !== "string") return undefined
+  if (link.href.length > 400 || !link.href.startsWith(`/api/modules/${moduleId}/`)) return undefined
+  if (!FIELD_ACTION_LINK_HREF.test(link.href)) return undefined
+  const shown = label(link.label).trim()
+  return shown === "" ? undefined : { href: link.href, label: shown }
 }
 
 /** The generated `test` field action of an agent or decision-provider instance, if it is one. */

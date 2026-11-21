@@ -150,6 +150,38 @@ body {
   :root[data-presenting] [data-testid="state-label-box"] { margin-top: 4px; }
 }
 
+/* The player surfaces (docs/modules/media.md §5; docs/CHARACTERS.md §2.8). Set on the root by `MediaSurface`:
+   `data-music` while Spotify's panel is up, `data-theatre` while YouTube's frame is, `data-theatre-badge` while the
+   assistant is quiet. Unlayered on purpose: these must beat the box's own utility classes (width) in the Stage.
+   The character is not told anything: its box (`.stage-vis`) changes size and place as it already does for
+   presentations (§2.7), and `focus` follows it. */
+:root[data-music] { --pva-music-room: 150px; --pva-music-side: 0px; }
+@media (min-width: 1024px) {
+  :root[data-music] { --pva-music-room: 0px; --pva-music-side: 364px; }
+}
+/* Presentations make room for the panel (below it on a phone, beside it from 1024 px). */
+:root[data-music] [data-testid="present-stage"] {
+  bottom: calc(96px + env(safe-area-inset-bottom) + var(--pva-music-room));
+  right: var(--pva-music-side);
+}
+:root[data-theatre] {
+  /* The frame's width: the viewport's, or what its height allows at 16:9 below the strip. */
+  --pva-theatre-w: min(calc(100vw - 24px), max(160px, calc((100dvh - var(--pva-theatre-top, 64px) - 96px - env(safe-area-inset-bottom, 0px) - 56px) * 16 / 9)));
+}
+:root[data-theatre] .stage-pad [data-present-yield] { display: none; }
+/* Quiet: the character is a badge at the left end of the theatre's strip, outside the frame. */
+:root[data-theatre-badge] .stage-vis {
+  position: fixed;
+  z-index: 7;
+  left: calc((100vw - var(--pva-theatre-w)) / 2 + 8px);
+  top: calc(var(--pva-theatre-top, 64px) + 4px);
+  width: 72px;
+  height: 48px;
+  max-width: none;
+  margin: 0;
+}
+:root[data-theatre-badge] [data-testid="state-label-box"] { display: none; }
+
 @keyframes pva-spin { to { transform: rotate(360deg); } }
 @keyframes pva-fade-in { from { opacity: 0; } to { opacity: 1; } }
 @keyframes pva-rise { from { opacity: 0; transform: translateY(8px); } to { opacity: 1; transform: none; } }

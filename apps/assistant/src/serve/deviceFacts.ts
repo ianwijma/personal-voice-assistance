@@ -10,7 +10,7 @@ import {
   type TargetDevice,
   type TurnPerson
 } from "@pva/core"
-import { boundaryKey, type DeclaredCapabilities, type DeviceOutputs, deviceOutputsFrom, type DevicePresentOutputs, devicePresentFrom, type DevicePlace, effectiveCapabilities, roomOf, speakerAllowedFrom } from "@pva/protocol"
+import { boundaryKey, type DeclaredCapabilities, type DeviceCapabilities, type DeviceOutputs, deviceOutputsFrom, type DevicePresentOutputs, devicePresentFrom, type DevicePlace, effectiveCapabilities, roomOf, speakerAllowedFrom } from "@pva/protocol"
 import { Effect } from "effect"
 import { deviceSettingsFrom } from "./devices.ts"
 import { type EffectiveMembers, effectiveMembersOf } from "./people.ts"
@@ -125,6 +125,12 @@ export interface DeviceFacts {
    * minus the owner's overrides (its own, else its type's). A page that never declared anything shows none.
    */
   readonly presentOf: (deviceId: string, kind?: string, declaredKinds?: Readonly<Record<string, number>>) => DevicePresentOutputs
+  /**
+   * The sources a page of the device can play now (`DevicePlayers`): what that page declared (`declared`, its own
+   * declaration) minus what the owner's overrides take away (`effectiveCapabilities`: no display or no speaker takes
+   * the players too). Empty: none.
+   */
+  readonly mediaOf: (deviceId: string, kind: string | undefined, declared: DeviceCapabilities | undefined) => ReadonlyArray<string>
   /** Something live changed (a connection, a declaration, visibility): the next read rebuilds the list. */
   readonly changed: () => void
   readonly devices: DevicesService
@@ -252,6 +258,13 @@ export const makeDeviceFacts = (options: DeviceFactsOptions): DeviceFacts => {
       // P10 (G11): one connection's own kinds in place of the device's latest declaration; display and overrides as declared.
       const caps = declared?.capabilities === undefined || declaredKinds === undefined ? declared?.capabilities : { ...declared.capabilities, present: { kinds: declaredKinds } }
       return devicePresentFrom(settings, caps)
+    },
+    mediaOf: (deviceId, kind, declared) => {
+      if (declared?.media === undefined) return []
+      const file = current().file
+      const known = file.devices[deviceId] !== undefined
+      const settings = deviceSettingsFrom(file, known ? deviceId : undefined, kind)
+      return effectiveCapabilities(declared, settings.capabilities).media?.players ?? []
     },
     changed: () => {
       version++

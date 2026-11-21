@@ -25,6 +25,12 @@ export interface FieldActionResult {
   /** One or two sentences for the owner ("First text after 640 ms: 'Hello there.'"). At most 500 characters. */
   readonly text: string
   readonly tone?: "neutral" | "ok" | "warning" | "error"
+  /**
+   * A link shown beside the answer, opened by the owner in a new tab: a path on the assistant itself, under
+   * `/api/modules/<this module's id>/` (a sign-in that continues on another site starts at the module's own route). The
+   * host drops a link whose `href` is anything else; `label` is at most 60 characters.
+   */
+  readonly link?: { readonly href: string; readonly label: string }
 }
 
 /**

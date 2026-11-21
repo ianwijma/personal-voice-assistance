@@ -10,6 +10,7 @@ import { type Connection, makeConnection, type RequestInput, type ResultMessage,
 import { EchoTestCancelled, runEchoTest } from "./echoTest.ts"
 import { deviceHello } from "./device.ts"
 import { type CapabilityWatch, watchCapabilities } from "./capabilities.ts"
+import { createMediaController, isTalking, type MediaController } from "./media/index.ts"
 import { ADMIN_TOKEN_KEY } from "./adminToken.ts"
 import { createPrefsStore, type Prefs, type PrefsStore } from "./prefs.ts"
 import { sessionsFullText } from "./sessions.ts"
@@ -129,6 +130,11 @@ export interface AssistantClient {
    */
   readonly echoTest: () => Promise<{ cancelled: boolean; residualDb: number }>
   readonly connection: Connection
+  /**
+   * Voice front end in a browser: the page's media players and their controller (docs/modules/media.md §5); undefined on
+   * the admin page and outside a browser. `media.command` messages reach it from `afterMessage`.
+   */
+  readonly media: MediaController | undefined
 }
 
 const clientIdKey = "pva.clientId"
@@ -314,6 +320,9 @@ export const createAssistantClient = (options: { readonly frontend?: FrontendRol
     onRoute: (route) => diagnostics.dispatch({ type: "route", route })
   })
 
+  // The page's media players: voice pages in a browser only (the admin page declares none). Creating them loads nothing.
+  const media: MediaController | undefined = frontend === "voice" && typeof window !== "undefined" ? createMediaController((m) => connection.send(m)) : undefined
+
   // continuation(state): the connection runs these callbacks on each socket event, on the present state.
   const connection: Connection = makeConnection({
     url: typeof location === "undefined" ? "ws://localhost:8787/ws" : resolveWsUrl(location),
@@ -342,6 +351,7 @@ export const createAssistantClient = (options: { readonly frontend?: FrontendRol
     hooks: {
       afterWelcome: (resumed) => {
         capsWatch?.resync()
+        media?.resync() // a new connection numbers its commands again: the whole state, with no `ack`
         if (resumed) {
           // The server assumes a live microphone on resume: tell it the truth.
           const s = store.get()
@@ -356,6 +366,7 @@ export const createAssistantClient = (options: { readonly frontend?: FrontendRol
         if (m.type === "admin.state" && !m.admin.loggedIn) writeToken(undefined)
         if (m.type === "welcome" && frontend === "admin" && !m.snapshot.admin.loggedIn) writeToken(undefined)
         if (m.type === "wake" && m.armed) playCue()
+        if (m.type === "media.command") media?.handleCommand(m.seq, m.command)
         if (m.type === "session" && previousRole === "owner" && m.role === "observer" && audio.running) {
           void releaseAudio("takeover") // taken over by another tab: close our microphone
         }
@@ -395,6 +406,7 @@ export const createAssistantClient = (options: { readonly frontend?: FrontendRol
 
   const startAudio = () => {
     if (frontend === "admin") return // the admin page never claims the audio
+    media?.activate() // the Start press is the gesture Spotify's player needs, inside this click
     const phase = store.get().audio.phase
     if (phase === "starting") return
     if (!VoiceAudio.supported()) {
@@ -615,6 +627,8 @@ export const createAssistantClient = (options: { readonly frontend?: FrontendRol
     if (frontend === "voice" && typeof window !== "undefined") capsWatch = watchCapabilities({ send: (m) => connection.send(m) })
     // continuation(state): the ring loop reads the present state on every change while connected.
     const stopRinging = store.subscribe(() => ringLoop.update())
+    // continuation(state): lowers or pauses what plays while the assistant is woken, listens, thinks or speaks; no round trip.
+    const stopTalk = media === undefined ? () => {} : store.subscribe(() => media.setTalking(isTalking(store.get())))
     // continuation(none): acts on the present state when the page becomes visible.
     const onVisible = () => {
       if (document.visibilityState !== "visible" || !audio.running) return
@@ -644,6 +658,7 @@ export const createAssistantClient = (options: { readonly frontend?: FrontendRol
       window.removeEventListener("pageshow", onPageShow)
       capsWatch?.stop()
       capsWatch = undefined
+      stopTalk()
       stopRinging()
       ringLoop.stop()
       stop()
@@ -666,6 +681,7 @@ export const createAssistantClient = (options: { readonly frontend?: FrontendRol
     store,
     prefs,
     connection,
+    media,
     connect,
     startAudio,
     endAudio,

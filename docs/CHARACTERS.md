@@ -146,6 +146,24 @@ window height, from 16 px up):
 So a character must stay readable in a strip 40 px high (a mode must read from what is inside the focus, as before);
 what it draws outside the focus may run under the presentation area.
 
+### 2.8 The player surface (media module)
+
+Since the media module's page (docs/modules/media.md §5, docs/UI-AND-MODULES.md §3.1) the stage can also show a music
+panel (Spotify) or a theatre (YouTube's frame). **The contract does not change for a character**: no character is told
+what plays, the frame and `focus` are as before, and a character written before this still works. What a character sees
+is the box changing size and place, which it already could (§2.7):
+
+- **Music panel**: nothing changes for the character. The panel is a separate card (a phone: above the controls; from
+  1024 px: at the right of the stage), and the box stays where it is.
+- **Theatre**: the frame takes the stage and the character yields, with the same means as a presentation, in two
+  steps. *Quiet*: the box is a badge of 72 × 48 px at the left end of the theatre's strip (`position: fixed`, so out of
+  the layout; `data-theatre-badge` on the root). A character must read its mode from a 72 × 48 px focus: a box
+  character gets one `resize`, a stage character's `focus` moves in one frame, and the stage canvas still covers the
+  whole viewport behind the page. *Talking* (woken, listening, hearing, thinking, speaking): the box is its usual size
+  again, and the theatre's frame starts below it. The frame is above the canvas, never under glow the character draws
+  over it: a character's drawing is behind the page's content, so nothing of a character is ever drawn over the frame.
+- A character that does not survive a 72 × 48 px focus is already out of contract (§2.7 asks for a strip 40 px high).
+
 ## 3. The manifest
 
 What a character declares about itself: the `Character` object in `apps/web/src/characters/contract.ts` (in the lab, the `Design` object). The host checks it on every load (`manifest.ts`) and refuses a character whose manifest is incomplete; the compatibility tests check it too (§6.7).
