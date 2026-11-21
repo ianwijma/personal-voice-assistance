@@ -44,7 +44,20 @@ import { matchWakePhrase, type WakeConfig } from "./WakeGate.ts"
  * - A window of an assistant that is switched off counts as step 2/3 for that off assistant: the utterance is held
  *   (a phrase can still reach a switched-on assistant) and otherwise dropped with reason `off`.
  * - `defaultAssistant` missing with `withoutPhrase: "assistant"` behaves as `nobody`.
+ *
+ * The guard (docs/PHRASES.md "Guards"; serve mode wires it to a device's media player): an optional predicate, asked
+ * at decision time and never stored. While it is true the device needs a wake phrase for every request, as if
+ * `withoutPhrase` were `nobody` and follow-up were 0: an utterance that starts without a phrase is held, and dropped
+ * with reason `guard` unless a phrase releases it; a follow-up window (or a reply in progress) admits nothing and
+ * `window()` does not show it; a window is not opened by an accepted utterance or a reply that ends while it is true
+ * (one that expired meanwhile stays expired). An armed window (the phrase alone, said under the guard or before it)
+ * still admits its one utterance: the phrase was said. A phrase works as ever; an utterance already accepted stays
+ * accepted; replies, `release`, `cancelReply` and the echo gate are untouched. The cost is one call of the predicate
+ * per decision (for the media guard, one map lookup).
  */
+
+/** True while a guard holds the device (`makeRouteGate`'s second argument). Synchronous; must not throw. */
+export type GateGuard = () => boolean
 
 /** One wake phrase on the device and the assistant it reaches (every assignment's phrases, as configured). */
 export interface RoutePhrase {
@@ -80,7 +93,7 @@ export type RouteTarget =
   /** The dispatcher must ask TypeSafe; `fallback` answers when it does not choose (already `null` when off). */
   | { readonly by: "decide"; readonly fallback: string | null }
   /** `assistant`: the switched-off assistant the route reached (reason `off`). */
-  | { readonly by: "dropped"; readonly reason: "asleep" | "off"; readonly assistant?: string }
+  | { readonly by: "dropped"; readonly reason: "asleep" | "off" | "guard"; readonly assistant?: string }
 
 export interface RouteResult {
   /** Events to pass on, in order. */
@@ -129,6 +142,8 @@ export interface RouteGate {
   cancelReply(): void
   /** An utterance starting now would be accepted without a phrase. */
   awake(now: number): boolean
+  /** The guard holds the device right now (every request needs a phrase). Always false without a guard. */
+  guarded(): boolean
   /** The open window right now, if any (armed first, then follow-up). */
   window(now: number): { readonly assistant: string; readonly by: "armed" | "follow-up" } | undefined
   filter(event: SttEvent, now: number): RouteResult
@@ -176,8 +191,9 @@ const withText = (event: SttEvent, text: string): SttEvent =>
 
 const blank = (text: string) => text.trim().length === 0
 
-export const makeRouteGate = (initial: RouteConfig): RouteGate => {
+export const makeRouteGate = (initial: RouteConfig, guard?: GateGuard): RouteGate => {
   let config = initial
+  const guarded = () => guard !== undefined && guard()
   let utterance: Utterance | undefined
   /** The assistant whose reply is playing. */
   let replying: string | undefined
@@ -195,6 +211,7 @@ export const makeRouteGate = (initial: RouteConfig): RouteGate => {
 
   const armedOpen = (now: number) => armed !== undefined && now - armed.at < armedMs()
   const followingOpen = (now: number) => {
+    if (guarded()) return undefined
     if (replying !== undefined && followUpOf(replying) > 0) return replying
     if (following === undefined) return undefined
     const ms = followUpOf(following.assistant)
@@ -220,6 +237,7 @@ export const makeRouteGate = (initial: RouteConfig): RouteGate => {
       if (w.by === "armed" && consume) armed = undefined
       return live({ assistant: w.assistant, by: w.by })
     }
+    if (guarded()) return { by: "dropped", reason: "guard" }
     switch (config.withoutPhrase) {
       case "assistant":
         return config.defaultAssistant === undefined
@@ -281,7 +299,7 @@ export const makeRouteGate = (initial: RouteConfig): RouteGate => {
           }
           const only = m !== undefined && blank(text)
           if (only) armed = { assistant: m.assistant, at: now }
-          else if (!blank(text) && "assistant" in target) following = { assistant: target.assistant, from: now }
+          else if (!blank(text) && "assistant" in target && !guarded()) following = { assistant: target.assistant, from: now }
           return {
             events: [withText(event, text)],
             target,
@@ -345,7 +363,7 @@ export const makeRouteGate = (initial: RouteConfig): RouteGate => {
           armed = { assistant: m.assistant, at: now }
           return { events: [], target: m.target, woke: { ...woke, armed: true }, ...heardOf(event.text, m, true) }
         }
-        following = { assistant: m.assistant, from: now }
+        if (!guarded()) following = { assistant: m.assistant, from: now }
         return {
           events: [u.start, withText(event, m.rest)],
           target: m.target,
@@ -370,7 +388,7 @@ export const makeRouteGate = (initial: RouteConfig): RouteGate => {
     },
     replyEnded: (assistant, now) => {
       if (replying === assistant) replying = undefined
-      following = { assistant, from: now }
+      if (!guarded()) following = { assistant, from: now }
     },
     release: () => {
       armed = undefined
@@ -381,6 +399,7 @@ export const makeRouteGate = (initial: RouteConfig): RouteGate => {
       armed = undefined
       following = undefined
     },
+    guarded,
     awake: (now) => baseTarget(now, false).by !== "dropped",
     window,
     filter: (event, now) => {

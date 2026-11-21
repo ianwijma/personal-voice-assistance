@@ -673,3 +673,140 @@ describe("the protocol's route config", () => {
     assert.strictEqual(gate.config().fallback, "jeff")
   })
 })
+
+// ---------------------------------------------------------------------------
+// The guard (docs/PHRASES.md "Guards"): while it holds, every request needs the wake phrase.
+
+describe("RouteGate: guard", () => {
+  const guarded = (config: RouteConfig) => {
+    const state = { on: false, asked: 0 }
+    const gate = makeRouteGate(config, () => {
+      state.asked++
+      return state.on
+    })
+    return { gate, state }
+  }
+  const GUARD_DROP = { by: "dropped", reason: "guard" } as const
+
+  it("without a guard, or while it is off, nothing changes", () => {
+    const plain = makeRouteGate(wake({ activation: "always" }))
+    assert.isFalse(plain.guarded())
+    const { gate } = guarded(wake({ activation: "always" }))
+    const out = feed(gate, [speechStarted, endOfTurn("lights on")])
+    assert.deepStrictEqual(out, [speechStarted, endOfTurn("lights on")])
+    assert.isTrue(gate.awake(10))
+  })
+
+  it("rule 1: with answering without a phrase on, an utterance without the phrase is not routed (reason guard), as asleep is", () => {
+    const { gate, state } = guarded(wake({ activation: "always" }))
+    state.on = true
+    assert.isFalse(gate.awake(0))
+    assert.strictEqual(gate.filter(speechStarted, 0).events.length, 0)
+    const r = gate.filter(endOfTurn("la la la"), 1)
+    assert.deepStrictEqual(r.events, [])
+    assert.deepStrictEqual(r.target, GUARD_DROP)
+    assert.deepStrictEqual(r.dropped, { text: "la la la" })
+    assert.deepStrictEqual(r.heard, { text: "la la la", accepted: false })
+    // The same in decide mode.
+    const d = guarded({ ...wake({ activation: "always" }), withoutPhrase: "decide", fallback: "jeff" })
+    d.state.on = true
+    d.gate.filter(speechStarted, 0)
+    assert.deepStrictEqual(d.gate.filter(endOfTurn("la la"), 1).target, GUARD_DROP)
+  })
+
+  it("rule 1: with the phrase, the request is routed as ever (also an eager transcript), and the phrase alone arms", () => {
+    const { gate, state } = guarded(wake({ activation: "always" }))
+    state.on = true
+    const out = feed(gate, [speechStarted, interim("hey jeff lights"), eagerEndOfTurn("hey jeff lights"), turnResumed, endOfTurn("hey jeff lights on")])
+    assert.deepStrictEqual(out, [speechStarted, interim("lights"), eagerEndOfTurn("lights"), turnResumed, endOfTurn("lights on")])
+    const r = gate.filter(speechStarted, 20)
+    assert.deepStrictEqual(r.events, [])
+    gate.filter(endOfTurn("Hey Jeff."), 21)
+    // The phrase alone arms; its one utterance is admitted (the phrase was said).
+    assert.deepStrictEqual(gate.window(22), { assistant: "jeff", by: "armed" })
+    assert.deepStrictEqual(feed(gate, [speechStarted, endOfTurn("pause")], 22), [speechStarted, endOfTurn("pause")])
+  })
+
+  it("rule 2: a follow-up window open when the guard starts admits nothing while it holds, and again after it lifts if not expired", () => {
+    const { gate, state } = guarded(wake())
+    feed(gate, [speechStarted, endOfTurn("hey jeff what time")], 0)
+    gate.replyStarted("jeff", 1)
+    gate.replyEnded("jeff", 2)
+    assert.deepStrictEqual(gate.window(100), { assistant: "jeff", by: "follow-up" })
+    state.on = true
+    assert.isUndefined(gate.window(100))
+    assert.isFalse(gate.awake(100))
+    assert.strictEqual(gate.filter(speechStarted, 100).events.length, 0)
+    assert.deepStrictEqual(gate.filter(endOfTurn("and tomorrow"), 101).target, GUARD_DROP)
+    state.on = false
+    assert.deepStrictEqual(feed(gate, [speechStarted, endOfTurn("and tomorrow")], 200), [speechStarted, endOfTurn("and tomorrow")])
+  })
+
+  it("rule 2: a window that expired while the guard held stays expired; a reply in progress is no window under the guard", () => {
+    const { gate, state } = guarded(wake({ followUpMs: 1_000 }))
+    feed(gate, [speechStarted, endOfTurn("hey jeff what time")], 0)
+    gate.replyEnded("jeff", 0)
+    state.on = true
+    assert.isFalse(gate.awake(500))
+    state.on = false
+    assert.isUndefined(gate.window(1_500))
+    assert.isFalse(gate.awake(1_500))
+    // A reply in progress counts as the follow-up window, unless guarded.
+    gate.replyStarted("jeff", 2_000)
+    assert.isTrue(gate.awake(2_100))
+    state.on = true
+    assert.isFalse(gate.awake(2_100))
+    assert.strictEqual(gate.filter(speechStarted, 2_100).events.length, 0)
+  })
+
+  it("rule 2: no follow-up window opens while guarded (a reply that ends, an accepted utterance); one opens once it lifted before the end", () => {
+    const { gate, state } = guarded(wake())
+    state.on = true
+    feed(gate, [speechStarted, endOfTurn("hey jeff what time")], 0)
+    gate.replyStarted("jeff", 1)
+    gate.replyEnded("jeff", 2)
+    state.on = false
+    assert.isUndefined(gate.window(3))
+    // The page paused (the room is quiet): the reply's end opens the window.
+    state.on = true
+    gate.replyStarted("jeff", 10)
+    state.on = false
+    gate.replyEnded("jeff", 11)
+    assert.deepStrictEqual(gate.window(12), { assistant: "jeff", by: "follow-up" })
+    // Two-phase held utterance accepted by a phrase under the guard opens none either.
+    const other = guarded(wake())
+    other.state.on = true
+    feed(other.gate, [speechStarted, interim("hey jeff"), endOfTurn("hey jeff what time")], 0)
+    other.state.on = false
+    assert.isUndefined(other.gate.window(5))
+  })
+
+  it("an utterance already accepted stays accepted to its end when the guard starts; the next one is held", () => {
+    const { gate, state } = guarded(wake({ activation: "always" }))
+    gate.filter(speechStarted, 0)
+    state.on = true
+    assert.deepStrictEqual(gate.filter(endOfTurn("lights on"), 1).events, [endOfTurn("lights on")])
+    assert.strictEqual(gate.filter(speechStarted, 2).events.length, 0)
+  })
+
+  it("rule 3: replyStarted/replyEnded/release/cancelReply work as before; the guard only gates what the route admits", () => {
+    const { gate, state } = guarded(wake())
+    state.on = true
+    gate.replyStarted("jeff", 0)
+    gate.cancelReply()
+    gate.release()
+    state.on = false
+    assert.isFalse(gate.awake(1))
+    assert.isFalse(gate.guarded())
+    state.on = true
+    assert.isTrue(gate.guarded())
+  })
+
+  it("the guard is asked at decision time, not cached (a handful of calls per decision)", () => {
+    const { gate, state } = guarded(wake({ activation: "always" }))
+    state.asked = 0
+    gate.filter(speechStarted, 0)
+    // One for the window, one for the decision.
+    assert.isAtMost(state.asked, 2)
+  })
+})

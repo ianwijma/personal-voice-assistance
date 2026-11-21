@@ -93,6 +93,11 @@ The rest is applied by the browser.
 > on). The text below describes `WakeGate`, which stays in core for the offline bench and the voice-node branch, and the
 > matching rules both share.
 
+**Guard (media).** `RouteGate` takes an optional `guard` predicate, asked at each decision. While it is true the device acts
+as if `withoutPhrase` were `nobody` and follow-up were 0: only a wake phrase gets an utterance through (an utterance already
+accepted stays accepted, a phrase alone still arms). Serve mode passes `DevicePlayers.isPlaying(deviceId)`, so a device whose
+own page is playing media needs the phrase for every request (docs/PHRASES.md, docs/modules/media.md).
+
 Pure and synchronous like `EchoGate`; time is passed in. It filters the `SttEvent` stream and must keep the
 utterance contract of docs/ARCHITECTURE.md (every forwarded utterance begins with `SpeechStarted` and ends with
 exactly one `EndOfTurn`; a dropped utterance forwards nothing at all).

@@ -292,7 +292,7 @@ Checked on 2026-11-21 against the providers' own pages unless marked.
 | `Playback` was keyed by room and only music provided it. | Keyed by device now; this module provides it. |
 | Modules reach the internet only through `@pva/net`, which sent GET and HEAD. | `makeFixedApi` (GET, PUT, POST, DELETE with a JSON or form body to hosts named in the module's own code). |
 | A module could not keep a secret it obtained itself. | `host.credentials` (the key vault). |
-| The echo gate knows only the assistant's own speech. Nothing ducks, and no rule requires the wake phrase while media plays. Browser echo cancellation of SDK and iframe audio is unproven. | Ducking is the page's (`open.talk`); the media guard and the measurements are still to do (below). |
+| The echo gate knows only the assistant's own speech. Nothing ducks, and the route gate requires the wake phrase while the device's player plays (the media guard). Browser echo cancellation of SDK and iframe audio is unproven. | Ducking is the page's (`open.talk`); the media guard is built (route gate, above); the measurements are still to do (below). |
 | The web-search module already offers other modules an image search over SearXNG. | Video search is added the same way (`WebVideos`). |
 
 ## Changes below the module (merged before it)
@@ -331,7 +331,8 @@ This is the part most likely to go wrong, and not all of it is built.
   Both are settings. *Built here as the `talk` each `open` carries; done by the page.*
 - **Media guard.** While a device's player is `playing`, that device needs the wake phrase for every request: no follow-up
   window and no answering without the phrase. Otherwise lyrics and video speech become turns. This is a change to the route gate,
-  fed by `DevicePlayers.isPlaying`, and it is the guard docs/PHRASES.md lists under "Not now". **Not built yet: still to do.**
+  fed by `DevicePlayers.isPlaying` (`makeRouteGate`'s `guard`, docs/PHRASES.md). *Built (step 5).* If the page stops reporting,
+  the guard lifts after 60 s (`isPlaying` counts only a report of `playing` from the last minute), and the device behaves as before.
 - **So "pause" is "hey …, pause"** in this version. Bare "pause" while media plays stays out.
 - **What the device measurements must show**: how often the wake phrase is heard over music and over a video at normal volume, and
   how much of the media's sound reaches speech recognition with the browser's echo cancellation on. If the wake phrase is not
@@ -381,8 +382,6 @@ scripts and fixtures.
 
 ## Still to do
 
-- **The media guard in the route gate** (build step 5): the wake phrase required for every request on a device while its player is
-  `playing`, fed by `DevicePlayers.isPlaying`; measured again on the device.
 - **The real-device measurements** above, and the plan revised from them (push-to-talk on the panel if the wake phrase is not
   reliable over music).
 - **The page** (`apps/web`), as the contract above says (built separately).

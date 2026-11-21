@@ -1609,6 +1609,8 @@ export const startServe = (options: ServeOptions): Effect.Effect<ServeHandle, Ht
           // P5: `CurrentTurn.room` and `.person` (the device's default person).
           place: () => deviceFacts.originOf(device?.id),
           // P5: "Don't use its speaker", or a declaration without one: nothing is sent to be played.
+          // Media guard (docs/modules/media.md §6): while the device's own page plays, every request needs the wake phrase.
+          ...(device !== undefined ? { guard: () => devicePlayers.service.isPlaying(device.id) } : {}),
           speakerAllowed: () => deviceFacts.speakerAllowed(device?.id, device === undefined ? undefined : devices.kindOfDevice(device.id)),
           hearing: hearingOf(device?.id),
           ...(options.hearerSwitchWaitMs !== undefined ? { hearerSwitchWaitMs: options.hearerSwitchWaitMs } : {}),

@@ -320,14 +320,23 @@ thread for 18–99 ms in one step, with one to ten aliases per option.)
 
 ## Not now
 
-Module windows, `capture`, guards, the `audible` window (wake-free control while a reply plays) and its setting, typed
+Module windows, `capture`, guards other than the media guard (below), the `audible` window (wake-free control while a reply plays) and its setting, typed
 actions before the model, switching the assistant, sleep, microphone mute, device state, earcons and canned replies of a
 module, media volume for louder and quieter, phrases on a notification's actions (a button's label is its phrase),
 matching typed text, fuzzy matching, the admin warning for a routine phrase close to a wake phrase, and the measurement
 of false stops.
 
-The media guard (a device whose player is playing needs the wake phrase for every request; docs/modules/media.md §6) is
-also not here yet. Its input is: `DevicePlayers.isPlaying(deviceId)` is a synchronous read of the page's last report
-(playing, reported within a minute), made so that the route gate can ask it on a turn's path. And "media volume for
+The media guard exists, and it is the only guard: while `DevicePlayers.isPlaying(deviceId)` is true for a device, the route
+gate (`makeRouteGate(config, guard)`, `GateGuard = () => boolean`, asked at each decision and never stored) treats that
+device as one that needs the wake phrase for every request. An utterance without a phrase is held and then dropped with the
+target reason `guard` (shown to the admin tester as not accepted); a follow-up window, or a reply in progress, admits nothing
+while the guard holds, and no follow-up window opens while it holds (one that expired meanwhile stays expired; one still
+open when the guard lifts admits again). A phrase works as ever, the phrase alone still arms its one utterance, an utterance
+already accepted stays accepted, and the echo gate and the interrupt modes are untouched. Text and touch input never pass the
+route gate. Core knows only the predicate; serve mode passes `() => devicePlayers.isPlaying(device.id)` per device session
+(`VoiceSession`'s `guard` option), so a device with no player page is never guarded. The check costs one call of the
+predicate, one map lookup, per gate decision; it was not measured. Tests: `packages/core/test/RouteGate.test.ts` ("guard"),
+`apps/assistant/test/serveMediaGuard.test.ts`. Not done: the `asleep` state the page shows follows `withoutPhrase` alone, so
+a guarded device that otherwise answers without a phrase still shows `listening`. And "media volume for
 louder and quieter": `Playback.changeVolume(deviceId, { by })` can succeed now (the page reports its level), but the
 host's "louder" and "quieter" still change the reply volume only.

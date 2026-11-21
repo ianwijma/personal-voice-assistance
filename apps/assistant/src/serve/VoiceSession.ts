@@ -156,6 +156,11 @@ export interface VoiceSessionOptions {
    */
   readonly speakerAllowed?: () => boolean
   /**
+   * The route gate's guard (`GateGuard`): true while something on the device makes every request need the wake phrase
+   * (serve mode: the device's own page is playing media, `DevicePlayers.isPlaying`). Asked at each decision. Absent: never.
+   */
+  readonly guard?: () => boolean
+  /**
    * The recogniser this device hears with now (the resource pool's for its hearer, WP-11). Read when the recogniser
    * loop starts and again after every `hearingChanged`. Absent: the engine build's `stt` (tests).
    */
@@ -489,7 +494,7 @@ export const makeVoiceSession = (options: VoiceSessionOptions): Effect.Effect<Vo
     // After the echo gate, before the dispatcher; configured from this device's settings and the assistants.
     const routeConfigNow = (): RouteConfig => routeConfigFrom(options.deviceSettings(), options.assistants(), options.deviceType?.())
     const routeKeyOf = (config: RouteConfig) => JSON.stringify({ ...config, off: [...config.off].sort() })
-    const route = makeRouteGate(routeConfigNow())
+    const route = makeRouteGate(routeConfigNow(), options.guard)
     let routeKey = routeKeyOf(route.config())
     const followUpOf = (assistant: string | undefined) => (assistant === undefined ? 0 : route.config().followUpMs?.[assistant] ?? 0)
     const longestFollowUp = () => Math.max(0, ...Object.values(route.config().followUpMs ?? {}))
