@@ -12,7 +12,7 @@ import {
 } from "@pva/core"
 import { speakDuration } from "@pva/language"
 import { homeLanguage, type Language, say, type WebVideo, WebVideos } from "@pva/module-contracts"
-import { Data, Deferred, Effect, Exit } from "effect"
+import { Clock, Data, Deferred, Effect, Exit } from "effect"
 import { httpsUrl, type MusicError, type MusicItem, type MusicKind } from "./music.ts"
 import type { Spotify } from "./spotify/client.ts"
 import { texts, type TextKey } from "./texts.ts"
@@ -95,6 +95,28 @@ const errorText = (source: string, code: string | undefined): TextKey =>
 
 const clean = (text: unknown, max: number): string | undefined => cleanPlayerText(text, max)
 
+/** A position this close to the start is a track that has just begun. */
+const JUST_BEGUN_MS = 2_000
+
+/**
+ * Is this `playing` report the answer to the play call, and not what the page was saying about the previous track? It
+ * must have been made after the call was sent, and name a track the page was not already on (`ref` differs from the
+ * previous one), or the very song asked for (`wanted`, the id of a song request), or, for an album, artist or playlist
+ * whose first track is not known, the same track begun again (position near the start). A page that gives no `ref` never confirms.
+ */
+export const confirmsPlaying = (
+  current: Pick<Current, "ref" | "positionMs">,
+  reportedAt: number | undefined,
+  sentAt: number,
+  previous: Pick<Current, "ref"> | undefined,
+  wanted: string | undefined
+): boolean => {
+  if (reportedAt === undefined || reportedAt < sentAt || current.ref === undefined) return false
+  if (wanted !== undefined && current.ref === wanted) return true
+  if (current.ref !== previous?.ref) return true
+  return current.positionMs !== undefined && current.positionMs <= JUST_BEGUN_MS
+}
+
 const watchUrl = (id: string) => `https://www.youtube.com/watch?v=${id}`
 
 export interface ControlOptions {
@@ -163,7 +185,7 @@ export const makeControl = (o: ControlOptions) =>
       const svc = host.service(DevicePlayers)
       const deviceId = turn?.deviceId
       if (svc === undefined || deviceId === undefined) return yield* said("cantPlay")
-      const state = yield* svc.state(deviceId)
+      const state = yield* svc.state(deviceId, turn?.connection)
       if (state === undefined) return yield* said("cantPlay")
       return { svc, deviceId, connection: turn?.connection, state }
     })
@@ -193,7 +215,7 @@ export const makeControl = (o: ControlOptions) =>
       Effect.gen(function*() {
         let waited = 0
         while (true) {
-          const s = yield* h.svc.state(h.deviceId)
+          const s = yield* h.svc.state(h.deviceId, h.connection)
           if (s === undefined) return undefined
           const r = probe(s)
           if (r !== undefined) return r
@@ -248,7 +270,7 @@ export const makeControl = (o: ControlOptions) =>
           if (p?.error !== undefined) return { error: p.error }
           return p?.ready === true && p.playerId !== undefined ? { id: p.playerId } : undefined
         }
-        const now = ready((yield* h.svc.state(h.deviceId)) ?? h.state)
+        const now = ready((yield* h.svc.state(h.deviceId, h.connection)) ?? h.state)
         if (now?.id !== undefined) return now.id
         if (now?.error !== undefined) return yield* said(errorText("spotify", now.error))
         // Not ready: ask the page to load its player (a timeout here is not the end: it may still answer, and is waited for below).
@@ -286,6 +308,9 @@ export const makeControl = (o: ControlOptions) =>
             return t("queued", { what })
           }
 
+          // What the page showed before this request: a `playing` report of that is not the answer to it (see `confirmsPlaying`).
+          const before = (yield* h.svc.state(h.deviceId, h.connection))?.current
+          const previous = before?.source === "spotify" ? before : undefined
           // The page shows its player surface (the cover, the title, the controls); the Web API then starts the music on it.
           sent.value = true
           yield* send(h, {
@@ -299,6 +324,8 @@ export const makeControl = (o: ControlOptions) =>
             autoplay: true,
             talk: talkOf(o.settings.musicTalk)
           })
+          // A report counts as the answer only if the page made it after this instant (the SDK may say it plays before the HTTP answer).
+          let playSentAt = yield* Clock.currentTimeMillis
           const started = yield* spotify.source.play(item, playerId, { timeoutMs: SEARCH_MS }).pipe(Effect.result)
           if (started._tag === "Failure") {
             // Spotify does not know the page's player yet: load it again, wait for its id, try once more.
@@ -310,9 +337,16 @@ export const makeControl = (o: ControlOptions) =>
             }, 1_500)
             if (again === undefined) return yield* failed("playerNotReady")
             playerId = again
+            playSentAt = yield* Clock.currentTimeMillis
             yield* spotify.source.play(item, playerId, { timeoutMs: SEARCH_MS }).pipe(Effect.mapError((e) => musicProblem(e, true)))
           }
-          const current = yield* waitFor(h, (s) => (s.current?.source === "spotify" && (s.current.status === "playing" || s.current.status === "blocked" || s.current.status === "error") ? s.current : undefined), PLAYING_MS)
+          const wanted = item.kind === "track" ? /^spotify:track:([A-Za-z0-9]+)$/.exec(item.uri)?.[1] : undefined
+          const current = yield* waitFor(h, (s) => {
+            const c = s.current
+            if (c?.source !== "spotify") return undefined
+            if (c.status === "blocked" || c.status === "error") return c
+            return c.status === "playing" && confirmsPlaying(c, s.reportedAt, playSentAt, previous, wanted) ? c : undefined
+          }, PLAYING_MS)
           if (current === undefined) return t("mayStillStart")
           if (current.status === "playing") return t("playingMusic", { what })
           if (current.status === "blocked") return t("tapPlay")

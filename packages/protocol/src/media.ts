@@ -160,7 +160,9 @@ export const MediaCurrent = Schema.Struct({
   volume: Schema.optionalKey(Level),
   canNext: Schema.optionalKey(Schema.Boolean),
   canPrevious: Schema.optionalKey(Schema.Boolean),
-  errorCode: Schema.optionalKey(ErrorCode)
+  errorCode: Schema.optionalKey(ErrorCode),
+  /** The page itself paused this for the talk rule ("pause while talking") and will resume it after the talk: a "stop" must still reach it. */
+  held: Schema.optionalKey(Schema.Boolean)
 })
 export type MediaCurrent = typeof MediaCurrent.Type
 

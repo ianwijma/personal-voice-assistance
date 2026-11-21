@@ -80,6 +80,21 @@ describe("which page counts", () => {
       yield* Fiber.interrupt(fiber)
     }))
 
+  it.effect("`state(device, connection)` reads the page `send` would use: the named one first, so a module reads the page it commands", () =>
+    Effect.gen(function*() {
+      const w = yield* world
+      const a = w.open("tab-a", ["spotify"])
+      const b = w.open("tab-b", ["spotify"])
+      w.report(a, w.playing("On a"))
+      // Without a connection: the page with something open; named: that page's own state, whatever the others say.
+      assert.strictEqual((yield* w.service.state("kitchen-display"))?.current?.title, "On a")
+      const named = yield* w.service.state("kitchen-display", makeConnectionRef("tab-b"))
+      assert.deepStrictEqual([named?.connection.id, named?.current], ["tab-b", undefined])
+      // A connection that is not a player page of the device falls back to the same choice `send` makes.
+      assert.strictEqual((yield* w.service.state("kitchen-display", makeConnectionRef("nobody")))?.connection.id, "tab-a")
+      assert.strictEqual(b.sent.length, 0)
+    }))
+
   it.effect("a device with no connected page that declared players has no player", () =>
     Effect.gen(function*() {
       const w = yield* world
@@ -299,6 +314,16 @@ describe("reports from a page are untrusted", () => {
       assert.isUndefined(s.current?.artist)
     }))
 
+  it.effect("`held` (the page itself paused it for the talk rule) passes as reported", () =>
+    Effect.gen(function*() {
+      const w = yield* world
+      const a = w.open("tab-a", ["spotify"])
+      w.report(a, { current: { source: "spotify", status: "paused", held: true } })
+      assert.deepStrictEqual((yield* w.service.state("kitchen-display"))?.current, { source: "spotify", status: "paused", held: true })
+      w.report(a, { current: { source: "spotify", status: "paused", held: false } })
+      assert.isUndefined((yield* w.service.state("kitchen-display"))?.current?.held)
+    }))
+
   it.effect("each connection has a burst of ten reports and ten a second after; the latest report over it is kept and applied", () =>
     Effect.gen(function*() {
       const w = yield* world
@@ -361,6 +386,25 @@ describe("changes and isPlaying", () => {
       yield* Effect.yieldNow
       assert.strictEqual(w.changes.length, seen)
       assert.strictEqual((yield* w.service.state("kitchen-display"))?.connection.id, "tab-a")
+    }))
+
+  it.effect("isPlaying is device-wide: a second tab that plays guards the device though another page is the chosen one", () =>
+    Effect.gen(function*() {
+      const w = yield* world
+      const a = w.open("tab-a", ["spotify"])
+      const b = w.open("tab-b", ["spotify"])
+      // a reports paused later than b reported playing, so a is the chosen page (the most recent report with something open).
+      w.report(b, w.playing())
+      yield* TestClock.adjust(1_000)
+      w.report(a, { players: [], current: { source: "spotify", status: "paused" } })
+      assert.strictEqual((yield* w.service.state("kitchen-display"))?.connection.id, "tab-a")
+      assert.isTrue(w.service.isPlaying("kitchen-display"))
+      // It stops counting when that tab goes quiet or goes away.
+      yield* TestClock.adjust(DEVICE_PLAYER_LIMITS.playingFreshMs)
+      assert.isFalse(w.service.isPlaying("kitchen-display"))
+      w.report(b, w.playing())
+      w.close(b)
+      assert.isFalse(w.service.isPlaying("kitchen-display"))
     }))
 
   it.effect("isPlaying: the chosen page says playing, reported within a minute", () =>

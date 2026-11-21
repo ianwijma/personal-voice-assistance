@@ -38,7 +38,9 @@ import { type ConnectionRef, makeConnectionRef } from "./TurnContext.ts"
  * 3. else the most recently connected one that declared players.
  *
  * A connection that declared no players is never chosen, and a device with none has no player (`no_player`). One state
- * per device: that of its chosen connection.
+ * per device: that of its chosen connection (`state(deviceId, connection)` and `send` apply the same rule, so a module
+ * that passes its turn's connection to both reads and commands the same page). `isPlaying` is the exception: it is true
+ * when any of the device's player pages plays.
  *
  * **Reports are untrusted.** `report` accepts one only from a voice page that declared players (the hub refuses admin pages
  * and voice nodes before it gets here), drops what does not fit the protocol's bounds, cleans every text the way texts
@@ -119,8 +121,12 @@ export interface DevicePlayerSendOptions {
 }
 
 export interface DevicePlayersService {
-  /** The device's last reported state; `undefined` when no connected page of that device declared players. */
-  readonly state: (deviceId: string) => Effect.Effect<DevicePlayerState | undefined>
+  /**
+   * The device's last reported state; `undefined` when no connected page of that device declared players. `connection`
+   * (a turn's `CurrentTurn.connection`) names the page to read first, by the same rule `send` uses (see "Which page"), so
+   * a module reads the page it commands.
+   */
+  readonly state: (deviceId: string, connection?: ConnectionRef) => Effect.Effect<DevicePlayerState | undefined>
   /**
    * Sends one command to the device's player page and waits for the first report that acknowledges it (see the top of
    * this file). Answers the page's state at that report.
@@ -129,8 +135,10 @@ export interface DevicePlayersService {
   /** Every accepted report that changed a device's state, and a player page arriving or going (`state` undefined on the last one's disconnect). */
   readonly changes: Stream.Stream<DevicePlayerChange>
   /**
-   * Whether the device's player is playing now: its state says `playing` and was reported within
-   * `DEVICE_PLAYER_LIMITS.playingFreshMs`. Synchronous and cheap (a map read): the route gate may ask on a turn's path.
+   * Whether any player page of the device is playing now: that page's state says `playing` and was reported within
+   * `DEVICE_PLAYER_LIMITS.playingFreshMs`. Device-wide on purpose (the route gate's guard): a second tab that plays
+   * guards the device even when another tab is the one `state` would choose. Synchronous and cheap (map reads): the
+   * route gate may ask on a turn's path.
    */
   readonly isPlaying: (deviceId: string) => boolean
 }
@@ -178,7 +186,8 @@ const cleanCurrent = (c: MediaCurrent): MediaCurrent => {
     ...(c.volume !== undefined ? { volume: c.volume } : {}),
     ...(c.canNext !== undefined ? { canNext: c.canNext } : {}),
     ...(c.canPrevious !== undefined ? { canPrevious: c.canPrevious } : {}),
-    ...(c.errorCode !== undefined ? { errorCode: c.errorCode } : {})
+    ...(c.errorCode !== undefined ? { errorCode: c.errorCode } : {}),
+    ...(c.held === true ? { held: true } : {})
   }
 }
 
@@ -349,8 +358,8 @@ export const makeDevicePlayers = (options: DevicePlayersOptions): Effect.Effect<
       }
     }
 
-    const stateOfDevice = (deviceId: string): DevicePlayerState | undefined => {
-      const link = choose(deviceId)
+    const stateOfDevice = (deviceId: string, preferred?: ConnectionRef): DevicePlayerState | undefined => {
+      const link = choose(deviceId, preferred)
       return link === undefined ? undefined : stateOf(link)
     }
 
@@ -531,12 +540,15 @@ export const makeDevicePlayers = (options: DevicePlayersOptions): Effect.Effect<
       })
 
     const isPlaying = (deviceId: string): boolean => {
-      const s = stateOfDevice(deviceId)
-      return s?.current?.status === "playing" && s.reportedAt !== undefined && clock() - s.reportedAt <= DEVICE_PLAYER_LIMITS.playingFreshMs
+      const now = clock()
+      return linksOf(deviceId).some((l) => {
+        const c = conns.get(l.id)
+        return c?.current?.status === "playing" && c.reportedAt !== undefined && now - c.reportedAt <= DEVICE_PLAYER_LIMITS.playingFreshMs
+      })
     }
 
     const service: DevicePlayersService = {
-      state: (deviceId) => Effect.sync(() => stateOfDevice(deviceId)),
+      state: (deviceId, connection) => Effect.sync(() => stateOfDevice(deviceId, connection)),
       send,
       changes: Stream.fromPubSub(pubsub),
       isPlaying

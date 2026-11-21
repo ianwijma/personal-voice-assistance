@@ -244,6 +244,25 @@ describe("what is open", () => {
     expect(currentOfState(state({ paused: true, position: 0, track_window: { current_track: track(), previous_tracks: [track()], next_tracks: [] } }), undefined).status).toBe("ended")
   })
 
+  it("playback moved to another device (a null state) while something is open is shown as paused, with no next or previous", async () => {
+    const r = rig()
+    r.player.prepare()
+    await flush()
+    r.player.open({ source: "spotify", title: "X", autoplay: true })
+    FakeSdk.last!.emit("player_state_changed", state())
+    expect(r.currents.at(-1)).toMatchObject({ status: "playing", ref: "4uLU6hMCjMI75M1A2tKUQC" })
+    FakeSdk.last!.emit("player_state_changed", null)
+    expect(r.currents.at(-1)).toMatchObject({ status: "paused", canNext: false, canPrevious: false })
+    // It plays here again.
+    FakeSdk.last!.emit("player_state_changed", state())
+    expect(r.currents.at(-1)?.status).toBe("playing")
+    // Nothing open: a null state says nothing.
+    r.player.close()
+    const n = r.currents.length
+    FakeSdk.last!.emit("player_state_changed", null)
+    expect(r.currents.length).toBe(n)
+  })
+
   it("never takes art from another host", () => {
     const c = currentOfState(state({ track_window: { current_track: track({ album: { name: "A", images: [{ url: "https://evil.example/x.png", height: 640 }] } }) } }), undefined)
     expect(c.artUrl).toBeUndefined()

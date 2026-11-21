@@ -9,7 +9,7 @@ import type { AddressInfo } from "node:net"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
-import { isLanAddress, makeModuleRouter, makeRouteLimiterForTests, type ModuleRouter, rateKeyOf } from "../src/serve/moduleRoutes.ts"
+import { isLanAddress, makeModuleRouter, makeRouteLimiterForTests, type ModuleRouter, originOf, rateKeyOf } from "../src/serve/moduleRoutes.ts"
 import { makeRouteTokens, type RouteTokenKeeper } from "../src/serve/RouteTokens.ts"
 import { ROUTE_TOKENS_ENTRY, type SettingsStore } from "../src/serve/SettingsStore.ts"
 import { openVault, type Vault } from "../src/serve/Vault.ts"
@@ -39,6 +39,9 @@ const routes: ReadonlyArray<ModuleRoute> = [
   { method: "GET", path: "slow", guards: ["lan"], timeoutMs: 100, handler: () => Effect.as(Effect.sleep(5_000), { status: 200 }) },
   { method: "GET", path: "broken", guards: ["lan"], handler: () => Effect.fail("secret detail") },
   { method: "GET", path: "limited", guards: ["lan"], rateLimit: { perAddress: 2, total: 3 }, handler: () => Effect.succeed({ status: 200 }) },
+  // The origin, and cookies both ways (the media module's sign-in binds its start and callback with one).
+  { method: "GET", path: "who", public: true, handler: (req) => Effect.succeed({ status: 200, body: { origin: req.origin ?? null, cookie: req.headers.cookie ?? null } }) },
+  { method: "GET", path: "set-cookie", public: true, handler: () => Effect.succeed({ status: 302, headers: { Location: "/api/modules/hooks/who", "Set-Cookie": "n=abc; HttpOnly; SameSite=Lax; Path=/api/modules/hooks/; Max-Age=600" } }) },
   // Review round 1.
   {
     method: "GET",
@@ -599,5 +602,27 @@ describe("module routes after review round 1", () => {
     const view = await Effect.runPromise(router.view("hooks"))
     expect(view.modules[0]).toMatchObject({ moduleId: "hooks", running: false, routes: [] })
     expect(view.modules[0]!.tokens.length).toBe(20)
+  })
+})
+
+describe("the origin and cookies of a route request", () => {
+  const req = (headers: Record<string, string>) => ({ headers }) as unknown as http.IncomingMessage
+
+  it("is the Host and the server's scheme; forwarding headers are believed only behind a declared proxy, and only for an allowed host", () => {
+    const forwarded = { host: "10.0.0.5:8080", "x-forwarded-host": "assistant.example.org", "x-forwarded-proto": "https" }
+    expect(originOf(req(forwarded), "http", false)).toEqual({ scheme: "http", host: "10.0.0.5:8080" })
+    expect(originOf(req(forwarded), "http", true)).toEqual({ scheme: "https", host: "assistant.example.org" })
+    // A forwarded host that is not allowed is not believed; neither is a forged scheme word.
+    expect(originOf(req({ ...forwarded, "x-forwarded-host": "evil.example", "x-forwarded-proto": "gopher" }), "http", true, new Set(["assistant.example.org"]))).toEqual({ scheme: "http", host: "10.0.0.5:8080" })
+    expect(originOf(req(forwarded), "http", true, new Set(["assistant.example.org"]))).toEqual({ scheme: "https", host: "assistant.example.org" })
+    expect(originOf(req({}), "http", false)).toBeUndefined()
+  })
+
+  it("a handler sees the origin (never a forwarded host without a declared proxy) and the cookie, and may set one", async () => {
+    const seen = await call("/who", { headers: { "X-Forwarded-Host": "evil.example", Cookie: "n=abc" } })
+    expect(JSON.parse(seen.text)).toEqual({ origin: { scheme: "http", host: new URL(base).host }, cookie: "n=abc" })
+    const set = await fetch(`${base}/set-cookie`, { redirect: "manual" })
+    expect(set.status).toBe(302)
+    expect(set.headers.get("set-cookie")).toBe("n=abc; HttpOnly; SameSite=Lax; Path=/api/modules/hooks/; Max-Age=600")
   })
 })

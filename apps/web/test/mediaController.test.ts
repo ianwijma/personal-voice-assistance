@@ -1,6 +1,6 @@
 import type { MediaCommand, MediaStateMessage } from "@pva/protocol"
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
-import { HEARTBEAT_MS, MediaController, RAMP_MS, REPORT_MIN_MS, RESTORE_MS } from "@/lib/media/controller.ts"
+import { HEARTBEAT_MS, MediaController, RAMP_MS, REPORT_MIN_MS, RESTORE_MS, WANT_REPEAT_FOR_MS, WANT_REPEAT_MS } from "@/lib/media/controller.ts"
 import { isTalking } from "@/lib/media/index.ts"
 import { initialState } from "@/lib/state.ts"
 import { FakePlayer } from "./mediaFakes.ts"
@@ -201,6 +201,25 @@ describe("credentials", () => {
     expect(JSON.stringify(r.sent)).not.toContain("tok-secret")
   })
 
+  it("while a player waits for a credential the wish is said again every 2 s, until the credential arrives or its wait ends", () => {
+    const r = rig()
+    r.music.events.needsCredential()
+    expect(r.sent.filter((m) => m.wants !== undefined)).toHaveLength(1)
+    vi.advanceTimersByTime(WANT_REPEAT_MS)
+    expect(r.sent.filter((m) => m.wants !== undefined).length).toBeGreaterThanOrEqual(2)
+    const before = r.sent.length
+    r.c.handleCommand(1, { type: "credential", source: "spotify", token: "t", expiresAtMs: 5 })
+    vi.advanceTimersByTime(WANT_REPEAT_MS * 3)
+    expect(r.sent.slice(before).filter((m) => m.wants !== undefined)).toHaveLength(0)
+    // No credential at all: it stops being repeated after the player's own wait.
+    const q = rig()
+    q.music.events.needsCredential()
+    vi.advanceTimersByTime(WANT_REPEAT_FOR_MS + WANT_REPEAT_MS)
+    const n = q.sent.length
+    vi.advanceTimersByTime(WANT_REPEAT_MS * 5)
+    expect(q.sent.length).toBe(n)
+  })
+
   it("a player that reports no_credential after its wait is passed on", () => {
     const r = rig()
     r.music.events.report({ ready: false, error: "no_credential" })
@@ -304,6 +323,23 @@ describe("talking: pause", () => {
     expect(r.video.calls).toEqual(["pause"])
     vi.advanceTimersByTime(1)
     expect(r.video.calls).toEqual(["pause", "play"])
+  })
+
+  it("reports `held` while the talk rule holds it paused, and a pause command from the server cancels the resume", () => {
+    const r = rig()
+    video(r)
+    r.c.setTalking(true)
+    r.video.say({ status: "paused" })
+    vi.advanceTimersByTime(REPORT_MIN_MS)
+    expect(last(r).state.current).toMatchObject({ status: "paused", held: true })
+    // The host's "stop": a pause while held. It is not resumed after the talk, and nothing is held any more.
+    r.c.handleCommand(9, { type: "pause" })
+    vi.advanceTimersByTime(REPORT_MIN_MS)
+    expect(last(r).state.current?.held).toBeUndefined()
+    r.video.calls.length = 0
+    r.c.setTalking(false)
+    vi.advanceTimersByTime(RESTORE_MS * 2)
+    expect(r.video.calls).not.toContain("play")
   })
 
   it("does not pause or resume something that was not playing", () => {

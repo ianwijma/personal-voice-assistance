@@ -11,8 +11,8 @@ Plays music from Spotify and YouTube videos on the device you talk to, with voic
 **Status.** Built on 2026-11-21 (steps 4 and 6 of the plan this page started as). Everything below that says what the
 module does is covered by tests against a scripted page, a fake Spotify and a stubbed video search. **Nothing has been tried
 on a real browser, a real Spotify Premium account or a real SearXNG yet**: see [Not yet verified on a real device](#not-yet-verified-on-a-real-device).
-The page that draws the player and makes the sound (`apps/web`) is a separate piece of work: [The page](#the-page-the-contract)
-describes the contract the module relies on, not something this module does.
+The page that draws the player and makes the sound is built too (`apps/web/src/lib/media`, `apps/web/src/components/media`):
+[The page](#the-page-the-contract) describes the contract the module relies on and the page keeps.
 
 ## What it does
 
@@ -29,7 +29,8 @@ One module, two sources, one player per device. It is off by default.
 - **One thing plays per device.** Starting a video pauses the music and the other way round (the page does this). The transport
   words act on whatever that device has open.
 - **The host's "stop"** pauses the device's player (the module provides `Playback`), after a ring, an announcement and a reply,
-  as the host orders them.
+  as the host orders them. It also reaches a player the page itself holds paused for the talk rule (`current.held`, below), which
+  would otherwise resume a second after the talk; a player that is plainly paused is sent nothing.
 - **While the assistant listens and speaks**, music is lowered and a video pauses (settings). The page does this itself, from the
   `talk` setting each `open` carries: there is no round trip.
 - **An answer says what happened**: the page reports the player's state, so "Paused." is said after the page confirmed it, and a
@@ -113,8 +114,12 @@ are limits, not measurements: no latency is claimed here (docs/MODULES.md §15).
 5. `PUT https://api.spotify.com/v1/me/player/play?device_id=<playerId>` with `{ "context_uri": "spotify:album:…" }` (album, artist,
    playlist) or `{ "uris": ["spotify:track:…"] }` (song). A `404` (Spotify does not know the page's player yet): `prepare` again,
    wait for a player id, and try once more.
-6. The page's state is read until it says `playing` (said: "Playing …"), `blocked` ("Tap play to start.") or `error` (its own
-   sentence), for at most 1.5 s; silence is "it may still start".
+6. The page's state (the page this turn came from) is read until it says `blocked` ("Tap play to start."), `error` (its own
+   sentence) or `playing` (said: "Playing …"), for at most 1.5 s; silence is "it may still start". A `playing` counts only if it
+   is the answer to *this* request and not the previous track still sounding: the page made the report after the play call
+   was sent, and its `ref` (the Spotify track id from the SDK) differs from the one the page showed before the request, or is the
+   song asked for, or (an album, artist or playlist, whose first track is not known) is the same track begun again (position within two
+   seconds of the start). A page that reports no `ref` never confirms: the answer is "it may still start".
 
 `queue: add` replaces steps 4 to 6 with `POST /v1/me/player/queue?uri=…&device_id=…`. Spotify's answers: `401` renews the token
 (one refresh at a time, shared by every caller) and a GET goes again once; a `PUT` or `POST` is reported instead ("Spotify's
@@ -151,23 +156,53 @@ with the owner's own developer app (the client secret stays on the server).
   `packages/core/src/ModuleHost.ts`, `apps/assistant/src/serve/moduleAction.ts`, `apps/web/src/components/fields/ActionField.tsx`.
 - **The start route is public, tied to an admin by a ticket.** A browser navigating to a link cannot send the admin session token,
   so `GET /api/modules/media/spotify/start` is a public route that needs a single-use `ticket` (random, ten minutes) which only
-  the Sign in press (an admin action) can make. It reads the origin it was reached on from the request's `X-Forwarded-Host` or
-  `Host` (the page and the route are on the same origin, whatever proxy is in front), builds the redirect address, and sends the
-  browser to `https://accounts.spotify.com/authorize` with the scopes `streaming user-read-email user-read-private
+  the Sign in press (an admin action) can make. It reads the origin it was reached on from `RouteRequest.origin`, which the HTTP
+  layer resolves: the `Host` header (already checked against the allowed hosts) and the server's own scheme, and, **only when the
+  server is declared to be behind a reverse proxy** (`SERVE_BEHIND_PROXY`), the proxy's `X-Forwarded-Host` (when it is an allowed
+  host) and `X-Forwarded-Proto`. Forwarding headers are never read otherwise, and never by the module. The address page and this
+  route use the same derivation. It builds the redirect address and sends the browser to `https://accounts.spotify.com/authorize` with the scopes `streaming user-read-email user-read-private
   user-modify-playback-state user-read-playback-state user-read-currently-playing playlist-read-private`, the client ID, the
-  redirect address and a random single-use `state` kept in memory for ten minutes.
-- **The scheme is `https`** (decision 3 below); only the loopback address `127.0.0.1` is `http`, as Spotify allows. `localhost` is
-  refused by Spotify, so no address is built for it and the page says so.
+  redirect address and a random single-use `state` kept in memory for ten minutes. The same response sets a cookie
+  (`pva_media_spotify`: a random value, `HttpOnly`, `SameSite=Lax`, `Path=/api/modules/media/spotify/`, `Max-Age=600`, `Secure` unless the
+  address is plain-http loopback) that is also recorded with the `state`: the callback needs both, so a callback link
+  that reaches another browser (login CSRF) is refused. The callback clears the cookie.
+- **The scheme is `https`** (decision 3 below); only a loopback address (`127.0.0.1`, `[::1]`) keeps the scheme the request really
+  arrived on (`http` is allowed there by Spotify). `localhost` is refused by Spotify, so no address is built for it and the page says so.
 - **The callback** (`GET /api/modules/media/spotify/callback`, public as a callback must be) checks the `state`, exchanges the code
   with `POST https://accounts.spotify.com/api/token` (form body, `Authorization: Basic base64(id:secret)`), keeps the refresh token in
   the key vault (`host.credentials`, name `spotify-refresh`, with the sign-in day and the display name beside it in
   `spotify-signin`), reads the display name from `GET /v1/me`, and answers a small page. Nothing from the query is echoed.
 - **Tokens.** Access tokens last an hour: held in memory, renewed when less than two minutes are left, one renewal at a time. A
   renewal may hand out a new refresh token: it replaces the old one in the vault. `invalid_grant` means the sign-in ended: the
-  credentials are cleared and the status says to sign in again. Refresh tokens end six months after the sign-in (refreshing does
+  credentials are cleared and the status says to sign in again. A refresh that was on its way when someone signed out or signed in
+  again is dropped and never written to the vault (a counter of sign-in changes). Refresh tokens end six months after the sign-in (refreshing does
   not extend that): Health warns 14 days before, and the status line shows the date.
 - **A locked key vault**: a module running keeps the token it started with; a renewed token that cannot be written is kept in
   memory and Health says the sign-in cannot be renewed; a vault locked at start leaves Spotify signed out with its own sentence.
+
+## Access tokens
+
+A Spotify access token (an hour; scopes: playback control, the owner's e-mail and profile, playlists) is handed to a page that
+asks for one with `wants: credential`. Because that is the owner's account, the module answers only when **both** hold:
+
+1. **The device is one the owner's registry knows** (`Devices.get(deviceId)`): a device id a client invents is neither sent
+   `prepare` with Spotify nor a token. The page of such a device still gets YouTube.
+2. **This module itself sent that connection a `prepare` that named Spotify** (and it was signed in then). A page that never
+   was told to load Spotify cannot ask for a token, whatever it declares.
+
+A connection is handed **at most one token per five minutes**, unless the one it was given expires within two minutes. The limit
+counts tokens sent: a page that repeats its wish (it does, every two seconds until the token arrives or its own ten seconds
+end) is not refused for repeating. Refusals and failures are logged at most once a minute per connection and never carry a token.
+
+**What remains exposed (the trust statement).** In this codebase a device is "known" once a voice page has connected with an id
+(its first connection registers it, capped at a number of devices), and the voice WebSocket has no login. So anyone who can open
+the assistant's voice page on the network (the home network, or the internet if the owner exposes it) can register or use a
+device id, be prepared for Spotify and receive the owner's access token. The checks above stop a client that only invents a
+device id or skips the module's own `prepare`, and they limit how often a token can be had, but not a client that behaves
+like a voice page. The stronger owner-controlled notions that exist (a device the owner has configured in the admin Devices
+page, i.e. with settings of its own) were not used: every new device would then have no Spotify until the owner opened its
+settings, with no sentence saying why. Closing this properly needs the voice page to authenticate (a device pairing); until
+then treat the voice page's address as being as private as the Spotify account's playback control.
 
 ## Settings
 
@@ -190,11 +225,12 @@ Each source works alone: without a Spotify sign-in the music tools say so and vi
 
 ## Routes
 
-All `GET`, all public (a browser arrives on them), each rate limited to 20 a minute per address:
+All `GET`, all public (a browser arrives on them), each rate limited to 20 a minute per address (and a total of 600 a minute
+for the route, far above what one address can use up, so an unauthenticated caller cannot lock the owner out of signing in):
 
 - `/api/modules/media/spotify/start?ticket=…`: described above; an unknown, used or old ticket gets a page, never a redirect.
 - `/api/modules/media/spotify/callback?code=…&state=…`: described above.
-- `/api/modules/media/spotify/address`: shows the exact redirect address for the origin it was reached on (escaped; a host that
+- `/api/modules/media/spotify/address`: shows the exact redirect address for the origin it was reached on, the way `start` finds it (escaped; a host that
   is not a plain host name, and `localhost`, are refused with a sentence).
 
 Every page is HTML in the household's language with `Cache-Control: no-store`, `Referrer-Policy: no-referrer` and a
@@ -306,7 +342,7 @@ of its own: the `link` a button's answer may carry (above).
 
 ## The page (the contract)
 
-Built separately in `apps/web`; this module relies on exactly this and no more. The page: declares `media.players` (the sources
+Built in `apps/web` (`lib/media`); this module relies on exactly this and no more. The page: declares `media.players` (the sources
 it can play: `spotify`, `youtube`) and `"video"` in `speaker.media`; answers `prepare` by loading the players it was named
 (Spotify's SDK only when `spotify` is named, so a household without the module contacts neither company), with `config.name` as the
 Spotify Connect device's name; reports `players: [{ source, ready, playerId?, error? }]`; asks for a token with `wants:
@@ -318,7 +354,11 @@ reports `media.state` on every change and every few seconds while playing, with 
 reports `current.status` as `loading`, `playing`, `paused`, `ended`, `blocked` (autoplay refused) or `error` with an `errorCode`
 (`initialization_error`, `account_error`, `authentication_error` for Spotify; `embed_refused`, `not_found` for YouTube); unlocks
 both players with its **Start** press; pauses a video when the tab is hidden (not music); on reload reports no player and the module
-restarts nothing by itself. Touch and voice share one state: a touch on the page's own buttons goes straight to the player and is
+restarts nothing by itself. It sets `current.ref` from Spotify's track id (the module's start confirmation needs it); while its Spotify player
+has something open and the SDK's state goes `null` (playback moved to another device) it reports `paused` with no next or previous;
+while a player waits for a credential it repeats its `wants` every two seconds (for its own ten seconds); and **while its own
+talk rule holds something paused it sets `current.held: true`** (`MediaCurrent.held`, optional, additive within protocol 12), so the host's
+"stop" can still reach it: the page cancels the pending resume on any pause, close, open or play command. Touch and voice share one state: a touch on the page's own buttons goes straight to the player and is
 reported; the module never needs to be asked for a pause.
 
 ## Listening while something plays
@@ -367,11 +407,12 @@ Everything below needs a real Spotify Premium account, a real SearXNG and a real
 scripts and fixtures.
 
 - That Spotify's Authorization Code flow works end to end with a real developer app: the redirect address as built from the
-  `Host` and `X-Forwarded-Host` headers behind the owner's real proxy, the scopes, the refresh-token rotation, and the six-month end.
+  request's origin behind the owner's real proxy (`SERVE_BEHIND_PROXY`, `SERVE_ALLOWED_HOSTS`), the scopes, the refresh-token rotation, and the six-month end.
 - That the Web Playback SDK loads in the owner's browser with isolation off, plays (Widevine), and that `PUT /me/player/play` on
   the page's `playerId` starts it; the wait for `playing` (1.5 s) and the `404` retry on a real device that Spotify learns of late.
-- That the page's `open` followed by the Web API call does not leave a stale `playing` from the previous track that would be
-  read as the new one (the module trusts `open` to reset the page's state).
+- That the Web Playback SDK's `player_state_changed` events carry the new track's id (`ref`) soon enough that the module's
+  confirmation (a report after the call, with a new `ref`) comes within 1.5 s, and that playback moved to another Spotify device
+  arrives as a `null` state (the page then reports `paused`).
 - That YouTube's frame autoplays after one **Start** press in each browser, and what a real SearXNG returns for a video search
   (which engines are on, whether YouTube results carry a length; `json` in its formats).
 - The time budget (4.6 s in all, and the parts) against real latencies, with `TurnTrace` numbers.
@@ -384,7 +425,8 @@ scripts and fixtures.
 
 - **The real-device measurements** above, and the plan revised from them (push-to-talk on the panel if the wake phrase is not
   reliable over music).
-- **The page** (`apps/web`), as the contract above says (built separately).
+- **A real-device check of the page** (`apps/web`, built: `lib/media`, `components/media`): the contract above is kept by it and
+  tested against fake players; nothing has run on a browser with real players yet.
 
 ## What was left out
 

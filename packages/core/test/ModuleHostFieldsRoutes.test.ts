@@ -35,7 +35,10 @@ const house = (probe: { pressed: Array<unknown>; options: Array<{ value: string;
       allOff: Setting.action({ label: "All off", buttonLabel: "All off" }),
       slow: Setting.action({ label: "Slow", buttonLabel: "Slow" }),
       signIn: Setting.action({ label: "Sign in", buttonLabel: "Sign in" }),
-      elsewhere: Setting.action({ label: "Elsewhere", buttonLabel: "Elsewhere" })
+      elsewhere: Setting.action({ label: "Elsewhere", buttonLabel: "Elsewhere" }),
+      encoded: Setting.action({ label: "Encoded", buttonLabel: "Encoded" }),
+      doubled: Setting.action({ label: "Doubled", buttonLabel: "Doubled" }),
+      queried: Setting.action({ label: "Queried", buttonLabel: "Queried" })
     },
     fieldActions: {
       check: ({ settings, draft }) =>
@@ -53,6 +56,9 @@ const house = (probe: { pressed: Array<unknown>; options: Array<{ value: string;
           // A link to the module's own route is passed on; one that leaves it (another module, another origin) is dropped.
           signIn: () => Effect.succeed({ ok: true, text: "Opened", link: { href: "/api/modules/house/start?ticket=abc123", label: "Continue" } }),
           elsewhere: () => Effect.succeed({ ok: true, text: "Not a link", link: { href: "https://example.org/", label: "Away" } }),
+          encoded: () => Effect.succeed({ ok: true, text: "Encoded", link: { href: "/api/modules/house/%2e%2e/other/start", label: "Escape" } }),
+          doubled: () => Effect.succeed({ ok: true, text: "Doubled", link: { href: "/api/modules/house//other", label: "Escape" } }),
+          queried: () => Effect.succeed({ ok: true, text: "Queried", link: { href: "/api/modules/house/start?next=%2Fa%20b", label: "Ok" } }),
           slow: () => Effect.as(Effect.sleep(60_000), { ok: true, text: "late" })
         }
       })
@@ -86,6 +92,16 @@ describe("field actions", () => {
         result: { ok: true, text: "Opened", link: { href: "/api/modules/house/start?ticket=abc123", label: "Continue" } }
       })
       assert.deepStrictEqual(yield* host.fieldAction("house", "elsewhere"), { ok: true, result: { ok: true, text: "Not a link" } })
+    }))
+
+  it.effect("a link whose path has a percent sign or a double slash is dropped (`%2e%2e` is `..`); a percent-encoded query stays", () =>
+    Effect.gen(function*() {
+      const probe = { pressed: [] as Array<unknown>, options: [], info: "" }
+      const host = yield* hostOf([house(probe)], { house: {} })
+      yield* host.startEnabled
+      assert.deepStrictEqual(yield* host.fieldAction("house", "encoded"), { ok: true, result: { ok: true, text: "Encoded" } })
+      assert.deepStrictEqual(yield* host.fieldAction("house", "doubled"), { ok: true, result: { ok: true, text: "Doubled" } })
+      assert.deepStrictEqual(yield* host.fieldAction("house", "queried"), { ok: true, result: { ok: true, text: "Queried", link: { href: "/api/modules/house/start?next=%2Fa%20b", label: "Ok" } } })
     }))
 
   it.effect("a definition handler runs without an instance; an instance handler needs one", () =>

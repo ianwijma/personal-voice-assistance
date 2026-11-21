@@ -28,6 +28,7 @@ import { Cause, type Context, Effect, Exit } from "effect"
 import type * as http from "node:http"
 import * as net from "node:net"
 import type { AdminSessions } from "./AdminSessions.ts"
+import { hostAllowed } from "./http.ts"
 import type { RouteTokenKeeper } from "./RouteTokens.ts"
 
 /**
@@ -73,6 +74,8 @@ export interface ModuleRouterOptions {
    * check of a route that is not public ignores the scheme (`crossSiteReason`). Default false.
    */
   readonly behindProxy?: boolean
+  /** The allowed host names (`allowedHostsFrom`): a forwarded host (behind a declared proxy) must be one of them. Absent: any plain host is believed. */
+  readonly allowedHosts?: ReadonlySet<string>
   readonly now?: () => number
   /** The caller's address. Default: the socket's (`req.socket.remoteAddress`); tests give others. */
   readonly remoteAddress?: (req: http.IncomingMessage) => string | undefined
@@ -294,6 +297,26 @@ const declaredLength = (req: http.IncomingMessage): number | "unknown" | "none" 
  * scheme is ignored and the `Origin`'s host and port must equal the `Host` header exactly (the proxy must pass `Host`
  * through unchanged). No forwarding header is read.
  */
+const firstValue = (v: string | string[] | undefined): string | undefined => {
+  const one = (Array.isArray(v) ? v[0] : v)?.split(",")[0]?.trim()
+  return one === undefined || one === "" ? undefined : one
+}
+
+/**
+ * The origin a request reached the server on (`RouteRequest.origin`): its `Host` (the HTTP layer has checked it against the
+ * allowed hosts) and the server's own scheme. Declared behind a proxy (`behindProxy`), the proxy's `X-Forwarded-Host`
+ * (when it is an allowed host) and `X-Forwarded-Proto` (`http` or `https`) are used instead; undeclared, they are never read.
+ */
+export const originOf = (req: http.IncomingMessage, scheme: "http" | "https", behindProxy: boolean, allowedHosts?: ReadonlySet<string>): RouteRequest["origin"] => {
+  const own = firstValue(req.headers.host)
+  if (!behindProxy) return own === undefined ? undefined : { scheme, host: own.toLowerCase() }
+  const forwarded = firstValue(req.headers["x-forwarded-host"])
+  const host = forwarded !== undefined && (allowedHosts === undefined || hostAllowed(forwarded, allowedHosts)) ? forwarded : own
+  if (host === undefined) return undefined
+  const proto = firstValue(req.headers["x-forwarded-proto"])?.toLowerCase()
+  return { scheme: proto === "http" || proto === "https" ? proto : scheme, host: host.toLowerCase() }
+}
+
 export const crossSiteReason = (req: http.IncomingMessage, scheme: "http" | "https", behindProxy = false): string | undefined => {
   const site = req.headers["sec-fetch-site"]
   if (typeof site === "string" && !["same-origin", "same-site", "none"].includes(site.trim().toLowerCase())) return "Requests from another site are refused"
@@ -524,6 +547,7 @@ export const makeModuleRouter = (options: ModuleRouterOptions): ModuleRouter => 
       }
       const headers = dict<string>()
       for (const [k, v] of Object.entries(req.headers)) if (k !== "authorization" && v !== undefined) headers[k] = Array.isArray(v) ? v.join(", ") : v
+      const origin = originOf(req, scheme, behindProxy, options.allowedHosts)
       const request: RouteRequest = {
         method: current.method,
         path: segments.join("/"),
@@ -533,6 +557,7 @@ export const makeModuleRouter = (options: ModuleRouterOptions): ModuleRouter => 
         headers,
         body,
         address,
+        ...(origin !== undefined ? { origin } : {}),
         ...(admitted.token !== undefined ? { token: admitted.token } : {})
       }
       const timeoutMs = current.timeoutMs ?? DEFAULT_ROUTE_TIMEOUT_MS

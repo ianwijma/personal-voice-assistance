@@ -371,8 +371,13 @@ export const ActionField = Schema.Struct({
  * new tab (a sign-in that continues on another site). Never an address on another origin: the page resolves `href` against
  * its own.
  */
+export const FIELD_ACTION_LINK_HREF = /^(?!.*\.\.)(?![^?]*\/\/)\/api\/modules\/[a-z][a-z0-9-]{0,39}\/[A-Za-z0-9._~/-]{0,300}(?:\?[A-Za-z0-9._~/=&%-]{0,300})?$/
+/**
+ * The path part (before `?`) has no `%` (so `%2e%2e` cannot be decoded into `..` by a browser or a proxy), no `..`, no `//`
+ * and no backslash; the query part may be percent-encoded.
+ */
 export const FieldActionLink = Schema.Struct({
-  href: Schema.String.check(Schema.isMaxLength(400), Schema.isPattern(/^\/api\/modules\/[a-z][a-z0-9-]{0,39}\/[A-Za-z0-9._~/?=&%-]{0,300}$/)),
+  href: Schema.String.check(Schema.isMaxLength(400), Schema.isPattern(FIELD_ACTION_LINK_HREF)),
   label: Text(60)
 })
 export type FieldActionLink = typeof FieldActionLink.Type

@@ -114,7 +114,7 @@ import {
 import { isTtsProvider, ttsProviderInfo } from "../providers.ts"
 import { DEFAULT_ASSISTANT_VOICE, voiceEngineName, voiceLabel } from "../voiceSelection.ts"
 import { type EnvMover, makeEnvMover } from "./envSettings.ts"
-import { type HttpError, type HttpServer, startHttp, webDirExists } from "./http.ts"
+import { allowedHostsFrom, type HttpError, type HttpServer, startHttp, webDirExists } from "./http.ts"
 import { makeNodeDist } from "./nodeDist.ts"
 import { type DeviceRegistry, deviceSettingsFrom, makeDeviceRegistry } from "./devices.ts"
 import { type Jobs, makeJobs } from "./jobs.ts"
@@ -1966,7 +1966,8 @@ export const startServe = (options: ServeOptions): Effect.Effect<ServeHandle, Ht
       tokens: routeTokens,
       services,
       scheme: options.tls === undefined ? "http" : "https",
-      behindProxy: options.behindProxy === true
+      behindProxy: options.behindProxy === true,
+      allowedHosts: allowedHostsFrom(options.allowedHosts ?? [], options.allowedOrigins)
     })
     const api = makeApi({
       moduleRoutes: moduleRouter,

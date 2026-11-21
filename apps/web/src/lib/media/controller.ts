@@ -41,6 +41,9 @@ export const RAMP_MS = 150
 export const RESTORE_MS = 1_000
 /** A level a player reports itself is only believed this long after the page last set one (its report may lag). */
 const VOLUME_SETTLE_MS = 600
+/** A wish for a credential is said again this often (a report can be lost on its way), until the credential comes or the player's own wait ends. */
+export const WANT_REPEAT_MS = 2_000
+export const WANT_REPEAT_FOR_MS = 10_000
 /** A `playing` report this soon after our own pause is the player catching up, not a touch. */
 const PAUSE_GRACE_MS = 700
 
@@ -97,6 +100,9 @@ export class MediaController {
   private lastKey = ""
   private ack: number | undefined
   private readonly wants = new Set<string>()
+  /** When each wish was first made, to repeat it every `WANT_REPEAT_MS` until `WANT_REPEAT_FOR_MS` have passed. */
+  private readonly wantedAt = new Map<string, number>()
+  private wantTimer: ReturnType<typeof setInterval> | undefined
 
   // Reporting.
   private dirty = false
@@ -213,6 +219,8 @@ export class MediaController {
       case "credential": {
         const p = this.playerOf(c.source)
         this.wants.delete(c.source)
+        this.wantedAt.delete(c.source)
+        this.stopWantTimerIfIdle()
         if (p === undefined) this.unsupported(c.source)
         else p.credential(c.token, c.expiresAtMs)
         return
@@ -316,7 +324,29 @@ export class MediaController {
 
   private playerWants(source: string) {
     this.wants.add(source)
+    if (!this.wantedAt.has(source)) this.wantedAt.set(source, Date.now())
+    this.startWantTimer()
     this.markDirty()
+  }
+
+  /** While a player waits for a credential its wish is repeated in a report, so one that was lost does not leave it waiting. */
+  private startWantTimer() {
+    if (this.wantTimer !== undefined || this.stopped) return
+    this.wantTimer = setInterval(() => {
+      const now = Date.now()
+      let again = false
+      for (const [source, at] of this.wantedAt) {
+        if (now - at < WANT_REPEAT_FOR_MS) again = true
+        else this.wantedAt.delete(source) // the player's own wait has ended; the wish stays in the reports, as before
+      }
+      if (again) this.markDirty()
+      this.stopWantTimerIfIdle()
+    }, WANT_REPEAT_MS)
+  }
+  private stopWantTimerIfIdle() {
+    if (this.wantedAt.size > 0 || this.wantTimer === undefined) return
+    clearInterval(this.wantTimer)
+    this.wantTimer = undefined
   }
 
   private playerCurrent(source: string, c: PlayerCurrent) {
@@ -378,6 +408,7 @@ export class MediaController {
     } else if (t.mode === "pause" && this.pausedByTalk === undefined && this.current.status === "playing") {
       this.pausedByTalk = { reassert: false, at: Date.now() }
       p.pause()
+      this.markDirty()
     }
   }
 
@@ -391,6 +422,7 @@ export class MediaController {
     if (this.pausedByTalk !== undefined) {
       this.pausedByTalk = undefined
       p.play()
+      this.markDirty()
     }
   }
 
@@ -489,9 +521,11 @@ export class MediaController {
     // The position is the one of this instant, not of the player's last report.
     const nowPos = ms(this.positionNow())
     const withPosition = current !== undefined && current.status === "playing" && nowPos !== undefined ? { ...current, positionMs: nowPos } : current
+    // While the talk rule holds it paused the server must know: its "stop" still has to reach it (it resumes after the talk).
+    const reported = withPosition !== undefined && this.pausedByTalk !== undefined ? { ...withPosition, held: true } : withPosition
     return {
       type: "media.state",
-      state: { players, ...(withPosition !== undefined ? { current: withPosition } : {}) },
+      state: { players, ...(reported !== undefined ? { current: reported } : {}) },
       ...(this.ack !== undefined ? { ack: this.ack } : {}),
       ...(this.wants.size > 0 ? { wants: [...this.wants].slice(0, 8).map((source) => ({ source, what: "credential" as const })) } : {})
     }
@@ -541,6 +575,8 @@ export class MediaController {
     this.stopped = true
     this.stopHeartbeat()
     this.clearTalkEffects()
+    if (this.wantTimer !== undefined) clearInterval(this.wantTimer)
+    this.wantTimer = undefined
     if (this.reportTimer !== undefined) clearTimeout(this.reportTimer)
     this.options.doc?.removeEventListener("visibilitychange", this.onVisibility)
   }

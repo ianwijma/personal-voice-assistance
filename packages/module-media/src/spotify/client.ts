@@ -93,9 +93,13 @@ export interface Spotify {
   readonly status: () => AccountStatus
   /** True while the last token refresh or call showed the client ID or secret is refused. */
   readonly clientRefused: () => boolean
-  /** Start a sign-in that returns to `redirectUri`: the address to send the browser to, or `undefined` when not configured. */
-  readonly beginSignIn: (redirectUri: string) => string | undefined
-  readonly completeSignIn: (code: string, state: string) => Effect.Effect<SignInOutcome>
+  /**
+   * Start a sign-in that returns to `redirectUri`: the address to send the browser to, or `undefined` when not configured.
+   * `binding` is a random value the caller also gives the same browser (a cookie); `completeSignIn` needs it back, so a
+   * `state` that reaches another browser's callback (login CSRF) is refused.
+   */
+  readonly beginSignIn: (redirectUri: string, binding: string) => string | undefined
+  readonly completeSignIn: (code: string, state: string, binding: string | undefined) => Effect.Effect<SignInOutcome>
   /** `none`: nobody was signed in. `locked`: the vault is locked, so nothing was cleared. */
   readonly signOut: Effect.Effect<"ok" | "none" | "locked">
 }
@@ -190,7 +194,9 @@ export const makeSpotify = (o: SpotifyOptions): Effect.Effect<Spotify> =>
     let refused = false
     let access: AccessToken | undefined
     let inflight: Fiber.Fiber<AccessToken, MusicError> | undefined
-    const pending = new Map<string, { readonly redirectUri: string; readonly expires: number }>()
+    /** Counts every change of who is signed in (a sign-in, a sign-out, an ended sign-in): a refresh that began under an older one is dropped. */
+    let generation = 0
+    const pending = new Map<string, { readonly redirectUri: string; readonly binding: string; readonly expires: number }>()
 
     // -- what the vault holds ----------------------------------------------------------------------------------------
     const stored = yield* o.credentials.get(REFRESH_CREDENTIAL).pipe(Effect.result)
@@ -301,6 +307,7 @@ export const makeSpotify = (o: SpotifyOptions): Effect.Effect<Spotify> =>
 
     /** The sign-in ended for good: forget it (the vault too, as far as it can be reached). */
     const endSignIn = Effect.gen(function*() {
+      generation++
       refresh = undefined
       access = undefined
       signedInAt = undefined
@@ -324,7 +331,10 @@ export const makeSpotify = (o: SpotifyOptions): Effect.Effect<Spotify> =>
     const doRefresh: Effect.Effect<AccessToken, MusicError> = Effect.gen(function*() {
       const current = refresh
       if (current === undefined || !configured) return yield* notSignedIn()
+      const began = generation
       const res = yield* tokenCall({ grant_type: "refresh_token", refresh_token: current })
+      // Who is signed in changed while the answer was on its way (a sign-out, a new sign-in): it is of no use and is never kept.
+      if (began !== generation) return yield* (refresh === undefined ? Effect.fail(notSignedIn()) : doRefresh)
       if (res.status !== 200) {
         const code = parse(res)?.error
         if (code === "invalid_grant") {
@@ -434,29 +444,33 @@ export const makeSpotify = (o: SpotifyOptions): Effect.Effect<Spotify> =>
       )
 
     // -- signing in --------------------------------------------------------------------------------------------------
-    const beginSignIn = (redirectUri: string): string | undefined => {
+    const beginSignIn = (redirectUri: string, binding: string): string | undefined => {
       if (!configured) return undefined
       const at = o.now()
       for (const [k, v] of pending) if (v.expires <= at) pending.delete(k)
       while (pending.size >= MAX_PENDING) pending.delete(pending.keys().next().value!)
       const state = randomBytes(24).toString("base64url")
-      pending.set(state, { redirectUri, expires: at + STATE_TTL_MS })
+      pending.set(state, { redirectUri, binding, expires: at + STATE_TTL_MS })
       return `https://accounts.spotify.com/authorize?response_type=code&client_id=${enc(clientId)}&scope=${enc(SPOTIFY_SCOPES)}&redirect_uri=${enc(redirectUri)}&state=${enc(state)}`
     }
 
-    const completeSignIn = (code: string, state: string): Effect.Effect<SignInOutcome> =>
+    const completeSignIn = (code: string, state: string, binding: string | undefined): Effect.Effect<SignInOutcome> =>
       Effect.gen(function*() {
         const entry = pending.get(state)
         // Single use, whatever follows.
         pending.delete(state)
-        if (entry === undefined || entry.expires <= o.now() || !configured) return "expired" as const
+        // The browser that comes back must be the one that left (`binding`), or the state is as good as unknown.
+        if (entry === undefined || entry.expires <= o.now() || !configured || binding === undefined || binding !== entry.binding) return "expired" as const
         const res = yield* tokenCall({ grant_type: "authorization_code", code, redirect_uri: entry.redirectUri }, 5_000).pipe(Effect.result)
         if (res._tag === "Failure") return "failed" as const
         if (res.success.status !== 200) return "refused" as const
         const got = accessFrom(parse(res.success))
         if (got === undefined || got.refresh === undefined) return "refused" as const
+        // Before the vault is written: a refresh still on its way from the earlier sign-in must not land after the new one.
+        generation++
         const kept = yield* o.credentials.set(REFRESH_CREDENTIAL, got.refresh).pipe(Effect.result)
         if (kept._tag === "Failure") return kept.failure.reason === "locked" ? ("locked" as const) : ("failed" as const)
+        generation++
         refresh = got.refresh
         access = got.access
         ended = false
@@ -475,10 +489,12 @@ export const makeSpotify = (o: SpotifyOptions): Effect.Effect<Spotify> =>
 
     const signOut: Effect.Effect<"ok" | "none" | "locked"> = Effect.gen(function*() {
       const had = refresh !== undefined
+      generation++
       const cleared = yield* o.credentials.clear(REFRESH_CREDENTIAL).pipe(Effect.result)
       if (cleared._tag === "Failure" && cleared.failure.reason === "locked") return "locked" as const
       yield* o.credentials.clear(SIGNIN_CREDENTIAL).pipe(Effect.ignore)
       const existed = had || (cleared._tag === "Success" && cleared.success)
+      generation++
       refresh = undefined
       access = undefined
       signedInAt = undefined

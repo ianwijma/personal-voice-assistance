@@ -6,7 +6,8 @@ import { assert, describe, it } from "@effect/vitest"
 import { vi } from "vitest"
 import { Playback, PlaybackError } from "@pva/core"
 import { Effect, Fiber } from "effect"
-import { at, makeVideos, makeWorld, NL, startMedia, track, video, album } from "./helpers.ts"
+import { confirmsPlaying } from "../src/control.ts"
+import { at, idOf, makeVideos, makeWorld, NL, sdkPlays, startMedia, track, uri, video, album } from "./helpers.ts"
 
 vi.setConfig({ testTimeout: 30_000 })
 
@@ -194,6 +195,44 @@ describe("playing music", () => {
       assert.strictEqual(answerOf(yield* Fiber.join(fiber)), "That is taking a while; it may still start.")
     }))
 
+  it.effect("a `playing` left over from the previous track is not the answer: only a new track, the song asked for, or the same track begun again is", () =>
+    Effect.gen(function*() {
+      const previous = { source: "spotify", status: "playing", title: "Old song", ref: "OLDTRACK", positionMs: 90_000 } as const
+      const ask = (input: Record<string, unknown>, sdk: ((page: Parameters<typeof sdkPlays>[0]) => ((body: any) => void) | undefined) | undefined, before: typeof previous | { ref: string; positionMs: number } = previous) =>
+        Effect.gen(function*() {
+          const { world, kit, page } = yield* setup()
+          yield* page.report({ current: { ...previous, ...before } })
+          world.onPlay = sdk === undefined ? undefined : sdk(page)
+          // (without a hook the page's SDK says nothing: the default one `startMedia` installed is replaced)
+          const fiber = yield* Effect.forkChild(kit.action("play_music", input, at()))
+          yield* kit.advance(2_500)
+          return answerOf(yield* Fiber.join(fiber))
+        })
+      const maybe = "That is taking a while; it may still start."
+      const stale = (ref: string, positionMs: number) => (page: Parameters<typeof sdkPlays>[0]) => () => void Effect.runFork(page.report({ current: { ...previous, ref, positionMs } }))
+      // The page says nothing new: the old track's `playing` is all there is.
+      assert.strictEqual(yield* ask({ query: "Feeling Good", kind: "track" }, undefined), maybe)
+      // A heartbeat of the old track after the call is the old track.
+      assert.strictEqual(yield* ask({ query: "Feeling Good", kind: "track" }, stale("OLDTRACK", 95_000)), maybe)
+      // Another track: the answer.
+      assert.strictEqual(yield* ask({ query: "Feeling Good", kind: "track" }, (page) => sdkPlays(page)), "Playing the song Feeling Good by Nina Simone.")
+      // The song asked for is already the one playing: it began again, and that is the answer.
+      const same = idOf(uri("track", 1))
+      assert.strictEqual(yield* ask({ query: "Feeling Good", kind: "track" }, stale(same, 300), { ref: same, positionMs: 90_000 }), "Playing the song Feeling Good by Nina Simone.")
+      // An album whose first track is unknown: the same track near its start is a restart; far into it is the old one.
+      assert.strictEqual(yield* ask({ query: "Kind of Blue", kind: "album" }, stale("OLDTRACK", 500)), "Playing the album Kind of Blue by Miles Davis.")
+      assert.strictEqual(yield* ask({ query: "Kind of Blue", kind: "album" }, stale("OLDTRACK", 95_000)), maybe)
+      assert.strictEqual(yield* ask({ query: "Kind of Blue", kind: "album" }, (page) => sdkPlays(page)), "Playing the album Kind of Blue by Miles Davis.")
+    }))
+
+  it("confirmsPlaying: a report made before the call was sent never confirms; neither does one with no track id", () => {
+    assert.isFalse(confirmsPlaying({ ref: "NEW", positionMs: 0 }, 999, 1_000, { ref: "OLD" }, undefined))
+    assert.isFalse(confirmsPlaying({ positionMs: 0 }, 1_000, 1_000, { ref: "OLD" }, undefined))
+    assert.isFalse(confirmsPlaying({ ref: "NEW" }, undefined, 1_000, undefined, undefined))
+    assert.isTrue(confirmsPlaying({ ref: "NEW", positionMs: 5_000 }, 1_000, 1_000, { ref: "OLD" }, undefined))
+    assert.isTrue(confirmsPlaying({ ref: "NEW", positionMs: 5_000 }, 1_000, 1_000, undefined, undefined))
+  })
+
   it.effect("no device that can play: a device with no page, a page without Spotify; a blank request asks for words", () =>
     Effect.gen(function*() {
       const { kit } = yield* setup()
@@ -377,6 +416,8 @@ describe("transport", () => {
   it.effect("volume: a level, or up and down by ten points from the level the page reports; unknown level and nothing asked are said", () =>
     Effect.gen(function*() {
       const { kit, page } = yield* playing()
+      // The page's reports are limited to a burst of ten: a second gives them back (the start made one more now: the SDK's own).
+      yield* kit.advance(1_000)
       assert.strictEqual(answerOf(yield* kit.action("volume", { level: 40 }, at())), "Volume at 40 percent.")
       assert.strictEqual(page.state().current?.volume, 0.4)
       assert.strictEqual(answerOf(yield* kit.action("volume", { change: "up" }, at())), "Volume at 50 percent.")
@@ -480,6 +521,30 @@ describe("Playback: the host's stop", () => {
       yield* kit.action("resume", {}, at())
       const stop = yield* kit.phrases.say("stop", { device: "kitchen-display" })
       assert.isTrue(stop.taken && stop.outcome.did === "paused-media")
+    }))
+
+  it.effect("a page the talk rule holds paused (`held`) is stopped too, and `media_pause` reaches it; a page that is plainly paused is sent nothing", () =>
+    Effect.gen(function*() {
+      const { kit, page } = yield* setup()
+      const playback = kit.service(Playback)!
+      yield* kit.action("play_music", { query: "Feeling Good", kind: "track" }, at())
+      const sentSince = (n: number) => page.commands().slice(n).map((c) => c.type)
+      // Held: the page paused it while the assistant talks and will resume it afterwards.
+      yield* page.report({ current: { ...page.state().current!, status: "paused", held: true } })
+      let n = page.commands().length
+      assert.isTrue(yield* playback.pause("kitchen-display"))
+      assert.deepStrictEqual(sentSince(n), ["pause"])
+      // The model's or a phrase's pause goes the same way.
+      yield* page.report({ current: { ...page.state().current!, status: "paused", held: true } })
+      n = page.commands().length
+      assert.deepStrictEqual(answerOf(yield* kit.action("pause", {}, at())), "Paused.")
+      assert.deepStrictEqual(sentSince(n), ["pause"])
+      // Plainly paused (not held): nothing is sent.
+      const { held: _held, ...plain } = page.state().current!
+      yield* page.report({ current: { ...plain, status: "paused" } })
+      n = page.commands().length
+      assert.isFalse(yield* playback.pause("kitchen-display"))
+      assert.deepStrictEqual(sentSince(n), [])
     }))
 
   it.effect("no page is `no_player`, a page that does not confirm is `timeout`, a bad id is `invalid`", () =>

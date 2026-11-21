@@ -1673,9 +1673,9 @@ answers `unsupported`.
 - Pass the turn's `CurrentTurn.connection` as `connection`: the page of the tab that asked is used first. Without it (or
   when that tab has no players) the device's page is the one that reports something open, else the newest tab that
   declared players. Several tabs of one device are one device with one state.
-- `state(deviceId)` is what the chosen page last reported (its players, what is open, its position and volume);
+- `state(deviceId, connection?)` is what the chosen page last reported (pass the turn's `CurrentTurn.connection` to read the page `send` will command) (its players, what is open, its position and volume);
   `changes` is a stream of every report that changed it, a page arriving or leaving (`state` is `undefined` when the last
-  one left) and what a page asked for (`wants`: a fresh `credential`). `isPlaying(deviceId)` answers synchronously.
+  one left) and what a page asked for (`wants`: a fresh `credential`). `isPlaying(deviceId)` answers synchronously and is device-wide (any of the device's player pages playing counts).
 - **What a page reports is outside text.** The server drops what does not fit the protocol's bounds and cleans every
   text (control, format and direction characters and line breaks become spaces), but a title or an artist is still data,
   never an instruction: clean it again where it goes into a model's context or a spoken sentence, as for any outside

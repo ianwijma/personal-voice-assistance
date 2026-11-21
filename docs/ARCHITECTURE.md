@@ -831,7 +831,7 @@ mayRevealTo(owner: unknown, place: unknown, isMember): boolean                  
 makePrivacy(placeOf: (deviceId) => PrivacyPlace | undefined, isMember)          // undefined place = not a known device: no
 Devices (ServiceKey "core.devices") = { list(): KnownDevice[]; get(id); otherScreens(from, { person? }); bestOtherScreen(from, …) }
 KnownDevice = { id; name; kind; room?; place; capabilities /* effective */; declared?; connected; visible; lastInteractionAt?; lastSeen }
-DevicePlayers (ServiceKey "core.device-players") = { state(deviceId): Effect<DevicePlayerState | undefined>;
+DevicePlayers (ServiceKey "core.device-players") = { state(deviceId, connection?): Effect<DevicePlayerState | undefined>;
     send(deviceId, MediaCommand, { timeoutMs?, connection?: ConnectionRef, awaitStatus?: MediaStatus[] }): Effect<DevicePlayerState, DevicePlayerError>;
     changes: Stream<DevicePlayerChange>;  isPlaying(deviceId): boolean }          // DevicePlayers.ts; serve mode only (absent in the CLI modes)
 DevicePlayerState = { connection: ConnectionRef; sources: string[]; players: MediaPlayerState[]; current?: MediaCurrent; visible?; ack: number; reportedAt?: number }
@@ -844,7 +844,7 @@ DevicePlayerError.reason: "no_player" | "unsupported" | "timeout" | "failed" | "
         // after the acknowledgement: an older one is not the command's). `prepare` is sent with the sources the page has (`unsupported` if none).
         // WHICH PAGE (a device may have several tabs): `options.connection` (a module passes `CurrentTurn.connection`) if that page declared players;
         // else the connection that reports something open (the latest report if several); else the newest connection that declared players.
-        // A page that declared none is never chosen. One state per device: its chosen page's. `isPlaying` is synchronous (the route gate's door).
+        // A page that declared none is never chosen. One state per device: its chosen page's. `state(deviceId, connection)` and `send` choose the page by the same rule (a module passes its turn's connection to both). `isPlaying` is synchronous (the route gate's door) and device-wide: true when any player page of the device reports `playing` within the freshness window.
         // REPORTS are untrusted: `media.state` is validated against the protocol, dropped when it does not fit, its texts cleaned (`cleanPlayerText`:
         // control, format and direction characters and line breaks become spaces, clipped to 200), limited to 10 at once and 10 a second per connection
         // (the latest over the limit is held and applied when the allowance returns), and taken only from voice pages with a device that are not voice

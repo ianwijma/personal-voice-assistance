@@ -131,6 +131,8 @@ export class SpotifyPlayer implements PagePlayer {
   // What is open (the SDK's state is shown only while it is).
   private opened: OpenCommand | undefined
   private lastState: SpotifyState | undefined
+  /** Playback moved to another Spotify device (the SDK's state went `null`) while something is open: shown as paused. */
+  private movedAway = false
   private activated = false
   private gestureOff: (() => void) | undefined
 
@@ -219,7 +221,15 @@ export class SpotifyPlayer implements PagePlayer {
       if (this.opened !== undefined) this.events?.current({ ...this.shown(), status: "blocked" })
     })
     on<SpotifyState | null>("player_state_changed", (s) => {
-      if (s === null) return
+      if (s === null) {
+        // Playback went to another Spotify device: this one is no longer playing, whatever it last said.
+        if (this.opened !== undefined) {
+          this.movedAway = true
+          this.events?.current(this.shown())
+        }
+        return
+      }
+      this.movedAway = false
       this.lastState = s
       if (this.opened !== undefined) this.events?.current(this.shown())
     })
@@ -230,10 +240,13 @@ export class SpotifyPlayer implements PagePlayer {
 
   /** What to show now: the SDK's state, or the title the server gave until the SDK has one. */
   private shown(): PlayerCurrent {
-    if (this.lastState !== undefined && this.lastState.track_window.current_track !== null) return currentOfState(this.lastState, this.opened?.link)
+    if (this.lastState !== undefined && this.lastState.track_window.current_track !== null) {
+      const c = currentOfState(this.lastState, this.opened?.link)
+      return this.movedAway ? { ...c, status: "paused", canNext: false, canPrevious: false } : c
+    }
     const o = this.opened
     return {
-      status: "loading",
+      status: this.movedAway ? "paused" : "loading",
       ...(o?.title !== undefined ? { title: o.title } : {}),
       ...(o?.subtitle !== undefined ? { artist: o.subtitle } : {}),
       ...(o?.artUrl !== undefined ? { artUrl: o.artUrl } : {}),
@@ -321,11 +334,13 @@ export class SpotifyPlayer implements PagePlayer {
   open(command: OpenCommand): void {
     this.opened = command
     this.lastState = undefined
+    this.movedAway = false
     // Without a `ref` the panel shows what the server said until the SDK reports; the server starts the playback.
     this.events?.current(this.shown())
     // If something already plays here, the SDK will not say so again: ask.
     void this.sdk?.getCurrentState().then((s) => {
       if (s === null || this.opened === undefined) return
+      this.movedAway = false
       this.lastState = s
       this.events?.current(this.shown())
     }, () => undefined)
@@ -359,6 +374,7 @@ export class SpotifyPlayer implements PagePlayer {
   close(): void {
     this.opened = undefined
     this.lastState = undefined
+    this.movedAway = false
     void this.sdk?.pause().catch(() => undefined)
   }
 }

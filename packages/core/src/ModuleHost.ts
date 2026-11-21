@@ -5,6 +5,7 @@ import {
   type FieldError,
   MAX_COMBO_OPTIONS,
   MAX_FIELD_LABEL,
+  FIELD_ACTION_LINK_HREF,
   MAX_MODULE_TEMPLATES,
   MAX_OPTIONS_JSON,
   MAX_ROUTE_DESCRIPTION,
@@ -3516,7 +3517,7 @@ const declaresMember = (object: object, key: string): boolean => {
 const fieldActionLink = (moduleId: string, link: FieldActionResult["link"], label: (text: string) => string): FieldActionResult["link"] => {
   if (typeof link !== "object" || link === null || typeof link.href !== "string" || typeof link.label !== "string") return undefined
   if (link.href.length > 400 || !link.href.startsWith(`/api/modules/${moduleId}/`)) return undefined
-  if (!/^\/api\/modules\/[a-z][a-z0-9-]{0,39}\/[A-Za-z0-9._~/?=&%-]{0,300}$/.test(link.href) || link.href.includes("..")) return undefined
+  if (!FIELD_ACTION_LINK_HREF.test(link.href)) return undefined
   const shown = label(link.label).trim()
   return shown === "" ? undefined : { href: link.href, label: shown }
 }

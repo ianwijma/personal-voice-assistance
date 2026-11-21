@@ -68,6 +68,8 @@ export const makeWorld = () => {
     invalidGrant: false,
     /** What the play endpoint answers 403 with. */
     playForbiddenReason: undefined as string | undefined,
+    /** Called with the body of every play request before the endpoint answers (the page's SDK saying what plays). */
+    onPlay: undefined as ((body: { readonly uris?: ReadonlyArray<string>; readonly context_uri?: string }) => void) | undefined,
     /** The play endpoint's connection ends after the request was written. */
     playBreaks: false,
     /** Every request breaks (no connection). */
@@ -123,6 +125,11 @@ export const makeWorld = () => {
     },
     "https://api.spotify.com/v1/me/player/play": (req) => {
       record(req)
+      try {
+        world.onPlay?.(JSON.parse(new TextDecoder().decode(req.body)))
+      } catch {
+        // A test hook that fails is the test's problem; the endpoint answers as it would.
+      }
       return answer(world.statuses.play, () => ({ status: 204 }))
     },
     "https://api.spotify.com/v1/me/player/queue": (req) => {
@@ -176,6 +183,23 @@ export const wrapped = (definition: ModuleDefinition<any>, seen: Seen): ModuleDe
     start: (ctx: any) => definition.start(ctx).pipe(Effect.tap((instance: any) => Effect.sync(() => void (seen.instance = instance))))
   }) as ModuleDefinition<any>
 
+/** The id (the last part) of a Spotify uri. */
+export const idOf = (uri: string): string => uri.split(":").pop()!
+
+/**
+ * The page's Spotify SDK as it behaves when the Web API starts something on it: the page reports `playing` with the track
+ * (`ref`) it now plays (a song's own id; for an album, playlist or artist the id of its first track, `<id>t1`), provided
+ * the page had accepted autoplay. Install it with `world.onPlay = sdkPlays(page, kit)`.
+ */
+export const sdkPlays = (page: { readonly deviceId: string; readonly state: () => { readonly current: Record<string, unknown> | undefined }; readonly report: (patch: any) => Effect.Effect<unknown> }) =>
+  (body: { readonly uris?: ReadonlyArray<string>; readonly context_uri?: string }) => {
+    const current = page.state().current
+    if (current?.status !== "playing") return
+    const id = body.uris !== undefined ? idOf(body.uris[0]!) : `${idOf(body.context_uri!)}t1`
+    // Reported in the page's own turn, before the play call answers: the SDK's event can come before the HTTP answer.
+    Effect.runFork(page.report({ current: { ...current, status: "playing", ref: id, positionMs: 0 } }))
+  }
+
 export const request = (over: Partial<RouteRequest> = {}): RouteRequest =>
   ({ method: "GET", path: "", params: {}, query: {}, queryAll: {}, headers: { host: "assistant.example.org" }, body: undefined, address: "192.168.1.9", ...over }) as RouteRequest
 
@@ -209,6 +233,14 @@ export const startMedia = (o: StartOptions, seen: Seen = { routes: [], instance:
       provide: o.videos === undefined ? [] : [o.videos.provided],
       ...(o.household !== undefined ? { household: o.household as never } : {})
     })
+    // By default the pages' Spotify SDK says what plays once the Web API has started it: every page whose last command was an
+    // `open` of Spotify and that accepted autoplay (a `playing` it made at the `open` is the previous track's, not the answer).
+    o.world.onPlay = (body) => {
+      for (const page of kit.players.pages()) {
+        const last = [...page.commands()].reverse().find((c) => c.type === "open")
+        if (last?.type === "open" && last.source === "spotify") sdkPlays(page)(body)
+      }
+    }
     return { kit, seen }
   })
 
