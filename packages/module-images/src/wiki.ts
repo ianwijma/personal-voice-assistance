@@ -13,8 +13,12 @@ export const API_MAX_BYTES = 96 * 1024
 /** The most candidates one search reads, and the most a question names. */
 export const MAX_CANDIDATES = 6
 export const MAX_ASKED = 3
-/** The picture's width asked of Commons; the image itself is fetched by the server's media route, never by the module. */
-export const THUMB_WIDTH = 800
+/**
+ * The picture's width asked of Commons; the image itself is fetched by the server's media route, never by the module.
+ * One of Wikimedia's standard thumbnail widths (issue #150): its upload hosts answer 400 for a thumbnail of any other width
+ * (800 px was refused), and the API rounds a request up to the next standard width anyway.
+ */
+export const THUMB_WIDTH = 960
 /** The longest page title or file name used as an identifier (MediaWiki's own limit is 255 bytes). */
 export const NAME_MAX = 255
 /** The longest title or description shown. */
@@ -25,7 +29,7 @@ export const LICENCE_MAX = 70
 const ARTIST_MAX = 200
 const URL_MAX = 2_000
 
-export type Source = "wikipedia" | "commons"
+export type Source = "wikipedia" | "commons" | "web"
 export type LookupFailure = "timeout" | "unreachable" | "rate-limited" | "invalid" | "failed"
 /** Why a read failed, and in which source; `detail` is for the log and holds no outside text. */
 export class LookupError extends Data.TaggedError("LookupError")<{ readonly reason: LookupFailure; readonly source: Source | "both"; readonly detail: string }> {}
@@ -195,7 +199,7 @@ export const decide = (query: string, found: ReadonlyArray<Candidate>): Decision
 // Pictures
 
 export interface Picture {
-  /** `https://upload.wikimedia.org/…`, printable ASCII, at most 2,000 characters. */
+  /** `https://upload.wikimedia.org/…` or `https://thumb.wikimedia.org/…`, printable ASCII, at most 2,000 characters. */
   readonly url: string
   /** The licence short name, whole (a longer one makes the file unusable). */
   readonly licence: string
@@ -204,7 +208,13 @@ export interface Picture {
   readonly artistCut: boolean
 }
 
-/** The address of an image the module hands the server: `https` on Wikimedia's own upload host, nothing else. */
+/**
+ * Wikimedia's own image hosts: the originals' (`upload`) and, since 2025, the thumbnails' (`thumb`), which is where the API's
+ * `thumburl` points (issue #150: with only `upload` admitted, every Commons answer was unusable).
+ */
+export const IMAGE_HOSTS: ReadonlySet<string> = new Set(["upload.wikimedia.org", "thumb.wikimedia.org"])
+
+/** The address of an image the module hands the server: `https` on one of Wikimedia's own image hosts, nothing else. */
 export const imageUrlOf = (value: unknown): string | undefined => {
   if (typeof value !== "string" || value.length > URL_MAX) return undefined
   let url: URL
@@ -213,7 +223,7 @@ export const imageUrlOf = (value: unknown): string | undefined => {
   } catch {
     return undefined
   }
-  if (url.protocol !== "https:" || url.hostname !== "upload.wikimedia.org" || url.port !== "" || url.username !== "" || url.password !== "" || url.hash !== "") return undefined
+  if (url.protocol !== "https:" || !IMAGE_HOSTS.has(url.hostname) || url.port !== "" || url.username !== "" || url.password !== "" || url.hash !== "") return undefined
   return /^[\x21-\x7e]+$/.test(url.href) && url.href.length <= URL_MAX ? url.href : undefined
 }
 

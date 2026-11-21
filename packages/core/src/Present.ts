@@ -309,6 +309,26 @@ export interface PresentPressRequest {
   readonly person?: TurnPerson
 }
 
+/** The viewer closed a presentation on a page (`present.close`): its close button, or Escape. */
+export interface PresentCloseRequest {
+  readonly presentationId: string
+  /** The revision the closing page displays: its show must be the current show of the id. */
+  readonly revision: string
+  readonly deviceId: string
+  /** The connection it came on: it must hold the presentation. Absent (the kit's helpers): one of the device's must. */
+  readonly connection?: ConnectionRef
+}
+
+/**
+ * What a close came to: `ok` when it is no longer shown (dismissed now, or it had ended already); else `say`, why not,
+ * in the household's language (the page shows it again with that sentence). `code` as for a press.
+ */
+export interface PresentCloseAnswer {
+  readonly ok: boolean
+  readonly say?: string
+  readonly code?: "unknown" | "busy"
+}
+
 /** What a press came to: `ok` when the handler ran; `say`: the sentence to show, in the household's language. */
 export interface PresentPressAnswer {
   readonly ok: boolean

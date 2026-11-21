@@ -103,7 +103,7 @@ A figure can do what an abstract form cannot: show attention. It also fails in w
 
 The box in the middle of the voice page (`.stage-vis`, at most 720 px wide and 48 to 240 px high) is too small for light: a glow cut off at its edges shows as a lit rectangle with hard edges, and a character that lights the screen's edge cannot reach the edge. So a character can ask for the whole stage.
 
-**What the host gives.** `canvas: "stage"` in the manifest. The canvas then covers the whole stage area of the voice page: the full viewport, behind the header, the captions, the controls and the chat panel. `resize(width, height, dpr)` reports that size. Each frame, `frame.focus` is the box's rectangle on that canvas (CSS pixels): where the character centres itself and what it sizes its main shape from. It is per frame because the box moves without the canvas resizing: the stage slides 200 px left while the chat panel is open (desktop widths 1024 to 1439 px, over 320 ms), the box's height and position scale with the window height, and the stage scrolls under long captions on short screens (the canvas does not scroll, so the focus moves, and can reach past the canvas edge). For a `"box"` character, `focus` is the whole canvas, so the same code serves both.
+**What the host gives.** `canvas: "stage"` in the manifest. The canvas then covers the whole stage area of the voice page: the full viewport, behind the header, the captions, the controls and the chat panel. `resize(width, height, dpr)` reports that size. Each frame, `frame.focus` is the box's rectangle on that canvas (CSS pixels): where the character centres itself and what it sizes its main shape from. It is per frame because the box moves without the canvas resizing: the stage slides 200 px left while the chat panel is open (desktop widths 1024 to 1439 px, over 320 ms), the box's height and position scale with the window height (and the box shrinks to a strip while something is presented, §2.7), and the stage scrolls under long captions on short screens (the canvas does not scroll, so the focus moves, and can reach past the canvas edge). For a `"box"` character, `focus` is the whole canvas, so the same code serves both.
 
 **What the character does.**
 
@@ -127,22 +127,24 @@ The box in the middle of the voice page (`.stage-vis`, at most 720 px wide and 4
 ### 2.7 The presentation stage (P10)
 
 Since P10 the voice page shows what modules present (cards, lists, timers, images, the weather) and P9's notification
-cards in **one presentation stage** (docs/PRESENTING.md "The voice page"). **Nothing changes for a character**: the
-contract, the frame, the box (`.stage-vis`), the stage canvas and `focus` are exactly as before, and no character is
-told what is presented. Where the stage sits, so a character author can leave it room:
+cards in **one presentation stage** (docs/PRESENTING.md "The voice page"). **The contract does not change for a
+character**: the frame, the box (`.stage-vis`), the stage canvas and `focus` are as before, and no character is told
+what is presented. What a character sees is the box changing size, which it always could (it already scales with the
+window height, from 16 px up):
 
-- a column at most 420 px wide, centred under the box, its bottom just above the controls (96 px above the bottom of
-  the page), growing upward as far as `max(160px, min(42dvh, 100dvh − 540px))` and scrolling within itself beyond
-  that, so on ordinary screens it stays below the box; on a very short screen it may cover the lower part of the
-  stage, never the box's centre at the heights the page supports;
-- it is drawn above the page (`z-index` 60), opaque cards with a border and the panel shadow, so glow under it is hidden
-  rather than fought with;
-- it slides 200 px left with the stage while the desktop chat is open (1024 to 1439 px wide), as the box does;
-- the page's scroll area gets the stage's height as extra bottom padding (`--pva-present-h`), so long captions scroll
-  above it; the focus moves with that scroll as it always did (§2.6).
+- **while something is presented the box shrinks to a strip under the header** (40 px high on a phone, 64 px from
+  640 px wide, its width unchanged; 16 px, covered by the presentation, on a screen at most 600 px high), and returns to
+  its usual size when the last presentation goes or a menu, a panel or the chat covers the stage. The change is
+  immediate (no animated resize), so a box character gets one `resize` each way and a stage character's `focus` moves
+  in one frame;
+- the presentation area takes the rest, from under that strip to just above the controls (96 px above the bottom of
+  the page), up to 960 px wide: opaque cards with a border and the panel shadow, drawn above the stage, so glow under
+  them is hidden rather than fought with; a stage character's atmosphere still shows around them;
+- the captions and the stage's overlays step aside while something is presented; the state label stays under the box;
+- it slides 200 px left with the stage while the desktop chat is open (1024 to 1439 px wide), as the box does.
 
-Atmosphere drawn outside the focus may run under the stage; what makes the mode readable belongs inside the focus, as
-before.
+So a character must stay readable in a strip 40 px high (a mode must read from what is inside the focus, as before);
+what it draws outside the focus may run under the presentation area.
 
 ## 3. The manifest
 

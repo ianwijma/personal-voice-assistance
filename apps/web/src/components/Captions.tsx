@@ -39,6 +39,7 @@ export function Captions() {
   return (
     <div
       data-testid="captions"
+      data-present-yield=""
       className={cx(
         // Two lines are reserved, so nothing under them moves when they appear; smaller on a short screen.
         "stage-legible mt-3 min-h-[3.2em] w-full max-w-[640px] px-6 text-center text-[16px] leading-[1.45] sm:text-caption short:mt-2 short:min-h-[2.9em] short:text-[16px]",

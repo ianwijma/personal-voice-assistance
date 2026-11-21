@@ -103,6 +103,11 @@
  * `node.paired`, `node.meter` (admin only); `result.pairing`; `devices` entries carry `node` and `capabilities`;
  * `device.setup` carries `sound` and `soundDevices` for a node; close code 4403 (`unauthorized`). HTTP: `/node/*`
  * (not part of the WebSocket protocol, but its schemas are here).
+ * Additive within 12 (docs/PRESENTING.md "Closing on the page"): `present.close` (a request a newer page sends, only
+ * for a presentation the server marked closable), the optional `PresentationWire.closable` and
+ * `PresentPageTexts.close`. An older server never marks one closable, so a newer page never sends it there (an
+ * older server would ignore it as `Unknown` anyway); an older page ignores the keys and never sends it. No closed set
+ * the decoder checks gains a member, so the version stays 12.
  */
 export const PROTOCOL_VERSION = 12
 

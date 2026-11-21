@@ -150,7 +150,7 @@ import { makePreviousConversations } from "./reports/previous.ts"
 import { makeReports, REPORT_MODULE_ID, type ReportsHost } from "./reports/Reports.ts"
 import { secretLikeEnvValues } from "./reports/scrub.ts"
 import { boundaryOf, makeServeReportSources } from "./reports/serveSources.ts"
-import type { SafeFetchOptions } from "@pva/net"
+import { type SafeFetchOptions, userAgent } from "@pva/net"
 import { effectiveMembersOf, makeMembersGate, makePeopleService, MEMBERS_ENV_REFUSED, MEMBERS_KEY, MEMBERS_SECTION_ID } from "./people.ts"
 import { householdBackupIssues, runMaintenance } from "@pva/store-sqlite"
 import { type KdfParams, openVault, type Vault, VaultPathConfig } from "./Vault.ts"
@@ -477,7 +477,13 @@ export const startServe = (options: ServeOptions): Effect.Effect<ServeHandle, Ht
     // P10: the Presenter (docs/PRESENTING.md) on the same store, made before the module host it gives `ctx.present` and the
     // gateway's split to. Pages (the hub), the image cache, the gateway and the page boundary are bound once they exist;
     // nothing is shown before a page says hello.
-    const media = yield* makeMediaCache({ dir: join(options.dataDir, "media"), log: logInfo, issues, ...(options.mediaFetch !== undefined ? { fetchOptions: options.mediaFetch } : {}) })
+    // Image hosts ask who is calling (Wikimedia refuses a fetch without a User-Agent: issue #150): the project's, with the
+    // household's API contact when one is set, as the modules send it.
+    const mediaAgent = () => {
+      const contact = sections.value("HOME_API_CONTACT")
+      return userAgent(typeof contact === "string" && contact.trim() !== "" ? contact : undefined)
+    }
+    const media = yield* makeMediaCache({ dir: join(options.dataDir, "media"), log: logInfo, issues, userAgent: mediaAgent, ...(options.mediaFetch !== undefined ? { fetchOptions: options.mediaFetch } : {}) })
     const present = yield* makePresentEngine({
       store: household.store,
       scheduler,

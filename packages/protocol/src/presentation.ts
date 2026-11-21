@@ -14,6 +14,10 @@ import type { DeviceSettings } from "./devices.ts"
  * - `present.dismiss` (server → every connection that holds it): take it down.
  * - `present.action` (voice page → server, a request): a tick on a checklist item or a press on a button. Answered
  *   with `result` (`say`: the sentence to show).
+ * - `present.close` (voice page → server, a request; additive within protocol 12): the viewer closed it on the page
+ *   (its close button, or Escape). Sent only for a presentation the server marked `closable`, so an older server, which
+ *   never marks one, is never sent it. The Presenter dismisses it as a module's dismissal does: every connection that
+ *   holds it is sent `present.dismiss`. Answered with `result` (`say` only on a refusal: the page shows it again).
  *
  * Every text here passed the server's page boundary (`ModuleHost.pageText`) and is cut to the bounds below; a page
  * inserts none of it as markup. This file also holds the one decision (`decidePresentation`), a device's presentation
@@ -164,6 +168,8 @@ export const PresentPageTexts = Schema.Struct({
   imageMissing: Schema.String.check(Schema.isMinLength(1), Schema.isMaxLength(60)),
   /** A press without a server answer (optional for older servers). */
   failed: Schema.optional(Schema.String.check(Schema.isMinLength(1), Schema.isMaxLength(60))),
+  /** The close button's accessible name ("Close"); sent with every `closable` presentation (absent from older servers). */
+  close: Schema.optionalKey(Schema.String.check(Schema.isMinLength(1), Schema.isMaxLength(30))),
   /** A timer at zero. */
   timerDone: Schema.String.check(Schema.isMinLength(1), Schema.isMaxLength(30)),
   /** Before a credit ("Image:"). */
@@ -191,6 +197,13 @@ export const PresentationWire = Schema.Struct({
   buttons: Schema.Array(PresentButton).check(Schema.isMaxLength(MAX_PRESENT_BUTTONS)),
   /** Ticks and buttons may be pressed here (the decision, and a handler named). */
   interactive: Schema.Boolean,
+  /**
+   * The viewer may close it here (`present.close`): the decision lets it be pressed on this device (a touch screen or a
+   * pointer), whether or not it has a handler. Optional, additive within protocol 12: an older server never sends it,
+   * so a newer page shows no close button there and never sends `present.close` to a server that does not know it;
+   * an older page ignores the key.
+   */
+  closable: Schema.optionalKey(Schema.Boolean),
   texts: PresentPageTexts
 })
 export type PresentationWire = typeof PresentationWire.Type
@@ -212,6 +225,18 @@ export const PresentAction = Schema.Struct({
   action: Schema.String.check(Schema.isPattern(PRESENT_ACTION_ID)),
   item: Schema.optionalKey(Schema.String.check(Schema.isPattern(LIST_ITEM_ID))),
   done: Schema.optionalKey(Schema.Boolean)
+})
+
+/**
+ * Voice page → server, a request (additive within protocol 12): the viewer closed this presentation on the page. Only
+ * for one the server marked `closable` for this connection; `revision` is the displayed one (its show must still be the
+ * current show of the id: a keyed replacement the page has not drawn yet is not closed unseen).
+ */
+export const PresentClose = Schema.Struct({
+  type: Schema.Literal("present.close"),
+  requestId: RequestId,
+  id: PresentationId,
+  revision: PresentationRevision
 })
 
 // ---------------------------------------------------------------------------------------------------------------------

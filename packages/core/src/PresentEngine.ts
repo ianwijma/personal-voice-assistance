@@ -49,6 +49,8 @@ import {
   presentationProblem,
   presentations,
   type PresentAnswer,
+  type PresentCloseAnswer,
+  type PresentCloseRequest,
   PresentError,
   type PresentHandle,
   type PresentHook,
@@ -98,6 +100,9 @@ import { CurrentJob, CurrentPrincipal, CurrentTurn, CurrentTurnCommit, type Prin
  *   net counting in UTC. The Presenter has no timer of its own.
  * - **A press** is admitted only for a connection that holds the presentation and while the decision still lets it be
  *   pressed there; it is claimed (one at a time per presentation) before the module's handler runs.
+ * - **A close on the page** (`close`) is admitted on the same conditions, for the show the page displays, and is the
+ *   module's dismissal without the module: the presentation leaves the index and every holder is sent
+ *   `present.dismiss`; the module's handle then answers as for any dismissed presentation.
  */
 
 export type PresentMessage = ServerMessageOf<"present.show"> | ServerMessageOf<"present.update"> | ServerMessageOf<"present.dismiss">
@@ -194,6 +199,11 @@ export interface PresentEngine extends PresentHook {
   readonly reconcileAll: () => void
   /** A tick or a button pressed on a page, admitted only where the presentation is held and may be pressed. */
   readonly press: (request: PresentPressRequest) => Effect.Effect<PresentPressAnswer>
+  /**
+   * The viewer closed a presentation on a page (`present.close`): admitted where it is held and may be pressed, for the
+   * show that page displays; then dismissed for every device and connection (the presentation has no per-device state).
+   */
+  readonly close: (request: PresentCloseRequest) => Effect.Effect<PresentCloseAnswer>
   /**
    * The gateway's split of a tool's or action's result: a `{ forModel, present }` is handed to the Presenter (a
    * validation, the bounds from memory, the decision for the origin device and one enqueue) and the model gets
@@ -607,6 +617,8 @@ export const makePresentEngine = (options: PresentEngineOptions): Effect.Effect<
         content,
         buttons: v.buttons.map((b) => ({ id: b.id, label: t(b.label, MAX_PRESENT_LABEL_CHARS) || b.id })),
         interactive: interactive && v.handler !== undefined,
+        // The viewer may close it wherever it could be pressed (a touch screen or a pointer), with or without a handler.
+        closable: interactive,
         texts: presentPageTexts(lang())
       }
     }
@@ -1528,6 +1540,46 @@ export const makePresentEngine = (options: PresentEngineOptions): Effect.Effect<
         })))
       })
 
+    /**
+     * A close on the page: the connection holds it, its show is the one that page displays and the current one, and the
+     * decision lets it be pressed there. Then it is dismissed as `dismiss` does (out of the index at once, every holder
+     * reconciled, the row marked ended and removed by maintenance), whoever's it is. A presentation that has ended
+     * already counts as closed. It runs no module code: the gateway and the risk policy are not asked (it changes
+     * nothing but what the screens show, as an end does).
+     */
+    const close = (request: PresentCloseRequest): Effect.Effect<PresentCloseAnswer> =>
+      Effect.gen(function*() {
+        const now = yield* wallNow
+        const refused = (key: PresentTextKey): PresentCloseAnswer => ({ ok: false, say: presentText(lang(), key), code: "unknown" })
+        const holder = heldOf(request.deviceId).find(({ by, conn }) => by.items.has(request.presentationId) && (request.connection === undefined || conn.id === request.connection.id))
+        if (holder === undefined) return refused("cantNow")
+        const e = index.get(request.presentationId)
+        if (e === undefined || e.expiresAt <= now) {
+          enqueue(request.deviceId)
+          return { ok: true }
+        }
+        // The show the page displays (its revision's show id), held there and current: a keyed replacement the page has
+        // not drawn yet is not closed unseen (the page shows it again, then gets the new content).
+        const showOf = (revision: string) => revision.slice(0, Math.max(0, revision.lastIndexOf(":")))
+        if (holder.by.items.get(request.presentationId)?.showId !== e.showId || showOf(request.revision) !== e.showId) {
+          enqueue(request.deviceId)
+          return refused("changed")
+        }
+        const device = deviceOf(request.deviceId)
+        const decision = device === undefined || !applies(e.target, device) ? undefined : decide(e, device, true, outputsFor(device, holder.conn))
+        if (decision?.show !== true || !decision.interactive) {
+          enqueue(request.deviceId)
+          return refused("cantNow")
+        }
+        doom(e, now + PRESENT_PURGE_AFTER_MS)
+        yield* Effect.ignore(tx((p) => {
+          const row = p.get(e.id)
+          if (row !== undefined && row.value.showId === e.showId && row.value.ended !== true) p.update(e.id, (v) => ({ ...v, ended: true as const }))
+        }))
+        log(`Presentations: a presentation of ${e.module} was closed on ${request.deviceId}`)
+        return { ok: true }
+      })
+
     const runClaimed = (request: PresentPressRequest, row: Row<StoredPresentation>, entry: PublishedHandler): Effect.Effect<PresentPressAnswer> =>
       Effect.gen(function*() {
         const v = row.value
@@ -1640,6 +1692,7 @@ export const makePresentEngine = (options: PresentEngineOptions): Effect.Effect<
         enqueueAll()
       },
       press,
+      close,
       fromResult,
       mediaFor: (token) => {
         const t = tokens.get(token)

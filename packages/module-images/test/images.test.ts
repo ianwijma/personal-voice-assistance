@@ -72,8 +72,10 @@ describe("@pva/module-images", () => {
         assert.strictEqual(shown.content.alt, "A picture of Okapi")
         assert.strictEqual(shown.content.caption, "Okapi: Giraffid native to the Congo")
       }
-      // The address the Presenter asked the image cache for: Wikimedia's own upload host, over https, the 800 px thumbnail.
-      assert.deepStrictEqual(media.urls, ["https://upload.wikimedia.org/wikipedia/commons/thumb/a/ab/Okapi2.jpg/800px-Okapi2.jpg"])
+      // The address the Presenter asked the image cache for: Wikimedia's own thumbnail host, over https, as the API gave it.
+      assert.deepStrictEqual(media.urls, ["https://thumb.wikimedia.org/wikipedia/commons/thumb/a/ab/Okapi2.jpg/960px-Okapi2.jpg?utm_source=commons.wikimedia.org&utm_campaign=imageinfo&utm_content=thumbnail"])
+      // Issue #150: a standard thumbnail width (Wikimedia answers 400 for a thumbnail of any other width, such as 800 px).
+      assert.strictEqual(new URL(net.requests[1]!.url).searchParams.get("iiurlwidth"), "960")
       // The module asked the two APIs only, by GET, with the project's user agent and no more than it needs.
       assert.deepStrictEqual(hosts(net.requests), ["en.wikipedia.org", "commons.wikimedia.org"])
       for (const q of net.requests) {
@@ -123,6 +125,7 @@ describe("@pva/module-images", () => {
       assert.deepStrictEqual(kit.present.shown("office-speaker"), [])
       // The module never asks for an image (only the two APIs), and the Presenter hands the cache nothing: no page would show it.
       assert.isFalse(hosts(net.requests).includes("upload.wikimedia.org"))
+      assert.isFalse(hosts(net.requests).includes("thumb.wikimedia.org"))
       assert.deepStrictEqual(media.urls, [])
       // In Dutch.
       const dutch = yield* start(standardWorld, { household: { ...SPEAKER.household, ...NL.household } })
@@ -396,6 +399,40 @@ describe("@pva/module-images", () => {
     for (const malformed of [null, "text", 3, { title: 3 }, { title: "x", imageinfo: "x" }, { title: "x", imageinfo: [3] }, info({ mime: undefined }), info({ thumburl: 42 }), info({ extmetadata: "x" })]) assert.isUndefined(fileOutcome(malformed), JSON.stringify(malformed))
     // A non-ASCII path is percent-encoded by the URL parser, so the address stays printable ASCII.
     assert.match(imageUrlOf("https://upload.wikimedia.org/\u00e9.jpg") ?? "", /^https:\/\/upload\.wikimedia\.org\/%C3%A9\.jpg$/)
+    // Issue #150: the thumbnail host is Wikimedia's too; a look-alike is not.
+    assert.strictEqual(imageUrlOf("https://thumb.wikimedia.org/wikipedia/commons/thumb/a/ab/X.jpg/960px-X.jpg?utm_source=x"), "https://thumb.wikimedia.org/wikipedia/commons/thumb/a/ab/X.jpg/960px-X.jpg?utm_source=x")
+    for (const bad of ["https://thumb.wikimedia.org.evil.example/a.jpg", "https://evilthumb.wikimedia.org/a.jpg", "http://thumb.wikimedia.org/a.jpg"]) assert.isUndefined(imageUrlOf(bad), bad)
+  })
+
+  it("issue #150: the answer Commons gives today (captured 2026-11-21 for the okapi's lead picture) is a usable picture on the thumbnail host", () => {
+    // Trimmed to the members the module reads, values exactly as the live API answered.
+    const live = {
+      batchcomplete: true,
+      query: {
+        pages: [{
+          pageid: 65399174,
+          ns: 6,
+          title: "File:Saint-Aignan (Loir-et-Cher). Okapi.jpg",
+          imagerepository: "local",
+          imageinfo: [{
+            thumburl: "https://thumb.wikimedia.org/wikipedia/commons/thumb/3/3a/Saint-Aignan_%28Loir-et-Cher%29._Okapi.jpg/960px-Saint-Aignan_%28Loir-et-Cher%29._Okapi.jpg?utm_source=commons.wikimedia.org&utm_campaign=imageinfo&utm_content=thumbnail",
+            thumbwidth: 800,
+            thumbheight: 534,
+            url: "https://upload.wikimedia.org/wikipedia/commons/3/3a/Saint-Aignan_%28Loir-et-Cher%29._Okapi.jpg?utm_source=commons.wikimedia.org&utm_campaign=imageinfo&utm_content=original",
+            extmetadata: {
+              Artist: { value: "<a rel=\"nofollow\" class=\"external text\" href=\"https://www.flickr.com/people/26082117@N07\">Daniel Jolivet</a>", source: "commons-desc-page" },
+              LicenseShortName: { value: "CC BY 2.0", source: "commons-desc-page", hidden: "" }
+            },
+            mime: "image/jpeg"
+          }]
+        }]
+      }
+    }
+    const outcome = fileOutcome(live.query.pages[0])
+    assert.deepStrictEqual(outcome, {
+      kind: "picture",
+      picture: { url: live.query.pages[0]!.imageinfo[0]!.thumburl, licence: "CC BY 2.0", artist: "Daniel Jolivet", artistCut: false }
+    })
   })
 
   it("candidatesOf reads an answer strictly: a legitimately empty search is empty, a malformed one is not an answer", () => {

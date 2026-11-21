@@ -2,6 +2,7 @@
 // never an SDK. Everything a provider answers is untrusted text: it is cleaned, cut and bounded here, before anything else
 // sees it.
 import { contentTypes, fetchOwnerConfiguredLan, type NetRefused, safeFetch, type SafeFetchError, type SafeFetchOptions, type SafeResponse } from "@pva/net"
+import { WEB_IMAGES_LIMITS, type WebImage, type WebImageQuery, WebImagesError, type WebImagesService } from "@pva/module-contracts"
 import { Data, Effect } from "effect"
 import { cleanText, HAS_UNWANTED, hostOf, isBlocked, siteOf } from "./clean.ts"
 
@@ -167,6 +168,85 @@ export const makeSearxng = (baseUrl: string, blocked: ReadonlyArray<string>): Se
       if (body === undefined || !Array.isArray(body.results)) return yield* new SearchError({ reason: "invalid", detail: "no results list" })
       const items = (body.results as ReadonlyArray<unknown>).map((r) => objectOf(r)).filter((r): r is Readonly<Record<string, unknown>> => r !== undefined)
       return toResults(items.map((r) => ({ title: r.title, url: r.url, snippet: r.content, published: r.publishedDate })), blocked)
+    })
+})
+
+// ---------------------------------------------------------------------------------------------------------------------
+// SearXNG image search (the `WebImages` service, `@pva/module-contracts`)
+
+/** An image address as the contract allows it: absolute https (a protocol-relative one made https), printable, bounded. */
+export const imageAddressOf = (value: unknown): string | undefined => {
+  if (typeof value !== "string") return undefined
+  const raw = value.trim().startsWith("//") ? `https:${value.trim()}` : value.trim()
+  if (raw === "" || raw.length > WEB_IMAGES_LIMITS.urlChars) return undefined
+  let url: URL
+  try {
+    url = new URL(raw)
+  } catch {
+    return undefined
+  }
+  if (url.protocol !== "https:" || url.username !== "" || url.password !== "" || url.hostname === "") return undefined
+  url.hash = ""
+  const href = url.href
+  // Printable ASCII without a space, a quote or a backslash: what the presentation's address may hold.
+  return href.length <= WEB_IMAGES_LIMITS.urlChars && /^https:\/\/[\x21\x23-\x5b\x5d-\x7e]+$/.test(href) ? href : undefined
+}
+
+/**
+ * The results of an image search, read as the contract says: a result without a usable picture or page, or with either on a
+ * blocked site, is dropped; a thumbnail that is not usable or is blocked is left out. At most `WEB_IMAGES_LIMITS.results`.
+ */
+export const toImages = (items: ReadonlyArray<Readonly<Record<string, unknown>>>, blocked: ReadonlyArray<string>): ReadonlyArray<WebImage> => {
+  const out: Array<WebImage> = []
+  const allowed = (url: string | undefined) => url !== undefined && !isBlocked(hostOf(url) ?? "", blocked)
+  for (const item of items.slice(0, 100)) {
+    const imageUrl = imageAddressOf(item.img_src)
+    const page = typeof item.url === "string" ? item.url.trim() : ""
+    if (!allowed(imageUrl) || page === "" || page.length > WEB_IMAGES_LIMITS.urlChars || HAS_UNWANTED.test(page) || /\s/.test(page)) continue
+    const host = hostOf(page)
+    const site = siteOf(page)
+    if (host === undefined || site === undefined || isBlocked(host, blocked)) continue
+    const thumbnailUrl = imageAddressOf(item.thumbnail_src)
+    const format = typeof item.img_format === "string" ? item.img_format.trim().toLowerCase().slice(0, 20) : ""
+    out.push({
+      imageUrl: imageUrl!,
+      ...(allowed(thumbnailUrl) ? { thumbnailUrl: thumbnailUrl! } : {}),
+      pageUrl: page,
+      site,
+      title: typeof item.title === "string" ? item.title.slice(0, WEB_IMAGES_LIMITS.titleChars) : "",
+      ...(format !== "" ? { format } : {})
+    })
+    if (out.length >= WEB_IMAGES_LIMITS.results) break
+  }
+  return out
+}
+
+const SAFE_LEVELS: ReadonlySet<number> = new Set([0, 1, 2])
+
+/** The `WebImages` service on a SearXNG server the owner typed (the owner-configured fetch: it may be on the home network). */
+export const makeSearxngImages = (baseUrl: string, blocked: ReadonlyArray<string>, net: NetDeps): WebImagesService => ({
+  search: (q: WebImageQuery) =>
+    Effect.gen(function*() {
+      // One line within its bound, as the contract says: checked as given, before spaces are collapsed.
+      const query = typeof q.query === "string" ? q.query.trim().replace(/ +/g, " ") : ""
+      if (query === "" || q.query.length > WEB_IMAGES_LIMITS.queryChars || HAS_UNWANTED.test(q.query) || !SAFE_LEVELS.has(q.safeSearch)) {
+        return yield* new WebImagesError({ reason: "failed", detail: "the query is outside the contract's bounds" })
+      }
+      const timeoutMs = Math.min(10_000, Math.max(500, Math.round(q.timeoutMs)))
+      const url = searxEndpoint(baseUrl, query, { categories: "images", safesearch: String(q.safeSearch), language: searxLanguage(q.language) })
+      const response = yield* fetchOwnerConfiguredLan(url, { accept: contentTypes.json, maxBytes: WEB_IMAGES_LIMITS.answerBytes, timeoutMs, ...net }).pipe(
+        Effect.mapError((e) => {
+          const f = failureOf(e)
+          return new WebImagesError({ reason: f.reason === "key-refused" ? "failed" : f.reason, detail: f.detail })
+        })
+      )
+      if (response.status === 403) return yield* new WebImagesError({ reason: "json-off", detail: "403: JSON output is not enabled in search.formats" })
+      if (response.status === 429) return yield* new WebImagesError({ reason: "rate-limited", detail: "429" })
+      if (response.status < 200 || response.status > 299) return yield* new WebImagesError({ reason: "failed", detail: `status ${response.status}` })
+      const body = objectOf(yield* parseJson(response).pipe(Effect.mapError((e) => new WebImagesError({ reason: "invalid", detail: e.detail }))))
+      if (body === undefined || !Array.isArray(body.results)) return yield* new WebImagesError({ reason: "invalid", detail: "no results list" })
+      const items = (body.results as ReadonlyArray<unknown>).map((r) => objectOf(r)).filter((r): r is Readonly<Record<string, unknown>> => r !== undefined)
+      return toImages(items, blocked)
     })
 })
 

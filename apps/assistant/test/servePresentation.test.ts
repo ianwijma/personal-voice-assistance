@@ -161,6 +161,25 @@ describe("presentation through the hub", () => {
     expect(presses).toEqual(["tick:milk"])
   })
 
+  it("present.close from a tab that holds it dismisses it on every tab (through the hub's admission); from another device it is refused and stays", async () => {
+    await start({ HOME_LANGUAGE: "nl-NL" })
+    const a = await page("present-close-0001")
+    const b = await page("present-close-0001")
+    const other = await page("present-close-0002")
+    await sleep(300)
+    const h = await run(present!.show({ device: a.device.id }, { kind: "card", title: "Bins", spoken: "Bins." }, { lifetime: "pinned" }))
+    await until(() => holds(a).has(h.id) && holds(b).has(h.id))
+    expect(holds(a).get(h.id)).toMatchObject({ closable: true, interactive: false, texts: { close: "Sluiten" } })
+    const revision = holds(a).get(h.id)!.revision
+    other.send({ type: "present.close", requestId: "c-other", id: h.id, revision })
+    expect(await other.waitFor("result", (m) => m.requestId === "c-other", { from: 0 })).toMatchObject({ ok: false, say: "Dat kan ik nu niet doen." })
+    expect(holds(a).has(h.id)).toBe(true)
+    a.send({ type: "present.close", requestId: "c-own", id: h.id, revision })
+    expect(await a.waitFor("result", (m) => m.requestId === "c-own", { from: 0 })).toMatchObject({ ok: true })
+    await until(() => !holds(a).has(h.id) && !holds(b).has(h.id))
+    expect(await run(h.dismiss)).toBe(false)
+  })
+
   it("b15: the hub's bound: four pending presses per connection on distinct presentations, the fifth refused with the Presenter's sentence; sixteen in all; slots given back", async () => {
     await start({ HOME_LANGUAGE: "nl-NL" })
     const pages = [] as Array<ScriptedClient>

@@ -295,3 +295,113 @@ it("r2 b5: a server's press answer takes precedence over the transport fallback"
   await act(async () => fireEvent.click(screen.getByRole("button")))
   expect(screen.getByRole("status").textContent).toBe("Probeer straks opnieuw.")
 })
+
+describe("larger while shown, and closed by touch", () => {
+  const closable = (id: string, extra: Partial<PresentationWire> = {}) => show(wire(id, CARD, { closable: true, texts: { ...EN, close: "Close" }, ...extra }))
+  const closeRequests = (request: ReturnType<typeof vi.fn>) => request.mock.calls.map((c) => c[0] as { type: string }).filter((m) => m.type === "present.close")
+
+  it("a closable presentation has a close button of at least 44 px with the server's name, in both languages; one that is not has none", () => {
+    mount(run([closable("en1"), closable("nl1", { texts: { ...NL, close: "Sluiten" } }), show(wire("plain", { ...CARD, title: "Plain" }))]))
+    const buttons = screen.getAllByTestId("presentation-close")
+    expect(buttons.map((b) => b.getAttribute("aria-label"))).toEqual(["Close", "Sluiten"])
+    for (const b of buttons) expect(b.className).toContain("size-11")
+    // An older server never marks one closable (and sends no name): no button.
+    cleanup()
+    mount(run([show(wire("older", CARD, { closable: true }))]))
+    expect(screen.queryByTestId("presentation-close")).toBeNull()
+  })
+
+  it("a tap hides it at once and tells the server; the server's dismissal takes it away for good", async () => {
+    let answer: (v: unknown) => void = () => undefined
+    const request = vi.fn(() => new Promise((resolve) => { answer = resolve }))
+    const { store } = mount(run([closable("a"), closable("b", { content: { ...CARD, title: "Other" }, shownAt: 2_000 })]), request)
+    await act(async () => fireEvent.click(screen.getAllByTestId("presentation-close")[0]!))
+    expect(closeRequests(request)).toEqual([{ type: "present.close", id: "a", revision: "a:1" }])
+    expect(screen.getAllByTestId("presentation")).toHaveLength(1)
+    expect(screen.getByRole("heading").textContent).toBe("Other")
+    await act(async () => answer({ ok: true }))
+    await act(async () => store.dispatch(dismiss("a")))
+    expect(screen.getAllByTestId("presentation")).toHaveLength(1)
+    // The same id shown again later (a key shown again) is a new showing: it is drawn.
+    await act(async () => store.dispatch(closable("a", { revision: "a2:1" })))
+    expect(screen.getAllByTestId("presentation")).toHaveLength(2)
+  })
+
+  it.each([
+    ["a refusal", async () => ({ ok: false, say: "That changed just now.", error: { code: "bad_message", message: "x" } }), "That changed just now."],
+    ["a lost connection", async () => Promise.reject(new Error("lost")), EN.failed]
+  ] as const)("after %s it comes back with the sentence", async (_name, answer, sentence) => {
+    mount(run([closable("a")]), vi.fn(answer))
+    await act(async () => fireEvent.click(screen.getByTestId("presentation-close")))
+    expect(screen.getByTestId("presentation")).toBeTruthy()
+    expect(screen.getByRole("status").textContent).toBe(sentence)
+  })
+
+  it("a refused close of one the server took away meanwhile does not bring it back", async () => {
+    let answer: (v: unknown) => void = () => undefined
+    const { store } = mount(run([closable("a")]), vi.fn(() => new Promise((resolve) => { answer = resolve })))
+    await act(async () => fireEvent.click(screen.getByTestId("presentation-close")))
+    await act(async () => store.dispatch(dismiss("a")))
+    await act(async () => answer({ ok: false, say: "I can't do that right now." }))
+    expect(screen.queryByTestId("presentation")).toBeNull()
+  })
+
+  it("a tap on the content, a tick or a button never closes it", async () => {
+    const request = vi.fn(async () => ({ ok: true, say: "Ticked." }))
+    mount(run([show(wire("l", LIST, { closable: true, texts: { ...EN, close: "Close" }, buttons: [{ id: "clear", label: "Clear" }] }))]), request)
+    await act(async () => fireEvent.click(screen.getByText("Shopping")))
+    await act(async () => fireEvent.click(screen.getAllByRole("checkbox")[0]!))
+    await act(async () => fireEvent.click(screen.getByRole("button", { name: "Clear" })))
+    expect(closeRequests(request)).toEqual([])
+    expect(screen.getByTestId("presentation")).toBeTruthy()
+  })
+
+  it("Escape closes the newest closable one; not while a reply plays (Escape stops that), not while covered, not one that is not closable", async () => {
+    const request = vi.fn(async () => ({ ok: true }))
+    const { store } = mount(run([closable("old", { shownAt: 1 }), closable("new", { shownAt: 5, content: { ...CARD, title: "Newest" } }), show(wire("fixed", CARD, { shownAt: 9 }))]), request)
+    act(() => store.dispatch({ type: "state", state: "speaking" } as unknown as Action))
+    await act(async () => fireEvent.keyDown(window, { key: "Escape" }))
+    expect(closeRequests(request)).toEqual([])
+    act(() => store.dispatch({ type: "state", state: "idle" } as unknown as Action))
+    await act(async () => fireEvent.keyDown(window, { key: "Escape" }))
+    expect(closeRequests(request)).toEqual([{ type: "present.close", id: "new", revision: "new:1" }])
+    await act(async () => fireEvent.keyDown(window, { key: "Escape" }))
+    expect(closeRequests(request).map((m) => (m as { id?: string }).id)).toEqual(["new", "old"])
+    await act(async () => fireEvent.keyDown(window, { key: "Escape" }))
+    expect(closeRequests(request)).toHaveLength(2)
+    cleanup()
+    const covered = vi.fn(async () => ({ ok: true }))
+    render(<ClientContext.Provider value={{ store: createStore(run([closable("c")]), reducer), request: covered } as unknown as AssistantClient}><PresentationStage obscured /></ClientContext.Provider>)
+    await act(async () => fireEvent.keyDown(window, { key: "Escape" }))
+    expect(closeRequests(covered)).toEqual([])
+  })
+
+  it("the character yields while something is shown: data-presenting on the root, gone when covered, closed or withdrawn", async () => {
+    const root = document.documentElement
+    const { store } = mount(run([closable("a")]), vi.fn(() => new Promise(() => undefined)))
+    expect(root.hasAttribute("data-presenting")).toBe(true)
+    await act(async () => fireEvent.click(screen.getByTestId("presentation-close")))
+    expect(root.hasAttribute("data-presenting")).toBe(false)
+    await act(async () => store.dispatch(closable("b")))
+    expect(root.hasAttribute("data-presenting")).toBe(true)
+    await act(async () => store.dispatch(dismiss("b")))
+    expect(root.hasAttribute("data-presenting")).toBe(false)
+    cleanup()
+    render(<ClientContext.Provider value={{ store: createStore(run([closable("c")]), reducer), request: vi.fn() } as unknown as AssistantClient}><PresentationStage obscured /></ClientContext.Provider>)
+    expect(root.hasAttribute("data-presenting")).toBe(false)
+  })
+
+  it("the area takes most of the screen: under the header and the character's strip down to the controls, up to 960 px; an image is scaled to fit with its caption", () => {
+    mount(run([closable("img", { content: IMAGE("ready") }), closable("card", { shownAt: 2_000 })]))
+    const stage = screen.getByTestId("present-stage")
+    expect(stage.className).toContain("top-[calc(var(--pva-notifications-space,0px)_+_56px_+_var(--pva-present-gap,76px))]")
+    expect(stage.className).toContain("bottom-[calc(96px_+_env(safe-area-inset-bottom))]")
+    expect((stage.firstElementChild as HTMLElement).className).toContain("max-w-[960px]")
+    const [image, card] = screen.getAllByTestId("presentation")
+    expect(image!.className).toContain("max-w-[960px]")
+    expect(card!.className).toContain("max-w-[680px]")
+    const img = screen.getByAltText("A heron")
+    expect(img.className).toContain("object-contain")
+    expect(img.className).toMatch(/max-h-\[max\(120px,calc\(var\(--pva-present-room/)
+  })
+})

@@ -1,5 +1,5 @@
 import type { IssueRegistry, MediaOutcome, MediaPort, MediaRefusal } from "@pva/core"
-import { type ContentTypePolicy, NetRefused, NetTooLarge, safeFetch, type SafeFetchError, type SafeFetchOptions, type SafeResponse } from "@pva/net"
+import { type ContentTypePolicy, NetRefused, NetTooLarge, safeFetch, type SafeFetchError, type SafeFetchOptions, type SafeResponse, userAgent } from "@pva/net"
 import { MEDIA_HASH, MEDIA_TOKEN } from "@pva/protocol"
 import { Deferred, Effect, Exit, type Scope } from "effect"
 import { createHash, randomBytes } from "node:crypto"
@@ -105,6 +105,11 @@ export interface MediaCacheOptions {
   readonly fetch?: (url: string, options: SafeFetchOptions) => Effect.Effect<SafeResponse, SafeFetchError>
   /** Passed to every fetch (tests: `resolver`, `connector`). */
   readonly fetchOptions?: Pick<SafeFetchOptions, "resolver" | "connector">
+  /**
+   * The `User-Agent` of every fetch, read at each fetch (the household's API contact may change). Default
+   * `userAgent(undefined)`. Never absent: image hosts refuse a request without one (Wikimedia answers 403, issue #150).
+   */
+  readonly userAgent?: () => string
   readonly now?: () => number
   readonly log?: (line: string) => void
   /** Where its Health issue goes (source `media`): the cache could not be read or cleaned, so nothing new is admitted. */
@@ -128,6 +133,10 @@ export interface MediaCache extends MediaPort {
 }
 
 export const MEDIA_PREFIX = "/media/"
+
+const hostOf = (url: string): string => {
+  try { return new URL(url).host } catch { return "an image host" }
+}
 export const MEDIA_ISSUE_SOURCE = "media"
 
 export const makeMediaCache = (options: MediaCacheOptions): Effect.Effect<MediaCache, never, Scope.Scope> =>
@@ -296,13 +305,18 @@ export const makeMediaCache = (options: MediaCacheOptions): Effect.Effect<MediaC
 
     const fetchOnce = (url: string): Effect.Effect<MediaOutcome> =>
       Effect.gen(function*() {
-        const exit = yield* Effect.exit(fetch(url, { accept: MEDIA_POLICY, maxBytes: MAX_IMAGE_BYTES, timeoutMs: MEDIA_FETCH_TIMEOUT_MS, ...options.fetchOptions }))
+        const agent = options.userAgent?.() ?? userAgent(undefined)
+        const exit = yield* Effect.exit(fetch(url, { accept: MEDIA_POLICY, maxBytes: MAX_IMAGE_BYTES, timeoutMs: MEDIA_FETCH_TIMEOUT_MS, headers: { "user-agent": agent }, ...options.fetchOptions }))
         if (Exit.isFailure(exit)) {
           const e = exit.cause.reasons.find((r) => r._tag === "Fail")
           return { refused: e !== undefined && e._tag === "Fail" ? refusalOf(e.error as SafeFetchError) : "fetch" } satisfies MediaOutcome
         }
         const r = exit.value
-        if (r.status < 200 || r.status > 299) return { refused: "fetch" } satisfies MediaOutcome
+        if (r.status < 200 || r.status > 299) {
+          // The host and the status only (never the path or query): enough to see a refusing image host in the log.
+          log(`Media: ${hostOf(r.url)} answered ${r.status}; the image is not kept`)
+          return { refused: "fetch" } satisfies MediaOutcome
+        }
         if (r.body.length > MAX_IMAGE_BYTES) return { refused: "size" } satisfies MediaOutcome
         // The type it says and the type its bytes are must agree, and be one of the kept types.
         const said = r.contentType

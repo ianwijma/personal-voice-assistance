@@ -263,6 +263,28 @@ describe("the mock, through its handlers, as the server", { timeout: 30_000 }, (
     for (const p of [one, old, again]) p.ws.close()
   })
 
+  it("closing on the page as the server: closable where it may be pressed; present.close from a holder ends it on every tab; from another device refused", async () => {
+    await clearPresentations()
+    const http = url.replace(/^ws/, "http").replace(/\/ws$/, "")
+    const screen = { v: 1, display: { class: "standard", widthPx: 800, heightPx: 600, dpr: 1, touch: "coarse", colour: true }, present: { kinds: { card: 1, list: 1, timer: 1, image: 1, weather: 1 } } }
+    const device = (id: string) => ({ device: { id, kind: "web-voice", name: "Close", capabilities: screen } as never })
+    const one = await Peer.open(device("d-mock-close1"))
+    const two = await Peer.open(device("d-mock-close1"))
+    const other = await Peer.open(device("d-mock-close2"))
+    const post = (path: string, body: unknown) => fetch(`${http}${path}`, { method: "POST", body: JSON.stringify(body) }).then((r) => r.json() as Promise<{ id?: string }>)
+    const shownCard = await post("/mock/present", { deviceId: "d-mock-close1", options: { lifetime: "pinned" }, presentation: { kind: "card", title: "Bins", spoken: "Bins." } })
+    const shown = await one.waitFor("present.show", (m) => m.presentation.id === shownCard.id)
+    await two.waitFor("present.show", (m) => m.presentation.id === shownCard.id)
+    expect([shown.presentation.closable, shown.presentation.interactive, shown.presentation.texts.close]).toEqual([true, false, "Close"])
+    const refused = await other.request({ type: "present.close", id: shownCard.id, revision: shown.presentation.revision })
+    expect([refused.ok, refused.say]).toEqual([false, "I can't do that right now."])
+    const closed = await one.request({ type: "present.close", id: shownCard.id, revision: shown.presentation.revision })
+    expect(closed.ok).toBe(true)
+    await one.waitFor("present.dismiss", (m) => m.id === shownCard.id)
+    await two.waitFor("present.dismiss", (m) => m.id === shownCard.id)
+    for (const p of [one, two, other]) p.ws.close()
+  })
+
   it("P10 review round 1: the mock checks before it commits (b10), ends presentations at their end (b12), derives lifetimes with the shared helper (b13), reconciles after a saved settings change (b14), sends each tab only its own kinds (G11) and serves images by a page's own address (b11)", async () => {
     await clearPresentations()
     const http = url.replace(/^ws/, "http").replace(/\/ws$/, "")

@@ -240,9 +240,10 @@ export interface HubOptions {
   /**
    * P10: the Presenter (docs/PRESENTING.md). The device is reconciled at the same moments as for notifications (a hello
    * once its record is written, a close, a changed declaration); a tick or a button is `present.action`, through the
-   * bounded admission, answered with `result` (`say`). Absent: none of it.
+   * bounded admission, answered with `result` (`say`); a close on the page is `present.close`, the same way. Absent:
+   * none of it (`close` absent: a close is answered as not possible here).
    */
-  readonly present?: Pick<PresentEngine, "reconcile" | "press" | "busyAnswer">
+  readonly present?: Pick<PresentEngine, "reconcile" | "press" | "busyAnswer"> & Partial<Pick<PresentEngine, "close">>
   /** P5: a device's connections, declaration or live state changed (the device facts rebuild their list). */
   readonly onDeviceChange?: () => void
   /**
@@ -1498,6 +1499,25 @@ export const makeSessionHub = (options: HubOptions): SessionHub => {
               : { ok: false, error: { code: answer.code === "not_running" ? "not_running" : answer.code === "busy" ? "busy" : "bad_message", message: answer.say }, say: answer.say }
         )
         return limited(client, message.requestId, pressed, undefined, () => {
+          const busy = present.busyAnswer()
+          return { ok: false, error: { code: "busy", message: busy.say }, say: busy.say } as HostResult
+        })
+      }
+      case "present.close": {
+        // The viewer closed a presentation on a voice page of the device it is shown on (the Presenter checks that this
+        // connection holds that show and may press it there). Through the bounded admission, as a press.
+        if (client.role !== "voice" || client.device === undefined || options.present?.close === undefined) {
+          return result(client, message.requestId, failure("bad_message", "A presentation is closed from a voice page of its device"))
+        }
+        const present = options.present
+        const closed = Effect.map(
+          present.close!({ presentationId: message.id, revision: message.revision, deviceId: client.device.id, connection: client.ref }),
+          (answer): HostResult =>
+            answer.ok
+              ? { ok: true }
+              : { ok: false, error: { code: answer.code === "busy" ? "busy" : "bad_message", message: answer.say ?? "Not closed" }, ...(answer.say !== undefined ? { say: answer.say } : {}) } as HostResult
+        )
+        return limited(client, message.requestId, closed, undefined, () => {
           const busy = present.busyAnswer()
           return { ok: false, error: { code: "busy", message: busy.say }, say: busy.say } as HostResult
         })

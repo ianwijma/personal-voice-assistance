@@ -5,77 +5,138 @@ import { formatRemaining, remainingMs } from "@/lib/countdown.ts"
 import { type HeldPresentation, pageClock } from "@/lib/state.ts"
 import { useClient, useClientState } from "./context.tsx"
 import { cx } from "./ui/controls.tsx"
+import { Icon } from "./ui/Icon.tsx"
 
 /**
- * P10: the presentation stage (docs/PRESENTING.md "The voice page"; docs/CHARACTERS.md §2.7). One layout on every
- * character: a column centred under the character's box, just above the controls, that grows upward as far as it may
- * without covering the box (at least 160 px on a short screen) and scrolls within itself beyond that. The character's
- * box, its canvas and the focus it is given are exactly as before:
- * the stage only adds bottom padding to the page's scroll area (`--pva-present-h`) so captions can scroll clear of it.
+ * P10: the presentation stage (docs/PRESENTING.md "The voice page"; docs/CHARACTERS.md §2.7). While it shows something
+ * it takes most of the screen: from just under the header and the character's shrunken box down to just above the
+ * controls, as wide as the screen on a phone and centred up to 960 px on a larger one (text kinds keep a readable
+ * measure of at most 680 px). The character yields while it is up: the stage sets `data-presenting` on the root and the
+ * page's CSS shrinks the box to a strip (`--pva-vis-mini`) and steps the captions aside; when the last presentation goes
+ * (or a menu, a panel or the chat covers the stage) everything is as before. The box, its canvas and the focus it is
+ * given follow the box as they always did.
  *
- * It holds presentations, a transient one first, then the pinned ones. Open page menus and dialogs hide them;
- * notifications have their own fixed region above those surfaces. Every word the host shows comes from the server in the household's language
- * (`texts`); every text of a presentation passed the server's page boundary and is put on the page as text, never as
- * markup. An image is only ever `/media/<token>`, the server's copy.
+ * It holds presentations, a transient one first, then the pinned ones, and scrolls within itself when they do not fit.
+ * Open page menus and dialogs hide them; notifications have their own fixed region above those surfaces. Every word the
+ * host shows comes from the server in the household's language (`texts`); every text of a presentation passed the
+ * server's page boundary and is put on the page as text, never as markup. An image is only ever `/media/<token>`, the
+ * server's copy.
+ *
+ * Closing: a presentation the server marked `closable` (this device can press things) has a close button, and Escape
+ * closes the newest one (unless a reply is playing: Escape stops that first). The page hides it at once and sends
+ * `present.close`; the server dismisses it for every page that holds it. Refused, it comes back with the server's
+ * sentence (or `texts.failed` when there was no answer).
  */
 export function PresentationStage({ obscured = false }: { readonly obscured?: boolean }) {
+  const client = useClient()
   const items = useClientState((s) => s.presentations)
   const chatOpen = useClientState((s) => s.ui.chatOpen)
-  const inner = useRef<HTMLDivElement>(null)
-  const empty = items.length === 0
-  // The stage's scroll area keeps the region's height clear at its bottom (captions scroll above it).
+  /** Closed here and not yet withdrawn by the server: id → the revision that was closed. */
+  const [closing, setClosing] = useState<ReadonlyMap<string, string>>(new Map())
+  /** A refused close: the server's sentence, shown on the presentation while that revision is held. */
+  const [refused, setRefused] = useState<ReadonlyMap<string, { readonly revision: string; readonly say: string }>>(new Map())
+  const visible = items.filter((p) => !closing.has(p.id))
+  const presenting = visible.length > 0 && !obscured
+  // Forget what the server has withdrawn (a closed id that is gone is done; one shown again later is a new showing).
+  useEffect(() => {
+    const held = new Set(items.map((p) => p.id))
+    setClosing((m) => ([...m.keys()].every((id) => held.has(id)) ? m : new Map([...m].filter(([id]) => held.has(id)))))
+    setRefused((m) => ([...m].every(([id, r]) => items.some((p) => p.id === id && p.revision === r.revision)) ? m : new Map([...m].filter(([id, r]) => items.some((p) => p.id === id && p.revision === r.revision)))))
+  }, [items])
+  // The character yields while something is shown (globals.css `data-presenting`).
   useLayoutEffect(() => {
-    const root = typeof document === "undefined" ? undefined : document.documentElement
-    const el = inner.current
-    if (root === undefined) return
-    if (el === null || empty) {
-      root.style.setProperty("--pva-present-h", "0px")
+    if (typeof document === "undefined") return
+    const root = document.documentElement
+    if (!presenting) {
+      root.removeAttribute("data-presenting")
       return
     }
-    const set = () => root.style.setProperty("--pva-present-h", `${Math.ceil(el.getBoundingClientRect().height)}px`)
-    set()
-    if (typeof ResizeObserver === "undefined") return
-    const ro = new ResizeObserver(set)
-    ro.observe(el)
-    return () => {
-      ro.disconnect()
-      root.style.setProperty("--pva-present-h", "0px")
+    root.setAttribute("data-presenting", "")
+    return () => root.removeAttribute("data-presenting")
+  }, [presenting])
+  const close = (p: HeldPresentation) => {
+    if (p.closable !== true || closing.has(p.id)) return
+    setClosing((m) => new Map(m).set(p.id, p.revision))
+    setRefused((m) => {
+      if (!m.has(p.id)) return m
+      const next = new Map(m)
+      next.delete(p.id)
+      return next
+    })
+    const restore = (say: string | undefined) => {
+      // Shown again only while the server still has it here; its answer goes with the revision it was given for.
+      const now = client.store.get().presentations.find((x) => x.id === p.id)
+      setClosing((m) => {
+        if (m.get(p.id) !== p.revision) return m
+        const next = new Map(m)
+        next.delete(p.id)
+        return next
+      })
+      if (now !== undefined && say !== undefined) setRefused((m) => new Map(m).set(p.id, { revision: now.revision, say }))
     }
-  }, [empty, obscured])
-  if (empty) return null
-  const ordered = [...items.filter((p) => p.lifetime === "transient"), ...items.filter((p) => p.lifetime === "pinned").sort((a, b) => a.shownAt - b.shownAt)]
+    // continuation(identity): restores only this presentation, only if the server refused and still holds it.
+    void client.request({ type: "present.close", id: p.id, revision: p.revision }).then((r) => {
+      if (!r.ok) restore(r.say ?? p.texts.failed)
+    }, () => restore(p.texts.failed))
+  }
+  const ordered = [...visible.filter((p) => p.lifetime === "transient"), ...visible.filter((p) => p.lifetime === "pinned").sort((a, b) => a.shownAt - b.shownAt)]
+  // Escape closes the newest closable presentation (where a keyboard exists). Panels, menus and a playing reply first.
+  const latest = useRef({ ordered, presenting, close })
+  latest.current = { ordered, presenting, close }
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key !== "Escape" || e.defaultPrevented || e.metaKey || e.ctrlKey || e.altKey || e.shiftKey) return
+      const { ordered: shown, presenting: up, close: closeOne } = latest.current
+      if (!up) return
+      const target = e.target instanceof Element ? e.target : null
+      if (target !== null && target.closest("input, textarea, select, [contenteditable=''], [contenteditable='true'], [role=dialog], [role=menu], [role=listbox]") !== null) return
+      const s = client.store.get()
+      if (s.ui.sheetOpen || s.ui.shortcutsOpen || s.session.serverState === "thinking" || s.session.serverState === "speaking" || s.audio.playing !== undefined) return
+      const newest = shown.filter((p) => p.closable === true).sort((a, b) => b.shownAt - a.shownAt || (a.id < b.id ? 1 : -1))[0]
+      if (newest === undefined) return
+      e.preventDefault()
+      closeOne(newest)
+    }
+    window.addEventListener("keydown", onKey)
+    return () => window.removeEventListener("keydown", onKey)
+  }, [client])
+  if (ordered.length === 0) return null
   return (
     <div
       data-testid="present-stage"
       className={cx(
-        "pointer-events-none fixed inset-x-0 bottom-[calc(96px+env(safe-area-inset-bottom))] z-[5] flex justify-center px-4 transition-transform duration-[320ms] ease-out",
+        "pointer-events-none fixed inset-x-0 z-[5] flex items-center justify-center pl-[max(12px,env(safe-area-inset-left))] pr-[max(12px,env(safe-area-inset-right))] transition-transform duration-[320ms] ease-out sm:pl-[max(24px,env(safe-area-inset-left))] sm:pr-[max(24px,env(safe-area-inset-right))]",
+        // From under the header and the character's strip to just above the controls (globals.css `--pva-present-gap`).
+        "top-[calc(var(--pva-notifications-space,0px)_+_56px_+_var(--pva-present-gap,76px))] bottom-[calc(96px_+_env(safe-area-inset-bottom))]",
+        // What an image may take of the height: the area less its card's padding, caption and credit (and buttons).
+        "[--pva-present-room:calc(100dvh_-_var(--pva-notifications-space,0px)_-_56px_-_var(--pva-present-gap,76px)_-_96px_-_env(safe-area-inset-bottom))]",
         chatOpen && "lg:max-[1439px]:-translate-x-[200px]"
       )}
     >
-      <div
-        ref={inner}
-        className="pointer-events-auto flex max-h-[max(160px,min(42dvh,calc(100dvh-540px)))] w-full max-w-[420px] flex-col gap-2 overflow-y-auto overscroll-contain scrollbar-quiet pt-1"
-      >
-        {ordered.length > 0
-          ? (
-            <section
-              aria-label={ordered[0]!.texts.region}
-              data-testid="presentations"
-              hidden={obscured}
-              inert={obscured}
-              className={cx("w-full flex-col gap-2", obscured ? "hidden" : "flex")}
-            >
-              {ordered.map((p) => <PresentationCard key={`${p.id}:${p.revision}`} p={p} />)}
-            </section>
-          )
-          : null}
+      <div className="pointer-events-auto flex max-h-full w-full max-w-[960px] flex-col overflow-y-auto overscroll-contain scrollbar-quiet">
+        <section
+          aria-label={ordered[0]!.texts.region}
+          data-testid="presentations"
+          hidden={obscured}
+          inert={obscured}
+          className={cx("w-full flex-col items-center gap-3", obscured ? "hidden" : "flex")}
+        >
+          {ordered.map((p) => (
+            <PresentationCard
+              key={`${p.id}:${p.revision}`}
+              p={p}
+              notice={refused.get(p.id)?.revision === p.revision ? refused.get(p.id)!.say : undefined}
+              onClose={() => close(p)}
+            />
+          ))}
+        </section>
       </div>
     </div>
   )
 }
 
-/** One presentation: its kind's renderer, its buttons, and the answer to the last press while it is still held. */
-function PresentationCard({ p }: { readonly p: HeldPresentation }) {
+/** One presentation: its kind's renderer, its buttons, its close button, and the answer to the last press while it is still held. */
+function PresentationCard({ p, notice, onClose }: { readonly p: HeldPresentation; readonly notice: string | undefined; readonly onClose: () => void }) {
   const client = useClient()
   const [said, setSaid] = useState<string | undefined>(undefined)
   const [pending, setPending] = useState<ReadonlySet<string>>(new Set())
@@ -86,7 +147,7 @@ function PresentationCard({ p }: { readonly p: HeldPresentation }) {
       mounted.current = false
     }
   }, [])
-  /** A tick or a button: one request each; the answer is shown only while this presentation is still held here. */
+  /** A tick or a button: one request each; the answer is shown only while this presentation is still held. */
   const press = (key: string, message: { readonly action: string; readonly item?: string; readonly done?: boolean }) => {
     if (!p.interactive || pending.has(key)) return
     setPending((x) => new Set(x).add(key))
@@ -108,18 +169,26 @@ function PresentationCard({ p }: { readonly p: HeldPresentation }) {
       if (current()) setSaid(p.texts.failed)
     })
   }
+  const closable = p.closable === true && p.texts.close !== undefined
+  const image = p.content.kind === "image"
+  const shown = notice ?? said
   return (
     <article
       data-testid="presentation"
       data-kind={p.content.kind}
       data-lifetime={p.lifetime}
-      className="w-full shrink-0 rounded-lg border border-line bg-surface px-4 py-3 text-ink shadow-panel animate-[pva-rise_200ms_var(--ease-out)]"
+      className={cx(
+        "relative w-full shrink-0 rounded-xl border border-line bg-surface text-ink shadow-panel animate-[pva-rise_200ms_var(--ease-out)]",
+        image ? "max-w-[960px] p-3 sm:p-4" : "max-w-[680px] px-5 py-4 sm:px-6 sm:py-5",
+        // The close button's corner stays clear of a title.
+        closable && !image && "pr-14 sm:pr-16"
+      )}
     >
       <Content p={p} pending={pending} onTick={(item, doneNow) => press(`tick:${item}`, { action: "tick", item, done: doneNow })} />
-      {said !== undefined ? <p className="mt-1 text-[13px] text-ink-muted [overflow-wrap:anywhere]" role="status">{said}</p> : null}
+      {shown !== undefined ? <p className="mt-2 text-[15px] text-ink-muted [overflow-wrap:anywhere]" role="status">{shown}</p> : null}
       {p.buttons.length > 0
         ? (
-          <div className="mt-2 flex flex-wrap justify-end gap-2">
+          <div className="mt-3 flex flex-wrap justify-end gap-2">
             {p.buttons.map((b) => (
               <button
                 key={b.id}
@@ -127,7 +196,7 @@ function PresentationCard({ p }: { readonly p: HeldPresentation }) {
                 data-action={b.id}
                 disabled={!p.interactive || pending.has(b.id)}
                 onClick={() => press(b.id, { action: b.id })}
-                className="inline-flex min-h-11 max-w-full items-center whitespace-normal rounded-md border border-line bg-surface px-4 py-1 text-left text-[14px] text-ink [overflow-wrap:anywhere] hover:bg-surface-2 disabled:opacity-50"
+                className="inline-flex min-h-11 max-w-full items-center whitespace-normal rounded-md border border-line bg-surface px-4 py-1 text-left text-[15px] text-ink [overflow-wrap:anywhere] hover:bg-surface-2 disabled:opacity-50"
               >
                 {b.label}
               </button>
@@ -135,9 +204,26 @@ function PresentationCard({ p }: { readonly p: HeldPresentation }) {
           </div>
         )
         : null}
+      {closable
+        ? (
+          <button
+            type="button"
+            data-testid="presentation-close"
+            aria-label={p.texts.close}
+            title={p.texts.close}
+            onClick={onClose}
+            className="absolute right-1.5 top-1.5 inline-flex size-11 items-center justify-center rounded-full border border-line bg-surface/90 text-ink-muted shadow-sm transition-colors duration-[120ms] hover:bg-surface-2 hover:text-ink focus-visible:outline-2 focus-visible:outline-offset-2 sm:right-2 sm:top-2"
+          >
+            <Icon name="close" size={20} />
+          </button>
+        )
+        : null}
     </article>
   )
 }
+
+/** A presentation's title: larger than the page's text, for reading from across a room. */
+const TITLE = "min-w-0 text-[20px] font-medium leading-snug [overflow-wrap:anywhere] sm:text-[24px]"
 
 function Content(props: { readonly p: HeldPresentation; readonly pending: ReadonlySet<string>; readonly onTick: (item: string, done: boolean) => void }) {
   const c: PresentContent = props.p.content
@@ -145,11 +231,11 @@ function Content(props: { readonly p: HeldPresentation; readonly pending: Readon
     case "card":
       return (
         <div>
-          <h2 className="text-[15px] font-medium [overflow-wrap:anywhere]">{c.title}</h2>
-          {c.text !== undefined ? <p className="mt-0.5 whitespace-pre-line text-[14px] text-ink-muted [overflow-wrap:anywhere]">{c.text}</p> : null}
+          <h2 className={TITLE}>{c.title}</h2>
+          {c.text !== undefined ? <p className="mt-1 whitespace-pre-line text-[17px] leading-relaxed text-ink-muted [overflow-wrap:anywhere] sm:text-[19px]">{c.text}</p> : null}
           {c.facts.length > 0
             ? (
-              <dl className="mt-2 grid grid-cols-[minmax(0,auto)_minmax(0,1fr)] gap-x-3 gap-y-1 text-[14px]">
+              <dl className="mt-3 grid grid-cols-[minmax(0,auto)_minmax(0,1fr)] gap-x-4 gap-y-1.5 text-[17px] sm:text-[19px]">
                 {c.facts.map((f, i) => (
                   <div key={i} className="contents">
                     <dt className="text-ink-faint [overflow-wrap:anywhere]">{f.label}</dt>
@@ -164,11 +250,11 @@ function Content(props: { readonly p: HeldPresentation; readonly pending: Readon
     case "list":
       return (
         <div>
-          <h2 className="text-[15px] font-medium [overflow-wrap:anywhere]">{c.title}</h2>
+          <h2 className={TITLE}>{c.title}</h2>
           {c.style === "bullets"
-            ? <ul className="mt-1 list-disc pl-5 text-[14px]">{c.items.map((i) => <li key={i.id} className="[overflow-wrap:anywhere]">{i.text}</li>)}</ul>
+            ? <ul className="mt-2 flex list-disc flex-col gap-1 pl-6 text-[17px] sm:text-[19px]">{c.items.map((i) => <li key={i.id} className="[overflow-wrap:anywhere]">{i.text}</li>)}</ul>
             : (
-              <ul className="mt-1 flex flex-col text-[14px]">
+              <ul className="mt-1 flex flex-col text-[17px] sm:text-[19px]">
                 {c.items.map((i) => (
                   <li key={i.id}>
                     <button
@@ -178,10 +264,10 @@ function Content(props: { readonly p: HeldPresentation; readonly pending: Readon
                       data-item={i.id}
                       disabled={!props.p.interactive || props.pending.has(`tick:${i.id}`)}
                       onClick={() => props.onTick(i.id, !i.done)}
-                      className="flex min-h-11 w-full items-center gap-3 rounded-md px-1 text-left hover:bg-surface-2 disabled:cursor-default disabled:hover:bg-transparent"
+                      className="flex min-h-12 w-full items-center gap-3 rounded-md px-1 text-left hover:bg-surface-2 disabled:cursor-default disabled:hover:bg-transparent"
                     >
-                      <span aria-hidden="true" className={cx("flex size-5 shrink-0 items-center justify-center rounded border", i.done ? "border-ink bg-ink text-surface" : "border-line")}>
-                        {i.done ? <svg viewBox="0 0 20 20" width={14} height={14} fill="none" stroke="currentColor" strokeWidth={2}><path d="M4.5 10.5l3.5 3.5 7.5-8" /></svg> : null}
+                      <span aria-hidden="true" className={cx("flex size-6 shrink-0 items-center justify-center rounded border", i.done ? "border-ink bg-ink text-surface" : "border-line")}>
+                        {i.done ? <svg viewBox="0 0 20 20" width={16} height={16} fill="none" stroke="currentColor" strokeWidth={2}><path d="M4.5 10.5l3.5 3.5 7.5-8" /></svg> : null}
                       </span>
                       <span className={cx("min-w-0 [overflow-wrap:anywhere]", i.done && "text-ink-faint line-through")}>{i.text}</span>
                     </button>
@@ -195,32 +281,32 @@ function Content(props: { readonly p: HeldPresentation; readonly pending: Readon
       return <TimerView label={c.label} endsAt={c.endsAt} serverNow={props.p.serverNow} receivedMono={props.p.receivedMono} done={props.p.texts.timerDone} />
     case "image":
       return (
-        <figure className="flex flex-col gap-1">
+        <figure className="flex flex-col gap-2">
           {c.image.state === "ready"
-            ? <ReadyImage key={c.image.token} token={c.image.token} alt={c.alt} missing={props.p.texts.imageMissing} />
-            : <p className="text-[14px] text-ink-faint" data-testid="image-state">{c.image.state === "loading" ? props.p.texts.loading : props.p.texts.imageMissing}</p>}
-          <figcaption className="text-[13px] text-ink-muted">
+            ? <ReadyImage key={c.image.token} token={c.image.token} alt={c.alt} missing={props.p.texts.imageMissing} buttons={props.p.buttons.length > 0} />
+            : <p className="flex min-h-40 items-center justify-center px-12 text-center text-[16px] text-ink-faint" data-testid="image-state">{c.image.state === "loading" ? props.p.texts.loading : props.p.texts.imageMissing}</p>}
+          <figcaption className="px-1 text-[15px] text-ink-muted sm:text-[17px]">
             {c.caption !== undefined ? <span className="block [overflow-wrap:anywhere]">{c.caption}</span> : null}
-            <span className="block text-[12px] text-ink-faint [overflow-wrap:anywhere]">{props.p.texts.credit} {c.credit}</span>
+            <span className="block text-[13px] text-ink-faint [overflow-wrap:anywhere]">{props.p.texts.credit} {c.credit}</span>
           </figcaption>
         </figure>
       )
     case "weather":
       return (
         <div>
-          <h2 className="text-[15px] font-medium [overflow-wrap:anywhere]">{c.place}</h2>
-          <div className="mt-1 flex items-center gap-3">
-            <WeatherSymbol icon={c.now.icon} size={36} />
-            <span className="min-w-0 text-[28px] leading-none tabular-nums [overflow-wrap:anywhere]">{c.now.temperature}</span>
-            <span className="min-w-0 text-[14px] text-ink-muted [overflow-wrap:anywhere]">{c.now.condition}</span>
+          <h2 className={TITLE}>{c.place}</h2>
+          <div className="mt-2 flex items-center gap-4">
+            <WeatherSymbol icon={c.now.icon} size={56} />
+            <span className="min-w-0 text-[44px] leading-none tabular-nums [overflow-wrap:anywhere] sm:text-[56px]">{c.now.temperature}</span>
+            <span className="min-w-0 text-[17px] text-ink-muted [overflow-wrap:anywhere] sm:text-[19px]">{c.now.condition}</span>
           </div>
           {c.days.length > 0
             ? (
-              <ul className="mt-2 grid grid-cols-[repeat(auto-fit,minmax(48px,1fr))] gap-2 text-center text-[13px]">
+              <ul className="mt-4 grid grid-cols-[repeat(auto-fit,minmax(56px,1fr))] gap-3 text-center text-[15px] sm:text-[17px]">
                 {c.days.map((d, i) => (
                   <li key={i} className="flex min-w-0 flex-col items-center gap-0.5 [overflow-wrap:anywhere]">
                     <span className="text-ink-faint [overflow-wrap:anywhere]">{d.label}</span>
-                    <WeatherSymbol icon={d.icon} size={22} />
+                    <WeatherSymbol icon={d.icon} size={28} />
                     <span className="tabular-nums"><span className="sr-only">{props.p.texts.high} </span>{d.high}</span>
                     <span className="tabular-nums text-ink-faint"><span className="sr-only">{props.p.texts.low} </span>{d.low}</span>
                   </li>
@@ -234,10 +320,22 @@ function Content(props: { readonly p: HeldPresentation; readonly pending: Readon
 }
 
 /** This page's own image address; one the browser could not load shows the server's sentence for a missing image. */
-function ReadyImage(props: { readonly token: string; readonly alt: string; readonly missing: string }) {
+function ReadyImage(props: { readonly token: string; readonly alt: string; readonly missing: string; readonly buttons: boolean }) {
   const [failed, setFailed] = useState(false)
-  if (failed) return <p className="text-[14px] text-ink-faint" data-testid="image-state">{props.missing}</p>
-  return <img src={`/media/${props.token}`} alt={props.alt} decoding="async" onError={() => setFailed(true)} className="max-h-[32dvh] w-full rounded-md object-contain" />
+  if (failed) return <p className="flex min-h-40 items-center justify-center px-12 text-center text-[16px] text-ink-faint" data-testid="image-state">{props.missing}</p>
+  // As large as the presentation area allows, its caption and credit (and buttons) still in view below it: scaled to fit.
+  return (
+    <img
+      src={`/media/${props.token}`}
+      alt={props.alt}
+      decoding="async"
+      onError={() => setFailed(true)}
+      className={cx(
+        "h-auto w-full rounded-lg object-contain",
+        props.buttons ? "max-h-[max(120px,calc(var(--pva-present-room,60dvh)_-_164px))]" : "max-h-[max(120px,calc(var(--pva-present-room,60dvh)_-_112px))]"
+      )}
+    />
+  )
 }
 
 /** A countdown to the server's instant, on this page's clock corrected by the offset taken when it arrived. */
@@ -251,9 +349,9 @@ function TimerView(props: { readonly label: string; readonly endsAt: number; rea
     return () => clearInterval(t)
   }, [left <= 0, props.receivedMono])
   return (
-    <div className="flex items-baseline justify-between gap-3">
-      <h2 className="min-w-0 text-[15px] font-medium [overflow-wrap:anywhere]">{props.label}</h2>
-      <span role="timer" data-testid="timer-left" className="shrink-0 text-[28px] leading-none tabular-nums">{left > 0 ? formatRemaining(left) : props.done}</span>
+    <div className="flex flex-wrap items-baseline justify-between gap-x-4 gap-y-2">
+      <h2 className={TITLE}>{props.label}</h2>
+      <span role="timer" data-testid="timer-left" className="shrink-0 text-[48px] leading-none tabular-nums sm:text-[64px]">{left > 0 ? formatRemaining(left) : props.done}</span>
     </div>
   )
 }

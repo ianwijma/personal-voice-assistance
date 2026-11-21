@@ -42,7 +42,9 @@ export const fileAnswer = (files: ReadonlyArray<FileFixture>) => ({
       title: f.title,
       index: i + 1,
       imageinfo: [{
-        thumburl: f.thumburl ?? `https://upload.wikimedia.org/wikipedia/commons/thumb/a/ab/${encodeURIComponent(f.title.replace(/^File:/, ""))}/800px-${encodeURIComponent(f.title.replace(/^File:/, ""))}`,
+        // The shape the API answers since 2025 (issue #150): the thumbnail on `thumb.wikimedia.org`, at a standard width, with
+        // tracking parameters.
+        thumburl: f.thumburl ?? `https://thumb.wikimedia.org/wikipedia/commons/thumb/a/ab/${encodeURIComponent(f.title.replace(/^File:/, ""))}/960px-${encodeURIComponent(f.title.replace(/^File:/, ""))}?utm_source=commons.wikimedia.org&utm_campaign=imageinfo&utm_content=thumbnail`,
         url: `https://upload.wikimedia.org/wikipedia/commons/a/ab/${encodeURIComponent(f.title.replace(/^File:/, ""))}`,
         mime: f.mime ?? "image/jpeg",
         extmetadata: {
@@ -92,7 +94,8 @@ export const worldNet = (world: World, wrap?: (c: OfflineConnector) => OfflineCo
       return { body: world.search?.[q] === undefined ? empty : fileAnswer(world.search[q]!) }
     },
     // The module never asks for the image: if it did, this would answer, and a test would see the request.
-    "https://upload.wikimedia.org/": { status: 200, headers: { "content-type": "image/jpeg" }, body: new Uint8Array([1, 2, 3]) }
+    "https://upload.wikimedia.org/": { status: 200, headers: { "content-type": "image/jpeg" }, body: new Uint8Array([1, 2, 3]) },
+    "https://thumb.wikimedia.org/": { status: 200, headers: { "content-type": "image/jpeg" }, body: new Uint8Array([1, 2, 3]) }
   })
   return { net, deps: { resolver: net.resolver, connector: wrap === undefined ? net.connector : wrap(net.connector) } }
 }

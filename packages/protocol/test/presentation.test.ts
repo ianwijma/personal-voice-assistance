@@ -14,11 +14,15 @@ import {
   PRESENT_KIND_VERSIONS,
   type PresentDecision,
   PresentAction,
+  PresentClose,
   presentationProblem,
+  PresentPageTexts,
   PresentationWire,
   selectPresentations
 } from "../src/index.ts"
-import { examplePresentation } from "../src/examples.ts"
+import { clientExamples, examplePresentation } from "../src/examples.ts"
+import { decodeClientMessage } from "../src/codec.ts"
+import { PROTOCOL_VERSION } from "../src/constants.ts"
 
 /** The table, written out: the first row that applies wins. */
 const expected = (c: { connected: boolean; personal: boolean; mayReveal: boolean; display: boolean; draws: boolean; touch: boolean }): PresentDecision => {
@@ -108,6 +112,47 @@ describe("the wire", () => {
     expect(() => decode({ ...base, requestId: "" })).toThrow()
     expect(() => decode({ ...base, id: "" })).toThrow()
     expect(() => decode({ ...base, item: "" })).toThrow()
+  })
+})
+
+describe("closing on the page (additive within protocol 12)", () => {
+  it("present.close: each bound accepted at its maximum and refused one past it; no other field", () => {
+    const decode = Schema.decodeUnknownSync(PresentClose)
+    const base = { type: "present.close", requestId: "r1", id: "p-1", revision: "show-1:1" } as const
+    expect(decode(base)).toEqual(base)
+    for (const [field, max] of [["requestId", 64], ["id", 64], ["revision", 96]] as const) {
+      expect(() => decode({ ...base, [field]: "a".repeat(max) }), `${field} at ${max}`).not.toThrow()
+      expect(() => decode({ ...base, [field]: "a".repeat(max + 1) }), `${field} at ${max + 1}`).toThrow()
+      expect(() => decode({ ...base, [field]: "" }), `${field} empty`).toThrow()
+    }
+    expect(() => decode({ ...base, revision: "show 1" })).toThrow()
+  })
+
+  it("is a client message a page sends with a request id; an older server's decoder answers Unknown for it, not Invalid", () => {
+    const got = decodeClientMessage(JSON.stringify(clientExamples["present.close"]))
+    expect(got._tag).toBe("Ok")
+    // The decoder's rule for a type it does not know (what an older server does with it): Unknown, which the hub ignores.
+    expect(decodeClientMessage(JSON.stringify({ ...clientExamples["present.close"], type: "present.close-later" }))._tag).toBe("Unknown")
+  })
+
+  it("closable and texts.close are optional: a server that never sends them still makes a valid presentation", () => {
+    const decode = Schema.decodeUnknownSync(PresentationWire)
+    const { closable: _c, texts, ...rest } = examplePresentation
+    const { close: _t, ...olderTexts } = texts
+    expect(decode({ ...rest, texts: olderTexts }).closable).toBeUndefined()
+    expect(decode(examplePresentation).closable).toBe(true)
+    expect(() => decode({ ...examplePresentation, closable: "yes" })).toThrow()
+    expect(() => decode({ ...examplePresentation, texts: { ...texts, close: "x".repeat(31) } })).toThrow()
+  })
+
+  it("an older page, whose schemas have neither key, decodes a newer server's presentation and ignores them", () => {
+    const { closable: _c, ...olderFields } = PresentationWire.fields
+    const { close: _t, ...olderTextFields } = PresentPageTexts.fields
+    const OlderWire = Schema.Struct({ ...olderFields, texts: Schema.Struct(olderTextFields) })
+    const decoded = Schema.decodeUnknownSync(OlderWire)(examplePresentation) as Record<string, unknown>
+    expect(decoded.id).toBe(examplePresentation.id)
+    expect("closable" in decoded).toBe(false)
+    expect(PROTOCOL_VERSION).toBe(12)
   })
 })
 

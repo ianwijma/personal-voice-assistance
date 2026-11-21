@@ -130,6 +130,26 @@ body {
   .stage-pad > * { margin-top: 0; }
 }
 
+/* P10: while something is presented (`data-presenting` on the root, set by `PresentationStage` while it shows at least
+   one presentation and no menu or panel covers it) the character yields: its box (`.stage-vis`) shrinks to a strip under
+   the header, the state label stays under it, and the captions and the stage's overlays step aside (the reply is still
+   announced to screen readers by `LiveAnnouncer`). The presentation area starts `--pva-present-gap` below the header.
+   On a short screen (a phone in landscape) the strip is covered by the presentation area instead: there is no room for
+   both. When nothing is presented any more, everything is as before. docs/CHARACTERS.md §2.7. */
+@layer components {
+  :root { --pva-vis-mini: 40px; --pva-present-gap: calc(var(--pva-vis-mini) + 36px); }
+  @media (min-width: 640px) {
+    :root { --pva-vis-mini: 64px; }
+  }
+  @media (max-height: 600px) {
+    :root { --pva-vis-mini: 16px; --pva-present-gap: 4px; }
+  }
+  :root[data-presenting] .stage-pad { padding-top: 4px; }
+  :root[data-presenting] .stage-vis { height: var(--pva-vis-mini); }
+  :root[data-presenting] .stage-pad [data-present-yield] { display: none; }
+  :root[data-presenting] [data-testid="state-label-box"] { margin-top: 4px; }
+}
+
 @keyframes pva-spin { to { transform: rotate(360deg); } }
 @keyframes pva-fade-in { from { opacity: 0; } to { opacity: 1; } }
 @keyframes pva-rise { from { opacity: 0; transform: translateY(8px); } to { opacity: 1; transform: none; } }
