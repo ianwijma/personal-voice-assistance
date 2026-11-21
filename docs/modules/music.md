@@ -2,6 +2,13 @@
 
 Plays and controls music per room through Music Assistant in Home Assistant.
 
+> **To be replaced.** The owner does not use Home Assistant for music. The plan in [media.md](media.md) (2026-11-21)
+> replaces this module with `media`: Spotify music and YouTube video played on the asking device itself. This page
+> describes the module as it is until that plan's last step removes it. What the new module keeps from this one: the
+> phrase tables for pause, resume, next and previous, the once-per-phrase-invocation record, the English and Dutch
+> text pattern and the cleaning of outside text. What goes: rooms and players, every Home Assistant call, the
+> room-keyed `Playback`.
+
 - Package: `packages/module-music`
 - Plan: [docs/MODULES-PLAN.md](../MODULES-PLAN.md) §5.1 row 8 (wave B)
 - Research: [docs/research/modules/music.md](../research/modules/music.md)
