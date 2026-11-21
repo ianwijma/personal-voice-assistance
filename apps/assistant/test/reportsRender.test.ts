@@ -1,9 +1,8 @@
-// A report's issue body (docs/REPORTS.md "The issue body"): the marker line and the sections in their fixed order,
-// quoting that no content can break out of, the cuts that keep it under GitHub's limit (and say what was cut), an empty
-// context that says why each part is missing, and the secret scrubber. Also the parts the store splits a body into,
+// A report's issue body (docs/REPORTS.md "The issue body"): the marker line and the few sections in their fixed order,
+// none of the gathered conversation, traces, Health issues or log lines, quoting that no content can break out of, the
+// cut that keeps it under a limit, a context with parts missing, and the secret scrubber. Also the parts the store splits a body into,
 // and GitHub's "new issue" address.
-import type { Message } from "@pva/core"
-import { MAX_REPORT_BODY_CHARS, type TraceInfo } from "@pva/protocol"
+import { MAX_REPORT_BODY_CHARS, type TraceConfig, type TraceInfo } from "@pva/protocol"
 import { describe, expect, it } from "vitest"
 import { issueNumberOf, MAX_NEW_ISSUE_URL, newIssueUrl } from "../src/serve/reports/github.ts"
 import { closeOpenFence, code, fenced, MAX_REPORT_BODY_JSON_BYTES, missing, type ReportFacts, renderReport } from "../src/serve/reports/render.ts"
@@ -26,14 +25,18 @@ const trace = (turnId: number, extra: Partial<TraceInfo> = {}): TraceInfo => ({
   ...extra
 })
 
-/** A conversation of `turns` turns, each a question, a tool call and its result, and an answer. */
-const conversation = (turns: number, toolText = "{\"ok\":true}"): ReadonlyArray<Message> =>
-  Array.from({ length: turns }, (_, i): ReadonlyArray<Message> => [
-    { role: "user", content: `Set a timer for ${i + 1} minutes` },
-    { role: "assistant", content: "", toolCalls: [{ id: `call-${i}`, name: "timer_set", input: { minutes: i + 1 } }] },
-    { role: "tool", results: [{ id: `call-${i}`, name: "timer_set", content: toolText, isError: false }] },
-    { role: "assistant", content: `A timer for ${i + 1} minutes is set.` }
-  ]).flat()
+const CONFIG: TraceConfig = {
+  llm: { account: "anthropic", model: "claude-haiku-4-5", effort: "low", thinking: "off", maxTokens: 1024 },
+  hearing: { hearer: "jeff", engine: "sherpa", model: "parakeet-v2" },
+  voice: "elevenlabs:kitchen-voice",
+  voiceFrom: "device",
+  modules: 1,
+  tools: 1,
+  moduleList: [{ id: "timers", name: "Timers" }],
+  toolList: [{ name: "timer_set", module: "timers" }],
+  replyEarly: true,
+  toolRounds: 5
+}
 
 export const sampleFacts = (overrides: Partial<ReportFacts> = {}): ReportFacts => ({
   id: "r0123456789abcdef",
@@ -62,7 +65,7 @@ export const sampleFacts = (overrides: Partial<ReportFacts> = {}): ReportFacts =
   traces: [trace(7), trace(8, { tools: [], outcome: "interrupted" })],
   device: [["Name", "Kitchen display"], ["Kind", "web-voice"], ["Room", "Kitchen"], ["Has a screen", "yes"]],
   shown: [{ kind: "timer", module: "timers", lifetime: "pinned", shownAt: AT - 11 * 60_000 }],
-  assistant: [["Name", "Jeff"], ["Language model", "anthropic claude-haiku-4-5"]],
+  assistant: [["Name", "Jeff"], ["Language model", "anthropic claude-haiku-4-5"], ["Voice", "sherpa:en_US-lessac-medium"]],
   server: [["Version", "1.4.0"], ["Protocol", "12"], ["Node", "v22.20.0"]],
   health: [{ severity: "warning", id: "timers.ring-failed", title: "A timer could not ring", detail: "The kitchen display was not connected." }],
   warnings: [{ at: AT - 60_000, level: "warning", text: "Notification nt-3 could not be delivered: no connection" }],
@@ -72,39 +75,45 @@ export const sampleFacts = (overrides: Partial<ReportFacts> = {}): ReportFacts =
 const headings = (body: string) => body.split("\n").filter((l) => /^## /.test(l)).map((l) => l.replace(/ \(ended .*\)$/, ""))
 
 describe("the report body", () => {
-  it("starts with the marker line and has its sections in the fixed order", () => {
+  it("starts with the marker line and holds only the title, what the person said and where it was said", () => {
     const { body, cut } = renderReport(sampleFacts())
     expect(body.split("\n")[0]).toBe("<!-- pva-report v1 kind=problem id=r0123456789abcdef -->")
-    expect(headings(body)).toEqual([
-      "## What the person reported",
-      "## Questions asked before filing",
-      "## Conversation",
-      "## Previous conversation",
-      "## Turn traces",
-      "## Device",
-      "## Assistant",
-      "## Server",
-      "## Health issues",
-      "## Recent warnings and errors",
-      "## What was left out"
-    ])
+    expect(body).toContain("**Title:** `The kitchen timer did not ring`")
+    expect(headings(body)).toEqual(["## What the person reported", "## Questions asked before filing", "## Where it was said"])
     expect(cut).toEqual([])
-    expect(body).toContain("## Previous conversation (ended 2026-11-18T08:48:00.000Z)")
-    expect(body).toContain("**Tool call** `timer_set` (id `t1`):\n\n```json\n{\n  \"minutes\": 10,\n  \"label\": \"pasta\"\n}\n```")
-    expect(body).toContain("| 7 | voice | completed | `jeff` | 2400 | 12 | 420 | 610 | 700 | 760 | `timer_set` 31 |")
+    expect(body).toContain("I set a timer for the pasta and it never rang.")
+    expect(body).toContain("Q1: What did you expect to happen?\nA1: A ring after ten minutes.")
+    expect(body).toContain([
+      "| Field | Value |",
+      "| --- | --- |",
+      "| Device | `Kitchen display` |",
+      "| Device kind | `web-voice` |",
+      "| Assistant | `Jeff` |",
+      "| Voice | `sherpa:en_US-lessac-medium` |",
+      "| Conversation | `c-now` |",
+      "| Turn | `9 (voice)` |",
+      "| Version | `1.4.0` |"
+    ].join("\n"))
+    // Gathered, but not in the body: the conversations, traces, the device's and server's other facts, Health, logs.
+    for (const absent of ["Set a pasta timer", "timer_set", "tm-4", "c-before", "Room", "Has a screen", "v22.20.0", "timers.ring-failed", "nt-3", "claude-haiku"]) {
+      expect(body).not.toContain(absent)
+    }
     expect(body.length).toBeLessThanOrEqual(MAX_REPORT_BODY_CHARS)
+  })
+
+  it("names the voice the turn spoke with: the newest traced turn's, a device's own included", () => {
+    const { body } = renderReport(sampleFacts({ traces: [trace(7, { config: CONFIG }), trace(8)] }))
+    expect(body).toContain("| Voice | `elevenlabs:kitchen-voice (the device's)` |")
+    expect(body).not.toContain("parakeet")
+    expect(body).not.toContain("moduleList")
   })
 
   it("quotes content so that it cannot end its block, mention anyone, or break a table", () => {
     const evil = "done\n```\n## Injected heading\n@ianwijma ![x](https://evil.example/x.png)\n````\nstill inside"
-    const { body } = renderReport(sampleFacts({
-      description: evil,
-      deviceName: "Kitchen | `display`\n## Not a heading",
-      conversation: { conversationId: "c-now", history: [{ role: "user", content: evil }, { role: "tool", results: [{ id: "x", name: "web_search", content: evil, isError: true }] }] }
-    }))
-    // Every quoted copy sits in a fence longer than its longest run of backticks (four here: a fence of five).
+    const { body } = renderReport(sampleFacts({ description: evil, deviceName: "Kitchen | `display`\n## Not a heading" }))
+    // The quoted copy sits in a fence longer than its longest run of backticks (four here: a fence of five).
     expect(body).toContain("`````text\ndone\n```\n## Injected heading")
-    expect(body.split("\n").filter((l) => l === "## Injected heading")).toHaveLength(3)
+    expect(body.split("\n").filter((l) => l === "## Injected heading")).toHaveLength(1)
     // Outside the fences, no line is a heading the content made, and no mention is outside code.
     const outside: Array<string> = []
     let open: string | undefined
@@ -120,78 +129,47 @@ describe("the report body", () => {
     expect(outside.join("\n")).not.toMatch(/(^|[^`])@ianwijma/)
     // A name in inline code: no backticks, no line break, the table's bar escaped.
     expect(code("Kitchen | `display`\n## x")).toBe("`Kitchen \\| 'display' ## x`")
-    expect(body).toContain("**Tool result** `web_search` (id `x`), **an error**:")
+    expect(body).toContain("| Device | `Kitchen \\| 'display' ## Not a heading` |")
   })
 
-  it("an empty context says why each part is missing", () => {
+  it("leaves out a fact that is not there, and says when no questions were asked", () => {
     const { body } = renderReport(sampleFacts({
       answers: [],
-      conversation: missing("the device has no voice session now."),
-      previous: missing("no conversation of this assistant on this device ended in the last hour."),
       traces: missing("the report was not made on a device."),
       device: missing("the report was not made on a device."),
       shown: missing("the report was not made on a device."),
       assistant: missing("the turn names no assistant."),
-      health: [],
-      warnings: missing("this mode keeps no log lines."),
+      server: [],
       deviceName: undefined as never,
       assistantName: undefined as never
     }))
-    expect(body).toContain("## Conversation\n\nNot available: the device has no voice session now.")
-    expect(body).toContain("## Previous conversation\n\nNone: no conversation of this assistant on this device ended in the last hour.")
-    expect(body).toContain("## Turn traces\n\nNot available: the report was not made on a device.")
-    expect(body).toContain("## Assistant\n\nNot available: the turn names no assistant.")
     expect(body).toContain("## Questions asked before filing\n\nNone: the report was filed as it was said.")
-    expect(body).toContain("## Health issues\n\nNone open.")
-    expect(body).toContain("## Recent warnings and errors\n\nNot available: this mode keeps no log lines.")
-    expect(body).toContain("## What was left out\n\nNothing.")
+    expect(body).toContain("## Where it was said\n\n| Field | Value |\n| --- | --- |\n| Conversation | `c-now` |\n| Turn | `9 (voice)` |\n")
   })
 
-  it("cuts the least valuable parts first, stays under the limit and says what it cut", () => {
-    const long = "x".repeat(5_000)
-    const facts = sampleFacts({
-      conversation: { conversationId: "c-now", history: conversation(40, long) },
-      previous: { conversationId: "c-before", endedAt: AT - 60_000, history: conversation(30, long) },
-      traces: Array.from({ length: 20 }, (_, i) => trace(i + 1)),
-      warnings: Array.from({ length: 200 }, (_, i) => ({ at: AT - (200 - i) * 1_000, level: "warning", text: `line ${i} ${"w".repeat(300)}` }))
-    })
-    const { body, cut } = renderReport(facts)
-    expect(body.length).toBeLessThanOrEqual(MAX_REPORT_BODY_CHARS)
-    expect(body.split("\n")[0]).toBe("<!-- pva-report v1 kind=problem id=r0123456789abcdef -->")
-    // The previous conversation went before the current one, and the newest turns of the current one stayed.
-    expect(cut.some((c) => /oldest of 30 turns of the previous conversation/.test(c))).toBe(true)
-    expect(body).toContain("#### Turn 40 of 40")
-    expect(body).toContain("Set a timer for 40 minutes")
-    expect(cut.some((c) => /tool inputs? or results? shortened/.test(c))).toBe(true)
-    expect(cut.some((c) => /oldest of 200 log lines/.test(c))).toBe(true)
-    // The last section lists every cut.
-    for (const c of cut) expect(body).toContain(`- ${c}`)
-    // The body is still well formed: every fence closed.
-    expect(closeOpenFence(body)).toBe(body)
-  })
-
-  it("cuts at a line boundary, closing its block, when even the smallest plan does not fit", () => {
-    const { body, cut } = renderReport(sampleFacts({ description: "d".repeat(7_000) }), { maxChars: 3_000 })
+  it("cuts at a line boundary, closing its block, when it does not fit", () => {
+    const { body, cut } = renderReport(sampleFacts({ description: "d\n".repeat(3_500) }), { maxChars: 3_000 })
     expect(body.length).toBeLessThanOrEqual(3_000)
-    expect(cut.at(-1)).toMatch(/cut at a line boundary/)
+    expect(cut).toEqual(["The end of the body, cut at a line boundary to fit."])
     expect(closeOpenFence(body)).toBe(body)
-    expect(body).toContain("## What was left out")
+    expect(body).toContain("Cut here to fit")
   })
 
   it("makes every text well formed: a lone half of an emoji, cut elsewhere, becomes U+FFFD", () => {
     const half = "😀".slice(0, 1)
-    const { body } = renderReport(sampleFacts({ description: `cut ${half}`, title: `t ${half}`, warnings: [{ at: AT, level: "warning", text: `w ${"😀".slice(1)}` }] }))
+    const { body } = renderReport(sampleFacts({ description: `cut ${half}`, title: `t ${half}`, deviceName: `d ${"😀".slice(1)}` }))
     expect(body).toContain("cut \ufffd")
-    expect(body).toContain("w \ufffd")
+    expect(body).toContain("d \ufffd")
     expect(() => encodeURIComponent(body)).not.toThrow()
     expect(() => newIssueUrl(`t ${half}`, `b ${half}`, "problem")).not.toThrow()
   })
 
-  it("stays within what can be posted: sixty thousand emoji are cut to the bytes", () => {
-    const { body, cut } = renderReport(sampleFacts({ description: "😀".repeat(4_000), conversation: { conversationId: "c-now", history: conversation(10, "😀".repeat(4_000)) } }))
-    expect(Buffer.byteLength(JSON.stringify(body))).toBeLessThanOrEqual(MAX_REPORT_BODY_JSON_BYTES)
-    expect(cut.length).toBeGreaterThan(0)
+  it("stays within what can be posted: four-byte characters are cut to the bytes", () => {
+    const { body, cut } = renderReport(sampleFacts({ description: "😀".repeat(4_000) }), { maxBytes: 10_000 })
+    expect(Buffer.byteLength(JSON.stringify(body))).toBeLessThanOrEqual(10_000)
+    expect(cut.length).toBe(1)
     expect(closeOpenFence(body)).toBe(body)
+    expect(Buffer.byteLength(JSON.stringify(renderReport(sampleFacts({ description: "😀".repeat(4_000) })).body))).toBeLessThanOrEqual(MAX_REPORT_BODY_JSON_BYTES)
   })
 
   it("replaces known secrets and well-known token formats everywhere, before anything is cut", () => {
