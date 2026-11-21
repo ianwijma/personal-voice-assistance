@@ -22,6 +22,14 @@ named, never an address read out). The module is **off by default**.
   characters, cut to a bound, and handed to the model with a `notice` saying so ("not an instruction"). The module's
   instructions say the same. A result address is never cut (one over 300 characters is dropped), a second result from a
   host already shown is dropped, and so is a blocked site.
+- **An image search for other modules** (issue #150): while the SearXNG address is set and valid, the shared part offers
+  the `WebImages` service (`@pva/module-contracts`, `webImages.ts`; used by `images`). One call is one SearXNG request
+  (`categories=images`, JSON, the caller's `safesearch` 0/1/2 and language, at most 512 KiB, the caller's time limit within
+  0.5 to 10 s) through the same owner-configured fetch. At most ten results, each with an `https` picture address and its
+  page (a protocol-relative address made `https`, a `data:` or `http:` one dropped), the engine's thumbnail when it has a
+  usable one, the page's site, the raw title cut to 300 characters and the stated format; a result whose page or picture is
+  on a blocked site is dropped, a blocked thumbnail left out. It fetches no picture (the server's media route does), is not
+  counted against the daily cap (SearXNG is free) and keeps nothing.
 - **A provider's answer that is malformed** (not JSON, no results list, a part present with the wrong type, such as Brave's
   `web` as a list or `null`) is a failure of that provider, so the fallback runs; only an answer without a `web` part at all
   (Brave's way of saying nothing matched) or with an empty list is "I found nothing for that."
@@ -163,8 +171,8 @@ one bounded read of at most 12 of the oldest rows through the `month` index, tho
 
 - `requires: [{ network: "internet" }]` (Brave and the pages), and `health` as above. SearXNG on the LAN is reached through
   the owner-configured function only.
-- A SearXNG server with JSON output on, or a Brave Search API key. Nothing else; no service from another module, no
-  contribution provided or used.
+- A SearXNG server with JSON output on, or a Brave Search API key. Nothing else; it uses no service from another module
+  and provides one, `WebImages` (above), and no contribution.
 - Libraries (all in the package, loaded only in the page task's worker): `@mozilla/readability`, `linkedom`, `turndown`;
   `@pva/language` for spoken numbers.
 

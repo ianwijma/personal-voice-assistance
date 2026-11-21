@@ -140,6 +140,34 @@ describe("the image cache (/media)", () => {
     await run(close)
   })
 
+  it("issue #150: every fetch says who is calling (image hosts such as Wikimedia answer 403 without a User-Agent); a refusing host is logged with its status", async () => {
+    const agents: Array<string | undefined> = []
+    const lines: Array<string> = []
+    const fetchOptions = (status: number) => ({
+      resolver: async () => ["93.184.216.34"],
+      connector: async (r: ConnectRequest) => {
+        agents.push(r.headers["user-agent"])
+        // As upload.wikimedia.org does: no User-Agent is a 403 ("Please set a user-agent").
+        if (r.headers["user-agent"] === undefined || r.headers["user-agent"] === "") return reply(403, new TextEncoder().encode("Please set a user-agent"), { "content-type": "text/plain" })
+        return status === 200 ? reply(200, JPEG, { "content-type": "image/jpeg" }) : reply(status, new Uint8Array(), { "content-type": "text/plain" })
+      }
+    })
+    const scope = await run(Scope.make())
+    const plain = await run(makeMediaCache({ dir: mkdtempSync(join(tmpdir(), "pva-media-")), fetchOptions: fetchOptions(200) }).pipe(Scope.provide(scope)))
+    expect("hash" in await run(plain.fetch("https://upload.wikimedia.org/a.jpg"))).toBe(true)
+    const contact = { value: "owner@example.org" }
+    const named = await run(makeMediaCache({ dir: mkdtempSync(join(tmpdir(), "pva-media-")), fetchOptions: fetchOptions(200), userAgent: () => `personal-voice-assistance/1 (${contact.value})` }).pipe(Scope.provide(scope)))
+    expect("hash" in await run(named.fetch("https://thumb.wikimedia.org/b.jpg"))).toBe(true)
+    // Read at each fetch: a changed contact is sent from the next fetch on.
+    contact.value = "other@example.org"
+    expect("hash" in await run(named.fetch("https://thumb.wikimedia.org/c.jpg"))).toBe(true)
+    expect(agents).toEqual(["personal-voice-assistance/1", "personal-voice-assistance/1 (owner@example.org)", "personal-voice-assistance/1 (other@example.org)"])
+    const refusing = await run(makeMediaCache({ dir: mkdtempSync(join(tmpdir(), "pva-media-")), fetchOptions: fetchOptions(429), log: (l) => lines.push(l) }).pipe(Scope.provide(scope)))
+    expect(await run(refusing.fetch("https://img.example/secret/path.jpg?q=private"))).toEqual({ refused: "fetch" })
+    expect(lines.filter((l) => l.includes("answered"))).toEqual(["Media: img.example answered 429; the image is not kept"])
+    await run(Scope.close(scope, Exit.void))
+  })
+
   it("refuses more fetches at once than its bound (busy); one address under way is fetched once for every asker", async () => {
     const w = world()
     const gate = Effect.runSync(Deferred.make<void>())

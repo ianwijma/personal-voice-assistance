@@ -74,7 +74,7 @@ An assistant uses only the modules it has switched on. Each has its own page in 
 | [News and feeds](docs/modules/news.md) | headlines and stories from feeds |
 | [Web search](docs/modules/web-search.md) | SearXNG or Brave, and a page read in short |
 | [Knowledge](docs/modules/knowledge.md) | Wikipedia summaries and Wiktionary definitions |
-| [Images](docs/modules/images.md) | a picture from Wikipedia or Wikimedia Commons |
+| [Images](docs/modules/images.md) | a picture from Wikipedia or Wikimedia Commons, or from the web through SearXNG |
 | [Calculator](docs/modules/calculator.md) | arithmetic, units, currency and random picks |
 | [Kitchen](docs/modules/kitchen.md) | pantry, recipes and what you can make |
 | [Bin day](docs/modules/bin-day.md) | which bin goes out next |

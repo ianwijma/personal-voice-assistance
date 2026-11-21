@@ -26,8 +26,15 @@ export const texts = defineTexts({
     creditNoAuthor: "Author not stated",
     sourceWikipedia: "Wikipedia",
     sourceCommons: "Wikimedia Commons",
+    foundWeb: "I found a picture of {title} on the web. I can't show it here.",
+    nothingWeb: "I couldn't find a picture of {word} on Wikipedia or on the web.",
+    noPictureWeb: "Wikipedia has a page on {title}, but neither it nor the web search had a picture I can use.",
+    creditWeb: "Picture from the web, via {site}",
+    sourceWeb: "SearXNG",
     noSafeSearchTitle: "Pictures have no safe-search filter",
-    noSafeSearchDetail: "Wikipedia and Wikimedia Commons have no safe-search filter, so a picture of a thing may show anything that has a page about it. Nothing here keeps children from seeing it."
+    noSafeSearchDetail: "Wikipedia and Wikimedia Commons have no safe-search filter, so a picture of a thing may show anything that has a page about it. Nothing here keeps children from seeing it.",
+    webSafeSearchTitle: "Wikipedia pictures have no safe-search filter",
+    webSafeSearchDetail: "Wikipedia and Wikimedia Commons have no safe-search filter, so a picture of a thing may show anything that has a page about it. Pictures from the web search go through SearXNG's safe search at the level set here ({level}), which misses things too. Nothing here keeps children from seeing it."
   },
   nl: {
     found: "Ik vond een plaatje van {title}: {description}. Ik kan het hier niet laten zien.",
@@ -53,7 +60,14 @@ export const texts = defineTexts({
     creditNoAuthor: "Maker niet vermeld",
     sourceWikipedia: "Wikipedia",
     sourceCommons: "Wikimedia Commons",
+    foundWeb: "Ik vond op internet een plaatje van {title}. Ik kan het hier niet laten zien.",
+    nothingWeb: "Ik kon geen plaatje van {word} vinden op Wikipedia of op internet.",
+    noPictureWeb: "Wikipedia heeft een pagina over {title}, maar daar en op internet vond ik geen plaatje dat ik kan gebruiken.",
+    creditWeb: "Plaatje van internet, via {site}",
+    sourceWeb: "SearXNG",
     noSafeSearchTitle: "Plaatjes hebben geen veilig-zoeken-filter",
-    noSafeSearchDetail: "Wikipedia en Wikimedia Commons hebben geen veilig-zoeken-filter, dus een plaatje van iets kan alles laten zien waarover een pagina bestaat. Niets hier houdt kinderen ervan weg."
+    noSafeSearchDetail: "Wikipedia en Wikimedia Commons hebben geen veilig-zoeken-filter, dus een plaatje van iets kan alles laten zien waarover een pagina bestaat. Niets hier houdt kinderen ervan weg.",
+    webSafeSearchTitle: "Plaatjes van Wikipedia hebben geen veilig-zoeken-filter",
+    webSafeSearchDetail: "Wikipedia en Wikimedia Commons hebben geen veilig-zoeken-filter, dus een plaatje van iets kan alles laten zien waarover een pagina bestaat. Plaatjes van het zoeken op internet gaan door het veilig zoeken van SearXNG op het niveau dat hier is ingesteld ({level}), en dat mist ook dingen. Niets hier houdt kinderen ervan weg."
   }
 })
