@@ -10,7 +10,8 @@ Every promise on this page has a case in `@pva/core/present-contract` (run on th
 memory and on a file), in the decision table (`packages/protocol/test/presentation.test.ts`), in the kit's examples
 (`packages/module-contracts/test/kit/presentExample.test.ts`), in the serve tests
 (`apps/assistant/test/servePresentation.test.ts`, `media.test.ts`) or in the page's tests
-(`apps/web/test/presentation.test.tsx`, `mockServer.test.ts`).
+(`apps/web/test/presentation.test.tsx`, `mockServer.test.ts`); closing on the page in
+`packages/core/test/present/PresentClose.test.ts`.
 
 ## In one paragraph
 
@@ -25,8 +26,10 @@ it is the only thing that sends `present.show`, `present.update` and `present.di
 server decided ("Showing on "Kitchen display".", "Not showing it: "Office speaker" has no display. Say this instead: …"),
 never what the eye saw. A tick or a button is admitted only for the displayed revision from a page that holds the
 presentation and may press it
-there; it is claimed and reaches the press handler the module registered in `shared`. An image reaches a page only as an
-address of that page's own, `/media/<token>`.
+there; it is claimed and reaches the press handler the module registered in `shared`. The viewer can close a
+presentation on a device that can press things (its close button, or Escape): the page sends `present.close` and the
+Presenter dismisses it as a module's dismissal does. An image reaches a page only as an address of that page's own,
+`/media/<token>`.
 
 ## The two ways in
 
@@ -255,6 +258,41 @@ transient the decision allows.
 - The page sends `present.action` `{ id, revision, action: "tick", item, done }` or `{ id, revision, action: <button id> }`; it goes
   through the hub's bounded admission like every other request.
 
+## Closing on the page
+
+- **What it is**: the viewer takes a presentation off the screen by touch (its close button) or, where there is a
+  keyboard, with Escape; not by asking the assistant. It is **a dismissal**, not a hiding on one page: the page sends
+  `present.close` `{ id, revision }` (a request, through the hub's bounded admission, answered with `result`), and the
+  Presenter takes it down through its normal path: out of the index at once, every connection that holds it is sent
+  `present.dismiss` (other tabs of the device, and other devices of a room target), the row is marked `ended` and removed
+  by maintenance ten seconds later. A reconnect does not bring it back, and the module's handle answers as for any
+  dismissed presentation (`update` → `undefined`, `dismiss` → `false`). The module is not told otherwise; showing its key
+  again shows it again (a new show).
+- **Who may**: a connection that holds the presentation, where the decision lets it be pressed (`interactive`: the device
+  has touch or a pointer), whether or not the presentation has a handler. The server marks each presentation it sends
+  `closable` on exactly that condition, with the close button's name `texts.close` ("Close", "Sluiten"); a page offers
+  a close only for those. A display without touch or a pointer is not offered one (and a close from it is refused).
+- **The displayed show**: the request's `revision` names the show the page displays. It must be the show that page
+  holds and the current show of the id: a keyed replacement the page has not drawn yet is not closed unseen (answered
+  "That changed just now.", and the page is reconciled). A content update of the same show (a tick from elsewhere) is
+  the same show: closing it with the earlier revision works.
+- **The answers**: closed (or ended already) → `{ ok: true }`; not held by that connection, or not pressable there →
+  "I can't do that right now."; another show → "That changed just now."; over the hub's bound → the household's "Too much
+  at once". A close runs no module code, so the gateway and the risk policy are not asked: like an end, it changes only
+  what screens show.
+- **Several devices**: a presentation has no per-device state (one row, one target), so a close on one device takes it
+  off every device of its target. A module that wants a screen per device shows one per device.
+- **Timers and rings**: closing a timer's countdown takes the countdown off the screens and nothing else: the timer
+  keeps running (the timers module keeps its own row) and still rings, because a ring is a notification card (P9),
+  which has its own Stop and no close button; a ring is never a presentation. The countdown comes back when the timer
+  is changed (its key is shown again).
+- **On the page**: the presentation is hidden at once (a tap feels instant) and the request sent; the server's
+  `present.dismiss` then removes it. Refused, it is shown again with the server's sentence (or `texts.failed` when there
+  was no answer); one the server withdrew meanwhile stays gone. Escape closes the newest closable presentation, except
+  while a reply is thinking or playing (Escape stops that first), while a menu, panel or dialog is open or covers the
+  stage, or while typing. A tap on the content never closes it (ticks, buttons and an accidental touch on a picture are
+  safe); there is no swipe.
+
 ## Images
 
 - **An image's address belongs to one page** (review round 1, G9). A page is never given a content hash. For each image
@@ -275,7 +313,9 @@ transient the decision allows.
   cannot inherit an older showing's refusal or reuse an expired file. A content update of the same show keeps its
   resolved image.
 - **The cache** fetches through `safeFetch` (public addresses only, redirects checked again; never the owner-configured
-  helper, for anything a model or a page supplies) with its own image policy, checks the type the response says and the
+  helper, for anything a model or a page supplies) with its own image policy and the project's `User-Agent` (with the
+  household's API contact when one is set; image hosts such as Wikimedia's answer 403 without one, issue #150; a refusing
+  host is logged with its status, never the path), checks the type the response says and the
   bytes it is against each other, and its size, keeps it as `data/media/<sha256>.<ext>` (directory `0700`, files `0600`,
   written through a temporary file and one `rename`) for a day within 256 files and 64 MiB. What it promises, exactly:
   an address is not fetched again while it is in this run's bounded in-memory index of addresses (1,024; not kept across
@@ -311,11 +351,21 @@ transient the decision allows.
 
 ## The voice page
 
-- **One stage layout on every character**: a column centred under the character's box, just above the controls, that
-  grows upward only as far as it may without covering the box (at least 160 px on a short screen) and scrolls within
-  itself beyond that; it slides with the stage while the desktop chat is open. The character's box, its canvas and its
-  `focus` are as before (docs/CHARACTERS.md §2.7); the stage only adds its height to the bottom padding of the page's
-  scroll area, so captions scroll clear of it.
+- **One stage layout on every character, most of the screen while something is shown**: the presentation area runs
+  from just under the header and the character's strip (`--pva-present-gap`) to just above the controls (96 px above
+  the bottom, plus the safe area), full width less a 12 px gutter (or the safe area, in landscape on a notched phone) on
+  a phone, centred and at most 960 px wide from 640 px up, and scrolls within itself when several do not fit (a single
+  one is centred in it). An image is scaled to fit that area (`object-contain`, at most the area's height less room for
+  its caption, credit and buttons, at least 120 px) and a card, list, timer or the weather keeps a measure of at most
+  680 px, in larger type than the page (titles 20 / 24 px, text 17 / 19 px, a timer's count 48 / 64 px, the
+  temperature 44 / 56 px). **The character yields while it is up** (docs/CHARACTERS.md §2.7): the page sets
+  `data-presenting` on the root, the box shrinks to a strip (40 px high on a phone, 64 px from 640 px wide) under the
+  header with the state label under it, and the captions and the stage's overlays step aside (screen readers still get
+  each reply from `LiveAnnouncer`); on a short screen (at most 600 px high: a phone in landscape) the area covers that
+  strip instead. When nothing is shown, or a menu, a panel or the chat covers the stage, everything is as before. The
+  controls (microphone, Stop, chat, More) and the header's menus stay where they were and reachable. The fixed chrome
+  (the notification strip of 88 px, the header of 56 px and the controls' 96 px) is not given up, so on a 375 × 667
+  phone the area is about 355 px high and on a phone in landscape (667 × 375) about 130 px.
 - P9's **notification cards are drawn first in the stage**, with their wire messages and behaviour unchanged; then the
   presentations, a transient one first, then the pinned ones oldest first. While narrow-screen chat is modal, ordinary
   presentations are hidden and inert; notification cards move inside the chat dialog so keyboard focus can reach ring
@@ -338,7 +388,11 @@ transient the decision allows.
   neither ends nor freezes it.
 - **An image the browser cannot load** (a 404 after the address was revoked, a decoding failure) shows the server's
   sentence for a missing image, with its caption and credit.
-- **Protocol**: additive within version 11. The decoder answers `Unknown` for a message a page does not know, so an older
+- **Protocol**: closing on the page is additive within version 12: `present.close` (a request), and the optional
+  `PresentationWire.closable` and `PresentPageTexts.close`. An older server never marks a presentation closable, so a
+  newer page offers no close there and never sends it `present.close` (which it would ignore as `Unknown` anyway); an
+  older page ignores both keys and never sends it. No closed set the decoder checks gains a member.
+- **Protocol (P10)**: additive within version 11. The decoder answers `Unknown` for a message a page does not know, so an older
   page ignores the new messages, and the server sends it none (it declares no kinds) and needs nothing from it. No closed
   set the decoder checks gains a member: the kinds live inside the new messages, and `present.kinds` was always an open
   record. So the version stays 11. (`ImageState.ready` carries the page's `token`, never a hash.)
@@ -404,6 +458,6 @@ under 10 ms.
 `facts` as its own kind, `table`, `gallery`, `progress`, `confirm`, `handoff`, the built-in `show` and `show_on` tools,
 `present.status` (a page's report of a failed load, and the next turn's context), the reveal rule tied to clauses,
 resizing images (`sharp`), a reduced form of personal content on a shared screen, a presentation on "wherever this is
-already shown", moving or shrinking the character's box, a close button on the page, and keeping the image cache's
-address index across a restart. (A press handler's risk class and its decision's record exist since P8: see "What a press
+already shown", closing a presentation on one device only (it has no per-device state), swipe to close, and keeping the
+image cache's address index across a restart. (A press handler's risk class and its decision's record exist since P8: see "What a press
 is" above and docs/MODULES.md §4.)

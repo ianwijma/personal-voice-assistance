@@ -1099,8 +1099,11 @@ selectPresentations(candidates): what a device shows (pinned ≤ 8 oldest first,
 devicePresentFrom(settings, declared): DevicePresentOutputs = { display, kinds, touch }   // declaration minus overrides
 // present.show / present.update { presentation: PresentationWire }, present.dismiss { id } (server → voice connection),
 // present.action { requestId, id, revision, action, item?, done? } (page → server) answered by result { say? }: additive within protocol 11
+// present.close { requestId, id, revision } (page → server, only for a presentation sent `closable`) answered by result { say? on refusal }:
+//   the Presenter's dismissal for every holder; additive within protocol 12 (PresentationWire.closable, PresentPageTexts.close optional)
 PresentHook (ModuleHostOptions.present) = { forPart(part, runner): ModulePresent; fromResult(moduleId, principal, value) }
 PresentEngine = PresentHook & { reconcile(deviceId); reconcileAll(); press(PresentPressRequest): Effect<PresentPressAnswer>;
+                                close(PresentCloseRequest): Effect<PresentCloseAnswer>;
                                 mediaFor(token): hash | undefined; busyAnswer(); live(); held(deviceId); maintainNow; planNow;
                                 plannedAt(); loaded(); settled }
 makePresentEngine({ store, scheduler, devices, outputs(device, declaredKinds?): DevicePresentOutputs, privacy, outlet: () => PresentOutlet?,

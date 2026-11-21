@@ -724,6 +724,8 @@ export const clientExamples: { readonly [T in ClientMessageType]: Extract<Client
   "notification.action": { type: "notification.action", requestId: "n1", id: "n-4f2a", actionId: "stop" },
   // P10 (additive within 11): a tick on a checklist item.
   "present.action": { type: "present.action", requestId: "p1", id: "p-7c1d", revision: "show-1:1", action: "tick", item: "milk", done: true },
+  // Additive within 12: the viewer closed a presentation marked `closable` (its close button, or Escape).
+  "present.close": { type: "present.close", requestId: "p2", id: "p-7c1d", revision: "show-1:1" },
   ...assistantsClientExamples,
   ...nodeClientExamples
 }
@@ -784,7 +786,8 @@ export const examplePresentation = {
   content: { kind: "list", title: "Shopping", style: "checklist", items: [{ id: "milk", text: "Milk", done: false }, { id: "eggs", text: "Eggs", done: false }] },
   buttons: [{ id: "clear", label: "Clear ticked" }],
   interactive: true,
-  texts: { region: "On screen", loading: "Loading the image…", imageMissing: "The image is not available.", failed: "That didn't work.", timerDone: "Done", credit: "Image:", high: "High", low: "Low" }
+  closable: true,
+  texts: { region: "On screen", loading: "Loading the image…", imageMissing: "The image is not available.", failed: "That didn't work.", close: "Close", timerDone: "Done", credit: "Image:", high: "High", low: "Low" }
 } as const
 
 export const serverExamples: { readonly [T in ServerMessageType]: Extract<ServerMessage, { readonly type: T }> } = {

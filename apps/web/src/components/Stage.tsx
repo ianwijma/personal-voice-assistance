@@ -33,8 +33,8 @@ export function Stage() {
         data-visual-state={v.state}
         className={cx(
           // The line stays at the same height in every state; what is under it flows downward.
-          // P10: the bottom keeps the presentation stage's height clear too (`--pva-present-h`), so captions scroll above it.
-          "absolute inset-0 flex flex-col items-center overflow-y-auto overflow-x-hidden pb-[calc(8rem+var(--pva-present-h,0px))] [overflow-anchor:none] transition-transform duration-[320ms] ease-out",
+          // P10: while something is presented the box shrinks and the captions step aside (globals.css `data-presenting`).
+          "absolute inset-0 flex flex-col items-center overflow-y-auto overflow-x-hidden pb-32 [overflow-anchor:none] transition-transform duration-[320ms] ease-out",
           // Top padding and the visualiser's height scale with the height (globals.css `stage-pad` / `stage-vis`).
           "stage-pad",
           v.chatOpen && "lg:max-[1439px]:-translate-x-[200px]"
@@ -51,7 +51,7 @@ export function Stage() {
         </div>
         <StateLabel />
         <Captions />
-        <div className="mt-6 flex short:mt-3 w-full max-w-[560px] flex-col items-center gap-4 px-4 empty:hidden" data-testid="stage-below">
+        <div className="mt-6 flex short:mt-3 w-full max-w-[560px] flex-col items-center gap-4 px-4 empty:hidden" data-testid="stage-below" data-present-yield="">
           {overlays.map((id) => {
             const Overlay = stageOverlays.find((o) => o.id === id)!.component
             return <Overlay key={id} />

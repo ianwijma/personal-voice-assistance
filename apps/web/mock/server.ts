@@ -1740,8 +1740,8 @@ const mockPresentIds = new Set<string>()
 const MOCK_IMAGE = Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==", "base64")
 /** The Presenter's own words, in the saved household language (as `PresentTexts` in packages/core: the test compares the two). */
 const MOCK_PRESENT_TEXTS = {
-  en: { region: "On screen", loading: "Loading the image…", imageMissing: "The image is not available.", timerDone: "Done", credit: "Image:", high: "High", low: "Low", done: "Done.", failed: "That didn't work.", cantNow: "I can't do that right now." },
-  nl: { region: "Op het scherm", loading: "De afbeelding wordt geladen…", imageMissing: "De afbeelding is niet beschikbaar.", timerDone: "Klaar", credit: "Afbeelding:", high: "Hoog", low: "Laag", done: "Klaar.", failed: "Dat lukte niet.", cantNow: "Dat kan ik nu niet doen." }
+  en: { region: "On screen", loading: "Loading the image…", imageMissing: "The image is not available.", timerDone: "Done", credit: "Image:", high: "High", low: "Low", done: "Done.", failed: "That didn't work.", cantNow: "I can't do that right now.", close: "Close" },
+  nl: { region: "Op het scherm", loading: "De afbeelding wordt geladen…", imageMissing: "De afbeelding is niet beschikbaar.", timerDone: "Klaar", credit: "Afbeelding:", high: "Hoog", low: "Laag", done: "Klaar.", failed: "Dat lukte niet.", cantNow: "Dat kan ik nu niet doen.", close: "Sluiten" }
 } as const
 const mockPresentTexts = () => (String(valueOf("HOME_LANGUAGE") ?? "").toLowerCase().startsWith("nl") ? MOCK_PRESENT_TEXTS.nl : MOCK_PRESENT_TEXTS.en)
 /** The shared decision for one presentation for one connection now, with the kinds its own page declared (as the server). */
@@ -1763,7 +1763,8 @@ const mockWire = (id: string, p: { readonly presentation: Presentation; readonly
     content: presentWireContent(p.presentation, token === undefined ? undefined : { state: "ready", token }),
     buttons: (p.presentation.buttons ?? []).map((b) => ({ id: b.id, label: b.label })),
     interactive: interactive && p.presentation.handler !== undefined,
-    texts: { region: texts.region, loading: texts.loading, imageMissing: texts.imageMissing, failed: texts.failed, timerDone: texts.timerDone, credit: texts.credit, high: texts.high, low: texts.low }
+    closable: interactive,
+    texts: { region: texts.region, loading: texts.loading, imageMissing: texts.imageMissing, failed: texts.failed, close: texts.close, timerDone: texts.timerDone, credit: texts.credit, high: texts.high, low: texts.low }
   }
 }
 const isPresentationWire = Schema.is(PresentationWire)
@@ -3128,6 +3129,29 @@ const onClientMessage = (c: Conn, m: ClientMessage) => {
       const refusedButton = mockPressRefusal()
       if (refusedButton !== undefined) return sendTo(c, { type: "result", requestId: m.requestId, ok: false, error: { code: "bad_message", message: refusedButton }, say: refusedButton })
       return sendTo(c, { type: "result", requestId: m.requestId, ok: true, say: texts.done })
+    }
+    case "present.close": {
+      // As the real server: the viewer closed it on a page that holds the show it names, where it may be pressed; then
+      // it ends for every page (the mock's dismissal). One that has ended already counts as closed.
+      if (c.frontend !== "voice" || c.deviceId === undefined) return result(c, m.requestId, false, { code: "bad_message", message: "A presentation is closed from a voice page of its device" })
+      pruneEndedMock()
+      const p = mockPresentations.get(m.id)
+      const texts = mockPresentTexts()
+      const held = mockPresentHeld.get(c.id)?.get(m.id)
+      const cant = () => sendTo(c, { type: "result", requestId: m.requestId, ok: false, error: { code: "bad_message", message: texts.cantNow }, say: texts.cantNow })
+      if (held === undefined) return cant()
+      if (p === undefined) {
+        reconcilePresentMock(c)
+        return sendTo(c, { type: "result", requestId: m.requestId, ok: true })
+      }
+      const d = decidePresentMock(c, p.presentation.kind)
+      // The mock has no keyed replacement, so every revision it held is of the same show (the server checks the show).
+      if (!d.show || !d.interactive) {
+        reconcilePresentMock(c)
+        return cant()
+      }
+      endMockPresentation(m.id)
+      return sendTo(c, { type: "result", requestId: m.requestId, ok: true })
     }
     case "device.caps": {
       // Protocol 11: what the device can do changed, or its live state; admin's device list follows.

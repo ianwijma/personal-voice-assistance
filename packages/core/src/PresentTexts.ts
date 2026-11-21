@@ -20,7 +20,9 @@ const TEXTS = {
     over: "That has ended already.",
     failed: "That didn't work.",
     handling: "That is being handled already.",
-    tooMany: "Too much at once; try again in a moment."
+    tooMany: "Too much at once; try again in a moment.",
+    close: "Close",
+    changed: "That changed just now."
   },
   nl: {
     region: "Op het scherm",
@@ -35,7 +37,9 @@ const TEXTS = {
     over: "Dat is al afgelopen.",
     failed: "Dat lukte niet.",
     handling: "Daar wordt al aan gewerkt.",
-    tooMany: "Te veel tegelijk; probeer het zo opnieuw."
+    tooMany: "Te veel tegelijk; probeer het zo opnieuw.",
+    close: "Sluiten",
+    changed: "Dat is net veranderd."
   }
 } as const
 
@@ -46,7 +50,7 @@ export const presentText = (language: NotifyLanguage, key: PresentTextKey): stri
 /** The stage's own words for a page. */
 export const presentPageTexts = (language: NotifyLanguage): PresentPageTexts => {
   const t = TEXTS[language]
-  return { region: t.region, loading: t.loading, imageMissing: t.imageMissing, failed: t.failed, timerDone: t.timerDone, credit: t.credit, high: t.high, low: t.low }
+  return { region: t.region, loading: t.loading, imageMissing: t.imageMissing, failed: t.failed, close: t.close, timerDone: t.timerDone, credit: t.credit, high: t.high, low: t.low }
 }
 
 /** Both tables, for the test that compares their keys. */

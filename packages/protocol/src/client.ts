@@ -1,6 +1,6 @@
 import { Schema } from "effect"
 import { NotificationAction } from "./notifications.ts"
-import { PresentAction } from "./presentation.ts"
+import { PresentAction, PresentClose } from "./presentation.ts"
 import { AdminToken } from "./admin.ts"
 import { Assistant, AssistantBody, AssistantId, MAX_ASSISTANTS } from "./assistants.ts"
 import {
@@ -498,6 +498,7 @@ export const ClientMessage = Schema.Union([
   DeviceCaps,
   NotificationAction,
   PresentAction,
+  PresentClose,
   NodeStatus,
   NodeLevel,
   NodeCommandSend,
