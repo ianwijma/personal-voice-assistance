@@ -84,7 +84,7 @@ export const texts = defineTexts({
     mayHaveHappened: "I may already have done that. If not, say it again.",
     // -- the admin page: buttons, status, the sign-in pages --------------------------------------------------------
     actNeedsSettings: "Enter the client ID and the client secret, save, and then sign in.",
-    actSignIn: "Use the link to continue at Spotify. Register the redirect address in the Spotify app first (Show the address).",
+    actSignIn: "Use the link to continue at Spotify. Register the redirect address in the Spotify app first (the guide above, or Check the address).",
     actAddress: "Use the link: it shows the exact redirect address to register in your Spotify app.",
     actSignedOut: "Signed out of Spotify.",
     actAlreadyOut: "You were not signed in.",

@@ -6,7 +6,7 @@ import { Answer, makeControl, type MediaSettings, NOTE, type Talk } from "./cont
 import type { MusicKind } from "./music.ts"
 import { makePlayback, type Pages, watchPages } from "./pages.ts"
 import { type AccountStatus, makeSpotify, type Spotify } from "./spotify/client.ts"
-import { ADDRESS_PATH, makeSignIn, START_PATH } from "./spotify/signIn.ts"
+import { ADDRESS_PATH, CALLBACK_PATH, makeSignIn, START_PATH } from "./spotify/signIn.ts"
 import { texts, type TextKey } from "./texts.ts"
 
 export { ACK_MS, BUDGET_MS, INVOCATIONS_KEPT, PLAYING_MS, QUERY_CHARS, READY_MS, SEARCH_MS, VIDEO_FALLBACKS, VIDEO_RESULTS, VOLUME_STEP } from "./control.ts"
@@ -27,7 +27,49 @@ export interface NetDeps {
   readonly connector?: Connector
 }
 
+/**
+ * The guide at the top of the Spotify settings: what to put in each field of Spotify's "Create app" form. The same
+ * wording is in docs/modules/media.md "Setting it up" (keep them in step). `{origin}` is replaced by the admin page with
+ * the address it is open on; the callback path is the sign-in's own constant, so the two cannot drift.
+ */
+export const SPOTIFY_REDIRECT_COPY = `{origin}${CALLBACK_PATH}`
+type InfoSteps = NonNullable<Parameters<typeof Setting.info>[0]["steps"]>
+export const SPOTIFY_SETUP_STEPS: InfoSteps = [
+  {
+    text: "Open the Spotify developer dashboard, sign in with your Premium account and press Create app.",
+    link: { href: "https://developer.spotify.com/dashboard", label: "Open the Spotify dashboard" }
+  },
+  {
+    text: "Fill in the form. Leave Website empty.",
+    copy: [
+      { label: "App name", value: "Voice assistant" },
+      { label: "App description", value: "Plays my music on my own voice assistant at home." }
+    ]
+  },
+  {
+    text: "Under Redirect URIs paste this address and press Add. It must match exactly. Spotify only accepts an https:// address (or http://127.0.0.1), so open this admin page on the same https address you use for the voice page.",
+    copy: [{ label: "Redirect URI", value: SPOTIFY_REDIRECT_COPY }]
+  },
+  {
+    text: "Under \"Which API/SDKs are you planning to use?\" tick Web API and Web Playback SDK; leave the others off. Tick the terms box and press Save."
+  },
+  {
+    text: "In the new app open Settings. Copy the Client ID into the field below. Press \"View client secret\" and copy it into the field below. Then save this page."
+  },
+  {
+    text: "In the app's User management add the name and e-mail of each Spotify account that will use it (five at most)."
+  },
+  {
+    text: "Press \"Sign in with Spotify\" below, open the link and agree."
+  }
+]
+
 const settings = {
+  spotifySetup: Setting.info({
+    label: "Set up Spotify",
+    description: "Takes about five minutes and needs Spotify Premium.",
+    steps: SPOTIFY_SETUP_STEPS
+  }),
   spotifyClientId: Setting.text({
     label: "Spotify client ID",
     description: "From your app in the Spotify developer dashboard (developer.spotify.com/dashboard). Not secret.",
@@ -39,8 +81,8 @@ const settings = {
   spotifyStatus: Setting.info({ label: "Spotify sign-in", description: "Who is signed in, and until when (Spotify ends a sign-in six months after it)." }),
   spotifyAddress: Setting.action({
     label: "Redirect address",
-    description: "Spotify only sends you back to an address you registered. This shows the exact one, from the address you are using now. Register it under Redirect URIs in your Spotify app, once.",
-    buttonLabel: "Show the address"
+    description: "The guide above shows the address to register. This checks the one the assistant will really send Spotify, from the address you are using now; they must be the same.",
+    buttonLabel: "Check the address the assistant will send"
   }),
   spotifySignIn: Setting.action({
     label: "Sign in",

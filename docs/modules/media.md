@@ -140,8 +140,9 @@ with the owner's own developer app (the client secret stays on the server).
 **What the owner does** (the first time, and twice a year after that, see "Setting it up" below for the dashboard side):
 
 1. Enter the **client ID** and **client secret** on the Media page, and Save.
-2. Press **Show the address**: a link appears; opening it shows the exact redirect address (`https://<the address you are using
-   now>/api/modules/media/spotify/callback`). Register it under Redirect URIs in the Spotify app.
+2. The guide at the top of the page shows the redirect address (`https://<the address you are using
+   now>/api/modules/media/spotify/callback`) ready to copy; register it under Redirect URIs in the Spotify app. **Check the
+   address the assistant will send** shows what the server itself will send, for when the two might differ.
 3. Press **Sign in with Spotify**: a link appears ("Continue to Spotify"); opening it sends the browser to Spotify, and Spotify
    sends it back to the callback, which says "Signed in to Spotify. You can close this page." The page's status line then reads
    "Signed in as <name>, until <date>."
@@ -212,8 +213,9 @@ Every setting is made in the admin UI: no environment variable and no file edit.
 |---|---|---|
 | `spotifyClientId` | text | from the owner's Spotify developer app; not secret |
 | `spotifyClientSecret` | secret | the key vault |
+| `spotifySetup` | info (steps) | **Set up Spotify**: the guide, first on the page: what to put in each field of Spotify's Create app form, values ready to copy |
 | `spotifyStatus` | info | "Signed in as …, until 2027-05-21." / "Not signed in." / the vault is locked / the sign-in has ended |
-| `spotifyAddress` | action | **Show the address**: a link to the page that shows the redirect address to register |
+| `spotifyAddress` | action | **Check the address the assistant will send**: a link to the page that shows the redirect address the server will send Spotify (its authoritative answer) |
 | `spotifySignIn` | action | **Sign in with Spotify**: a link that continues at Spotify (needs the client ID and secret saved) |
 | `spotifySignOut` | action | **Sign out**: forgets the sign-in (asks first; a locked vault clears nothing) |
 | `videoSafeSearch` | choice (`strict`, `moderate`, `none`; default `moderate`) | passed to SearXNG with every video search |
@@ -269,25 +271,34 @@ credential stays when the module is switched off, as route tokens do; **Sign out
 
 ## Setting it up
 
-In the admin page, with a Spotify Premium account:
+The guide is in the admin page, at the top of the Spotify settings ("Set up Spotify", `SPOTIFY_SETUP_STEPS` in
+`packages/module-media/src/index.ts`); it is the one source of this wording, so keep the steps below in step with it. Its
+redirect value is `{origin}` + `CALLBACK_PATH`, where the admin page puts the address it is open on; the server builds the
+same for an `https` address (`redirectUriOf`), and forces `https` for any non-loopback host, so open the admin page on the
+same https address as the voice page (over plain `http://` the page would show an address the server never sends: then
+press **Check the address the assistant will send**). With a Spotify Premium account:
 
-1. **Make a Spotify app.** Go to `developer.spotify.com/dashboard`, sign in, press Create app. Any name and description. For
-   "Which API/SDKs are you planning to use?" tick **Web API** and **Web Playback SDK**. Leave the redirect address for step 4 (the
-   form wants one: give `https://127.0.0.1/` for now, or fill it in later under Settings). Open the app's Settings: copy the
-   **Client ID**, and View client secret for the **secret**.
-2. **Add yourself.** In the app's User management, add the Spotify account (name and e-mail) of everyone who will use it (five at
+1. **Make a Spotify app.** Open `developer.spotify.com/dashboard`, sign in with the Premium account and press Create app.
+2. **Fill in the form.** App name `Voice assistant`; App description `Plays my music on my own voice assistant at home.`;
+   leave Website empty.
+3. **Redirect URIs.** Paste `https://<the address in your browser>/api/modules/media/spotify/callback` and press Add. It must
+   match exactly; Spotify only accepts an `https://` address (or `http://127.0.0.1`).
+4. **APIs.** Under "Which API/SDKs are you planning to use?" tick **Web API** and **Web Playback SDK**, leave the others
+   off, tick the terms box and press Save.
+5. **Client ID and secret.** In the new app open Settings: copy the **Client ID** into the field, press "View client secret"
+   and copy it into the field too. Save the page.
+6. **Add yourself.** In the app's User management add the name and e-mail of each Spotify account that will use it (five at
    most in development mode); without it Spotify answers "forbidden" and the assistant says so.
-3. **Switch the module on** (Settings → modules → Media, for the assistants that should have it), paste the client ID and the
-   secret, and **Save**.
-4. **Register the redirect address.** Press **Show the address**, open the link, and copy the address it shows into the app's
-   Settings → Redirect URIs (Add, then Save). It is `https://<the address in your browser>/api/modules/media/spotify/callback`;
-   open the admin page the way the voice pages are opened (the same address), so it is the right one.
-5. **Sign in.** Press **Sign in with Spotify**, open the link, and agree. The status line shows who is signed in and until when.
-   Repeat it twice a year (Health tells you 14 days before).
-6. **Video** needs the Web search module on with your SearXNG address, and `json` among that server's `search.formats`.
-7. **On each device** open the voice page once and press **Start** (browsers only let a page play sound after a touch). A
-   browser without Widevine (some Chromium builds) cannot play Spotify; Health says so for that device. Ads play in YouTube's
-   player unless that browser is signed in to YouTube Premium.
+7. **Sign in.** Switch the module on (Settings → modules → Media, for the assistants that should have it), press
+   **Sign in with Spotify**, open the link and agree. The status line shows who is signed in and until when. Repeat it twice
+   a year (Health tells you 14 days before).
+
+Also:
+
+- **Video** needs the Web search module on with your SearXNG address, and `json` among that server's `search.formats`.
+- **On each device** open the voice page once and press **Start** (browsers only let a page play sound after a touch). A
+  browser without Widevine (some Chromium builds) cannot play Spotify; Health says so for that device. Ads play in YouTube's
+  player unless that browser is signed in to YouTube Premium.
 
 ## Facts that shape the design
 

@@ -393,12 +393,39 @@ export const FieldActionResult = Schema.Struct({
 })
 export type FieldActionResult = typeof FieldActionResult.Type
 
-/** Read-only text computed by the server ("Logged in with a Max plan", "Last test: 912 ms"). Value: `string` ("" when not known). */
+/**
+ * An address a step of an info field's guide offers (additive within 12): absolute `https://`, no credentials, no
+ * whitespace or control characters, at most 300 characters. The page opens it in a new tab with `rel="noopener noreferrer"`.
+ */
+export const INFO_STEP_LINK_HREF = /^https:\/\/(?![^/?#]*@)[^\s\u0000-\u001f\u007f/?#]+(?:[/?#][^\s\u0000-\u001f\u007f]*)?$/
+export const MAX_INFO_STEPS = 12
+export const MAX_INFO_STEP_COPY = 6
+export const InfoStepLink = Schema.Struct({
+  href: Schema.String.check(Schema.isMaxLength(300), Schema.isPattern(INFO_STEP_LINK_HREF)),
+  label: Schema.String.check(Schema.isMaxLength(60))
+})
+/** A value ready to copy. `{origin}` in `value` is replaced by the admin page with its own `window.location.origin`; nothing else is substituted. */
+export const InfoStepCopy = Schema.Struct({
+  label: Schema.String.check(Schema.isMaxLength(40)),
+  value: Schema.String.check(Schema.isMaxLength(300))
+})
+export const InfoStep = Schema.Struct({
+  text: Schema.String.check(Schema.isMaxLength(300)),
+  copy: Schema.optionalKey(Schema.Array(InfoStepCopy).check(Schema.isMaxLength(MAX_INFO_STEP_COPY))),
+  link: Schema.optionalKey(InfoStepLink)
+})
+export type InfoStep = typeof InfoStep.Type
+
+/**
+ * Read-only text computed by the server ("Logged in with a Max plan", "Last test: 912 ms"). Value: `string` ("" when not known).
+ * `steps` (additive within 12) makes it a numbered guide, drawn from the definition: text, values to copy, a link.
+ */
 export const InfoField = Schema.Struct({
   type: Schema.Literal("info"),
   ...common,
   ...fieldText,
-  tone: Schema.optionalKey(Schema.Literals(["neutral", "ok", "warning", "error"]))
+  tone: Schema.optionalKey(Schema.Literals(["neutral", "ok", "warning", "error"])),
+  steps: Schema.optionalKey(Schema.Array(InfoStep).check(Schema.isMaxLength(MAX_INFO_STEPS)))
 })
 
 export const SettingField = Schema.Union([
